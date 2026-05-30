@@ -1904,6 +1904,11 @@ function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
       : "edit";
   const targetTitle = cleanSpecEditPromptText(payload.targetTitle || "Spec node", 240);
   const targetPath = cleanSpecEditPromptText(payload.targetPath || "", 300);
+  const targetVisiblePath = cleanSpecEditPromptText(payload.targetVisiblePath || "", 300);
+  const targetProjectRoot = cleanSpecEditPromptText(payload.targetProjectRoot || "", 600);
+  const targetProjectRelativePath = cleanSpecEditPromptText(payload.targetProjectRelativePath || "", 300);
+  const targetWorkspaceRoot = cleanSpecEditPromptText(payload.targetWorkspaceRoot || "", 600);
+  const mountId = cleanSpecEditPromptText(payload.mountId || "", 160);
   const currentStatement = cleanSpecEditPromptText(payload.currentStatement || "", 1800);
   const desiredStatement = cleanSpecEditPromptText(payload.desiredStatement || "", 1800);
   const userInstruction = cleanSpecEditPromptText(payload.userInstruction || "", 1800);
@@ -1917,6 +1922,19 @@ function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
     `Target node: ${targetTitle}`,
   ];
   if (targetPath) lines.push(`Target path: ${targetPath}`);
+  if (targetVisiblePath && targetVisiblePath !== targetPath) lines.push(`Container visible path: ${targetVisiblePath}`);
+  if (targetProjectRelativePath && targetProjectRelativePath !== targetPath) {
+    lines.push(`Project-relative path: ${targetProjectRelativePath}`);
+  }
+  if (targetProjectRoot) lines.push(`Project root: ${targetProjectRoot}`);
+  if (targetWorkspaceRoot && targetWorkspaceRoot !== targetProjectRoot) {
+    lines.push(`Container workspace root: ${targetWorkspaceRoot}`);
+  }
+  if (mountId) lines.push(`Project mount id: ${mountId}`);
+  if (payload.containerTargetNodeId && payload.containerTargetNodeId !== payload.targetNodeId) {
+    lines.push(`Container graph node id: ${payload.containerTargetNodeId}`);
+  }
+  if (payload.sourceRepoId) lines.push(`Source repo id: ${payload.sourceRepoId}`);
   if (payload.targetSpecObjectId) lines.push(`Target spec object id: ${payload.targetSpecObjectId}`);
   if (payload.baseGraphHash) lines.push(`Base graph cursor: ${payload.baseGraphHash}`);
   if (payload.baseNodeHash) lines.push(`Base node hash: ${payload.baseNodeHash}`);
@@ -2630,6 +2648,76 @@ function getWorkspaceRootIdentity(value) {
     : cleaned.replace(/\/+$/g, "");
 
   return withoutTrailingSlash.toLowerCase();
+}
+
+function normalizeWorkspaceCoordinationTarget(value, fallbackRoot = "") {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const repoPath = cleanWorkspaceRootDirectory(
+    source.repoPath || source.repo_path || fallbackRoot,
+  );
+  if (!repoPath) {
+    return null;
+  }
+
+  return {
+    repoPath,
+    dbPath: cleanWorkspaceRootDirectory(source.dbPath || source.db_path),
+    mountId: String(source.mountId || source.mount_id || "").trim(),
+    projectName: String(source.projectName || source.project_name || "").trim(),
+    projectKind: String(source.projectKind || source.project_kind || "").trim(),
+    workspaceRelativePath: String(
+      source.workspaceRelativePath || source.workspace_relative_path || "",
+    ).trim(),
+    isWorkspaceRoot: Boolean(source.isWorkspaceRoot || source.is_workspace_root),
+    hasGit: Boolean(source.hasGit || source.has_git),
+    hasAgents: Boolean(source.hasAgents || source.has_agents),
+    hasKernelDb: Boolean(source.hasKernelDb || source.has_kernel_db),
+  };
+}
+
+function normalizeWorkspaceCoordinationTargetResponse(response, fallbackRoot = "") {
+  const data = unwrapCloudCommandData(response, {});
+  const rootDirectory = cleanWorkspaceRootDirectory(
+    data.repoPath || data.repo_path || fallbackRoot,
+  );
+  const targets = (Array.isArray(data.targets) ? data.targets : [])
+    .map((target) => normalizeWorkspaceCoordinationTarget(target))
+    .filter(Boolean);
+
+  if (!targets.length && rootDirectory) {
+    targets.push(normalizeWorkspaceCoordinationTarget({
+      repoPath: rootDirectory,
+      isWorkspaceRoot: true,
+      projectKind: "workspace_root",
+    }));
+  }
+
+  return {
+    container: Boolean(data.container),
+    rootDirectory,
+    targets,
+    workspaceKind: String(data.workspaceKind || data.workspace_kind || "").trim(),
+  };
+}
+
+function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
+  const safeRoot = cleanWorkspaceRootDirectory(rootDirectory);
+  if (!safeRoot) {
+    return [];
+  }
+
+  const record = targetsByRoot?.[getWorkspaceRootIdentity(safeRoot)];
+  if (record?.targets?.length) {
+    return record.targets;
+  }
+
+  return [
+    normalizeWorkspaceCoordinationTarget({
+      repoPath: safeRoot,
+      isWorkspaceRoot: true,
+      projectKind: "workspace_root",
+    }),
+  ].filter(Boolean);
 }
 
 function isWindowsSystemRootDirectory(value) {
@@ -3634,6 +3722,8 @@ export default function App() {
   const agentInstallationSyncKeyRef = useRef("");
   const terminalPresenceSyncKeyRef = useRef("");
   const workspaceMcpSyncKeyRef = useRef("");
+  const tokenomicsSyncCursorRef = useRef("");
+  const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
     [agentStatuses],
@@ -3642,21 +3732,93 @@ export default function App() {
     workspaceTerminalRoleOptions,
     activeAgent,
   );
-  const workspaceNotificationRoots = useMemo(() => (
-    workspaces
-      .map((workspace) => {
-        const workspaceId = String(workspace?.id || "").trim();
-        if (!workspaceId) {
-          return null;
+  const workspaceCoordinationRootEntries = useMemo(() => {
+    const entries = [];
+    const seen = new Set();
+
+    workspaces.forEach((workspace) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      if (!workspaceId) {
+        return;
+      }
+      const rootDirectory = (
+        getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+        || cleanWorkspaceRootDirectory(defaultWorkingDirectory)
+      );
+      const key = `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
+      if (!rootDirectory || seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      entries.push({
+        rootDirectory,
+        workspaceId,
+      });
+    });
+
+    return entries;
+  }, [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  const workspaceCoordinationRootKey = useMemo(
+    () => JSON.stringify(workspaceCoordinationRootEntries.map((entry) => [
+      entry.workspaceId,
+      getWorkspaceRootIdentity(entry.rootDirectory),
+    ])),
+    [workspaceCoordinationRootEntries],
+  );
+
+  useEffect(() => {
+    if (!workspaceCoordinationRootEntries.length) {
+      setWorkspaceCoordinationTargetsByRoot({});
+      return undefined;
+    }
+
+    let cancelled = false;
+    Promise.all(
+      workspaceCoordinationRootEntries.map(async (entry) => {
+        const key = getWorkspaceRootIdentity(entry.rootDirectory);
+        try {
+          const response = await invoke("coordination_workspace_targets", {
+            repoPath: entry.rootDirectory,
+          });
+          return [
+            key,
+            normalizeWorkspaceCoordinationTargetResponse(response, entry.rootDirectory),
+          ];
+        } catch {
+          return [
+            key,
+            normalizeWorkspaceCoordinationTargetResponse(null, entry.rootDirectory),
+          ];
         }
-        const rootDirectory = (
-          getWorkspaceRootDirectory(workspaceSettings, workspaceId)
-          || cleanWorkspaceRootDirectory(defaultWorkingDirectory)
-        );
-        return rootDirectory ? { rootDirectory, workspaceId } : null;
-      })
-      .filter(Boolean)
-  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
+      }),
+    ).then((entries) => {
+      if (cancelled) {
+        return;
+      }
+      setWorkspaceCoordinationTargetsByRoot(Object.fromEntries(entries));
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceCoordinationRootEntries, workspaceCoordinationRootKey]);
+
+  const workspaceNotificationRoots = useMemo(() => (
+    workspaceCoordinationRootEntries.flatMap((entry) => (
+      getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        entry.rootDirectory,
+      ).map((target) => ({
+        mountId: target.mountId || "",
+        rootDirectory: target.repoPath,
+        workspaceId: entry.workspaceId,
+        workspaceRootDirectory: entry.rootDirectory,
+      }))
+    ))
+  ), [
+    workspaceCoordinationRootEntries,
+    workspaceCoordinationTargetsByRoot,
+  ]);
   const workspaceNotificationSummaries = useMemo(
     () => getWorkspaceNotificationSummaries(workspaceNotifications, workspaceThreads),
     [workspaceNotifications, workspaceThreads],
@@ -7928,6 +8090,7 @@ export default function App() {
       .filter(Boolean)
       .map((runtimeWorkspace) => {
         const rootDirectory = getWorkspaceRootDirectory(workspaceSettings, runtimeWorkspace.id);
+        const workingDirectory = rootDirectory || defaultWorkingDirectory;
         const terminalCount = getWorkspaceTerminalCount(workspaceSettings, runtimeWorkspace.id);
         const terminalRoles = getWorkspaceTerminalRoles(
           workspaceSettings,
@@ -7991,7 +8154,11 @@ export default function App() {
           terminalAgentsByIndex,
           terminalRolesByIndex,
           threadsByIndex,
-          workingDirectory: rootDirectory || defaultWorkingDirectory,
+          coordinationTargets: getWorkspaceCoordinationTargetsForRoot(
+            workspaceCoordinationTargetsByRoot,
+            workingDirectory,
+          ),
+          workingDirectory,
           workspace: runtimeWorkspace,
         };
       });
@@ -8006,6 +8173,7 @@ export default function App() {
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
     workspaceThreads,
+    workspaceCoordinationTargetsByRoot,
     workspaces,
   ]);
   const terminalPresenceWorkspaces = useMemo(() => (
@@ -8111,24 +8279,32 @@ export default function App() {
     const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
     const addTarget = (workspace, repoPath, activeOverride = null) => {
       const workspaceId = String(workspace?.id || "").trim();
-      const workingDirectory = String(repoPath || "").trim();
-      if (!workspaceId || !workingDirectory) {
+      const rootDirectory = String(repoPath || "").trim();
+      if (!workspaceId || !rootDirectory) {
         return;
       }
-      const key = `${workspaceId}:${workingDirectory}`;
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
-      targets.push({
-        repoPath: workingDirectory,
-        workspaceActive,
-        workspaceId,
-        workspaceName: workspace?.name || workspaceId,
-        workspaceStatus: workspaceActive ? "active" : "deactivated",
+      getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        rootDirectory,
+      ).forEach((coordinationTarget) => {
+        const workingDirectory = String(coordinationTarget?.repoPath || rootDirectory).trim();
+        const key = `${workspaceId}:${workingDirectory}`;
+        if (!workingDirectory || seen.has(key)) {
+          return;
+        }
+        seen.add(key);
+        targets.push({
+          mountId: coordinationTarget?.mountId || "",
+          projectName: coordinationTarget?.projectName || "",
+          repoPath: workingDirectory,
+          workspaceActive,
+          workspaceId,
+          workspaceName: workspace?.name || workspaceId,
+          workspaceStatus: workspaceActive ? "active" : "deactivated",
+        });
       });
     };
 
@@ -8153,6 +8329,7 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    workspaceCoordinationTargetsByRoot,
     workspaceSettings,
     workspaces,
   ]);
@@ -8388,19 +8565,51 @@ export default function App() {
     }
 
     let disposed = false;
+    const tokenomicsCursorFromSummary = (summary) => {
+      const direct = typeof summary?.sync_cursor === "string" ? summary.sync_cursor.trim() : "";
+      if (direct) return direct;
+      const rollups = Array.isArray(summary?.rollups) ? summary.rollups : [];
+      return rollups
+        .map((row) => String(row?.updated_at || row?.updatedAt || "").trim())
+        .filter(Boolean)
+        .sort()
+        .pop() || "";
+    };
     const syncTokenomics = async (reason) => {
       try {
         if (reason === "tokenomics_scan") {
           await invoke("tokenomics_scan_usage");
+          const summary = await invoke("tokenomics_get_sync_payload");
+          if (disposed) {
+            return;
+          }
+          await invoke("cloud_mcp_sync_tokenomics_state", {
+            summary,
+            reason,
+            delta: false,
+          });
+          tokenomicsSyncCursorRef.current = tokenomicsCursorFromSummary(summary);
+          return;
         }
-        const summary = await invoke("tokenomics_get_sync_payload");
+
+        await invoke("tokenomics_scan_usage");
+        const summary = await invoke("tokenomics_get_sync_delta", {
+          sinceUpdatedAt: tokenomicsSyncCursorRef.current || null,
+        });
         if (disposed) {
           return;
         }
-        await invoke("cloud_mcp_sync_tokenomics_state", {
-          summary,
-          reason,
-        });
+        const rollupCount = Number(summary?.rollup_count ?? summary?.rollupCount ?? 0);
+        const limitCount = Array.isArray(summary?.limits) ? summary.limits.length : 0;
+        if (rollupCount > 0 || limitCount > 0) {
+          await invoke("cloud_mcp_sync_tokenomics_state", {
+            summary,
+            reason,
+            delta: true,
+          });
+          tokenomicsSyncCursorRef.current =
+            tokenomicsCursorFromSummary(summary) || tokenomicsSyncCursorRef.current;
+        }
       } catch (error) {
         if (!disposed) {
           logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_sync.failed", {
@@ -8432,20 +8641,26 @@ export default function App() {
     const seen = new Set();
     const addTarget = (workspace, repoPath) => {
       const workspaceId = String(workspace?.id || "").trim();
-      const workingDirectory = String(repoPath || "").trim();
-      if (!workspaceId || !workingDirectory) {
+      const rootDirectory = String(repoPath || "").trim();
+      if (!workspaceId || !rootDirectory) {
         return;
       }
-      const key = `${workspaceId}:${workingDirectory}`;
-      if (seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
-        return;
-      }
-      seen.add(key);
-      targets.push({
-        key,
-        repoPath: workingDirectory,
-        workspaceId,
-        workspaceName: workspace?.name || "",
+      getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        rootDirectory,
+      ).forEach((coordinationTarget) => {
+        const workingDirectory = String(coordinationTarget?.repoPath || rootDirectory).trim();
+        const key = `${workspaceId}:${workingDirectory}`;
+        if (!workingDirectory || seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
+          return;
+        }
+        seen.add(key);
+        targets.push({
+          key,
+          repoPath: workingDirectory,
+          workspaceId,
+          workspaceName: workspace?.name || "",
+        });
       });
     };
 
@@ -8470,6 +8685,7 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    workspaceCoordinationTargetsByRoot,
     workspaceSyncState,
   ]);
 
@@ -8478,17 +8694,23 @@ export default function App() {
 
     enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
       const workspaceId = descriptor.workspace?.id || "";
-      const repoPath = descriptor.workingDirectory || "";
-      const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
+      const coordinationTargets = descriptor.coordinationTargets?.length
+        ? descriptor.coordinationTargets
+        : [{ repoPath: descriptor.workingDirectory || "" }];
 
-      if (!runtimeKey) {
-        return;
-      }
+      coordinationTargets.forEach((coordinationTarget) => {
+        const repoPath = coordinationTarget?.repoPath || "";
+        const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
 
-      desiredTargets.set(runtimeKey, {
-        repoPath,
-        workspaceId,
-        workspaceName: descriptor.workspace?.name || "",
+        if (!runtimeKey) {
+          return;
+        }
+
+        desiredTargets.set(runtimeKey, {
+          repoPath,
+          workspaceId,
+          workspaceName: descriptor.workspace?.name || "",
+        });
       });
     });
 
@@ -8990,7 +9212,10 @@ export default function App() {
     if (workspaceDeactivationState.isActive) {
       throw new Error("Workspace deactivation is in progress.");
     }
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory || defaultWorkingDirectory;
+    const repoPath = payload.targetProjectRoot
+      || selectedWorkspaceFileRoot
+      || activatedWorkspaceTerminalWorkingDirectory
+      || defaultWorkingDirectory;
     if (!repoPath) {
       throw new Error("Workspace root is not available.");
     }
@@ -9000,16 +9225,23 @@ export default function App() {
       agent_id: "",
       base_graph_hash: payload.baseGraphHash || "",
       base_node_hash: payload.baseNodeHash || "",
+      container_target_node_id: payload.containerTargetNodeId || "",
       current_statement: payload.currentStatement || "",
       desired_statement: payload.desiredStatement || "",
       event_kind: "spec_edit_requested",
       intent_id: intentId,
+      mount_id: payload.mountId || "",
       operation: payload.operation || "edit",
+      source_repo_id: payload.sourceRepoId || "",
       status: "queued",
       target_node_id: payload.targetNodeId || "",
       target_path: payload.targetPath || "",
+      target_project_relative_path: payload.targetProjectRelativePath || "",
+      target_project_root: payload.targetProjectRoot || "",
       target_spec_object_id: payload.targetSpecObjectId || "",
       target_title: payload.targetTitle || "",
+      target_visible_path: payload.targetVisiblePath || "",
+      target_workspace_root: payload.targetWorkspaceRoot || "",
       terminal_id: "",
       terminal_index: null,
       terminal_instance_id: "",
@@ -9034,20 +9266,27 @@ export default function App() {
         agentLabel: "the next available agent",
         baseGraphHash: payload.baseGraphHash || "",
         baseNodeHash: payload.baseNodeHash || "",
+        containerTargetNodeId: payload.containerTargetNodeId || "",
         createdAt: promptSubmittedAt,
         currentStatement: payload.currentStatement || "",
         desiredStatement: payload.desiredStatement || "",
         intentId,
+        mountId: payload.mountId || "",
         operation: payload.operation || "edit",
         promptText: prompt,
         repoPath,
+        sourceRepoId: payload.sourceRepoId || "",
         submittedAt: promptSubmittedAt,
         submittedAtMs: promptSubmittedAtMs,
         targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
         targetNodeId: payload.targetNodeId || "",
         targetPath: payload.targetPath || "",
+        targetProjectRelativePath: payload.targetProjectRelativePath || "",
+        targetProjectRoot: payload.targetProjectRoot || "",
         targetSpecObjectId: payload.targetSpecObjectId || "",
         targetTitle: payload.targetTitle || "",
+        targetVisiblePath: payload.targetVisiblePath || "",
+        targetWorkspaceRoot: payload.targetWorkspaceRoot || "",
         terminalId: "",
         terminalIndex: null,
         terminalInstanceId: "",
@@ -9067,16 +9306,23 @@ export default function App() {
           specEdit: {
             baseGraphHash: payload.baseGraphHash || "",
             baseNodeHash: payload.baseNodeHash || "",
+            containerTargetNodeId: payload.containerTargetNodeId || "",
             intentId,
             intentPayload,
+            mountId: payload.mountId || "",
             operation: payload.operation || "edit",
             promptText: prompt,
             repoPath,
+            sourceRepoId: payload.sourceRepoId || "",
             targetNodeId: payload.targetNodeId || "",
             targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
             targetPath: payload.targetPath || "",
+            targetProjectRelativePath: payload.targetProjectRelativePath || "",
+            targetProjectRoot: payload.targetProjectRoot || "",
             targetSpecObjectId: payload.targetSpecObjectId || "",
             targetTitle: payload.targetTitle || "",
+            targetVisiblePath: payload.targetVisiblePath || "",
+            targetWorkspaceRoot: payload.targetWorkspaceRoot || "",
             workspaceId: selectedWorkspace.id,
             workspaceName: selectedWorkspace.name || "",
           },
@@ -12102,6 +12348,10 @@ export default function App() {
                           terminalWorkspace={activatedWorkspace}
                           terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
                           terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
+                          terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
+                            workspaceCoordinationTargetsByRoot,
+                            activatedWorkspaceTerminalWorkingDirectory,
+                          )}
                           terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
                           terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
                           terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
@@ -12180,6 +12430,7 @@ export default function App() {
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
+                            terminalWorkspaceCoordinationTargets={runtimeDescriptor.coordinationTargets}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
                             terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
@@ -12899,6 +13150,10 @@ export default function App() {
                 <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
                   {selectedWorkspace ? (
                     <McpsWorkspaceView
+                      coordinationTargets={getWorkspaceCoordinationTargetsForRoot(
+                        workspaceCoordinationTargetsByRoot,
+                        selectedWorkspaceFileRoot,
+                      )}
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       onOpenSettings={() => showView("settings")}
                       rootDirectory={selectedWorkspaceFileRoot}

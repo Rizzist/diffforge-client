@@ -2225,6 +2225,8 @@ async fn terminal_open(
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
     let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
     let working_directory_request = request.working_directory;
+    let requested_project_root = request.project_root;
+    let requested_mount_id = request.mount_id;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
     let terminal_index = request.terminal_index;
@@ -2322,7 +2324,11 @@ async fn terminal_open(
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if plain_shell {
     } else if !is_prewarm_pty {
-        let coordination_working_directory = workspace_coordination_root_for_terminal(&working_directory)?;
+        let coordination_working_directory = workspace_coordination_root_for_terminal(
+            &working_directory,
+            requested_project_root.as_deref(),
+            requested_mount_id.as_deref(),
+        )?;
         terminal_project_root = coordination_working_directory.clone();
         ensure_workspace_git_bootstrap_for_terminal(&coordination_working_directory).await?;
 
@@ -2634,6 +2640,7 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
         let recovery_roots = if !exact_repo && !mounts.is_empty() {
             mounts
                 .iter()
+                .filter(|mount| mount.has_git || mount.has_agents)
                 .map(|mount| mount.root_path.clone())
                 .collect::<Vec<_>>()
         } else {

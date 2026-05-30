@@ -19,6 +19,7 @@ import {
   isContainmentEdge,
   isNoSpecNode,
   liveAgentsFor,
+  nodeProjectContext,
   nodeKind,
   nodeSourceState,
   nodeSourceTone,
@@ -49,6 +50,26 @@ const LIGHT_READABLE_TONES = {
   "#64748b": "#475569",
 };
 const VIEWPORT_FIT_DELAYS = [90, 240];
+const PROJECT_GROUP_PADDING = {
+  top: 64,
+  right: 58,
+  bottom: 48,
+  left: 58,
+};
+const PROJECT_GROUP_MIN_SIZE = {
+  width: 250,
+  height: 180,
+};
+const PROJECT_GROUP_TONES = [
+  "#14b8a6",
+  "#3b82f6",
+  "#f59e0b",
+  "#ef4444",
+  "#22c55e",
+  "#06b6d4",
+  "#a855f7",
+  "#e11d48",
+];
 
 const EDGE_ANCHORS = [
   { id: "top-left", position: Position.Top, x: 0.24, y: 0 },
@@ -95,6 +116,128 @@ function sourceLabel(sourceState) {
 
 function dimensionsForFlowNode(node) {
   return dimensionsForNode(node);
+}
+
+function stableToneIndex(value) {
+  const source = String(value || "");
+  let hash = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    hash = ((hash << 5) - hash + source.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash) % PROJECT_GROUP_TONES.length;
+}
+
+function safeFlowId(value) {
+  return String(value || "project")
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "project";
+}
+
+function pathLeaf(value) {
+  const parts = String(value || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+
+function pathHead(value) {
+  const parts = String(value || "")
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts[0] || "";
+}
+
+function projectGroupLabel(context, fallback) {
+  return text(
+    context.mountId
+      || pathHead(context.visiblePath)
+      || pathLeaf(context.projectRoot)
+      || fallback,
+    "Project",
+  );
+}
+
+function projectGroupKeyForNode(node) {
+  const context = nodeProjectContext(node);
+  const key = text(context.mountId || context.projectRoot || context.sourceRepoId);
+  if (!key) return null;
+  return {
+    key,
+    label: projectGroupLabel(context, key),
+    projectRoot: context.projectRoot,
+    visiblePath: context.visiblePath,
+    workspaceRoot: context.workspaceRoot,
+  };
+}
+
+function projectGroupFlowNodes(nodes, layout, selectedNodeId) {
+  const groups = new Map();
+  nodes.forEach((node) => {
+    const groupInfo = projectGroupKeyForNode(node);
+    if (!groupInfo) return;
+    const position = layout.get(node.id);
+    if (!position) return;
+    const dimensions = dimensionsForFlowNode(node);
+    const existing = groups.get(groupInfo.key) || {
+      ...groupInfo,
+      left: Number.POSITIVE_INFINITY,
+      top: Number.POSITIVE_INFINITY,
+      right: Number.NEGATIVE_INFINITY,
+      bottom: Number.NEGATIVE_INFINITY,
+      memberIds: [],
+    };
+    existing.left = Math.min(existing.left, position.x);
+    existing.top = Math.min(existing.top, position.y);
+    existing.right = Math.max(existing.right, position.x + dimensions.width);
+    existing.bottom = Math.max(existing.bottom, position.y + dimensions.height);
+    existing.memberIds.push(node.id);
+    groups.set(groupInfo.key, existing);
+  });
+
+  return [...groups.values()]
+    .sort((left, right) => left.label.localeCompare(right.label) || left.key.localeCompare(right.key))
+    .map((group) => {
+      const width = Math.max(
+        PROJECT_GROUP_MIN_SIZE.width,
+        group.right - group.left + PROJECT_GROUP_PADDING.left + PROJECT_GROUP_PADDING.right,
+      );
+      const height = Math.max(
+        PROJECT_GROUP_MIN_SIZE.height,
+        group.bottom - group.top + PROJECT_GROUP_PADDING.top + PROJECT_GROUP_PADDING.bottom,
+      );
+      const tone = PROJECT_GROUP_TONES[stableToneIndex(group.key)];
+      return {
+        id: `project-group-${safeFlowId(group.key)}`,
+        type: "projectGroup",
+        position: {
+          x: group.left - PROJECT_GROUP_PADDING.left,
+          y: group.top - PROJECT_GROUP_PADDING.top,
+        },
+        zIndex: 0,
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        focusable: false,
+        style: {
+          width,
+          height,
+        },
+        data: {
+          label: group.label,
+          projectRoot: group.projectRoot,
+          visiblePath: group.visiblePath,
+          memberCount: group.memberIds.length,
+          memberIds: group.memberIds,
+          selected: group.memberIds.includes(selectedNodeId),
+          tone,
+        },
+      };
+    });
 }
 
 function flowEdgeColor(edge, sourceNode, targetNode) {
@@ -293,7 +436,10 @@ export default function XyflowGraphRenderer({
 }) {
   const [flowNodes, setFlowNodes, onNodesChange] = useNodesState([]);
   const [flowEdges, setFlowEdges, onEdgesChange] = useEdgesState([]);
-  const nodeTypes = useMemo(() => ({ specGraphNode: SpecGraphNode }), []);
+  const nodeTypes = useMemo(() => ({
+    projectGroup: ProjectGroupNode,
+    specGraphNode: SpecGraphNode,
+  }), []);
   const activeLayout = layout || new Map();
   const viewportInteractedRef = useRef(false);
   const viewportKey = useMemo(
@@ -321,6 +467,7 @@ export default function XyflowGraphRenderer({
       return;
     }
 
+    const projectGroups = projectGroupFlowNodes(nodes, activeLayout, selectedNodeId);
     const nextNodes = nodes.map((node) => {
       const dimensions = dimensionsForFlowNode(node);
       return {
@@ -341,7 +488,7 @@ export default function XyflowGraphRenderer({
         },
       };
     });
-    setFlowNodes(nextNodes);
+    setFlowNodes([...projectGroups, ...nextNodes]);
     setFlowEdges(toFlowEdges(edges, nodes, activeLayout));
   }, [activeLayout, edges, layoutPending, nodes, onSelect, selectedNodeId, setFlowEdges, setFlowNodes]);
 
@@ -350,7 +497,9 @@ export default function XyflowGraphRenderer({
       ...node,
       data: {
         ...node.data,
-        selected: node.id === selectedNodeId,
+        selected: node.type === "projectGroup"
+          ? Array.isArray(node.data?.memberIds) && node.data.memberIds.includes(selectedNodeId)
+          : node.id === selectedNodeId,
       },
     })));
   }, [selectedNodeId, setFlowNodes]);
@@ -377,7 +526,9 @@ export default function XyflowGraphRenderer({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onMoveStart={handleMoveStart}
-        onNodeClick={(_, node) => onSelect(node.id)}
+        onNodeClick={(_, node) => {
+          if (node.type === "specGraphNode") onSelect(node.id);
+        }}
         minZoom={0.18}
         maxZoom={1.8}
         elevateEdgesOnSelect={false}
@@ -434,6 +585,25 @@ function ViewportFitController({ fitKey, shouldSkipFit }) {
   }, [fitKey, nodesInitialized, reactFlow, shouldSkipFit]);
 
   return null;
+}
+
+function ProjectGroupNode({ data }) {
+  const label = text(data?.label, "Project");
+  const projectRoot = text(data?.projectRoot || data?.visiblePath);
+  const count = Number(data?.memberCount) || 0;
+  return (
+    <ProjectGroupFrame
+      aria-hidden="true"
+      $selected={Boolean(data?.selected)}
+      $tone={data?.tone || "#14b8a6"}
+    >
+      <ProjectGroupHeader $tone={data?.tone || "#14b8a6"}>
+        <ProjectGroupLabel title={label}>{label}</ProjectGroupLabel>
+        {count > 0 && <ProjectGroupCount>{count}</ProjectGroupCount>}
+      </ProjectGroupHeader>
+      {projectRoot && <ProjectGroupPath title={projectRoot}>{projectRoot}</ProjectGroupPath>}
+    </ProjectGroupFrame>
+  );
 }
 
 function SpecGraphNode({ data, selected }) {
@@ -541,6 +711,10 @@ const FlowFrame = styled.div`
       transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
+  .react-flow__node-projectGroup {
+    pointer-events: none;
+  }
+
   .react-flow__edges {
     z-index: 1;
   }
@@ -602,6 +776,139 @@ const FlowFrame = styled.div`
     background: #fafafc;
     border-bottom-color: rgba(0, 0, 0, 0.08);
     color: #333333;
+  }
+`;
+
+const ProjectGroupFrame = styled.div`
+  background:
+    linear-gradient(135deg, ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "18")}, transparent 42%),
+    rgba(5, 10, 18, 0.42);
+  border: 1px solid ${({ $selected, $tone }) => colorWithAlpha($tone || "#14b8a6", $selected ? "aa" : "66")};
+  border-radius: 8px;
+  box-shadow: ${({ $selected, $tone }) => (
+    $selected
+      ? `0 0 0 2px ${colorWithAlpha($tone || "#14b8a6", "22")}, inset 0 0 34px ${colorWithAlpha($tone || "#14b8a6", "12")}`
+      : `inset 0 0 26px ${colorWithAlpha($tone || "#14b8a6", "0f")}`
+  )};
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+  position: relative;
+  width: 100%;
+
+  &::before {
+    background-image:
+      linear-gradient(${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "1a")} 1px, transparent 1px),
+      linear-gradient(90deg, ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "1a")} 1px, transparent 1px);
+    background-size: 28px 28px;
+    content: "";
+    inset: 0;
+    opacity: 0.34;
+    position: absolute;
+  }
+
+  &::after {
+    border: 1px dashed ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "54")};
+    border-radius: 6px;
+    content: "";
+    inset: 10px;
+    opacity: ${({ $selected }) => ($selected ? 0.82 : 0.52)};
+    position: absolute;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      linear-gradient(135deg, ${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "12")}, transparent 46%),
+      rgba(255, 255, 255, 0.7);
+    border-color: ${({ $selected, $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), $selected ? "aa" : "55")};
+    box-shadow: ${({ $selected, $tone }) => (
+      $selected
+        ? `0 0 0 2px ${colorWithAlpha(lightReadableTone($tone || "#0f766e"), "18")}`
+        : "0 1px 2px rgba(0, 0, 0, 0.04)"
+    )};
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background-image:
+      linear-gradient(${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "12")} 1px, transparent 1px),
+      linear-gradient(90deg, ${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "12")} 1px, transparent 1px);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    border-color: ${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "44")};
+  }
+`;
+
+const ProjectGroupHeader = styled.div`
+  align-items: center;
+  background: ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "20")};
+  border: 1px solid ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "5c")};
+  border-radius: 999px;
+  color: ${({ $tone }) => colorWithAlpha($tone || "#14b8a6", "f2")};
+  display: inline-flex;
+  gap: 7px;
+  left: 16px;
+  max-width: calc(100% - 32px);
+  min-width: 0;
+  padding: 5px 8px 5px 10px;
+  position: absolute;
+  top: 14px;
+  z-index: 2;
+
+  html[data-forge-theme="light"] & {
+    background: ${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "10")};
+    border-color: ${({ $tone }) => colorWithAlpha(lightReadableTone($tone || "#0f766e"), "42")};
+    color: ${({ $tone }) => lightReadableTone($tone || "#0f766e")};
+  }
+`;
+
+const ProjectGroupLabel = styled.div`
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  line-height: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+const ProjectGroupCount = styled.div`
+  align-items: center;
+  background: rgba(4, 9, 16, 0.72);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.86);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-weight: 900;
+  height: 18px;
+  justify-content: center;
+  min-width: 18px;
+  padding: 0 5px;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.86);
+    color: #1d1d1f;
+  }
+`;
+
+const ProjectGroupPath = styled.div`
+  bottom: 13px;
+  color: rgba(219, 231, 247, 0.38);
+  font-size: 9px;
+  font-weight: 720;
+  left: 18px;
+  max-width: calc(100% - 36px);
+  overflow: hidden;
+  position: absolute;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  z-index: 2;
+
+  html[data-forge-theme="light"] & {
+    color: #6e6e73;
   }
 `;
 

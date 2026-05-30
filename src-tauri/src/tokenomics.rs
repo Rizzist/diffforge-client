@@ -7,6 +7,7 @@ const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v3-incremental-30d";
 const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v1-mtime-cache";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
+const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 
 use std::io::BufRead as _;
 
@@ -44,6 +45,19 @@ async fn tokenomics_get_sync_payload(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || tokenomics_summary_for(&app, true))
         .await
         .map_err(|error| format!("Unable to join Tokenomics sync payload: {error}"))?
+}
+
+#[tauri::command]
+async fn tokenomics_get_sync_delta(
+    app: AppHandle,
+    since_updated_at: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = tokenomics_open_db(&app)?;
+        tokenomics_sync_delta_from_conn(&conn, since_updated_at.as_deref())
+    })
+    .await
+    .map_err(|error| format!("Unable to join Tokenomics sync delta: {error}"))?
 }
 
 #[tauri::command]
@@ -162,7 +176,7 @@ fn tokenomics_scan_usage_for(app: &AppHandle) -> Result<Value, String> {
     let mut inserted_events = 0usize;
     let mut sources = Vec::new();
 
-    let codex_result = tokenomics_scan_codex_state_db(&conn)?;
+    let codex_result = tokenomics_scan_codex_state_db(app, &conn)?;
     scanned_files += codex_result.files_scanned;
     inserted_events += codex_result.inserted_events;
     sources.push(json!({
@@ -234,7 +248,7 @@ struct TokenomicsSource {
 }
 
 fn tokenomics_sources() -> Vec<TokenomicsSource> {
-    let home = env::var("HOME").ok().map(PathBuf::from);
+    let home = tokenomics_home_dir();
     let mut sources = Vec::new();
     if let Some(home) = home {
         sources.push(TokenomicsSource {
@@ -255,10 +269,26 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
     sources
 }
 
+fn tokenomics_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 struct TokenomicsScanResult {
     files_scanned: usize,
     inserted_events: usize,
     status: &'static str,
+}
+
+struct TokenomicsCodexThreadCandidate {
+    thread_id: String,
+    rollout_path: PathBuf,
+    source: String,
+    model_provider: String,
+    model: Option<String>,
+    cwd: Option<String>,
+    updated_at_unix: u64,
 }
 
 struct TokenomicsFileScanResult {
@@ -322,6 +352,33 @@ fn tokenomics_unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn tokenomics_emit_scan_progress(app: &AppHandle, payload: Value) {
+    let _ = app.emit(TOKENOMICS_SCAN_PROGRESS_EVENT, payload);
+}
+
+fn tokenomics_scan_day_progress(
+    updated_at_unix: u64,
+    backfill_cutoff: u64,
+    now_unix: u64,
+) -> (u64, u64, String) {
+    let total_days = TOKENOMICS_INITIAL_BACKFILL_DAYS.max(1);
+    let clamped = updated_at_unix.clamp(backfill_cutoff, now_unix.max(backfill_cutoff));
+    let day_index = clamped
+        .saturating_sub(backfill_cutoff)
+        .checked_div(86_400)
+        .unwrap_or(0)
+        .min(total_days.saturating_sub(1));
+    let remaining_days = now_unix.saturating_sub(clamped).checked_div(86_400).unwrap_or(0);
+    let label = if remaining_days == 0 {
+        "today".to_string()
+    } else if remaining_days == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{remaining_days} days ago")
+    };
+    (day_index + 1, total_days, label)
 }
 
 fn tokenomics_normalize_unix_timestamp(value: i64) -> u64 {
@@ -548,9 +605,10 @@ fn tokenomics_source_is_unchanged(
 }
 
 fn tokenomics_scan_codex_state_db(
+    app: &AppHandle,
     conn: &rusqlite::Connection,
 ) -> Result<TokenomicsScanResult, String> {
-    let Some(home) = env::var("HOME").ok().map(PathBuf::from) else {
+    let Some(home) = tokenomics_home_dir() else {
         return Ok(TokenomicsScanResult {
             files_scanned: 0,
             inserted_events: 0,
@@ -591,61 +649,113 @@ fn tokenomics_scan_codex_state_db(
         backfill_cutoff
     };
 
-    let codex_conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|error| {
-                format!(
-                    "Unable to open Codex Tokenomics database {}: {error}",
-                    db_path.display()
-                )
-            })?;
-    let mut statement = codex_conn
-        .prepare(
-            "SELECT
-               id,
-               rollout_path,
-               source,
-               model_provider,
-               model,
-               cwd,
-               updated_at
-             FROM threads
-             WHERE COALESCE(rollout_path, '') != ''
-               AND (?1 = 0 OR updated_at >= ?1 OR updated_at >= ?2)
-             ORDER BY updated_at ASC",
+    tokenomics_emit_scan_progress(
+        app,
+        json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "phase": if initial_backfill_done { "catch_up" } else { "backfill_start" },
+            "day_index": 0,
+            "day_total": TOKENOMICS_INITIAL_BACKFILL_DAYS,
+            "day_label": if initial_backfill_done { "latest usage" } else { "preparing 30-day scan" },
+            "files_scanned": 0,
+            "inserted_events": 0,
+        }),
+    );
+
+    let candidates = {
+        let codex_conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
-        .map_err(|error| format!("Unable to prepare Codex Tokenomics query: {error}"))?;
-    let mut rows = statement
-        .query(rusqlite::params![
-            min_thread_updated_at as i64,
-            (min_thread_updated_at as i64).saturating_mul(1000)
-        ])
-        .map_err(|error| format!("Unable to query Codex Tokenomics database: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Unable to open Codex Tokenomics database {}: {error}",
+                db_path.display()
+            )
+        })?;
+        let mut statement = codex_conn
+            .prepare(
+                "SELECT
+                   id,
+                   rollout_path,
+                   source,
+                   model_provider,
+                   model,
+                   cwd,
+                   updated_at
+                 FROM threads
+                 WHERE COALESCE(rollout_path, '') != ''
+                   AND (?1 = 0 OR updated_at >= ?1 OR updated_at >= ?2)
+                 ORDER BY updated_at ASC",
+            )
+            .map_err(|error| format!("Unable to prepare Codex Tokenomics query: {error}"))?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                min_thread_updated_at as i64,
+                (min_thread_updated_at as i64).saturating_mul(1000)
+            ])
+            .map_err(|error| format!("Unable to query Codex Tokenomics database: {error}"))?;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("Unable to read Codex Tokenomics row: {error}"))?
+        {
+            let thread_id: String = row.get(0).unwrap_or_default();
+            let rollout_path: String = row.get(1).unwrap_or_default();
+            let path = PathBuf::from(&rollout_path);
+            if thread_id.is_empty() || !path.exists() {
+                continue;
+            }
+            let updated_at: i64 = row.get::<_, i64>(6).unwrap_or(0).max(0);
+            candidates.push(TokenomicsCodexThreadCandidate {
+                thread_id,
+                rollout_path: path,
+                source: row.get(2).unwrap_or_else(|_| "codex".to_string()),
+                model_provider: row.get(3).unwrap_or_else(|_| "openai".to_string()),
+                model: row.get(4).ok(),
+                cwd: row.get(5).ok(),
+                updated_at_unix: tokenomics_normalize_unix_timestamp(updated_at),
+            });
+        }
+        candidates
+    };
+
     let mut inserted_events = 0usize;
     let mut files_scanned = 0usize;
     let mut skipped_cached = 0usize;
+    let mut current_day_index = 0u64;
     let mut newest_event_timestamp = scan_state
         .as_ref()
         .map(|state| state.last_event_timestamp)
         .unwrap_or(backfill_cutoff);
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| format!("Unable to read Codex Tokenomics row: {error}"))?
-    {
-        let thread_id: String = row.get(0).unwrap_or_default();
-        let rollout_path: String = row.get(1).unwrap_or_default();
-        let source: String = row.get(2).unwrap_or_else(|_| "codex".to_string());
-        let model_provider: String = row.get(3).unwrap_or_else(|_| "openai".to_string());
-        let model: Option<String> = row.get(4).ok();
-        let cwd: Option<String> = row.get(5).ok();
-        let updated_at: i64 = row.get::<_, i64>(6).unwrap_or(0).max(0);
-        let path = PathBuf::from(&rollout_path);
-        if thread_id.is_empty() || !path.exists() {
-            continue;
+
+    for candidate in candidates.iter() {
+        let (day_index, day_total, day_label) =
+            tokenomics_scan_day_progress(candidate.updated_at_unix, backfill_cutoff, now_unix);
+        if day_index != current_day_index {
+            current_day_index = day_index;
+            let mut progress = json!({
+                "provider": "openai",
+                "agent_kind": "codex",
+                "phase": if initial_backfill_done { "catch_up" } else { "day_start" },
+                "day_index": day_index,
+                "day_total": day_total,
+                "day_label": day_label,
+                "files_scanned": files_scanned,
+                "inserted_events": inserted_events,
+                "candidate_count": candidates.len(),
+            });
+            if files_scanned > 0 {
+                if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
+                    progress["summary"] = summary;
+                }
+            }
+            tokenomics_emit_scan_progress(app, progress);
         }
-        let updated_at_unix = tokenomics_normalize_unix_timestamp(updated_at);
-        let (mtime, size) = tokenomics_file_mtime_size(&path);
-        let offset = tokenomics_get_source_offset(conn, "openai", "codex", &path)?;
+
+        let (mtime, size) = tokenomics_file_mtime_size(&candidate.rollout_path);
+        let offset = tokenomics_get_source_offset(conn, "openai", "codex", &candidate.rollout_path)?;
         let offset_is_current = offset.as_ref().is_some_and(|offset| {
             offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
                 && offset.last_seen_mtime == mtime
@@ -673,13 +783,13 @@ fn tokenomics_scan_codex_state_db(
         files_scanned += 1;
         let file_scan = tokenomics_scan_codex_session_file(
             conn,
-            &thread_id,
-            &path,
-            &source,
-            &model_provider,
-            model.as_deref(),
-            cwd.as_deref(),
-            updated_at_unix,
+            &candidate.thread_id,
+            &candidate.rollout_path,
+            &candidate.source,
+            &candidate.model_provider,
+            candidate.model.as_deref(),
+            candidate.cwd.as_deref(),
+            candidate.updated_at_unix,
             start_after_line,
             if initial_backfill_done {
                 0
@@ -689,17 +799,34 @@ fn tokenomics_scan_codex_state_db(
         )?;
         inserted_events += file_scan.inserted_events;
         newest_event_timestamp =
-            newest_event_timestamp.max(file_scan.last_event_timestamp.max(updated_at_unix));
+            newest_event_timestamp.max(file_scan.last_event_timestamp.max(candidate.updated_at_unix));
         tokenomics_upsert_source_offset(
             conn,
             "openai",
             "codex",
-            &path,
+            &candidate.rollout_path,
             TOKENOMICS_CODEX_SCANNER_VERSION,
             file_scan.last_line_index,
-            file_scan.last_event_timestamp.max(updated_at_unix),
+            file_scan.last_event_timestamp.max(candidate.updated_at_unix),
         )?;
     }
+
+    let mut complete_progress = json!({
+        "provider": "openai",
+        "agent_kind": "codex",
+        "phase": "complete",
+        "day_index": TOKENOMICS_INITIAL_BACKFILL_DAYS,
+        "day_total": TOKENOMICS_INITIAL_BACKFILL_DAYS,
+        "day_label": "complete",
+        "files_scanned": files_scanned,
+        "inserted_events": inserted_events,
+        "candidate_count": candidates.len(),
+    });
+    if let Ok(summary) = tokenomics_summary_from_conn(conn, true, Some(inserted_events)) {
+        complete_progress["summary"] = summary;
+    }
+    tokenomics_emit_scan_progress(app, complete_progress);
+
     tokenomics_upsert_scan_state(
         conn,
         "openai",
@@ -1439,11 +1566,14 @@ fn tokenomics_record_usage_value(
 
 fn tokenomics_summary_for(app: &AppHandle, include_rollups: bool) -> Result<Value, String> {
     let conn = tokenomics_open_db(app)?;
-    tokenomics_reconcile_codex_state_db(&conn)?;
+    tokenomics_reconcile_codex_state_db(app, &conn)?;
     tokenomics_summary_from_conn(&conn, include_rollups, None)
 }
 
-fn tokenomics_reconcile_codex_state_db(conn: &rusqlite::Connection) -> Result<(), String> {
+fn tokenomics_reconcile_codex_state_db(
+    app: &AppHandle,
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
     let non_state_event_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM tokenomics_usage_events WHERE provider='openai' AND agent_kind='codex' AND source_kind!='codex_token_count_jsonl'",
@@ -1455,7 +1585,7 @@ fn tokenomics_reconcile_codex_state_db(conn: &rusqlite::Connection) -> Result<()
         tokenomics_delete_provider_rows(conn, "openai", "codex")?;
         tokenomics_delete_provider_scan_cache(conn, "openai", "codex")?;
     }
-    let _ = tokenomics_scan_codex_state_db(conn)?;
+    let _ = tokenomics_scan_codex_state_db(app, conn)?;
     Ok(())
 }
 
@@ -1574,6 +1704,94 @@ fn tokenomics_summary_from_conn(
             {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
         ],
         "limits": limits,
+    }))
+}
+
+fn tokenomics_sync_delta_from_conn(
+    conn: &rusqlite::Connection,
+    since_updated_at: Option<&str>,
+) -> Result<Value, String> {
+    let clean_since = since_updated_at
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut statement = conn
+        .prepare(
+            "SELECT
+               provider,
+               agent_kind,
+               NULL AS model,
+               subscription_key,
+               workspace_id,
+               repo_path,
+               'hour' AS bucket_width,
+               bucket_start,
+               0 AS input_tokens,
+               0 AS output_tokens,
+               0 AS cache_read_tokens,
+               0 AS cache_write_tokens,
+               COALESCE(SUM(total_tokens), 0) AS total_tokens,
+               0 AS estimated_cost_microusd,
+               COALESCE(SUM(event_count), 0) AS event_count,
+               MAX(updated_at) AS updated_at
+             FROM tokenomics_rollups
+             WHERE bucket_width='hour'
+               AND (
+                 bucket_start >= strftime('%Y-%m-%dT%H', 'now', '-30 days')
+                 OR bucket_start LIKE 'unix-hour-%'
+               )
+               AND (?1 IS NULL OR updated_at >= ?1)
+             GROUP BY provider, agent_kind, subscription_key, workspace_id, repo_path, bucket_start
+             ORDER BY updated_at DESC, bucket_start DESC, provider, agent_kind
+             LIMIT ?2",
+        )
+        .map_err(|error| format!("Unable to prepare Tokenomics delta query: {error}"))?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let mapped = statement
+        .query_map(
+            rusqlite::params![clean_since, TOKENOMICS_SYNC_ROLLUP_LIMIT as i64],
+            |row| {
+                let mut object = serde_json::Map::new();
+                for (index, column) in columns.iter().enumerate() {
+                    let value = match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => Value::Null,
+                        rusqlite::types::ValueRef::Integer(value) => json!(value),
+                        rusqlite::types::ValueRef::Real(value) => json!(value),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            Value::String(String::from_utf8_lossy(value).to_string())
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => {
+                            Value::String(tokenomics_hash(&String::from_utf8_lossy(value)))
+                        }
+                    };
+                    object.insert(column.to_string(), value);
+                }
+                Ok(Value::Object(object))
+            },
+        )
+        .map_err(|error| format!("Unable to query Tokenomics delta rows: {error}"))?;
+    let mut rollups = Vec::new();
+    for row in mapped {
+        rollups.push(row.map_err(|error| format!("Unable to read Tokenomics delta row: {error}"))?);
+    }
+    let sync_cursor = rollups
+        .iter()
+        .filter_map(|row| row.get("updated_at").and_then(Value::as_str))
+        .max()
+        .map(ToOwned::to_owned)
+        .or_else(|| clean_since.map(ToOwned::to_owned));
+    let rollup_count = rollups.len();
+    Ok(json!({
+        "known": rollup_count > 0,
+        "source": "rust_local_tokenomics_sqlite_delta",
+        "updated_at": tokenomics_now_iso_like(),
+        "sync_cursor": sync_cursor,
+        "rollup_count": rollup_count,
+        "rollups": rollups,
+        "limits": tokenomics_provider_limits(conn)?,
     }))
 }
 

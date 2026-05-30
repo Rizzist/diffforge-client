@@ -506,14 +506,6 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
                 return Err(error);
             }
         };
-        match workspace_git_bootstrap_for_selected_root(&working_directory) {
-            Ok(_) => {}
-            Err(error) => {
-                return Err(format!(
-                    "Unable to prepare workspace Git for terminal isolation: {error}"
-                ));
-            }
-        }
         Ok(workspace_root_response(&working_directory))
     })
     .await

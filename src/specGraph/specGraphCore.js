@@ -83,6 +83,63 @@ function metadata(item) {
   return jsonObject(field(item, "metadata", "metadata_json", "metadataJson"));
 }
 
+function metadataText(item, meta, ...keys) {
+  return text(field(item, ...keys) || field(meta, ...keys));
+}
+
+function normalizeProjectMount(rawMount) {
+  const mount = rawMount && typeof rawMount === "object" && !Array.isArray(rawMount)
+    ? rawMount
+    : {};
+  const mountId = text(field(mount, "mountId", "mount_id"));
+  const workspaceRelativePath = text(field(mount, "workspaceRelativePath", "workspace_relative_path"));
+  const projectRoot = text(field(mount, "projectRoot", "project_root"));
+  const projectName = text(field(mount, "projectName", "project_name"));
+  const projectKind = text(field(mount, "projectKind", "project_kind"));
+  return {
+    ...mount,
+    mountId,
+    mount_id: mountId,
+    workspaceRelativePath,
+    workspace_relative_path: workspaceRelativePath,
+    projectRoot,
+    project_root: projectRoot,
+    projectName,
+    project_name: projectName,
+    projectKind,
+    project_kind: projectKind,
+    hasGit: booleanField(mount, "hasGit", "has_git"),
+    hasAgents: booleanField(mount, "hasAgents", "has_agents"),
+    hasSpecGraphCache: booleanField(mount, "hasSpecGraphCache", "has_spec_graph_cache"),
+  };
+}
+
+export function nodeProjectContext(node = {}) {
+  const meta = node?.metadata || {};
+  const mountId = metadataText(node, meta, "mountId", "mount_id");
+  const projectRoot = metadataText(node, meta, "projectRoot", "project_root");
+  const workspaceRoot = metadataText(node, meta, "workspaceRoot", "workspace_root");
+  const projectRelativePath = metadataText(node, meta, "projectRelativePath", "project_relative_path");
+  const visiblePath = metadataText(node, meta, "visiblePath", "visible_path");
+  const sourceRepoId = metadataText(node, meta, "sourceRepoId", "source_repo_id", "repoId", "repo_id");
+  const sourceGraphCursor = metadataText(node, meta, "sourceGraphCursor", "source_graph_cursor");
+  const sourceNodeId = metadataText(node, meta, "sourceNodeId", "source_node_id");
+  const sourceNodeHash = metadataText(node, meta, "sourceNodeHash", "source_node_hash");
+  const containerNodeId = metadataText(node, meta, "containerNodeId", "container_node_id") || text(node?.id);
+  return {
+    containerNodeId,
+    mountId,
+    projectRelativePath,
+    projectRoot,
+    sourceGraphCursor,
+    sourceNodeHash,
+    sourceNodeId,
+    sourceRepoId,
+    visiblePath,
+    workspaceRoot,
+  };
+}
+
 function displayTitleForNode(title, path, nodeType, displayIdentity) {
   if (isWorkspaceNodeType(nodeType)) {
     return displayIdentity?.repoName
@@ -364,6 +421,7 @@ function normalizeNode(raw, index = 0, options = {}) {
     || booleanField(meta, "local_only", "localOnly");
   const ignoredOverlay = booleanField(raw, "ignored_overlay", "ignoredOverlay")
     || booleanField(meta, "ignored_overlay", "ignoredOverlay");
+  const projectContext = nodeProjectContext({ ...raw, metadata: meta, id });
   const notificationCount = Math.max(
     0,
     Number(field(raw, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
@@ -400,6 +458,26 @@ function normalizeNode(raw, index = 0, options = {}) {
     file_origin: fileOrigin,
     file_state: fileState,
     lease_state: leaseState,
+    container_node_id: projectContext.containerNodeId,
+    containerNodeId: projectContext.containerNodeId,
+    mount_id: projectContext.mountId,
+    mountId: projectContext.mountId,
+    project_root: projectContext.projectRoot,
+    projectRoot: projectContext.projectRoot,
+    workspace_root: projectContext.workspaceRoot,
+    workspaceRoot: projectContext.workspaceRoot,
+    project_relative_path: projectContext.projectRelativePath,
+    projectRelativePath: projectContext.projectRelativePath,
+    visible_path: projectContext.visiblePath,
+    visiblePath: projectContext.visiblePath,
+    source_repo_id: projectContext.sourceRepoId,
+    sourceRepoId: projectContext.sourceRepoId,
+    source_graph_cursor: projectContext.sourceGraphCursor,
+    sourceGraphCursor: projectContext.sourceGraphCursor,
+    source_node_id: projectContext.sourceNodeId,
+    sourceNodeId: projectContext.sourceNodeId,
+    source_node_hash: projectContext.sourceNodeHash,
+    sourceNodeHash: projectContext.sourceNodeHash,
     local_only: localOnly,
     ignored_overlay: ignoredOverlay,
     provisional,
@@ -494,13 +572,30 @@ export function normalizeSnapshot(snapshot, options = {}) {
     })
     .filter(Boolean)
     .filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
+  const graphStats = snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {};
+  const projectMountSource = Array.isArray(snapshot?.projectMounts)
+    ? snapshot.projectMounts
+    : Array.isArray(snapshot?.project_mounts)
+      ? snapshot.project_mounts
+      : Array.isArray(graphStats?.project_mounts)
+        ? graphStats.project_mounts
+        : Array.isArray(graphStats?.projectMounts)
+          ? graphStats.projectMounts
+          : [];
+  const projectMounts = projectMountSource.map(normalizeProjectMount);
+  const containerWorkspace = booleanField(snapshot, "containerWorkspace", "container_workspace")
+    || booleanField(matrix, "container_workspace", "containerWorkspace")
+    || booleanField(graphStats, "container_workspace", "containerWorkspace")
+    || projectMounts.length > 0;
 
   return {
     matrix,
     nodes,
     edges,
     agentWork: snapshot?.agentWork || matrix?.agent_work || {},
-    graphStats: snapshot?.graphStats || matrix?.graph_stats || matrix?.graphStats || {},
+    graphStats,
+    containerWorkspace,
+    projectMounts,
     taskHistory: normalizeTaskHistory(snapshot?.taskHistory || matrix?.task_history || matrix?.taskHistory || {}),
     workspaceDisplayIdentity: displayIdentity,
   };

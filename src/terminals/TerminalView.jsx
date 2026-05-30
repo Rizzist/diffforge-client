@@ -3040,13 +3040,33 @@ function normalizeTodoQueueSpecEdit(value) {
     ...(intentPayload ? { intentPayload } : {}),
     baseGraphHash: String(specEdit.baseGraphHash || specEdit.base_graph_hash || intentPayload?.base_graph_hash || "").trim(),
     baseNodeHash: String(specEdit.baseNodeHash || specEdit.base_node_hash || intentPayload?.base_node_hash || "").trim(),
+    containerTargetNodeId: String(
+      specEdit.containerTargetNodeId
+        || specEdit.container_target_node_id
+        || intentPayload?.container_target_node_id
+        || "",
+    ).trim(),
     intentId,
+    mountId: String(specEdit.mountId || specEdit.mount_id || intentPayload?.mount_id || "").trim(),
     operation: String(specEdit.operation || intentPayload?.operation || "edit").trim().slice(0, 40),
     promptText,
     repoPath: String(specEdit.repoPath || specEdit.repo_path || "").trim().slice(0, 4096),
+    sourceRepoId: String(specEdit.sourceRepoId || specEdit.source_repo_id || intentPayload?.source_repo_id || "").trim(),
     targetNodeId: String(specEdit.targetNodeId || specEdit.target_node_id || intentPayload?.target_node_id || "").trim(),
     targetNodeSignature: String(specEdit.targetNodeSignature || specEdit.target_node_signature || "").trim(),
     targetPath: String(specEdit.targetPath || specEdit.target_path || intentPayload?.target_path || "").trim(),
+    targetProjectRelativePath: String(
+      specEdit.targetProjectRelativePath
+        || specEdit.target_project_relative_path
+        || intentPayload?.target_project_relative_path
+        || "",
+    ).trim(),
+    targetProjectRoot: String(
+      specEdit.targetProjectRoot
+        || specEdit.target_project_root
+        || intentPayload?.target_project_root
+        || "",
+    ).trim().slice(0, 4096),
     targetSpecObjectId: String(
       specEdit.targetSpecObjectId
         || specEdit.target_spec_object_id
@@ -3054,9 +3074,77 @@ function normalizeTodoQueueSpecEdit(value) {
         || "",
     ).trim(),
     targetTitle: String(specEdit.targetTitle || specEdit.target_title || intentPayload?.target_title || "").trim(),
+    targetVisiblePath: String(specEdit.targetVisiblePath || specEdit.target_visible_path || intentPayload?.target_visible_path || "").trim(),
+    targetWorkspaceRoot: String(
+      specEdit.targetWorkspaceRoot
+        || specEdit.target_workspace_root
+        || intentPayload?.target_workspace_root
+        || "",
+    ).trim().slice(0, 4096),
     workspaceId: String(specEdit.workspaceId || specEdit.workspace_id || "").trim(),
     workspaceName: String(specEdit.workspaceName || specEdit.workspace_name || "").trim(),
   };
+}
+
+function normalizeTerminalCoordinationPath(value) {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+}
+
+function terminalCoordinationPathsEqual(left, right) {
+  const leftPath = normalizeTerminalCoordinationPath(left);
+  const rightPath = normalizeTerminalCoordinationPath(right);
+  return Boolean(leftPath && rightPath && leftPath === rightPath);
+}
+
+function normalizeTerminalCoordinationTarget(value) {
+  const target = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  if (!target) {
+    return null;
+  }
+  const repoPath = String(target.repoPath || target.repo_path || "").trim();
+  if (!repoPath) {
+    return null;
+  }
+  return {
+    repoPath,
+    mountId: String(target.mountId || target.mount_id || "").trim(),
+    projectName: String(target.projectName || target.project_name || "").trim(),
+    projectKind: String(target.projectKind || target.project_kind || "").trim(),
+    workspaceRelativePath: String(
+      target.workspaceRelativePath || target.workspace_relative_path || "",
+    ).trim(),
+    isWorkspaceRoot: Boolean(target.isWorkspaceRoot || target.is_workspace_root),
+  };
+}
+
+function normalizeTerminalCoordinationTargets(value) {
+  return (Array.isArray(value) ? value : [])
+    .map(normalizeTerminalCoordinationTarget)
+    .filter(Boolean);
+}
+
+function terminalCoordinationTargetForIndex(targets, terminalIndexes, terminalIndex, fallbackRoot = "") {
+  const normalizedTargets = normalizeTerminalCoordinationTargets(targets);
+  if (!normalizedTargets.length) {
+    return fallbackRoot
+      ? { repoPath: fallbackRoot, mountId: "", projectName: "", projectKind: "workspace_root", workspaceRelativePath: "", isWorkspaceRoot: true }
+      : null;
+  }
+
+  if (normalizedTargets.length === 1) {
+    return normalizedTargets[0];
+  }
+
+  const position = (Array.isArray(terminalIndexes) ? terminalIndexes : []).indexOf(terminalIndex);
+  const targetIndex = position >= 0 ? position % normalizedTargets.length : 0;
+  return normalizedTargets[targetIndex];
+}
+
+function specEditTargetRepoPath(specEdit) {
+  return String(specEdit?.repoPath || specEdit?.targetProjectRoot || "").trim();
 }
 
 function normalizeVoiceAgentQueueArguments(value) {
@@ -6723,6 +6811,7 @@ function TerminalView({
   terminalAgentsByIndex = {},
   terminalRolesByIndex = {},
   terminalThreadsByIndex = {},
+  terminalWorkspaceCoordinationTargets = [],
   terminalWorkspaceWorkingDirectory,
   terminalWorkspaceLogicalIndexes,
   terminalWorkspaceLogicalTerminalCount,
@@ -6776,6 +6865,23 @@ function TerminalView({
   const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
     ? terminalWorkspaceLogicalIndexes
     : [];
+  const normalizedTerminalWorkspaceCoordinationTargets = useMemo(
+    () => normalizeTerminalCoordinationTargets(terminalWorkspaceCoordinationTargets),
+    [terminalWorkspaceCoordinationTargets],
+  );
+  const getTerminalProjectTarget = useCallback((terminalIndex) => (
+    terminalCoordinationTargetForIndex(
+      normalizedTerminalWorkspaceCoordinationTargets,
+      logicalTerminalIndexes,
+      terminalIndex,
+      terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+    )
+  ), [
+    defaultWorkingDirectory,
+    logicalTerminalIndexes,
+    normalizedTerminalWorkspaceCoordinationTargets,
+    terminalWorkspaceWorkingDirectory,
+  ]);
   const displayTerminalRows = Array.isArray(terminalDisplayRows)
     ? terminalDisplayRows
     : [];
@@ -7260,7 +7366,10 @@ function TerminalView({
 
     const paneId = getTerminalPaneId(targetTerminalIndex);
     const targetRole = String(getTerminalRole(targetTerminalIndex) || "").trim().toLowerCase();
+    const targetProject = getTerminalProjectTarget(targetTerminalIndex);
     const terminalAgent = getTerminalAgent(targetTerminalIndex);
+    const specEdit = getTodoQueueItemSpecEdit(item);
+    const specEditRepoPath = specEditTargetRepoPath(specEdit);
     const terminalEntries = Object.values(workspaceThreadEntry?.terminals || {});
     const liveTerminal = terminalEntries.find((candidate) => {
       const candidateIndex = Number(candidate?.terminalIndex);
@@ -7333,6 +7442,9 @@ function TerminalView({
       liveTerminal,
       paneId,
       parkedStatus,
+      projectRoot: targetProject?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+      projectMountId: targetProject?.mountId || "",
+      projectName: targetProject?.projectName || "",
       recordedAgentInputReady,
       requiresAgentInputReady,
       orphanRunningLooksIdle,
@@ -7352,6 +7464,17 @@ function TerminalView({
       turnStartedAt,
       workspaceId,
     };
+
+    if (
+      specEditRepoPath
+      && targetProject?.repoPath
+      && !terminalCoordinationPathsEqual(specEditRepoPath, targetProject.repoPath)
+    ) {
+      return unavailable("project_mismatch", "Choose a terminal for this project.", {
+        ...targetFields,
+        specEditRepoPath,
+      });
+    }
 
     if (!paneId) {
       return unavailable("missing_pane", "Choose an agent terminal for this todo.", targetFields);
@@ -7504,13 +7627,16 @@ function TerminalView({
       reason: "",
     };
   }, [
+    defaultWorkingDirectory,
     getTerminalAgent,
     getTerminalImageInputSupport,
     getTerminalPaneId,
+    getTerminalProjectTarget,
     getTerminalRole,
     getTerminalThread,
     logicalTerminalIndexes,
     terminalWorkspace?.id,
+    terminalWorkspaceWorkingDirectory,
     workspaceThreadEntry,
   ]);
   const fullscreenState = fullscreenActive
@@ -8473,7 +8599,7 @@ function TerminalView({
     try {
       logTerminalStatus("frontend.voice_plan.status_send", {
         payload,
-        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        repoPath: target.projectRoot || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
         workspaceId: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || "",
       });
@@ -11448,6 +11574,7 @@ function TerminalView({
         {logicalTerminalIndexes.map((terminalIndex) => {
           const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
+          const terminalProjectTarget = getTerminalProjectTarget(terminalIndex);
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
             || draggingThisTerminal
             || fullscreenThisTerminal;
@@ -11487,6 +11614,8 @@ function TerminalView({
                 onThreadTerminalLifecycle={onThreadTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
+                projectRoot={terminalProjectTarget?.mountId ? terminalProjectTarget.repoPath : ""}
+                mountId={terminalProjectTarget?.mountId || ""}
                 startupReady={terminalStartupReady}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
@@ -11540,6 +11669,10 @@ function TerminalView({
       onThreadTerminalLifecycle={onThreadTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
+      projectRoot={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId
+        ? getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.repoPath
+        : ""}
+      mountId={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId || ""}
       startupReady={terminalStartupReady}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
       terminalIndex={logicalTerminalIndexes[0] || 0}

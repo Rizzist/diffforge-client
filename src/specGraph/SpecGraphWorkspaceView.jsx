@@ -18,6 +18,7 @@ import {
   isUnspecifiedStructuralNode,
   isWorktreeFileNode,
   mergeLocalIgnoredOverlay,
+  nodeProjectContext,
   normalizeSnapshot,
   selectedFallback,
   splitSpecHistory,
@@ -91,7 +92,11 @@ export default function SpecGraphWorkspaceView({
     const nodeId = text(selectedNode?.id, "");
     if (!nodeId) return [];
     return (Array.isArray(pendingSpecEdits) ? pendingSpecEdits : [])
-      .filter((intent) => text(intent?.targetNodeId, "") === nodeId);
+      .filter((intent) => {
+        const targetNodeId = text(intent?.targetNodeId, "");
+        const containerTargetNodeId = text(intent?.containerTargetNodeId, "");
+        return targetNodeId === nodeId || containerTargetNodeId === nodeId;
+      });
   }, [pendingSpecEdits, selectedNode?.id]);
   const taskHistory = specGraph.taskHistory || { tasks: [] };
   const historyTasks = Array.isArray(taskHistory.tasks) ? taskHistory.tasks : [];
@@ -140,17 +145,32 @@ export default function SpecGraphWorkspaceView({
       return;
     }
     setSpecEditStatus({ state: "submitting", message: "Queueing spec edit..." });
+    const projectContext = nodeProjectContext(selectedNode);
+    const displayPath = text(selectedNode.display_path || selectedNode.displayPath || selectedNode.path, "");
+    const routedNodeId = projectContext.sourceNodeId || selectedNode.id;
+    const routedNodeHash = projectContext.sourceNodeHash
+      || text(specGraphSnapshot?.nodeHashes?.[selectedNode.id], "");
+    const targetPath = projectContext.projectRoot
+      ? projectContext.projectRelativePath
+      : displayPath;
     onSubmitSpecEditIntent({
-      baseGraphHash: text(specGraphSnapshot?.cursor, ""),
-      baseNodeHash: text(specGraphSnapshot?.nodeHashes?.[selectedNode.id], ""),
+      baseGraphHash: projectContext.sourceGraphCursor || text(specGraphSnapshot?.cursor, ""),
+      baseNodeHash: routedNodeHash,
+      containerTargetNodeId: projectContext.containerNodeId || selectedNode.id,
       currentStatement: specEditDraft.currentStatement,
       desiredStatement,
+      mountId: projectContext.mountId,
       operation: specEditDraft.operation,
+      sourceRepoId: projectContext.sourceRepoId,
       targetNode: selectedNode,
-      targetNodeId: selectedNode.id,
-      targetPath: text(selectedNode.display_path || selectedNode.displayPath || selectedNode.path, ""),
+      targetNodeId: routedNodeId,
+      targetPath,
+      targetProjectRelativePath: projectContext.projectRelativePath,
+      targetProjectRoot: projectContext.projectRoot,
       targetSpecObjectId: specEditDraft.targetSpecObjectId,
       targetTitle: text(selectedNode.display_title || selectedNode.displayTitle || selectedNode.title, "Spec node"),
+      targetVisiblePath: displayPath || projectContext.visiblePath,
+      targetWorkspaceRoot: projectContext.workspaceRoot,
       userInstruction: instruction,
     })
       .then((result) => {

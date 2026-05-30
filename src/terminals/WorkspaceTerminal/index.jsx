@@ -1109,6 +1109,8 @@ function WorkspaceTerminal({
   onThreadTerminalLifecycle,
   onToggleFullscreenTerminal,
   prewarmShell = false,
+  projectRoot = "",
+  mountId = "",
   startupReady = true,
   terminalIndex = 0,
   terminalCount = 1,
@@ -10052,6 +10054,8 @@ function WorkspaceTerminal({
               model: startupThreadProviderModel,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
+              projectRoot: projectRoot || "",
+              mountId: mountId || "",
               slotKey: startupSlotKey,
               terminalIndex,
               threadId: startupThreadId,
@@ -10392,7 +10396,7 @@ function WorkspaceTerminal({
   // PTY lifetime must be tied to pane identity and explicit lifecycle actions only.
   // Volatile thread/global-state callbacks are intentionally excluded so ordinary
   // workspace-thread updates do not tear down live terminal processes.
-  }, [paneId, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
+  }, [mountId, paneId, projectRoot, restartKey, terminalClosed, terminalIndex, terminalRoleId, terminalStartupUnblocked, workspace?.id]);
 
   useEffect(() => {
     const pendingPrompt = thread?.pendingPrompt;

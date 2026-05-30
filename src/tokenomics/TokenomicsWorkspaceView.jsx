@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
+
+const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 
 const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
@@ -463,16 +466,40 @@ function mergeTokenomicsSummary(previous, next) {
   };
 }
 
+function tokenomicsLoadingLabel(status, summary, progress) {
+  const phase = String(progress?.phase || "");
+  if (phase === "complete") return "Finalizing usage";
+  if (phase === "catch_up") return "Catching up usage";
+  if (phase === "day_start" || phase === "backfill_start") return "Scanning 30-day usage";
+  return status === "scanning" || !summary ? "Scanning usage" : "Loading usage";
+}
+
+function tokenomicsLoadingDetail(progress) {
+  const dayIndex = numeric(progress?.day_index, progress?.dayIndex);
+  const dayTotal = numeric(progress?.day_total, progress?.dayTotal);
+  const dayLabel = String(progress?.day_label || progress?.dayLabel || "").trim();
+  const files = numeric(progress?.files_scanned, progress?.filesScanned);
+  const events = numeric(progress?.inserted_events, progress?.insertedEvents);
+  const parts = [];
+  if (dayLabel) parts.push(dayLabel);
+  if (dayIndex > 0 && dayTotal > 0) parts.push(`${dayIndex}/${dayTotal}`);
+  parts.push(`${files} files`);
+  parts.push(`${events} events`);
+  return parts.join(" · ");
+}
+
 export default function TokenomicsWorkspaceView({ billingStatus = null } = {}) {
   const [summary, setSummary] = useState(null);
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const [selectedProvider, setSelectedProvider] = useState("all");
+  const [scanProgress, setScanProgress] = useState(null);
   const loadedOnceRef = useRef(false);
 
   const refresh = useCallback(async ({ scan = false } = {}) => {
     setStatus(scan ? "scanning" : "loading");
     setError("");
+    if (scan) setScanProgress(null);
     try {
       if (scan) {
         invoke("tokenomics_get_live_limits")
@@ -527,6 +554,32 @@ export default function TokenomicsWorkspaceView({ billingStatus = null } = {}) {
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
+      if (!disposed) {
+        const payload = event.payload || null;
+        setScanProgress(payload);
+        if (payload?.summary) {
+          setSummary((previous) => mergeTokenomicsSummary(previous, payload.summary || {}));
+        }
+      }
+    })
+      .then((handler) => {
+        if (disposed) {
+          handler();
+        } else {
+          unlisten = handler;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
   const providers = Array.isArray(summary?.by_provider) ? summary.by_provider : [];
   const modelRows = Array.isArray(summary?.by_model) ? summary.by_model : [];
   const dailyRaw = selectedProvider === "all"
@@ -575,7 +628,8 @@ export default function TokenomicsWorkspaceView({ billingStatus = null } = {}) {
         {status !== "ready" ? (
           <TokenomicsLoading role="status" aria-live="polite">
             <span />
-            <strong>{status === "scanning" || !summary ? "Scanning usage" : "Loading usage"}</strong>
+            <strong>{tokenomicsLoadingLabel(status, summary, scanProgress)}</strong>
+            {scanProgress ? <small>{tokenomicsLoadingDetail(scanProgress)}</small> : null}
           </TokenomicsLoading>
         ) : null}
 
@@ -915,6 +969,7 @@ const TokenomicsError = styled.div`
 const TokenomicsLoading = styled.div`
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 9px;
   min-width: 0;
   padding: 9px 10px;
@@ -936,6 +991,17 @@ const TokenomicsLoading = styled.div`
   }
 
   strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    min-width: 0;
+    color: #7f8da3;
+    font-size: 10px;
+    font-weight: 800;
+    line-height: 1.25;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

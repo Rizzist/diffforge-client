@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
@@ -1254,6 +1256,8 @@ struct TerminalOpenRequest {
     terminal_index: Option<u16>,
     thread_id: Option<String>,
     working_directory: Option<String>,
+    project_root: Option<String>,
+    mount_id: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     cols: Option<u16>,
@@ -2809,6 +2813,7 @@ pub fn run() {
             tokenomics_get_summary,
             tokenomics_get_live_limits,
             tokenomics_get_sync_payload,
+            tokenomics_get_sync_delta,
             tokenomics_record_usage,
             cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_hard_reset_cloud_sqlite,
@@ -2848,6 +2853,7 @@ pub fn run() {
             terminal_close,
             terminal_close_all,
             coordination::tauri_commands::coordination_init,
+            coordination::tauri_commands::coordination_workspace_targets,
             coordination::tauri_commands::coordination_get_snapshot,
             coordination::tauri_commands::coordination_log_ui_surface_event,
             coordination::tauri_commands::coordination_cleanup_bloat_dry_run,
