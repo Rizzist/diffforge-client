@@ -809,6 +809,7 @@ fn cleanup_terminal_instance_with_context(
         input_queue,
         active_task,
         coordination,
+        session_mode: _,
         metadata,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
@@ -1195,6 +1196,7 @@ async fn prepare_terminal_coordination_launch(
     terminal_slot_key: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
+    session_mode: TerminalSessionMode,
 ) -> Result<
     (
         crate::coordination::models::TerminalCoordinationContext,
@@ -1248,6 +1250,7 @@ async fn prepare_terminal_coordination_launch(
             None,
             None,
             Some(&terminal_launch_epoch),
+            Some(session_mode.coordination_enforcement_mode()),
         ) {
             Ok(context) => {
                 let worktree_required = context.enforcement_mode == "worktree_required";
@@ -1267,10 +1270,11 @@ async fn prepare_terminal_coordination_launch(
                     write_root_display.eq_ignore_ascii_case(&repo_root_display);
                 #[cfg(not(windows))]
                 let write_root_matches_repo_root = write_root_display == repo_root_display;
-                if !worktree_required
+                if session_mode.requires_managed_patch_worktree()
+                    && (!worktree_required
                     || !has_worktree_id
                     || !has_worktree_path
-                    || write_root_matches_repo_root
+                    || write_root_matches_repo_root)
                 {
                     let coordination = terminal_coordination_session_from_context(&context);
                     interrupt_terminal_coordination_session(
@@ -1291,18 +1295,29 @@ async fn prepare_terminal_coordination_launch(
 
                 let process_working_directory =
                     workspace_path_for_process(&PathBuf::from(&context.write_root));
-                let branch_name = context
-                    .slot_key
-                    .as_ref()
-                    .map(|slot_key| format!("agent/{slot_key}"));
-                let launch_worktree = json!({
-                    "agentId": context.agent_id.clone(),
-                    "branchName": branch_name.clone(),
-                    "id": context.worktree_id.clone(),
-                    "path": context.write_root.clone(),
-                    "sessionId": context.session_id.clone(),
-                    "slotKey": context.slot_key.clone(),
-                });
+                let launch_worktree = if context.worktree_id.is_some() {
+                    let branch_name = context
+                        .slot_key
+                        .as_ref()
+                        .map(|slot_key| format!("agent/{slot_key}"));
+                    json!({
+                        "agentId": context.agent_id.clone(),
+                        "branchName": branch_name.clone(),
+                        "id": context.worktree_id.clone(),
+                        "path": context.write_root.clone(),
+                        "sessionId": context.session_id.clone(),
+                        "slotKey": context.slot_key.clone(),
+                    })
+                } else {
+                    json!({
+                        "agentId": context.agent_id.clone(),
+                        "branchName": Value::Null,
+                        "id": Value::Null,
+                        "path": context.write_root.clone(),
+                        "sessionId": context.session_id.clone(),
+                        "slotKey": context.slot_key.clone(),
+                    })
+                };
                 Ok((context, launch_worktree, process_working_directory))
             }
             Err(error) => Err(format!(
@@ -2227,6 +2242,7 @@ async fn terminal_open(
     let working_directory_request = request.working_directory;
     let requested_project_root = request.project_root;
     let requested_mount_id = request.mount_id;
+    let requested_session_mode = request.session_mode;
     let workspace_id = request.workspace_id;
     let workspace_name = request.workspace_name;
     let terminal_index = request.terminal_index;
@@ -2234,6 +2250,20 @@ async fn terminal_open(
     let requested_slot_key = request.slot_key;
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
+    let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
+    let default_session_mode = if plain_shell || is_prewarm_pty {
+        TerminalSessionMode::Free
+    } else {
+        TerminalSessionMode::ManagedPatch
+    };
+    let session_mode =
+        TerminalSessionMode::from_request(requested_session_mode.as_deref(), default_session_mode)?;
+    if plain_shell && session_mode.requires_managed_patch_worktree() {
+        return Err(
+            "Plain shell terminals cannot use managed patch mode. Use an agent terminal for managed patch mode or free/activity/remote mode for shell work."
+                .to_string(),
+        );
+    }
     log_terminal_crash_forensics_event(
         "backend.terminal_open.begin",
         json!({
@@ -2246,6 +2276,7 @@ async fn terminal_open(
             "requested_cols": requested_cols,
             "requested_rows": requested_rows,
             "requested_instance_id": request.instance_id,
+            "session_mode": session_mode.as_str(),
             "terminal_index": terminal_index,
             "thread_id": thread_id
                 .as_deref()
@@ -2254,7 +2285,9 @@ async fn terminal_open(
     );
 
     let preserve_coordination_session =
-        request.preserve_coordination_session.unwrap_or(false) && !plain_shell && !fresh_session;
+        request.preserve_coordination_session.unwrap_or(false)
+            && !fresh_session
+            && session_mode.should_prepare_coordination();
     close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
@@ -2309,7 +2342,6 @@ async fn terminal_open(
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
     let (command_candidates, args, label) = if is_prewarm_pty || plain_shell {
         (Vec::new(), Vec::new(), "Prepared PTY".to_string())
     } else {
@@ -2322,15 +2354,30 @@ async fn terminal_open(
     });
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
-    if plain_shell {
-    } else if !is_prewarm_pty {
-        let coordination_working_directory = workspace_coordination_root_for_terminal(
+    if session_mode == TerminalSessionMode::DirectEdit {
+        let direct_edit_root = workspace_direct_edit_root_for_terminal(
             &working_directory,
             requested_project_root.as_deref(),
             requested_mount_id.as_deref(),
         )?;
+        terminal_project_root = direct_edit_root.clone();
+        process_working_directory = workspace_path_for_process(&direct_edit_root);
+    }
+    if !is_prewarm_pty && session_mode.should_prepare_coordination() {
+        let coordination_working_directory = match session_mode {
+            TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal(
+                &working_directory,
+                requested_project_root.as_deref(),
+                requested_mount_id.as_deref(),
+            )?,
+            TerminalSessionMode::DirectEdit => terminal_project_root.clone(),
+            TerminalSessionMode::Activity | TerminalSessionMode::RemoteOps => working_directory.clone(),
+            TerminalSessionMode::Free => working_directory.clone(),
+        };
         terminal_project_root = coordination_working_directory.clone();
-        ensure_workspace_git_bootstrap_for_terminal(&coordination_working_directory).await?;
+        if session_mode.requires_managed_patch_worktree() {
+            ensure_workspace_git_bootstrap_for_terminal(&coordination_working_directory).await?;
+        }
 
         let coordination_pty_id = if fresh_session {
             format!("{pane_id}-fresh-{instance_id}")
@@ -2347,10 +2394,13 @@ async fn terminal_open(
             terminal_slot_key.clone(),
             workspace_id.clone(),
             workspace_name.clone(),
+            session_mode,
         )
         .await?;
         process_working_directory = prepared_working_directory;
-        launch_worktree = Some(worktree);
+        if context.worktree_id.is_some() {
+            launch_worktree = Some(worktree);
+        }
         coordination_context = Some(context);
     }
 
@@ -2365,7 +2415,19 @@ async fn terminal_open(
     let shell_pty = is_prewarm_pty || plain_shell;
     let warm_pty = if shell_pty {
         ensure_app_not_shutting_down("terminal open")?;
-        match create_warm_shell_pty_in_directory(size, &process_working_directory) {
+        let mut coordination_env_vars = terminal_coordination
+            .as_ref()
+            .map(|coordination| coordination.env_vars.clone())
+            .unwrap_or_default();
+        if terminal_coordination.is_some() {
+            coordination_env_vars
+                .extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
+        }
+        match create_warm_shell_pty_in_directory_with_env(
+            size,
+            &process_working_directory,
+            &coordination_env_vars,
+        ) {
             Ok(warm_pty) => warm_pty,
             Err(error) => {
                 return Err(error);
@@ -2461,6 +2523,7 @@ async fn terminal_open(
         process_working_directory.clone(),
         agent_started,
         terminal_coordination.clone(),
+        session_mode,
         terminal_metadata,
     );
 
@@ -2510,6 +2573,8 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
             "plain_shell": plain_shell,
             "rows": size.rows,
+            "completion_mode": session_mode.completion_mode(),
+            "session_mode": session_mode.as_str(),
             "shell_pty": shell_pty,
         }),
     );
@@ -2525,6 +2590,8 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
             "plain_shell": plain_shell,
             "rows": size.rows,
+            "completion_mode": session_mode.completion_mode(),
+            "session_mode": session_mode.as_str(),
             "shell_pty": shell_pty,
         }),
     );
@@ -2542,6 +2609,8 @@ async fn terminal_open(
             "plain_shell": plain_shell,
             "pty_backend": if cfg!(windows) { "conpty" } else { "native" },
             "rows": size.rows,
+            "completion_mode": session_mode.completion_mode(),
+            "session_mode": session_mode.as_str(),
             "shell_pty": shell_pty,
             "term": TERMINAL_EMULATION_TERM,
             "term_program": TERMINAL_EMULATION_PROGRAM,
@@ -2598,6 +2667,8 @@ async fn terminal_open(
                     .as_ref()
                     .map(|_| "worktree_only".to_string())
             }),
+        session_mode: session_mode.as_str().to_string(),
+        file_authority: session_mode.file_authority().to_string(),
     })
 }
 
@@ -2744,7 +2815,7 @@ async fn terminal_start_agent(
     else {
         return Err("Terminal session is not running.".to_string());
     };
-    if instance.coordination.is_none() {
+    if instance.coordination.is_none() && instance.session_mode.should_prepare_coordination() {
         return Err(
             "Deferred agent start is blocked because this terminal has no coordination session."
                 .to_string(),
@@ -2904,7 +2975,7 @@ async fn start_terminal_agent_in_prepared_pty(
         };
     }
 
-    if instance.coordination.is_none() {
+    if instance.coordination.is_none() && instance.session_mode.should_prepare_coordination() {
         return TerminalStartAgentPaneResult {
             pane_id,
             instance_id: Some(instance.id),
@@ -5442,6 +5513,7 @@ async fn terminal_resume_parked_prompt_once(
                 terminal_instance_id,
                 working_directory,
                 coordination,
+                TerminalSessionMode::ManagedPatch,
                 local_task_id,
                 local_task_title,
                 prompt_for_cloud,
@@ -6034,6 +6106,7 @@ async fn terminal_write_inner(
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
             let coordination = instance.coordination.clone();
+            let session_mode = instance.session_mode;
             let terminal_instance_id = instance.id;
             let active_task = instance.active_task.lock().await.clone();
             let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
@@ -6058,6 +6131,7 @@ async fn terminal_write_inner(
                     terminal_instance_id,
                     working_directory,
                     coordination,
+                    session_mode,
                     local_task_id,
                     local_task_title,
                     prompt_for_cloud,
@@ -6197,6 +6271,7 @@ async fn terminal_write_inner(
                 let pane_id_for_context = pane_id.clone();
                 let working_directory = instance.working_directory.as_ref().clone();
                 let coordination = instance.coordination.clone();
+                let session_mode = instance.session_mode;
                 let terminal_instance_id = instance.id;
                 let active_task = instance.active_task.lock().await.clone();
                 let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
@@ -6220,6 +6295,7 @@ async fn terminal_write_inner(
                         terminal_instance_id,
                         working_directory,
                         coordination,
+                        session_mode,
                         local_task_id,
                         local_task_title,
                         event_prompt,
@@ -7063,6 +7139,100 @@ mod terminal_tests {
             session_id,
             terminal_launch_epoch: None,
             env_vars: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_session_mode_defaults_aliases_and_authority_are_stable() {
+        assert_eq!(
+            TerminalSessionMode::from_request(None, TerminalSessionMode::Free).unwrap(),
+            TerminalSessionMode::Free
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("patch-mode"), TerminalSessionMode::Free)
+                .unwrap(),
+            TerminalSessionMode::ManagedPatch
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("worktree"), TerminalSessionMode::Free)
+                .unwrap(),
+            TerminalSessionMode::ManagedPatch
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("direct"), TerminalSessionMode::ManagedPatch)
+                .unwrap(),
+            TerminalSessionMode::DirectEdit
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("free-terminal"), TerminalSessionMode::ManagedPatch)
+                .unwrap(),
+            TerminalSessionMode::Free
+        );
+        assert_eq!(
+            TerminalSessionMode::from_request(Some("ssh"), TerminalSessionMode::ManagedPatch)
+                .unwrap(),
+            TerminalSessionMode::RemoteOps
+        );
+
+        let invalid =
+            TerminalSessionMode::from_request(Some("root-sync-everything"), TerminalSessionMode::Free)
+                .unwrap_err();
+        assert!(invalid.contains("managed_patch"));
+
+        assert_eq!(
+            TerminalSessionMode::ManagedPatch.file_authority(),
+            "git_worktree_patch"
+        );
+        assert_eq!(
+            TerminalSessionMode::DirectEdit.file_authority(),
+            "bounded_direct_edit"
+        );
+        assert_eq!(TerminalSessionMode::Activity.file_authority(), "none");
+        assert_eq!(
+            TerminalSessionMode::Free.file_authority(),
+            "external_unmanaged"
+        );
+        assert_eq!(
+            TerminalSessionMode::RemoteOps.file_authority(),
+            "remote_unmanaged"
+        );
+    }
+
+    #[test]
+    fn non_free_modes_prepare_coordination_but_only_managed_patch_refreshes_context_pack() {
+        let modes = [
+            TerminalSessionMode::ManagedPatch,
+            TerminalSessionMode::DirectEdit,
+            TerminalSessionMode::Activity,
+            TerminalSessionMode::Free,
+            TerminalSessionMode::RemoteOps,
+        ];
+
+        for mode in modes {
+            assert_eq!(
+                mode.should_prepare_coordination(),
+                mode != TerminalSessionMode::Free,
+                "{mode:?} coordination gate changed"
+            );
+            assert_eq!(
+                mode.requires_managed_patch_worktree(),
+                mode == TerminalSessionMode::ManagedPatch,
+                "{mode:?} worktree gate changed"
+            );
+            assert_eq!(
+                mode.should_request_cloud_context_pack(),
+                mode == TerminalSessionMode::ManagedPatch,
+                "{mode:?} cloud context-pack gate changed"
+            );
+            assert_eq!(
+                mode.completion_mode(),
+                if mode == TerminalSessionMode::ManagedPatch {
+                    "submit_patch"
+                } else {
+                    "complete_task"
+                },
+                "{mode:?} completion mode changed"
+            );
         }
     }
 

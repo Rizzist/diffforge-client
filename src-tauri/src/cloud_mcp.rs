@@ -123,6 +123,7 @@ struct CloudMcpTerminalContextState {
     thread_id: Option<String>,
     workspace_id: String,
     workspace_name: String,
+    session_mode: String,
     created_ms: u64,
     last_changed_hash: String,
     last_checkpoint_ms: u64,
@@ -5489,6 +5490,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
     instance_id: u64,
     coordination: Option<&TerminalCoordinationSession>,
     local_task_id: Option<&str>,
+    session_mode: Option<&str>,
     reason: &str,
 ) {
     let claimed_paths = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
@@ -5509,6 +5511,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
         "current_prompt": current_prompt,
         "progress_summary": progress_summary,
         "task_id": local_task_id,
+        "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
         "claimed_paths": claimed_paths,
         "workspace_root": workspace_path_display(working_directory),
         "terminal_id": pane_id,
@@ -5523,6 +5526,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
             "terminal_instance_id": instance_id,
             "workspace_root": workspace_path_display(working_directory),
             "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+            "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
             "local_coordination_task_id": local_task_id,
             "coordination_task_id": local_task_id,
             "local_lease_file_evidence": has_claimed_paths,
@@ -5891,6 +5895,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
         instance_id,
         coordination,
         local_task_id,
+        Some(if coordination.is_some() { "managed_patch" } else { "free" }),
         "terminal_task_lifecycle",
     )
     .await;
@@ -6144,6 +6149,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         instance_id,
         coordination,
         local_task_id,
+        Some(close_context.session_mode.as_str()),
         reason,
     )
     .await;
@@ -6290,6 +6296,7 @@ async fn cloud_mcp_observe_terminal_output(
                     entry.agent_id.clone(),
                     entry.lane.clone(),
                     entry.local_task_id.clone(),
+                    entry.session_mode.clone(),
                     brief,
                     entry.working_directory.clone(),
                 ))
@@ -6316,6 +6323,7 @@ async fn cloud_mcp_observe_terminal_output(
                     entry.thread_id.clone(),
                     entry.workspace_id.clone(),
                     entry.workspace_name.clone(),
+                    entry.session_mode.clone(),
                 ))
             } else {
                 None
@@ -6357,7 +6365,9 @@ async fn cloud_mcp_observe_terminal_output(
         }),
     );
 
-    if let Some((repo_id, agent_id, lane, local_task_id, brief, working_directory)) = work_update {
+    if let Some((repo_id, agent_id, lane, local_task_id, session_mode, brief, working_directory)) =
+        work_update
+    {
         cloud_mcp_sync_terminal_agent_status(
             &state,
             &repo_id,
@@ -6371,6 +6381,7 @@ async fn cloud_mcp_observe_terminal_output(
             instance_id,
             None,
             local_task_id.as_deref(),
+            Some(session_mode.as_str()),
             "terminal_status",
         )
         .await;
@@ -6391,6 +6402,7 @@ async fn cloud_mcp_observe_terminal_output(
         thread_id,
         workspace_id,
         _workspace_name,
+        session_mode,
     )) = completion
     else {
         return;
@@ -6406,6 +6418,7 @@ async fn cloud_mcp_observe_terminal_output(
             "prompt_event_id": prompt_event_id.clone(),
             "prompt_event_submitted_at": prompt_event_submitted_at.clone(),
             "repo_id": repo_id.clone(),
+            "session_mode": session_mode.clone(),
             "status_truth": "idle_or_prompt_ready",
             "thread_id": thread_id.clone(),
             "workspace_id": workspace_id.clone(),
@@ -6431,6 +6444,37 @@ async fn cloud_mcp_observe_terminal_output(
                 "workspace_id": workspace_id.clone(),
             }),
         );
+    }
+    if session_mode != TerminalSessionMode::ManagedPatch.as_str() {
+        let brief = if work_brief.trim().is_empty() {
+            "Terminal activity is idle.".to_string()
+        } else {
+            format!(
+                "Terminal activity ready: {}",
+                cloud_mcp_work_subject(&work_brief)
+            )
+        };
+        cloud_mcp_sync_terminal_agent_status(
+            &state,
+            &repo_id,
+            &agent_id,
+            &lane,
+            "inactive",
+            None,
+            &brief,
+            &working_directory,
+            pane_id,
+            instance_id,
+            None,
+            local_task_id.as_deref(),
+            Some(session_mode.as_str()),
+            "terminal_unmanaged_prompt_ready",
+        )
+        .await;
+
+        let mut runtime = state.inner.lock().await;
+        runtime.terminal_contexts.remove(&terminal_key);
+        return;
     }
     let scan_root = working_directory.clone();
     let changed_files =
@@ -6474,6 +6518,7 @@ async fn cloud_mcp_observe_terminal_output(
         instance_id,
         None,
         local_task_id.as_deref(),
+        Some(session_mode.as_str()),
         "terminal_prompt_ready",
     )
     .await;
@@ -6499,6 +6544,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
     instance_id: u64,
     working_directory: PathBuf,
     coordination: Option<TerminalCoordinationSession>,
+    session_mode: TerminalSessionMode,
     local_task_id: Option<String>,
     local_task_title: Option<String>,
     prompt: String,
@@ -6538,6 +6584,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 thread_id: prompt_metadata.thread_id.clone(),
                 workspace_id: prompt_metadata.workspace_id.clone(),
                 workspace_name: prompt_metadata.workspace_name.clone(),
+                session_mode: session_mode.as_str().to_string(),
                 created_ms: cloud_mcp_now_ms(),
                 last_changed_hash: String::new(),
                 last_checkpoint_ms: 0,
@@ -6589,6 +6636,8 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "task_id": local_task_id.clone(),
         "run_id": local_task_id.clone(),
         "prompt": prompt,
+        "session_mode": session_mode.as_str(),
+        "file_authority": session_mode.file_authority(),
         "workspace_root": workspace_path_display(&working_directory),
         "coordination": coordination.as_ref().map(|coordination| json!({
             "agent_id": coordination.agent_id.clone(),
@@ -6610,15 +6659,48 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "terminal-agent",
         "starting",
         Some(payload["prompt"].as_str().unwrap_or_default()),
-        "Terminal prompt submitted; preparing Spec Graph context.",
+        if session_mode.should_request_cloud_context_pack() {
+            "Terminal prompt submitted; preparing Spec Graph context."
+        } else {
+            "Terminal prompt submitted without managed patch coordination."
+        },
         &working_directory,
         &pane_id,
         instance_id,
         coordination.as_ref(),
         local_task_id.as_deref(),
+        Some(session_mode.as_str()),
         "terminal_prompt_submitted",
     )
     .await;
+
+    if !session_mode.should_request_cloud_context_pack() {
+        let lane = format!("terminal-{}", session_mode.as_str());
+        {
+            let mut runtime = state.inner.lock().await;
+            if let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) {
+                entry.lane = lane.clone();
+            }
+        }
+        cloud_mcp_sync_terminal_agent_status(
+            &state,
+            &repo_id,
+            &agent_id,
+            &lane,
+            "active",
+            payload["prompt"].as_str(),
+            "Terminal activity is running outside managed patch mode.",
+            &working_directory,
+            &pane_id,
+            instance_id,
+            coordination.as_ref(),
+            local_task_id.as_deref(),
+            Some(session_mode.as_str()),
+            "terminal_unmanaged_context_ready",
+        )
+        .await;
+        return;
+    }
 
     match cloud_mcp_post_json_endpoint(&state, "/v1/context/pack", &payload).await {
         Ok(response) => {
@@ -6668,6 +6750,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 instance_id,
                 coordination.as_ref(),
                 local_task_id.as_deref(),
+                Some(session_mode.as_str()),
                 "terminal_context_ready",
             )
             .await;
@@ -6729,12 +6812,18 @@ async fn cloud_mcp_track_terminal_file_changes(
 ) {
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_secs(8)).await;
-        if let Some((local_task_id, work_brief)) = {
+        if let Some((local_task_id, work_brief, session_mode)) = {
             let runtime = state.inner.lock().await;
             runtime
                 .terminal_contexts
                 .get(&terminal_key)
-                .map(|entry| (entry.local_task_id.clone(), entry.work_brief.clone()))
+                .map(|entry| {
+                    (
+                        entry.local_task_id.clone(),
+                        entry.work_brief.clone(),
+                        entry.session_mode.clone(),
+                    )
+                })
         } {
             let heartbeat_brief = if work_brief.trim().is_empty() {
                 "Terminal task is active.".to_string()
@@ -6754,6 +6843,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                 instance_id,
                 coordination.as_ref(),
                 local_task_id.as_deref(),
+                Some(session_mode.as_str()),
                 "rust_terminal_activity_watch",
             )
             .await;
@@ -6887,6 +6977,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                 instance_id,
                 coordination.as_ref(),
                 Some(local_task_id_for_scope.as_str()),
+                Some("managed_patch"),
                 "stable_file_changes_ready",
             )
             .await;
@@ -12356,6 +12447,219 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     }
 }
 
+pub(crate) fn cloud_mcp_forward_agent_complete_task(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    task_id: Option<&str>,
+    lane: Option<&str>,
+    summary: Option<&str>,
+    local_task_status: Option<&str>,
+    session_mode: Option<&str>,
+    file_authority: Option<&str>,
+    enforcement_mode: Option<&str>,
+    completion_mode: Option<&str>,
+    complete_result: &Value,
+) -> Result<Value, String> {
+    let active_task_id = task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "complete_task Cloud sync requires the task_id returned by start_task.".to_string()
+        })?;
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = cloud_mcp_base_url();
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let task_status = local_task_status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("done");
+    let summary_text = summary.unwrap_or("Task completed through the local coordination kernel.");
+    let session_mode_text = session_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("activity");
+    let file_authority_text = file_authority
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let enforcement_mode_text = enforcement_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("coordination_only");
+    let completion_mode_text = completion_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("complete_task");
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.complete_task"),
+    );
+    metadata.insert("complete_result".to_string(), complete_result.clone());
+    metadata.insert("cloud_task_id".to_string(), json!(active_task_id));
+    metadata.insert("coordination_task_id".to_string(), json!(active_task_id));
+    metadata.insert(
+        "local_coordination_task_id".to_string(),
+        json!(active_task_id),
+    );
+    metadata.insert("session_mode".to_string(), json!(session_mode_text));
+    metadata.insert("sessionMode".to_string(), json!(session_mode_text));
+    metadata.insert("file_authority".to_string(), json!(file_authority_text));
+    metadata.insert("fileAuthority".to_string(), json!(file_authority_text));
+    metadata.insert("enforcement_mode".to_string(), json!(enforcement_mode_text));
+    metadata.insert("enforcementMode".to_string(), json!(enforcement_mode_text));
+    metadata.insert("completion_mode".to_string(), json!(completion_mode_text));
+    metadata.insert("completionMode".to_string(), json!(completion_mode_text));
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-agent-complete-task"),
+    );
+    arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
+    arguments.insert("status".to_string(), json!(task_status));
+    arguments.insert("task_status".to_string(), json!(task_status));
+    arguments.insert("summary".to_string(), json!(summary_text));
+    arguments.insert("brief".to_string(), json!(summary_text));
+    arguments.insert("metadata".to_string(), Value::Object(metadata));
+    arguments.insert("task_id".to_string(), json!(active_task_id));
+    arguments.insert("run_id".to_string(), json!(active_task_id));
+    arguments.insert("session_mode".to_string(), json!(session_mode_text));
+    arguments.insert("file_authority".to_string(), json!(file_authority_text));
+    arguments.insert(
+        "enforcement_mode".to_string(),
+        json!(enforcement_mode_text),
+    );
+    arguments.insert("completion_mode".to_string(), json!(completion_mode_text));
+    arguments.insert("record_spec_activity".to_string(), json!(false));
+    if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("lane".to_string(), json!(lane));
+    }
+    if let Some(repo_id) = identity.repo_id.as_deref() {
+        arguments.insert("repo_id".to_string(), json!(repo_id));
+    }
+    if let Some(repo_path) = identity.repo_path.as_ref() {
+        let repo_path = repo_path.to_string_lossy().to_string();
+        arguments.insert("repo_path".to_string(), json!(repo_path.clone()));
+        arguments.insert("workspace_root".to_string(), json!(repo_path));
+    }
+    if let Some(workspace_id) = identity.workspace_id.as_deref() {
+        arguments.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    if let Some(agent_id) = identity.cloud_agent_id() {
+        arguments.insert("agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("self_agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("current_agent_id".to_string(), json!(agent_id));
+    }
+    if let Some(session_id) = identity.session_id.as_deref() {
+        arguments.insert("session_id".to_string(), json!(session_id));
+    }
+
+    let request = json!({
+        "event_kind": "task_completed",
+        "payload": Value::Object(arguments),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let should_sync_filetree = file_authority_text == "bounded_direct_edit"
+        && matches!(task_status, "done" | "completed" | "merged");
+    let filetree_sync = if should_sync_filetree {
+        if let (Some(repo_id), Some(repo_path)) =
+            (identity.repo_id.as_deref(), identity.repo_path.as_ref())
+        {
+            match cloud_mcp_proxy_push_current_filetree_snapshot(
+                &base_url,
+                repo_id,
+                repo_path,
+                identity.workspace_id.as_deref(),
+                identity.workspace_name.as_deref(),
+                "direct_edit_complete_filetree_resync",
+            ) {
+                Ok(response) => json!({"ok": true, "response": response}),
+                Err(error) => json!({"ok": false, "error": error}),
+            }
+        } else {
+            json!({"ok": false, "skipped": true, "reason": "missing_repo_for_filetree_resync"})
+        }
+    } else {
+        json!({"ok": false, "skipped": true, "reason": "non_file_authority_completion"})
+    };
+    identity.log(
+        "cloud_mcp.agent_complete_task.start",
+        "complete_task",
+        json!({
+            "activity": "agent complete_task",
+            "baseUrl": base_url,
+            "filetreeSync": filetree_sync,
+            "taskStatus": task_status,
+            "taskId": active_task_id,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
+        Ok(response) => {
+            identity.log(
+                "cloud_mcp.agent_complete_task.done",
+                "complete_task",
+                json!({
+                    "activity": "agent complete_task synced",
+                    "baseUrl": base_url,
+                    "filetreeSync": filetree_sync,
+                }),
+            );
+            let mut parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            if let Some(object) = parsed.as_object_mut() {
+                object.insert("filetree_sync".to_string(), filetree_sync);
+            }
+            Ok(parsed)
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.agent_complete_task.error",
+                "complete_task",
+                json!({
+                    "activity": "agent complete_task sync failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
 fn cloud_mcp_submit_patch_changed_file_paths(submit_result: &Value) -> Vec<String> {
     fn collect_from_array(paths: &mut Vec<String>, value: Option<&Value>) {
         if let Some(values) = value.and_then(Value::as_array) {
@@ -12678,6 +12982,10 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     lane: Option<&str>,
     task_title: Option<&str>,
     task_body: Option<&str>,
+    session_mode: Option<&str>,
+    file_authority: Option<&str>,
+    enforcement_mode: Option<&str>,
+    completion_mode: Option<&str>,
     plan: &str,
 ) -> Result<Value, String> {
     let plan = cloud_mcp_clean_prompt_text(plan);
@@ -12755,6 +13063,22 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
+    if let Some(session_mode) = session_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert("session_mode".to_string(), json!(session_mode));
+        metadata.insert("sessionMode".to_string(), json!(session_mode));
+    }
+    if let Some(file_authority) = file_authority.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert("file_authority".to_string(), json!(file_authority));
+        metadata.insert("fileAuthority".to_string(), json!(file_authority));
+    }
+    if let Some(enforcement_mode) = enforcement_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert("enforcement_mode".to_string(), json!(enforcement_mode));
+        metadata.insert("enforcementMode".to_string(), json!(enforcement_mode));
+    }
+    if let Some(completion_mode) = completion_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        metadata.insert("completion_mode".to_string(), json!(completion_mode));
+        metadata.insert("completionMode".to_string(), json!(completion_mode));
+    }
 
     let mut arguments = serde_json::Map::new();
     arguments.insert(
@@ -12772,6 +13096,18 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     if let Some(agent_kind) = agent_kind.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("agent_kind".to_string(), json!(agent_kind));
         arguments.insert("coding_agent".to_string(), json!(agent_kind));
+    }
+    if let Some(session_mode) = session_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("session_mode".to_string(), json!(session_mode));
+    }
+    if let Some(file_authority) = file_authority.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("file_authority".to_string(), json!(file_authority));
+    }
+    if let Some(enforcement_mode) = enforcement_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("enforcement_mode".to_string(), json!(enforcement_mode));
+    }
+    if let Some(completion_mode) = completion_mode.map(str::trim).filter(|value| !value.is_empty()) {
+        arguments.insert("completion_mode".to_string(), json!(completion_mode));
     }
     if let Some(task_body) = task_body.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("expected_output".to_string(), json!(task_body));

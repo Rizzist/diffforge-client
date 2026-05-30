@@ -1876,7 +1876,9 @@ function normalizeCoordination(value) {
       agentId: "",
       agentSlotId: "",
       coordinationMode: "",
+      fileAuthority: "",
       sessionId: "",
+      sessionMode: "",
       worktreePath: "",
     };
   }
@@ -1886,7 +1888,9 @@ function normalizeCoordination(value) {
     agentId: cleanText(value.agentId),
     agentSlotId: cleanText(value.agentSlotId),
     coordinationMode: cleanText(value.coordinationMode),
+    fileAuthority: cleanText(value.fileAuthority),
     sessionId: cleanText(value.sessionId),
+    sessionMode: cleanText(value.sessionMode),
     worktreePath: cleanText(value.worktreePath),
   };
 }
@@ -1938,8 +1942,10 @@ function normalizeActiveTerminal(value) {
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
     ...promptingUserFields(value),
+    fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
+    sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
     terminalIndex,
     threadId: cleanText(value.threadId),
     updatedAt: cleanText(value.updatedAt, nowIso()),
@@ -2878,7 +2884,9 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     agentId: cleanText(event.coordinationAgentId || event.agentCoordinationId, existing.coordination?.agentId),
     agentSlotId: cleanText(event.agentSlotId, existing.coordination?.agentSlotId),
     coordinationMode: cleanText(event.coordinationMode, existing.coordination?.coordinationMode),
+    fileAuthority: cleanText(event.fileAuthority, existing.coordination?.fileAuthority),
     sessionId: cleanText(event.sessionId, existing.coordination?.sessionId),
+    sessionMode: cleanText(event.sessionMode, existing.coordination?.sessionMode),
     worktreePath: cleanText(event.worktreePath, activeTerminal?.worktreePath || existing.coordination?.worktreePath),
   };
   const existingProviderBindings = normalizeProviderBindings(

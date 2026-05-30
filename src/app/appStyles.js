@@ -4540,6 +4540,54 @@ export const TerminalAgentDot = styled.span`
   }
 `;
 
+export const TerminalModeBadge = styled.span`
+  display: inline-flex;
+  max-width: 74px;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 6px;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 999px;
+  color: rgba(235, 241, 250, 0.86);
+  background: rgba(10, 14, 22, 0.36);
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-mode="managed_patch"] {
+    border-color: rgba(98, 160, 255, 0.28);
+    color: #cfe1ff;
+    background: rgba(98, 160, 255, 0.13);
+  }
+
+  &[data-mode="direct_edit"] {
+    border-color: rgba(250, 204, 21, 0.3);
+    color: #fde68a;
+    background: rgba(161, 98, 7, 0.18);
+  }
+
+  &[data-mode="activity"] {
+    border-color: rgba(45, 212, 191, 0.28);
+    color: #b7f7ef;
+    background: rgba(20, 184, 166, 0.12);
+  }
+
+  &[data-mode="remote_ops"] {
+    border-color: rgba(216, 180, 254, 0.28);
+    color: #ead8ff;
+    background: rgba(147, 51, 234, 0.13);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(30, 41, 59, 0.78);
+    background: rgba(255, 255, 255, 0.72);
+  }
+`;
+
 export const TerminalProjectBadge = styled.div`
   display: grid;
   min-width: 120px;

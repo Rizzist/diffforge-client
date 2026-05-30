@@ -671,6 +671,7 @@ struct TerminalInstance {
     input_queue: Arc<Mutex<()>>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
+    session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
 }
 
@@ -704,6 +705,7 @@ struct TerminalCloudMcpCloseContext {
     working_directory: Arc<PathBuf>,
     active_task: Arc<Mutex<Option<TerminalActiveTask>>>,
     coordination: Option<TerminalCoordinationSession>,
+    session_mode: TerminalSessionMode,
 }
 
 impl TerminalCloudMcpCloseContext {
@@ -712,6 +714,7 @@ impl TerminalCloudMcpCloseContext {
             working_directory: Arc::clone(&instance.working_directory),
             active_task: Arc::clone(&instance.active_task),
             coordination: instance.coordination.clone(),
+            session_mode: instance.session_mode,
         }
     }
 }
@@ -726,6 +729,89 @@ struct TerminalCoordinationSession {
     session_id: String,
     terminal_launch_epoch: Option<String>,
     env_vars: Vec<(String, String)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalSessionMode {
+    ManagedPatch,
+    DirectEdit,
+    Activity,
+    Free,
+    RemoteOps,
+}
+
+impl TerminalSessionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            TerminalSessionMode::ManagedPatch => "managed_patch",
+            TerminalSessionMode::DirectEdit => "direct_edit",
+            TerminalSessionMode::Activity => "activity",
+            TerminalSessionMode::Free => "free",
+            TerminalSessionMode::RemoteOps => "remote_ops",
+        }
+    }
+
+    fn file_authority(self) -> &'static str {
+        match self {
+            TerminalSessionMode::ManagedPatch => "git_worktree_patch",
+            TerminalSessionMode::DirectEdit => "bounded_direct_edit",
+            TerminalSessionMode::Activity => "none",
+            TerminalSessionMode::Free => "external_unmanaged",
+            TerminalSessionMode::RemoteOps => "remote_unmanaged",
+        }
+    }
+
+    fn coordination_enforcement_mode(self) -> &'static str {
+        match self {
+            TerminalSessionMode::ManagedPatch => "worktree_required",
+            TerminalSessionMode::DirectEdit => "bounded_direct_edit",
+            TerminalSessionMode::Activity => "activity_only",
+            TerminalSessionMode::Free => "external_unmanaged",
+            TerminalSessionMode::RemoteOps => "remote_unmanaged",
+        }
+    }
+
+    fn completion_mode(self) -> &'static str {
+        match self {
+            TerminalSessionMode::ManagedPatch => "submit_patch",
+            TerminalSessionMode::DirectEdit
+            | TerminalSessionMode::Activity
+            | TerminalSessionMode::Free
+            | TerminalSessionMode::RemoteOps => "complete_task",
+        }
+    }
+
+    fn should_prepare_coordination(self) -> bool {
+        !matches!(self, TerminalSessionMode::Free)
+    }
+
+    fn requires_managed_patch_worktree(self) -> bool {
+        matches!(self, TerminalSessionMode::ManagedPatch)
+    }
+
+    fn should_request_cloud_context_pack(self) -> bool {
+        matches!(self, TerminalSessionMode::ManagedPatch)
+    }
+
+    fn from_request(
+        value: Option<&str>,
+        default_mode: TerminalSessionMode,
+    ) -> Result<Self, String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(default_mode);
+        };
+
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "managed" | "managed_patch" | "patch" | "patch_mode" | "worktree" => {
+                Ok(TerminalSessionMode::ManagedPatch)
+            }
+            "direct" | "direct_edit" | "direct_project" => Ok(TerminalSessionMode::DirectEdit),
+            "activity" | "activity_mode" => Ok(TerminalSessionMode::Activity),
+            "free" | "free_terminal" | "unmanaged" => Ok(TerminalSessionMode::Free),
+            "remote" | "remote_ops" | "ssh" => Ok(TerminalSessionMode::RemoteOps),
+            _ => Err("Terminal session mode must be one of managed_patch, direct_edit, activity, free, or remote_ops.".to_string()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -797,6 +883,7 @@ impl TerminalInstance {
         working_directory: PathBuf,
         agent_started: bool,
         coordination: Option<TerminalCoordinationSession>,
+        session_mode: TerminalSessionMode,
         metadata: TerminalInstanceMetadata,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
@@ -820,6 +907,7 @@ impl TerminalInstance {
                 input_queue: Arc::new(Mutex::new(())),
                 active_task: Arc::new(Mutex::new(None)),
                 coordination,
+                session_mode,
                 metadata,
             },
             reader,
@@ -1254,6 +1342,7 @@ struct TerminalOpenRequest {
     plain_shell: Option<bool>,
     fresh_session: Option<bool>,
     preserve_coordination_session: Option<bool>,
+    session_mode: Option<String>,
     slot_key: Option<String>,
     terminal_index: Option<u16>,
     thread_id: Option<String>,
@@ -1309,6 +1398,8 @@ struct TerminalOpenResult {
     slot_key: Option<String>,
     thread_id: Option<String>,
     coordination_mode: Option<String>,
+    session_mode: String,
+    file_authority: String,
 }
 
 #[derive(Serialize, Clone)]

@@ -1325,9 +1325,20 @@ fn create_warm_shell_pty_in_directory(
     size: PtySize,
     working_directory: &Path,
 ) -> Result<WarmPty, String> {
+    create_warm_shell_pty_in_directory_with_env(size, working_directory, &[])
+}
+
+fn create_warm_shell_pty_in_directory_with_env(
+    size: PtySize,
+    working_directory: &Path,
+    env_vars: &[(String, String)],
+) -> Result<WarmPty, String> {
     let mut command = terminal_interactive_shell_command();
 
     command.cwd(working_directory);
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
 
     spawn_terminal_pty(size, command, "warm terminal shell")
 }

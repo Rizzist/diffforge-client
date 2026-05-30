@@ -50,6 +50,7 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
+    "complete_task",
     "submit_patch",
     "submit_patch_status",
 ];
@@ -58,6 +59,7 @@ const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
+    "complete_task",
     "submit_patch",
     "submit_patch_status",
 ];
@@ -78,6 +80,7 @@ struct SessionSlotOptions {
     prepared_worktree_only: bool,
     replace_active_session: bool,
     terminal_launch_epoch: Option<String>,
+    enforcement_mode: Option<String>,
 }
 
 impl Default for SessionSlotOptions {
@@ -87,6 +90,7 @@ impl Default for SessionSlotOptions {
             prepared_worktree_only: false,
             replace_active_session: false,
             terminal_launch_epoch: None,
+            enforcement_mode: None,
         }
     }
 }
@@ -3168,6 +3172,95 @@ impl CoordinationKernel {
         self.finish_transaction(result, "mark terminal task stopped")
     }
 
+    pub fn complete_terminal_task(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        status: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Value, String> {
+        let normalized_status = status
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("done")
+            .to_ascii_lowercase();
+        let status = match normalized_status.as_str() {
+            "done" | "completed" | "skipped" => normalized_status.as_str(),
+            _ => {
+                return Err("complete_task status must be done, completed, or skipped.".to_string())
+            }
+        };
+        self.ensure_session_active(session_id, agent_id)?;
+        self.ensure_session_owns_task(session_id, task_id)?;
+        let task = self.query_one(
+            "SELECT status FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let task_status = task["status"].as_str().unwrap_or_default();
+        if !Self::task_status_allows_start_reuse(task_status) {
+            return Ok(api_error(
+                "task_not_active",
+                "Cannot complete a task that has already ended or submitted a patch.",
+                json!({"task_id": task_id, "status": task_status}),
+            ));
+        }
+
+        self.begin_immediate_transaction("complete terminal task")?;
+        let result = (|| -> Result<Value, String> {
+            let now = now_rfc3339();
+            self.conn
+                .execute(
+                    "UPDATE tasks
+                     SET status=?1,
+                         finished_at=COALESCE(finished_at, ?2),
+                         updated_at=?2
+                     WHERE id=?3 AND claimed_session_id=?4
+                       AND status NOT IN ('done', 'completed', 'merged', 'cancelled', 'interrupted', 'skipped', 'patch_submitted', 'resolved_patch_submitted')",
+                    params![status, now, task_id, session_id],
+                )
+                .map_err(|error| format!("Unable to mark task {status}: {error}"))?;
+            let cleared_session_task =
+                self.clear_session_task_if_current(session_id, task_id, &now)?;
+            let released_leases = self.release_active_leases_for_task_with_event(
+                task_id,
+                &format!("task_{status}"),
+                "task_leases_released_after_complete",
+            )?;
+            let event_id = self.emit_event(
+                "task_completed",
+                "agent",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "status": status,
+                    "summary": summary,
+                    "released_leases": released_leases,
+                    "cleared_session_task": cleared_session_task,
+                    "completion_mode": "complete_task",
+                }),
+            )?;
+            Ok(json!({
+                "event_id": event_id,
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "status": status,
+                "summary": summary,
+                "released_leases": released_leases,
+                "cleared_session_task": cleared_session_task,
+            }))
+        })();
+
+        self.finish_transaction(result, "complete terminal task")
+    }
+
     fn insert_task_dependency_checked(
         &self,
         task_id: &str,
@@ -4412,6 +4505,7 @@ impl CoordinationKernel {
         context_run_id: Option<&str>,
         context_role: Option<&str>,
         terminal_launch_epoch: Option<&str>,
+        enforcement_mode: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_or_create_agent_slot(slot_key, agent_name, agent_kind, role)?;
         let session = self.create_session_for_slot_with_options(
@@ -4426,6 +4520,10 @@ impl CoordinationKernel {
                 prepared_worktree_only: true,
                 replace_active_session: true,
                 terminal_launch_epoch: terminal_launch_epoch
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                enforcement_mode: enforcement_mode
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string),
@@ -4719,18 +4817,39 @@ impl CoordinationKernel {
 
         let id = uuid();
         let now = now_rfc3339();
-        let mut enforcement_mode = if write_enabled {
-            "worktree_required"
-        } else {
-            "read_only"
+        let requested_enforcement_mode = options
+            .enforcement_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(mode) = requested_enforcement_mode {
+            if !matches!(
+                mode,
+                "worktree_required"
+                    | "bounded_direct_edit"
+                    | "activity_only"
+                    | "remote_unmanaged"
+                    | "coordination_only"
+                    | "read_only"
+            ) {
+                return Err(format!(
+                    "Unknown terminal coordination enforcement mode: {mode}"
+                ));
+            }
         }
-        .to_string();
+        let mut enforcement_mode = requested_enforcement_mode
+            .unwrap_or(if write_enabled {
+                "worktree_required"
+            } else {
+                "read_only"
+            })
+            .to_string();
         let mut write_root = self.paths.repo_path.display().to_string();
         let mut worktree_id = None;
         let mut base_git_sha = None;
         let mut warnings = Vec::new();
 
-        if write_enabled {
+        if write_enabled && enforcement_mode == "worktree_required" {
             let worktree_result = if options.prepared_worktree_only {
                 match self.prepared_worktree_for_slot_with_telemetry(agent_slot_id, pty_id) {
                     Ok(worktree) => Ok(worktree),
@@ -4809,6 +4928,27 @@ impl CoordinationKernel {
                     )?;
                 }
             }
+        } else if write_enabled {
+            self.emit_event(
+                "session_write_root_assigned",
+                "agent",
+                agent_id,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: Some(agent_slot_id.to_string()),
+                    session_id: Some(id.clone()),
+                    task_id: task_id.map(str::to_string),
+                    context_run_id: context_run_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "slot_key": slot_key,
+                    "write_root": write_root,
+                    "enforcement_mode": enforcement_mode,
+                    "worktree_id": Value::Null,
+                    "worktree_required": false,
+                }),
+            )?;
         }
 
         self.conn
@@ -5021,6 +5161,7 @@ impl CoordinationKernel {
         context_run_id: Option<&str>,
         context_role: Option<&str>,
         terminal_launch_epoch: Option<&str>,
+        enforcement_mode: Option<&str>,
     ) -> Result<TerminalCoordinationContext, String> {
         let objective_key = require_workspace_objective_key(workspace_id)?;
         let _workspace_mcp =
@@ -5038,6 +5179,7 @@ impl CoordinationKernel {
             context_run_id,
             context_role,
             terminal_launch_epoch,
+            enforcement_mode,
         )?;
         let context = self.terminal_context_from_session(
             session,
@@ -17126,17 +17268,17 @@ impl CoordinationKernel {
             "session_heartbeat_recorded": heartbeat,
             "brief": brief["data"].clone(),
             "workflow": {
-                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "submit_patch", "submit_patch_status"],
+                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "complete_task", "submit_patch", "submit_patch_status"],
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
-                    "Use normal shell and edit tools inside COORDINATION_AGENT_BRANCH_ROOT.",
-                    "Submit the patch when finished; submit_patch returns a job id and submit_patch_status reports progress."
+                    "Use normal shell and edit tools inside the terminal's advertised write root.",
+                    "Managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
                 ],
                 "cloud_mcp": {
                     "mode": "automatic_rust_lifecycle",
-                    "agent_action_required": "use_cloud_returned_start_task_id_for_lease_checkpoint_and_submit",
+                    "agent_action_required": "use_cloud_returned_start_task_id_for_lease_checkpoint_submit_or_complete",
                     "note": "Diff Forge publishes context packs, task lifecycle, checkpoint summaries, and lane state through the app/kernel cloud sync path."
                 }
             }
@@ -17594,6 +17736,7 @@ impl CoordinationKernel {
             "start_task",
             "acquire_lease",
             "checkpoint",
+            "complete_task",
             "submit_patch",
             "submit_patch_status",
         ];
@@ -17674,9 +17817,9 @@ impl CoordinationKernel {
             } else if !missing_minimal_agent_tools.is_empty()
                 || mcp_tools.len() != minimal_agent_tools.len()
             {
-                "Agent MCP should expose only start_task, acquire_lease, checkpoint, submit_patch, and submit_patch_status."
+                "Agent MCP should expose only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status."
             } else {
-                "Agent MCP exposes only start_task, acquire_lease, checkpoint, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
+                "Agent MCP exposes only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
@@ -23557,6 +23700,7 @@ mod tests {
             "start_task",
             "acquire_lease",
             "checkpoint",
+            "complete_task",
             "submit_patch",
             "submit_patch_status",
         ] {
@@ -23588,6 +23732,7 @@ mod tests {
             "mcp__coordination-kernel__start_task",
             "mcp__coordination-kernel__acquire_lease",
             "mcp__coordination-kernel__checkpoint",
+            "mcp__coordination-kernel__complete_task",
             "mcp__coordination-kernel__submit_patch",
             "mcp__coordination-kernel__submit_patch_status",
             "mcp__workspace-mcp-gateway__workspace_mcp__sync_manifest",
@@ -23946,6 +24091,7 @@ enabled = true
                 "start_task",
                 "acquire_lease",
                 "checkpoint",
+                "complete_task",
                 "submit_patch",
                 "submit_patch_status"
             ]
@@ -24152,6 +24298,7 @@ enabled = true
                 None,
                 None,
                 Some("epoch-1"),
+                None,
             )
             .unwrap();
         let session_id = first["id"].as_str().unwrap().to_string();
@@ -24168,6 +24315,7 @@ enabled = true
                 None,
                 None,
                 Some("epoch-2"),
+                None,
             )
             .unwrap();
         assert_eq!(second["id"].as_str(), Some(session_id.as_str()));
@@ -25160,6 +25308,134 @@ enabled = true
             session["enforcementMode"].as_str(),
             Some("coordination_only")
         );
+    }
+
+    #[test]
+    fn no_git_direct_terminal_session_uses_bounded_direct_edit_without_worktree() {
+        let repo = temp_repo("direct_terminal_no_git");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Generic Shell",
+                "shell",
+                "1",
+                Some("pane-direct"),
+                Some("workspace-direct"),
+                Some("Direct Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-direct"),
+                Some("bounded_direct_edit"),
+            )
+            .unwrap();
+
+        assert_eq!(context.enforcement_mode, "bounded_direct_edit");
+        assert_eq!(context.file_authority(), "bounded_direct_edit");
+        assert_eq!(context.completion_mode(), "complete_task");
+        assert!(context.worktree_id.is_none());
+        assert!(context.worktree_path.is_none());
+        assert_eq!(
+            PathBuf::from(&context.write_root).canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
+        );
+        let env = context.env_vars();
+        assert!(env.contains(&(
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "bounded_direct_edit".to_string()
+        )));
+        assert!(env.contains(&(
+            "COORDINATION_COMPLETION_MODE".to_string(),
+            "complete_task".to_string()
+        )));
+    }
+
+    #[test]
+    fn activity_terminal_session_tracks_tasks_without_worktree_authority() {
+        let repo = temp_repo("activity_terminal_no_git");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Research",
+                "shell",
+                "research",
+                Some("pane-activity"),
+                Some("workspace-activity"),
+                Some("Activity Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-activity"),
+                Some("activity_only"),
+            )
+            .unwrap();
+
+        assert_eq!(context.enforcement_mode, "activity_only");
+        assert_eq!(context.file_authority(), "none");
+        assert_eq!(context.completion_mode(), "complete_task");
+        assert!(context.worktree_id.is_none());
+        assert!(context.worktree_path.is_none());
+    }
+
+    #[test]
+    fn complete_terminal_task_finishes_non_worktree_session_and_clears_task() {
+        let repo = temp_repo("complete_activity_terminal");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Research",
+                "shell",
+                "research",
+                Some("pane-complete"),
+                Some("workspace-complete"),
+                Some("Activity Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-complete"),
+                Some("activity_only"),
+            )
+            .unwrap();
+        let started = kernel
+            .start_task(
+                Some(context.agent_id.as_str()),
+                Some(context.session_id.as_str()),
+                Some("task-complete-activity"),
+                None,
+                Some("Research an operational task."),
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = started["data"]["task_id"].as_str().unwrap();
+
+        let completed = kernel
+            .complete_terminal_task(
+                task_id,
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+                Some("done"),
+                Some("Research finished."),
+            )
+            .unwrap();
+
+        assert_eq!(completed["status"].as_str(), Some("done"));
+        let task = kernel
+            .query_one(
+                "SELECT status FROM tasks WHERE id=?1",
+                &[&task_id],
+                "missing",
+            )
+            .unwrap();
+        assert_eq!(task["status"].as_str(), Some("done"));
+        let session = kernel
+            .query_one(
+                "SELECT task_id FROM agent_sessions WHERE id=?1",
+                &[&context.session_id],
+                "missing",
+            )
+            .unwrap();
+        assert!(session["task_id"].is_null());
     }
 
     #[test]

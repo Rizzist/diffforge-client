@@ -123,6 +123,7 @@ import {
   TerminalParkedCancelButton,
   TerminalRestartPill,
   TerminalAgentDot,
+  TerminalModeBadge,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -814,6 +815,18 @@ const TERMINAL_STARTUP_DEFAULT_MODELS = {
   claude: "sonnet",
   codex: "gpt-5.5",
 };
+const TERMINAL_SESSION_MODE_MANAGED_PATCH = "managed_patch";
+const TERMINAL_SESSION_MODE_DIRECT_EDIT = "direct_edit";
+const TERMINAL_SESSION_MODE_ACTIVITY = "activity";
+const TERMINAL_SESSION_MODE_FREE = "free";
+const TERMINAL_SESSION_MODE_REMOTE_OPS = "remote_ops";
+const TERMINAL_SESSION_MODE_LABELS = {
+  [TERMINAL_SESSION_MODE_MANAGED_PATCH]: "Patch",
+  [TERMINAL_SESSION_MODE_DIRECT_EDIT]: "Direct",
+  [TERMINAL_SESSION_MODE_ACTIVITY]: "Activity",
+  [TERMINAL_SESSION_MODE_FREE]: "Free",
+  [TERMINAL_SESSION_MODE_REMOTE_OPS]: "Remote",
+};
 const FORGE_LIGHT_THEME_ID = "light";
 const TERMINAL_DARK_THEME = {
   background: TERMINAL_THEME_BACKGROUND,
@@ -877,6 +890,45 @@ function getCurrentForgeThemeId() {
 
 function getTerminalThemeForForgeTheme(themeId = getCurrentForgeThemeId()) {
   return themeId === FORGE_LIGHT_THEME_ID ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME;
+}
+
+function normalizeTerminalSessionMode(value, fallback = TERMINAL_SESSION_MODE_FREE) {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+  if (
+    normalized === TERMINAL_SESSION_MODE_MANAGED_PATCH
+    || normalized === TERMINAL_SESSION_MODE_DIRECT_EDIT
+    || normalized === TERMINAL_SESSION_MODE_ACTIVITY
+    || normalized === TERMINAL_SESSION_MODE_FREE
+    || normalized === TERMINAL_SESSION_MODE_REMOTE_OPS
+  ) {
+    return normalized;
+  }
+  if (normalized === "managed" || normalized === "patch" || normalized === "worktree") {
+    return TERMINAL_SESSION_MODE_MANAGED_PATCH;
+  }
+  if (normalized === "direct") {
+    return TERMINAL_SESSION_MODE_DIRECT_EDIT;
+  }
+  if (normalized === "remote" || normalized === "ssh") {
+    return TERMINAL_SESSION_MODE_REMOTE_OPS;
+  }
+  return fallback;
+}
+
+function defaultTerminalSessionModeForRole(roleId, isPrewarm = false) {
+  const role = String(roleId || "").trim().toLowerCase();
+  if (isPrewarm || role === "generic" || role === "terminal" || role === "shell") {
+    return TERMINAL_SESSION_MODE_FREE;
+  }
+  return TERMINAL_SESSION_MODE_MANAGED_PATCH;
+}
+
+function getTerminalSessionModeLabel(mode) {
+  const normalized = normalizeTerminalSessionMode(mode, TERMINAL_SESSION_MODE_FREE);
+  return TERMINAL_SESSION_MODE_LABELS[normalized] || "Free";
 }
 
 function getTerminalStartupDefaultModel(agentKind) {
@@ -1231,6 +1283,16 @@ function WorkspaceTerminal({
   const terminalThreadSawAgentOutputRef = useRef(false);
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
+  const [terminalSessionMode, setTerminalSessionMode] = useState(terminalDefaultSessionMode);
+  const terminalSessionModeRef = useRef(terminalDefaultSessionMode);
+  const terminalSessionModeExplicitRef = useRef(false);
+  useEffect(() => {
+    if (!terminalLaunchInfo && !terminalSessionModeExplicitRef.current) {
+      terminalSessionModeRef.current = terminalDefaultSessionMode;
+      setTerminalSessionMode(terminalDefaultSessionMode);
+    }
+  }, [terminalDefaultSessionMode, terminalLaunchInfo]);
   const threadProviderBinding = getWorkspaceThreadProviderBinding(thread, terminalAgentKind);
   const threadProviderSessionId = threadProviderBinding?.nativeSessionId
     || (String(thread?.currentAgent || "").toLowerCase() === terminalAgentKind ? thread?.transcriptSessionId : "")
@@ -9971,6 +10033,12 @@ function WorkspaceTerminal({
         const openKind = isGenericTerminal || shouldPrewarmShell ? "prewarm-pty" : agent.id;
         const openProvider = isGenericTerminal || shouldPrewarmShell ? null : agent.id;
         let agentStartedInCurrentPty = isGenericTerminal || !shouldPrewarmShell;
+        const sessionModeForThisStart = normalizeTerminalSessionMode(
+          terminalSessionModeRef.current,
+          defaultTerminalSessionModeForRole(terminalRoleId, shouldPrewarmShell),
+        );
+        terminalSessionModeRef.current = sessionModeForThisStart;
+        setTerminalSessionMode(sessionModeForThisStart);
 
         startAgentInCurrentPty = async (reason = "agent_launch_ready", launchEpoch = agentLaunchEpochRef.current) => {
           if (isDisposed || !hasOpenPty || agentStartedInCurrentPty) {
@@ -10054,6 +10122,7 @@ function WorkspaceTerminal({
               model: startupThreadProviderModel,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
+              sessionMode: sessionModeForThisStart,
               projectRoot: projectRoot || "",
               mountId: mountId || "",
               slotKey: startupSlotKey,
@@ -10104,6 +10173,10 @@ function WorkspaceTerminal({
         hasOpenPty = true;
         startupControlReplyBridgeOpen = false;
         setTerminalLaunchInfo(openResult || null);
+        const openedSessionMode = normalizeTerminalSessionMode(openResult?.sessionMode, sessionModeForThisStart);
+        terminalSessionModeExplicitRef.current = false;
+        terminalSessionModeRef.current = openedSessionMode;
+        setTerminalSessionMode(openedSessionMode);
         terminalThreadSlotKeyRef.current = openResult?.slotKey || terminalThreadSlotKeyRef.current;
         logThreadBridgeDiagnostic("frontend.terminal_open.emit_opened_lifecycle", {
           agentId: agent?.id || terminalAgentKind,
@@ -10111,6 +10184,7 @@ function WorkspaceTerminal({
           instanceId: terminalInstanceId,
           paneId,
           preserveCoordinationForThisStart,
+          sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
           startupThreadProviderModel: startupThreadProviderModel || "",
           startupThreadProviderModelSource,
@@ -10133,6 +10207,8 @@ function WorkspaceTerminal({
           paneId,
           providerSessionId: startupThreadProviderSessionId,
           sessionId: openResult?.sessionId || "",
+          sessionMode: openResult?.sessionMode || sessionModeForThisStart,
+          fileAuthority: openResult?.fileAuthority || "",
           slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
           status: shouldPrewarmShell ? "starting" : "active",
           terminalIndex,
@@ -11380,12 +11456,19 @@ function WorkspaceTerminal({
     return true;
   }, [onThreadTerminalLifecycle, terminalAgentKind, terminalIndex, workspace?.id]);
 
-  const restartTerminalAs = useCallback((roleId = terminalAgentKind) => {
+  const restartTerminalAs = useCallback((roleId = terminalAgentKind, options = {}) => {
     if (terminalClosing) {
       return;
     }
 
     const nextRoleId = String(roleId || terminalAgentKind).toLowerCase();
+    const nextSessionMode = normalizeTerminalSessionMode(
+      options.sessionMode,
+      defaultTerminalSessionModeForRole(nextRoleId),
+    );
+    terminalSessionModeRef.current = nextSessionMode;
+    terminalSessionModeExplicitRef.current = true;
+    setTerminalSessionMode(nextSessionMode);
     setRestartRoleMenuOpen(false);
 
     detachThreadForNewTerminalSession({
@@ -11627,6 +11710,12 @@ function WorkspaceTerminal({
     />
   );
   const restartMenuAgentKind = terminalAgentKind;
+  const displayedTerminalSessionMode = normalizeTerminalSessionMode(
+    terminalLaunchInfo?.sessionMode || terminalSessionMode,
+    defaultTerminalSessionModeForRole(terminalRoleId),
+  );
+  const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
+  const restartAgentModeOptions = restartRoleOptions.filter((option) => option.id !== "generic");
 
   return (
     <TerminalWorkspaceSurface
@@ -11648,6 +11737,12 @@ function WorkspaceTerminal({
             data-slot={getTerminalAgentColorSlot(terminalIndex)}
             title={terminalAgentTitle}
           />
+          <TerminalModeBadge
+            data-mode={displayedTerminalSessionMode}
+            title={`${getTerminalSessionModeLabel(displayedTerminalSessionMode)} terminal mode`}
+          >
+            {getTerminalSessionModeLabel(displayedTerminalSessionMode)}
+          </TerminalModeBadge>
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"
@@ -11724,27 +11819,80 @@ function WorkspaceTerminal({
               <ButtonRefreshIcon aria-hidden="true" />
             </TerminalRestartButton>
             <TerminalRestartDropdown data-open={restartRoleMenuOpen ? "true" : "false"} role="menu">
-              {getTerminalRoleSwitchOptions(agentStatuses).map((option) => (
+              {restartRoleOptions.map((option) => {
+                const optionSessionMode = defaultTerminalSessionModeForRole(option.id);
+                const optionSelected = option.id === restartMenuAgentKind
+                  && displayedTerminalSessionMode === optionSessionMode;
+                return (
+                  <TerminalRestartOption
+                    data-role={option.id}
+                    data-selected={optionSelected ? "true" : "false"}
+                    key={`${option.id}:${optionSessionMode}`}
+                    onClick={() => restartTerminalAs(option.id, { sessionMode: optionSessionMode })}
+                    role="menuitem"
+                    title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
+                    type="button"
+                  >
+                    <strong>
+                      {threadsViewActive
+                        ? option.id === restartMenuAgentKind
+                          ? `Restart ${option.label}`
+                          : `New ${option.label} session`
+                        : option.id === terminalAgentKind
+                          ? `Restart ${option.label}`
+                          : option.label}
+                    </strong>
+                  </TerminalRestartOption>
+                );
+              })}
+              {restartAgentModeOptions.map((option) => (
                 <TerminalRestartOption
                   data-role={option.id}
-                  data-selected={option.id === restartMenuAgentKind ? "true" : "false"}
-                  key={option.id}
-                  onClick={() => restartTerminalAs(option.id)}
+                  data-selected={option.id === restartMenuAgentKind && displayedTerminalSessionMode === TERMINAL_SESSION_MODE_FREE ? "true" : "false"}
+                  key={`${option.id}:free`}
+                  onClick={() => restartTerminalAs(option.id, { sessionMode: TERMINAL_SESSION_MODE_FREE })}
                   role="menuitem"
-                  title={threadsViewActive ? `Start new ${option.label} session` : `Restart as ${option.label}`}
+                  title={`Restart ${option.label} without managed patch coordination`}
                   type="button"
                 >
-                  <strong>
-                    {threadsViewActive
-                      ? option.id === restartMenuAgentKind
-                        ? `Restart ${option.label}`
-                        : `New ${option.label} session`
-                      : option.id === terminalAgentKind
-                        ? `Restart ${option.label}`
-                        : option.label}
-                  </strong>
+                  <strong>{`${option.label} Free`}</strong>
                 </TerminalRestartOption>
               ))}
+              {restartAgentModeOptions.map((option) => (
+                <TerminalRestartOption
+                  data-role={option.id}
+                  data-selected={option.id === restartMenuAgentKind && displayedTerminalSessionMode === TERMINAL_SESSION_MODE_DIRECT_EDIT ? "true" : "false"}
+                  key={`${option.id}:direct`}
+                  onClick={() => restartTerminalAs(option.id, { sessionMode: TERMINAL_SESSION_MODE_DIRECT_EDIT })}
+                  role="menuitem"
+                  title={`Restart ${option.label} in bounded direct edit mode`}
+                  type="button"
+                >
+                  <strong>{`${option.label} Direct`}</strong>
+                </TerminalRestartOption>
+              ))}
+              <TerminalRestartOption
+                data-role="generic"
+                data-selected={restartMenuAgentKind === "generic" && displayedTerminalSessionMode === TERMINAL_SESSION_MODE_ACTIVITY ? "true" : "false"}
+                key="generic:activity"
+                onClick={() => restartTerminalAs("generic", { sessionMode: TERMINAL_SESSION_MODE_ACTIVITY })}
+                role="menuitem"
+                title="Restart as an activity terminal"
+                type="button"
+              >
+                <strong>Activity Terminal</strong>
+              </TerminalRestartOption>
+              <TerminalRestartOption
+                data-role="generic"
+                data-selected={restartMenuAgentKind === "generic" && displayedTerminalSessionMode === TERMINAL_SESSION_MODE_REMOTE_OPS ? "true" : "false"}
+                key="generic:remote"
+                onClick={() => restartTerminalAs("generic", { sessionMode: TERMINAL_SESSION_MODE_REMOTE_OPS })}
+                role="menuitem"
+                title="Restart as a remote ops terminal"
+                type="button"
+              >
+                <strong>Remote Ops</strong>
+              </TerminalRestartOption>
             </TerminalRestartDropdown>
           </TerminalRestartMenu>
           <TerminalCloseButton

@@ -26,6 +26,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
+    "complete_task",
     "submit_patch",
     "submit_patch_status",
 ];
@@ -65,6 +66,10 @@ pub struct McpContext {
     pub worktree_path: Option<String>,
     pub workspace_id: Option<String>,
     pub objective_key: Option<String>,
+    pub enforcement_mode: Option<String>,
+    pub file_authority: Option<String>,
+    pub session_mode: Option<String>,
+    pub completion_mode: Option<String>,
 }
 
 impl McpContext {
@@ -90,6 +95,10 @@ impl McpContext {
                 ("--worktree-path", Some(value)) => context.worktree_path = Some(value),
                 ("--workspace-id", Some(value)) => context.workspace_id = Some(value),
                 ("--objective-key", Some(value)) => context.objective_key = Some(value),
+                ("--enforcement-mode", Some(value)) => context.enforcement_mode = Some(value),
+                ("--file-authority", Some(value)) => context.file_authority = Some(value),
+                ("--session-mode", Some(value)) => context.session_mode = Some(value),
+                ("--completion-mode", Some(value)) => context.completion_mode = Some(value),
                 _ => {}
             }
             index += 2;
@@ -113,6 +122,10 @@ impl McpContext {
             worktree_path: string_field(value, "worktree_path"),
             workspace_id: string_field(value, "workspace_id"),
             objective_key: string_field(value, "objective_key"),
+            enforcement_mode: string_field(value, "enforcement_mode"),
+            file_authority: string_field(value, "file_authority"),
+            session_mode: string_field(value, "session_mode"),
+            completion_mode: string_field(value, "completion_mode"),
         };
         context.apply_env_defaults();
         context
@@ -133,6 +146,10 @@ impl McpContext {
             "worktree_path": self.worktree_path,
             "workspace_id": self.workspace_id,
             "objective_key": self.objective_key,
+            "enforcement_mode": self.enforcement_mode,
+            "file_authority": self.file_authority,
+            "session_mode": self.session_mode,
+            "completion_mode": self.completion_mode,
         })
     }
 
@@ -174,18 +191,19 @@ impl McpContext {
         );
         set_default_from_env(&mut self.task_id, &["COORDINATION_TASK_ID"]);
         set_default_from_env(&mut self.worktree_id, &["COORDINATION_WORKTREE_ID"]);
-        set_default_from_env(
-            &mut self.worktree_path,
-            &[
-                "COORDINATION_WORKTREE_PATH",
-                "COORDINATION_AGENT_BRANCH_ROOT",
-            ],
-        );
+        set_default_from_env(&mut self.worktree_path, &["COORDINATION_WORKTREE_PATH"]);
         set_default_from_env(
             &mut self.workspace_id,
             &["COORDINATION_WORKSPACE_ID", "CLOUD_MCP_WORKSPACE_ID"],
         );
         set_default_from_env(&mut self.objective_key, &["COORDINATION_OBJECTIVE_KEY"]);
+        set_default_from_env(
+            &mut self.enforcement_mode,
+            &["COORDINATION_ENFORCEMENT_MODE"],
+        );
+        set_default_from_env(&mut self.file_authority, &["COORDINATION_FILE_AUTHORITY"]);
+        set_default_from_env(&mut self.session_mode, &["COORDINATION_SESSION_MODE"]);
+        set_default_from_env(&mut self.completion_mode, &["COORDINATION_COMPLETION_MODE"]);
     }
 }
 
@@ -2387,10 +2405,19 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
         .worktree_id
         .clone()
         .or_else(|| session_string_field(live_session.as_ref(), "worktree_id"));
-    let worktree_path = context
-        .worktree_path
+    let worktree_path = context.worktree_path.clone().or_else(|| {
+        worktree_id
+            .as_ref()
+            .and_then(|_| session_string_field(live_session.as_ref(), "write_root"))
+    });
+    let enforcement_mode = context
+        .enforcement_mode
         .clone()
-        .or_else(|| session_string_field(live_session.as_ref(), "write_root"));
+        .or_else(|| session_string_field(live_session.as_ref(), "enforcement_mode"));
+    let (session_mode, file_authority, completion_mode) = enforcement_mode
+        .as_deref()
+        .map(coordination_authority_for_enforcement_mode)
+        .unwrap_or(("free", "external_unmanaged", "complete_task"));
     let actor_id = agent_id.clone().unwrap_or_else(|| REPO_ID.to_string());
     let _ = kernel.emit_event(
         event_type,
@@ -2408,6 +2435,10 @@ fn record_mcp_client_event(context: &McpContext, event_type: &str, details: Valu
             "terminal_launch_epoch": context.terminal_launch_epoch.clone(),
             "worktree_id": worktree_id,
             "worktree_path": worktree_path,
+            "enforcement_mode": enforcement_mode,
+            "session_mode": context.session_mode.clone().unwrap_or_else(|| session_mode.to_string()),
+            "file_authority": context.file_authority.clone().unwrap_or_else(|| file_authority.to_string()),
+            "completion_mode": context.completion_mode.clone().unwrap_or_else(|| completion_mode.to_string()),
             "workspace_id": context.workspace_id.clone(),
             "objective_key": context.objective_key.clone(),
             "identity_resolved_from_active_session": live_session.is_some(),
@@ -2449,7 +2480,11 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
         );
     }
     apply_context_defaults(context, &mut input);
-    if matches!(tool, "acquire_lease" | "checkpoint" | "submit_patch") && !explicit_task_id {
+    if matches!(
+        tool,
+        "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
+    ) && !explicit_task_id
+    {
         if let Some(object) = input.as_object_mut() {
             object.insert("__explicit_task_id_missing".to_string(), json!(true));
         }
@@ -2502,6 +2537,7 @@ fn dispatch_tool_result(
         "start_task" => kernel_start_task(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
+        "complete_task" => kernel_complete_task(&kernel, &input),
         "submit_patch" => kernel_submit_patch(&kernel, &input),
         "submit_patch_status" => kernel_submit_patch_status(&kernel, &input),
         _ => Ok(api_error(
@@ -2637,6 +2673,10 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         lane.as_deref(),
         task_title.as_deref(),
         None,
+        input["session_mode"].as_str(),
+        input["file_authority"].as_str(),
+        input["enforcement_mode"].as_str(),
+        input["completion_mode"].as_str(),
         &start_plan,
     ) {
         Ok(response) => response,
@@ -2908,6 +2948,23 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         ));
     }
     let resource_key = req(input, "resource_key")?;
+    let file_authority = input["file_authority"].as_str().unwrap_or("none");
+    let enforcement_mode = input["enforcement_mode"].as_str().unwrap_or_default();
+    let no_local_file_authority = matches!(enforcement_mode, "activity_only" | "remote_unmanaged")
+        || matches!(file_authority, "remote_unmanaged" | "external_unmanaged")
+        || (file_authority == "none"
+            && matches!(enforcement_mode, "activity_only" | "remote_unmanaged"));
+    if no_local_file_authority && cloud_file_resource_key(resource_key) {
+        return Ok(api_error(
+            "no_local_file_authority",
+            "This terminal mode has no local file editing authority. Use direct_edit or managed_patch for local file leases, or use complete_task for non-file work.",
+            json!({
+                "resource_key": resource_key,
+                "file_authority": file_authority,
+                "enforcement_mode": enforcement_mode,
+            }),
+        ));
+    }
     let mode = input["mode"].as_str().unwrap_or("write");
     let acquired = kernel.acquire_lease(
         task_id,
@@ -3208,6 +3265,79 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     })))
 }
 
+fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
+        return Ok(api_error(
+            "task_id_required_after_start_task",
+            "complete_task requires the task_id returned by start_task; implicit session task defaults are not allowed.",
+            json!({}),
+        ));
+    }
+    let task_id = req(input, "task_id")?;
+    let agent_id = req(input, "agent_id")?;
+    let session_id = req(input, "session_id")?;
+    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
+        return Ok(api_error(
+            "start_task_required_before_complete_task",
+            "Call start_task for this session and pass its returned task_id before completing the task.",
+            json!({"task_id": task_id, "session_id": session_id}),
+        ));
+    }
+    let task = kernel
+        .query_json(
+            "SELECT id, status, assigned_role FROM tasks WHERE id=?1 LIMIT 1",
+            &[&task_id],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| json!({}));
+    let lane = input["lane"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| task["assigned_role"].as_str());
+    let status = input["status"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let summary = input["summary"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let completed =
+        kernel.complete_terminal_task(task_id, agent_id, session_id, status, summary)?;
+    if completed["ok"].as_bool() == Some(false) {
+        return Ok(completed);
+    }
+    let completed_status = completed["data"]["status"]
+        .as_str()
+        .or(status)
+        .or(Some("done"));
+    let cloud = match crate::cloud_mcp_forward_agent_complete_task(
+        input["repo_path"].as_str(),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        Some(agent_id),
+        Some(session_id),
+        Some(task_id),
+        lane,
+        summary,
+        completed_status,
+        input["session_mode"].as_str(),
+        input["file_authority"].as_str(),
+        input["enforcement_mode"].as_str(),
+        input["completion_mode"].as_str(),
+        &completed,
+    ) {
+        Ok(response) => json!({"ok": true, "response": response}),
+        Err(error) => json!({"ok": false, "error": error}),
+    };
+    let mut response = completed;
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
+}
+
 fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
     if input["__explicit_task_id_missing"].as_bool() == Some(true) {
         return Ok(api_error(
@@ -3219,6 +3349,20 @@ fn kernel_submit_patch(kernel: &CoordinationKernel, input: &Value) -> Result<Val
     let task_id = req(input, "task_id")?;
     let agent_id = req(input, "agent_id")?;
     let session_id = req(input, "session_id")?;
+    let enforcement_mode = input["enforcement_mode"]
+        .as_str()
+        .unwrap_or("coordination_only");
+    if enforcement_mode != "worktree_required" || !value_has_nonempty_string(input, "worktree_id") {
+        return Ok(api_error(
+            "not_patch_capable",
+            "submit_patch is only available from managed patch sessions with an isolated git worktree. Use complete_task for direct, activity, or remote work.",
+            json!({
+                "enforcement_mode": enforcement_mode,
+                "file_authority": input["file_authority"].as_str(),
+                "completion_mode": input["completion_mode"].as_str().unwrap_or("complete_task"),
+            }),
+        ));
+    }
     if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
         return Ok(api_error(
             "start_task_required_before_submit_patch",
@@ -3396,6 +3540,10 @@ fn apply_context_defaults(context: &McpContext, input: &mut Value) {
         ("worktree_path", &context.worktree_path),
         ("workspace_id", &context.workspace_id),
         ("objective_key", &context.objective_key),
+        ("enforcement_mode", &context.enforcement_mode),
+        ("file_authority", &context.file_authority),
+        ("session_mode", &context.session_mode),
+        ("completion_mode", &context.completion_mode),
     ]);
     for (key, value) in defaults {
         if !object.contains_key(key) {
@@ -3453,6 +3601,7 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
         ("terminal_launch_epoch", "terminal_launch_epoch"),
         ("task_id", "task_id"),
         ("worktree_id", "worktree_id"),
+        ("enforcement_mode", "enforcement_mode"),
     ] {
         let missing = object
             .get(key)
@@ -3485,6 +3634,46 @@ fn apply_live_session_defaults(kernel: &CoordinationKernel, input: &mut Value) {
                 Value::String(value.to_string()),
             );
         }
+    }
+    let enforcement_mode = object
+        .get("enforcement_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            session["enforcement_mode"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("coordination_only");
+    let (session_mode, file_authority, completion_mode) =
+        coordination_authority_for_enforcement_mode(enforcement_mode);
+    for (key, value) in [
+        ("session_mode", session_mode),
+        ("file_authority", file_authority),
+        ("completion_mode", completion_mode),
+    ] {
+        let missing = object
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty());
+        if missing {
+            object.insert(key.to_string(), Value::String(value.to_string()));
+        }
+    }
+}
+
+fn coordination_authority_for_enforcement_mode(
+    enforcement_mode: &str,
+) -> (&'static str, &'static str, &'static str) {
+    match enforcement_mode {
+        "worktree_required" => ("managed_patch", "git_worktree_patch", "submit_patch"),
+        "bounded_direct_edit" => ("direct_edit", "bounded_direct_edit", "complete_task"),
+        "activity_only" => ("activity", "none", "complete_task"),
+        "remote_unmanaged" => ("remote_ops", "remote_unmanaged", "complete_task"),
+        "read_only" | "coordination_only" => ("activity", "none", "complete_task"),
+        _ => ("free", "external_unmanaged", "complete_task"),
     }
 }
 
@@ -3594,6 +3783,18 @@ fn value_has_nonempty_string(input: &Value, key: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn cloud_file_resource_key(resource_key: &str) -> bool {
+    let trimmed = resource_key.trim();
+    if trimmed.is_empty() || trimmed.starts_with("route:") || trimmed.starts_with("db:") {
+        return false;
+    }
+    trimmed.starts_with("file:")
+        || trimmed.starts_with("glob:")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('.')
+}
+
 fn mcp_start_task_seen_for_task(
     kernel: &CoordinationKernel,
     task_id: &str,
@@ -3617,9 +3818,10 @@ fn mcp_start_task_seen_for_task(
 
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the coordination task only after read-only inspection, immediately before editing. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, and patches.".to_string(),
+        "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
@@ -3656,6 +3858,16 @@ fn tool_input_schema(name: &str) -> Value {
                 "summary": {"type": "string", "description": "One short public summary of active task progress. Do not call checkpoint before start_task."}
             },
             "required": ["task_id", "summary"],
+            "additionalProperties": true
+        }),
+        "complete_task" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
+                "summary": {"type": "string", "description": "Short public summary of the completed direct/activity/remote work."},
+                "status": {"type": "string", "description": "Optional completion status: done, completed, or skipped.", "default": "done"}
+            },
+            "required": ["task_id"],
             "additionalProperties": true
         }),
         "submit_patch" => json!({
@@ -3860,6 +4072,88 @@ mod tests {
             )
             .unwrap();
         assert!(checkpoint_events.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn submit_patch_rejects_non_worktree_authority_before_patch_queue() {
+        let root =
+            std::env::temp_dir().join(format!("diffforge_submit_direct_guard_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let kernel = CoordinationKernel::init(&root, None).unwrap();
+
+        let result = kernel_submit_patch(
+            &kernel,
+            &json!({
+                "task_id": "task-direct",
+                "agent_id": "agent-direct",
+                "session_id": "session-direct",
+                "enforcement_mode": "bounded_direct_edit",
+                "file_authority": "bounded_direct_edit",
+                "completion_mode": "complete_task",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(result["error"]["code"].as_str(), Some("not_patch_capable"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activity_file_lease_is_rejected_without_local_file_authority() {
+        let root =
+            std::env::temp_dir().join(format!("diffforge_activity_file_guard_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let kernel = CoordinationKernel::init(&root, None).unwrap();
+        let agent = kernel
+            .create_or_get_agent("Research", "shell", None)
+            .unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Research only", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .emit_event(
+                "mcp_agent_tool_called",
+                "agent_mcp_client",
+                agent_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({"details": {"tool": "start_task", "ok": true}}),
+            )
+            .unwrap();
+
+        let result = kernel_acquire_lease(
+            &kernel,
+            &json!({
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "resource_key": "file:src/main.rs",
+                "file_authority": "none",
+                "enforcement_mode": "activity_only",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(
+            result["error"]["code"].as_str(),
+            Some("no_local_file_authority")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
