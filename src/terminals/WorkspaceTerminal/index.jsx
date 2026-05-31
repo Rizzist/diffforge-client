@@ -123,6 +123,7 @@ import {
   TerminalParkedCancelButton,
   TerminalRestartPill,
   TerminalAgentDot,
+  TerminalStateDebugBadge,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -11717,6 +11718,14 @@ function WorkspaceTerminal({
   const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
+  const terminalStateDebugLabel = (() => {
+    const state = String(terminalState || "").trim();
+    const activity = String(terminalThreadActivityStatus || "").trim();
+    const raw = state && !["prewarmed", "running"].includes(state)
+      ? state
+      : activity || state || "unknown";
+    return raw.replace(/[_-]+/g, " ");
+  })();
   if (!agent) {
     return (
       <TerminalWorkspaceSurface>
@@ -11801,6 +11810,9 @@ function WorkspaceTerminal({
             data-slot={getTerminalAgentColorSlot(terminalIndex)}
             title={terminalAgentTitle}
           />
+          <TerminalStateDebugBadge title={`Terminal state: ${terminalStateDebugLabel}`}>
+            {terminalStateDebugLabel}
+          </TerminalStateDebugBadge>
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"

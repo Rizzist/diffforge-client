@@ -26,6 +26,7 @@ const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
+const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
@@ -1742,6 +1743,22 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetThreadId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "thread_id"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "threadId"])),
+        "target_terminal_color": cloud_mcp_payload_text(event, &["target_terminal_color"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetTerminalColor"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminal_color"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["terminalColor"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_terminal_color"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetTerminalColor"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminal_color"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminalColor"])),
+        "target_color_slot": cloud_mcp_payload_text(event, &["target_color_slot"])
+            .or_else(|| cloud_mcp_payload_text(event, &["targetColorSlot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["color_slot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["colorSlot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_color_slot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "targetColorSlot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "color_slot"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "colorSlot"])),
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
@@ -1813,6 +1830,10 @@ async fn cloud_mcp_start_remote_command_listener(
                 .unwrap_or_default();
             if event_kind.starts_with("credit_wallet_") {
                 let _ = app.emit(CLOUD_MCP_CREDIT_WALLET_EVENT, event.clone());
+                continue;
+            }
+            if event_kind == "tokenomics_refresh_requested" {
+                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
                 continue;
             }
             if event_kind != "remote_command_requested" {

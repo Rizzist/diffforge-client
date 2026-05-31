@@ -46,6 +46,21 @@ const RESOLVED_APPROVAL_STATUSES = new Set([
   "resolved",
 ]);
 
+const MANUAL_ACCEPTANCE_NOTIFICATION_KINDS = new Set([
+  "approval.required",
+]);
+
+const MANUAL_ACCEPTANCE_ACTIONABILITIES = new Set([
+  "approve_deny",
+]);
+
+const MANUAL_ACCEPTANCE_PROMPT_KINDS = new Set([
+  "approval",
+  "confirmation",
+  "permission",
+  "terminal-control",
+]);
+
 function cleanText(value, fallback = "") {
   const text = String(value ?? "").trim();
   return text || fallback;
@@ -96,6 +111,12 @@ function normalizeNotificationKind(value) {
   return kind.replace(/_/g, ".");
 }
 
+function normalizePromptingUserKind(value) {
+  return cleanText(value)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
 function normalizeNotification(notification, workspaceId) {
   if (!notification || typeof notification !== "object" || Array.isArray(notification)) {
     return null;
@@ -121,6 +142,9 @@ function normalizeNotification(notification, workspaceId) {
     kind,
     paneId: cleanText(notification.paneId || notification.pane_id),
     pendingAction: Boolean(notification.pendingAction || notification.pending_action),
+    promptingUserConfidence: cleanText(notification.promptingUserConfidence || notification.prompting_user_confidence),
+    promptingUserKind: normalizePromptingUserKind(notification.promptingUserKind || notification.prompting_user_kind),
+    promptingUserSource: cleanText(notification.promptingUserSource || notification.prompting_user_source),
     seenAt: cleanText(notification.seenAt || notification.seen_at),
     sessionId: cleanText(notification.sessionId || notification.session_id),
     severity: cleanText(notification.severity, "info"),
@@ -356,6 +380,9 @@ function shouldCueNotification(notification, existing, options = {}) {
   if (options.suppressCue || !notification) {
     return false;
   }
+  if (!notificationRequiresManualAcceptance(notification)) {
+    return false;
+  }
   if (["dismissed", "resolved"].includes(notification.status)) {
     return false;
   }
@@ -366,6 +393,27 @@ function shouldCueNotification(notification, existing, options = {}) {
     return false;
   }
   return true;
+}
+
+function notificationRequiresManualAcceptance(notification) {
+  if (!notification?.pendingAction) {
+    return false;
+  }
+  const kind = normalizeNotificationKind(notification.kind);
+  const actionability = cleanText(notification.actionability).toLowerCase();
+  if (
+    MANUAL_ACCEPTANCE_NOTIFICATION_KINDS.has(kind)
+    || MANUAL_ACCEPTANCE_ACTIONABILITIES.has(actionability)
+  ) {
+    return true;
+  }
+  if (kind !== "user.input.required") {
+    return false;
+  }
+  const promptingKind = normalizePromptingUserKind(
+    notification.promptingUserKind || notification.prompting_user_kind,
+  );
+  return MANUAL_ACCEPTANCE_PROMPT_KINDS.has(promptingKind);
 }
 
 function appendNotificationCue(state, bucket, workspaceId, notification, existing, options = {}) {
@@ -696,6 +744,9 @@ function buildPromptingNotification(event, workspaceId, existing, options = {}) 
     kind: "user.input.required",
     paneId: cleanText(event?.paneId || event?.pane_id),
     pendingAction: true,
+    promptingUserConfidence: cleanText(event?.promptingUserConfidence || event?.prompting_user_confidence),
+    promptingUserKind: normalizePromptingUserKind(event?.promptingUserKind || event?.prompting_user_kind),
+    promptingUserSource: cleanText(event?.promptingUserSource || event?.prompting_user_source),
     seenAt: seenOnArrival ? createdAt : existing?.seenAt || "",
     sessionId: cleanText(event?.nativeSessionId || event?.providerSessionId),
     severity: "action_required",

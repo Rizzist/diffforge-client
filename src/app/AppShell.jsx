@@ -15,6 +15,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { authStore, DEFAULT_AUTH_MESSAGE, isSafeAuthValue, useAuthSnapshot } from "../authStore";
 import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 import {
+  TERMINAL_AGENT_COLOR_HEX_BY_SLOT,
+  normalizeTerminalColorSlot,
+  sanitizeTerminalColor,
+} from "../terminals/terminalColors.js";
+import {
   closeWorkspaceTerminalPane,
   getDefaultTerminalIndexes,
   getTerminalAgentColorSlot,
@@ -842,6 +847,7 @@ const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancel
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
+const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 
 function getThreadDiagnosticTextLength(value) {
@@ -1321,25 +1327,6 @@ const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
 const TERMINAL_PRESENCE_SYNC_INTERVAL_MS = 20000;
 const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
-const TERMINAL_AGENT_COLOR_HEX_BY_SLOT = [
-  "#62a0ff",
-  "#ff9d48",
-  "#3ccb7f",
-  "#e5c45f",
-  "#68d8d6",
-  "#f46d8a",
-  "#aac66d",
-  "#d0d7e6",
-  "#54b6ff",
-  "#ffbf66",
-  "#7bdc9d",
-  "#ff8a9c",
-  "#56d0b6",
-  "#d8b34d",
-  "#9fb6d9",
-  "#f0f4ff",
-];
-
 function unwrapCloudCommandData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
     return fallback;
@@ -8913,7 +8900,10 @@ export default function App() {
       }
       tokenomicsSyncInFlightRef.current = true;
       try {
-        if (reason === "tokenomics_scan") {
+        if (reason === "tokenomics_scan" || reason === "tokenomics_server_refresh") {
+          if (reason === "tokenomics_server_refresh") {
+            tokenomicsSyncCursorRef.current = "";
+          }
           await startAccountTokenomicsStartupScan(accountKey);
           const summary = await invoke("tokenomics_get_sync_payload");
           if (disposed) {
@@ -8959,6 +8949,20 @@ export default function App() {
     };
 
     syncTokenomics("tokenomics_scan");
+    let unlistenRefresh = null;
+    listen(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, () => {
+      if (!disposed) {
+        syncTokenomics("tokenomics_server_refresh");
+      }
+    })
+      .then((handler) => {
+        unlistenRefresh = handler;
+      })
+      .catch((error) => {
+        logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_refresh_listener.failed", {
+          message: getErrorMessage(error, "Unable to listen for server Tokenomics refresh."),
+        });
+      });
     const intervalId = window.setInterval(
       () => syncTokenomics("tokenomics_heartbeat"),
       60 * 1000,
@@ -8966,6 +8970,9 @@ export default function App() {
 
     return () => {
       disposed = true;
+      if (typeof unlistenRefresh === "function") {
+        unlistenRefresh();
+      }
       window.clearInterval(intervalId);
     };
   }, [authState, user]);
@@ -9528,6 +9535,25 @@ export default function App() {
             "thread_id",
             "threadId",
           ]);
+          const targetColorSlot = normalizeTerminalColorSlot(remoteCommandIntegerField(event, [
+            "target_color_slot",
+            "targetColorSlot",
+            "color_slot",
+            "colorSlot",
+            "terminal_color_slot",
+            "terminalColorSlot",
+          ]) ?? targetTerminalIndex);
+          const rawTargetTerminalColor = remoteCommandStringField(event, [
+            "target_terminal_color",
+            "targetTerminalColor",
+            "terminal_color",
+            "terminalColor",
+            "color",
+          ]);
+          const hasTerminalTarget = Boolean(targetTerminalId || targetThreadId || Number.isInteger(targetTerminalIndex));
+          const targetTerminalColor = hasTerminalTarget
+            ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
+            : "";
           if (!text || !workspaceId) {
             await invoke("cloud_mcp_record_remote_command_status", {
               event,
@@ -9551,10 +9577,14 @@ export default function App() {
                   targetTerminalId,
                   targetTerminalIndex,
                   targetThreadId,
+                  ...(targetTerminalColor ? { targetTerminalColor } : {}),
+                  ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
                 },
                 source: "next-remote-control",
                 targetAgentId: agentId || "",
                 targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+                ...(targetTerminalColor ? { targetTerminalColor } : {}),
+                ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
                 targetTerminalId,
                 targetTerminalIndex,
                 targetThreadId,

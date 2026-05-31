@@ -3917,67 +3917,67 @@ export const TerminalParkedAgentBadge = styled.span`
     0 0 14px var(--terminal-slot-accent);
 
   &[data-slot="0"] {
-    --terminal-slot-accent: #62a0ff;
-  }
-
-  &[data-slot="1"] {
     --terminal-slot-accent: #ff9d48;
   }
 
-  &[data-slot="2"] {
+  &[data-slot="1"] {
     --terminal-slot-accent: #3ccb7f;
   }
 
-  &[data-slot="3"] {
+  &[data-slot="2"] {
     --terminal-slot-accent: #e5c45f;
   }
 
-  &[data-slot="4"] {
+  &[data-slot="3"] {
     --terminal-slot-accent: #68d8d6;
   }
 
-  &[data-slot="5"] {
+  &[data-slot="4"] {
     --terminal-slot-accent: #f46d8a;
   }
 
-  &[data-slot="6"] {
+  &[data-slot="5"] {
     --terminal-slot-accent: #aac66d;
   }
 
-  &[data-slot="7"] {
+  &[data-slot="6"] {
     --terminal-slot-accent: #d0d7e6;
   }
 
-  &[data-slot="8"] {
-    --terminal-slot-accent: #54b6ff;
+  &[data-slot="7"] {
+    --terminal-slot-accent: #c084fc;
   }
 
-  &[data-slot="9"] {
+  &[data-slot="8"] {
     --terminal-slot-accent: #ffbf66;
   }
 
-  &[data-slot="10"] {
+  &[data-slot="9"] {
     --terminal-slot-accent: #7bdc9d;
   }
 
-  &[data-slot="11"] {
+  &[data-slot="10"] {
     --terminal-slot-accent: #ff8a9c;
   }
 
-  &[data-slot="12"] {
+  &[data-slot="11"] {
     --terminal-slot-accent: #56d0b6;
   }
 
-  &[data-slot="13"] {
+  &[data-slot="12"] {
     --terminal-slot-accent: #d8b34d;
   }
 
-  &[data-slot="14"] {
+  &[data-slot="13"] {
     --terminal-slot-accent: #9fb6d9;
   }
 
-  &[data-slot="15"] {
+  &[data-slot="14"] {
     --terminal-slot-accent: #f0f4ff;
+  }
+
+  &[data-slot="15"] {
+    --terminal-slot-accent: #f7a8ff;
   }
 `;
 
@@ -4446,7 +4446,7 @@ export const TerminalRestartPill = styled.div`
 `;
 
 export const TerminalAgentDot = styled.span`
-  --terminal-slot-accent: #62a0ff;
+  --terminal-slot-accent: #ff9d48;
 
   display: inline-flex;
   width: 10px;
@@ -4480,63 +4480,63 @@ export const TerminalAgentDot = styled.span`
   }
 
   &[data-slot="1"] {
-    --terminal-slot-accent: #ff9d48;
-  }
-
-  &[data-slot="2"] {
     --terminal-slot-accent: #3ccb7f;
   }
 
-  &[data-slot="3"] {
+  &[data-slot="2"] {
     --terminal-slot-accent: #e5c45f;
   }
 
-  &[data-slot="4"] {
+  &[data-slot="3"] {
     --terminal-slot-accent: #68d8d6;
   }
 
-  &[data-slot="5"] {
+  &[data-slot="4"] {
     --terminal-slot-accent: #f46d8a;
   }
 
-  &[data-slot="6"] {
+  &[data-slot="5"] {
     --terminal-slot-accent: #aac66d;
   }
 
-  &[data-slot="7"] {
+  &[data-slot="6"] {
     --terminal-slot-accent: #d0d7e6;
   }
 
-  &[data-slot="8"] {
-    --terminal-slot-accent: #54b6ff;
+  &[data-slot="7"] {
+    --terminal-slot-accent: #c084fc;
   }
 
-  &[data-slot="9"] {
+  &[data-slot="8"] {
     --terminal-slot-accent: #ffbf66;
   }
 
-  &[data-slot="10"] {
+  &[data-slot="9"] {
     --terminal-slot-accent: #7bdc9d;
   }
 
-  &[data-slot="11"] {
+  &[data-slot="10"] {
     --terminal-slot-accent: #ff8a9c;
   }
 
-  &[data-slot="12"] {
+  &[data-slot="11"] {
     --terminal-slot-accent: #56d0b6;
   }
 
-  &[data-slot="13"] {
+  &[data-slot="12"] {
     --terminal-slot-accent: #d8b34d;
   }
 
-  &[data-slot="14"] {
+  &[data-slot="13"] {
     --terminal-slot-accent: #9fb6d9;
   }
 
-  &[data-slot="15"] {
+  &[data-slot="14"] {
     --terminal-slot-accent: #f0f4ff;
+  }
+
+  &[data-slot="15"] {
+    --terminal-slot-accent: #f7a8ff;
   }
 `;
 
@@ -4622,6 +4622,33 @@ export const TerminalProjectBadge = styled.div`
     color: #9ca9ba;
     font-size: 10px;
     font-weight: 820;
+  }
+`;
+
+export const TerminalStateDebugBadge = styled.span`
+  display: inline-flex;
+  max-width: 88px;
+  height: 18px;
+  align-items: center;
+  padding: 0 6px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.82);
+  background: rgba(15, 23, 42, 0.48);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  text-transform: lowercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(99, 102, 118, 0.2);
+    color: rgba(48, 54, 68, 0.82);
+    background: rgba(255, 255, 255, 0.72);
   }
 `;
 

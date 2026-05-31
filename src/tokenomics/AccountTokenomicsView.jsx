@@ -839,6 +839,11 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const dailyRaw = selectedProvider === "all"
     ? (Array.isArray(summary?.daily) ? summary.daily : [])
     : (Array.isArray(summary?.daily_by_provider) ? summary.daily_by_provider : []);
+  const monthlyRaw = Array.isArray(summary?.monthly_by_provider) && summary.monthly_by_provider.length
+    ? summary.monthly_by_provider
+    : Array.isArray(summary?.monthly) && summary.monthly.length
+      ? summary.monthly
+      : dailyRaw;
   const hourlyRaw = Array.isArray(summary?.session_hourly_by_provider)
     ? summary.session_hourly_by_provider
     : (Array.isArray(summary?.hourly_by_provider) ? summary.hourly_by_provider : []);
@@ -851,8 +856,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [dailyRaw, selectedAccountKey, selectedProvider],
   );
   const month = useMemo(
-    () => monthAggregate(dailyRaw, selectedProvider, selectedAccountKey),
-    [dailyRaw, selectedAccountKey, selectedProvider],
+    () => monthAggregate(monthlyRaw, selectedProvider, selectedAccountKey),
+    [monthlyRaw, selectedAccountKey, selectedProvider],
   );
   const accountRows = Array.isArray(summary?.by_account) ? summary.by_account : [];
   const totalRows = selectedProvider === "all" || selectedAccountKey === "all" ? providers : accountRows;

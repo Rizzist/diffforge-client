@@ -2565,6 +2565,16 @@ fn tokenomics_summary_from_conn(
             "SELECT provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_rollups WHERE bucket_width='day' GROUP BY provider, agent_kind, provider_account_key, bucket_start ORDER BY bucket_start DESC LIMIT 240"
         ),
     )?;
+    let monthly = tokenomics_query_rows(
+        conn,
+        "SELECT substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_rollups WHERE bucket_width='day' GROUP BY substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 24",
+    )?;
+    let monthly_by_provider = tokenomics_query_rows(
+        conn,
+        &format!(
+            "SELECT provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM tokenomics_rollups WHERE bucket_width='day' GROUP BY provider, agent_kind, provider_account_key, substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 240"
+        ),
+    )?;
     let hourly_by_provider = tokenomics_query_rows(
         conn,
         &format!(
@@ -2636,6 +2646,8 @@ fn tokenomics_summary_from_conn(
         "by_model": by_model,
         "daily": daily,
         "daily_by_provider": daily_by_provider,
+        "monthly": monthly,
+        "monthly_by_provider": monthly_by_provider,
         "hourly_by_provider": hourly_by_provider,
         "session_hourly_by_provider": session_hourly_by_provider,
         "accounts": accounts,
@@ -2680,12 +2692,13 @@ fn tokenomics_account_hourly_sync_rollups(
                COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                COALESCE(SUM(event_count), 0) AS event_count,
                MAX(updated_at) AS updated_at
-             FROM tokenomics_rollups
-             WHERE bucket_width='hour'
-               AND (
-                 bucket_start >= strftime('%Y-%m-%dT%H', 'now', '-30 days')
-                 OR bucket_start LIKE 'unix-hour-%'
-               )
+	             FROM tokenomics_rollups
+	             WHERE bucket_width='hour'
+	               AND (
+	                 bucket_start >= strftime('%Y-%m-01T00', 'now')
+	                 OR bucket_start >= strftime('%Y-%m-%dT%H', 'now', '-30 days')
+	                 OR bucket_start LIKE 'unix-hour-%'
+	               )
                AND (?1 IS NULL OR updated_at >= ?1)
              GROUP BY provider, agent_kind, {model_sql}, subscription_key, provider_account_key, bucket_start
              ORDER BY updated_at DESC, bucket_start DESC, provider, agent_kind
@@ -3606,6 +3619,50 @@ mod tokenomics_tests {
     }
 
     #[test]
+    fn tokenomics_summary_monthly_is_not_limited_to_daily_chart_window() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        for day in 1..=16_i64 {
+            conn.execute(
+                "INSERT INTO tokenomics_rollups(
+                   id, provider, agent_kind, model, subscription_key,
+                   provider_account_key, provider_account_label, workspace_id, repo_path,
+                   bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
+                   cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
+                 ) VALUES(
+                   ?1, 'openai', 'codex', 'gpt-5.5', 'openai:codex:personal',
+                   'openai:codex:personal', 'Personal', NULL, NULL,
+                   'day', ?2, ?3, 0, 0,
+                   0, ?3, 0, 1, '2026-05-30T05:00:00Z'
+                 )",
+                rusqlite::params![
+                    format!("rollup-day-{day}"),
+                    format!("2026-05-{day:02}"),
+                    day,
+                ],
+            )
+            .unwrap();
+        }
+
+        let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
+        assert_eq!(summary["daily"].as_array().unwrap().len(), 14);
+        assert_eq!(
+            summary["monthly"][0]["bucket_start"],
+            json!("2026-05-01")
+        );
+        assert_eq!(summary["monthly"][0]["total_tokens"], json!(136));
+        assert_eq!(
+            summary["monthly_by_provider"][0]["provider_account_key"],
+            json!("openai:codex:personal")
+        );
+        assert_eq!(
+            summary["monthly_by_provider"][0]["total_tokens"],
+            json!(136)
+        );
+    }
+
+    #[test]
     fn tokenomics_account_sync_rollups_preserve_provider_accounts() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
@@ -3679,6 +3736,37 @@ mod tokenomics_tests {
                 && row["provider_account_key"] == json!("openai:codex:personal")
                 && row["total_tokens"] == json!(7)
         }));
+    }
+
+    #[test]
+    fn tokenomics_account_sync_rollups_include_full_current_month() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let month_start: String = conn
+            .query_row("SELECT strftime('%Y-%m-01T00', 'now')", [], |row| row.get(0))
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key,
+               provider_account_key, provider_account_label, workspace_id, repo_path,
+               bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
+             ) VALUES(
+               'current-month-start', 'openai', 'codex', 'gpt-5.5', 'openai:codex:personal',
+               'openai:codex:personal', 'Personal', NULL, NULL,
+               'hour', ?1, 7, 0, 0,
+               0, 7, 0, 1, '2026-05-01T00:00:00Z'
+             )",
+            rusqlite::params![month_start],
+        )
+        .unwrap();
+
+        let rollups = tokenomics_account_hourly_sync_rollups(&conn, None).unwrap();
+
+        assert!(rollups
+            .iter()
+            .any(|row| row["bucket_start"] == json!(month_start) && row["total_tokens"] == json!(7)));
     }
 
     #[test]

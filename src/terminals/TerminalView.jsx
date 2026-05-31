@@ -65,6 +65,12 @@ import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
+import {
+  TODO_QUEUE_DEFAULT_DOT_COLOR,
+  normalizeTerminalColorSlot,
+  normalizeTerminalHexColor,
+  terminalColorForSlot,
+} from "./terminalColors.js";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
@@ -85,6 +91,7 @@ import {
   getActiveWorkspaceFileDrag,
   getDraggedWorkspaceFile,
   getErrorMessage,
+  getTerminalAgentColorSlot,
   getTerminalSubmitSequence,
   getThreadComposerSyncKey,
   getWorkspaceThreadComposerAttachments,
@@ -2128,21 +2135,14 @@ const TodoQueueItemCard = styled.article`
   user-select: none;
 
   &::before {
-    content: "\\2022";
-    color: #8bb8ff;
-    font-size: 13px;
-    font-weight: 900;
-    line-height: 1.45;
-  }
-
-  &[data-todo-targeted="true"]::before {
     content: "";
-    width: 8px;
-    height: 8px;
-    margin-top: 7px;
+    width: 6px;
+    height: 6px;
+    margin-top: 8px;
+    margin-left: 4px;
     border-radius: 999px;
-    background: var(--todo-agent-color, #8bb8ff);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--todo-agent-color, #8bb8ff) 20%, transparent);
+    background: var(--todo-agent-color, ${TODO_QUEUE_DEFAULT_DOT_COLOR});
+    box-shadow: none;
   }
 
   &:hover {
@@ -4190,6 +4190,48 @@ function getTodoQueueTargetTerminalIndex(item) {
   );
 }
 
+function getTodoQueueTargetColorSlot(item) {
+  return normalizeTerminalColorSlot(
+    item?.targetColorSlot
+      ?? item?.target_color_slot
+      ?? item?.terminalColorSlot
+      ?? item?.terminal_color_slot
+      ?? item?.colorSlot
+      ?? item?.color_slot
+      ?? item?.remoteCommand?.targetColorSlot
+      ?? item?.remoteCommand?.target_color_slot
+      ?? item?.remoteCommand?.terminalColorSlot
+      ?? item?.remoteCommand?.terminal_color_slot
+      ?? item?.remoteCommand?.colorSlot
+      ?? item?.remoteCommand?.color_slot
+      ?? item?.remote_command?.target_color_slot
+      ?? item?.remote_command?.terminal_color_slot
+      ?? item?.remote_command?.color_slot,
+  );
+}
+
+function getTodoQueueTargetTerminalColor(item) {
+  const candidates = [
+    item?.targetTerminalColor,
+    item?.target_terminal_color,
+    item?.terminalColor,
+    item?.terminal_color,
+    item?.remoteCommand?.targetTerminalColor,
+    item?.remoteCommand?.target_terminal_color,
+    item?.remoteCommand?.terminalColor,
+    item?.remoteCommand?.terminal_color,
+    item?.remote_command?.target_terminal_color,
+    item?.remote_command?.terminal_color,
+  ];
+  for (const candidate of candidates) {
+    const color = normalizeTerminalHexColor(candidate);
+    if (color) {
+      return color;
+    }
+  }
+  return "";
+}
+
 function todoQueueRemoteItemsMatch(left, right) {
   if (!left || !right) {
     return false;
@@ -4544,6 +4586,12 @@ function createTodoQueueItem(text, options = {}) {
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(options);
   const targetThreadId = getTodoQueueTargetThreadId(options);
+  const targetColorSlot = getTodoQueueTargetColorSlot(options);
+  const hasTerminalTarget = Boolean(targetTerminalId || Number.isInteger(targetTerminalIndex) || targetThreadId);
+  const targetColorFallbackSlot = targetColorSlot ?? targetTerminalIndex ?? 0;
+  const targetTerminalColor = hasTerminalTarget
+    ? getTodoQueueTargetTerminalColor(options) || terminalColorForSlot(targetColorFallbackSlot)
+    : "";
   const remoteCommand = options.remoteCommand && typeof options.remoteCommand === "object"
     ? { ...options.remoteCommand }
     : null;
@@ -4563,6 +4611,8 @@ function createTodoQueueItem(text, options = {}) {
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
+    ...(targetTerminalColor ? { targetTerminalColor } : {}),
+    ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     text: normalizeTodoQueueText(text),
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -4586,6 +4636,12 @@ function normalizeTodoQueueItem(item) {
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
   const targetThreadId = getTodoQueueTargetThreadId(item);
+  const targetColorSlot = getTodoQueueTargetColorSlot(item);
+  const hasTerminalTarget = Boolean(targetTerminalId || Number.isInteger(targetTerminalIndex) || targetThreadId);
+  const targetColorFallbackSlot = targetColorSlot ?? targetTerminalIndex ?? 0;
+  const targetTerminalColor = hasTerminalTarget
+    ? getTodoQueueTargetTerminalColor(item) || terminalColorForSlot(targetColorFallbackSlot)
+    : "";
   const remoteCommand = item.remoteCommand && typeof item.remoteCommand === "object"
     ? { ...item.remoteCommand }
     : item.remote_command && typeof item.remote_command === "object"
@@ -4612,6 +4668,8 @@ function normalizeTodoQueueItem(item) {
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
+    ...(targetTerminalColor ? { targetTerminalColor } : {}),
+    ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     text,
     ...(workspaceId ? { workspaceId } : {}),
   };
@@ -4892,6 +4950,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   dropError = "",
   agentStatuses = [],
   items,
+  getItemAccentColor = null,
   onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
   onCancelQueuedItem,
@@ -6589,6 +6648,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         const hasTerminalTarget = Number.isInteger(targetTerminalIndex)
                           || Boolean(getTodoQueueTargetTerminalId(item))
                           || Boolean(getTodoQueueTargetThreadId(item));
+                        const todoAccentColor = typeof getItemAccentColor === "function"
+                          ? getItemAccentColor(item)
+                          : targetAgentId
+                            ? getTodoQueueAgentAccentColor(targetAgentId)
+                            : "";
 
                         return (
                           <TodoQueueItemCard
@@ -6613,7 +6677,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             onPointerDown={(event) => handlePointerDown(event, item)}
                             ref={(element) => setTodoItemElement(item.id, element)}
                             role="listitem"
-                            style={targetAgentId ? { "--todo-agent-color": getTodoQueueAgentAccentColor(targetAgentId) } : undefined}
+                            style={todoAccentColor ? { "--todo-agent-color": todoAccentColor } : undefined}
                             title={
                               isQueued
                                 ? hasTerminalTarget
@@ -7109,6 +7173,42 @@ function TerminalView({
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+  const getTodoQueueItemAccentColor = useCallback((item) => {
+    const targetTerminalId = getTodoQueueTargetTerminalId(item);
+    const targetThreadId = getTodoQueueTargetThreadId(item);
+    const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+    const targetColorSlot = getTodoQueueTargetColorSlot(item);
+    const hasTerminalTarget = Boolean(
+      targetTerminalId
+      || targetThreadId
+      || Number.isInteger(targetTerminalIndex)
+    );
+
+    if (hasTerminalTarget) {
+      const identityMatchedIndex = (targetTerminalId || targetThreadId)
+        ? logicalTerminalIndexes.find((terminalIndex) => todoQueueSendTargetMatchesIdentity({
+          paneId: getTerminalPaneId(terminalIndex),
+          targetThread: getTerminalThread(terminalIndex),
+        }, targetTerminalId, targetThreadId))
+        : null;
+      const liveTerminalIndex = Number.isInteger(identityMatchedIndex)
+        ? identityMatchedIndex
+        : Number.isInteger(targetTerminalIndex) && logicalTerminalIndexes.includes(targetTerminalIndex)
+          ? targetTerminalIndex
+          : null;
+      if (Number.isInteger(liveTerminalIndex)) {
+        return terminalColorForSlot(getTerminalAgentColorSlot(liveTerminalIndex));
+      }
+
+      return getTodoQueueTargetTerminalColor(item)
+        || (Number.isInteger(targetColorSlot) ? terminalColorForSlot(targetColorSlot) : "")
+        || (Number.isInteger(targetTerminalIndex) ? terminalColorForSlot(targetTerminalIndex) : "")
+        || TODO_QUEUE_DEFAULT_DOT_COLOR;
+    }
+
+    const targetAgentId = getTodoQueueTargetAgentId(item);
+    return targetAgentId ? getTodoQueueAgentAccentColor(targetAgentId) : "";
+  }, [getTerminalPaneId, getTerminalThread, logicalTerminalIndexes]);
   const getTerminalImageInputSupport = useCallback((terminalIndex) => (
     (() => {
       const role = getTerminalRole(terminalIndex);
@@ -10592,6 +10692,8 @@ function TerminalView({
           item: getTodoQueueItemLogSummary([item])[0] || null,
           source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
           targetAgentId: getTodoQueueTargetAgentId(item),
+          targetColorSlot: getTodoQueueTargetColorSlot(item),
+          targetTerminalColor: getTodoQueueTargetTerminalColor(item),
           targetTerminalId: getTodoQueueTargetTerminalId(item),
           targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
           targetThreadId: getTodoQueueTargetThreadId(item),
@@ -10620,6 +10722,8 @@ function TerminalView({
         phase: "queued",
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         targetRole: getTodoQueueTargetAgentId(item),
+        targetColorSlot: getTodoQueueTargetColorSlot(item),
+        targetTerminalColor: getTodoQueueTargetTerminalColor(item),
         targetTerminalId: getTodoQueueTargetTerminalId(item),
         targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
         targetThreadId: getTodoQueueTargetThreadId(item),
@@ -10631,6 +10735,8 @@ function TerminalView({
         item: getTodoQueueItemLogSummary([item])[0] || null,
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         targetAgentId: getTodoQueueTargetAgentId(item),
+        targetColorSlot: getTodoQueueTargetColorSlot(item),
+        targetTerminalColor: getTodoQueueTargetTerminalColor(item),
         targetTerminalId: getTodoQueueTargetTerminalId(item),
         targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
         targetThreadId: getTodoQueueTargetThreadId(item),
@@ -12194,6 +12300,7 @@ function TerminalView({
                           defaultWorkingDirectory={defaultWorkingDirectory}
                           draft={todoQueueDraft}
                           dropError={todoDropError}
+                          getItemAccentColor={getTodoQueueItemAccentColor}
                           items={todoQueueItems}
                           onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
                           onBeginTodoDrag={handleBeginTodoDrag}
