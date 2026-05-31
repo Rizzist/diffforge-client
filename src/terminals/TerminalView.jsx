@@ -102,16 +102,15 @@ import {
   setWorkspaceThreadComposerDraft,
   subscribeWorkspaceThreadComposerAttachments,
   subscribeWorkspaceThreadComposerDrafts,
-  waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
   WORKSPACE_FILE_POINTER_DROP_EVENT,
   workspaceFileToComposerAttachment,
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
-const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [300, 1000, 2500, 5000];
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
+const TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS = 1200;
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
@@ -128,6 +127,7 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "parked_task_waiting",
   "reserved",
   "resume_in_progress",
+  "session_acceptance_pending",
   "submitted_prompt_active",
   "terminal_starting",
 ]);
@@ -2953,6 +2953,13 @@ function normalizeTodoQueueText(value) {
     .slice(0, TODO_QUEUE_MAX_TEXT_LENGTH);
 }
 
+function normalizeTodoQueuePromptComparisonText(value) {
+  return normalizeTodoQueueText(value)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 function normalizeTodoQueueMultilineText(value, maxLength = TODO_QUEUE_MAX_NOTE_TEXT_LENGTH) {
   return String(value || "")
     .replace(/\r\n/g, "\n")
@@ -2964,6 +2971,17 @@ function normalizeTodoQueueMultilineText(value, maxLength = TODO_QUEUE_MAX_NOTE_
 function getTodoQueueLineCount(value) {
   const text = normalizeTodoQueueMultilineText(value);
   return text ? text.split("\n").length : 0;
+}
+
+function getTodoQueueLatestUserMessage(thread) {
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (String(message?.role || "").trim().toLowerCase() === "user") {
+      return message;
+    }
+  }
+  return null;
 }
 
 function getTodoQueuePastedLinesLabel(lineCount) {
@@ -4102,22 +4120,6 @@ function getTodoQueueLifecycleSource(source, item) {
     : "tui-todo-drop";
 }
 
-function getTodoQueueAcceptLogPrefix(source, item) {
-  if (isSpecEditTodoQueueItem(item)) {
-    return "frontend.spec_edit";
-  }
-  if (source === "tui-todo-auto-queue") {
-    return "frontend.todo_auto_queue";
-  }
-  if (source === "tui-voice-agent-queue") {
-    return "frontend.voice_agent_queue";
-  }
-  if (source === TODO_QUEUE_SOURCE_VOICE_PLAN) {
-    return "frontend.voice_plan_queue";
-  }
-  return "frontend.todo_drop";
-}
-
 function normalizeTodoTerminalAgentId(value) {
   return String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
 }
@@ -4132,9 +4134,14 @@ function normalizeTodoTerminalIndex(value) {
 }
 
 function getTodoQueueTargetAgentId(item) {
+  const queueState = getTodoQueueRawQueueState(item);
   return normalizeTodoTerminalAgentId(
     item?.targetAgentId
       || item?.target_agent_id
+      || queueState?.targetAgentId
+      || queueState?.target_agent_id
+      || queueState?.targetRole
+      || queueState?.target_role
       || item?.remoteCommand?.targetAgentId
       || item?.remote_command?.target_agent_id
       || "",
@@ -4142,6 +4149,7 @@ function getTodoQueueTargetAgentId(item) {
 }
 
 function getTodoQueueTargetTerminalId(item) {
+  const queueState = getTodoQueueRawQueueState(item);
   return normalizeTodoTerminalIdentity(
     item?.targetTerminalId
       || item?.target_terminal_id
@@ -4149,6 +4157,12 @@ function getTodoQueueTargetTerminalId(item) {
       || item?.terminal_id
       || item?.paneId
       || item?.pane_id
+      || queueState?.targetTerminalId
+      || queueState?.target_terminal_id
+      || queueState?.terminalId
+      || queueState?.terminal_id
+      || queueState?.paneId
+      || queueState?.pane_id
       || item?.remoteCommand?.targetTerminalId
       || item?.remoteCommand?.target_terminal_id
       || item?.remoteCommand?.terminalId
@@ -4163,11 +4177,16 @@ function getTodoQueueTargetTerminalId(item) {
 }
 
 function getTodoQueueTargetThreadId(item) {
+  const queueState = getTodoQueueRawQueueState(item);
   return normalizeTodoTerminalIdentity(
     item?.targetThreadId
       || item?.target_thread_id
       || item?.threadId
       || item?.thread_id
+      || queueState?.targetThreadId
+      || queueState?.target_thread_id
+      || queueState?.threadId
+      || queueState?.thread_id
       || item?.remoteCommand?.targetThreadId
       || item?.remoteCommand?.target_thread_id
       || item?.remoteCommand?.threadId
@@ -4179,11 +4198,16 @@ function getTodoQueueTargetThreadId(item) {
 }
 
 function getTodoQueueTargetTerminalIndex(item) {
-  return normalizeTodoTerminalIndex(
+  const queueState = getTodoQueueRawQueueState(item);
+  const directIndex = normalizeTodoTerminalIndex(
     item?.targetTerminalIndex
       ?? item?.target_terminal_index
       ?? item?.terminalIndex
       ?? item?.terminal_index
+      ?? queueState?.targetTerminalIndex
+      ?? queueState?.target_terminal_index
+      ?? queueState?.terminalIndex
+      ?? queueState?.terminal_index
       ?? item?.remoteCommand?.targetTerminalIndex
       ?? item?.remoteCommand?.target_terminal_index
       ?? item?.remoteCommand?.terminalIndex
@@ -4191,9 +4215,54 @@ function getTodoQueueTargetTerminalIndex(item) {
       ?? item?.remote_command?.target_terminal_index
       ?? item?.remote_command?.terminal_index,
   );
+  if (directIndex !== null) {
+    return directIndex;
+  }
+
+  const colorSlot = normalizeTerminalColorSlot(
+    item?.targetColorSlot
+      ?? item?.target_color_slot
+      ?? item?.terminalColorSlot
+      ?? item?.terminal_color_slot
+      ?? item?.colorSlot
+      ?? item?.color_slot
+      ?? queueState?.targetColorSlot
+      ?? queueState?.target_color_slot
+      ?? queueState?.terminalColorSlot
+      ?? queueState?.terminal_color_slot
+      ?? queueState?.colorSlot
+      ?? queueState?.color_slot
+      ?? item?.remoteCommand?.targetColorSlot
+      ?? item?.remoteCommand?.target_color_slot
+      ?? item?.remoteCommand?.terminalColorSlot
+      ?? item?.remoteCommand?.terminal_color_slot
+      ?? item?.remoteCommand?.colorSlot
+      ?? item?.remoteCommand?.color_slot
+      ?? item?.remote_command?.target_color_slot
+      ?? item?.remote_command?.terminal_color_slot
+      ?? item?.remote_command?.color_slot,
+  );
+  const hasTerminalColor = Boolean(normalizeTerminalHexColor(
+    item?.targetTerminalColor
+      || item?.target_terminal_color
+      || item?.terminalColor
+      || item?.terminal_color
+      || queueState?.targetTerminalColor
+      || queueState?.target_terminal_color
+      || queueState?.terminalColor
+      || queueState?.terminal_color
+      || item?.remoteCommand?.targetTerminalColor
+      || item?.remoteCommand?.target_terminal_color
+      || item?.remoteCommand?.terminalColor
+      || item?.remoteCommand?.terminal_color
+      || item?.remote_command?.target_terminal_color
+      || item?.remote_command?.terminal_color,
+  ));
+  return hasTerminalColor ? colorSlot : null;
 }
 
 function getTodoQueueTargetColorSlot(item) {
+  const queueState = getTodoQueueRawQueueState(item);
   return normalizeTerminalColorSlot(
     item?.targetColorSlot
       ?? item?.target_color_slot
@@ -4201,6 +4270,12 @@ function getTodoQueueTargetColorSlot(item) {
       ?? item?.terminal_color_slot
       ?? item?.colorSlot
       ?? item?.color_slot
+      ?? queueState?.targetColorSlot
+      ?? queueState?.target_color_slot
+      ?? queueState?.terminalColorSlot
+      ?? queueState?.terminal_color_slot
+      ?? queueState?.colorSlot
+      ?? queueState?.color_slot
       ?? item?.remoteCommand?.targetColorSlot
       ?? item?.remoteCommand?.target_color_slot
       ?? item?.remoteCommand?.terminalColorSlot
@@ -4214,11 +4289,16 @@ function getTodoQueueTargetColorSlot(item) {
 }
 
 function getTodoQueueTargetTerminalColor(item) {
+  const queueState = getTodoQueueRawQueueState(item);
   const candidates = [
     item?.targetTerminalColor,
     item?.target_terminal_color,
     item?.terminalColor,
     item?.terminal_color,
+    queueState?.targetTerminalColor,
+    queueState?.target_terminal_color,
+    queueState?.terminalColor,
+    queueState?.terminal_color,
     item?.remoteCommand?.targetTerminalColor,
     item?.remoteCommand?.target_terminal_color,
     item?.remoteCommand?.terminalColor,
@@ -4233,6 +4313,144 @@ function getTodoQueueTargetTerminalColor(item) {
     }
   }
   return "";
+}
+
+function normalizeTodoQueuePersistedQueueState(item) {
+  const queueState = getTodoQueueRawQueueState(item);
+  if (!queueState) {
+    return null;
+  }
+
+  const phase = normalizeTodoQueuePersistedPhase(
+    queueState.phase
+      || queueState.state
+      || queueState.queuePhase
+      || queueState.queue_phase,
+  );
+  if (!phase) {
+    return null;
+  }
+
+  const source = normalizeTodoQueueSource(queueState.source || item?.source || "");
+  const targetAgentId = getTodoQueueTargetAgentId(item);
+  const targetTerminalId = getTodoQueueTargetTerminalId(item);
+  const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+  const targetThreadId = getTodoQueueTargetThreadId(item);
+  const targetColorSlot = getTodoQueueTargetColorSlot(item);
+  const targetTerminalColor = getTodoQueueTargetTerminalColor(item);
+  const createdAt = String(queueState.createdAt || queueState.created_at || queueState.queuedAt || queueState.queued_at || "").trim();
+  const updatedAt = String(queueState.updatedAt || queueState.updated_at || "").trim();
+  const reason = String(queueState.reason || "").trim();
+
+  return {
+    phase,
+    state: phase,
+    ...(source ? { source } : {}),
+    ...(targetAgentId ? { targetAgentId, targetRole: targetAgentId } : {}),
+    ...(targetTerminalId ? { targetTerminalId } : {}),
+    ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetThreadId ? { targetThreadId } : {}),
+    ...(targetTerminalColor ? { targetTerminalColor } : {}),
+    ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
+    ...(createdAt ? { queuedAt: createdAt } : {}),
+    ...(updatedAt ? { updatedAt } : {}),
+    ...(reason ? { reason } : {}),
+  };
+}
+
+function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
+  if (!item || typeof item !== "object") {
+    return item;
+  }
+
+  const safePhase = normalizeTodoQueuePersistedPhase(phase);
+  if (!safePhase) {
+    const { queueState: _queueState, queue_state: _queueStateSnake, ...rest } = item;
+    return rest;
+  }
+
+  const existingState = getTodoQueueRawQueueState(item) || {};
+  const fieldTargetColorSlot = normalizeTerminalColorSlot(fields.targetColorSlot);
+  const fieldTargetTerminalIndex = normalizeTodoTerminalIndex(fields.targetTerminalIndex);
+  const existingTargetColorSlot = normalizeTerminalColorSlot(existingState.targetColorSlot ?? existingState.target_color_slot);
+  const existingTargetTerminalIndex = normalizeTodoTerminalIndex(
+    existingState.targetTerminalIndex
+      ?? existingState.target_terminal_index
+      ?? existingState.terminalIndex
+      ?? existingState.terminal_index,
+  );
+  const nowIso = new Date().toISOString();
+  const nextState = normalizeTodoQueuePersistedQueueState({
+    ...item,
+    queueState: {
+      ...existingState,
+      phase: safePhase,
+      state: safePhase,
+      source: fields.source || existingState.source || item.source || "",
+      targetAgentId: fields.targetAgentId || fields.targetRole || existingState.targetAgentId || existingState.targetRole || getTodoQueueTargetAgentId(item),
+      targetColorSlot: fieldTargetColorSlot ?? existingTargetColorSlot ?? getTodoQueueTargetColorSlot(item),
+      targetTerminalColor: fields.targetTerminalColor || existingState.targetTerminalColor || existingState.target_terminal_color || getTodoQueueTargetTerminalColor(item),
+      targetTerminalId: fields.targetTerminalId || existingState.targetTerminalId || existingState.target_terminal_id || getTodoQueueTargetTerminalId(item),
+      targetTerminalIndex: fieldTargetTerminalIndex ?? existingTargetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+      targetThreadId: fields.targetThreadId || existingState.targetThreadId || existingState.target_thread_id || getTodoQueueTargetThreadId(item),
+      queuedAt: existingState.queuedAt || existingState.queued_at || nowIso,
+      updatedAt: nowIso,
+      reason: fields.reason || existingState.reason || "",
+    },
+  });
+
+  return nextState ? { ...item, queueState: nextState } : item;
+}
+
+function getTodoQueueItemWithoutPersistedQueueState(item) {
+  if (!item || typeof item !== "object") {
+    return item;
+  }
+  const { queueState: _queueState, queue_state: _queueStateSnake, ...rest } = item;
+  return rest;
+}
+
+function getTodoQueueItemStorageRehydrated(item) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item);
+  if (!queueState) {
+    return item;
+  }
+  return getTodoQueueItemWithPersistedQueueState(item, "queued", {
+    ...queueState,
+    reason: queueState.phase === "sending" ? "recovered_after_restart" : queueState.reason || "",
+  });
+}
+
+function buildTodoQueuePendingItemsFromPersistedQueue(items, workspaceId = "") {
+  const startedAtMs = Date.now();
+  return (Array.isArray(items) ? items : []).reduce((pendingItems, item) => {
+    const queueState = normalizeTodoQueuePersistedQueueState(item);
+    if (!item?.id || !queueState) {
+      return pendingItems;
+    }
+    pendingItems[item.id] = {
+      cancellable: true,
+      item: getTodoQueueItemLogSummary([item])[0] || null,
+      itemId: item.id,
+      message: "",
+      paneId: "",
+      phase: "queued",
+      reason: queueState.reason || "rehydrated",
+      source: queueState.source || getTodoQueueItemAutoQueueSource(item),
+      startedAtMs,
+      state: "queued",
+      targetRole: queueState.targetRole || queueState.targetAgentId || getTodoQueueTargetAgentId(item),
+      targetTerminalId: queueState.targetTerminalId || getTodoQueueTargetTerminalId(item),
+      targetTerminalIndex: Number.isInteger(queueState.targetTerminalIndex)
+        ? queueState.targetTerminalIndex
+        : getTodoQueueTargetTerminalIndex(item) ?? "",
+      targetThreadId: queueState.targetThreadId || getTodoQueueTargetThreadId(item),
+      timeoutAtMs: 0,
+      timeoutMs: 0,
+      workspaceId: item.workspaceId || workspaceId || "",
+    };
+    return pendingItems;
+  }, {});
 }
 
 function todoQueueRemoteItemsMatch(left, right) {
@@ -4568,6 +4786,21 @@ function getTodoQueuePendingPhase(pendingItem) {
   return phase === "queued" ? "queued" : "sending";
 }
 
+function normalizeTodoQueuePersistedPhase(value) {
+  const phase = String(value || "").trim().toLowerCase();
+  return phase === "queued" || phase === "sending" ? phase : "";
+}
+
+function getTodoQueueRawQueueState(item) {
+  if (item?.queueState && typeof item.queueState === "object") {
+    return item.queueState;
+  }
+  if (item?.queue_state && typeof item.queue_state === "object") {
+    return item.queue_state;
+  }
+  return null;
+}
+
 function createTodoQueueItem(text, options = {}) {
   const createdAt = typeof options.createdAt === "string" && options.createdAt.trim()
     ? options.createdAt
@@ -4598,6 +4831,7 @@ function createTodoQueueItem(text, options = {}) {
   const remoteCommand = options.remoteCommand && typeof options.remoteCommand === "object"
     ? { ...options.remoteCommand }
     : null;
+  const queueState = normalizeTodoQueuePersistedQueueState(options);
 
   return {
     createdAt,
@@ -4609,6 +4843,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(source ? { source } : {}),
     ...(specEdit ? { specEdit } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
+    ...(queueState ? { queueState } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
@@ -4650,6 +4885,7 @@ function normalizeTodoQueueItem(item) {
     : item.remote_command && typeof item.remote_command === "object"
       ? { ...item.remote_command }
       : null;
+  const queueState = normalizeTodoQueuePersistedQueueState(item);
   if (!text && !image && !note && !specEdit?.promptText) {
     return null;
   }
@@ -4666,6 +4902,7 @@ function normalizeTodoQueueItem(item) {
     ...(source ? { source } : {}),
     ...(specEdit ? { specEdit } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
+    ...(queueState ? { queueState } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
@@ -4691,7 +4928,8 @@ function readTodoQueueItems(storageKey) {
   }
 
   try {
-    return normalizeTodoQueueItems(JSON.parse(window.localStorage.getItem(storageKey) || "[]"));
+    return normalizeTodoQueueItems(JSON.parse(window.localStorage.getItem(storageKey) || "[]"))
+      .map(getTodoQueueItemStorageRehydrated);
   } catch {
     return [];
   }
@@ -7007,6 +7245,7 @@ function TerminalView({
   terminalRolesByIndex = {},
   terminalThreadsByIndex = {},
   terminalWorkspaceCoordinationTargets = [],
+  terminalWorkspaceRootWasEmptyAtSelection = false,
   terminalWorkspaceWorkingDirectory,
   terminalWorkspaceLogicalIndexes,
   terminalWorkspaceLogicalTerminalCount,
@@ -7139,6 +7378,7 @@ function TerminalView({
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
   const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
+  const todoQueueLiveTerminalsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
   const todoQueueTerminalResumeLocksRef = useRef(new Map());
   const voiceAgentToolCallIdsRef = useRef(new Set());
@@ -7379,6 +7619,208 @@ function TerminalView({
   const selectedWorkspaceThreadId = workspaceThreadEntry?.threadsView?.selectedThreadId
     || workspaceThreadEntry?.activeThreadId
     || "";
+  const resolveTodoQueueLiveTerminal = useCallback((terminalIndex, paneIdOverride = "") => {
+    const normalizedIndex = Number(terminalIndex);
+    if (!Number.isInteger(normalizedIndex)) {
+      return {
+        liveTerminal: null,
+        liveTerminalSource: "",
+        runtimeTerminal: null,
+        workspaceLiveTerminal: null,
+      };
+    }
+
+    const paneId = String(paneIdOverride || getTerminalPaneId(normalizedIndex) || "").trim();
+    const workspaceLiveTerminal = Object.values(workspaceThreadEntry?.terminals || {}).find((candidate) => {
+      const candidateIndex = Number(candidate?.terminalIndex);
+      return Number.isInteger(candidateIndex)
+        ? candidateIndex === normalizedIndex
+        : String(candidate?.paneId || "").trim() === paneId;
+    }) || null;
+    const runtimeCandidate = todoQueueLiveTerminalsRef.current.get(normalizedIndex) || null;
+    const runtimePaneId = String(runtimeCandidate?.paneId || "").trim();
+    const runtimeTerminal = runtimeCandidate && (!paneId || !runtimePaneId || runtimePaneId === paneId)
+      ? runtimeCandidate
+      : null;
+    if (!workspaceLiveTerminal && !runtimeTerminal) {
+      return {
+        liveTerminal: null,
+        liveTerminalSource: "",
+        runtimeTerminal,
+        workspaceLiveTerminal,
+      };
+    }
+
+    const configuredThread = getTerminalThread(normalizedIndex);
+    const workspaceStatus = String(workspaceLiveTerminal?.status || "").trim().toLowerCase();
+    const runtimeStatus = String(runtimeTerminal?.status || "").trim().toLowerCase();
+    const mergedStatus = workspaceStatus && workspaceStatus !== "starting"
+      ? workspaceStatus
+      : runtimeStatus || workspaceStatus || "active";
+    const workspaceInputReadyAt = workspaceLiveTerminal?.inputReadyAt
+      || workspaceLiveTerminal?.promptReadyAt
+      || "";
+    const runtimeInputReadyAt = runtimeTerminal?.inputReadyAt
+      || runtimeTerminal?.promptReadyAt
+      || "";
+    const inputReadyAt = workspaceInputReadyAt || runtimeInputReadyAt;
+    const promptReadyAt = workspaceLiveTerminal?.promptReadyAt
+      || runtimeTerminal?.promptReadyAt
+      || inputReadyAt;
+    const liveTerminal = {
+      ...(runtimeTerminal || {}),
+      ...(workspaceLiveTerminal || {}),
+      agentId: workspaceLiveTerminal?.agentId || runtimeTerminal?.agentId || getTerminalRole(normalizedIndex),
+      inputReady: Boolean(workspaceLiveTerminal?.inputReady || runtimeTerminal?.inputReady),
+      inputReadyAt,
+      instanceId: workspaceLiveTerminal?.instanceId || runtimeTerminal?.instanceId || "",
+      paneId: workspaceLiveTerminal?.paneId || runtimeTerminal?.paneId || paneId,
+      promptReadyAt,
+      status: mergedStatus,
+      terminalIndex: normalizedIndex,
+      threadId: workspaceLiveTerminal?.threadId || runtimeTerminal?.threadId || configuredThread?.id || "",
+      workspaceId: workspaceLiveTerminal?.workspaceId || runtimeTerminal?.workspaceId || terminalWorkspace?.id || "",
+    };
+    const liveTerminalSource = workspaceLiveTerminal && runtimeTerminal
+      ? "workspace_threads+mounted_terminal_lifecycle"
+      : workspaceLiveTerminal
+        ? "workspace_threads"
+        : "mounted_terminal_lifecycle";
+
+    return {
+      liveTerminal,
+      liveTerminalSource,
+      runtimeTerminal,
+      workspaceLiveTerminal,
+    };
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    terminalWorkspace?.id,
+    workspaceThreadEntry,
+  ]);
+  const recordTodoQueueTerminalLifecycle = useCallback((event = {}) => {
+    const eventWorkspaceId = String(event.workspaceId || event.workspace_id || "").trim();
+    if (
+      eventWorkspaceId
+      && terminalWorkspace?.id
+      && eventWorkspaceId !== terminalWorkspace.id
+    ) {
+      return;
+    }
+
+    const eventPaneId = String(event.paneId || event.pane_id || "").trim();
+    let terminalIndex = Number(event.terminalIndex ?? event.terminal_index);
+    if (!Number.isInteger(terminalIndex) && eventPaneId) {
+      const matchingIndex = logicalTerminalIndexes.find((candidateIndex) => (
+        getTerminalPaneId(candidateIndex) === eventPaneId
+      ));
+      terminalIndex = Number.isInteger(matchingIndex) ? matchingIndex : Number.NaN;
+    }
+    if (!Number.isInteger(terminalIndex) || !logicalTerminalIndexes.includes(terminalIndex)) {
+      return;
+    }
+
+    const eventType = String(event.type || "").trim().toLowerCase();
+    const paneId = eventPaneId || getTerminalPaneId(terminalIndex);
+    const terminalClosed = eventType === "closed"
+      || eventType === "exited"
+      || eventType === "error"
+      || event.forgetTerminalThread === true;
+    if (terminalClosed) {
+      const deleted = todoQueueLiveTerminalsRef.current.delete(terminalIndex);
+      if (deleted) {
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+      }
+      logTerminalStatus("frontend.todo_queue.live_terminal_lifecycle", {
+        eventType,
+        paneId,
+        reason: "terminal_removed",
+        terminalIndex,
+        threadId: event.threadId || "",
+        workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
+      });
+      return;
+    }
+
+    const existing = todoQueueLiveTerminalsRef.current.get(terminalIndex) || {};
+    const activityStatus = String(event.activityStatus || "").trim().toLowerCase();
+    const marksReady = event.inputReady === true
+      || eventType === "terminal-input-ready"
+      || eventType === "terminal-prompt-ready"
+      || eventType === "provider-turn-completed"
+      || eventType === "provider-turn-error";
+    const marksBusy = event.inputReady === false
+      || eventType === "message-submitted"
+      || eventType === "agent-output"
+      || eventType === "provider-turn-started"
+      || activityStatus === "thinking";
+    const inputReady = marksReady
+      ? true
+      : marksBusy
+        ? false
+        : Boolean(existing.inputReady);
+    const nowIso = new Date().toISOString();
+    const status = String(event.status || existing.status || "active").trim().toLowerCase() || "active";
+    const nextTerminal = {
+      agentId: event.agentId || existing.agentId || getTerminalRole(terminalIndex),
+      inputReady,
+      inputReadyAt: inputReady
+        ? event.inputReadyAt || event.promptReadyAt || existing.inputReadyAt || existing.promptReadyAt || nowIso
+        : "",
+      inputReadyConfidence: event.inputReadyConfidence
+        || event.promptReadyConfidence
+        || existing.inputReadyConfidence
+        || "",
+      instanceId: event.instanceId ?? existing.instanceId ?? "",
+      paneId,
+      promptReadyAt: inputReady
+        ? event.promptReadyAt || event.inputReadyAt || existing.promptReadyAt || existing.inputReadyAt || nowIso
+        : "",
+      promptReadyConfidence: event.promptReadyConfidence
+        || event.inputReadyConfidence
+        || existing.promptReadyConfidence
+        || "",
+      status,
+      terminalIndex,
+      threadId: event.threadId || existing.threadId || getTerminalThread(terminalIndex)?.id || "",
+      updatedAt: nowIso,
+      workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
+    };
+    const changed = existing.inputReady !== nextTerminal.inputReady
+      || String(existing.instanceId || "") !== String(nextTerminal.instanceId || "")
+      || String(existing.paneId || "") !== String(nextTerminal.paneId || "")
+      || String(existing.status || "") !== String(nextTerminal.status || "")
+      || String(existing.threadId || "") !== String(nextTerminal.threadId || "");
+    todoQueueLiveTerminalsRef.current.set(terminalIndex, nextTerminal);
+    if (changed || marksReady || marksBusy || eventType === "opened") {
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    }
+    logTerminalStatus("frontend.todo_queue.live_terminal_lifecycle", {
+      eventType,
+      inputReady,
+      inputReadyAt: nextTerminal.inputReadyAt,
+      instanceId: nextTerminal.instanceId || "",
+      marksBusy,
+      marksReady,
+      paneId,
+      status,
+      terminalIndex,
+      threadId: nextTerminal.threadId || "",
+      workspaceId: nextTerminal.workspaceId || "",
+    });
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+  ]);
+  const handleWorkspaceTerminalLifecycle = useCallback((event) => {
+    recordTodoQueueTerminalLifecycle(event);
+    onThreadTerminalLifecycle?.(event);
+  }, [onThreadTerminalLifecycle, recordTodoQueueTerminalLifecycle]);
   const getLiveTerminalPaneIdForThread = useCallback((threadId) => {
     const safeThreadId = String(threadId || "").trim();
     if (!safeThreadId || !workspaceThreadEntry?.terminals) {
@@ -7546,18 +7988,19 @@ function TerminalView({
         return;
       }
       logTerminalStatus("frontend.terminal_status.ground_truth_availability", {
-        activityStatus: fields.activityStatus || "",
-        agentInputReady: Boolean(fields.agentInputReady),
-        allowGeneric,
-        available,
-        hasComposerDraft: Boolean(fields.syncKey && String(getWorkspaceThreadComposerDraftStore().get(fields.syncKey) || "").length > 0),
-        hasComposerSyncKey: Boolean(fields.syncKey),
-        hasLiveTerminal: Boolean(fields.liveTerminal),
-        hasPendingPrompt: Boolean(fields.targetThread?.pendingPrompt),
-        hasResolvedBinding: Boolean(fields.targetBinding?.instanceId),
-        hasTargetThread: Boolean(fields.targetThread?.id),
-        inputReadyAt: fields.inputReadyAt || "",
-        latestTurnState: fields.latestTurnState || "",
+          activityStatus: fields.activityStatus || "",
+          agentInputReady: Boolean(fields.agentInputReady),
+          allowGeneric,
+          available,
+          hasComposerDraft: Boolean(fields.syncKey && String(getWorkspaceThreadComposerDraftStore().get(fields.syncKey) || "").length > 0),
+          hasComposerSyncKey: Boolean(fields.syncKey),
+          hasLiveTerminal: Boolean(fields.liveTerminal),
+          hasPendingPrompt: Boolean(fields.targetThread?.pendingPrompt),
+          hasResolvedBinding: Boolean(fields.targetBinding?.instanceId || fields.targetBinding?.paneId),
+          hasTargetThread: Boolean(fields.targetThread?.id),
+          inputReadyAt: fields.inputReadyAt || "",
+          liveTerminalSource: fields.liveTerminalSource || "",
+          latestTurnState: fields.latestTurnState || "",
         effectiveLatestTurnState: fields.effectiveLatestTurnState || "",
         message,
         parkedStatus: fields.parkedStatus || "",
@@ -7598,35 +8041,33 @@ function TerminalView({
     const paneId = getTerminalPaneId(targetTerminalIndex);
     const targetRole = String(getTerminalRole(targetTerminalIndex) || "").trim().toLowerCase();
     const targetProject = getTerminalProjectTarget(targetTerminalIndex);
-    const terminalAgent = getTerminalAgent(targetTerminalIndex);
-    const specEdit = getTodoQueueItemSpecEdit(item);
-    const specEditRepoPath = specEditTargetRepoPath(specEdit);
-    const terminalEntries = Object.values(workspaceThreadEntry?.terminals || {});
-    const liveTerminal = terminalEntries.find((candidate) => {
-      const candidateIndex = Number(candidate?.terminalIndex);
-      return Number.isInteger(candidateIndex)
-        ? candidateIndex === targetTerminalIndex
-        : candidate?.paneId === paneId;
-    }) || null;
-    const liveThread = liveTerminal?.threadId
-      ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
-      : null;
+      const terminalAgent = getTerminalAgent(targetTerminalIndex);
+      const specEdit = getTodoQueueItemSpecEdit(item);
+      const specEditRepoPath = specEditTargetRepoPath(specEdit);
+      const {
+        liveTerminal,
+        liveTerminalSource,
+      } = resolveTodoQueueLiveTerminal(targetTerminalIndex, paneId);
+      const liveThread = liveTerminal?.threadId
+        ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
+        : null;
     const configuredThread = getTerminalThread(targetTerminalIndex);
     const targetThread = liveThread || configuredThread || null;
     const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
     const targetBinding = targetProviderBinding?.terminalBinding || targetThread?.terminalBinding || null;
     const resolvedBinding = targetBinding
       ? {
-        ...targetBinding,
-        instanceId: targetBinding.instanceId || liveTerminal?.instanceId || "",
-        paneId: targetBinding.paneId || paneId,
-      }
-      : liveTerminal?.instanceId
-        ? {
-          instanceId: liveTerminal.instanceId,
-          paneId,
+          ...targetBinding,
+          instanceId: targetBinding.instanceId || liveTerminal?.instanceId || "",
+          paneId: targetBinding.paneId || paneId,
         }
-        : null;
+        : liveTerminal
+          ? {
+            instanceId: liveTerminal.instanceId || "",
+            paneId: liveTerminal.paneId || paneId,
+            terminalIndex: targetTerminalIndex,
+          }
+          : null;
     const syncKey = getThreadComposerSyncKey(targetThread, {
       ...resolvedBinding,
       paneId: resolvedBinding?.paneId || paneId,
@@ -7657,21 +8098,35 @@ function TerminalView({
       terminalStatus,
       turnStartedAt,
     } = terminalGroundTruth;
-    const shouldAutoSubmit = Boolean(
-      !image
-        && targetRole
-        && !["generic", "terminal", "shell"].includes(targetRole),
-    );
-    const targetFields = {
-      agentInputReady,
-      activityStatus: effectiveActivityStatus,
-      completedTurnLooksSendable,
-      image,
-      inputReadyAt,
-      latestTurnState,
-      effectiveLatestTurnState,
-      liveTerminal,
-      paneId,
+      const sendableByCompletedIdleTerminal = Boolean(
+        ["active", "running"].includes(terminalStatus)
+          && !targetThread?.pendingPrompt
+          && effectiveLatestTurnState !== "running"
+          && effectiveActivityStatus !== "thinking"
+          && (
+            completedTurnLooksSendable
+              || runningTurnLooksIdle
+              || TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState || latestTurnState)
+          )
+      );
+      const queueAgentInputReady = Boolean(agentInputReady || sendableByCompletedIdleTerminal);
+      const shouldAutoSubmit = Boolean(
+        !image
+          && targetRole
+          && !["generic", "terminal", "shell"].includes(targetRole),
+      );
+      const targetFields = {
+        agentInputReady: queueAgentInputReady,
+        activityStatus: effectiveActivityStatus,
+        completedTurnLooksSendable,
+        image,
+        inputReadyAt,
+        rawAgentInputReady: agentInputReady,
+        latestTurnState,
+        effectiveLatestTurnState,
+        liveTerminal,
+        liveTerminalSource,
+        paneId,
       parkedStatus,
       projectRoot: targetProject?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
       projectMountId: targetProject?.mountId || "",
@@ -7680,8 +8135,9 @@ function TerminalView({
       requiresAgentInputReady,
       orphanRunningLooksIdle,
       inputReadyIsFreshForTurn,
-      runningTurnLooksIdle,
-      shouldAutoSubmit,
+        runningTurnLooksIdle,
+        sendableByCompletedIdleTerminal,
+        shouldAutoSubmit,
       syncKey,
       targetBinding: resolvedBinding,
       targetProviderBinding,
@@ -7818,6 +8274,81 @@ function TerminalView({
       const blockingThreadId = String(blockingInFlightPrompt.threadId || "").trim();
       const liveThreadId = String(liveTerminal?.threadId || targetThread?.id || "").trim();
       const inputReadyAtMs = Date.parse(inputReadyAt || "") || 0;
+      const blockingLatestTurn = targetThread?.latestTurn || null;
+      const blockingLatestTurnState = String(
+        blockingLatestTurn?.state || effectiveLatestTurnState || latestTurnState || "",
+      ).trim().toLowerCase();
+      const blockingLatestTurnId = String(blockingLatestTurn?.turnId || blockingLatestTurn?.id || "").trim();
+      const blockingLatestMessageId = String(blockingLatestTurn?.messageId || "").trim();
+      const blockingPromptId = String(blockingInFlightPrompt.promptId || "").trim();
+      const blockingPromptTurnMatches = Boolean(
+        blockingPromptId
+          && (
+            blockingLatestTurnId.includes(blockingPromptId)
+            || blockingLatestMessageId === blockingPromptId
+          ),
+      );
+      const blockingLatestUserMessage = getTodoQueueLatestUserMessage(targetThread);
+      const blockingPromptText = normalizeTodoQueuePromptComparisonText(blockingInFlightPrompt.promptText);
+      const blockingLatestUserPromptText = normalizeTodoQueuePromptComparisonText(blockingLatestUserMessage?.text);
+      const blockingLatestUserPromptMatches = Boolean(
+        blockingPromptText
+          && blockingLatestUserPromptText
+          && blockingPromptText === blockingLatestUserPromptText,
+      );
+      const blockingLatestTurnStartedAtMs = Date.parse(
+        blockingLatestTurn?.startedAt
+          || blockingLatestTurn?.requestedAt
+          || blockingLatestTurn?.updatedAt
+          || "",
+      ) || 0;
+      const blockingLatestTurnAfterSubmit = Boolean(
+        blockingSubmittedAtMs
+          && blockingLatestTurnStartedAtMs
+          && blockingLatestTurnStartedAtMs >= blockingSubmittedAtMs - TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS,
+      );
+      const blockingPromptAccepted = Boolean(
+        blockingInFlightPrompt.accepted === true
+          || blockingInFlightPrompt.acceptedAtMs
+          || blockingInFlightPrompt.acceptedAt,
+      );
+      const blockingFreshInputReady = Boolean(
+        (recordedAgentInputReady || agentInputReady)
+          && blockingSubmittedAtMs
+          && inputReadyAtMs
+          && inputReadyAtMs >= blockingSubmittedAtMs - TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS,
+      );
+        const blockingTerminalReadyForNextPrompt = Boolean(
+          ["active", "running"].includes(terminalStatus)
+            && !targetThread?.pendingPrompt
+            && effectiveLatestTurnState !== "running"
+            && effectiveActivityStatus !== "thinking"
+          && (
+              queueAgentInputReady
+                || completedTurnLooksSendable
+                || runningTurnLooksIdle
+                || TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState)
+            )
+        );
+        const blockingPromptAcceptedByCompletedThread = Boolean(
+          !blockingPromptAccepted
+            && TODO_QUEUE_CLOSED_TURN_STATES.has(blockingLatestTurnState)
+            && blockingFreshInputReady
+            && blockingTerminalReadyForNextPrompt
+            && blockingLatestUserPromptMatches
+            && (blockingPromptTurnMatches || blockingLatestTurnAfterSubmit)
+        );
+        const blockingAcceptedPromptFinished = Boolean(
+          (blockingPromptAccepted || blockingPromptAcceptedByCompletedThread)
+            && TODO_QUEUE_CLOSED_TURN_STATES.has(blockingLatestTurnState)
+            && blockingFreshInputReady
+            && blockingTerminalReadyForNextPrompt
+          && (
+            blockingPromptTurnMatches
+            || blockingLatestUserPromptMatches
+            || blockingLatestTurnAfterSubmit
+          )
+      );
       const inFlightPromptInstanceChanged = Boolean(
         Number.isInteger(blockingInstanceId)
           && blockingInstanceId > 0
@@ -7834,12 +8365,23 @@ function TerminalView({
         ? "terminal_instance_changed"
         : inFlightPromptThreadChanged
           ? "terminal_thread_changed"
-          : "";
+          : blockingAcceptedPromptFinished
+            ? "terminal_confirmed_finished"
+            : "";
       if (staleInFlightReason) {
         todoQueueTerminalInFlightPromptsRef.current.delete(targetTerminalIndex);
         logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
           agentInputReady,
-          blockingPromptId: blockingInFlightPrompt.promptId || "",
+          blockingAcceptedPromptFinished,
+          blockingFreshInputReady,
+          blockingLatestTurnAfterSubmit,
+            blockingLatestTurnId,
+            blockingLatestTurnState,
+            blockingLatestUserPromptMatches,
+            blockingPromptAcceptedByCompletedThread,
+            blockingPromptId: blockingInFlightPrompt.promptId || "",
+          blockingPromptTurnMatches,
+          blockingTerminalReadyForNextPrompt,
           completedTurnLooksSendable,
           effectiveLatestTurnState,
           inputReadyAt,
@@ -7874,9 +8416,9 @@ function TerminalView({
     if (!targetThread?.id) {
       return unavailable("terminal_unavailable", "This terminal does not have a live thread yet.", targetFields);
     }
-    if (!resolvedBinding?.instanceId) {
-      return unavailable("terminal_unavailable", "This terminal is not ready to receive a todo yet.", targetFields);
-    }
+      if (!resolvedBinding?.paneId) {
+        return unavailable("terminal_unavailable", "This terminal is not ready to receive a todo yet.", targetFields);
+      }
     if (targetThread?.pendingPrompt) {
       return unavailable("pending_prompt", "This terminal already has a prompt waiting to send.", targetFields);
     }
@@ -7886,9 +8428,9 @@ function TerminalView({
     if (effectiveActivityStatus === "thinking") {
       return unavailable("busy_activity", "This agent is already working.", targetFields);
     }
-    if (requiresAgentInputReady && !agentInputReady) {
-      return unavailable("agent_not_ready", "This agent is still starting.", targetFields);
-    }
+      if (requiresAgentInputReady && !queueAgentInputReady) {
+        return unavailable("agent_not_ready", "This agent is still starting.", targetFields);
+      }
     if (!syncKey) {
       return unavailable("terminal_unavailable", "This terminal does not have a shared composer yet.", targetFields);
     }
@@ -7912,15 +8454,16 @@ function TerminalView({
   }, [
     defaultWorkingDirectory,
     getTerminalAgent,
-    getTerminalImageInputSupport,
-    getTerminalPaneId,
-    getTerminalProjectTarget,
-    getTerminalRole,
-    getTerminalThread,
-    logicalTerminalIndexes,
-    terminalWorkspace?.id,
-    terminalWorkspaceWorkingDirectory,
-    workspaceThreadEntry,
+      getTerminalImageInputSupport,
+      getTerminalPaneId,
+      getTerminalProjectTarget,
+      getTerminalRole,
+      getTerminalThread,
+      logicalTerminalIndexes,
+      resolveTodoQueueLiveTerminal,
+      terminalWorkspace?.id,
+      terminalWorkspaceWorkingDirectory,
+      workspaceThreadEntry,
   ]);
   const fullscreenState = fullscreenActive
     ? fullscreenMotion.phase === "opening" || fullscreenMotion.phase === "closing"
@@ -8021,10 +8564,36 @@ function TerminalView({
     }
   }, [clearFullscreenTransitionTimer]);
 
+  const replaceTodoQueuePendingItems = useCallback((nextPendingItems) => {
+    const normalizedPendingItems = nextPendingItems && typeof nextPendingItems === "object"
+      ? nextPendingItems
+      : {};
+    todoQueuePendingItemsRef.current = normalizedPendingItems;
+    setTodoQueuePendingItems(normalizedPendingItems);
+  }, []);
+
   useEffect(() => {
-    setTodoQueueItems(readTodoQueueItems(todoQueueStorageKey));
+    todoQueuePendingTimersRef.current.forEach((timeoutId) => {
+      window.clearTimeout(timeoutId);
+    });
+    todoQueuePendingTimersRef.current.clear();
+    const persistedItems = readTodoQueueItems(todoQueueStorageKey);
+    setTodoQueueItems(persistedItems);
+    replaceTodoQueuePendingItems(buildTodoQueuePendingItemsFromPersistedQueue(
+      persistedItems,
+      terminalWorkspace?.id || "",
+    ));
+    writeTodoQueueItems(todoQueueStorageKey, persistedItems);
     setTodoQueueDraft("");
-  }, [todoQueueStorageKey]);
+    if (persistedItems.some((item) => normalizeTodoQueuePersistedQueueState(item))) {
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+      logTerminalStatus("frontend.todo_queue.rehydrated", {
+        itemCount: persistedItems.length,
+        queuedItemCount: persistedItems.filter((item) => normalizeTodoQueuePersistedQueueState(item)).length,
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id, todoQueueStorageKey]);
 
   useEffect(() => {
     const bumpDispatchRevision = () => setTodoQueueDispatchRevision((revision) => revision + 1);
@@ -8037,24 +8606,22 @@ function TerminalView({
     };
   }, []);
 
-  useEffect(() => {
-    const inFlightPrompts = todoQueueTerminalInFlightPromptsRef.current;
-    if (!inFlightPrompts.size || !workspaceThreadEntry?.terminals) {
-      return;
-    }
+    useEffect(() => {
+      const inFlightPrompts = todoQueueTerminalInFlightPromptsRef.current;
+      if (!inFlightPrompts.size) {
+        return;
+      }
 
-    let changed = false;
-    const nowMs = Date.now();
-    inFlightPrompts.forEach((inFlightPrompt, terminalIndex) => {
-      const promptId = String(inFlightPrompt?.promptId || "").trim();
-      const liveTerminal = Object.values(workspaceThreadEntry.terminals || {}).find((candidate) => (
-        Number(candidate?.terminalIndex) === Number(terminalIndex)
-      )) || null;
-      const targetThread = inFlightPrompt?.threadId
-        ? workspaceThreadEntry?.threads?.[inFlightPrompt.threadId] || null
-        : liveTerminal?.threadId
-          ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
-          : null;
+      let changed = false;
+      const nowMs = Date.now();
+      inFlightPrompts.forEach((inFlightPrompt, terminalIndex) => {
+        const promptId = String(inFlightPrompt?.promptId || "").trim();
+        const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex);
+        const targetThread = inFlightPrompt?.threadId
+          ? workspaceThreadEntry?.threads?.[inFlightPrompt.threadId] || null
+          : liveTerminal?.threadId
+            ? workspaceThreadEntry?.threads?.[liveTerminal.threadId] || null
+            : null;
       const targetRole = String(liveTerminal?.agentId || targetThread?.currentAgent || "").trim().toLowerCase();
       const providerBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
       const terminalGroundTruth = getThreadTerminalGroundTruth({
@@ -8080,10 +8647,26 @@ function TerminalView({
             || latestMessageId === promptId
           ),
       );
-      const completedMatchingTurn = Boolean(
-        promptTurnMatches
-          && ["completed", "error", "interrupted"].includes(latestTurnState),
+      const latestUserMessage = getTodoQueueLatestUserMessage(targetThread);
+      const promptText = normalizeTodoQueuePromptComparisonText(inFlightPrompt?.promptText);
+      const latestUserPromptText = normalizeTodoQueuePromptComparisonText(latestUserMessage?.text);
+      const latestUserPromptMatches = Boolean(
+        promptText
+          && latestUserPromptText
+          && promptText === latestUserPromptText,
       );
+      const latestTurnStartedAtMs = Date.parse(
+        latestTurn?.startedAt
+          || latestTurn?.requestedAt
+          || latestTurn?.updatedAt
+          || "",
+      ) || 0;
+      const latestTurnAfterSubmit = Boolean(
+        submittedAtMs
+          && latestTurnStartedAtMs
+          && latestTurnStartedAtMs >= submittedAtMs - TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS,
+      );
+      const latestTurnClosed = TODO_QUEUE_CLOSED_TURN_STATES.has(latestTurnState);
       const freshInputReady = Boolean(
         (liveTerminal?.inputReady || providerBinding?.inputReady)
           && submittedAtMs
@@ -8117,8 +8700,92 @@ function TerminalView({
               || TODO_QUEUE_CLOSED_TURN_STATES.has(terminalGroundTruth.effectiveLatestTurnState)
           )
       );
+      const acceptedAtMs = Number(
+        inFlightPrompt?.acceptedAtMs
+          || Date.parse(inFlightPrompt?.acceptedAt || "")
+          || 0,
+      );
+      const promptAccepted = acceptedAtMs > 0 || inFlightPrompt?.accepted === true;
+      const latestUserCreatedAtMs = Date.parse(latestUserMessage?.createdAt || "") || 0;
+      const providerSessionId = String(
+        targetThread?.transcriptSessionId
+          || providerBinding?.nativeSessionId
+          || inFlightPrompt?.sessionId
+          || "",
+      ).trim();
+        const sessionAcceptedByThread = Boolean(
+          !promptAccepted
+            && providerSessionId
+            && latestUserPromptMatches
+          && (
+            !submittedAtMs
+            || (
+              latestUserCreatedAtMs
+              && latestUserCreatedAtMs >= submittedAtMs - TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS
+              )
+            )
+        );
+        const promptAcceptedByCompletedThread = Boolean(
+          !promptAccepted
+            && latestTurnClosed
+            && latestUserPromptMatches
+            && terminalReadyForNextPrompt
+            && freshInputReady
+            && (promptTurnMatches || latestTurnAfterSubmit)
+        );
+        const effectivePromptAccepted = promptAccepted
+          || sessionAcceptedByThread
+          || promptAcceptedByCompletedThread;
+        if (sessionAcceptedByThread || promptAcceptedByCompletedThread) {
+          const acceptedAt = new Date().toISOString();
+          const acceptedMatchedBy = sessionAcceptedByThread
+            ? "thread-state-reconcile"
+            : "completed-thread-reconcile";
+          inFlightPrompts.set(terminalIndex, {
+            ...inFlightPrompt,
+            accepted: true,
+            acceptedAt,
+            acceptedAtMs: Date.parse(acceptedAt) || Date.now(),
+            acceptedMatchedBy,
+            sessionId: providerSessionId,
+          });
+          changed = true;
+          logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
+            latestUserCreatedAt: latestUserMessage?.createdAt || "",
+            matchedBy: acceptedMatchedBy,
+            promptEventId: promptId,
+            promptAcceptedByCompletedThread,
+            reason: sessionAcceptedByThread
+              ? "thread_state_prompt_accepted"
+              : "completed_thread_prompt_accepted",
+            sessionIdPresent: Boolean(providerSessionId),
+          source: inFlightPrompt?.source || "",
+          targetTerminalIndex: terminalIndex,
+          threadId: targetThread?.id || inFlightPrompt?.threadId || "",
+          workspaceId: targetThread?.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+        });
+        window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
+            detail: {
+              agentId: targetRole,
+              matchedBy: acceptedMatchedBy,
+            promptEventId: promptId,
+            sessionId: providerSessionId,
+            threadId: targetThread?.id || inFlightPrompt?.threadId || "",
+            workspaceId: targetThread?.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+          },
+        }));
+      }
+      const completedMatchingTurn = Boolean(effectivePromptAccepted && promptTurnMatches && latestTurnClosed);
+      const completedAcceptedAliasedTurn = Boolean(
+        effectivePromptAccepted
+          && latestTurnClosed
+          && (latestUserPromptMatches || latestTurnAfterSubmit)
+          && terminalReadyForNextPrompt
+          && freshInputReady
+      );
       const terminalConfirmedFinished = Boolean(
-        completedMatchingTurn && (freshInputReady || terminalReadyForNextPrompt),
+        (completedMatchingTurn || completedAcceptedAliasedTurn)
+          && (freshInputReady || terminalReadyForNextPrompt),
       );
       const expired = Number(inFlightPrompt?.startedAtMs || 0) > 0
         && nowMs - Number(inFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
@@ -8131,6 +8798,7 @@ function TerminalView({
       changed = true;
       logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
         completedMatchingTurn,
+        completedAcceptedAliasedTurn,
         completionSignal: terminalConfirmedFinished
           ? "terminal_confirmed_finished"
           : terminalInstanceChanged
@@ -8140,11 +8808,15 @@ function TerminalView({
                 : "timeout",
         expired,
         freshInputReady,
+        latestTurnAfterSubmit,
         latestMessageId,
         latestTurnId,
         latestTurnState,
+        latestUserPromptMatches,
         promptEventId: promptId,
+        promptAccepted: effectivePromptAccepted,
         promptTurnMatches,
+        sessionAcceptedByThread,
         staleButReady: false,
         reason: terminalConfirmedFinished
           ? "terminal_confirmed_finished"
@@ -8176,20 +8848,20 @@ function TerminalView({
     if (changed) {
       setTodoQueueDispatchRevision((revision) => revision + 1);
     }
-  }, [terminalWorkspace?.id, workspaceThreadEntry]);
+    }, [resolveTodoQueueLiveTerminal, terminalWorkspace?.id, workspaceThreadEntry]);
 
-  useEffect(() => {
-    const handlePromptAccepted = (event) => {
-      const detail = event?.detail || {};
-      const promptEventId = String(detail.promptEventId || detail.promptId || "").trim();
-      if (!promptEventId || !todoQueueTerminalInFlightPromptsRef.current.size) {
-        return;
-      }
-
-      let changed = false;
-      todoQueueTerminalInFlightPromptsRef.current.forEach((inFlightPrompt, terminalIndex) => {
-        if (String(inFlightPrompt?.promptId || "").trim() !== promptEventId) {
+    useEffect(() => {
+      const handlePromptAccepted = (event) => {
+        const detail = event?.detail || {};
+        const promptEventId = String(detail.promptEventId || detail.promptId || "").trim();
+        if (!promptEventId || !todoQueueTerminalInFlightPromptsRef.current.size) {
           return;
+        }
+
+        let changed = false;
+        todoQueueTerminalInFlightPromptsRef.current.forEach((inFlightPrompt, terminalIndex) => {
+          if (String(inFlightPrompt?.promptId || "").trim() !== promptEventId) {
+            return;
         }
         if (
           detail.threadId
@@ -8199,23 +8871,30 @@ function TerminalView({
           return;
         }
 
-        todoQueueTerminalInFlightPromptsRef.current.delete(terminalIndex);
-        changed = true;
-        logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
-          matchedBy: detail.matchedBy || "",
+          todoQueueTerminalInFlightPromptsRef.current.set(terminalIndex, {
+            ...inFlightPrompt,
+            accepted: true,
+            acceptedAt: new Date().toISOString(),
+            acceptedAtMs: Date.now(),
+            acceptedMatchedBy: detail.matchedBy || "",
+            sessionId: detail.sessionId || inFlightPrompt?.sessionId || "",
+          });
+          changed = true;
+          logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
+            matchedBy: detail.matchedBy || "",
           promptEventId,
-          reason: "prompt_accepted_event",
+          reason: "prompt_accepted_waiting_for_terminal_ready",
           source: inFlightPrompt?.source || "",
           targetTerminalIndex: terminalIndex,
           threadId: detail.threadId || inFlightPrompt?.threadId || "",
-          workspaceId: detail.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+            workspaceId: detail.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+          });
         });
-      });
+        if (changed) {
+          setTodoQueueDispatchRevision((revision) => revision + 1);
+        }
 
-      if (changed) {
-        setTodoQueueDispatchRevision((revision) => revision + 1);
-      }
-    };
+      };
 
     window.addEventListener(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, handlePromptAccepted);
     return () => {
@@ -8229,14 +8908,11 @@ function TerminalView({
       return;
     }
 
-    const terminalEntries = Object.values(workspaceThreadEntry?.terminals || {});
-    const nowMs = Date.now();
-    let changed = false;
+      const nowMs = Date.now();
+      let changed = false;
 
-    resumeLocks.forEach((resumeLock, terminalIndex) => {
-      const liveTerminal = terminalEntries.find((candidate) => (
-        Number(candidate?.terminalIndex) === Number(terminalIndex)
-      )) || null;
+      resumeLocks.forEach((resumeLock, terminalIndex) => {
+        const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex);
       const targetThread = resumeLock?.threadId
         ? workspaceThreadEntry?.threads?.[resumeLock.threadId] || null
         : liveTerminal?.threadId
@@ -8371,7 +9047,7 @@ function TerminalView({
     if (changed) {
       setTodoQueueDispatchRevision((revision) => revision + 1);
     }
-  }, [terminalWorkspace?.id, workspaceThreadEntry]);
+    }, [resolveTodoQueueLiveTerminal, terminalWorkspace?.id, workspaceThreadEntry]);
 
   useEffect(() => {
     const element = terminalWorkspaceMainRef.current;
@@ -8517,14 +9193,6 @@ function TerminalView({
     });
   }, [terminalWorkspace?.id]);
 
-  const replaceTodoQueuePendingItems = useCallback((nextPendingItems) => {
-    const normalizedPendingItems = nextPendingItems && typeof nextPendingItems === "object"
-      ? nextPendingItems
-      : {};
-    todoQueuePendingItemsRef.current = normalizedPendingItems;
-    setTodoQueuePendingItems(normalizedPendingItems);
-  }, []);
-
   const clearTodoQueueItemPending = useCallback((itemId, reason = "unspecified", fields = {}) => {
     const safeItemId = String(itemId || "").trim();
     if (!safeItemId) {
@@ -8567,7 +9235,14 @@ function TerminalView({
     const nextPendingItems = { ...todoQueuePendingItemsRef.current };
     delete nextPendingItems[safeItemId];
     replaceTodoQueuePendingItems(nextPendingItems);
-  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
+    updateTodoQueueItems((currentItems) => (
+      currentItems.map((item) => (
+        item.id === safeItemId
+          ? getTodoQueueItemWithoutPersistedQueueState(item)
+          : item
+      ))
+    ));
+  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id, updateTodoQueueItems]);
 
   const setTodoQueueItemPending = useCallback((itemId, fields = {}) => {
     const safeItemId = String(itemId || "").trim();
@@ -8584,7 +9259,12 @@ function TerminalView({
     const startedAtMs = Date.now();
     const rawPhase = String(fields.phase || fields.state || "sending").trim().toLowerCase();
     const phase = rawPhase === "queued" ? "queued" : "sending";
-    const timeoutMs = phase === "queued" ? 0 : TODO_QUEUE_CONSUME_TIMEOUT_MS;
+    const requestedTimeoutMs = Number(fields.timeoutMs || 0);
+    const timeoutMs = phase === "queued"
+      ? 0
+      : requestedTimeoutMs > 0
+        ? requestedTimeoutMs
+        : TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
     const pendingItem = {
       cancellable: phase === "queued",
       item: fields.item || null,
@@ -8601,6 +9281,23 @@ function TerminalView({
       timeoutMs,
       workspaceId: String(fields.workspaceId || terminalWorkspace?.id || ""),
     };
+    updateTodoQueueItems((currentItems) => (
+      currentItems.map((item) => (
+        item.id === safeItemId
+          ? getTodoQueueItemWithPersistedQueueState(item, phase, {
+            reason: pendingItem.reason,
+            source: fields.source || "",
+            targetAgentId: fields.targetAgentId || "",
+            targetColorSlot: fields.targetColorSlot,
+            targetTerminalColor: fields.targetTerminalColor || "",
+            targetTerminalId: fields.targetTerminalId || "",
+            targetTerminalIndex: pendingItem.targetTerminalIndex,
+            targetThreadId: fields.targetThreadId || "",
+            targetRole: pendingItem.targetRole,
+          })
+          : item
+      ))
+    ));
     if (timeoutMs) {
       const timeoutId = window.setTimeout(() => {
         const currentPendingItem = todoQueuePendingItemsRef.current[safeItemId];
@@ -8633,6 +9330,13 @@ function TerminalView({
         const nextPendingItems = { ...todoQueuePendingItemsRef.current };
         delete nextPendingItems[safeItemId];
         replaceTodoQueuePendingItems(nextPendingItems);
+        updateTodoQueueItems((currentItems) => (
+          currentItems.map((item) => (
+            item.id === safeItemId
+              ? getTodoQueueItemWithoutPersistedQueueState(item)
+              : item
+          ))
+        ));
       }, timeoutMs);
 
       todoQueuePendingTimersRef.current.set(safeItemId, timeoutId);
@@ -8660,7 +9364,7 @@ function TerminalView({
       ...todoQueuePendingItemsRef.current,
       [safeItemId]: pendingItem,
     });
-  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
+  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id, updateTodoQueueItems]);
 
   const queueReleasedVoicePlanTasks = useCallback((tasks, snapshot = null, options = {}) => {
     const releasedTasks = (Array.isArray(tasks) ? tasks : [])
@@ -9136,14 +9840,6 @@ function TerminalView({
     todoQueuePendingItemsRef.current = {};
   }, []);
 
-  useEffect(() => {
-    todoQueuePendingTimersRef.current.forEach((timeoutId) => {
-      window.clearTimeout(timeoutId);
-    });
-    todoQueuePendingTimersRef.current.clear();
-    replaceTodoQueuePendingItems({});
-  }, [replaceTodoQueuePendingItems, todoQueueStorageKey]);
-
   const recordTodoQueueSpecEditDispatch = useCallback(async ({
     item,
     paneId,
@@ -9303,10 +9999,6 @@ function TerminalView({
       workspaceId,
     };
     const planTask = getTodoQueueItemPlanTask(currentItem);
-    const planTaskDoneWhen = String(planTask?.doneWhen || "").trim().toLowerCase();
-    const shouldCompletePlanTaskOnSubmitObserved = Boolean(
-      planTask && planTaskDoneWhen === "confirmed_running",
-    );
 
     logTerminalStatus("frontend.todo_queue.send_start", {
       ...terminalWriteLogBase,
@@ -9464,17 +10156,22 @@ function TerminalView({
         threadId: targetThread.id,
         workspaceId,
       });
-      onThreadTerminalLifecycle?.({
+        handleWorkspaceTerminalLifecycle({
         agentId: targetRole,
         instanceId: targetBinding?.instanceId || "",
+        inputReady: false,
+        activityStatus: "thinking",
         messageCreatedAt: submittedAt || "",
         messageId: safePromptId,
         messageSource: lifecycleSource,
         paneId,
+        pendingPromptDeliveryMode: "session-acceptance",
         pendingPromptId: safePromptId,
+        pendingPromptText: safeThreadMessageText,
         promptEventId: safePromptId,
         promptEventSubmittedAt: submittedAt || "",
         repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        sessionAcceptancePending: true,
         slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
         source: lifecycleSource,
         status: "active",
@@ -9668,6 +10365,7 @@ function TerminalView({
 
           todoQueueTerminalInFlightPromptsRef.current.set(Number(target.targetTerminalIndex), {
             itemId: currentItem.id || currentItem.itemId || "",
+            promptText: terminalText,
             promptId,
             source,
             startedAtMs: Date.now(),
@@ -9823,7 +10521,7 @@ function TerminalView({
           expectedPrompt: terminalText,
           promptId,
           threadId: targetThread.id,
-          timeoutMs: TODO_QUEUE_CONSUME_TIMEOUT_MS,
+          timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
           workspaceId,
         });
         try {
@@ -9933,97 +10631,87 @@ function TerminalView({
             terminalText,
             threadMessageText,
           });
-          if (planTask && lifecycleDispatchedAtSubmit) {
-            clearTodoQueueItemPending(currentItem.id || currentItem.itemId || "", "submit_observed", {
-              promptId,
-              source,
-              submitConfirmed: true,
-              targetRole,
-              targetTerminalIndex: target.targetTerminalIndex,
-            });
-          }
-          let acceptedDetail = null;
-          let acceptedBySubmitObservation = false;
-          if (shouldCompletePlanTaskOnSubmitObserved) {
-            acceptedBySubmitObservation = true;
-            acceptedWaiter.cancel();
-            logTerminalStatus("frontend.todo_queue.terminal_write.accept_skip", {
-              ...terminalWriteLogBase,
-              doneWhen: planTaskDoneWhen,
-              instanceId: targetBinding?.instanceId || "",
-              promptEventId: promptId,
-              reason: "confirmed_running_submit_observed",
-              threadId: targetThread.id,
-            });
-          } else {
-            try {
-              acceptedDetail = await waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
-                acceptedWaiter,
+            let acceptedDetail = null;
+            const recordAcceptedDetail = (detail, matchedByFallback = "") => {
+              if (!detail) {
+                return null;
+              }
+              const targetTerminalNumber = Number(target.targetTerminalIndex);
+              const inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalNumber);
+              if (String(inFlightPrompt?.promptId || "") === promptId) {
+                todoQueueTerminalInFlightPromptsRef.current.set(targetTerminalNumber, {
+                  ...inFlightPrompt,
+                  accepted: true,
+                  acceptedAt: new Date().toISOString(),
+                  acceptedAtMs: Date.now(),
+                  acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
+                  sessionId: detail?.sessionId || inFlightPrompt?.sessionId || "",
+                });
+              }
+              logTerminalStatus("frontend.todo_queue.terminal_write.accepted", {
+                ...terminalWriteLogBase,
+                acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
+                instanceId: targetBinding?.instanceId || "",
+                promptEventId: promptId,
+                sessionIdPresent: Boolean(detail?.sessionId),
+                threadId: targetThread.id,
+              });
+              logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
+                acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
                 agentId: targetRole,
-                binding: {
-                  instanceId: targetBinding?.instanceId,
-                  paneId,
-                  terminalIndex: target.targetTerminalIndex,
-                },
-                expectedPrompt: terminalText,
-                getDraftValue: () => (
-                  syncKey
-                    ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
-                    : terminalText
-                ),
-                allowEnterRetry: true,
-                isGenericTerminal: false,
-                logPrefix: getTodoQueueAcceptLogPrefix(source, currentItem),
+                paneId,
                 promptId,
-                retryDelaysMs: TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS,
-                submitSequence: terminalSubmitSequence,
+                sessionIdPresent: Boolean(detail?.sessionId),
+                source,
+                syncKey,
+                surface: "tui_terminal_grid",
+                targetTerminalIndex: targetLogIndex,
                 threadId: targetThread.id,
                 workspaceId,
               });
-            } catch (acceptError) {
-              if (!planTask || !lifecycleDispatchedAtSubmit) {
-                throw acceptError;
-              }
-
-              acceptedBySubmitObservation = true;
-              logTerminalStatus("frontend.todo_queue.terminal_write.accept_timeout_ignored", {
+              return detail;
+            };
+            const acceptedMonitorPromise = acceptedWaiter.promise
+              .then((detail) => recordAcceptedDetail(detail, "acceptance-waiter"))
+              .catch((acceptError) => {
+                logTerminalStatus("frontend.todo_queue.terminal_write.accept_wait_done", {
+                  ...terminalWriteLogBase,
+                  instanceId: targetBinding?.instanceId || "",
+                  message: acceptError?.message || String(acceptError || ""),
+                  promptEventId: promptId,
+                  reason: "acceptance_wait_timeout_or_error",
+                  threadId: targetThread.id,
+                });
+                return null;
+              });
+            acceptedDetail = await Promise.race([
+              acceptedMonitorPromise,
+              new Promise((resolve) => {
+                window.setTimeout(() => resolve(null), TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS);
+              }),
+            ]);
+            if (!acceptedDetail) {
+              acceptedWaiter.cancel();
+              logTerminalStatus("frontend.todo_queue.terminal_write.accept_deferred", {
                 ...terminalWriteLogBase,
-                doneWhen: planTaskDoneWhen,
+                graceMs: TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS,
                 instanceId: targetBinding?.instanceId || "",
-                message: acceptError?.message || String(acceptError || ""),
                 promptEventId: promptId,
-                reason: "voice_plan_submit_observed",
+                reason: "terminal_submit_confirmed_before_session_acceptance",
                 threadId: targetThread.id,
               });
             }
-          }
-          if (acceptedDetail) {
-            logTerminalStatus("frontend.todo_queue.terminal_write.accepted", {
+            logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
               ...terminalWriteLogBase,
               acceptedMatchedBy: acceptedDetail?.matchedBy || "",
+              awaitingSessionAcceptance: !acceptedDetail,
               instanceId: targetBinding?.instanceId || "",
               promptEventId: promptId,
-              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
+              reason: acceptedDetail
+                ? "session_accepted_waiting_for_terminal_ready"
+                : "terminal_submit_confirmed_waiting_for_session_acceptance",
               threadId: targetThread.id,
             });
-            logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
-              acceptedMatchedBy: acceptedDetail?.matchedBy || "",
-              agentId: targetRole,
-              paneId,
-              promptId,
-              sessionIdPresent: Boolean(acceptedDetail?.sessionId),
-              source,
-              syncKey,
-              surface: "tui_terminal_grid",
-              targetTerminalIndex: targetLogIndex,
-              threadId: targetThread.id,
-              workspaceId,
-            });
-          }
-          clearInFlightPrompt("submit_confirmed", {
-            acceptedBySubmitObservation,
-            acceptedMatchedBy: acceptedDetail?.matchedBy || "",
-          });
           if (syncKey) {
             setWorkspaceThreadComposerDraft(syncKey, "");
           }
@@ -10070,20 +10758,20 @@ function TerminalView({
               });
             }
           }
-          dropResult = {
-            acceptedDetail,
-            acceptedBySubmitObservation,
-            confirmedSubmit: true,
-            lifecycleDispatchedAtSubmit,
-            promptId,
-            promptEventSubmittedAt: submittedAt,
-            syncKey,
-            targetBinding,
-            targetThread,
-            terminalText,
-            threadMessageText,
-            writeResult,
-          };
+            dropResult = {
+              acceptedDetail,
+              confirmedSubmit: true,
+              lifecycleDispatchedAtSubmit,
+              promptId,
+              promptEventSubmittedAt: submittedAt,
+              sessionAccepted: Boolean(acceptedDetail),
+              syncKey,
+              targetBinding,
+              targetThread,
+              terminalText,
+              threadMessageText,
+              writeResult,
+            };
         } catch (submitError) {
           clearInFlightPromptOnError("submit_error");
           submittedWaiter.cancel();
@@ -10153,17 +10841,22 @@ function TerminalView({
         threadId: targetThread.id,
         workspaceId,
       });
-      onThreadTerminalLifecycle?.({
+        handleWorkspaceTerminalLifecycle({
         agentId: targetRole,
         instanceId: targetBinding?.instanceId || "",
+        inputReady: false,
+        activityStatus: "thinking",
         messageCreatedAt: dropResult?.promptEventSubmittedAt || "",
         messageId: dropResult?.promptId || "",
         messageSource: lifecycleSource,
         paneId,
+        pendingPromptDeliveryMode: "session-acceptance",
         pendingPromptId: dropResult?.promptId || "",
+        pendingPromptText: resultThreadMessageText,
         promptEventId: dropResult?.promptId || "",
         promptEventSubmittedAt: dropResult?.promptEventSubmittedAt || "",
         repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        sessionAcceptancePending: true,
         slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
         source: lifecycleSource,
         status: "active",
@@ -10239,17 +10932,17 @@ function TerminalView({
         workspaceId,
       });
     }
-    if (dropResult?.confirmedSubmit && planTask) {
-      await recordVoicePlanTaskStatus(planTask, "dispatched", {
-        acceptedBySubmitObservation: Boolean(dropResult?.acceptedBySubmitObservation),
-        agentId: targetRole,
-        clientTodoId: currentItem.id || "",
-        lifecycleDispatchedAtSubmit: Boolean(dropResult?.lifecycleDispatchedAtSubmit),
-        promptEventId: dropResult?.promptId || planTask.taskId,
-        terminalId: paneId,
-        terminalIndex: target.targetTerminalIndex,
-        threadId: targetThread?.id || "",
-      });
+      if (dropResult?.confirmedSubmit && planTask) {
+        await recordVoicePlanTaskStatus(planTask, "dispatched", {
+          agentId: targetRole,
+          clientTodoId: currentItem.id || "",
+          lifecycleDispatchedAtSubmit: Boolean(dropResult?.lifecycleDispatchedAtSubmit),
+          promptEventId: dropResult?.promptId || planTask.taskId,
+          sessionAccepted: Boolean(dropResult?.sessionAccepted || dropResult?.acceptedDetail),
+          terminalId: paneId,
+          terminalIndex: target.targetTerminalIndex,
+          threadId: targetThread?.id || "",
+        });
       dropResult.planTaskStatusRecorded = true;
     }
     logBigViewSyncDiagnosticEvent("tui.image.drop_write_done", {
@@ -10281,9 +10974,10 @@ function TerminalView({
     return dropResult;
   }, [
     clearTodoQueueItemPending,
-    defaultWorkingDirectory,
-    getTodoQueueTerminalSendTarget,
-    onThreadTerminalLifecycle,
+      defaultWorkingDirectory,
+      getTodoQueueTerminalSendTarget,
+      handleWorkspaceTerminalLifecycle,
+      onThreadTerminalLifecycle,
     recordTodoQueueSpecEditDispatch,
     recordVoicePlanTaskStatus,
     terminalWorkspace?.id,
@@ -11020,28 +11714,44 @@ function TerminalView({
       reservationItemId: queuedItem.id,
       source,
       targetTerminalIndex,
-    })
-      .then((dropResult) => {
-        setTodoDropError("");
-        logTerminalStatus("frontend.todo_queue.dispatch_consumed", {
-          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
-          promptId: dropResult?.promptId || "",
-          source,
-          submitConfirmed: Boolean(dropResult?.confirmedSubmit),
-          targetRole: target.targetRole,
-          targetTerminalIndex,
-          workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
-        });
-        clearTodoQueueItemPending(queuedItem.id, "consumed", {
-          promptId: dropResult?.promptId || "",
-          source,
-          submitConfirmed: Boolean(dropResult?.confirmedSubmit),
-          targetRole: target.targetRole,
-          targetTerminalIndex,
-        });
-        updateTodoQueueItems((currentItems) => (
-          currentItems.filter((item) => item.id !== queuedItem.id)
-        ));
+      })
+        .then((dropResult) => {
+          const sessionAccepted = Boolean(
+            dropResult?.sessionAccepted
+              || dropResult?.acceptedDetail,
+          );
+          const terminalSubmitConfirmed = Boolean(dropResult?.confirmedSubmit);
+          const consumeReason = terminalSubmitConfirmed
+            ? sessionAccepted
+              ? "session_accepted"
+              : "terminal_submit_confirmed"
+            : "consumed";
+          setTodoDropError("");
+          logTerminalStatus("frontend.todo_queue.dispatch_consumed", {
+            acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
+            awaitingSessionAcceptance: terminalSubmitConfirmed && !sessionAccepted,
+            item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+            promptId: dropResult?.promptId || "",
+            sessionAccepted,
+            source,
+            submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+            targetRole: target.targetRole,
+            targetTerminalIndex,
+            workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+          });
+          clearTodoQueueItemPending(queuedItem.id, consumeReason, {
+            acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
+            awaitingSessionAcceptance: terminalSubmitConfirmed && !sessionAccepted,
+            promptId: dropResult?.promptId || "",
+            sessionAccepted,
+            source,
+            submitConfirmed: Boolean(dropResult?.confirmedSubmit),
+            targetRole: target.targetRole,
+            targetTerminalIndex,
+          });
+          updateTodoQueueItems((currentItems) => (
+            currentItems.filter((item) => item.id !== queuedItem.id)
+          ));
       })
       .catch((error) => {
         const stillQueued = todoQueueItemsRef.current.some((item) => item.id === queuedItem.id);
@@ -12087,7 +12797,7 @@ function TerminalView({
                 onSelectWorkspaceThread={onSelectWorkspaceThread}
                 onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
                 onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
-                onThreadTerminalLifecycle={onThreadTerminalLifecycle}
+                  onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
                 projectRoot={terminalProjectTarget?.mountId ? terminalProjectTarget.repoPath : ""}
@@ -12109,6 +12819,7 @@ function TerminalView({
                 workingDirectory={terminalWorkspaceWorkingDirectory}
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
+                workspaceRootWasEmptyAtSelection={terminalWorkspaceRootWasEmptyAtSelection}
                 workspaceThreads={workspaceThreads}
                 workspaces={workspaces}
                 selectedWorkspaceThreadId={selectedWorkspaceThreadId}
@@ -12142,7 +12853,7 @@ function TerminalView({
       onSelectWorkspaceThread={onSelectWorkspaceThread}
       onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
       onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
-      onThreadTerminalLifecycle={onThreadTerminalLifecycle}
+        onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
       projectRoot={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId
@@ -12166,6 +12877,7 @@ function TerminalView({
       workingDirectory={terminalWorkspaceWorkingDirectory}
       workspace={terminalWorkspace}
       workspaceError={workspaceError}
+      workspaceRootWasEmptyAtSelection={terminalWorkspaceRootWasEmptyAtSelection}
       workspaceThreads={workspaceThreads}
       workspaces={workspaces}
       selectedWorkspaceThreadId={selectedWorkspaceThreadId}

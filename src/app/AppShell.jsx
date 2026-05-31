@@ -1045,6 +1045,15 @@ function buildTerminalReadyProjectionEvents(thread, event = {}, groundTruth = nu
   const eventType = String(event.type || "").trim().toLowerCase();
   const readinessCanCompleteTurn = eventType === "terminal-prompt-ready"
     || eventType === "terminal-input-ready";
+  const pendingPrompt = thread?.pendingPrompt || null;
+  const pendingPromptWaitingForSession = Boolean(
+    pendingPrompt
+      && event.promptAccepted !== true
+      && event.sessionAccepted !== true
+  );
+  if (pendingPromptWaitingForSession) {
+    return [];
+  }
   const shouldCompleteFromReadiness = readinessCanCompleteTurn
     && (
       threadLatestRunningTurnMatchesPrompt(thread, event)
@@ -3004,6 +3013,7 @@ function normalizeWorkspaceSettings(value) {
         const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+        const rootWasEmptyAtSelection = Boolean(settings?.rootWasEmptyAtSelection);
 
         if (!workspaceId || (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT && !hasCustomTerminalRoles)) {
           return null;
@@ -3013,6 +3023,7 @@ function normalizeWorkspaceSettings(value) {
           workspaceId,
           {
             rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
+            rootWasEmptyAtSelection: rootDirectory ? rootWasEmptyAtSelection : false,
             terminalCount,
             terminalRoles,
           },
@@ -3266,6 +3277,10 @@ function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
   return cleanWorkspaceRootDirectory(workspaceSettings?.[workspaceId]?.rootDirectory);
 }
 
+function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
+  return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
+}
+
 function workspaceRuntimeActivationKey(workspaceId, repoPath) {
   const safeWorkspaceId = String(workspaceId || "").trim();
   const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
@@ -3513,6 +3528,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 
   const currentSettings = settings?.[workspaceId] || {};
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
+  const hasRootWasEmptyAtSelection = Object.prototype.hasOwnProperty.call(nextValues, "rootWasEmptyAtSelection");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
@@ -3521,6 +3537,11 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const rootDirectory = isDisallowedWorkspaceRootDirectory(cleanedRootDirectory)
     ? ""
     : cleanedRootDirectory;
+  const rootWasEmptyAtSelection = rootDirectory
+    ? Boolean(hasRootWasEmptyAtSelection
+      ? nextValues.rootWasEmptyAtSelection
+      : currentSettings.rootWasEmptyAtSelection)
+    : false;
   const terminalCount = normalizeWorkspaceTerminalCount(
     hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
   );
@@ -3539,6 +3560,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 
   nextSettings[workspaceId] = {
     rootDirectory,
+    rootWasEmptyAtSelection,
     terminalCount,
     terminalRoles,
   };
@@ -6081,6 +6103,7 @@ export default function App() {
     try {
       const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
       const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
 
       if (!rootDirectory) {
         throw new Error("Workspace root directory was not returned by validation.");
@@ -6114,6 +6137,7 @@ export default function App() {
       ];
       const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
         rootDirectory,
+        rootWasEmptyAtSelection,
       });
       const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
       const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(currentLifecycleSettings.enabledWorkspaceIds);
@@ -6277,6 +6301,11 @@ export default function App() {
         currentTerminalCount,
       );
       const rootChanged = rootDirectory !== currentRootDirectory;
+      const rootWasEmptyAtSelection = rootDirectory
+        ? rootChanged
+          ? Boolean(normalizedRoot?.emptyDirectory)
+          : getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
+        : false;
       const previousMcpRepoPath = currentRootDirectory || defaultWorkingDirectory;
       const nextMcpRepoPath = rootDirectory || defaultWorkingDirectory;
       const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
@@ -6398,6 +6427,7 @@ export default function App() {
       setWorkspaceSettings((settings) => {
         const nextSettings = updateWorkspaceLocalSettings(settings, selectedWorkspace.id, {
           rootDirectory,
+          rootWasEmptyAtSelection,
           terminalCount,
           terminalRoles,
         });
@@ -8116,6 +8146,9 @@ export default function App() {
   const activatedWorkspaceRootDirectory = activatedWorkspace
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspace.id)
     : "";
+  const activatedWorkspaceRootWasEmptyAtSelection = activatedWorkspace
+    ? getWorkspaceRootWasEmptyAtSelection(workspaceSettings, activatedWorkspace.id)
+    : false;
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
   const shouldPrewarmWorkspaceTerminals = false;
   const selectedWorkspaceTerminalCount = selectedWorkspace && !shouldShowWorkspaceSetup
@@ -8293,6 +8326,10 @@ export default function App() {
       .map((runtimeWorkspace) => {
         const rootDirectory = getWorkspaceRootDirectory(workspaceSettings, runtimeWorkspace.id);
         const workingDirectory = rootDirectory || defaultWorkingDirectory;
+        const rootWasEmptyAtSelection = getWorkspaceRootWasEmptyAtSelection(
+          workspaceSettings,
+          runtimeWorkspace.id,
+        );
         const terminalCount = getWorkspaceTerminalCount(workspaceSettings, runtimeWorkspace.id);
         const terminalRoles = getWorkspaceTerminalRoles(
           workspaceSettings,
@@ -8362,6 +8399,7 @@ export default function App() {
           terminalsByIndex,
           terminalRolesByIndex,
           threadsByIndex,
+          rootWasEmptyAtSelection,
           workingDirectory,
           workspace: runtimeWorkspace,
         };
@@ -10507,11 +10545,19 @@ export default function App() {
               && rawTurnCompleteSeen
               && !transcriptTargetsLatestRunningTurn,
           );
+          const matchedTranscriptCompletionCanSettleTurn = Boolean(
+            pollUntilTurnComplete
+              && activeRunningTurnAtTranscriptResult
+              && promptAccepted
+              && transcriptTargetsLatestRunningTurn
+              && rawTurnCompleteSeen
+          );
           const sessionTranscriptCanSettleTurn = Boolean(
             pollUntilTurnComplete
               && activeRunningTurnAtTranscriptResult
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
+              && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
               && (
                 rawTurnCompleteSeen
                 || settledAssistantResponseSeen
@@ -10523,10 +10569,7 @@ export default function App() {
               && rawTurnCompleteSeen
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
-              && (
-                terminalLifecycleCanSettleTurn
-                || sessionTranscriptCanSettleTurn
-              )
+              && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
           );
           const assistantResponseCompletesTurn = Boolean(
             pollUntilTurnComplete
@@ -10534,11 +10577,8 @@ export default function App() {
               && promptAccepted
               && (
                 activeRunningTurnAtTranscriptResult
-                  ? transcriptTargetsLatestRunningTurn && (
-                    terminalLifecycleCanSettleTurn
-                    || sessionTranscriptCanSettleTurn
-                  )
-                  : true
+                  ? transcriptTargetsLatestRunningTurn && terminalLifecycleCanSettleTurn
+                  : terminalLifecycleCanSettleTurn
               )
           );
           const turnCompleteSeen = Boolean(
@@ -10548,11 +10588,7 @@ export default function App() {
                 !activeRunningTurnAtTranscriptResult
                 || (
                   transcriptTargetsLatestRunningTurn
-                  && (
-                    terminalReadinessCanSettleTurn
-                    || transcriptExplicitCompletionCanSettleTurn
-                    || sessionTranscriptCanSettleTurn
-                  )
+                  && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
                 )
               ),
           );
@@ -10574,6 +10610,7 @@ export default function App() {
             assistantResponseCompletesTurn,
             latestTimestampPresent: Boolean(result?.latestTimestamp),
             matchedBy: result?.matchedBy || "",
+            matchedTranscriptCompletionCanSettleTurn,
             messageCount: messages.length,
             messageDiagnostics: transcriptMessageDiagnostics,
             pollUntilTurnComplete,
@@ -10606,6 +10643,7 @@ export default function App() {
             allowTranscriptTurnCompletion,
             assistantResponseCompletesTurn,
             matchedBy: result?.matchedBy || "",
+            matchedTranscriptCompletionCanSettleTurn,
             messageCount: messages.length,
             pollUntilTurnComplete,
             promptAccepted,
@@ -10792,6 +10830,56 @@ export default function App() {
                   pollUntilTurnComplete: true,
                   promptEventId,
                   providerSessionId: sessionMatchedByProviderId ? (sessionId || providerSessionId) : providerSessionId,
+                });
+              }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
+            }
+            return;
+          }
+          const expectedPromptAcceptancePending = Boolean(
+            pollUntilTurnComplete
+              && expectedUserMessage
+              && !expectedUserMessageIsControlPrompt
+              && !promptAccepted
+          );
+          if (expectedPromptAcceptancePending) {
+            const elapsedMs = Date.now() - pollStartedAt;
+            const shouldContinuePolling = elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
+              agentId,
+              elapsedMs,
+              matchedBy,
+              messageCount: messages.length,
+              pollUntilTurnComplete,
+              promptEventIdPresent: Boolean(promptEventId),
+              reason: "prompt_acceptance_pending",
+              requestKey,
+              sessionIdPresent: Boolean(sessionId),
+              shouldContinuePolling,
+              threadId,
+              workspaceId,
+            });
+            logTerminalStatus("frontend.terminal_status.transcript_prompt_acceptance_pending", {
+              agentId,
+              elapsedMs,
+              matchedBy,
+              messageCount: messages.length,
+              promptAccepted,
+              promptEventId,
+              requestKey,
+              threadId,
+              workspaceId,
+            });
+            if (shouldContinuePolling) {
+              window.setTimeout(() => {
+                requestWorkspaceThreadTranscript({
+                  ...event,
+                  delayMs: 0,
+                  expectedMessageCreatedAt,
+                  expectedUserMessage,
+                  pollStartedAt,
+                  pollUntilTurnComplete: true,
+                  promptEventId,
+                  providerSessionId: sessionId || providerSessionId,
                 });
               }, WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS);
             }
@@ -11004,24 +11092,40 @@ export default function App() {
           }
           if (pollUntilTurnComplete) {
             const elapsedMs = Date.now() - pollStartedAt;
+            const waitingForPromptAcceptance = Boolean(
+              expectedUserMessage
+                && !expectedUserMessageIsControlPrompt
+                && !promptAccepted
+            );
             const shouldContinuePolling = (
-              !(turnCompleteSeen || assistantResponseCompletesTurn)
-              || (voicePlanPromptEventId.startsWith("voice-plan-") && !promptAccepted)
+              waitingForPromptAcceptance
+              || (
+                activeRunningTurnAtTranscriptResult
+                && (
+                  !(turnCompleteSeen || assistantResponseCompletesTurn)
+                  || (voicePlanPromptEventId.startsWith("voice-plan-") && !promptAccepted)
+                )
+              )
             )
               && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.poll", {
+              activeRunningTurnAtTranscriptResult,
               agentId,
               elapsedMs,
               expectedUserMessagePresent: Boolean(expectedUserMessage),
+              promptAccepted,
               requestKey,
               shouldContinuePolling,
               threadId,
               turnCompleteSeen,
+              waitingForPromptAcceptance,
               workspaceId,
             });
             logTerminalStatus("frontend.terminal_status.transcript_poll_decision", {
+              activeRunningTurnAtTranscriptResult,
               agentId,
               elapsedMs,
+              promptAccepted,
               promptEventId,
               requestKey,
               shouldContinuePolling,
@@ -11031,6 +11135,7 @@ export default function App() {
               ) ? "idle_or_done" : "processing_or_unknown",
               threadId,
               turnCompleteSeen,
+              waitingForPromptAcceptance,
               workspaceId,
             });
             if (shouldContinuePolling) {
@@ -11661,6 +11766,10 @@ export default function App() {
       } else if (lifecycleEvent.type === "terminal-input-ready") {
         const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
         const projectionEvents = getReadinessProjectionEvents(existingThread, lifecycleEvent);
+        const pendingPromptWaitingForSession = Boolean(
+          existingThread?.pendingPrompt
+            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
+        );
         if (!existingThread && !projectionEvents.length) {
           operation = "terminal_input_ready_active_terminal";
           nextThreads = updateWorkspaceActiveTerminal(threads, {
@@ -11671,25 +11780,43 @@ export default function App() {
         } else {
           operation = projectionEvents.length
             ? "terminal_input_ready_completed"
-            : "terminal_input_ready_idle";
+            : pendingPromptWaitingForSession
+              ? "terminal_input_ready_waiting_for_session_acceptance"
+              : "terminal_input_ready_idle";
           nextThreads = projectionEvents.length
             ? appendWorkspaceThreadProjectionEvents(threads, {
               ...lifecycleEvent,
               clearPendingPrompt: true,
               projectionEvents,
             })
-            : markWorkspaceThreadAgentActivity(threads, {
-              ...lifecycleEvent,
-              activityStatus: "idle",
-            });
+            : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
+              ? {
+                ...lifecycleEvent,
+                activityStatus: "thinking",
+                inputReady: false,
+                inputReadyAt: "",
+                inputReadyConfidence: "",
+                promptReadyAt: "",
+                promptReadyConfidence: "",
+                type: "agent-output",
+              }
+              : {
+                ...lifecycleEvent,
+                activityStatus: "idle",
+              });
         }
       } else if (lifecycleEvent.type === "terminal-prompt-ready") {
         const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
         const projectionEvents = getReadinessProjectionEvents(existingThread, lifecycleEvent);
+        const pendingPromptWaitingForSession = Boolean(
+          existingThread?.pendingPrompt
+            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
+        );
         logTerminalStatus("frontend.terminal_cli.finish_candidate_projection", {
           agentId: lifecycleAgentId,
           eventTime: new Date().toISOString(),
           inputReadyAt: lifecycleEvent.inputReadyAt || lifecycleEvent.promptReadyAt || "",
+          pendingPromptWaitingForSession,
           projectionEventCount: projectionEvents.length,
           projectedCompletion: projectionEvents.some((projectionEvent) => (
             projectionEvent?.type === "thread.turn.completed"
@@ -11712,17 +11839,30 @@ export default function App() {
         } else {
           operation = projectionEvents.length
             ? "terminal_prompt_ready_completed"
-            : "terminal_prompt_ready_idle";
+            : pendingPromptWaitingForSession
+              ? "terminal_prompt_ready_waiting_for_session_acceptance"
+              : "terminal_prompt_ready_idle";
           nextThreads = projectionEvents.length
             ? appendWorkspaceThreadProjectionEvents(threads, {
               ...lifecycleEvent,
               clearPendingPrompt: true,
               projectionEvents,
             })
-            : markWorkspaceThreadAgentActivity(threads, {
-              ...lifecycleEvent,
-              activityStatus: "idle",
-            });
+            : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
+              ? {
+                ...lifecycleEvent,
+                activityStatus: "thinking",
+                inputReady: false,
+                inputReadyAt: "",
+                inputReadyConfidence: "",
+                promptReadyAt: "",
+                promptReadyConfidence: "",
+                type: "agent-output",
+              }
+              : {
+                ...lifecycleEvent,
+                activityStatus: "idle",
+              });
         }
       } else if (lifecycleEvent.type === "agent-output") {
         operation = "mark_agent_activity";
@@ -13039,6 +13179,7 @@ export default function App() {
                           terminalWorkspace={activatedWorkspace}
                           terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
                           terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
+                          terminalWorkspaceRootWasEmptyAtSelection={activatedWorkspaceRootWasEmptyAtSelection}
                           terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
                           terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
                           terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
@@ -13119,6 +13260,7 @@ export default function App() {
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
+                            terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
                             terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}

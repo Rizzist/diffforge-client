@@ -755,11 +755,118 @@ fn workspace_active_project_root_for_mounts(
     }
 }
 
+fn workspace_directory_is_empty(root: &Path) -> bool {
+    fs::read_dir(root)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
+fn workspace_gitignore_only_diff_forge_bootstrap_rules(path: &Path) -> bool {
+    let existing = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+
+    existing.split(|byte| *byte == b'\n').all(|line| {
+        let trimmed = trim_gitignore_ascii(line);
+        trimmed.is_empty()
+            || trimmed.starts_with(b"#")
+            || gitignore_pattern_ignores_workspace_dir(trimmed, b".agents")
+            || gitignore_pattern_ignores_workspace_dir(trimmed, b"logs")
+    })
+}
+
+fn workspace_logs_directory_only_diff_forge_bootstrap_files(path: &Path) -> bool {
+    let read_dir = match fs::read_dir(path) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return false,
+    };
+
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let entry_path = entry.path();
+        let name = entry_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let Ok(metadata) = fs::symlink_metadata(&entry_path) else {
+            return false;
+        };
+
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+
+        if metadata.is_file() {
+            if name == ".DS_Store" {
+                continue;
+            }
+            if matches!(
+                name,
+                "coordination-alignment.jsonl" | "coordination-events.jsonl"
+            ) {
+                continue;
+            }
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn workspace_root_entry_is_empty_git_bootstrap_metadata(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+
+    match name {
+        ".DS_Store" => metadata.is_file(),
+        ".agents" => metadata.is_dir(),
+        ".gitignore" => {
+            metadata.is_file() && workspace_gitignore_only_diff_forge_bootstrap_rules(path)
+        }
+        "logs" => {
+            metadata.is_dir() && workspace_logs_directory_only_diff_forge_bootstrap_files(path)
+        }
+        _ => false,
+    }
+}
+
+fn workspace_directory_is_empty_for_git_bootstrap(root: &Path) -> bool {
+    let read_dir = match fs::read_dir(root) {
+        Ok(read_dir) => read_dir,
+        Err(_) => return false,
+    };
+
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if !workspace_root_entry_is_empty_git_bootstrap_metadata(&entry.path()) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn workspace_root_response(root: &Path) -> ForgeWorkingDirectory {
     let mounts = workspace_project_mounts(root);
     let workspace_mounts = workspace_mount_manifest_from_projects(root, &mounts);
     ForgeWorkingDirectory {
         working_directory: workspace_path_display(root),
+        empty_directory: workspace_directory_is_empty(root),
         workspace_kind: workspace_kind_for_mounts(root, &mounts),
         active_project_root: workspace_active_project_root_for_mounts(&mounts),
         project_mounts: mounts,
@@ -768,7 +875,10 @@ fn workspace_root_response(root: &Path) -> ForgeWorkingDirectory {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn workspace_git_bootstrap_for_selected_root(root: &Path) -> Result<WorkspaceGitBootstrap, String> {
+fn workspace_git_bootstrap_for_selected_root(
+    root: &Path,
+    _selected_root_was_empty_at_selection: bool,
+) -> Result<WorkspaceGitBootstrap, String> {
     let mounts = workspace_project_mounts(root);
     let is_selected_project = workspace_selected_root_mount(root, &mounts).is_some();
 
@@ -780,6 +890,17 @@ fn workspace_git_bootstrap_for_selected_root(root: &Path) -> Result<WorkspaceGit
             initialized_repo: false,
             created_initial_commit: false,
             gitignore_update: "container_project_mounts".to_string(),
+        });
+    }
+
+    if !root.join(".git").exists() && !workspace_directory_is_empty_for_git_bootstrap(root) {
+        return Ok(WorkspaceGitBootstrap {
+            repo_path: workspace_path_display(root),
+            branch: String::new(),
+            head_sha: String::new(),
+            initialized_repo: false,
+            created_initial_commit: false,
+            gitignore_update: "selected_root_not_empty".to_string(),
         });
     }
 
@@ -2128,7 +2249,7 @@ mod workspace_files_tests {
         init_test_git_repo(&project);
         fs::create_dir_all(project.join(".agents").join("spec-graph")).unwrap();
 
-        let bootstrap = workspace_git_bootstrap_for_selected_root(&root).unwrap();
+        let bootstrap = workspace_git_bootstrap_for_selected_root(&root, false).unwrap();
         let response = workspace_root_response(&root);
 
         assert!(!root.join(".git").exists());
@@ -2143,6 +2264,90 @@ mod workspace_files_tests {
         );
         assert!(response.project_mounts[0].has_agents);
         assert!(response.project_mounts[0].has_spec_graph_cache);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_root_response_reports_empty_directory_before_local_state_exists() {
+        let root = test_workspace_root("diffforge-empty-root-response");
+        fs::create_dir_all(&root).unwrap();
+
+        let empty_response = workspace_root_response(&root);
+        assert!(empty_response.empty_directory);
+
+        fs::write(root.join("README.md"), "not empty\n").unwrap();
+        let non_empty_response = workspace_root_response(&root);
+        assert!(!non_empty_response.empty_directory);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_empty_git_bootstrap_check_ignores_diff_forge_metadata() {
+        let root = test_workspace_root("diffforge-empty-bootstrap-metadata");
+        fs::create_dir_all(root.join(".agents").join("cloud-mcp")).unwrap();
+        fs::write(
+            root.join(".agents").join("cloud-mcp").join("cloud-mcp.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(root.join(".gitignore"), ".agents/\n/logs/\n").unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join("logs").join("coordination-events.jsonl"), "{}\n").unwrap();
+
+        assert!(!workspace_directory_is_empty(&root));
+        assert!(workspace_directory_is_empty_for_git_bootstrap(&root));
+
+        fs::write(root.join("README.md"), "now a project\n").unwrap();
+        assert!(!workspace_directory_is_empty_for_git_bootstrap(&root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_root_bootstrap_allows_reopened_metadata_only_folder_without_empty_selection() {
+        let root = test_workspace_root("diffforge-reopened-empty-bootstrap");
+        fs::create_dir_all(root.join(".agents").join("spec-graph")).unwrap();
+        fs::write(root.join(".gitignore"), ".agents/\n/logs/\n").unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join("logs").join("coordination-alignment.jsonl"), "{}\n").unwrap();
+
+        let bootstrap = workspace_git_bootstrap_for_selected_root(&root, false).unwrap();
+
+        assert!(root.join(".git").exists());
+        assert!(bootstrap.initialized_repo);
+        assert!(bootstrap.created_initial_commit);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_root_bootstrap_skips_non_empty_plain_folder_without_empty_selection() {
+        let root = test_workspace_root("diffforge-non-empty-bootstrap-skip");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("README.md"), "not empty\n").unwrap();
+
+        let bootstrap = workspace_git_bootstrap_for_selected_root(&root, false).unwrap();
+
+        assert!(!root.join(".git").exists());
+        assert!(!bootstrap.initialized_repo);
+        assert_eq!(bootstrap.gitignore_update, "selected_root_not_empty");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_root_bootstrap_skips_non_empty_plain_folder_with_stale_empty_selection() {
+        let root = test_workspace_root("diffforge-stale-empty-bootstrap-skip");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("README.md"), "not empty\n").unwrap();
+
+        let bootstrap = workspace_git_bootstrap_for_selected_root(&root, true).unwrap();
+
+        assert!(!root.join(".git").exists());
+        assert!(!bootstrap.initialized_repo);
+        assert_eq!(bootstrap.gitignore_update, "selected_root_not_empty");
 
         let _ = fs::remove_dir_all(root);
     }

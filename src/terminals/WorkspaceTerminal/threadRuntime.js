@@ -1418,7 +1418,7 @@ export function requestTerminalSubmitDiagnosticSnapshot(fields = {}) {
 export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
   acceptedWaiter,
   agentId = "",
-  allowEnterRetry = true,
+  allowEnterRetry = false,
   binding,
   expectedPrompt = "",
   getDraftValue,

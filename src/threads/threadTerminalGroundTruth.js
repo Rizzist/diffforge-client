@@ -417,6 +417,7 @@ export function getThreadTerminalGroundTruth({
   const hasProjectionEvents = Array.isArray(thread?.projectionEvents) && thread.projectionEvents.length > 0;
   const hasNativeSession = providerBindingsHaveNativeSession(providerBindings);
   const hasPendingPrompt = Boolean(thread?.pendingPrompt);
+  const promptSubmissionPending = Boolean(hasPendingPrompt && latestTurnState === "running");
   const hasTranscriptSession = Boolean(cleanText(thread?.transcriptSessionId));
   const orphanRunningLooksIdle = Boolean(
     latestTurnState === "running"
@@ -483,25 +484,29 @@ export function getThreadTerminalGroundTruth({
   const requiresAgentInputReady = safeAgentReadyRoles.has(cleanText(targetRole).toLowerCase());
   const completedTurnLooksSendable = Boolean(
     requiresAgentInputReady
-      && !recordedAgentInputReady
+      && recordedAgentInputReady
+      && inputReadyIsFreshForTurn
       && (COMPLETED_TURN_STATES.has(latestTurnState) || runningTurnLooksIdle || orphanRunningLooksIdle)
       && !completedTurnLooksStaleActive
       && effectiveActivityStatus !== "thinking"
       && !hasPendingPrompt
       && terminalLooksActive
   );
-  const agentInputReady = !requiresAgentInputReady
-    || recordedAgentInputReady
-    || completedTurnLooksSendable;
-  const terminalGroundTruthStatus = runningTurnLooksIdle || (
-    recordedAgentInputReady
-    && inputReadyIsFreshForTurn
-    && terminalLooksActive
-  )
-    ? "idle_or_prompt_ready"
-    : latestTurnState === "running" || activityStatus === "thinking"
-      ? "processing_or_active"
-      : "idle_or_unknown";
+  const agentInputReady = !hasPendingPrompt && (
+    !requiresAgentInputReady
+      || (recordedAgentInputReady && inputReadyIsFreshForTurn)
+  );
+  const terminalGroundTruthStatus = promptSubmissionPending
+    ? "processing_or_active"
+    : runningTurnLooksIdle || (
+      recordedAgentInputReady
+      && inputReadyIsFreshForTurn
+      && terminalLooksActive
+    )
+      ? "idle_or_prompt_ready"
+      : latestTurnState === "running" || activityStatus === "thinking"
+        ? "processing_or_active"
+        : "idle_or_unknown";
   const promptClearedByLifecycle = Boolean(
     PROMPTING_CLEARING_LIFECYCLE_TYPES.has(lifecycleType)
       || lifecycleEvent?.terminalIsPromptingUser === false
@@ -580,6 +585,7 @@ export function getThreadTerminalGroundTruth({
     latestTurnState,
     messageCount,
     orphanRunningLooksIdle,
+    promptSubmissionPending,
     recordedAgentInputReady,
     requiresAgentInputReady,
     runningTurnLooksIdle,

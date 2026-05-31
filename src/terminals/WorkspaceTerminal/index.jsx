@@ -689,6 +689,8 @@ const TERMINAL_CODING_AGENT_INPUT_READY_DELAY_MS = 15000;
 const TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS = 250;
 const TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS = 120;
 const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
+const TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS = 2500;
+const TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS = 600;
 const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
@@ -1194,6 +1196,7 @@ function WorkspaceTerminal({
   workingDirectory,
   workspace,
   workspaceError,
+  workspaceRootWasEmptyAtSelection = false,
   workspaceThreads = {},
   workspaces = [],
   selectedWorkspaceThreadId = "",
@@ -1299,6 +1302,7 @@ function WorkspaceTerminal({
   const terminalThreadReadyLifecycleEmittedRef = useRef(false);
   const terminalThreadPromptReadyPendingRef = useRef(null);
   const terminalThreadSawAgentOutputRef = useRef(false);
+  const terminalThreadSubmittedPromptRef = useRef(null);
   const terminalThreadLastWorkStartedAtRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
   const terminalThreadLastActiveOutputLifecycleAtRef = useRef(0);
   const threadsViewSelectedThreadRef = useRef(null);
@@ -1351,6 +1355,7 @@ function WorkspaceTerminal({
       terminalThreadReadyDetectionArmedRef.current = false;
       terminalThreadReadyLifecycleEmittedRef.current = false;
       terminalThreadSawAgentOutputRef.current = false;
+      terminalThreadSubmittedPromptRef.current = null;
     }
     terminalThreadActivityStatusRef.current = nextStatus;
     if (!isGenericTerminal && (previousStatus !== nextStatus || options.forceNewTurn === true)) {
@@ -1384,6 +1389,64 @@ function WorkspaceTerminal({
     logTerminalStatus("frontend.terminal_cli.prompt_ready_detection_armed", getTerminalCliStatusLogBase({
       source: "arm_terminal_prompt_ready_detection",
     }));
+  };
+  const rememberTerminalThreadSubmittedPrompt = ({
+    promptEventId = "",
+    promptText = "",
+    source = "terminal-submit",
+    submittedAt = "",
+    threadId = "",
+  } = {}) => {
+    const safePromptText = String(promptText || "").trim();
+    const safeThreadId = String(threadId || terminalThreadIdRef.current || "").trim();
+    if (!safePromptText || !safeThreadId) {
+      return;
+    }
+
+    terminalThreadSubmittedPromptRef.current = {
+      promptEventId: String(promptEventId || "").trim(),
+      promptText: safePromptText,
+      source,
+      submittedAt,
+      submittedAtMs: performance.now(),
+      threadId: safeThreadId,
+    };
+  };
+  const getPromptReadySuppressionReason = (outputText = "", {
+    source = "terminal-output-prompt-ready",
+  } = {}) => {
+    const submittedPrompt = terminalThreadSubmittedPromptRef.current;
+    if (!submittedPrompt || submittedPrompt.threadId !== terminalThreadIdRef.current) {
+      return "";
+    }
+    if (terminalThreadSawAgentOutputRef.current) {
+      return "";
+    }
+
+    const promptAgeMs = performance.now() - Number(submittedPrompt.submittedAtMs || 0);
+    if (promptAgeMs > TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS) {
+      return "";
+    }
+
+    const normalizeEchoText = (value) => stripLiveViewControlSequences(String(value || ""))
+      .replace(/\[[0-9;?]*[A-Za-z]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    const normalizedOutput = normalizeEchoText(outputText);
+    const normalizedPrompt = normalizeEchoText(submittedPrompt.promptText);
+    const outputIncludesSubmittedPrompt = Boolean(
+      normalizedPrompt
+        && normalizedOutput.includes(normalizedPrompt),
+    );
+    if (outputIncludesSubmittedPrompt) {
+      return "submitted_prompt_echo";
+    }
+    if (promptAgeMs <= TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS) {
+      return "recent_submit_before_agent_output";
+    }
+
+    return "";
   };
   const flushTerminalPromptReadyPending = (reason = "provider-turn-started") => {
     const pending = terminalThreadPromptReadyPendingRef.current;
@@ -1766,6 +1829,13 @@ function WorkspaceTerminal({
       terminalIndex,
       threadId: terminalThreadIdRef.current || "",
       workspaceId: workspace?.id || "",
+    });
+    rememberTerminalThreadSubmittedPrompt({
+      promptEventId: options.promptEventId || "",
+      promptText: safeUserMessage,
+      source: options.source || options.messageSource || "observed_terminal_prompt",
+      submittedAt: options.messageCreatedAt || "",
+      threadId: terminalThreadIdRef.current || "",
     });
     markTerminalThreadActivityStatus("thinking", {
       forceNewTurn: true,
@@ -2564,6 +2634,15 @@ function WorkspaceTerminal({
     const promptId = createThreadProjectionToken("prompt");
     const startedAt = new Date().toISOString();
     const turnId = `turn-${promptId}`;
+    if (latestThread.id === terminalThreadIdRef.current) {
+      rememberTerminalThreadSubmittedPrompt({
+        promptEventId: promptId,
+        promptText: text,
+        source: "bigview_thread_submit",
+        submittedAt: startedAt,
+        threadId: latestThread.id,
+      });
+    }
     const previousDraft = threadComposerDraftsRef.current.has(syncKey)
       ? threadComposerDraftsRef.current.get(syncKey)
       : "";
@@ -3518,7 +3597,83 @@ function WorkspaceTerminal({
       ) {
         return;
       }
-      if (payload.looksActive !== true || payload.looksReady === true) {
+
+      if (payload.looksReady === true && payload.looksActive !== true) {
+        const outputText = payload.outputPreview || payload.decodedPreview || "";
+        const promptReadySource = "backend-terminal-output-prompt-ready";
+        const suppressionReason = getPromptReadySuppressionReason(outputText, {
+          source: promptReadySource,
+        });
+        if (suppressionReason) {
+          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_suppressed", getTerminalCliStatusLogBase({
+            outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+            promptEventId: terminalThreadSubmittedPromptRef.current?.promptEventId || "",
+            promptReadySource,
+            reason: suppressionReason,
+            source: promptReadySource,
+            statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
+          }));
+          return;
+        }
+
+        const currentThreadActivityStatus = String(
+          terminalThreadActivityStatusRef.current || "",
+        ).trim().toLowerCase();
+        const latestThreadTurnState = String(
+          thread?.latestTurn?.state || "",
+        ).trim().toLowerCase();
+        const readyCanRepairThread = currentThreadActivityStatus === "thinking"
+          || latestThreadTurnState === "running";
+        if (
+          isGenericTerminal
+          || !terminalThreadIdRef.current
+          || !readyCanRepairThread
+          || terminalThreadReadyLifecycleEmittedRef.current
+        ) {
+          return;
+        }
+
+        const inputReadyAt = new Date().toISOString();
+        logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_output", getTerminalCliStatusLogBase({
+          inputReadyAt,
+          outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+          source: promptReadySource,
+          statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
+        }));
+        markTerminalThreadActivityStatus("idle", {
+          promptReadySource,
+          reason: promptReadySource,
+        });
+        terminalThreadReadyLifecycleEmittedRef.current = true;
+
+        const promptReadyLifecycle = {
+          activityStatus: "idle",
+          agentId: terminalAgentKind,
+          inputReady: true,
+          inputReadyAt,
+          inputReadyConfidence: promptReadySource,
+          instanceId: terminalInstanceIdRef.current || undefined,
+          nativeSessionId: threadProviderSessionId || "",
+          nativeSessionKind: threadProviderSessionId ? "session" : "",
+          nativeSessionSource: threadProviderSessionId ? promptReadySource : "",
+          outputText: String(outputText || "").slice(-1200),
+          paneId,
+          promptReadyAt: inputReadyAt,
+          providerSessionId: threadProviderSessionId || "",
+          source: promptReadySource,
+          status: "active",
+          terminalIndex,
+          threadId: terminalThreadIdRef.current,
+          type: "terminal-prompt-ready",
+          workspaceId: workspace?.id || thread?.workspaceId || "",
+        };
+        terminalThreadPromptReadyPendingRef.current = promptReadyLifecycle;
+        recordThreadTerminalReadiness(promptReadyLifecycle);
+        onThreadTerminalLifecycle?.(promptReadyLifecycle);
+        return;
+      }
+
+      if (payload.looksActive !== true) {
         return;
       }
       markTerminalActiveOutputObserved({
@@ -3542,7 +3697,18 @@ function WorkspaceTerminal({
         unlisten();
       }
     };
-  }, [markTerminalActiveOutputObserved, paneId]);
+  }, [
+    isGenericTerminal,
+    markTerminalActiveOutputObserved,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    thread?.latestTurn?.state,
+    thread?.workspaceId,
+    threadProviderSessionId,
+    workspace?.id,
+  ]);
 
   useEffect(() => {
     let disposed = false;
@@ -8222,10 +8388,15 @@ function WorkspaceTerminal({
             const thinkingElapsedMs = thinkingSince > 0 ? performance.now() - thinkingSince : 0;
             const readyOutputText = decodeTerminalOutputChunkForReady(terminalData);
             const outputLooksPromptReady = terminalOutputLooksPromptReady(readyOutputText);
+            const promptReadySuppressionReason = outputLooksPromptReady
+              ? getPromptReadySuppressionReason(readyOutputText, {
+                source: "terminal-output-prompt-ready",
+              })
+              : "";
             const promptReadyDetectionArmed = Boolean(terminalThreadReadyDetectionArmedRef.current);
             if (
               thinkingElapsedMs >= TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS
-              || (outputLooksPromptReady && thinkingElapsedMs >= TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS)
+              && !outputLooksPromptReady
             ) {
               terminalThreadSawAgentOutputRef.current = true;
             }
@@ -8249,6 +8420,7 @@ function WorkspaceTerminal({
             const shouldEmitPromptReady = Boolean(
               !terminalThreadReadyLifecycleEmittedRef.current
               && outputLooksPromptReady
+              && !promptReadySuppressionReason
               && (
                 (
                   promptReadyDetectionArmed
@@ -8266,6 +8438,7 @@ function WorkspaceTerminal({
                 lifecycleAlreadyEmitted: Boolean(terminalThreadReadyLifecycleEmittedRef.current),
                 outputPreview: sanitizeTerminalDiagnosticText(readyOutputText, 320),
                 promptReadyDetectionArmed,
+                promptReadySuppressionReason,
                 sawAgentOutput,
                 shouldEmitPromptReady,
                 source: "terminal_output_prompt_ready_match",
@@ -9786,6 +9959,13 @@ function WorkspaceTerminal({
               });
             }
             if (terminalSubmittedInputHasText && promptTextAtSubmit && !shouldSuppressSubmitLifecycle) {
+              rememberTerminalThreadSubmittedPrompt({
+                promptEventId: confirmedSubmitBridge?.promptEventId || "",
+                promptText: promptTextAtSubmit,
+                source: confirmedSubmitBridge?.promptEventSource || "tui-manual-input",
+                submittedAt: confirmedSubmitBridge?.promptEventSubmittedAt || "",
+                threadId: terminalThreadIdRef.current || "",
+              });
               recordSubmittedAgentMessage(
                 terminalInstanceId,
                 promptTextAtSubmit,
@@ -10271,6 +10451,7 @@ function WorkspaceTerminal({
               terminalIndex,
               threadId: startupThreadId,
               workingDirectory: workingDirectory || "",
+              workspaceRootWasEmptyAtSelection: Boolean(workspaceRootWasEmptyAtSelection),
               workspaceId: workspace?.id || "",
               workspaceName: workspace?.name || "",
               cols: initialSize.cols,
@@ -10633,13 +10814,17 @@ function WorkspaceTerminal({
     const promptId = String(pendingPrompt?.id || "").trim();
     const promptText = String(pendingPrompt?.text || "").trim();
     const deliveryMode = String(pendingPrompt?.deliveryMode || "").trim().toLowerCase();
+    const sessionAcceptanceOnly = deliveryMode === "session-acceptance";
     const requestedProviderDelivery = deliveryMode === "provider-api";
     const useTerminalConfirmedDelivery = true;
-    const effectiveDeliveryMode = requestedProviderDelivery
-      ? "terminal-confirmed-forced-from-provider-api"
-      : deliveryMode === "terminal-confirmed"
-        ? "terminal-confirmed"
-        : "terminal-confirmed-default";
+    let effectiveDeliveryMode = "terminal-confirmed-default";
+    if (sessionAcceptanceOnly) {
+      effectiveDeliveryMode = "session-acceptance";
+    } else if (requestedProviderDelivery) {
+      effectiveDeliveryMode = "terminal-confirmed-forced-from-provider-api";
+    } else if (deliveryMode === "terminal-confirmed") {
+      effectiveDeliveryMode = "terminal-confirmed";
+    }
     const threadId = terminalThreadIdRef.current || thread?.id || "";
     const instanceId = terminalInstanceIdRef.current || 0;
     const hasSessionRestoreModel = Boolean(threadProviderSessionId && threadProviderModel);
@@ -10664,6 +10849,14 @@ function WorkspaceTerminal({
       threadId,
       workspaceId: workspace?.id || thread?.workspaceId || "",
     };
+
+    if (sessionAcceptanceOnly) {
+      logTerminalStatus("frontend.pending_prompt.skip", {
+        ...pendingPromptLogFields,
+        reason: "session_acceptance_tracking_only",
+      });
+      return;
+    }
 
     if (
       !promptId

@@ -1271,6 +1271,7 @@ struct SavedTodoTextAttachment {
 #[serde(rename_all = "camelCase")]
 struct ForgeWorkingDirectory {
     working_directory: String,
+    empty_directory: bool,
     workspace_kind: String,
     active_project_root: Option<String>,
     project_mounts: Vec<WorkspaceProjectMount>,
@@ -1351,6 +1352,7 @@ struct TerminalOpenRequest {
     terminal_index: Option<u16>,
     thread_id: Option<String>,
     working_directory: Option<String>,
+    workspace_root_was_empty_at_selection: Option<bool>,
     project_root: Option<String>,
     mount_id: Option<String>,
     workspace_id: Option<String>,

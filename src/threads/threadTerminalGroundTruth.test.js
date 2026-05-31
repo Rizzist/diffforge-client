@@ -94,3 +94,111 @@ test("fresh prompt readiness still completes a completed turn", () => {
   assert.equal(groundTruth.terminalWorkState, "complete");
   assert.equal(groundTruth.terminalIsComplete, true);
 });
+
+test("fresh prompt readiness settles a restored running turn", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:15:00.000Z",
+      status: "active",
+    },
+    providerBinding: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:15:00.000Z",
+      status: "active",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "thinking",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "running",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "make a pricing.html" },
+        { role: "assistant", text: "I'll add it now." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.delta" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.runningTurnLooksIdle, true);
+  assert.equal(groundTruth.effectiveActivityStatus, "idle");
+  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
+  assert.equal(groundTruth.terminalGroundTruthStatus, "idle_or_prompt_ready");
+});
+
+test("pending session acceptance keeps a running turn active despite prompt readiness", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:15:00.000Z",
+      status: "active",
+    },
+    providerBinding: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:15:00.000Z",
+      status: "active",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "thinking",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "running",
+      },
+      messageCount: 0,
+      messages: [],
+      pendingPrompt: {
+        id: "prompt-test",
+        text: "summarize recent commits",
+      },
+      projectionEvents: [{ type: "thread.turn.started" }],
+    },
+  });
+
+  assert.equal(groundTruth.promptSubmissionPending, true);
+  assert.equal(groundTruth.runningTurnLooksIdle, false);
+  assert.equal(groundTruth.agentInputReady, false);
+  assert.equal(groundTruth.terminalGroundTruthStatus, "processing_or_active");
+  assert.equal(groundTruth.terminalWorkState, "running");
+});
+
+test("completed transcript without fresh readiness is not sendable", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      inputReady: false,
+      status: "active",
+    },
+    providerBinding: {
+      inputReady: false,
+      status: "active",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "completed",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "make a pricing.html" },
+        { role: "assistant", text: "I am still working on it." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.effectiveActivityStatus, "idle");
+  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
+  assert.equal(groundTruth.completedTurnLooksSendable, false);
+  assert.equal(groundTruth.agentInputReady, false);
+});

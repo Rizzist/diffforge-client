@@ -564,7 +564,9 @@ function normalizePendingPrompt(value) {
   }
 
   const rawDeliveryMode = cleanText(value.deliveryMode || value.mode).toLowerCase();
-  const deliveryMode = rawDeliveryMode === "provider-api" || rawDeliveryMode === "terminal-confirmed"
+  const deliveryMode = rawDeliveryMode === "provider-api"
+    || rawDeliveryMode === "terminal-confirmed"
+    || rawDeliveryMode === "session-acceptance"
     ? rawDeliveryMode
     : "terminal";
 
@@ -2116,14 +2118,21 @@ function normalizeThread(thread, workspaceId, options = {}) {
     transcriptSessionId,
   });
   const latestTurn = orphanRunningThreadState ? null : projectedLatestTurn;
+  const detachedNonLiveRunningThread = Boolean(
+    latestTurn?.state === "running"
+      && !terminalBinding
+      && ["closed", "exited", "idle"].includes(safeStatus)
+  );
   const activityStatus = options.stripLiveBindings
     ? "idle"
     : orphanRunningThreadState
       ? "idle"
-      : activityStatusForLatestTurn(
-      latestTurn,
-      normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
-    );
+      : detachedNonLiveRunningThread
+        ? "idle"
+        : activityStatusForLatestTurn(
+          latestTurn,
+          normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
+        );
   const normalizedProviderBindings = orphanRunningThreadState
     ? clearOrphanRunningProviderBindings(providerBindings)
     : providerBindings;
@@ -3124,7 +3133,7 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     createdAt: event.messageCreatedAt,
     deliveryMode: event.pendingPromptDeliveryMode || event.deliveryMode,
     id: event.pendingPromptId,
-    message: event.pendingPromptText,
+    message: event.pendingPromptText || (event.sessionAcceptancePending === true ? submittedUserMessage : ""),
     model: event.model,
   });
   const hasSubmittedPrompt = Boolean(submittedUserMessage || pendingPrompt);
@@ -4409,38 +4418,62 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const transcriptExplicitInputReadyAt = transcriptExplicitCompletionCanSettleTurn
     ? cleanText(event.completedAt, now)
     : "";
+  const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
+    agentId,
+    completedAt: event.completedAt,
+    expectedMessageCreatedAt: event.expectedMessageCreatedAt,
+    expectedUserMessage: event.expectedUserMessage,
+    latestTimestamp: event.latestTimestamp,
+    promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
+    promptAccepted: event.promptAccepted,
+    promptEventSubmittedAt: event.promptEventSubmittedAt,
+    source: cleanText(event.source, `${agentId}-session`),
+    submittedAt: event.submittedAt,
+    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
+    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
+    transcriptExplicitCompletionCanSettleTurn,
+    turnCompleteSeen: event.turnCompleteSeen,
+  });
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
-    createProjectionEventsFromTranscript(existing, event.messages, {
-      agentId,
-      completedAt: event.completedAt,
-      expectedMessageCreatedAt: event.expectedMessageCreatedAt,
-      expectedUserMessage: event.expectedUserMessage,
-      latestTimestamp: event.latestTimestamp,
-      promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
-      promptAccepted: event.promptAccepted,
-      promptEventSubmittedAt: event.promptEventSubmittedAt,
-      source: cleanText(event.source, `${agentId}-session`),
-      submittedAt: event.submittedAt,
-      allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
-      assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-      transcriptExplicitCompletionCanSettleTurn,
-      turnCompleteSeen: event.turnCompleteSeen,
-    }),
+    projectionEventsToAdd,
   );
   const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
   const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const pendingPromptId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  const shouldClearAcceptedPendingPrompt = Boolean(
+    event.promptAccepted === true
+      && existing.pendingPrompt
+      && (
+        !pendingPromptId
+        || cleanText(existing.pendingPrompt.id) === pendingPromptId
+      )
+  );
   const shouldClearOrphanRunning = isOrphanRunningThreadState({
     latestTurn: projectedLatestTurn,
     messageCount: messages.length,
     messages,
-    pendingPrompt: existing.pendingPrompt,
+    pendingPrompt: shouldClearAcceptedPendingPrompt ? null : existing.pendingPrompt,
     projectionEvents,
     providerBindings: existing.providerBindings,
     transcriptSessionId: sessionId || existing.transcriptSessionId,
   });
+  const existingStatus = cleanText(existing.status).toLowerCase();
+  const projectedLatestTurnState = normalizeThreadLatestTurn(projectedLatestTurn)?.state || "";
+  const detachedIdleHydrateKeepsIdle = Boolean(
+    projectedLatestTurnState === "running"
+      && projectionEventsToAdd.length === 0
+      && !normalizeTerminalBinding(existing.terminalBinding)
+      && ["closed", "exited", "idle"].includes(existingStatus)
+      && event.allowTranscriptTurnCompletion !== true
+      && event.assistantResponseCompletesTurn !== true
+      && event.transcriptExplicitCompletionCanSettleTurn !== true
+      && event.turnCompleteSeen !== true
+  );
   const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
-  const activityStatus = activityStatusForLatestTurn(latestTurn, "idle");
+  const activityStatus = detachedIdleHydrateKeepsIdle
+    ? "idle"
+    : activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
     : existing.lastMessageAt;
@@ -4515,6 +4548,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
           materialized: true,
           messageCount: messages.length,
           messages,
+          pendingPrompt: shouldClearAcceptedPendingPrompt ? null : existing.pendingPrompt,
           projectionEvents,
           providerBindings,
           sessionName: sessionTitle || existingSessionName || existingTitle || title,
