@@ -50,6 +50,8 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
+    "write_file",
+    "delete_file",
     "complete_task",
     "submit_patch",
     "submit_patch_status",
@@ -59,6 +61,8 @@ const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
+    "write_file",
+    "delete_file",
     "complete_task",
     "submit_patch",
     "submit_patch_status",
@@ -3191,8 +3195,26 @@ impl CoordinationKernel {
                 return Err("complete_task status must be done, completed, or skipped.".to_string())
             }
         };
-        self.ensure_session_active(session_id, agent_id)?;
+        let session = self.ensure_session_active(session_id, agent_id)?;
         self.ensure_session_owns_task(session_id, task_id)?;
+        let session_worktree_id = session["worktree_id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty());
+        let managed_patch_session = session["enforcement_mode"].as_str()
+            == Some("worktree_required")
+            || session_worktree_id.is_some();
+        if managed_patch_session {
+            return Ok(api_error(
+                "managed_patch_requires_submit_patch",
+                "This task is running in managed patch mode. Finish it with submit_patch so the isolated worktree is validated and applied to the main repo.",
+                json!({
+                    "task_id": task_id,
+                    "session_id": session_id,
+                    "worktree_id": session_worktree_id,
+                    "enforcement_mode": session["enforcement_mode"].as_str(),
+                }),
+            ));
+        }
         let task = self.query_one(
             "SELECT status FROM tasks WHERE id=?1",
             &[&task_id],
@@ -4984,6 +5006,9 @@ impl CoordinationKernel {
                 params![id, worktree_id, now_rfc3339(), agent_slot_id],
             )
             .map_err(|error| format!("Unable to attach session to agent slot: {error}"))?;
+        if let Some(worktree_id) = worktree_id.as_deref() {
+            self.bind_worktree_to_session(worktree_id, agent_slot_id, agent_id, &id)?;
+        }
 
         let mcp_config = self.write_or_update_slot_mcp_config(
             agent_slot_id,
@@ -5117,6 +5142,7 @@ impl CoordinationKernel {
         let codex_launch = prepare_managed_codex_profile_for_terminal(
             &self.paths,
             agent_kind,
+            &agent_id,
             slot_key.as_deref(),
             &session_id,
             &write_root,
@@ -5258,6 +5284,7 @@ impl CoordinationKernel {
         let codex_launch = prepare_managed_codex_profile_for_terminal(
             &self.paths,
             &agent_kind,
+            &agent_id,
             slot_key.as_deref(),
             &session_id,
             &write_root,
@@ -5382,8 +5409,10 @@ impl CoordinationKernel {
     ) -> Result<Value, String> {
         let slot_key = normalize_agent_slot_key(slot_key)?;
         let slot = self.get_or_create_agent_slot(&slot_key, agent_name, agent_kind, None)?;
-        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_agent_id = required_string(&slot, "agent_id")?;
         let agent_slot_id = required_string(&slot, "id")?;
+        let (agent_id, session_id) =
+            self.active_session_owner_for_slot(agent_slot_id, &slot_agent_id)?;
         if !self.paths.repo_path.join(".git").exists() {
             return Err(
                 "Repo has no .git; terminal worktree isolation is unavailable.".to_string(),
@@ -5427,10 +5456,18 @@ impl CoordinationKernel {
             self.conn
                 .execute(
                     "UPDATE worktrees
-                     SET agent_id=?1, path=?2, branch_name=?3, base_sha=?4,
-                         current_sha=?4, status='active', updated_at=?5
-                     WHERE id=?6",
-                    params![agent_id, path_text, branch, recorded_sha, now, id],
+                     SET agent_id=?1, session_id=?2, path=?3, branch_name=?4, base_sha=?5,
+                         current_sha=?5, status='active', updated_at=?6
+                     WHERE id=?7",
+                    params![
+                        agent_id,
+                        session_id.as_deref(),
+                        path_text,
+                        branch,
+                        recorded_sha,
+                        now,
+                        id
+                    ],
                 )
                 .map_err(|error| format!("Unable to update terminal worktree row: {error}"))?;
         } else {
@@ -5439,11 +5476,12 @@ impl CoordinationKernel {
                     "INSERT INTO worktrees(
                         id, agent_slot_id, agent_id, session_id, path, branch_name,
                         base_sha, current_sha, status, created_at, updated_at
-                    ) VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, 'active', ?7, ?7)",
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?8)",
                     params![
                         id,
                         agent_slot_id,
                         agent_id,
+                        session_id.as_deref(),
                         path_text,
                         branch,
                         recorded_sha,
@@ -7814,7 +7852,9 @@ impl CoordinationKernel {
         _context_role: Option<&str>,
     ) -> Result<SessionMcpConfigPaths, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
-        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_agent_id = required_string(&slot, "agent_id")?;
+        let (agent_id, _active_owner_session_id) =
+            self.active_session_owner_for_slot(agent_slot_id, &slot_agent_id)?;
         let slot_key = required_string(&slot, "slot_key")?;
         let (command, mut args) = self.coordination_mcp_command_spec();
         args.extend([
@@ -9949,6 +9989,324 @@ impl CoordinationKernel {
         ))
     }
 
+    pub fn write_file_for_task(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        path: &str,
+        content: &str,
+    ) -> Result<Value, String> {
+        let authority = match self.managed_file_authority_for_task(
+            task_id,
+            agent_id,
+            session_id,
+            path,
+            "write_file",
+        )? {
+            Ok(authority) => authority,
+            Err(response) => return Ok(response),
+        };
+        if authority.target_path.is_dir() {
+            return Ok(api_error(
+                "target_is_directory",
+                "write_file can only write regular files.",
+                json!({"path": authority.normalized_path}),
+            ));
+        }
+        let existed = authority.target_path.exists();
+        write_text_file_atomic(&authority.target_path, content)?;
+        let change_kind = if existed { "modified" } else { "added" };
+        let change = self.record_workspace_change(WorkspaceChangeInput {
+            task_id: Some(task_id),
+            agent_id: Some(agent_id),
+            agent_slot_id: authority.session["agent_slot_id"].as_str(),
+            session_id: Some(session_id),
+            worktree_id: authority.worktree_id.as_deref(),
+            change_source: "managed_write_file",
+            path: &authority.normalized_path,
+            resource_key: &authority.resource_key,
+            change_kind,
+            lease: Some(&authority.lease),
+            violation_id: None,
+            summary: Some("Managed coordination write"),
+            details: json!({
+                "authority": &authority.authority,
+                "target_path": process_path_text(&authority.target_path),
+                "byte_len": content.as_bytes().len(),
+            }),
+        })?;
+        self.emit_event(
+            "managed_file_written",
+            "agent",
+            agent_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: authority.session["agent_slot_id"]
+                    .as_str()
+                    .map(str::to_string),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "path": &authority.normalized_path,
+                "resource_key": &authority.resource_key,
+                "change_kind": change_kind,
+                "authority": &authority.authority,
+                "write_root": process_path_text(&authority.write_root),
+                "target_path": process_path_text(&authority.target_path),
+                "change": change.clone(),
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "status": "written",
+            "path": authority.normalized_path,
+            "resource_key": authority.resource_key,
+            "change_kind": change_kind,
+            "authority": authority.authority,
+            "write_root": process_path_text(&authority.write_root),
+            "target_path": process_path_text(&authority.target_path),
+            "worktree_id": authority.worktree_id,
+            "completion_mode": authority.completion_mode,
+            "change": change,
+        })))
+    }
+
+    pub fn delete_file_for_task(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Value, String> {
+        let authority = match self.managed_file_authority_for_task(
+            task_id,
+            agent_id,
+            session_id,
+            path,
+            "delete_file",
+        )? {
+            Ok(authority) => authority,
+            Err(response) => return Ok(response),
+        };
+        if !authority.target_path.exists() {
+            return Ok(api_error(
+                "file_not_found",
+                "delete_file could not find the requested file.",
+                json!({"path": authority.normalized_path}),
+            ));
+        }
+        if authority.target_path.is_dir() {
+            return Ok(api_error(
+                "target_is_directory",
+                "delete_file can only delete regular files.",
+                json!({"path": authority.normalized_path}),
+            ));
+        }
+        fs::remove_file(&authority.target_path).map_err(|error| {
+            format!(
+                "Unable to delete {} through managed coordination write: {error}",
+                authority.target_path.display()
+            )
+        })?;
+        let change = self.record_workspace_change(WorkspaceChangeInput {
+            task_id: Some(task_id),
+            agent_id: Some(agent_id),
+            agent_slot_id: authority.session["agent_slot_id"].as_str(),
+            session_id: Some(session_id),
+            worktree_id: authority.worktree_id.as_deref(),
+            change_source: "managed_delete_file",
+            path: &authority.normalized_path,
+            resource_key: &authority.resource_key,
+            change_kind: "deleted",
+            lease: Some(&authority.lease),
+            violation_id: None,
+            summary: Some("Managed coordination delete"),
+            details: json!({
+                "authority": &authority.authority,
+                "target_path": process_path_text(&authority.target_path),
+            }),
+        })?;
+        self.emit_event(
+            "managed_file_deleted",
+            "agent",
+            agent_id,
+            EventRefs {
+                task_id: Some(task_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+                agent_slot_id: authority.session["agent_slot_id"]
+                    .as_str()
+                    .map(str::to_string),
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "path": &authority.normalized_path,
+                "resource_key": &authority.resource_key,
+                "authority": &authority.authority,
+                "write_root": process_path_text(&authority.write_root),
+                "target_path": process_path_text(&authority.target_path),
+                "change": change.clone(),
+            }),
+        )?;
+        Ok(api_ok(json!({
+            "status": "deleted",
+            "path": authority.normalized_path,
+            "resource_key": authority.resource_key,
+            "authority": authority.authority,
+            "write_root": process_path_text(&authority.write_root),
+            "target_path": process_path_text(&authority.target_path),
+            "worktree_id": authority.worktree_id,
+            "completion_mode": authority.completion_mode,
+            "change": change,
+        })))
+    }
+
+    fn managed_file_authority_for_task(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        path: &str,
+        operation: &str,
+    ) -> Result<Result<ManagedFileAuthority, Value>, String> {
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        self.ensure_session_owns_task(session_id, task_id)?;
+        reject_path_escape(path)?;
+        let normalized_path = normalize_change_path(path)?;
+        if is_coordination_owned_root_status_path(&normalized_path) {
+            return Ok(Err(api_error(
+                "coordination_path_denied",
+                "Diff Forge coordination metadata files are managed by the app and cannot be edited through agent file tools.",
+                json!({"path": normalized_path}),
+            )));
+        }
+
+        let requested_path = self.paths.repo_path.join(&normalized_path);
+        if let Some(git_root) = nearest_git_root_for_requested_path(&requested_path) {
+            let repo_root = self
+                .paths
+                .repo_path
+                .canonicalize()
+                .unwrap_or_else(|_| self.paths.repo_path.clone());
+            if !same_path_text(
+                &process_path_text(&git_root),
+                &process_path_text(&repo_root),
+            ) {
+                let nested_relative = requested_path
+                    .strip_prefix(&git_root)
+                    .ok()
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|| normalized_path.clone());
+                return Ok(Err(api_error(
+                    "nested_git_repo_requires_repo_path",
+                    "This file is inside a nested Git repository. Use the coordination tools with repo_path set to that nested repository and path relative to it, so the nested repo gets its own task worktree lifecycle.",
+                    json!({
+                        "operation": operation,
+                        "path": normalized_path,
+                        "nested_repo_path": process_path_text(&git_root),
+                        "nested_repo_relative_path": nested_relative,
+                    }),
+                )));
+            }
+        }
+
+        let resource_key = path_to_file_resource(&normalized_path);
+        let Some(lease) = self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?
+        else {
+            return Ok(Err(api_error(
+                "lease_required_before_write",
+                "Call acquire_lease with a write lease covering this file before using managed file writes.",
+                json!({
+                    "operation": operation,
+                    "path": normalized_path,
+                    "resource_key": resource_key,
+                }),
+            )));
+        };
+
+        let enforcement_mode = session["enforcement_mode"]
+            .as_str()
+            .unwrap_or("coordination_only");
+        let (write_root, authority, completion_mode) = match enforcement_mode {
+            "worktree_required" => {
+                if let Some(problem) = self.session_worktree_isolation_problem(&session)? {
+                    return Ok(Err(api_error(
+                        "invalid_worktree_authority",
+                        "This task's assigned worktree is not safe to write. Start a fresh task or reset the terminal session.",
+                        json!({"problem": problem}),
+                    )));
+                }
+                let Some(write_root) = session["write_root"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    return Ok(Err(api_error(
+                        "missing_write_root",
+                        "This task has no assigned writable root.",
+                        json!({"task_id": task_id, "session_id": session_id}),
+                    )));
+                };
+                (
+                    PathBuf::from(write_root),
+                    "git_worktree_patch".to_string(),
+                    "submit_patch".to_string(),
+                )
+            }
+            "bounded_direct_edit" => {
+                let write_root = session["write_root"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or(""));
+                (
+                    PathBuf::from(write_root),
+                    "bounded_direct_edit".to_string(),
+                    "complete_task".to_string(),
+                )
+            }
+            "general_worker" if repo_has_git(&self.paths.repo_path) => {
+                return Ok(Err(api_error(
+                    "acquire_lease_required_before_write",
+                    "This general worker still has no task worktree. Call acquire_lease for this file first; the lease step assigns the worktree.",
+                    json!({
+                        "operation": operation,
+                        "path": normalized_path,
+                        "resource_key": resource_key,
+                    }),
+                )));
+            }
+            _ => {
+                return Ok(Err(api_error(
+                    "no_file_write_authority",
+                    "This terminal session does not have local file write authority for managed writes.",
+                    json!({
+                        "operation": operation,
+                        "path": normalized_path,
+                        "enforcement_mode": enforcement_mode,
+                    }),
+                )));
+            }
+        };
+        let target_path = managed_write_target_path(&write_root, &normalized_path)?;
+        let worktree_id = if enforcement_mode == "worktree_required" {
+            session["worktree_id"].as_str().map(str::to_string)
+        } else {
+            None
+        };
+        Ok(Ok(ManagedFileAuthority {
+            session,
+            normalized_path,
+            resource_key,
+            lease,
+            write_root,
+            target_path,
+            worktree_id,
+            authority,
+            completion_mode,
+        }))
+    }
+
     pub fn list_workspace_changes(
         &self,
         task_id: Option<&str>,
@@ -10195,6 +10553,87 @@ impl CoordinationKernel {
                 changes.push(change);
             }
         }
+        let orphan_worktrees = self.query_json(
+            "SELECT w.id AS worktree_id,
+                    w.path AS worktree_path,
+                    w.agent_slot_id
+             FROM worktrees w
+             WHERE w.status='active'
+               AND w.path IS NOT NULL
+               AND w.path <> ''
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM agent_sessions s
+                 WHERE s.worktree_id=w.id
+                   AND s.status='active'
+                   AND s.task_id IS NOT NULL
+                   AND s.task_id <> ''
+               )
+             ORDER BY w.updated_at DESC",
+            &[],
+        )?;
+        let mut orphan_count = 0usize;
+        for worktree in orphan_worktrees {
+            let worktree_id = worktree["worktree_id"].as_str();
+            let agent_slot_id = worktree["agent_slot_id"].as_str();
+            let worktree_path = PathBuf::from(worktree["worktree_path"].as_str().unwrap_or(""));
+            if !worktree_path.exists() {
+                continue;
+            }
+            let canonical_worktree = worktree_path.canonicalize().map_err(|error| {
+                format!(
+                    "Unable to canonicalize orphan worktree path {}: {error}",
+                    worktree_path.display()
+                )
+            })?;
+            if !canonical_worktree.starts_with(
+                self.paths
+                    .worktrees_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.paths.worktrees_root.clone()),
+            ) {
+                continue;
+            }
+            for changed_file in self.changed_files(&canonical_worktree)? {
+                reject_path_escape(&changed_file.path)?;
+                let resource_key = path_to_file_resource(&changed_file.path);
+                let violation_id = self.create_workspace_violation(
+                    None,
+                    None,
+                    None,
+                    worktree_id,
+                    "orphan_worktree_write",
+                    Some(&changed_file.path),
+                    Some(&resource_key),
+                    "warning",
+                    json!({
+                        "change_source": "orphan_worktree_scan",
+                        "change_kind": changed_file.change_kind,
+                        "recovery_actions": ["adopt_with_start_task_and_submit_patch", "discard_worktree_changes"],
+                    }),
+                )?;
+                let change = self.record_workspace_change(WorkspaceChangeInput {
+                    task_id: None,
+                    agent_id: None,
+                    agent_slot_id,
+                    session_id: None,
+                    worktree_id,
+                    change_source: "orphan_worktree_scan",
+                    path: &changed_file.path,
+                    resource_key: &resource_key,
+                    change_kind: &changed_file.change_kind,
+                    lease: None,
+                    violation_id: Some(&violation_id),
+                    summary: Some("Dirty worktree without active task"),
+                    details: json!({
+                        "untracked": changed_file.untracked,
+                        "recovery_actions": ["adopt_with_start_task_and_submit_patch", "discard_worktree_changes"],
+                    }),
+                })?;
+                changes.push(change);
+                orphan_count += 1;
+            }
+        }
         self.emit_event(
             "change_scan_finished",
             "kernel",
@@ -10203,6 +10642,7 @@ impl CoordinationKernel {
             json!({
                 "change_count": changes.len(),
                 "warning_count": warnings.len(),
+                "orphan_worktree_change_count": orphan_count,
                 "scanner": "git_status",
             }),
         )?;
@@ -12193,9 +12633,6 @@ impl CoordinationKernel {
         if session["worktree_id"].as_str() != Some(worktree_id) {
             return Err("Session is not linked to this worktree.".to_string());
         }
-        if worktree["agent_id"].as_str() != Some(agent_id) {
-            return Err("Worktree does not belong to this agent.".to_string());
-        }
         let session_slot = session["agent_slot_id"].as_str().unwrap_or("");
         let worktree_slot = worktree["agent_slot_id"].as_str().unwrap_or("");
         let legacy_session_match = worktree["session_id"].as_str() == Some(session_id);
@@ -12204,6 +12641,49 @@ impl CoordinationKernel {
         }
         if worktree_slot.is_empty() && !legacy_session_match {
             return Err("Worktree does not belong to this session.".to_string());
+        }
+        if worktree["agent_id"].as_str() != Some(agent_id)
+            || worktree["session_id"].as_str() != Some(session_id)
+        {
+            self.conn
+                .execute(
+                    "UPDATE worktrees
+                     SET agent_id=?1,
+                         session_id=?2,
+                         agent_slot_id=COALESCE(NULLIF(?3, ''), agent_slot_id),
+                         status='active',
+                         updated_at=?4
+                     WHERE id=?5",
+                    params![
+                        agent_id,
+                        session_id,
+                        session_slot,
+                        now_rfc3339(),
+                        worktree_id
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to repair active session worktree ownership: {error}")
+                })?;
+            self.emit_event(
+                "worktree_ownership_repaired",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: (!session_slot.is_empty()).then(|| session_slot.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "worktree_id": worktree_id,
+                    "previous_agent_id": worktree["agent_id"].as_str(),
+                    "previous_session_id": worktree["session_id"].as_str(),
+                    "previous_agent_slot_id": worktree["agent_slot_id"].as_str(),
+                    "reason": "session_linked_worktree_validation_repair",
+                }),
+            )?;
         }
         let worktree_path = PathBuf::from(worktree["path"].as_str().unwrap_or_default());
         if !worktree_path.exists() {
@@ -19528,6 +20008,80 @@ impl CoordinationKernel {
         self.create_or_reuse_worktree_for_slot_with_refresh(agent_slot_id, true, None)
     }
 
+    fn active_session_owner_for_slot(
+        &self,
+        agent_slot_id: &str,
+        fallback_agent_id: &str,
+    ) -> Result<(String, Option<String>), String> {
+        let active = self.query_json(
+            "SELECT s.id, s.agent_id
+             FROM agent_sessions s
+             JOIN agent_slots slot ON slot.active_session_id=s.id
+             WHERE slot.id=?1
+               AND s.agent_slot_id=?1
+               AND s.status='active'
+             ORDER BY s.updated_at DESC, s.created_at DESC
+             LIMIT 1",
+            &[&agent_slot_id],
+        )?;
+        let active = if active.is_empty() {
+            self.query_json(
+                "SELECT id, agent_id
+                 FROM agent_sessions
+                 WHERE agent_slot_id=?1
+                   AND status='active'
+                 ORDER BY updated_at DESC, created_at DESC
+                 LIMIT 1",
+                &[&agent_slot_id],
+            )?
+        } else {
+            active
+        };
+        if let Some(session) = active.into_iter().next() {
+            if let Some(agent_id) = session["agent_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                return Ok((
+                    agent_id.to_string(),
+                    session["id"]
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string),
+                ));
+            }
+        }
+        Ok((fallback_agent_id.to_string(), None))
+    }
+
+    fn bind_worktree_to_session(
+        &self,
+        worktree_id: &str,
+        agent_slot_id: &str,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE worktrees
+                 SET agent_slot_id=?1,
+                     agent_id=?2,
+                     session_id=?3,
+                     status='active',
+                     updated_at=?4
+                 WHERE id=?5",
+                params![
+                    agent_slot_id,
+                    agent_id,
+                    session_id,
+                    now_rfc3339(),
+                    worktree_id
+                ],
+            )
+            .map_err(|error| format!("Unable to bind worktree to active session: {error}"))?;
+        Ok(())
+    }
+
     fn prepared_worktree_for_slot(&self, agent_slot_id: &str) -> Result<Value, String> {
         self.prepared_worktree_for_slot_with_telemetry(agent_slot_id, None)
     }
@@ -19538,7 +20092,9 @@ impl CoordinationKernel {
         _telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
-        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_agent_id = required_string(&slot, "agent_id")?;
+        let (agent_id, session_id) =
+            self.active_session_owner_for_slot(agent_slot_id, &slot_agent_id)?;
         let slot_key = required_string(&slot, "slot_key")?;
         let existing_id = slot["worktree_id"]
             .as_str()
@@ -19562,9 +20118,9 @@ impl CoordinationKernel {
         self.conn
             .execute(
                 "UPDATE worktrees
-                 SET agent_id=?1, status='active', updated_at=?2
-                 WHERE id=?3",
-                params![agent_id, now_rfc3339(), existing_id],
+                 SET agent_id=?1, session_id=?2, status='active', updated_at=?3
+                 WHERE id=?4",
+                params![agent_id, session_id.as_deref(), now_rfc3339(), existing_id],
             )
             .map_err(|error| format!("Unable to mark prepared worktree active: {error}"))?;
         let response = json!({
@@ -19588,7 +20144,9 @@ impl CoordinationKernel {
         telemetry_pane_id: Option<&str>,
     ) -> Result<Value, String> {
         let slot = self.get_agent_slot_by_id(agent_slot_id)?;
-        let agent_id = required_string(&slot, "agent_id")?;
+        let slot_agent_id = required_string(&slot, "agent_id")?;
+        let (agent_id, session_id) =
+            self.active_session_owner_for_slot(agent_slot_id, &slot_agent_id)?;
         let slot_key = required_string(&slot, "slot_key")?;
         if !self.paths.repo_path.join(".git").exists() {
             return Err("Repo has no .git; worktree isolation is unavailable.".to_string());
@@ -19667,10 +20225,12 @@ impl CoordinationKernel {
                         self.conn
                             .execute(
                                 "UPDATE worktrees
-                                 SET agent_id=?1, status='active', base_sha=?2, current_sha=?2, updated_at=?3
-                                 WHERE id=?4",
+                                 SET agent_id=?1, session_id=?2, status='active',
+                                     base_sha=?3, current_sha=?3, updated_at=?4
+                                 WHERE id=?5",
                                 params![
                                     agent_id,
+                                    session_id.as_deref(),
                                     refresh["current_sha"].as_str().unwrap_or(base_sha.as_str()),
                                     now_rfc3339(),
                                     existing_id
@@ -19884,11 +20444,12 @@ impl CoordinationKernel {
             self.conn
                 .execute(
                     "UPDATE worktrees
-                     SET agent_id=?1, path=?2, branch_name=?3, base_sha=?4,
-                         current_sha=?4, status='active', updated_at=?5
-                     WHERE id=?6",
+                     SET agent_id=?1, session_id=?2, path=?3, branch_name=?4, base_sha=?5,
+                         current_sha=?5, status='active', updated_at=?6
+                     WHERE id=?7",
                     params![
                         agent_id,
+                        session_id.as_deref(),
                         worktree_path_text.clone(),
                         branch.clone(),
                         recorded_sha.clone(),
@@ -19903,11 +20464,12 @@ impl CoordinationKernel {
                     "INSERT INTO worktrees(
                         id, agent_slot_id, agent_id, session_id, path, branch_name,
                         base_sha, current_sha, status, created_at, updated_at
-                    ) VALUES(?1, ?2, ?3, NULL, ?4, ?5, ?6, ?6, 'active', ?7, ?7)",
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 'active', ?8, ?8)",
                     params![
                         id,
                         agent_slot_id,
                         agent_id,
+                        session_id.as_deref(),
                         worktree_path_text.clone(),
                         branch.clone(),
                         recorded_sha.clone(),
@@ -20039,6 +20601,10 @@ impl CoordinationKernel {
             slot_id
         };
         let worktree = self.create_or_reuse_worktree_for_slot(&agent_slot_id)?;
+        let worktree_id = worktree["id"]
+            .as_str()
+            .ok_or_else(|| "Created worktree did not return an id.".to_string())?;
+        self.bind_worktree_to_session(worktree_id, &agent_slot_id, agent_id, session_id)?;
         self.conn
             .execute(
                 "UPDATE agent_sessions
@@ -20047,7 +20613,7 @@ impl CoordinationKernel {
                      updated_at=?4
                  WHERE id=?5",
                 params![
-                    worktree["id"].as_str(),
+                    Some(worktree_id),
                     worktree["path"].as_str(),
                     worktree["baseSha"].as_str(),
                     now_rfc3339(),
@@ -20786,6 +21352,18 @@ struct ChangedFile {
     untracked: bool,
 }
 
+struct ManagedFileAuthority {
+    session: Value,
+    normalized_path: String,
+    resource_key: String,
+    lease: Value,
+    write_root: PathBuf,
+    target_path: PathBuf,
+    worktree_id: Option<String>,
+    authority: String,
+    completion_mode: String,
+}
+
 struct WorktreeDiffContext {
     worktree_path: PathBuf,
     worktree_id: Option<String>,
@@ -21386,6 +21964,83 @@ fn write_text_file_atomic(path: &Path, value: &str) -> Result<(), String> {
     write_bytes_atomic(path, value.as_bytes())
 }
 
+fn managed_write_target_path(write_root: &Path, normalized_path: &str) -> Result<PathBuf, String> {
+    reject_path_escape(normalized_path)?;
+    let root = write_root
+        .canonicalize()
+        .map_err(|error| format!("Unable to canonicalize managed write root: {error}"))?;
+    let target = root.join(normalized_path);
+    if target.exists() {
+        let canonical_target = target.canonicalize().map_err(|error| {
+            format!(
+                "Unable to canonicalize managed write target {}: {error}",
+                target.display()
+            )
+        })?;
+        if !canonical_target.starts_with(&root) {
+            return Err(format!(
+                "Managed write target {} escapes write root {}.",
+                canonical_target.display(),
+                root.display()
+            ));
+        }
+    }
+    let parent = target.parent().ok_or_else(|| {
+        format!(
+            "Managed write target {} has no parent directory.",
+            target.display()
+        )
+    })?;
+    if parent.exists() {
+        let canonical_parent = parent.canonicalize().map_err(|error| {
+            format!(
+                "Unable to canonicalize managed write parent {}: {error}",
+                parent.display()
+            )
+        })?;
+        if !canonical_parent.starts_with(&root) {
+            return Err(format!(
+                "Managed write parent {} escapes write root {}.",
+                canonical_parent.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(target)
+}
+
+fn nearest_git_root_for_requested_path(path: &Path) -> Option<PathBuf> {
+    let mut cursor = existing_or_parent_canonical_path(path);
+    if cursor.is_file() {
+        cursor = cursor.parent()?.to_path_buf();
+    }
+    loop {
+        let dot_git = cursor.join(".git");
+        if dot_git.is_dir() || dot_git.is_file() {
+            return Some(cursor);
+        }
+        let Some(parent) = cursor.parent() else {
+            return None;
+        };
+        cursor = parent.to_path_buf();
+    }
+}
+
+fn existing_or_parent_canonical_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut cursor = path;
+    while let Some(parent) = cursor.parent() {
+        if let Ok(canonical) = parent.canonicalize() {
+            let suffix = path.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
+            return canonical.join(suffix);
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
+}
+
 fn json_file_matches(path: &Path, value: &Value) -> bool {
     serde_json::to_vec_pretty(value)
         .ok()
@@ -21405,6 +22060,7 @@ struct ManagedCodexProfileLaunch {
 fn prepare_managed_codex_profile_for_terminal(
     paths: &StoragePaths,
     agent_kind: &str,
+    agent_id: &str,
     slot_key: Option<&str>,
     session_id: &str,
     write_root: &str,
@@ -21431,9 +22087,17 @@ fn prepare_managed_codex_profile_for_terminal(
         });
     let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
     let profile_home = codex_profile_home_for_launch()?;
-    let hooks_path = codex_managed_hooks_path(&profile_home);
+    let hooks_path = codex_managed_hooks_path(&profile_home, &profile);
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
-    let hooks_config = codex_managed_hooks_config(mcp_command);
+    let hooks_config = codex_managed_hooks_config(
+        mcp_command,
+        &paths.repo_path,
+        &paths.db_path,
+        agent_id,
+        session_id,
+        slot_key.unwrap_or(&slot_segment),
+        agent_kind,
+    );
     let hook_file_will_change = !json_file_matches(&hooks_path, &hooks_config);
     let config = codex_managed_profile_config(
         &paths.repo_path,
@@ -21483,8 +22147,8 @@ fn codex_profile_home_for_launch() -> Result<PathBuf, String> {
     Ok(home)
 }
 
-fn codex_managed_hooks_path(profile_home: &Path) -> PathBuf {
-    profile_home.join("diffforge.hooks.json")
+fn codex_managed_hooks_path(profile_home: &Path, profile: &str) -> PathBuf {
+    profile_home.join(format!("{profile}.hooks.json"))
 }
 
 fn codex_managed_profile_name(repo_path: &Path, slot_segment: &str) -> String {
@@ -21543,7 +22207,6 @@ fn codex_managed_profile_config(
 #[derive(Debug, Clone)]
 struct CodexManagedGitRoute {
     repo_root: PathBuf,
-    worktree_root: PathBuf,
 }
 
 fn append_codex_managed_permission_profile(
@@ -21605,13 +22268,7 @@ extends = \"{parent_profile}\"\n\n\
 
         for route in &routes {
             let repo_relative = codex_permission_relative_path(&write_root, &route.repo_root)?;
-            let worktree_relative =
-                codex_permission_relative_path(&write_root, &route.worktree_root)?;
-            config.push_str(&format!(
-                "\"{}\" = \"read\"\n\"{}\" = \"write\"\n",
-                toml_escape(&repo_relative),
-                toml_escape(&worktree_relative)
-            ));
+            config.push_str(&format!("\"{}\" = \"read\"\n", toml_escape(&repo_relative)));
         }
     }
 
@@ -21626,16 +22283,32 @@ hooksPath = \"{}\"\n",
     Ok(config)
 }
 
-fn codex_managed_hooks_config(mcp_command: &str) -> Value {
+fn codex_managed_hooks_config(
+    mcp_command: &str,
+    repo_path: &Path,
+    db_path: &Path,
+    agent_id: &str,
+    session_id: &str,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Value {
     json!({
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "apply_patch|Edit|Write|Bash",
+                    "matcher": "apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
                     "hooks": [
                         {
                             "type": "command",
-                            "command": codex_write_guard_hook_command(mcp_command),
+                            "command": codex_write_guard_hook_command(
+                                mcp_command,
+                                repo_path,
+                                db_path,
+                                agent_id,
+                                session_id,
+                                slot_key,
+                                agent_kind,
+                            ),
                             "timeout": 30,
                             "statusMessage": "Routing Diff Forge writes"
                         }
@@ -21849,39 +22522,29 @@ fn prepend_codex_managed_root_permission_profile(config: String, profile: &str) 
 
 fn codex_managed_git_routes_for_general_worker_root(
     write_root: &Path,
-    slot_key: &str,
-    agent_kind: &str,
+    _slot_key: &str,
+    _agent_kind: &str,
 ) -> Result<Vec<CodexManagedGitRoute>, String> {
     let mut routes = Vec::new();
     if write_root.join(".git").is_dir() || write_root.join(".git").is_file() {
-        let worktree_root = create_or_reuse_codex_route_worktree(write_root, slot_key, agent_kind)?;
         routes.push(CodexManagedGitRoute {
             repo_root: write_root.to_path_buf(),
-            worktree_root,
         });
     }
     for repo_root in discover_nested_git_roots(write_root, 8, 256) {
-        let worktree_root = create_or_reuse_codex_route_worktree(&repo_root, slot_key, agent_kind)?;
-        routes.push(CodexManagedGitRoute {
-            repo_root,
-            worktree_root,
-        });
+        routes.push(CodexManagedGitRoute { repo_root });
     }
     Ok(routes)
 }
 
 fn codex_managed_git_routes_for_direct_root(
     write_root: &Path,
-    slot_key: &str,
-    agent_kind: &str,
+    _slot_key: &str,
+    _agent_kind: &str,
 ) -> Result<Vec<CodexManagedGitRoute>, String> {
     let mut routes = Vec::new();
     for repo_root in discover_nested_git_roots(write_root, 8, 256) {
-        let worktree_root = create_or_reuse_codex_route_worktree(&repo_root, slot_key, agent_kind)?;
-        routes.push(CodexManagedGitRoute {
-            repo_root,
-            worktree_root,
-        });
+        routes.push(CodexManagedGitRoute { repo_root });
     }
     Ok(routes)
 }
@@ -21941,53 +22604,6 @@ fn discover_nested_git_roots(root: &Path, max_depth: usize, max_roots: usize) ->
     roots
 }
 
-fn create_or_reuse_codex_route_worktree(
-    repo_root: &Path,
-    slot_key: &str,
-    agent_kind: &str,
-) -> Result<PathBuf, String> {
-    let (kernel, _) =
-        CoordinationKernel::open_for_terminal_launch(repo_root, None).map_err(|error| {
-            format!(
-                "Unable to open Diff Forge coordination for nested repo {}: {error}",
-                repo_root.display()
-            )
-        })?;
-    let agent_kind = if agent_kind.trim().is_empty() {
-        "codex"
-    } else {
-        agent_kind.trim()
-    };
-    let agent_name = format!("{} {}", agent_kind, slot_key.trim());
-    let slot = kernel
-        .get_or_create_agent_slot(slot_key, &agent_name, agent_kind, None)
-        .map_err(|error| {
-            format!(
-                "Unable to create Diff Forge route slot for {}: {error}",
-                repo_root.display()
-            )
-        })?;
-    let slot_id = slot["id"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Diff Forge route slot did not return an id.".to_string())?;
-    let worktree = kernel
-        .create_or_reuse_worktree_for_slot(slot_id)
-        .map_err(|error| {
-            format!(
-                "Unable to create Diff Forge route worktree for {}: {error}",
-                repo_root.display()
-            )
-        })?;
-    let path = worktree["path"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Diff Forge route worktree did not return a path.".to_string())?;
-    Ok(PathBuf::from(path)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(path)))
-}
-
 fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, String> {
     let relative = child.strip_prefix(root).map_err(|_| {
         format!(
@@ -22008,11 +22624,25 @@ fn codex_permission_relative_path(root: &Path, child: &Path) -> Result<String, S
     }
 }
 
-fn codex_write_guard_hook_command(command: &str) -> String {
+fn codex_write_guard_hook_command(
+    command: &str,
+    repo_path: &Path,
+    db_path: &Path,
+    agent_id: &str,
+    session_id: &str,
+    slot_key: &str,
+    agent_kind: &str,
+) -> String {
     format!(
-        "{} --diff-forge-write-guard --provider {}",
+        "{} --diff-forge-write-guard --provider {} --repo-path {} --db-path {} --agent-id {} --session-id {} --slot-key {} --agent-kind {}",
         quote_shell_literal_for_config(command),
         quote_shell_literal_for_config("codex"),
+        quote_shell_literal_for_config(&process_path_text(repo_path)),
+        quote_shell_literal_for_config(&process_path_text(db_path)),
+        quote_shell_literal_for_config(agent_id),
+        quote_shell_literal_for_config(session_id),
+        quote_shell_literal_for_config(slot_key),
+        quote_shell_literal_for_config(agent_kind),
     )
 }
 
@@ -24488,24 +25118,31 @@ hooksPath = "{}"
             Some(hooks_path.as_path()),
         )
         .unwrap();
-        let hooks = codex_managed_hooks_config("diffforge");
+        let hooks = codex_managed_hooks_config(
+            "diffforge",
+            &container,
+            &container.join(".agents").join("coordination.db"),
+            "agent-1",
+            "session-1",
+            "slot1",
+            "codex",
+        );
 
         assert!(config.contains("default_permissions = \"diffforge-coordinated\""));
         assert!(!config.contains("sandbox_mode ="));
         assert!(config.contains("\"nested/repo\" = \"read\""));
-        assert!(config.contains("\"nested/repo/.agents/worktrees/slot1"));
-        assert!(config.contains("\" = \"write\""));
+        assert!(!config.contains("nested/repo/.agents/worktrees/slot1"));
         assert!(!config.contains("--diff-forge-write-guard"));
         assert!(hooks.to_string().contains("--diff-forge-write-guard"));
-        assert!(!hooks
+        assert!(hooks
             .to_string()
             .contains(process_path_text(&container).as_str()));
-        assert!(!hooks.to_string().contains("slot1"));
-        assert!(!hooks.to_string().contains("--agent-kind"));
+        assert!(hooks.to_string().contains("slot1"));
+        assert!(hooks.to_string().contains("--agent-kind"));
     }
 
     #[test]
-    fn managed_codex_home_config_general_worker_reads_root_and_writes_slot_worktree() {
+    fn managed_codex_home_config_general_worker_reads_root_without_raw_worktree_write() {
         let repo = init_git_repo("managed_codex_general_worker");
         let hooks_path = repo.join("diffforge.hooks.json");
 
@@ -24522,8 +25159,8 @@ hooksPath = "{}"
         assert!(config.contains("extends = \":read-only\""));
         assert!(config.contains("\".\" = \"read\""));
         assert!(!config.contains("\".\" = \"write\""));
-        assert!(config.contains(".agents/worktrees/slot1"));
-        assert!(config.contains("\" = \"write\""));
+        assert!(!config.contains(".agents/worktrees/slot1"));
+        assert!(!config.contains("\" = \"write\""));
     }
 
     #[test]
@@ -24563,8 +25200,8 @@ hooksPath = "{}"
         assert!(config.contains("\".\" = \"read\""));
         assert!(!config.contains("\".\" = \"write\""));
         assert!(config.contains("\"packages/nested-app\" = \"read\""));
-        assert!(config.contains("\"packages/nested-app/.agents/worktrees/slot1"));
-        assert!(config.contains("\" = \"write\""));
+        assert!(!config.contains("packages/nested-app/.agents/worktrees/slot1"));
+        assert!(!config.contains("\" = \"write\""));
     }
 
     #[test]
@@ -24585,6 +25222,125 @@ hooksPath = "{}"
             !config.contains("[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]")
         );
         assert!(!config.contains("\".\" = \"write\""));
+    }
+
+    #[test]
+    fn managed_write_file_writes_assigned_worktree_only_after_lease() {
+        let repo = init_git_repo("managed_write_file_worktree");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Edit file", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        let worktree = kernel
+            .create_worktree_for_session(agent_id, session_id, Some(task_id))
+            .unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src.txt",
+                "write",
+                None,
+                Some("managed write"),
+            )
+            .unwrap();
+
+        let result = kernel
+            .write_file_for_task(task_id, agent_id, session_id, "src.txt", "updated\n")
+            .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(true));
+        let worktree_path = PathBuf::from(worktree["path"].as_str().unwrap());
+        assert_eq!(
+            fs::read_to_string(worktree_path.join("src.txt")).unwrap(),
+            "updated\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("src.txt")).unwrap(),
+            "initial\n"
+        );
+    }
+
+    #[test]
+    fn managed_write_file_rejects_nested_git_repo_without_repo_path_override() {
+        let container = temp_repo("managed_write_nested_container");
+        let child = container.join("nested").join("repo");
+        fs::create_dir_all(&child).unwrap();
+        run(&child, "git", &["init"]);
+        fs::write(child.join("src.txt"), "initial\n").unwrap();
+        run(&child, "git", &["add", "src.txt"]);
+        run(
+            &child,
+            "git",
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        let kernel = CoordinationKernel::init(&container, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, false, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Edit nested repo", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .conn
+            .execute(
+                "UPDATE agent_sessions SET enforcement_mode='bounded_direct_edit', write_root=?1 WHERE id=?2",
+                params![container.display().to_string(), session_id],
+            )
+            .unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:nested/repo/src.txt",
+                "write",
+                None,
+                Some("managed write"),
+            )
+            .unwrap();
+
+        let result = kernel
+            .write_file_for_task(
+                task_id,
+                agent_id,
+                session_id,
+                "nested/repo/src.txt",
+                "updated\n",
+            )
+            .unwrap();
+
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(
+            result["error"]["code"].as_str(),
+            Some("nested_git_repo_requires_repo_path")
+        );
+        assert_eq!(
+            fs::read_to_string(child.join("src.txt")).unwrap(),
+            "initial\n"
+        );
     }
 
     #[test]
@@ -24768,6 +25524,8 @@ hooksPath = "{}"
                 "start_task",
                 "acquire_lease",
                 "checkpoint",
+                "write_file",
+                "delete_file",
                 "complete_task",
                 "submit_patch",
                 "submit_patch_status"
@@ -26121,6 +26879,126 @@ hooksPath = "{}"
             Some("worktree_required")
         );
         assert!(session["worktree_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn prepared_slot_refresh_preserves_active_session_worktree_owner() {
+        let repo = init_git_repo("prepared_slot_owner_rebind");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "2",
+                Some("pane-owner-rebind"),
+                Some("workspace-owner-rebind"),
+                Some("Owner Rebind Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-owner-rebind"),
+                Some("general_worker"),
+            )
+            .unwrap();
+        let authority = kernel
+            .resolve_general_worker_file_authority(
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+            )
+            .unwrap();
+        let worktree_id = authority["worktree_id"].as_str().unwrap();
+        let worktree_path = PathBuf::from(authority["worktree_path"].as_str().unwrap());
+
+        kernel
+            .prepare_workspace_terminal_slots(Some("workspace-owner-rebind"), None, 2)
+            .unwrap();
+        let worktree = kernel.get_worktree(worktree_id).unwrap();
+        assert_eq!(
+            worktree["agent_id"].as_str(),
+            Some(context.agent_id.as_str())
+        );
+        assert_eq!(
+            worktree["session_id"].as_str(),
+            Some(context.session_id.as_str())
+        );
+
+        let task = kernel
+            .create_task(
+                "Patch from rebound owner",
+                None,
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel
+            .claim_task(
+                task_id,
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+            )
+            .unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+                "file:owner.txt",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(worktree_path.join("owner.txt"), "owned by active session\n").unwrap();
+        let submitted = kernel
+            .submit_patch(
+                task_id,
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+                Some(worktree_id),
+                Some("owner rebind submit"),
+            )
+            .unwrap();
+        assert_eq!(submitted["ok"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn managed_patch_session_rejects_complete_task_without_submit_patch() {
+        let repo = init_git_repo("managed_complete_reject");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let session = kernel
+            .create_session_for_slot_key(
+                "codex-01",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-managed-complete"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_id = session["agentId"].as_str().unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Managed task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+
+        let completed = kernel
+            .complete_terminal_task(task_id, agent_id, session_id, Some("done"), Some("done"))
+            .unwrap();
+        assert_eq!(completed["ok"].as_bool(), Some(false));
+        assert_eq!(
+            completed["error"]["code"].as_str(),
+            Some("managed_patch_requires_submit_patch")
+        );
     }
 
     #[test]

@@ -1073,23 +1073,10 @@ fn apply_claude_coordinated_auto_approval_args(
         || file_authority.trim() == "task_scoped";
     let direct_edit_allowed = enforcement_mode.trim() == "bounded_direct_edit"
         || file_authority.trim() == "bounded_direct_edit";
-    let slot_key = terminal_coordination_env_value(coordination, "COORDINATION_SLOT_KEY")
-        .unwrap_or_else(|| "unknown".to_string());
-    let general_worker_edit_root = if general_worker {
-        diff_forge_create_or_reuse_slot_worktree(
-            Path::new(&coordination.repo_path),
-            &slot_key,
-            &coordination.agent_kind,
-        )
-        .ok()
-        .map(|path| path.display().to_string())
-    } else {
-        None
-    };
     let edit_root = if worktree_required || direct_edit_allowed {
         Some(coordination_root.clone())
     } else {
-        general_worker_edit_root.clone()
+        None
     };
     let local_edit_allowed = edit_root.is_some();
 
@@ -1553,7 +1540,19 @@ fn diff_forge_write_guard_decision(
     let tool_key = tool_name.to_ascii_lowercase();
     let tool_input = &hook_input["tool_input"];
 
-    if matches!(tool_key.as_str(), "bash" | "powershell" | "monitor") {
+    if matches!(
+        tool_key.as_str(),
+        "bash"
+            | "powershell"
+            | "monitor"
+            | "shell"
+            | "sh"
+            | "zsh"
+            | "exec_command"
+            | "functions.exec_command"
+            | "run_command"
+            | "command"
+    ) {
         if tool_input["dangerouslyDisableSandbox"].as_bool() == Some(true)
             || tool_input["dangerously_disable_sandbox"].as_bool() == Some(true)
         {
@@ -1562,7 +1561,18 @@ fn diff_forge_write_guard_decision(
                     .to_string(),
             );
         }
-        if matches!(tool_key.as_str(), "bash" | "powershell") {
+        if matches!(
+            tool_key.as_str(),
+            "bash"
+                | "powershell"
+                | "shell"
+                | "sh"
+                | "zsh"
+                | "exec_command"
+                | "functions.exec_command"
+                | "run_command"
+                | "command"
+        ) {
             let cwd = hook_input["cwd"]
                 .as_str()
                 .filter(|value| !value.trim().is_empty())
@@ -2306,54 +2316,8 @@ fn diff_forge_task_status_is_terminal(status: &str) -> bool {
 }
 
 fn diff_forge_start_task_required_message() -> String {
-    "Diff Forge denied this Git write because this terminal has no active task-owned worktree. Call coordination-kernel.start_task, then acquire_lease for the file before editing."
+    "Diff Forge denied this Git write because this terminal has no active task-owned worktree. Call coordination-kernel.start_task, then acquire_lease for the file, then use coordination-kernel.write_file/delete_file or a task-owned worktree edit."
         .to_string()
-}
-
-fn diff_forge_create_or_reuse_slot_worktree(
-    repo_root: &Path,
-    slot_key: &str,
-    agent_kind: &str,
-) -> Result<PathBuf, String> {
-    let (kernel, _) =
-        crate::coordination::CoordinationKernel::open_for_terminal_launch(repo_root, None)
-            .map_err(|error| {
-                format!(
-                    "Unable to open Diff Forge coordination for {}: {error}",
-                    repo_root.display()
-                )
-            })?;
-    let agent_kind = if agent_kind.trim().is_empty() {
-        "agent"
-    } else {
-        agent_kind.trim()
-    };
-    let agent_name = format!("{} {}", agent_kind, slot_key.trim());
-    let slot = kernel
-        .get_or_create_agent_slot(slot_key, &agent_name, agent_kind, None)
-        .map_err(|error| {
-            format!(
-                "Unable to create Diff Forge agent slot for {}: {error}",
-                repo_root.display()
-            )
-        })?;
-    let slot_id = slot["id"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Diff Forge agent slot did not return an id.".to_string())?;
-    let worktree = kernel
-        .create_or_reuse_worktree_for_slot(slot_id)
-        .map_err(|error| {
-            format!(
-                "Unable to create Diff Forge worktree for {}: {error}",
-                repo_root.display()
-            )
-        })?;
-    let path = worktree["path"]
-        .as_str()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "Diff Forge worktree did not return a path.".to_string())?;
-    Ok(claude_guard_resolved_path(&PathBuf::from(path), repo_root))
 }
 
 fn diff_forge_nearest_git_root(path: &Path) -> Option<PathBuf> {
@@ -2577,7 +2541,13 @@ fn claude_guard_collect_tool_paths(value: &Value, paths: &mut Vec<String>) {
             for (key, value) in object {
                 if matches!(
                     key.as_str(),
-                    "file_path" | "filePath" | "path" | "notebook_path" | "notebookPath"
+                    "file_path"
+                        | "filePath"
+                        | "path"
+                        | "filename"
+                        | "file"
+                        | "notebook_path"
+                        | "notebookPath"
                 ) {
                     if let Some(path) = value.as_str().filter(|path| !path.trim().is_empty()) {
                         paths.push(path.to_string());
