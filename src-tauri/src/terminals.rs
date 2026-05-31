@@ -7384,6 +7384,7 @@ mod terminal_tests {
             codex_mcp_config_path: String::new(),
             codex_home_path: None,
             codex_profile: None,
+            codex_bypass_hook_trust: false,
             claude_mcp_config_path: String::new(),
             mcp_command: String::new(),
             workspace_id: Some("workspace-1".to_string()),
@@ -7931,7 +7932,7 @@ mod terminal_tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--enable", "hooks"]));
-        assert!(args
+        assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
@@ -7979,6 +7980,35 @@ mod terminal_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn coordinated_codex_secondary_untrusted_hook_launch_uses_bypass_flag() {
+        let mut coordination = terminal_test_coordination("codex_hook_bypass_args");
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            "/tmp/diffforge-agent-worktree".to_string(),
+        ));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_PROFILE".to_string(),
+            "diffforge-test-profile".to_string(),
+        ));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST".to_string(),
+            "1".to_string(),
+        ));
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &[],
+            Some(&coordination),
+            "pane-auto",
+            42,
+        );
+
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
     }
 
     #[test]
@@ -8546,7 +8576,7 @@ command = "diffforge"
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--enable", "hooks"]));
-        assert!(args
+        assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));

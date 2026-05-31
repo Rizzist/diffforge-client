@@ -9221,8 +9221,8 @@ export default function App() {
     const isAccountReset = resetScope === "account";
     const confirmed = window.confirm(
       isAccountReset
-        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including old duplicate device/client activations from before device standardization. Workspace filetree sync snapshots are kept and reset databases are uploaded to Backblaze B2."
-        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state for this client. Workspace filetree sync snapshots are kept and the reset database is uploaded to Backblaze B2.",
+        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including old duplicate device/client activations from before device standardization. Workspace filetree entries are kept and the cloud checkpoint is refreshed."
+        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state for this client. Workspace filetree entries are kept and the cloud checkpoint is refreshed.",
     );
     if (!confirmed) {
       return;
@@ -9240,26 +9240,19 @@ export default function App() {
       const preservedFiletrees = Number(data?.preserved?.repo_filetree_state || 0);
       const backups = Array.isArray(data?.backups) ? data.backups : [];
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
-      const skippedBackup = backups.find((backup) => backup?.skipped);
       const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
-      const queuedBackupContextCount = Math.max(
-        0,
-        Number(backgroundCheckpoint?.backup_context_count || backgroundCheckpoint?.backupContextCount || data?.backup_context_count || 0),
-      );
       const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
-      const filetreeLabel = preservedFiletrees === 1 ? "filetree snapshot" : "filetree snapshots";
-      const backupLabel = updatedBackupCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
-      let backupMessage = `skipped B2 backup${skippedBackup?.reason ? ` (${skippedBackup.reason})` : ""}`;
+      const filetreeLabel = preservedFiletrees === 1 ? "filetree entry" : "filetree entries";
+      let checkpointMessage = "cloud checkpoint refresh skipped";
       if (backgroundCheckpoint?.queued) {
-        const queuedBackupLabel = queuedBackupContextCount === 1 ? "B2 checkpoint" : "B2 checkpoints";
-        backupMessage = `queued ${queuedBackupContextCount || resetClientCount} ${queuedBackupLabel}`;
+        checkpointMessage = "queued cloud checkpoint refresh";
       } else if (backgroundCheckpoint?.error) {
-        backupMessage = `could not queue B2 checkpoint (${backgroundCheckpoint.error})`;
+        checkpointMessage = "could not queue cloud checkpoint refresh";
       } else if (updatedBackupCount > 0) {
-        backupMessage = `updated ${updatedBackupCount} ${backupLabel}`;
+        checkpointMessage = "refreshed cloud checkpoint";
       }
       setCloudSqliteResetMessage(
-        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}. Preserved ${preservedFiletrees} ${filetreeLabel} and ${backupMessage}.`,
+        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}. Preserved ${preservedFiletrees} ${filetreeLabel} and ${checkpointMessage}.`,
       );
     } catch (error) {
       setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
@@ -13262,7 +13255,7 @@ export default function App() {
                           <SettingsLabel>Hard reset</SettingsLabel>
                           <SettingsValue>Reset cloud SQLite</SettingsValue>
                           <SettingsHint>
-                            Deletes cloud task history, voice orchestrator history, synced devices, logs, MCP state, terminal presence, and Spec Graph working state. Workspace filetree sync snapshots are preserved.
+                            Deletes cloud task history, voice orchestrator history, synced devices, logs, MCP state, terminal presence, and Spec Graph working state. Workspace filetree entries are preserved.
                           </SettingsHint>
                         </div>
                         <AgentReadyPill data-tone="orange">
@@ -13271,7 +13264,7 @@ export default function App() {
                           ) : (
                             <ButtonRefreshIcon aria-hidden="true" />
                           )}
-                          <span>{isCloudSqliteResetting ? "Resetting" : "B2 checkpoint"}</span>
+                          <span>{isCloudSqliteResetting ? "Resetting" : "Checkpoint"}</span>
                         </AgentReadyPill>
                       </AccountCardHeader>
 
@@ -13286,7 +13279,7 @@ export default function App() {
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Remote</span>
-                          <strong>Backblaze B2</strong>
+                          <strong>Cloud checkpoint</strong>
                         </SettingsIdentityItem>
                       </SettingsIdentityGrid>
 

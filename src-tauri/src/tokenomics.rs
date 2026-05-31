@@ -2658,12 +2658,13 @@ fn tokenomics_account_hourly_sync_rollups(
         .filter(|value| !value.is_empty());
     let account_key_sql = "COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, ''), provider || ':' || agent_kind || ':unknown')";
     let account_label_sql = "COALESCE(NULLIF(provider_account_label, ''), CASE WHEN agent_kind='codex' THEN 'Codex account' WHEN agent_kind='claude' THEN 'Claude account' WHEN agent_kind='opencode' THEN 'OpenCode account' ELSE agent_kind || ' account' END)";
+    let model_sql = "COALESCE(NULLIF(model, ''), agent_kind)";
     let mut statement = conn
         .prepare(
             &format!("SELECT
                provider,
                agent_kind,
-               NULL AS model,
+               {model_sql} AS model,
                {account_key_sql} AS subscription_key,
                {account_key_sql} AS provider_account_key,
                {account_label_sql} AS provider_account_label,
@@ -2686,7 +2687,7 @@ fn tokenomics_account_hourly_sync_rollups(
                  OR bucket_start LIKE 'unix-hour-%'
                )
                AND (?1 IS NULL OR updated_at >= ?1)
-             GROUP BY provider, agent_kind, subscription_key, provider_account_key, bucket_start
+             GROUP BY provider, agent_kind, {model_sql}, subscription_key, provider_account_key, bucket_start
              ORDER BY updated_at DESC, bucket_start DESC, provider, agent_kind
              LIMIT ?2"),
         )
@@ -3558,6 +3559,7 @@ mod tokenomics_tests {
         assert_eq!(rollups[0]["output_tokens"], json!(6));
         assert_eq!(rollups[0]["total_tokens"], json!(12));
         assert_eq!(rollups[0]["event_count"], json!(2));
+        assert_eq!(rollups[0]["model"], json!("codex"));
     }
 
     #[test]
@@ -3637,6 +3639,46 @@ mod tokenomics_tests {
                 && row["total_tokens"] == json!(5)));
         assert!(rollups.iter().any(|row| row["provider_account_key"] == json!("openai:codex:work")
                 && row["total_tokens"] == json!(7)));
+    }
+
+    #[test]
+    fn tokenomics_account_sync_rollups_preserve_models_for_same_account() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        for (id, model, total_tokens) in [
+            ("rollup-gpt-55", "gpt-5.5", 5_i64),
+            ("rollup-spark", "gpt-5.3-codex-spark", 7_i64),
+        ] {
+            conn.execute(
+                "INSERT INTO tokenomics_rollups(
+                   id, provider, agent_kind, model, subscription_key,
+                   provider_account_key, provider_account_label, workspace_id, repo_path,
+                   bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
+                   cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
+                 ) VALUES(
+                   ?1, 'openai', 'codex', ?2, 'openai:codex:personal',
+                   'openai:codex:personal', 'Codex personal', NULL, NULL,
+                   'hour', 'unix-hour-test', 0, 0, 0,
+                   0, ?3, 0, 1, '2026-05-30T05:00:00Z'
+                 )",
+                rusqlite::params![id, model, total_tokens],
+            )
+            .unwrap();
+        }
+
+        let rollups = tokenomics_account_hourly_sync_rollups(&conn, None).unwrap();
+
+        assert_eq!(rollups.len(), 2);
+        assert!(rollups.iter().any(|row| {
+            row["model"] == json!("gpt-5.5")
+                && row["provider_account_key"] == json!("openai:codex:personal")
+                && row["total_tokens"] == json!(5)
+        }));
+        assert!(rollups.iter().any(|row| {
+            row["model"] == json!("gpt-5.3-codex-spark")
+                && row["provider_account_key"] == json!("openai:codex:personal")
+                && row["total_tokens"] == json!(7)
+        }));
     }
 
     #[test]

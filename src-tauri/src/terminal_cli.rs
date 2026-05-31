@@ -697,6 +697,8 @@ fn terminal_args_with_codex_mcp_identity(
     let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
         .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
     let codex_profile = env_value("DIFFFORGE_CODEX_PROFILE");
+    let codex_bypass_hook_trust = env_value("DIFFFORGE_CODEX_BYPASS_HOOK_TRUST")
+        .is_some_and(|value| terminal_env_truthy(&value));
     let enforcement_mode = env_value("COORDINATION_ENFORCEMENT_MODE").unwrap_or_default();
     let file_authority = env_value("COORDINATION_FILE_AUTHORITY").unwrap_or_default();
 
@@ -737,6 +739,7 @@ fn terminal_args_with_codex_mcp_identity(
             &mut next,
             write_root.as_deref(),
             codex_profile.as_deref(),
+            codex_bypass_hook_trust,
         );
 
         append_codex_global_mcp_disable_args(&mut next);
@@ -985,6 +988,7 @@ fn apply_codex_coordinated_auto_approval_args(
     args: &mut Vec<String>,
     write_root: Option<&str>,
     codex_profile: Option<&str>,
+    bypass_hook_trust: bool,
 ) {
     strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
     args.push("--ask-for-approval".to_string());
@@ -1012,7 +1016,16 @@ fn apply_codex_coordinated_auto_approval_args(
         args.push("--enable".to_string());
         args.push("hooks".to_string());
     }
-    args.push("--dangerously-bypass-hook-trust".to_string());
+    if bypass_hook_trust {
+        args.push("--dangerously-bypass-hook-trust".to_string());
+    }
+}
+
+fn terminal_env_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn strip_terminal_arg_option(args: &mut Vec<String>, long: &str, short: &str, takes_value: bool) {
@@ -1399,14 +1412,30 @@ pub fn run_claude_worktree_guard(args: &[String]) -> i32 {
 }
 
 pub fn run_diff_forge_write_guard(args: &[String]) -> i32 {
-    let provider = terminal_cli_arg_value(args, "--provider").unwrap_or("codex");
-    let repo_path = terminal_cli_arg_value(args, "--repo-path");
-    let slot_key = terminal_cli_arg_value(args, "--slot-key").unwrap_or("unknown");
-    let agent_kind = terminal_cli_arg_value(args, "--agent-kind").unwrap_or(provider);
+    let provider = terminal_cli_arg_or_env(args, "--provider", &["DIFFFORGE_HOOK_PROVIDER"])
+        .unwrap_or_else(|| "codex".to_string());
+    let repo_path = terminal_cli_arg_or_env(
+        args,
+        "--repo-path",
+        &[
+            "COORDINATION_REPO_PATH",
+            "COORDINATION_PROJECT_ROOT",
+            "DIFFFORGE_REPO_PATH",
+            "COORDINATION_WRITE_ROOT",
+        ],
+    );
+    let slot_key = terminal_cli_arg_or_env(args, "--slot-key", &["COORDINATION_SLOT_KEY"])
+        .unwrap_or_else(|| "unknown".to_string());
+    let agent_kind = terminal_cli_arg_or_env(
+        args,
+        "--agent-kind",
+        &["COORDINATION_AGENT_KIND", "DIFFFORGE_AGENT_KIND"],
+    )
+    .unwrap_or_else(|| provider.clone());
 
     let Some(repo_path) = repo_path.filter(|value| !value.trim().is_empty()) else {
         print_diff_forge_pre_tool_deny(
-            provider,
+            &provider,
             "Diff Forge write guard is missing the coordination root.",
         );
         return 0;
@@ -1415,7 +1444,7 @@ pub fn run_diff_forge_write_guard(args: &[String]) -> i32 {
     let mut input = String::new();
     if let Err(error) = std::io::stdin().read_to_string(&mut input) {
         print_diff_forge_pre_tool_deny(
-            provider,
+            &provider,
             &format!("Diff Forge write guard could not read hook input: {error}."),
         );
         return 0;
@@ -1424,7 +1453,7 @@ pub fn run_diff_forge_write_guard(args: &[String]) -> i32 {
         Ok(value) => value,
         Err(error) => {
             print_diff_forge_pre_tool_deny(
-                provider,
+                &provider,
                 &format!("Diff Forge write guard received invalid hook input: {error}."),
             );
             return 0;
@@ -1432,15 +1461,15 @@ pub fn run_diff_forge_write_guard(args: &[String]) -> i32 {
     };
 
     match diff_forge_write_guard_decision(
-        provider,
+        &provider,
         &hook_input,
-        Path::new(repo_path),
-        slot_key,
-        agent_kind,
+        Path::new(&repo_path),
+        &slot_key,
+        &agent_kind,
     ) {
         Ok(Some(output)) => println!("{output}"),
         Ok(None) => {}
-        Err(error) => print_diff_forge_pre_tool_deny(provider, &error),
+        Err(error) => print_diff_forge_pre_tool_deny(&provider, &error),
     }
 
     0
@@ -1771,6 +1800,21 @@ fn terminal_cli_arg_value<'a>(args: &'a [String], key: &str) -> Option<&'a str> 
         index += 1;
     }
     None
+}
+
+fn terminal_cli_arg_or_env(args: &[String], key: &str, env_keys: &[&str]) -> Option<String> {
+    terminal_cli_arg_value(args, key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            env_keys.iter().find_map(|env_key| {
+                env::var(env_key)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+        })
 }
 
 fn print_claude_worktree_guard_deny(reason: &str) {

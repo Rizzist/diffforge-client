@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiEnvelope {
@@ -44,6 +48,8 @@ pub struct TerminalCoordinationContext {
     pub codex_home_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub codex_bypass_hook_trust: bool,
     pub claude_mcp_config_path: String,
     pub mcp_command: String,
     pub workspace_id: Option<String>,
@@ -237,6 +243,12 @@ impl TerminalCoordinationContext {
                 if !profile.trim().is_empty() {
                     values.push(("DIFFFORGE_CODEX_PROFILE".to_string(), profile.clone()));
                 }
+            }
+            if self.codex_bypass_hook_trust {
+                values.push((
+                    "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST".to_string(),
+                    "1".to_string(),
+                ));
             }
         }
 
