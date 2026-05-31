@@ -40,6 +40,9 @@ import {
   recordThreadTerminalReadiness,
 } from "../threads/threadTerminalGroundTruth.js";
 import {
+  transcriptHasTurnCompletionForPrompt as transcriptHasTurnCompletionForPromptEvidence,
+} from "../threads/workspaceThreadTranscriptEvidence.js";
+import {
   isTerminalControlHistoryPrompt,
 } from "../threads/terminalControlPrompts.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
@@ -883,55 +886,6 @@ function transcriptMessageIndicatesTurnComplete(message) {
     || status === "task_complete"
     || id.includes("task-complete")
     || title === "task complete";
-}
-
-function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
-  const promptText = normalizeWorkspaceThreadProjectionText(
-    event.expectedUserMessage || event.userMessage || event.message,
-  );
-  const submittedAtMs = workspaceThreadMessageTimestampMs({
-    createdAt: event.messageCreatedAt || event.submittedAt || event.createdAt,
-  });
-  const transcriptMessages = Array.isArray(messages) ? messages : [];
-  let userIndex = -1;
-  if (promptText) {
-    transcriptMessages.forEach((message, index) => {
-      const role = String(message?.role || "").trim().toLowerCase();
-      if (
-        role === "user"
-        && normalizeWorkspaceThreadProjectionText(message?.text || message?.message) === promptText
-      ) {
-        userIndex = index;
-      }
-    });
-  }
-  if (userIndex < 0 && submittedAtMs) {
-    transcriptMessages.forEach((message, index) => {
-      const role = String(message?.role || "").trim().toLowerCase();
-      const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
-      if (role === "user" && messageTimestampMs && messageTimestampMs >= submittedAtMs - 30000) {
-        userIndex = index;
-      }
-    });
-  }
-
-  const hasExplicitCompletion = transcriptMessages.some((message, index) => {
-    if (!transcriptMessageIndicatesTurnComplete(message)) {
-      return false;
-    }
-    if (userIndex >= 0) {
-      return index > userIndex;
-    }
-    const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
-    return submittedAtMs
-      ? Boolean(messageTimestampMs && messageTimestampMs >= submittedAtMs - 30000)
-      : true;
-  });
-  if (hasExplicitCompletion) {
-    return true;
-  }
-
-  return false;
 }
 
 function transcriptLatestPostPromptMessage(messages, event = {}) {
@@ -10491,9 +10445,11 @@ export default function App() {
             messageCreatedAt: expectedMessageCreatedAt,
             submittedAt,
           });
-          const rawTurnCompleteSeen = transcriptHasTurnCompletionForPrompt(messages, {
+          const rawTurnCompleteSeen = transcriptHasTurnCompletionForPromptEvidence(messages, {
             agentId,
+            allowTimestampFallback,
             expectedUserMessage,
+            matchedBy,
             messageCreatedAt: expectedMessageCreatedAt,
             submittedAt,
           });
@@ -10520,6 +10476,15 @@ export default function App() {
           );
           const terminalLifecycleCanSettleTurn = terminalReadinessCanSettleTurn
             || terminalDetachedCanSettleTurn;
+          const expectedUserMessageIsControlPrompt = Boolean(
+            expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
+          );
+          const transcriptCompletionHasPromptEvidence = Boolean(
+            !pollUntilTurnComplete
+              || !expectedUserMessage
+              || expectedUserMessageIsControlPrompt
+              || promptAccepted
+          );
           const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
           const latestTurnAtTranscriptResult = threadAtTranscriptResult?.latestTurn || null;
           const activeRunningTurnAtTranscriptResult = String(
@@ -10578,6 +10543,7 @@ export default function App() {
           );
           const turnCompleteSeen = Boolean(
             rawTurnCompleteSeen
+              && transcriptCompletionHasPromptEvidence
               && (
                 !activeRunningTurnAtTranscriptResult
                 || (
@@ -10766,9 +10732,6 @@ export default function App() {
               && sessionMatchedByProviderId
               && voicePlanPromptEventId.startsWith("voice-plan-")
               && promptAccepted,
-          );
-          const expectedUserMessageIsControlPrompt = Boolean(
-            expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
           );
           const requiresExactPromptEvidence = (
             pollUntilTurnComplete

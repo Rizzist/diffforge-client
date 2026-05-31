@@ -108,7 +108,7 @@ import {
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
-const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [];
+const TODO_DROP_PROMPT_ACCEPT_RETRY_DELAYS_MS = [300, 1000, 2500, 5000];
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
@@ -7830,30 +7830,11 @@ function TerminalView({
           && liveThreadId
           && blockingThreadId !== liveThreadId,
       );
-      const terminalReadyAfterPrompt = Boolean(
-        ["active", "running"].includes(terminalStatus)
-          && !targetThread?.pendingPrompt
-          && effectiveActivityStatus !== "thinking"
-          && effectiveLatestTurnState !== "running"
-          && (
-            agentInputReady
-              || completedTurnLooksSendable
-              || runningTurnLooksIdle
-              || TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState || latestTurnState)
-          )
-          && (
-            !blockingSubmittedAtMs
-              || !inputReadyAtMs
-              || inputReadyAtMs >= blockingSubmittedAtMs - TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS
-          )
-      );
       const staleInFlightReason = inFlightPromptInstanceChanged
         ? "terminal_instance_changed"
         : inFlightPromptThreadChanged
           ? "terminal_thread_changed"
-          : terminalReadyAfterPrompt
-            ? "terminal_ready_after_in_flight_prompt"
-            : "";
+          : "";
       if (staleInFlightReason) {
         todoQueueTerminalInFlightPromptsRef.current.delete(targetTerminalIndex);
         logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
@@ -7872,7 +7853,6 @@ function TerminalView({
           submittedAt: blockingInFlightPrompt.submittedAt || "",
           submittedAtMs: blockingSubmittedAtMs,
           targetTerminalIndex,
-          terminalReadyAfterPrompt,
           terminalStatus,
           threadId: blockingThreadId || targetThread?.id || "",
           workspaceId,
@@ -8137,14 +8117,13 @@ function TerminalView({
               || TODO_QUEUE_CLOSED_TURN_STATES.has(terminalGroundTruth.effectiveLatestTurnState)
           )
       );
-      const staleButReady = Boolean(!promptTurnMatches && terminalReadyForNextPrompt);
       const terminalConfirmedFinished = Boolean(
         completedMatchingTurn && (freshInputReady || terminalReadyForNextPrompt),
       );
       const expired = Number(inFlightPrompt?.startedAtMs || 0) > 0
         && nowMs - Number(inFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
 
-      if (!terminalConfirmedFinished && !staleButReady && !terminalInstanceChanged && !threadChanged && !expired) {
+      if (!terminalConfirmedFinished && !terminalInstanceChanged && !threadChanged && !expired) {
         return;
       }
 
@@ -8154,9 +8133,7 @@ function TerminalView({
         completedMatchingTurn,
         completionSignal: terminalConfirmedFinished
           ? "terminal_confirmed_finished"
-          : staleButReady
-            ? "terminal_ready_without_matching_turn"
-            : terminalInstanceChanged
+          : terminalInstanceChanged
               ? "terminal_instance_changed"
               : threadChanged
                 ? "terminal_thread_changed"
@@ -8168,12 +8145,10 @@ function TerminalView({
         latestTurnState,
         promptEventId: promptId,
         promptTurnMatches,
-        staleButReady,
+        staleButReady: false,
         reason: terminalConfirmedFinished
           ? "terminal_confirmed_finished"
-          : staleButReady
-            ? "terminal_ready_without_matching_turn"
-            : terminalInstanceChanged
+          : terminalInstanceChanged
               ? "terminal_instance_changed"
               : threadChanged
                 ? "terminal_thread_changed"
