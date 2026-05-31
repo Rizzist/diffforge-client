@@ -27,6 +27,33 @@ function cleanPromptingText(value, maxLength = 1200) {
     .slice(0, maxLength);
 }
 
+function cleanTerminalStateText(value, maxLength = 2400) {
+  return String(value || "")
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
+    .replace(/\u001b[@-_][0-?]*[ -/]*[@-~]?/g, " ")
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function terminalStateTextHasWorkingIndicator(text) {
+  const lower = cleanTerminalStateText(text).toLowerCase();
+  return Boolean(
+    /\bworking\s*\(/.test(lower)
+      || /\besc\s+to\s+interrupt\b/.test(lower)
+      || /\bcontext\s+refresh\b/.test(lower)
+  );
+}
+
+function terminalStateTextHasPromptMarker(text) {
+  const normalized = cleanTerminalStateText(text);
+  return Boolean(
+    normalized.includes("›")
+  );
+}
+
 function normalizePromptingUserKind(value, fallback = "unknown") {
   const kind = cleanText(value, fallback)
     .toLowerCase()
@@ -595,24 +622,35 @@ export function terminalOutputLooksPromptReady(value) {
     : value == null
       ? ""
       : String(value);
+  if (terminalStateTextHasWorkingIndicator(text)) {
+    return false;
+  }
   return Boolean(
     text.includes("\n›")
       || text.includes("\r›")
       || text.includes("› ")
       || text.includes("\n> ")
       || text.includes("\r> ")
+      || terminalStateTextHasPromptMarker(text)
   );
 }
 
 export function terminalOutputLooksActive(value) {
-  const text = cleanPromptingText(value, 1600);
+  const text = cleanTerminalStateText(value, 1600);
   if (!text) {
     return false;
   }
 
   const lower = text.toLowerCase();
+  if (terminalStateTextHasWorkingIndicator(text)) {
+    return true;
+  }
+  if (terminalStateTextHasPromptMarker(text)) {
+    return false;
+  }
+
   return Boolean(
-    text.includes("•")
+    /(?:^|\s)•\s*(?:called|ran|edited|created|updated|modified|explored|exploring|read|listed|searched|checked|checking|wrote|applied|started|starting)\b/i.test(text)
       || lower.includes("working (")
       || /\bcalled\s+/.test(lower)
       || /\bran\s+/.test(lower)

@@ -1567,6 +1567,9 @@ function WorkspaceTerminal({
     markTerminalThreadActivityStatus(terminalThreadActivityStatus, {
       reason: "thread_prop_status_sync",
     });
+    if (String(terminalThreadActivityStatus || "").trim().toLowerCase() === "thinking") {
+      armTerminalPromptReadyDetection();
+    }
   }, [terminalThreadActivityStatus]);
   const openTerminalPathLink = useCallback((path, kind = "path") => {
     const linkKind = kind || (isTerminalUrlLink(path) ? "url" : "path");

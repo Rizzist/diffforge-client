@@ -1325,7 +1325,6 @@ const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
-const TERMINAL_PRESENCE_SYNC_INTERVAL_MS = 20000;
 const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
 function unwrapCloudCommandData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
@@ -3720,6 +3719,10 @@ export default function App() {
   const workspaceDeactivationInFlightRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
   const terminalPresenceSyncKeyRef = useRef("");
+  const terminalPresenceWorkspacesRef = useRef([]);
+  const terminalStatusEventSeqRef = useRef(new Map());
+  const terminalStatusEventDedupRef = useRef(new Map());
+  const terminalStatusEventEmitterRef = useRef(null);
   const workspaceMcpSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
@@ -8591,6 +8594,256 @@ export default function App() {
     () => JSON.stringify(terminalPresenceWorkspaces),
     [terminalPresenceWorkspaces],
   );
+  useEffect(() => {
+    terminalPresenceWorkspacesRef.current = terminalPresenceWorkspaces;
+  }, [terminalPresenceWorkspaces]);
+  const nextTerminalStatusEventSeq = useCallback((terminalKey, candidateSeq = 0) => {
+    const key = String(terminalKey || "terminal").trim() || "terminal";
+    const previousSeq = Number(terminalStatusEventSeqRef.current.get(key) || 0);
+    const candidate = Number(candidateSeq || 0);
+    const wallClock = Date.now();
+    const nextSeq = Math.max(previousSeq + 1, candidate + 1, wallClock);
+    terminalStatusEventSeqRef.current.set(key, nextSeq);
+    return nextSeq;
+  }, []);
+  const emitTerminalStatusEvent = useCallback((event = {}, options = {}) => {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || shouldShowWorkspaceSetup
+      || workspaceSyncState === "loading"
+    ) {
+      return;
+    }
+    const workspaceId = String(options.workspaceId || event.workspaceId || "").trim();
+    if (!workspaceId) {
+      return;
+    }
+
+    const terminalIndex = Number.parseInt(
+      options.terminalIndex ?? event.terminalIndex ?? 0,
+      10,
+    );
+    const safeTerminalIndex = Number.isInteger(terminalIndex) && terminalIndex >= 0
+      ? terminalIndex
+      : 0;
+    const presenceWorkspace = terminalPresenceWorkspacesRef.current.find((workspace) => (
+      String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
+    ));
+    const presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
+      Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? -1) === safeTerminalIndex
+        || (
+          event.paneId
+          && String(terminal?.paneId || terminal?.pane_id || "").trim() === String(event.paneId).trim()
+        )
+        || (
+          event.threadId
+          && String(terminal?.threadId || terminal?.thread_id || "").trim() === String(event.threadId).trim()
+        )
+    )) || null;
+    const workspaceRecord = workspaces.find((workspace) => String(workspace?.id || "").trim() === workspaceId);
+    const repoPath = String(
+      presenceWorkspace?.repoPath
+        || presenceWorkspace?.repo_path
+        || getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+        || selectedWorkspaceRootDirectory
+        || defaultWorkingDirectory
+        || "",
+    ).trim();
+    if (!repoPath) {
+      return;
+    }
+
+    const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
+    const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
+    const statusAfter = (() => {
+      if (options.statusAfter || options.status) return String(options.statusAfter || options.status).trim().toLowerCase();
+      if (["closed", "exited"].includes(eventType)) return "closed";
+      if (eventType === "provider-turn-error" || rawStatus === "error" || rawStatus === "failed") return "error";
+      if (
+        eventType === "terminal-prompt-ready"
+        || eventType === "terminal-input-ready"
+        || eventType === "provider-turn-completed"
+      ) {
+        return "idle";
+      }
+      if (
+        eventType === "message-submitted"
+        || eventType === "provider-turn-started"
+        || eventType === "thread-starting"
+        || eventType === "agent-output"
+        || ["thinking", "running", "working", "busy"].includes(rawStatus)
+      ) {
+        return "working";
+      }
+      if (["paused", "parked", "waiting", "resume_ready"].includes(rawStatus)) return "paused";
+      return String(presenceTerminal?.status || rawStatus || "idle").trim().toLowerCase();
+    })();
+    const readinessAfter = String(options.readiness || options.readinessAfter || "").trim().toLowerCase() || (() => {
+      if (statusAfter === "working") return "busy";
+      if (statusAfter === "paused") return "needs_input";
+      if (statusAfter === "error") return "error";
+      if (statusAfter === "closed") return "closed";
+      return "ready";
+    })();
+    const turnStatus = String(options.turnStatus || event.turnStatus || "").trim().toLowerCase() || (() => {
+      if (statusAfter === "working") return "running";
+      if (statusAfter === "error") return "failed";
+      if (statusAfter === "closed") return "interrupted";
+      if (statusAfter === "idle") return "completed";
+      return "";
+    })();
+    const agentId = String(
+      options.agentId
+        || event.agentId
+        || presenceTerminal?.agentId
+        || presenceTerminal?.agentKind
+        || presenceTerminal?.agent_kind
+        || "",
+    ).trim().toLowerCase() || "terminal";
+    const paneId = String(
+      options.paneId
+        || event.paneId
+        || presenceTerminal?.paneId
+        || presenceTerminal?.pane_id
+        || getWorkspaceTerminalPaneId(workspaceId, safeTerminalIndex, agentId),
+    ).trim();
+    const terminalInstanceId = event.instanceId
+      || event.terminalInstanceId
+      || presenceTerminal?.terminalInstanceId
+      || presenceTerminal?.terminal_instance_id
+      || "";
+    const threadId = String(
+      options.threadId
+        || event.threadId
+        || presenceTerminal?.threadId
+        || presenceTerminal?.thread_id
+        || createWorkspaceThreadId(workspaceId, safeTerminalIndex),
+    ).trim();
+    const terminalKey = [
+      workspaceId,
+      paneId,
+      terminalInstanceId || "0",
+      threadId,
+      safeTerminalIndex,
+    ].join(":");
+    const statusSeq = nextTerminalStatusEventSeq(
+      terminalKey,
+      Number(options.statusSeq || event.statusSeq || presenceTerminal?.statusSeq || presenceTerminal?.status_seq || 0),
+    );
+    const dedupKey = [
+      workspaceId,
+      paneId,
+      threadId,
+      eventType,
+      statusAfter,
+      readinessAfter,
+      turnStatus,
+    ].join(":");
+    const previousDedup = terminalStatusEventDedupRef.current.get(dedupKey) || 0;
+    const observedAtMs = Date.now();
+    if (observedAtMs - previousDedup < 120) {
+      return;
+    }
+    terminalStatusEventDedupRef.current.set(dedupKey, observedAtMs);
+
+    const workspacePayload = {
+      repoPath,
+      workspaceActive: true,
+      workspaceId,
+      workspaceName: presenceWorkspace?.workspaceName
+        || presenceWorkspace?.workspace_name
+        || workspaceRecord?.name
+        || workspaceId,
+      workspaceStatus: "active",
+    };
+    const terminalPayload = {
+      agentId,
+      agentKind: agentId,
+      agentLabel: presenceTerminal?.agentLabel
+        || presenceTerminal?.agent_label
+        || getManagedAgentLabel(agentId),
+      color: presenceTerminal?.color || "",
+      colorSlot: presenceTerminal?.colorSlot ?? presenceTerminal?.color_slot ?? getTerminalAgentColorSlot(safeTerminalIndex),
+      eventId: `${terminalKey}:${statusSeq}`,
+      eventType,
+      inputReady: readinessAfter === "ready",
+      observedAtMs,
+      paneId,
+      readiness: readinessAfter,
+      readinessAfter,
+      sessionState: statusAfter === "closed" ? "no_session" : "session_attached",
+      status: statusAfter,
+      statusAfter,
+      statusSeq,
+      terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
+      terminalId: paneId,
+      terminalIndex: safeTerminalIndex,
+      terminalInstanceId,
+      terminalLifecycle: statusAfter === "closed" ? "closed" : "open",
+      threadId,
+      turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
+      turnStatus,
+    };
+
+    const diagnosticToken = authStore.getToken();
+    logTerminalStatus("frontend.terminal_status.event_sync.send", {
+      agentId,
+      eventType,
+      paneId,
+      readinessAfter,
+      statusAfter,
+      statusSeq,
+      terminalIndex: safeTerminalIndex,
+      threadId,
+      workspaceId,
+    });
+    invoke("cloud_mcp_sync_terminal_status_event", {
+      workspace: workspacePayload,
+      terminal: terminalPayload,
+      reason: options.reason || event.source || eventType,
+    }).catch((error) => {
+      logTerminalStatus("frontend.terminal_status.event_sync.error", {
+        agentId,
+        eventType,
+        message: getErrorMessage(error, "Unable to sync terminal status event."),
+        paneId,
+        statusAfter,
+        statusSeq,
+        terminalIndex: safeTerminalIndex,
+        threadId,
+        workspaceId,
+      });
+      void recordCloudConnectionDiagnostic(diagnosticToken, {
+        channel: "rust-client-sync",
+        step: "rust.sync.terminal_status_event",
+        status: "error",
+        message: getErrorMessage(error, "Unable to sync terminal status event."),
+        details: {
+          eventType,
+          statusAfter,
+          statusSeq,
+          terminalIndex: safeTerminalIndex,
+          workspaceId,
+        },
+      });
+    });
+  }, [
+    authState,
+    defaultWorkingDirectory,
+    nextTerminalStatusEventSeq,
+    selectedWorkspaceRootDirectory,
+    shouldShowWorkspaceSetup,
+    user,
+    workspaceHydrationReady,
+    workspaceSettings,
+    workspaceSyncState,
+    workspaces,
+  ]);
+  useEffect(() => {
+    terminalStatusEventEmitterRef.current = emitTerminalStatusEvent;
+  }, [emitTerminalStatusEvent]);
   const workspaceMcpSyncTargets = useMemo(() => {
     if (shouldShowWorkspaceSetup) {
       return [];
@@ -8739,14 +8992,9 @@ export default function App() {
 	    };
 
     syncPresence("terminal_presence_snapshot");
-    const intervalId = window.setInterval(
-      () => syncPresence("terminal_presence_heartbeat"),
-      TERMINAL_PRESENCE_SYNC_INTERVAL_MS,
-    );
 
     return () => {
       disposed = true;
-      window.clearInterval(intervalId);
     };
   }, [
     shouldShowWorkspaceSetup,
@@ -10294,13 +10542,26 @@ export default function App() {
               && rawTurnCompleteSeen
               && !transcriptTargetsLatestRunningTurn,
           );
+          const sessionTranscriptCanSettleTurn = Boolean(
+            pollUntilTurnComplete
+              && activeRunningTurnAtTranscriptResult
+              && promptAccepted
+              && transcriptTargetsLatestRunningTurn
+              && (
+                rawTurnCompleteSeen
+                || settledAssistantResponseSeen
+              )
+          );
           const transcriptExplicitCompletionCanSettleTurn = Boolean(
             pollUntilTurnComplete
               && activeRunningTurnAtTranscriptResult
               && rawTurnCompleteSeen
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
-              && terminalLifecycleCanSettleTurn
+              && (
+                terminalLifecycleCanSettleTurn
+                || sessionTranscriptCanSettleTurn
+              )
           );
           const assistantResponseCompletesTurn = Boolean(
             pollUntilTurnComplete
@@ -10308,7 +10569,10 @@ export default function App() {
               && promptAccepted
               && (
                 activeRunningTurnAtTranscriptResult
-                  ? transcriptTargetsLatestRunningTurn && terminalLifecycleCanSettleTurn
+                  ? transcriptTargetsLatestRunningTurn && (
+                    terminalLifecycleCanSettleTurn
+                    || sessionTranscriptCanSettleTurn
+                  )
                   : true
               )
           );
@@ -10321,6 +10585,7 @@ export default function App() {
                   && (
                     terminalReadinessCanSettleTurn
                     || transcriptExplicitCompletionCanSettleTurn
+                    || sessionTranscriptCanSettleTurn
                   )
                 )
               ),
@@ -10360,6 +10625,7 @@ export default function App() {
             promptAccepted,
             rawTurnCompleteSeen,
             settledAssistantResponseSeen,
+            sessionTranscriptCanSettleTurn,
             staleTranscriptCompletionBlocked,
             terminalReadinessCanSettleTurn,
             transcriptExplicitCompletionCanSettleTurn,
@@ -10382,6 +10648,7 @@ export default function App() {
             requestKey,
             sessionIdPresent: Boolean(sessionId),
             settledAssistantResponseSeen,
+            sessionTranscriptCanSettleTurn,
             staleTranscriptCompletionBlocked,
             terminalReadinessCanSettleTurn,
             transcriptExplicitCompletionCanSettleTurn,
@@ -10717,11 +10984,31 @@ export default function App() {
                 threadId,
                 workspaceId,
               });
-            }
-            return nextThreads;
-          });
-          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-") && promptAccepted) {
-            logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
+	            }
+	            return nextThreads;
+	          });
+	          if (turnCompleteSeen || assistantResponseCompletesTurn) {
+	            terminalStatusEventEmitterRef.current?.({
+	              ...event,
+	              agentId,
+	              inputReady: true,
+	              providerSessionId: sessionId || providerSessionId,
+	              readiness: "ready",
+	              status: "idle",
+	              threadId,
+	              turnStatus: "completed",
+	              type: "provider-turn-completed",
+	              workspaceId,
+	            }, {
+	              eventType: "provider-turn-completed",
+	              reason: "transcript_turn_completed",
+	              readiness: "ready",
+	              status: "idle",
+	              turnStatus: "completed",
+	            });
+	          }
+	          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-") && promptAccepted) {
+	            logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
               agentId,
               completionSource: trustedVoicePlanTerminalFinish
                 ? "transcript_session_terminal_finish"
@@ -11032,6 +11319,9 @@ export default function App() {
       threadId: lifecycleThreadId,
       type: lifecycleEvent.type || "",
       workspaceId: lifecycleWorkspaceId,
+    });
+    terminalStatusEventEmitterRef.current?.(lifecycleEvent, {
+      reason: lifecycleEvent.source || `lifecycle:${lifecycleEvent.type || "terminal-status"}`,
     });
     setWorkspaceNotifications((current) => reduceThreadLifecycleNotificationEvent(
       current,

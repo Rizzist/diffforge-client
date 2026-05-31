@@ -16,7 +16,7 @@
     "register:windows:dev-deeplink": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-windows-dev-deeplink.ps1",
     "preview": "vite preview",
     "test": "npm run test:frontend && npm run test:rust",
-    "test:frontend": "node --test src/specGraph/specGraphCore.test.js src/specGraph/specGraphLayout.test.js src/tokenomics/tokenomicsFormat.test.js src/notifications/workspaceNotifications.test.js src/terminals/terminalColors.test.js src/threads/threadTerminalGroundTruth.test.js",
+    "test:frontend": "node --test src/specGraph/specGraphCore.test.js src/specGraph/specGraphLayout.test.js src/tokenomics/tokenomicsFormat.test.js src/notifications/workspaceNotifications.test.js src/terminals/terminalColors.test.js src/threads/threadTerminalGroundTruth.test.js src/threads/workspaceThreads.test.js",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "macos:accessibility:reset": "tccutil reset Accessibility ai.diffforge.desktop",
     "tauri": "tauri",

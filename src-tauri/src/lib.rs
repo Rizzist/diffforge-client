@@ -3240,6 +3240,7 @@ pub fn run() {
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_terminal_presence,
+            cloud_mcp_sync_terminal_status_event,
             cloud_mcp_sync_workspace_mcp_snapshot,
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,

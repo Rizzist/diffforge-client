@@ -1454,11 +1454,13 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         )
         .await;
         let device_profile = cloud_mcp_desktop_device_profile();
+        let connection_epoch = state.global_ws_epoch.load(Ordering::SeqCst);
         let hello = json!({
             "kind": "hello",
             "id": format!("hello-{}", cloud_mcp_now_ms()),
             "client_id": CLOUD_MCP_RUST_CLIENT_ID,
             "source": "rust-diffforge",
+            "connection_epoch": connection_epoch,
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
             "device_name": device_profile["device_name"].clone(),
@@ -1607,6 +1609,7 @@ async fn cloud_mcp_send_lifecycle_event(
     reason: Option<&str>,
 ) -> Result<Value, String> {
     let now = cloud_mcp_now_ms();
+    let connection_epoch = state.global_ws_epoch.load(Ordering::SeqCst);
     let snapshot = cloud_mcp_status_snapshot(state).await;
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -1624,6 +1627,7 @@ async fn cloud_mcp_send_lifecycle_event(
         "client_kind": device_profile["client_kind"].clone(),
         "reason": reason.unwrap_or(status),
         "status": status,
+        "connection_epoch": connection_epoch,
         "registered_workspace_count": snapshot.registered_workspace_count,
         "global_ws_connected": snapshot.global_ws_connected,
         "workspaces": cloud_mcp_lifecycle_workspaces(state).await,
@@ -2038,7 +2042,11 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                     "workspace_active": workspace.get("workspace_active")
                         .or_else(|| workspace.get("workspaceActive"))
                         .cloned()
-                        .unwrap_or_else(|| json!(true)),
+                        .unwrap_or_else(|| json!(false)),
+                    "workspace_reported_active": workspace.get("workspace_active")
+                        .or_else(|| workspace.get("workspaceActive"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(false)),
                 }));
             }
         }
@@ -2055,7 +2063,9 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             "workspace_id": workspace.workspace_id,
             "repo_id": repo_id,
             "workspace_name": workspace.workspace_name,
-            "workspace_active": true,
+            "workspace_active": false,
+            "workspace_reported_active": false,
+            "workspace_status": "registered",
         }));
     }
 
@@ -5625,6 +5635,115 @@ async fn cloud_mcp_sync_terminal_agent_status(
             }),
         ),
     }
+    if let Some(task_id) = local_task_id.filter(|value| !value.trim().is_empty()) {
+        let task_spec_payload = json!({
+            "source": "rust-diffforge-terminal-lifecycle",
+            "entity_type": "task",
+            "canonical_event_kind": cloud_mcp_task_spec_event_kind(status),
+            "repo_id": repo_id,
+            "agent_id": agent_id,
+            "agent_label": agent_label,
+            "self_agent_id": agent_id,
+            "current_agent_id": agent_id,
+            "status": status,
+            "task_status": cloud_mcp_task_spec_status(status),
+            "lane": lane,
+            "current_prompt": current_prompt,
+            "summary": progress_summary,
+            "progress_summary": progress_summary,
+            "task_id": task_id,
+            "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
+            "claimed_paths": cloud_mcp_terminal_claimed_paths(coordination, Some(task_id)),
+            "workspace_root": workspace_path_display(working_directory),
+            "terminal_id": pane_id,
+            "pane_id": pane_id,
+            "terminal_instance_id": instance_id,
+            "producer_id": format!("{}:{}", pane_id, instance_id),
+            "producer_seq": cloud_mcp_now_ms() as i64,
+            "metadata": {
+                "agent_label": agent_label,
+                "agent_kind": coordination.map(|coordination| coordination.agent_kind.clone()),
+                "coding_agent": coordination.map(|coordination| coordination.agent_kind.clone()),
+                "managed_by": "rust-diffforge",
+                "reason": reason,
+                "terminal_id": pane_id,
+                "terminal_instance_id": instance_id,
+                "workspace_root": workspace_path_display(working_directory),
+                "session_id": coordination.map(|coordination| coordination.session_id.clone()),
+                "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
+                "local_coordination_task_id": task_id,
+                "coordination_task_id": task_id,
+                "local_lease_file_evidence": has_claimed_paths,
+            },
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        log_terminal_status_event(
+            "backend.cloud_mcp.task_spec_event.send",
+            json!({
+                "endpoint": "task_spec_event",
+                "payload": task_spec_payload.clone(),
+                "reason": reason,
+                "terminal_id": pane_id,
+                "terminal_instance_id": instance_id,
+            }),
+        );
+        let task_spec_result =
+            cloud_mcp_post_event_endpoint(state, "task_spec_event", &task_spec_payload).await;
+        match &task_spec_result {
+            Ok(value) => log_terminal_status_event(
+                "backend.cloud_mcp.task_spec_event.result",
+                json!({
+                    "endpoint": "task_spec_event",
+                    "ok": true,
+                    "result": value,
+                    "terminal_id": pane_id,
+                    "terminal_instance_id": instance_id,
+                }),
+            ),
+            Err(error) => log_terminal_status_event(
+                "backend.cloud_mcp.task_spec_event.error",
+                json!({
+                    "endpoint": "task_spec_event",
+                    "error": clean_terminal_telemetry_text(error),
+                    "terminal_id": pane_id,
+                    "terminal_instance_id": instance_id,
+                }),
+            ),
+        }
+    }
+}
+
+fn cloud_mcp_task_spec_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "done" | "completed" | "complete" | "idle" | "ready" | "prompt_ready" => "done",
+        "merged" | "applied" => "merged",
+        "skipped" => "skipped",
+        "cancelled" | "canceled" => "cancelled",
+        "interrupted" => "interrupted",
+        "failed" | "error" => "failed",
+        "queued" => "queued",
+        "dispatched" => "dispatched",
+        "claimed" => "claimed",
+        "started" => "started",
+        "review" | "submitted" | "patch_submitted" => "review",
+        "parked" | "waiting" | "paused" | "resume_ready" | "resume_requested" => "waiting",
+        "starting" => "starting",
+        _ => "working",
+    }
+}
+
+fn cloud_mcp_task_spec_event_kind(status: &str) -> &'static str {
+    match cloud_mcp_task_spec_status(status) {
+        "done" | "merged" | "skipped" => "task.completed",
+        "cancelled" => "task.cancelled",
+        "interrupted" => "task.interrupted",
+        "failed" => "task.failed",
+        "queued" => "task.queued",
+        "dispatched" => "task.dispatched",
+        "claimed" | "started" | "starting" => "task.started",
+        "waiting" => "task.needs_input",
+        _ => "task.progressed",
+    }
 }
 
 fn cloud_mcp_agent_status_for_lifecycle_status(status: &str) -> &'static str {
@@ -6222,9 +6341,95 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     runtime.terminal_contexts.remove(&terminal_key);
 }
 
+fn cloud_mcp_clean_terminal_state_text(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len().min(2400));
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let mut escaped = false;
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if escaped && next == '\\' {
+                            break;
+                        }
+                        escaped = next == '\u{1b}';
+                    }
+                }
+                _ => {
+                    let _ = chars.next();
+                }
+            }
+            cleaned.push(' ');
+        } else if ch.is_control() {
+            cleaned.push(' ');
+        } else {
+            cleaned.push(ch);
+        }
+    }
+
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn cloud_mcp_terminal_output_has_working_indicator(cleaned_text: &str) -> bool {
+    let lower = cleaned_text.to_lowercase();
+    lower.contains("working (")
+        || lower.contains("esc to interrupt")
+        || lower.contains("context refresh")
+}
+
+fn cloud_mcp_terminal_output_has_prompt_marker(cleaned_text: &str) -> bool {
+    cleaned_text.contains('›')
+}
+
 fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    text.contains('•')
+    let cleaned = cloud_mcp_clean_terminal_state_text(text);
+    if cleaned.is_empty() {
+        return false;
+    }
+    if cloud_mcp_terminal_output_has_working_indicator(&cleaned) {
+        return true;
+    }
+    if cloud_mcp_terminal_output_has_prompt_marker(&cleaned) {
+        return false;
+    }
+
+    let lower = cleaned.to_lowercase();
+    let tool_action = [
+        "• called",
+        "• ran",
+        "• edited",
+        "• created",
+        "• updated",
+        "• modified",
+        "• explored",
+        "• exploring",
+        "• read",
+        "• listed",
+        "• searched",
+        "• checked",
+        "• checking",
+        "• wrote",
+        "• applied",
+        "• started",
+        "• starting",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    tool_action
         || lower.contains("called ")
         || lower.contains("ran ")
         || lower.contains("edited ")
@@ -6237,15 +6442,20 @@ fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
         || lower.contains("i'm ")
         || lower.contains("i’m ")
         || lower.contains("i am ")
-        || lower.contains("context refresh")
 }
 
 fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
+    let cleaned = cloud_mcp_clean_terminal_state_text(text);
+    if cloud_mcp_terminal_output_has_working_indicator(&cleaned) {
+        return false;
+    }
+
     text.contains("\n›")
         || text.contains("\r›")
         || text.contains("› ")
         || text.contains("\n> ")
         || text.contains("\r> ")
+        || cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
 }
 
 async fn cloud_mcp_observe_terminal_output(
@@ -7563,6 +7773,233 @@ async fn cloud_mcp_sync_terminal_presence(
     }
 
     cloud_mcp_post_event_endpoint(state.inner(), "terminal_presence_snapshot", &payload).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_terminal_status_event(
+    state: State<'_, CloudMcpState>,
+    workspace: Value,
+    terminal: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let clean_option = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let reason = clean_option(reason).unwrap_or_else(|| "terminal_status_event".to_string());
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let repo_path = cloud_mcp_payload_text(
+        &workspace,
+        &[
+            "repo_path",
+            "repoPath",
+            "workspace_root",
+            "workspaceRoot",
+            "workspace_root_directory",
+            "workspaceRootDirectory",
+            "workingDirectory",
+            "rootDirectory",
+            "terminalWorkspaceWorkingDirectory",
+        ],
+    )
+    .or_else(|| {
+        cloud_mcp_payload_text(
+            &terminal,
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "workingDirectory",
+                "rootDirectory",
+            ],
+        )
+    })
+    .unwrap_or_default();
+    if repo_path.trim().is_empty() {
+        return Err("Terminal status events require a workspace root.".to_string());
+    }
+
+    let workspace_id = cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])
+        .or_else(|| cloud_mcp_payload_text(&terminal, &["workspace_id", "workspaceId"]));
+    let workspace_name = cloud_mcp_payload_text(
+        &workspace,
+        &["workspace_name", "workspaceName", "name", "label"],
+    );
+    let workspace_active = workspace
+        .get("workspace_active")
+        .or_else(|| workspace.get("workspaceActive"))
+        .or_else(|| workspace.get("active"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let workspace_status = cloud_mcp_payload_text(
+        &workspace,
+        &["workspace_status", "workspaceStatus", "status"],
+    )
+    .unwrap_or_else(|| {
+        if workspace_active {
+            "active".to_string()
+        } else {
+            "deactivated".to_string()
+        }
+    });
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+
+    let terminal_index = terminal
+        .get("terminal_index")
+        .or_else(|| terminal.get("terminalIndex"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 255);
+    let agent_kind = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "agent_kind",
+            "agentKind",
+            "agent_id",
+            "agentId",
+            "role",
+            "provider",
+            "binary",
+            "kind",
+        ],
+    )
+    .unwrap_or_else(|| "terminal".to_string());
+    let agent_label = cloud_mcp_payload_text(&terminal, &["agent_label", "agentLabel", "label"])
+        .unwrap_or_else(|| agent_kind.clone());
+    let status = cloud_mcp_payload_text(
+        &terminal,
+        &["status_after", "statusAfter", "status", "state"],
+    )
+    .unwrap_or_else(|| "idle".to_string());
+    let readiness = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "readiness_after",
+            "readinessAfter",
+            "readiness",
+            "terminal_readiness",
+            "terminalReadiness",
+        ],
+    );
+    let session_state = cloud_mcp_payload_text(&terminal, &["session_state", "sessionState"])
+        .unwrap_or_else(|| "session_attached".to_string());
+    let status_seq = terminal
+        .get("status_seq")
+        .or_else(|| terminal.get("statusSeq"))
+        .cloned()
+        .unwrap_or_else(|| json!(cloud_mcp_now_ms()));
+    let observed_at_ms = terminal
+        .get("observed_at_ms")
+        .or_else(|| terminal.get("observedAtMs"))
+        .cloned()
+        .unwrap_or_else(|| json!(cloud_mcp_now_ms()));
+    let event_type = cloud_mcp_payload_text(
+        &terminal,
+        &["event_type", "eventType", "type", "terminal_event_type", "terminalEventType"],
+    )
+    .unwrap_or_else(|| "terminal.status".to_string());
+    let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
+    let terminal_id = cloud_mcp_payload_text(&terminal, &["terminal_id", "terminalId"])
+        .or_else(|| pane_id.clone());
+    let terminal_instance_id = terminal
+        .get("terminal_instance_id")
+        .or_else(|| terminal.get("terminalInstanceId"))
+        .or_else(|| terminal.get("instance_id"))
+        .or_else(|| terminal.get("instanceId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let terminal_epoch = cloud_mcp_payload_text(&terminal, &["terminal_epoch", "terminalEpoch"])
+        .or_else(|| {
+            terminal_id
+                .as_ref()
+                .map(|terminal_id| format!("{}:{}", terminal_id, terminal_instance_id))
+        });
+    let normalized_terminal = json!({
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "presence_agent_id": cloud_mcp_payload_text(&terminal, &["presence_agent_id", "presenceAgentId", "id"]),
+        "agent_kind": agent_kind,
+        "agent_label": agent_label,
+        "status": status,
+        "status_after": status,
+        "session_state": session_state,
+        "terminal_index": terminal_index,
+        "terminal_epoch": terminal_epoch,
+        "terminal_instance_id": terminal_instance_id,
+        "terminal_lifecycle": cloud_mcp_payload_text(&terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
+        "readiness": readiness,
+        "readiness_after": readiness,
+        "turn_id": cloud_mcp_payload_text(&terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId", "active_turn_id", "activeTurnId"]),
+        "turn_status": cloud_mcp_payload_text(&terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
+        "status_seq": status_seq,
+        "observed_at_ms": observed_at_ms,
+        "event_type": event_type,
+        "event_id": cloud_mcp_payload_text(&terminal, &["event_id", "eventId"]),
+        "input_ready": terminal
+            .get("input_ready")
+            .or_else(|| terminal.get("inputReady"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "pane_id": pane_id,
+        "terminal_id": terminal_id,
+        "thread_id": cloud_mcp_payload_text(&terminal, &["thread_id", "threadId"]),
+        "color": cloud_mcp_payload_text(&terminal, &["color", "accent", "accentColor"]),
+        "color_slot": cloud_mcp_payload_text(&terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
+    });
+    let workspace_payload = json!({
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "repo_id": req.repo_id,
+        "workspace_root": req.root_display,
+        "workspace_active": workspace_active,
+        "workspace_id": req.workspace_id,
+        "workspace_name": req.workspace_name,
+        "workspace_status": workspace_status,
+        "terminal_count": 1,
+        "terminals": [normalized_terminal.clone()],
+    });
+    let payload = json!({
+        "source": "rust-diffforge-terminal-status-event",
+        "event_kind": "terminal_status_event",
+        "snapshot_scope": "device_workspace_terminal",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": reason,
+        "repo_id": workspace_payload["repo_id"].clone(),
+        "workspace_id": workspace_payload["workspace_id"].clone(),
+        "workspace_count": 1,
+        "terminal_count": 1,
+        "terminal": normalized_terminal,
+        "workspaces": [workspace_payload],
+        "summary": "Desktop terminal status event synced.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    log_terminal_status_event(
+        "backend.cloud_mcp.terminal_status_event.send",
+        json!({
+            "payload": payload.clone(),
+            "reason": reason,
+        }),
+    );
+    cloud_mcp_post_event_endpoint(state.inner(), "terminal_status_event", &payload).await
 }
 
 #[tauri::command]
@@ -10902,6 +11339,27 @@ mod cloud_mcp_tests {
             modified_ms: None,
             references: Vec::new(),
         }
+    }
+
+    #[test]
+    fn terminal_output_classifier_handles_codex_ready_redraw() {
+        let finished_screen = "\u{1b}[39;49m\u{1b}[K\u{1b}[2m•  \u{1b}[22mThe project is basically empty.\u{1b}[39m\u{1b}[49m\u{1b}[0m\
+\u{1b}[r\u{1b}[47;3H\u{1b}[45;2H\u{1b}[0m\u{1b}[49m\u{1b}[K\
+\u{1b}[47;1H\u{1b}[1m›\u{1b}[47;3H\u{1b}[22m\u{1b}[2mExplain this codebase\
+\u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
+\u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m\u{1b}[49m";
+
+        assert!(cloud_mcp_terminal_output_looks_ready(finished_screen));
+        assert!(!cloud_mcp_terminal_output_looks_active(finished_screen));
+    }
+
+    #[test]
+    fn terminal_output_classifier_keeps_codex_working_screen_active() {
+        let working_screen = "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m \u{1b}[2m(10s • esc to interrupt)\u{1b}[39m\
+\u{1b}[47;1H\u{1b}[22m\u{1b}[1m›\u{1b}[47;3H\u{1b}[22m\u{1b}[2mExplain this codebase";
+
+        assert!(!cloud_mcp_terminal_output_looks_ready(working_screen));
+        assert!(cloud_mcp_terminal_output_looks_active(working_screen));
     }
 
     #[test]

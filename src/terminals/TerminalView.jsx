@@ -2116,6 +2116,13 @@ const TodoQueueList = styled.div`
 `;
 
 const TodoQueueItemCard = styled.article`
+  --todo-dot-center-x: 19px;
+  --todo-dot-center-y: 19px;
+  --todo-dot-radius: 3px;
+  --todo-dot-size: 6px;
+  --todo-spinner-radius: 8px;
+  --todo-spinner-size: 16px;
+
   position: relative;
   display: grid;
   min-height: 35px;
@@ -2136,10 +2143,10 @@ const TodoQueueItemCard = styled.article`
 
   &::before {
     content: "";
-    width: 6px;
-    height: 6px;
-    margin-top: 8px;
-    margin-left: 4px;
+    width: var(--todo-dot-size);
+    height: var(--todo-dot-size);
+    margin-top: calc(var(--todo-dot-center-y) - 8px - var(--todo-dot-radius));
+    margin-left: calc(var(--todo-dot-center-x) - 12px - var(--todo-dot-radius));
     border-radius: 999px;
     background: var(--todo-agent-color, ${TODO_QUEUE_DEFAULT_DOT_COLOR});
     box-shadow: none;
@@ -2305,11 +2312,11 @@ const todoQueuePendingSpin = keyframes`
 
 const TodoQueueItemPendingSpinner = styled.div`
   position: absolute;
-  top: 8px;
-  left: 14px;
+  top: calc(var(--todo-dot-center-y) - var(--todo-spinner-radius));
+  left: calc(var(--todo-dot-center-x) - var(--todo-spinner-radius));
   z-index: 2;
-  width: 16px;
-  height: 16px;
+  width: var(--todo-spinner-size);
+  height: var(--todo-spinner-size);
   pointer-events: none;
   transition: opacity 130ms ease;
 
