@@ -447,7 +447,7 @@ fn workspace_has_explicit_workspace_marker(root: &Path) -> bool {
         || workspace_cargo_toml_declares_workspace(root)
 }
 
-fn workspace_has_project_marker(root: &Path) -> bool {
+fn workspace_has_project_file_marker(root: &Path) -> bool {
     workspace_has_explicit_workspace_marker(root)
         || root.join(".agents").join("spec-graph").is_dir()
         || workspace_has_any_file(
@@ -472,7 +472,21 @@ fn workspace_has_project_marker(root: &Path) -> bool {
                 "CMakeLists.txt",
             ],
         )
+}
+
+fn workspace_has_project_marker(root: &Path) -> bool {
+    workspace_has_project_file_marker(root)
         || workspace_has_any_dir(root, &["src", "app"])
+}
+
+fn workspace_project_kind_for_selected_root(root: &Path) -> Option<WorkspaceProjectKind> {
+    if workspace_is_exact_git_root(root) {
+        Some(WorkspaceProjectKind::Git)
+    } else if workspace_has_project_file_marker(root) {
+        Some(WorkspaceProjectKind::Marker)
+    } else {
+        None
+    }
 }
 
 fn workspace_project_kind_for_root(root: &Path) -> Option<WorkspaceProjectKind> {
@@ -627,26 +641,19 @@ fn workspace_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount> {
         .canonicalize()
         .unwrap_or_else(|_| root.to_path_buf());
 
-    if let Some(project_kind) = workspace_project_kind_for_root(&workspace_root)
-        .filter(|kind| matches!(kind, WorkspaceProjectKind::Git))
-    {
-        return workspace_project_mount_from_root(&workspace_root, workspace_root.clone(), project_kind)
-            .into_iter()
-            .collect();
-    }
-
-    if workspace_has_explicit_workspace_marker(&workspace_root) {
-        return workspace_project_mount_from_root(
-            &workspace_root,
-            workspace_root.clone(),
-            WorkspaceProjectKind::Marker,
-        )
-        .into_iter()
-        .collect();
-    }
-
     let mut mounts = Vec::new();
     let mut seen = HashSet::new();
+
+    if let Some(project_kind) = workspace_project_kind_for_selected_root(&workspace_root) {
+        let key = normalized_path_key(&workspace_root);
+        seen.insert(key);
+        if let Some(mount) =
+            workspace_project_mount_from_root(&workspace_root, workspace_root.clone(), project_kind)
+        {
+            mounts.push(mount);
+        }
+    }
+
     let mut queue = VecDeque::new();
     queue.push_back((workspace_root.clone(), 0usize));
 
@@ -725,8 +732,9 @@ fn workspace_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount> {
     }
 
     mounts.sort_by(|left, right| {
-        left.workspace_relative_path
-            .cmp(&right.workspace_relative_path)
+        left.mount_depth
+            .cmp(&right.mount_depth)
+            .then_with(|| left.workspace_relative_path.cmp(&right.workspace_relative_path))
     });
     mounts
 }
@@ -2445,6 +2453,67 @@ mod workspace_files_tests {
             normalized_path_key(&coordination_root.canonicalize().unwrap()),
             normalized_path_key(&root.canonicalize().unwrap())
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_git_root_still_discovers_nested_git_project_mounts() {
+        let root = test_workspace_root("diffforge-selected-git-with-nested-git");
+        init_test_git_repo(&root);
+        let child = root.join("packages").join("mobile");
+        init_test_git_repo(&child);
+
+        let response = workspace_root_response(&root);
+        let coordination_root =
+            workspace_coordination_root_for_terminal(&root, None, None).unwrap();
+        let project_mount_ids = response
+            .project_mounts
+            .iter()
+            .map(|mount| mount.mount_id.as_str())
+            .collect::<HashSet<_>>();
+        let workspace_mount_ids = response
+            .workspace_mounts
+            .iter()
+            .map(|mount| (mount.mount_id.as_str(), mount.mount_kind.as_str()))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(response.workspace_kind, "git_repo");
+        assert!(project_mount_ids.contains("root"));
+        assert!(project_mount_ids.contains("packages/mobile"));
+        assert!(workspace_mount_ids.contains(&("packages", "container")));
+        assert!(workspace_mount_ids.contains(&("packages/mobile", "project")));
+        assert_eq!(
+            normalized_path_key(&coordination_root.canonicalize().unwrap()),
+            normalized_path_key(&root.canonicalize().unwrap())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_mount_scan_finds_deep_nested_git_boundaries() {
+        let root = test_workspace_root("diffforge-deep-nested-git-mount");
+        let child = root
+            .join("cases")
+            .join("client")
+            .join("regions")
+            .join("east")
+            .join("apps")
+            .join("mobile")
+            .join("native");
+        init_test_git_repo(&child);
+
+        let response = workspace_root_response(&root);
+        let mount_ids = response
+            .project_mounts
+            .iter()
+            .map(|mount| mount.mount_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(response.workspace_kind, "container");
+        assert!(mount_ids.contains("cases/client/regions/east/apps/mobile/native"));
+        assert!(!root.join(".git").exists());
 
         let _ = fs::remove_dir_all(root);
     }

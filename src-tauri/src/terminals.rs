@@ -8493,7 +8493,7 @@ command = "diffforge"
     }
 
     #[test]
-    fn coordinated_claude_general_worker_starts_in_repo_and_edits_slot_worktree() {
+    fn coordinated_claude_general_worker_starts_in_repo_without_raw_worktree_write() {
         let mut coordination = terminal_test_coordination("claude_general_worker_args");
         let repo = PathBuf::from(&coordination.repo_path);
         fs::write(repo.join("README.md"), "initial\n").unwrap();
@@ -8539,18 +8539,16 @@ command = "diffforge"
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
-        assert!(args
+        assert!(!args
             .windows(2)
             .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1")));
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
-        let settings_arg = args
+        assert!(!args
             .windows(2)
-            .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
-            .unwrap();
-        assert!(settings_arg.contains("--claude-worktree-guard"));
-        assert!(settings_arg.contains(".agents/worktrees/1"));
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        assert!(!args.windows(2).any(|pair| pair[0] == "--settings"));
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -8558,9 +8556,9 @@ command = "diffforge"
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(allowed_tools
+        assert!(!allowed_tools
             .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") && allowed.contains(".agents/worktrees/1")));
+            .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//")));
         assert!(!allowed_tools
             .split(',')
             .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));

@@ -1111,8 +1111,8 @@ fn apply_claude_coordinated_auto_approval_args(
         coordination_args,
     ));
 
-    if local_edit_allowed {
-        strip_terminal_arg_option(args, "--permission-mode", "", true);
+    strip_terminal_arg_option(args, "--permission-mode", "", true);
+    if local_edit_allowed || general_worker {
         args.push("--permission-mode".to_string());
         args.push("acceptEdits".to_string());
     }
