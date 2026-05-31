@@ -3026,6 +3026,13 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
                 })
                 .filter(|value| !value.trim().is_empty())
         });
+    let forward_worktree_id = authority_resolution["worktree_id"]
+        .as_str()
+        .or_else(|| input["worktree_id"].as_str());
+    let forward_worktree_path = authority_resolution["worktree_path"]
+        .as_str()
+        .or_else(|| authority_resolution["agent_branch_root"].as_str())
+        .or_else(|| input["worktree_path"].as_str());
     let cloud = match crate::cloud_mcp_forward_agent_acquire_lease(
         input["repo_path"].as_str(),
         input["db_path"].as_str().map(PathBuf::from).as_deref(),
@@ -3033,8 +3040,8 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         Some(agent_id),
         Some(session_id),
         Some(task_id),
-        input["worktree_id"].as_str(),
-        input["worktree_path"].as_str(),
+        forward_worktree_id,
+        forward_worktree_path,
         resource_key,
         mode,
         task_intent.as_deref(),

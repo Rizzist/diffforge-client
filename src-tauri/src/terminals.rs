@@ -1298,7 +1298,7 @@ fn terminal_coordination_launch_target(
                     .to_string(),
             );
         }
-        TerminalSessionMode::General if has_git_or_selected_empty_bootstrap => "worktree_required",
+        TerminalSessionMode::General if has_git_or_selected_empty_bootstrap => "general_worker",
         TerminalSessionMode::General => "bounded_direct_edit",
         TerminalSessionMode::DirectEdit if has_git => "worktree_required",
         TerminalSessionMode::DirectEdit => "bounded_direct_edit",
@@ -1310,7 +1310,11 @@ fn terminal_coordination_launch_target(
     Ok(TerminalCoordinationLaunchTarget {
         root: target_root,
         enforcement_mode,
-        requires_git_bootstrap: enforcement_mode == "worktree_required",
+        requires_git_bootstrap: if matches!(session_mode, TerminalSessionMode::General) {
+            selected_workspace_empty_git_bootstrap
+        } else {
+            enforcement_mode == "worktree_required"
+        },
         allows_git_init: selected_workspace_empty_git_bootstrap,
     })
 }
@@ -7356,6 +7360,16 @@ mod terminal_tests {
         repo
     }
 
+    fn terminal_test_git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     fn terminal_test_directory(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "diffforge_terminal_test_{}_{}",
@@ -7364,6 +7378,56 @@ mod terminal_tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    fn terminal_test_task_guard_identity(
+        repo: &Path,
+        slot_key: &str,
+        lease_resource: Option<&str>,
+    ) -> (DiffForgeWriteGuardIdentity, PathBuf) {
+        let kernel = crate::coordination::CoordinationKernel::init(repo, None).unwrap();
+        let session = kernel
+            .create_terminal_session_for_slot_key(
+                slot_key,
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some(&format!("terminal-{slot_key}")),
+                true,
+                None,
+                None,
+                Some("test-launch"),
+                Some("worktree_required"),
+            )
+            .unwrap();
+        let agent_id = session["agentId"].as_str().unwrap().to_string();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let worktree_path = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, &agent_id, &session_id).unwrap();
+        if let Some(resource_key) = lease_resource {
+            kernel
+                .acquire_lease(
+                    task_id,
+                    &agent_id,
+                    &session_id,
+                    resource_key,
+                    "write",
+                    Some(600),
+                    None,
+                )
+                .unwrap();
+        }
+        let identity = DiffForgeWriteGuardIdentity::new(
+            Some(agent_id),
+            Some(session_id),
+            Some(kernel.paths.db_path.clone()),
+        );
+        (identity, worktree_path)
     }
 
     fn terminal_test_plain_project(name: &str) -> PathBuf {
@@ -7580,7 +7644,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_uses_worktree_policy_for_git_root() {
+    fn general_terminal_launch_target_uses_general_worker_for_git_root() {
         let repo = terminal_test_repo("general_git_launch_target");
 
         let target = terminal_coordination_launch_target(
@@ -7592,8 +7656,8 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
-        assert!(target.requires_git_bootstrap);
+        assert_eq!(target.enforcement_mode, "general_worker");
+        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -7634,7 +7698,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(target.enforcement_mode, "general_worker");
         assert!(target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
@@ -7660,7 +7724,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(target.enforcement_mode, "general_worker");
         assert!(target.requires_git_bootstrap);
         assert!(target.allows_git_init);
         assert_eq!(
@@ -7747,7 +7811,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(target.enforcement_mode, "general_worker");
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -7789,7 +7853,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
         )
         .unwrap();
-        assert_eq!(selected.enforcement_mode, "worktree_required");
+        assert_eq!(selected.enforcement_mode, "general_worker");
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
             normalized_path_key(&frontend.canonicalize().unwrap())
@@ -8429,10 +8493,84 @@ command = "diffforge"
     }
 
     #[test]
+    fn coordinated_claude_general_worker_starts_in_repo_and_edits_slot_worktree() {
+        let mut coordination = terminal_test_coordination("claude_general_worker_args");
+        let repo = PathBuf::from(&coordination.repo_path);
+        fs::write(repo.join("README.md"), "initial\n").unwrap();
+        for args in [
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Diff Forge Test"],
+            vec!["add", "README.md"],
+            vec!["commit", "-m", "initial"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let repo_text = repo.display().to_string();
+        coordination.env_vars.push((
+            "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
+            repo_text.clone(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_ENFORCEMENT_MODE".to_string(),
+            "general_worker".to_string(),
+        ));
+        coordination.env_vars.push((
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "task_scoped".to_string(),
+        ));
+        coordination
+            .env_vars
+            .push(("COORDINATION_SLOT_KEY".to_string(), "1".to_string()));
+
+        let args = terminal_args_with_codex_mcp_identity(
+            "claude",
+            &["--permission-mode".to_string(), "bypassPermissions".to_string()],
+            Some(&coordination),
+            "pane-general",
+            44,
+        );
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1")));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        let settings_arg = args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
+            .unwrap();
+        assert!(settings_arg.contains("--claude-worktree-guard"));
+        assert!(settings_arg.contains(".agents/worktrees/1"));
+        let allowed_tools = args
+            .windows(2)
+            .find_map(|pair| {
+                (pair[0] == "--allowedTools" || pair[0] == "--allowed-tools")
+                    .then(|| pair[1].as_str())
+            })
+            .unwrap();
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") && allowed.contains(".agents/worktrees/1")));
+        assert!(!allowed_tools
+            .split(',')
+            .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));
+    }
+
+    #[test]
     fn claude_worktree_guard_denies_root_file_edit() {
-        let repo = terminal_test_directory("claude_guard_root_edit");
-        let worktree = repo.join(".agents").join("worktrees").join("1");
-        fs::create_dir_all(&worktree).unwrap();
+        let repo = terminal_test_repo_with_commit("claude_guard_root_edit");
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
         fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
         let hook_input = json!({
             "hook_event_name": "PreToolUse",
@@ -8444,14 +8582,15 @@ command = "diffforge"
         });
 
         let reason =
-            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1").unwrap();
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
+                .unwrap();
 
         assert!(reason.contains("outside terminal slot"));
     }
 
     #[test]
-    fn claude_worktree_guard_allows_assigned_worktree_edit() {
-        let repo = terminal_test_directory("claude_guard_worktree_edit");
+    fn claude_worktree_guard_denies_assigned_worktree_edit_without_task() {
+        let repo = terminal_test_repo_with_commit("claude_guard_worktree_no_task");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
         let hook_input = json!({
@@ -8463,17 +8602,44 @@ command = "diffforge"
             }
         });
 
-        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1");
+        let reason = claude_worktree_guard_denial_reason(
+            &hook_input,
+            &repo,
+            &worktree,
+            "1",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap();
+
+        assert!(reason.contains("no active task-owned worktree"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_allows_assigned_worktree_edit_with_task_and_lease() {
+        let repo = terminal_test_repo_with_commit("claude_guard_worktree_edit");
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": worktree.join("pricing.html").display().to_string()
+            }
+        });
+
+        let reason =
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity);
 
         assert!(reason.is_none());
     }
 
     #[test]
     fn claude_worktree_guard_denies_other_slot_worktree_edit() {
-        let repo = terminal_test_directory("claude_guard_cross_slot_edit");
-        let worktree = repo.join(".agents").join("worktrees").join("1");
+        let repo = terminal_test_repo_with_commit("claude_guard_cross_slot_edit");
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
         let other = repo.join(".agents").join("worktrees").join("2");
-        fs::create_dir_all(&worktree).unwrap();
         fs::create_dir_all(&other).unwrap();
         let hook_input = json!({
             "hook_event_name": "PreToolUse",
@@ -8484,8 +8650,9 @@ command = "diffforge"
             }
         });
 
-        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1")
-            .unwrap();
+        let reason =
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
+                .unwrap();
 
         assert!(reason.contains("outside terminal slot"));
     }
@@ -8505,10 +8672,56 @@ command = "diffforge"
             }
         });
 
-        let reason = claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1")
-            .unwrap();
+        let reason = claude_worktree_guard_denial_reason(
+            &hook_input,
+            &repo,
+            &worktree,
+            "1",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap();
 
         assert!(reason.contains("unsandboxed"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_denies_mutating_shell_without_lease() {
+        let repo = terminal_test_repo_with_commit("claude_guard_shell_no_lease");
+        let (identity, worktree) = terminal_test_task_guard_identity(&repo, "1", None);
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "command": "echo '<h1>Updated</h1>' > pricing.html"
+            }
+        });
+
+        let reason =
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity)
+                .unwrap();
+
+        assert!(reason.contains("no active write lease"));
+    }
+
+    #[test]
+    fn claude_worktree_guard_allows_mutating_shell_with_lease() {
+        let repo = terminal_test_repo_with_commit("claude_guard_shell_with_lease");
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "1", Some("file:pricing.html"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "command": "echo '<h1>Updated</h1>' > pricing.html"
+            }
+        });
+
+        let reason =
+            claude_worktree_guard_denial_reason(&hook_input, &repo, &worktree, "1", &identity);
+
+        assert!(reason.is_none());
     }
 
     #[test]
@@ -8516,6 +8729,8 @@ command = "diffforge"
         let repo = terminal_test_repo_with_commit("codex_apply_patch_route");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (identity, _worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:src/main.rs"));
         let patch = format!(
             "*** Begin Patch\n*** Update File: {}\n@@\n-fn main() {{}}\n+fn main() {{ println!(\"hi\"); }}\n*** End Patch\n",
             repo.join("src/main.rs").display()
@@ -8526,6 +8741,7 @@ command = "diffforge"
             &repo,
             "slot1",
             "codex",
+            &identity,
         )
         .unwrap();
 
@@ -8549,8 +8765,15 @@ command = "diffforge"
         });
 
         let decision =
-            diff_forge_write_guard_decision("claude", &hook_input, &root, "slot1", "claude")
-                .unwrap();
+            diff_forge_write_guard_decision(
+                "claude",
+                &hook_input,
+                &root,
+                "slot1",
+                "claude",
+                &DiffForgeWriteGuardIdentity::default(),
+            )
+            .unwrap();
 
         assert!(decision.is_none());
     }
@@ -8568,12 +8791,176 @@ command = "diffforge"
             }
         });
 
+        let error = diff_forge_write_guard_decision(
+            "claude",
+            &hook_input,
+            &repo,
+            "slot1",
+            "claude",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap_err();
+
+        if !error.contains("no active task-owned worktree") {
+            panic!("nested guard error: {error}");
+        }
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_worktree_edit_without_active_lease() {
+        let repo = terminal_test_repo_with_commit("write_guard_worktree_no_lease");
+        let (identity, worktree) = terminal_test_task_guard_identity(&repo, "slot1", None);
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": worktree.join("pricing.html").display().to_string()
+            }
+        });
+
         let error =
-            diff_forge_write_guard_decision("claude", &hook_input, &repo, "slot1", "claude")
+            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
+                .unwrap_err();
+
+        assert!(error.contains("no active write lease"));
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_real_git_root_edit_with_active_task_route() {
+        let repo = terminal_test_repo_with_commit("write_guard_git_root_active");
+        fs::write(repo.join("pricing.html"), "<h1>Root</h1>\n").unwrap();
+        let (identity, _worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:pricing.html"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "file_path": repo.join("pricing.html").display().to_string()
+            }
+        });
+
+        let error =
+            diff_forge_write_guard_decision("claude", &hook_input, &repo, "slot1", "claude", &identity)
                 .unwrap_err();
 
         assert!(error.contains("direct Git repository edit"));
         assert!(error.contains(".agents/worktrees/slot1"));
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_nested_git_edit_from_direct_container() {
+        let root = terminal_test_directory("write_guard_nested_git_container");
+        let repo = root.join("packages").join("nested-app");
+        fs::create_dir_all(&repo).unwrap();
+        terminal_test_git(&repo, &["init"]);
+        fs::write(repo.join("pricing.html"), "<h1>Nested</h1>\n").unwrap();
+        terminal_test_git(&repo, &["config", "user.email", "test@example.com"]);
+        terminal_test_git(&repo, &["config", "user.name", "Diff Forge Test"]);
+        terminal_test_git(&repo, &["add", "pricing.html"]);
+        terminal_test_git(&repo, &["commit", "-m", "init"]);
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "cwd": root.display().to_string(),
+            "tool_input": {
+                "file_path": repo.join("pricing.html").display().to_string()
+            }
+        });
+
+        let error = diff_forge_write_guard_decision(
+            "claude",
+            &hook_input,
+            &root,
+            "slot1",
+            "claude",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap_err();
+
+        if !error.contains("no active task-owned worktree") {
+            panic!("nested guard error: {error}");
+        }
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_nested_git_inside_outer_slot_without_child_task() {
+        let root = terminal_test_directory("write_guard_nested_git_inside_slot");
+        terminal_test_git(&root, &["init"]);
+        fs::write(root.join("README.md"), "root\n").unwrap();
+        terminal_test_git(&root, &["config", "user.email", "test@example.com"]);
+        terminal_test_git(&root, &["config", "user.name", "Diff Forge Test"]);
+        terminal_test_git(&root, &["add", "README.md"]);
+        terminal_test_git(&root, &["commit", "-m", "root"]);
+        let (identity, outer_slot) = terminal_test_task_guard_identity(
+            &root,
+            "slot1",
+            Some("file:packages/nested-app/pricing.html"),
+        );
+        let repo = outer_slot.join("packages").join("nested-app");
+        fs::create_dir_all(&repo).unwrap();
+        terminal_test_git(&repo, &["init"]);
+        fs::write(repo.join("pricing.html"), "<h1>Nested</h1>\n").unwrap();
+        terminal_test_git(&repo, &["config", "user.email", "test@example.com"]);
+        terminal_test_git(&repo, &["config", "user.name", "Diff Forge Test"]);
+        terminal_test_git(&repo, &["add", "pricing.html"]);
+        terminal_test_git(&repo, &["commit", "-m", "init"]);
+
+        let error = diff_forge_git_write_route(
+            &repo.join("pricing.html"),
+            "slot1",
+            "codex",
+            &identity,
+            true,
+        )
+        .unwrap_err();
+
+        if !error.contains("no active task-owned worktree") {
+            panic!("nested guard error: {error}");
+        }
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_mutating_shell_in_git_root() {
+        let repo = terminal_test_repo_with_commit("write_guard_shell_git_root");
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "command": "echo '<h1>Root</h1>' > pricing.html"
+            }
+        });
+
+        let (identity, _worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:pricing.html"));
+        let error =
+            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
+                .unwrap_err();
+
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains("Shell commands that mutate Git repositories"));
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_mutating_shell_in_worktree_without_lease() {
+        let repo = terminal_test_repo_with_commit("write_guard_shell_worktree_no_lease");
+        let (identity, worktree) = terminal_test_task_guard_identity(&repo, "slot1", None);
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "command": "echo '<h1>Root</h1>' > pricing.html"
+            }
+        });
+
+        let error =
+            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
+                .unwrap_err();
+
+        assert!(error.contains("no active write lease"));
     }
 
     #[cfg(windows)]

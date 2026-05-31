@@ -9468,7 +9468,7 @@ export default function App() {
     const isAccountReset = resetScope === "account";
     const confirmed = window.confirm(
       isAccountReset
-        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including old duplicate device/client activations from before device standardization. Workspace filetree entries are kept and the cloud checkpoint is refreshed."
+        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including filetree sync, duplicate device/client activations, task history, runtime state, logs, MCP state, terminal presence, and Spec Graph working state. Diff Forge AI credit usage is kept in the cloud credit ledger."
         : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state for this client. Workspace filetree entries are kept and the cloud checkpoint is refreshed.",
     );
     if (!confirmed) {
@@ -9484,12 +9484,18 @@ export default function App() {
         resetScope: isAccountReset ? "account_preserve_filetree" : "client_preserve_filetree",
       });
       const data = unwrapCloudCommandData(response, {});
+      const resetMode = data?.reset_mode || data?.resetMode || "";
+      const fullAccountWipe = isAccountReset && resetMode === "account_full_sqlite_wipe";
       const preservedFiletrees = Number(data?.preserved?.repo_filetree_state || 0);
+      const preservedCreditRows = Object.entries(data?.preserved || {})
+        .filter(([key]) => key.startsWith("credit_"))
+        .reduce((total, [, value]) => total + Number(value || 0), 0);
       const backups = Array.isArray(data?.backups) ? data.backups : [];
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
       const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
       const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
       const filetreeLabel = preservedFiletrees === 1 ? "filetree entry" : "filetree entries";
+      const creditUsageLabel = preservedCreditRows === 1 ? "credit ledger row" : "credit ledger rows";
       let checkpointMessage = "cloud checkpoint refresh skipped";
       if (backgroundCheckpoint?.queued) {
         checkpointMessage = "queued cloud checkpoint refresh";
@@ -9498,8 +9504,11 @@ export default function App() {
       } else if (updatedBackupCount > 0) {
         checkpointMessage = "refreshed cloud checkpoint";
       }
+      const resetSummary = fullAccountWipe
+        ? `Cleared all account SQLite data across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}; preserved ${preservedCreditRows} ${creditUsageLabel} and ${checkpointMessage}.`
+        : `Preserved ${preservedFiletrees} ${filetreeLabel} and ${checkpointMessage}.`;
       setCloudSqliteResetMessage(
-        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}. Preserved ${preservedFiletrees} ${filetreeLabel} and ${checkpointMessage}.`,
+        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete. ${resetSummary}`,
       );
     } catch (error) {
       setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
@@ -13686,7 +13695,7 @@ export default function App() {
                           <SettingsLabel>Hard reset</SettingsLabel>
                           <SettingsValue>Reset cloud SQLite</SettingsValue>
                           <SettingsHint>
-                            Deletes cloud task history, voice orchestrator history, synced devices, logs, MCP state, terminal presence, and Spec Graph working state. Workspace filetree entries are preserved.
+                            Client reset preserves workspace filetree sync. Account reset clears every local cloud SQLite row for the signed-in account except local credit-ledger rows, if present.
                           </SettingsHint>
                         </div>
                         <AgentReadyPill data-tone="orange">
@@ -13706,7 +13715,7 @@ export default function App() {
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Preserved</span>
-                          <strong>Filetree sync</strong>
+                          <strong>Client filetree only</strong>
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Remote</span>

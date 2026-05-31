@@ -21561,16 +21561,22 @@ fn append_codex_managed_permission_profile(
     let write_root = write_root
         .canonicalize()
         .unwrap_or_else(|_| write_root.to_path_buf());
-    let routes = if enforcement_mode == "bounded_direct_edit" {
-        codex_managed_git_routes_for_direct_root(&write_root, slot_key, agent_kind)?
-    } else {
-        Vec::new()
+    let routes = match enforcement_mode {
+        "bounded_direct_edit" => {
+            codex_managed_git_routes_for_direct_root(&write_root, slot_key, agent_kind)?
+        }
+        "general_worker" => {
+            codex_managed_git_routes_for_general_worker_root(&write_root, slot_key, agent_kind)?
+        }
+        _ => Vec::new(),
     };
     let write_enabled = matches!(
         enforcement_mode,
         "worktree_required" | "bounded_direct_edit" | "general_worker"
     );
-    let parent_profile = if write_enabled {
+    let parent_profile = if enforcement_mode == "general_worker" {
+        ":read-only"
+    } else if write_enabled {
         ":workspace"
     } else {
         ":read-only"
@@ -21588,11 +21594,14 @@ extends = \"{parent_profile}\"\n\n\
         toml_escape(&process_path_text(&write_root))
     ));
 
-    if write_enabled {
+    if write_enabled && (enforcement_mode != "general_worker" || !routes.is_empty()) {
         config.push_str(&format!(
-            "\n[permissions.{profile}.filesystem.\":workspace_roots\"]\n\
-\".\" = \"write\"\n"
+            "\n[permissions.{profile}.filesystem.\":workspace_roots\"]\n"
         ));
+
+        if enforcement_mode != "general_worker" {
+            config.push_str("\".\" = \"write\"\n");
+        }
 
         for route in &routes {
             let repo_relative = codex_permission_relative_path(&write_root, &route.repo_root)?;
@@ -21836,6 +21845,29 @@ fn prepend_codex_managed_root_permission_profile(config: String, profile: &str) 
         }
     }
     next
+}
+
+fn codex_managed_git_routes_for_general_worker_root(
+    write_root: &Path,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<Vec<CodexManagedGitRoute>, String> {
+    let mut routes = Vec::new();
+    if write_root.join(".git").is_dir() || write_root.join(".git").is_file() {
+        let worktree_root = create_or_reuse_codex_route_worktree(write_root, slot_key, agent_kind)?;
+        routes.push(CodexManagedGitRoute {
+            repo_root: write_root.to_path_buf(),
+            worktree_root,
+        });
+    }
+    for repo_root in discover_nested_git_roots(write_root, 8, 256) {
+        let worktree_root = create_or_reuse_codex_route_worktree(&repo_root, slot_key, agent_kind)?;
+        routes.push(CodexManagedGitRoute {
+            repo_root,
+            worktree_root,
+        });
+    }
+    Ok(routes)
 }
 
 fn codex_managed_git_routes_for_direct_root(
@@ -22400,7 +22432,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-4. Use normal shell and edit tools inside `COORDINATION_AGENT_BRANCH_ROOT`; never edit the shared project root or another agent slot's worktree.\n\
+4. Use normal shell and edit tools only inside the write authority returned for the leased task. In Git workspaces this is the assigned isolated worktree/agent branch root; in non-Git direct-edit workspaces it is the bounded project root. Never edit the shared Git project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -24470,6 +24502,69 @@ hooksPath = "{}"
             .contains(process_path_text(&container).as_str()));
         assert!(!hooks.to_string().contains("slot1"));
         assert!(!hooks.to_string().contains("--agent-kind"));
+    }
+
+    #[test]
+    fn managed_codex_home_config_general_worker_reads_root_and_writes_slot_worktree() {
+        let repo = init_git_repo("managed_codex_general_worker");
+        let hooks_path = repo.join("diffforge.hooks.json");
+
+        let config = codex_managed_profile_config(
+            &repo,
+            &repo,
+            "general_worker",
+            Some("slot1"),
+            "codex",
+            Some(hooks_path.as_path()),
+        )
+        .unwrap();
+
+        assert!(config.contains("extends = \":read-only\""));
+        assert!(config.contains("\".\" = \"read\""));
+        assert!(!config.contains("\".\" = \"write\""));
+        assert!(config.contains(".agents/worktrees/slot1"));
+        assert!(config.contains("\" = \"write\""));
+    }
+
+    #[test]
+    fn managed_codex_home_config_general_worker_protects_nested_git_roots() {
+        let repo = init_git_repo("managed_codex_general_worker_nested");
+        let child = repo.join("packages").join("nested-app");
+        fs::create_dir_all(&child).unwrap();
+        run(&child, "git", &["init"]);
+        fs::write(child.join("pricing.html"), "<h1>Nested</h1>\n").unwrap();
+        run(&child, "git", &["add", "pricing.html"]);
+        run(
+            &child,
+            "git",
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        let hooks_path = repo.join("diffforge.hooks.json");
+
+        let config = codex_managed_profile_config(
+            &repo,
+            &repo,
+            "general_worker",
+            Some("slot1"),
+            "codex",
+            Some(hooks_path.as_path()),
+        )
+        .unwrap();
+
+        assert!(config.contains("extends = \":read-only\""));
+        assert!(config.contains("\".\" = \"read\""));
+        assert!(!config.contains("\".\" = \"write\""));
+        assert!(config.contains("\"packages/nested-app\" = \"read\""));
+        assert!(config.contains("\"packages/nested-app/.agents/worktrees/slot1"));
+        assert!(config.contains("\" = \"write\""));
     }
 
     #[test]
