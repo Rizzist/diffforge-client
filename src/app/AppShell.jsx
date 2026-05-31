@@ -10267,6 +10267,11 @@ export default function App() {
               || event.inputReady === true
               || event.terminalPromptReady === true
           );
+          const terminalDetachedCanSettleTurn = Boolean(
+            ["closed", "exited"].includes(String(event.type || "").trim().toLowerCase())
+          );
+          const terminalLifecycleCanSettleTurn = terminalReadinessCanSettleTurn
+            || terminalDetachedCanSettleTurn;
           const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
           const latestTurnAtTranscriptResult = threadAtTranscriptResult?.latestTurn || null;
           const activeRunningTurnAtTranscriptResult = String(
@@ -10295,6 +10300,7 @@ export default function App() {
               && rawTurnCompleteSeen
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
+              && terminalLifecycleCanSettleTurn
           );
           const assistantResponseCompletesTurn = Boolean(
             pollUntilTurnComplete
@@ -10302,7 +10308,7 @@ export default function App() {
               && promptAccepted
               && (
                 activeRunningTurnAtTranscriptResult
-                  ? transcriptTargetsLatestRunningTurn
+                  ? transcriptTargetsLatestRunningTurn && terminalLifecycleCanSettleTurn
                   : true
               )
           );

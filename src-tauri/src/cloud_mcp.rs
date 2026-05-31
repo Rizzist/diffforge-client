@@ -6291,8 +6291,23 @@ async fn cloud_mcp_observe_terminal_output(
             "looks_active": looks_active,
             "looks_ready": looks_ready,
             "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-            "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
         }),
+    );
+    let _ = app.emit(
+        TERMINAL_OUTPUT_STATE_EVENT,
+        TerminalOutputStatePayload {
+            pane_id: pane_id.to_string(),
+            instance_id,
+            looks_active,
+            looks_ready,
+            status_truth: if looks_active {
+                "processing_or_active".to_string()
+            } else {
+                "idle_or_prompt_ready".to_string()
+            },
+            output_preview: clean_terminal_diagnostic_log_text(&text),
+        },
     );
 
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
@@ -6310,7 +6325,7 @@ async fn cloud_mcp_observe_terminal_output(
                     "looks_active": looks_active,
                     "looks_ready": looks_ready,
                     "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                    "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+                    "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
                 }),
             );
             let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
@@ -6412,7 +6427,7 @@ async fn cloud_mcp_observe_terminal_output(
             "looks_active": looks_active,
             "looks_ready": looks_ready,
             "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-            "status_truth": if looks_ready { "idle_or_prompt_ready" } else { "processing_or_active" },
+            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
             "will_mark_done": completion.is_some(),
             "will_send_active_update": work_update.is_some(),
         }),

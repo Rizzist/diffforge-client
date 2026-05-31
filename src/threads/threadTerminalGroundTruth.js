@@ -432,11 +432,20 @@ export function getThreadTerminalGroundTruth({
         )
       )
   );
+  const completedTurnLooksStaleActive = Boolean(
+    latestTurnState === "completed"
+      && activityStatus === "thinking"
+      && terminalLooksActive
+      && !recordedAgentInputReady
+      && !hasPendingPrompt
+  );
   const effectiveLatestTurnState = runningTurnLooksIdle
     ? "completed"
+    : completedTurnLooksStaleActive
+      ? "running"
     : latestTurnState;
   const latestTurnFinished = COMPLETED_TURN_STATES.has(latestTurnState);
-  const effectiveActivityStatus = (runningTurnLooksIdle || latestTurnFinished) && activityStatus === "thinking"
+  const effectiveActivityStatus = (runningTurnLooksIdle || (latestTurnFinished && !completedTurnLooksStaleActive)) && activityStatus === "thinking"
     ? "idle"
     : orphanRunningLooksIdle && activityStatus === "thinking"
       ? "idle"
@@ -449,6 +458,7 @@ export function getThreadTerminalGroundTruth({
     requiresAgentInputReady
       && !recordedAgentInputReady
       && (COMPLETED_TURN_STATES.has(latestTurnState) || runningTurnLooksIdle || orphanRunningLooksIdle)
+      && !completedTurnLooksStaleActive
       && effectiveActivityStatus !== "thinking"
       && !hasPendingPrompt
       && terminalLooksActive
@@ -532,6 +542,7 @@ export function getThreadTerminalGroundTruth({
     activityStatus,
     agentInputReady,
     completedTurnLooksSendable,
+    completedTurnLooksStaleActive,
     effectiveActivityStatus,
     effectiveLatestTurnState,
     hasNativeSession,
@@ -590,5 +601,29 @@ export function terminalOutputLooksPromptReady(value) {
       || text.includes("› ")
       || text.includes("\n> ")
       || text.includes("\r> ")
+  );
+}
+
+export function terminalOutputLooksActive(value) {
+  const text = cleanPromptingText(value, 1600);
+  if (!text) {
+    return false;
+  }
+
+  const lower = text.toLowerCase();
+  return Boolean(
+    text.includes("•")
+      || lower.includes("working (")
+      || /\bcalled\s+/.test(lower)
+      || /\bran\s+/.test(lower)
+      || /\bedited\s+/.test(lower)
+      || /\bcreated\s+/.test(lower)
+      || /\bupdated\s+/.test(lower)
+      || /\bmodified\s+/.test(lower)
+      || /\bi(?:'|’)ll\s+/.test(lower)
+      || /\bi\s+will\s+/.test(lower)
+      || /\bi(?:'|’)m\s+/.test(lower)
+      || /\bi\s+am\s+/.test(lower)
+      || lower.includes("context refresh")
   );
 }

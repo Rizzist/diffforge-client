@@ -108,16 +108,16 @@ const APP_SHUTDOWN_PHASE_STOPPING_DAEMONS: u8 = 4;
 const APP_SHUTDOWN_PHASE_EXITING: u8 = 5;
 const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
-const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
-const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
+const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = true;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
-const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
-const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -136,6 +136,7 @@ const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-ref
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
+const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
@@ -1456,6 +1457,17 @@ struct TerminalPromptSubmittedPayload {
     prompt_match: bool,
     prompt_source: String,
     prompt: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputStatePayload {
+    pane_id: String,
+    instance_id: u64,
+    looks_active: bool,
+    looks_ready: bool,
+    status_truth: String,
+    output_preview: String,
 }
 
 #[derive(Serialize)]

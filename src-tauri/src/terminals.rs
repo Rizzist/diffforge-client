@@ -3931,7 +3931,7 @@ fn is_terminal_color_reply_prompt(prompt: &str) -> bool {
 }
 
 fn normalize_terminal_enter_sequences_for_pty(data: String) -> String {
-    if data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
+    if data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
         return data
             .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
             .replace(TERMINAL_ENTER_SEQUENCE, "\r");
@@ -7787,12 +7787,18 @@ mod terminal_tests {
     }
 
     #[test]
-    fn enhanced_enter_sequence_is_preserved_before_pty_write() {
+    fn enhanced_enter_sequence_is_normalized_before_pty_write() {
         assert_eq!(
             normalize_terminal_enter_sequences_for_pty(format!(
                 "send from overlay{TERMINAL_ENTER_SEQUENCE}"
             )),
-            format!("send from overlay{TERMINAL_ENTER_SEQUENCE}")
+            "send from overlay\r"
+        );
+        assert_eq!(
+            normalize_terminal_enter_sequences_for_pty(format!(
+                "send from overlay{TERMINAL_ENTER_SEQUENCE_MOD1}"
+            )),
+            "send from overlay\r"
         );
         assert_eq!(
             normalize_terminal_enter_sequences_for_pty(format!(

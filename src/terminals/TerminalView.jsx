@@ -2143,6 +2143,7 @@ const TodoQueueItemCard = styled.article`
     border-radius: 999px;
     background: var(--todo-agent-color, ${TODO_QUEUE_DEFAULT_DOT_COLOR});
     box-shadow: none;
+    transition: opacity 130ms ease;
   }
 
   &:hover {
@@ -2151,7 +2152,7 @@ const TodoQueueItemCard = styled.article`
 
   &:hover::before,
   &:focus-within::before {
-    content: "";
+    opacity: 0;
   }
 
   html[data-forge-theme="light"] & {
@@ -2159,7 +2160,7 @@ const TodoQueueItemCard = styled.article`
   }
 
   html[data-forge-theme="light"] &::before {
-    color: #0066cc;
+    background: var(--todo-agent-color, #0066cc);
   }
 
   html[data-forge-theme="light"] &:hover {
@@ -2458,9 +2459,7 @@ const TodoQueueItemText = styled.p`
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: #edf5ff;
-  font-size: 12px;
-  font-weight: 690;
-  line-height: 1.45;
+  font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
@@ -2477,10 +2476,7 @@ const TodoQueueItemEditor = styled.textarea`
   color: #f7fafc;
   background: transparent;
   outline: none;
-  font-size: 12px;
-  font-weight: 690;
-  line-height: 1.45;
-  font-family: inherit;
+  font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
@@ -2489,22 +2485,22 @@ const TodoQueueItemEditor = styled.textarea`
 
 const TodoQueueDraftBullet = styled.span`
   position: absolute;
-  top: calc(8px + var(--todo-list-offset, 0px));
-  left: 12px;
+  top: calc(16px + var(--todo-list-offset, 0px));
+  left: 16px;
   z-index: 1;
-  color: #8bb8ff;
-  font-size: 13px;
-  font-weight: 900;
-  line-height: 1.45;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: ${TODO_QUEUE_DEFAULT_DOT_COLOR};
   pointer-events: none;
   transition: top 150ms ease;
 
   &::before {
-    content: "\\2022";
+    content: "";
   }
 
   html[data-forge-theme="light"] & {
-    color: #0066cc;
+    background: #0066cc;
   }
 `;
 

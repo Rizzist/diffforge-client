@@ -369,6 +369,7 @@ import {
 } from "../../threads/terminalControlPrompts.js";
 import {
   recordThreadTerminalReadiness,
+  terminalOutputLooksActive,
   terminalOutputLooksPromptReady,
 } from "../../threads/threadTerminalGroundTruth.js";
 import {
@@ -417,6 +418,7 @@ import {
   TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS,
   TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS,
   TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS,
+  TERMINAL_OUTPUT_STATE_EVENT,
   TERMINAL_PARKED_PROMPT_EVENT,
   TERMINAL_SHIFT_ENTER_SEQUENCE,
   TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS,
@@ -1297,6 +1299,8 @@ function WorkspaceTerminal({
   const terminalThreadReadyLifecycleEmittedRef = useRef(false);
   const terminalThreadPromptReadyPendingRef = useRef(null);
   const terminalThreadSawAgentOutputRef = useRef(false);
+  const terminalThreadLastWorkStartedAtRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
+  const terminalThreadLastActiveOutputLifecycleAtRef = useRef(0);
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
@@ -1337,6 +1341,7 @@ function WorkspaceTerminal({
     const sawAgentOutputBefore = Boolean(terminalThreadSawAgentOutputRef.current);
     if (nextStatus === "thinking" && (previousStatus !== "thinking" || options.forceNewTurn === true)) {
       terminalThreadThinkingSinceRef.current = performance.now();
+      terminalThreadLastWorkStartedAtRef.current = terminalThreadThinkingSinceRef.current;
       terminalThreadReadyDetectionArmedRef.current = false;
       terminalThreadReadyLifecycleEmittedRef.current = false;
       terminalThreadPromptReadyPendingRef.current = null;
@@ -1404,6 +1409,70 @@ function WorkspaceTerminal({
     recordThreadTerminalReadiness(replayedPending);
     onThreadTerminalLifecycle?.(replayedPending);
   };
+  const markTerminalActiveOutputObserved = useCallback(({
+    outputText = "",
+    source = "terminal-output-active",
+    statusTruth = "processing_or_active",
+  } = {}) => {
+    if (isGenericTerminal || !terminalThreadIdRef.current) {
+      return false;
+    }
+
+    const now = performance.now();
+    const currentStatus = String(terminalThreadActivityStatusRef.current || "").trim().toLowerCase();
+    if (currentStatus === "thinking") {
+      terminalThreadSawAgentOutputRef.current = true;
+      return false;
+    }
+
+    const lastWorkStartedAt = Number(terminalThreadLastWorkStartedAtRef.current || 0);
+    const recentWorkStarted = Boolean(
+      lastWorkStartedAt > 0
+        && now - lastWorkStartedAt <= 30 * 60 * 1000
+    );
+    if (
+      !recentWorkStarted
+      || terminalThreadReadyLifecycleEmittedRef.current
+      || now - Number(terminalThreadLastActiveOutputLifecycleAtRef.current || 0) < 500
+    ) {
+      return false;
+    }
+
+    terminalThreadLastActiveOutputLifecycleAtRef.current = now;
+    terminalThreadSawAgentOutputRef.current = true;
+    markTerminalThreadActivityStatus("thinking", {
+      reason: source,
+    });
+    logTerminalStatus("frontend.terminal_cli.active_output_reactivated", getTerminalCliStatusLogBase({
+      outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+      source,
+      statusTruth,
+    }));
+    onThreadTerminalLifecycle?.({
+      activityStatus: "thinking",
+      agentId: terminalAgentKind,
+      inputReady: false,
+      instanceId: terminalInstanceIdRef.current || undefined,
+      outputText: String(outputText || "").slice(-1200),
+      paneId,
+      source,
+      status: "active",
+      terminalIndex,
+      terminalWorkState: "running",
+      threadId: terminalThreadIdRef.current,
+      type: "agent-output",
+      workspaceId: workspace?.id || thread?.workspaceId || "",
+    });
+    return true;
+  }, [
+    isGenericTerminal,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
   const terminalStartupSnapshotRef = useRef(null);
   const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
     agentKind: terminalAgentKind,
@@ -3433,6 +3502,44 @@ function WorkspaceTerminal({
   useEffect(() => {
     patchTerminalMetrics({ terminalCount });
   }, [terminalCount]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    listen(TERMINAL_OUTPUT_STATE_EVENT, (event) => {
+      const payload = event.payload || {};
+      if (
+        payload.paneId !== paneId
+        || Number(payload.instanceId || 0) !== Number(terminalInstanceIdRef.current || 0)
+      ) {
+        return;
+      }
+      if (payload.looksActive !== true || payload.looksReady === true) {
+        return;
+      }
+      markTerminalActiveOutputObserved({
+        outputText: payload.outputPreview || payload.decodedPreview || "",
+        source: "backend-terminal-output-active",
+        statusTruth: payload.statusTruth || payload.status_truth || "processing_or_active",
+      });
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [markTerminalActiveOutputObserved, paneId]);
 
   useEffect(() => {
     let disposed = false;
@@ -8090,6 +8197,22 @@ function WorkspaceTerminal({
             hasVisibleOutput
             && !isGenericTerminal
             && terminalThreadIdRef.current
+          ) {
+            const activeOutputText = decodeTerminalOutputChunkForReady(terminalData);
+            if (
+              terminalOutputLooksActive(activeOutputText)
+              && !terminalOutputLooksPromptReady(activeOutputText)
+            ) {
+              markTerminalActiveOutputObserved({
+                outputText: activeOutputText,
+                source: "terminal-output-active",
+              });
+            }
+          }
+          if (
+            hasVisibleOutput
+            && !isGenericTerminal
+            && terminalThreadIdRef.current
             && terminalThreadActivityStatusRef.current === "thinking"
           ) {
             const thinkingSince = Number(terminalThreadThinkingSinceRef.current || 0);
@@ -10265,7 +10388,7 @@ function WorkspaceTerminal({
 
         focusTerminalKeyboardInput();
 
-        const shouldWriteStartupModelRestore = terminalAgentKind === "codex";
+        const shouldWriteStartupModelRestore = false;
         if (
           startupThreadProviderModel
           && startupThreadProviderSessionId
