@@ -83,6 +83,7 @@ const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH: usize = 2048;
 const MAX_FILE_EXPLORER_ENTRIES: usize = 600;
 const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 128;
+const MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES: usize = 256;
 const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 8;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
@@ -3364,6 +3365,7 @@ pub fn run() {
             cloud_mcp_get_spec_graph,
             agent_thread_session_discover,
             agent_thread_transcript,
+            terminal_workspace_raw_scan,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,

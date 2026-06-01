@@ -5,6 +5,7 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { KeyboardArrowLeft } from "@styled-icons/material-rounded/KeyboardArrowLeft";
+import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Send } from "@styled-icons/material-rounded/Send";
 import styled, { keyframes } from "styled-components";
 import { createWorkspaceDisplayIdentity } from "../workspace/workspaceDisplayIdentity.js";
@@ -54,6 +55,9 @@ export default function SpecGraphWorkspaceView({
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [selectedHistoryNodeId, setSelectedHistoryNodeId] = useState("");
   const [resetStatus, setResetStatus] = useState({ state: "idle", message: "" });
+  const [rawScan, setRawScan] = useState(null);
+  const [rawScanState, setRawScanState] = useState("idle");
+  const [rawScanError, setRawScanError] = useState("");
   const snapshot = specGraphSnapshot;
   const error = specGraphError;
   const state = specGraphState;
@@ -76,6 +80,35 @@ export default function SpecGraphWorkspaceView({
   useEffect(() => {
     if (showLocalIgnored) loadLocalIgnoredOverlay();
   }, [loadLocalIgnoredOverlay, showLocalIgnored]);
+
+  const loadRawScan = useCallback(() => {
+    if (!repoPath || !workspaceId) {
+      setRawScan(null);
+      setRawScanError("");
+      setRawScanState("idle");
+      return;
+    }
+
+    setRawScanState((current) => (current === "idle" ? "loading" : "refreshing"));
+    setRawScanError("");
+    invoke("terminal_workspace_raw_scan", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then((scan) => {
+        setRawScan(scan);
+        setRawScanState("ready");
+      })
+      .catch((nextError) => {
+        setRawScanError(nextError?.message || String(nextError));
+        setRawScanState("error");
+      });
+  }, [repoPath, workspaceId, workspaceName]);
+
+  useEffect(() => {
+    if (viewMode === "rawScan") loadRawScan();
+  }, [loadRawScan, viewMode]);
 
   const baseSpecGraph = useMemo(
     () => normalizeSnapshot(snapshot, { workspaceDisplayIdentity }),
@@ -270,23 +303,34 @@ export default function SpecGraphWorkspaceView({
           >
             History
           </ViewToggleButton>
+          <ViewToggleButton
+            type="button"
+            data-active={viewMode === "rawScan" ? "true" : "false"}
+            onClick={() => setViewMode("rawScan")}
+          >
+            Raw Scan
+          </ViewToggleButton>
         </ViewToggleGroup>
-        <LocalIgnoredToggle
-          type="button"
-          data-active={showLocalIgnored ? "true" : "false"}
-          onClick={() => {
-            setShowLocalIgnored((current) => !current);
-          }}
-        >
-          {showLocalIgnored ? "Hide local ignored" : "Show local ignored"}
-        </LocalIgnoredToggle>
-        <LocalIgnoredHint>
-          {localIgnoredState === "loading"
-            ? "checking local cache"
-            : showLocalIgnored
-              ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
-              : "local only, not synced"}
-        </LocalIgnoredHint>
+        {viewMode === "graph" && (
+          <>
+            <LocalIgnoredToggle
+              type="button"
+              data-active={showLocalIgnored ? "true" : "false"}
+              onClick={() => {
+                setShowLocalIgnored((current) => !current);
+              }}
+            >
+              {showLocalIgnored ? "Hide local ignored" : "Show local ignored"}
+            </LocalIgnoredToggle>
+            <LocalIgnoredHint>
+              {localIgnoredState === "loading"
+                ? "checking local cache"
+                : showLocalIgnored
+                  ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
+                  : "local only, not synced"}
+            </LocalIgnoredHint>
+          </>
+        )}
         <ToolbarSpacer />
         <ResetGraphButton
           type="button"
@@ -301,8 +345,18 @@ export default function SpecGraphWorkspaceView({
         )}
       </SpecGraphToolbar>
 
-      <SpecGraphShell>
-        {viewMode === "history" ? (
+      <SpecGraphShell data-view={viewMode}>
+        {viewMode === "rawScan" ? (
+          <>
+            <RawScanMain
+              error={rawScanError}
+              onRefresh={loadRawScan}
+              scan={rawScan}
+              state={rawScanState}
+            />
+            <RawScanInspector scan={rawScan} state={rawScanState} />
+          </>
+        ) : viewMode === "history" ? (
           <>
             <TaskHistoryMain
               tasks={historyTasks}
@@ -515,6 +569,200 @@ function TaskHistoryInspector({ task, node }) {
   );
 }
 
+function RawScanMain({ error, onRefresh, scan, state }) {
+  const projectMounts = arrayValue(scan?.projectMounts);
+  const folderTrace = arrayValue(scan?.folderTrace?.entries);
+  const loading = state === "loading" || state === "refreshing";
+  const workspaceKind = text(scan?.workspaceKind, "unknown");
+  const cache = scan?.cache || {};
+
+  return (
+    <RawScanMainPane>
+      <RawScanHeader>
+        <RawScanTitleBlock>
+          <h2>Raw Scan</h2>
+          <p>{text(scan?.root, "No workspace root loaded.")}</p>
+        </RawScanTitleBlock>
+        <RawScanRefreshButton disabled={loading} onClick={onRefresh} type="button">
+          <RefreshIcon aria-hidden="true" />
+          <span>{loading ? "Scanning" : "Refresh"}</span>
+        </RawScanRefreshButton>
+      </RawScanHeader>
+
+      {error && <RawScanError>{error}</RawScanError>}
+
+      <RawScanMetricGrid>
+        <RawScanMetric>
+          <small>workspace</small>
+          <strong>{workspaceKind}</strong>
+        </RawScanMetric>
+        <RawScanMetric>
+          <small>mounts</small>
+          <strong>{projectMounts.length}</strong>
+        </RawScanMetric>
+        <RawScanMetric>
+          <small>cache</small>
+          <strong>{text(cache.status, loading ? "loading" : "idle")}</strong>
+        </RawScanMetric>
+        <RawScanMetric>
+          <small>folders</small>
+          <strong>{folderTrace.length}</strong>
+        </RawScanMetric>
+      </RawScanMetricGrid>
+
+      <RawScanSection>
+        <RawScanSectionHeader>
+          <h3>Project Mounts</h3>
+          <span>{projectMounts.length}</span>
+        </RawScanSectionHeader>
+        {projectMounts.length ? (
+          <RawScanRows>
+            {projectMounts.map((mount, index) => (
+              <RawScanMountRow key={`${mount.mountId || mount.mount_id || "mount"}:${index}`}>
+                <RawScanRowMain>
+                  <strong>{rawPathLabel(mount.workspaceRelativePath || mount.workspace_relative_path)}</strong>
+                  <small>{text(mount.projectRoot || mount.project_root, "no project root")}</small>
+                </RawScanRowMain>
+                <RawScanBadges>
+                  <RawScanBadge data-state={mount.hasGit || mount.has_git ? "git" : "plain"}>
+                    {mount.hasGit || mount.has_git ? "git" : "non-git"}
+                  </RawScanBadge>
+                  <RawScanBadge data-state={mount.mountKind || mount.mount_kind || "project"}>
+                    {text(mount.mountKind || mount.mount_kind, "project")}
+                  </RawScanBadge>
+                  {(mount.hasAgents || mount.has_agents) && <RawScanBadge>.agents</RawScanBadge>}
+                  {(mount.hasSpecGraphCache || mount.has_spec_graph_cache) && <RawScanBadge>spec cache</RawScanBadge>}
+                </RawScanBadges>
+              </RawScanMountRow>
+            ))}
+          </RawScanRows>
+        ) : (
+          <RawScanEmpty>No project mounts detected.</RawScanEmpty>
+        )}
+      </RawScanSection>
+
+      <RawScanSection>
+        <RawScanSectionHeader>
+          <h3>Folder Trace</h3>
+          <span>{scan?.folderTrace?.truncated ? `${folderTrace.length}+` : folderTrace.length}</span>
+        </RawScanSectionHeader>
+        {folderTrace.length ? (
+          <RawScanTraceRows>
+            {folderTrace.map((entry, index) => (
+              <RawScanTraceRow key={`${entry.path || entry.relativePath || "folder"}:${index}`} $depth={Number(entry.depth) || 0}>
+                <RawScanTracePath>
+                  <strong>{rawPathLabel(entry.relativePath)}</strong>
+                  <small>{text(entry.path)}</small>
+                </RawScanTracePath>
+                <RawScanBadges>
+                  <RawScanBadge data-state={entry.scanAction}>{text(entry.scanAction, "scanned")}</RawScanBadge>
+                  <RawScanBadge data-state={entry.isExactGitRoot || entry.hasGitMarker ? "git" : "plain"}>
+                    {entry.isExactGitRoot || entry.hasGitMarker ? "git" : "non-git"}
+                  </RawScanBadge>
+                  {entry.projectKind && entry.projectKind !== "none" && (
+                    <RawScanBadge data-state={entry.projectKind}>{entry.projectKind}</RawScanBadge>
+                  )}
+                  {entry.hasAgents && <RawScanBadge>.agents</RawScanBadge>}
+                  {entry.hasSpecGraphCache && <RawScanBadge>spec cache</RawScanBadge>}
+                </RawScanBadges>
+              </RawScanTraceRow>
+            ))}
+          </RawScanTraceRows>
+        ) : (
+          <RawScanEmpty>{loading ? "Scanning workspace." : "No folder trace loaded."}</RawScanEmpty>
+        )}
+      </RawScanSection>
+    </RawScanMainPane>
+  );
+}
+
+function RawScanInspector({ scan, state }) {
+  const selectedRoot = scan?.selectedRoot || {};
+  const cache = scan?.cache || {};
+  const limits = scan?.limits || {};
+  const launchTargets = arrayValue(scan?.launchTargets);
+
+  return (
+    <Inspector>
+      <InspectorHeader>
+        <InspectorTitleBlock>
+          <h2>Startup Topology</h2>
+          <small>{text(state, "idle")}</small>
+        </InspectorTitleBlock>
+        <InspectorFacts>
+          <span>{text(scan?.workspaceKind, "unknown")}</span>
+          <span>{text(cache.status, "cache")}</span>
+        </InspectorFacts>
+      </InspectorHeader>
+
+      <RawScanInspectorBody>
+        <RawScanDetailSection>
+          <h3>Selected Root</h3>
+          <RawScanFactGrid>
+            <RawScanFact label="project kind" value={text(selectedRoot.projectKind, "none")} />
+            <RawScanFact label="git root" value={yesNo(selectedRoot.exactGitRoot)} />
+            <RawScanFact label="broad area" value={yesNo(selectedRoot.broadArea)} />
+            <RawScanFact label="empty" value={yesNo(selectedRoot.emptyDirectory)} />
+            <RawScanFact label="git bootstrap" value={yesNo(selectedRoot.emptyForGitBootstrap)} />
+            <RawScanFact label="git top-level" value={text(selectedRoot.gitTopLevel, "none")} />
+          </RawScanFactGrid>
+        </RawScanDetailSection>
+
+        <RawScanDetailSection>
+          <h3>Launch Cache</h3>
+          <RawScanFactGrid>
+            <RawScanFact label="status" value={text(cache.status, "unknown")} />
+            <RawScanFact label="hit" value={yesNo(cache.hit)} />
+            <RawScanFact label="fresh" value={yesNo(cache.fresh)} />
+            <RawScanFact label="age" value={`${Number(cache.ageMs || 0)} ms`} />
+            <RawScanFact label="ttl" value={`${Number(cache.ttlMs || 0)} ms`} />
+            <RawScanFact label="scanned" value={formatRawScanMs(cache.scannedAtMs)} />
+          </RawScanFactGrid>
+        </RawScanDetailSection>
+
+        <RawScanDetailSection>
+          <h3>Limits</h3>
+          <RawScanFactGrid>
+            <RawScanFact label="mount cap" value={String(limits.projectMounts || "")} />
+            <RawScanFact label="depth cap" value={String(limits.projectMountScanMaxDepth || "")} />
+            <RawScanFact label="trace cap" value={String(scan?.folderTrace?.maxEntries || "")} />
+            <RawScanFact label="unreadable" value={String(scan?.folderTrace?.unreadableEntries || 0)} />
+          </RawScanFactGrid>
+        </RawScanDetailSection>
+
+        <RawScanDetailSection>
+          <h3>Terminal Targets</h3>
+          {launchTargets.length ? (
+            <RawScanTargetList>
+              {launchTargets.map((target) => (
+                <RawScanTarget key={target.sessionMode}>
+                  <strong>{text(target.sessionMode, "mode")}</strong>
+                  <small>{target.ok ? text(target.targetRoot, "no target") : text(target.error, "blocked")}</small>
+                  <RawScanBadges>
+                    <RawScanBadge data-state={target.ok ? "ok" : "error"}>{target.ok ? "ok" : "blocked"}</RawScanBadge>
+                    {target.enforcementMode && <RawScanBadge>{target.enforcementMode}</RawScanBadge>}
+                  </RawScanBadges>
+                </RawScanTarget>
+              ))}
+            </RawScanTargetList>
+          ) : (
+            <RawScanEmpty>No terminal target data loaded.</RawScanEmpty>
+          )}
+        </RawScanDetailSection>
+      </RawScanInspectorBody>
+    </Inspector>
+  );
+}
+
+function RawScanFact({ label, value }) {
+  return (
+    <RawScanFactItem>
+      <small>{label}</small>
+      <strong>{value || "none"}</strong>
+    </RawScanFactItem>
+  );
+}
+
 function HistoryArbiterList({ decisions }) {
   const visibleDecisions = Array.isArray(decisions) ? decisions : [];
   return (
@@ -585,6 +833,28 @@ function shortTaskId(taskId) {
   const value = text(taskId);
   if (!value) return "no task";
   return value.length > 10 ? `${value.slice(0, 8)}...` : value;
+}
+
+function arrayValue(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function rawPathLabel(value) {
+  return text(value, ".");
+}
+
+function yesNo(value) {
+  return value ? "yes" : "no";
+}
+
+function formatRawScanMs(value) {
+  const numeric = Number(value || 0);
+  if (!numeric) return "not scanned";
+  return new Date(numeric).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function formatCodingAgent(value) {
@@ -1308,9 +1578,17 @@ const SpecGraphShell = styled.div`
   flex: 1;
   overflow: hidden;
 
+  &[data-view="rawScan"] {
+    grid-template-columns: minmax(0, 1.25fr) minmax(300px, 32%);
+  }
+
   @media (max-width: 900px) {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(360px, 1fr) minmax(260px, 40%);
+
+    &[data-view="rawScan"] {
+      grid-template-columns: 1fr;
+    }
   }
 `;
 
@@ -1338,6 +1616,335 @@ const HistoryMain = styled.main`
   min-height: 0;
   overflow: auto;
   padding: 12px;
+`;
+
+const RawScanMainPane = styled.main`
+  border: 1px solid var(--history-border);
+  border-radius: 8px;
+  background: var(--history-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+`;
+
+const RawScanHeader = styled.header`
+  align-items: flex-start;
+  border-bottom: 1px solid var(--history-border);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding-bottom: 10px;
+`;
+
+const RawScanTitleBlock = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+
+  h2 {
+    color: var(--history-text);
+    font-size: 15px;
+    line-height: 1.2;
+    margin: 0;
+  }
+
+  p {
+    color: var(--history-muted);
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const RawScanRefreshButton = styled.button`
+  align-items: center;
+  background: rgba(136, 165, 200, 0.1);
+  border: 1px solid rgba(136, 165, 200, 0.24);
+  border-radius: 7px;
+  color: var(--history-blue);
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1;
+  min-height: 31px;
+  padding: 0 10px;
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.58;
+  }
+`;
+
+const RefreshIcon = styled(Refresh)`
+  height: 15px;
+  width: 15px;
+`;
+
+const RawScanError = styled.div`
+  border: 1px solid rgba(196, 135, 135, 0.32);
+  border-radius: 7px;
+  color: var(--history-red);
+  font-size: 12px;
+  font-weight: 640;
+  padding: 9px 10px;
+`;
+
+const RawScanMetricGrid = styled.div`
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+
+  @media (max-width: 760px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+`;
+
+const RawScanMetric = styled.div`
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+
+  small {
+    color: var(--history-muted);
+    font-size: 10px;
+    font-weight: 720;
+    text-transform: uppercase;
+  }
+
+  strong {
+    color: var(--history-text);
+    font-size: 15px;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const RawScanSection = styled.section`
+  border-top: 1px solid var(--history-border);
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 10px;
+`;
+
+const RawScanSectionHeader = styled.header`
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+
+  h3 {
+    color: var(--history-text);
+    font-size: 12px;
+    margin: 0;
+  }
+
+  span {
+    color: var(--history-muted);
+    font-size: 11px;
+    font-weight: 720;
+  }
+`;
+
+const RawScanRows = styled.div`
+  display: grid;
+  gap: 7px;
+`;
+
+const RawScanMountRow = styled.div`
+  align-items: center;
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 9px 10px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const RawScanRowMain = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  strong {
+    color: var(--history-text);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+
+  small {
+    color: var(--history-muted);
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 10px;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const RawScanBadges = styled.div`
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  justify-content: flex-end;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    justify-content: flex-start;
+  }
+`;
+
+const RawScanBadge = styled.span`
+  border: 1px solid var(--history-border);
+  border-radius: 5px;
+  color: var(--history-muted);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1;
+  padding: 4px 6px;
+  white-space: nowrap;
+
+  &[data-state="git"],
+  &[data-state="ok"] {
+    border-color: rgba(138, 168, 146, 0.32);
+    color: var(--history-green);
+  }
+
+  &[data-state="container"],
+  &[data-state="queued"],
+  &[data-state="selected_root"] {
+    border-color: rgba(136, 165, 200, 0.28);
+    color: var(--history-blue);
+  }
+
+  &[data-state="skipped_by_mount_scan"],
+  &[data-state="max_depth"],
+  &[data-state="error"] {
+    border-color: rgba(185, 135, 109, 0.32);
+    color: var(--history-orange);
+  }
+`;
+
+const RawScanEmpty = styled.div`
+  color: var(--history-muted);
+  font-size: 12px;
+  font-weight: 620;
+  padding: 8px 2px;
+`;
+
+const RawScanTraceRows = styled.div`
+  display: grid;
+  gap: 5px;
+`;
+
+const RawScanTraceRow = styled.div`
+  align-items: center;
+  border: 1px solid rgba(139, 151, 166, 0.14);
+  border-radius: 7px;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 7px 9px 7px ${({ $depth }) => 9 + Math.min(Math.max($depth, 0), 8) * 12}px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const RawScanTracePath = styled(RawScanRowMain)``;
+
+const RawScanInspectorBody = styled.div`
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+`;
+
+const RawScanDetailSection = styled.section`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+
+  h3 {
+    color: var(--history-text);
+    font-size: 12px;
+    margin: 0;
+  }
+`;
+
+const RawScanFactGrid = styled.div`
+  display: grid;
+  gap: 7px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+`;
+
+const RawScanFactItem = styled.div`
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px;
+
+  small {
+    color: var(--history-muted);
+    font-size: 10px;
+    font-weight: 720;
+    text-transform: uppercase;
+  }
+
+  strong {
+    color: var(--history-text);
+    font-size: 11px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const RawScanTargetList = styled.div`
+  display: grid;
+  gap: 7px;
+`;
+
+const RawScanTarget = styled.div`
+  border: 1px solid var(--history-border);
+  border-radius: 7px;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+
+  strong {
+    color: var(--history-text);
+    font-size: 12px;
+  }
+
+  small {
+    color: var(--history-muted);
+    font-family: "SFMono-Regular", "Menlo", monospace;
+    font-size: 10px;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
 `;
 
 const Glyph = styled.svg`

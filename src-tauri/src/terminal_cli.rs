@@ -987,11 +987,6 @@ fn apply_claude_coordinated_auto_approval_args(
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
 ) {
-    let coordination_root =
-        terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
-            .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| coordination.repo_path.clone());
     let enforcement_mode =
         terminal_coordination_env_value(coordination, "COORDINATION_ENFORCEMENT_MODE")
             .unwrap_or_default();
@@ -1004,8 +999,21 @@ fn apply_claude_coordinated_auto_approval_args(
         enforcement_mode.trim() == "general_worker" || file_authority.trim() == "task_scoped";
     let direct_edit_allowed = enforcement_mode.trim() == "bounded_direct_edit"
         || file_authority.trim() == "bounded_direct_edit";
+    let view_root = terminal_coordination_env_value(coordination, "COORDINATION_VISIBLE_ROOT")
+        .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_PROJECT_ROOT"))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| coordination.repo_path.clone());
+    let branch_root = terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
+        .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| coordination.repo_path.clone());
+    let coordination_root = if worktree_required {
+        view_root.clone()
+    } else {
+        branch_root.clone()
+    };
     let edit_root = if worktree_required || direct_edit_allowed {
-        Some(coordination_root.clone())
+        Some(branch_root.clone())
     } else {
         None
     };
@@ -1128,11 +1136,12 @@ fn claude_write_authority_guard_settings(
 ) -> String {
     let write_root = write_root.trim();
     let edit_root = claude_absolute_permission_glob(write_root);
-    let guard_command = if worktree_required {
-        claude_worktree_guard_hook_command(coordination, write_root)
+    let guard_root = if worktree_required {
+        coordination.repo_path.as_str()
     } else {
-        diff_forge_write_guard_hook_command(coordination, write_root, "claude")
+        write_root
     };
+    let guard_command = diff_forge_write_guard_hook_command(coordination, guard_root, "claude");
     let mut deny_rules = vec![
         format!(
             "Edit({})",
@@ -1247,43 +1256,6 @@ fn claude_permission_absolute_path(path: &str) -> String {
         format!("/{normalized}")
     } else {
         format!("//{normalized}")
-    }
-}
-
-fn claude_worktree_guard_hook_command(
-    coordination: &TerminalCoordinationSession,
-    write_root: &str,
-) -> String {
-    let slot_key = terminal_coordination_env_value(coordination, "COORDINATION_SLOT_KEY")
-        .unwrap_or_else(|| "unknown".to_string());
-    let command_path = coordination.mcp_command.as_str();
-
-    #[cfg(windows)]
-    {
-        format!(
-            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --claude-worktree-guard --repo-path {} --db-path {} --agent-id {} --session-id {} --worktree-path {} --slot-key {}\"",
-            quote_powershell_literal(command_path),
-            quote_powershell_literal(&coordination.repo_path),
-            quote_powershell_literal(&coordination.db_path),
-            quote_powershell_literal(&coordination.agent_id),
-            quote_powershell_literal(&coordination.session_id),
-            quote_powershell_literal(write_root),
-            quote_powershell_literal(&slot_key),
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        format!(
-            "{} --claude-worktree-guard --repo-path {} --db-path {} --agent-id {} --session-id {} --worktree-path {} --slot-key {}",
-            quote_shell_literal(command_path),
-            quote_shell_literal(&coordination.repo_path),
-            quote_shell_literal(&coordination.db_path),
-            quote_shell_literal(&coordination.agent_id),
-            quote_shell_literal(&coordination.session_id),
-            quote_shell_literal(write_root),
-            quote_shell_literal(&slot_key),
-        )
     }
 }
 

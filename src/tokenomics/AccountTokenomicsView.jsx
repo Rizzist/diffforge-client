@@ -22,6 +22,7 @@ import {
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
+const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 
 const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
@@ -163,7 +164,7 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
   const endKey = latestDataKey > todayKey ? latestDataKey : todayKey;
   const endDate = dateFromDayKey(endKey);
   const buckets = [];
-  for (let offset = 6; offset >= 0; offset -= 1) {
+  for (let offset = TOKENOMICS_DAILY_WINDOW_DAYS - 1; offset >= 0; offset -= 1) {
     const date = addUtcDays(endDate, -offset);
     const key = dayKeyUtc(date);
     const match = byDay.get(key);
@@ -179,10 +180,15 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
   }));
 }
 
-function monthAggregate(dailyRows, selectedProvider, selectedAccountKey) {
-  const month = dayKeyUtc(new Date()).slice(0, 7);
+function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+  const today = dateFromDayKey(dayKeyUtc(new Date()));
+  const startKey = dayKeyUtc(addUtcDays(today, -(Math.max(1, windowDays) - 1)));
+  const endKey = dayKeyUtc(today);
   const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey)
-    .filter((row) => bucketDayKey(row).startsWith(month));
+    .filter((row) => {
+      const key = bucketDayKey(row);
+      return key >= startKey && key <= endKey;
+    });
   return aggregateRows(rows);
 }
 
@@ -839,11 +845,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const dailyRaw = selectedProvider === "all"
     ? (Array.isArray(summary?.daily) ? summary.daily : [])
     : (Array.isArray(summary?.daily_by_provider) ? summary.daily_by_provider : []);
-  const monthlyRaw = Array.isArray(summary?.monthly_by_provider) && summary.monthly_by_provider.length
-    ? summary.monthly_by_provider
-    : Array.isArray(summary?.monthly) && summary.monthly.length
-      ? summary.monthly
-      : dailyRaw;
   const hourlyRaw = Array.isArray(summary?.session_hourly_by_provider)
     ? summary.session_hourly_by_provider
     : (Array.isArray(summary?.hourly_by_provider) ? summary.hourly_by_provider : []);
@@ -855,9 +856,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey),
     [dailyRaw, selectedAccountKey, selectedProvider],
   );
-  const month = useMemo(
-    () => monthAggregate(monthlyRaw, selectedProvider, selectedAccountKey),
-    [monthlyRaw, selectedAccountKey, selectedProvider],
+  const last30Days = useMemo(
+    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey),
+    [dailyRaw, selectedAccountKey, selectedProvider],
   );
   const accountRows = Array.isArray(summary?.by_account) ? summary.by_account : [];
   const totalRows = selectedProvider === "all" || selectedAccountKey === "all" ? providers : accountRows;
@@ -1031,7 +1032,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               <BarsIcon aria-hidden="true" />
               Daily Usage
             </span>
-            <RangePill>7d</RangePill>
+            <RangePill>30d</RangePill>
           </PanelTitle>
           <DailyChart>
             {dailyRows.map((row) => (
@@ -1073,11 +1074,11 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 <CostCell value={today.cost} />
               </tr>
               <tr>
-                <td>This Month</td>
-                <TokenCell value={month.input || total.input} />
-                <TokenCell value={month.output || total.output} />
-                <TokenCell value={month.cache || total.cache} />
-                <CostCell value={month.cost || total.cost} />
+                <td>Last 30 Days</td>
+                <TokenCell value={last30Days.input} />
+                <TokenCell value={last30Days.output} />
+                <TokenCell value={last30Days.cache} />
+                <CostCell value={last30Days.cost} />
               </tr>
             </tbody>
           </UsageTable>
@@ -1671,9 +1672,9 @@ const RangePill = styled.small`
 
 const DailyChart = styled.div`
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  grid-template-columns: repeat(30, minmax(0, 1fr));
   align-items: end;
-  gap: 6px;
+  gap: 4px;
   min-height: 96px;
 `;
 

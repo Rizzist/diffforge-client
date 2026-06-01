@@ -2960,11 +2960,123 @@ function isWindowsSystemRootDirectory(value) {
 }
 
 function isFilesystemRootDirectory(value) {
-  return cleanWorkspaceRootDirectory(value).replace(/\\/g, "/") === "/";
+  const cleaned = cleanWorkspaceRootDirectory(value)
+    .replace(/\\/g, "/")
+    .replace(/\/+$/g, "");
+
+  return cleaned === "/" || /^[a-z]:$/i.test(cleaned) || /^\/\/[^/]+\/[^/]+$/i.test(cleaned);
+}
+
+function normalizeWorkspacePolicyPath(value) {
+  return cleanWorkspaceRootDirectory(value)
+    .replace(/\\/g, "/")
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+}
+
+function pathMatchesPolicyLiteral(path, literal, includeChildren = false) {
+  const normalizedPath = normalizeWorkspacePolicyPath(path);
+  const normalizedLiteral = normalizeWorkspacePolicyPath(literal);
+
+  if (!normalizedLiteral) return false;
+  if (normalizedPath === normalizedLiteral) return true;
+  return includeChildren && normalizedPath.startsWith(`${normalizedLiteral}/`);
+}
+
+function isUserCollectionOrProfileRoot(value) {
+  const cleaned = normalizeWorkspacePolicyPath(value);
+  const parts = cleaned.split("/").filter(Boolean);
+
+  if (cleaned === "/users" || cleaned === "/home") return true;
+  if (parts.length === 2 && (parts[0] === "users" || parts[0] === "home")) return true;
+  if (parts.length === 2 && /^[a-z]:$/.test(parts[0]) && parts[1] === "users") return true;
+  if (parts.length === 3 && /^[a-z]:$/.test(parts[0]) && parts[1] === "users") return true;
+
+  return false;
+}
+
+function isBroadUserFolderRoot(value) {
+  const cleaned = normalizeWorkspacePolicyPath(value);
+
+  return /^\/(?:users|home)\/[^/]+\/(?:desktop|documents|downloads|pictures|music|movies|videos)$/i
+    .test(cleaned)
+    || /^[a-z]:\/users\/[^/]+\/(?:desktop|documents|downloads|pictures|music|movies|videos)$/i
+      .test(cleaned);
+}
+
+function isCloudStorageRoot(value) {
+  const cleaned = normalizeWorkspacePolicyPath(value);
+
+  return /^\/(?:users|home)\/[^/]+\/(?:dropbox|google drive|icloud drive|onedrive(?: - [^/]+)?)$/i
+    .test(cleaned)
+    || /^[a-z]:\/users\/[^/]+\/(?:dropbox|google drive|icloud drive|onedrive(?: - [^/]+)?)$/i
+      .test(cleaned);
+}
+
+function isUserStateDirectory(value) {
+  const cleaned = normalizeWorkspacePolicyPath(value);
+
+  return /^\/(?:users|home)\/[^/]+\/(?:library|\.cache|\.config|\.local(?:\/share)?|\.npm|\.cargo|\.rustup|\.pyenv|\.nvm|\.bun)(?:\/.*)?$/i
+    .test(cleaned)
+    || /^[a-z]:\/users\/[^/]+\/appdata(?:\/.*)?$/i.test(cleaned);
+}
+
+function isSystemOrAppWorkspaceRoot(value) {
+  const cleaned = normalizeWorkspacePolicyPath(value);
+
+  if ([
+    "/users",
+    "/home",
+    "/volumes",
+    "/media",
+    "/mnt",
+    "/opt",
+    "/srv",
+    "/tmp",
+    "/var",
+    "/var/tmp",
+    "/private",
+    "/private/tmp",
+    "/private/var",
+    "/lost+found",
+  ].includes(cleaned)) {
+    return true;
+  }
+
+  return [
+    "/applications",
+    "/system",
+    "/library",
+    "/network",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "c:/windows",
+    "c:/program files",
+    "c:/program files (x86)",
+    "c:/programdata",
+  ].some((literal) => pathMatchesPolicyLiteral(cleaned, literal, true))
+    || /^[a-z]:\/(?:windows|program files|program files \(x86\)|programdata|system volume information|\$recycle\.bin|recovery|perflogs|windows\.old)(?:\/.*)?$/i
+      .test(cleaned);
 }
 
 function isDisallowedWorkspaceRootDirectory(value) {
-  return isFilesystemRootDirectory(value) || isWindowsSystemRootDirectory(value);
+  return isFilesystemRootDirectory(value)
+    || isWindowsSystemRootDirectory(value)
+    || isSystemOrAppWorkspaceRoot(value)
+    || isUserCollectionOrProfileRoot(value)
+    || isUserStateDirectory(value)
+    || isCloudStorageRoot(value)
+    || isBroadUserFolderRoot(value);
 }
 
 function normalizeWorkspaceTerminalCount(value) {

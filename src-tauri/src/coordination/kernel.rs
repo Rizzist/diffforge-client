@@ -7995,6 +7995,7 @@ impl CoordinationKernel {
                 )?;
             }
         }
+        self.write_agent_contract_files(&self.paths.repo_path)?;
         let config_id = existing_config
             .as_ref()
             .map(|(id, _)| id.clone())
@@ -8205,15 +8206,6 @@ impl CoordinationKernel {
     fn cleanup_repo_root_coordination_activation_files(&self) -> Result<Value, String> {
         let mut removed = Vec::new();
         let mut updated = Vec::new();
-
-        for name in ["AGENTS.md", "CLAUDE.md"] {
-            let path = self.paths.repo_path.join(name);
-            match remove_generated_agent_contract(&path)? {
-                GeneratedFileCleanup::Removed => removed.push(name.to_string()),
-                GeneratedFileCleanup::Updated => updated.push(name.to_string()),
-                GeneratedFileCleanup::Unchanged => {}
-            }
-        }
 
         match cleanup_repo_mcp_json(&self.paths.repo_path.join(".mcp.json"))? {
             GeneratedFileCleanup::Removed => removed.push(".mcp.json".to_string()),
@@ -17338,7 +17330,7 @@ impl CoordinationKernel {
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
-                    "Use normal shell and edit tools inside the terminal's advertised write root.",
+                    "Use normal shell and edit tools from the visible project root; Git-managed writes must route to the assigned agent branch root.",
                     "Managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
                 ],
                 "cloud_mcp": {
@@ -22777,7 +22769,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts inside its assigned isolated worktree/agent branch root, so target ordinary repository-relative paths from that cwd. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never edit the shared Git project root or another agent slot's worktree.\n\
+4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; permitted writes are routed to the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT`. If a tool cannot route automatically, target that branch-root path explicitly. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -22785,7 +22777,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, lane claims, and merge context through the Rust cloud event path.\n\
 - Use the local coordination kernel for leases, patch submission, and merge safety.\n\
-- Edit only inside the assigned agent worktree/branch root when one is provided.\n\
+- For Git-managed files, edit only through the assigned agent worktree/branch root when one is provided; use the visible project root for inspection.\n\
 - Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch, then poll submit_patch_status when needed.\n\
 - Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
 \n\
@@ -22825,37 +22817,6 @@ fn write_or_update_generated_agent_contract(path: &Path, contract: &str) -> Resu
 
     write_text_file_atomic(path, contract)?;
     Ok(true)
-}
-
-fn remove_generated_agent_contract(path: &Path) -> Result<GeneratedFileCleanup, String> {
-    if !path.exists() {
-        return Ok(GeneratedFileCleanup::Unchanged);
-    }
-    let existing = fs::read_to_string(path)
-        .map_err(|error| format!("Unable to read {}: {error}", path.display()))?;
-    let Some(start) = existing.find(DIFFFORGE_AGENT_CONTRACT_BEGIN) else {
-        return Ok(GeneratedFileCleanup::Unchanged);
-    };
-    let Some(end) = existing.find(DIFFFORGE_AGENT_CONTRACT_END) else {
-        return Ok(GeneratedFileCleanup::Unchanged);
-    };
-    if end < start {
-        return Ok(GeneratedFileCleanup::Unchanged);
-    }
-    let end_index = end + DIFFFORGE_AGENT_CONTRACT_END.len();
-    let mut next = format!("{}{}", &existing[..start], &existing[end_index..]);
-    next = next.trim_matches('\n').to_string();
-    if next.trim().is_empty() {
-        fs::remove_file(path)
-            .map_err(|error| format!("Unable to remove {}: {error}", path.display()))?;
-        return Ok(GeneratedFileCleanup::Removed);
-    }
-    next.push('\n');
-    if next == existing {
-        return Ok(GeneratedFileCleanup::Unchanged);
-    }
-    write_text_file_atomic(path, &next)?;
-    Ok(GeneratedFileCleanup::Updated)
 }
 
 fn cleanup_repo_mcp_json(path: &Path) -> Result<GeneratedFileCleanup, String> {
@@ -24497,6 +24458,10 @@ mod tests {
         assert!(!repo.join(".mcp.json").exists());
         assert!(!repo.join(".codex").join("config.toml").exists());
         assert!(!repo.join(".claude").join("settings.local.json").exists());
+        let repo_agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
+        assert!(repo_agents.contains("visible project root"));
+        assert!(repo_agents.contains("COORDINATION_AGENT_BRANCH_ROOT"));
+        assert!(repo_agents.contains("coordination-kernel.submit_patch"));
         let worktree_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap();
         assert!(worktree_agents.contains("coordination-kernel.start_task"));
         let worktree_codex =

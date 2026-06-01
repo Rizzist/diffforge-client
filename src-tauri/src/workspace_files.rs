@@ -51,7 +51,7 @@ fn source_project_directory() -> Option<PathBuf> {
 }
 
 fn should_fallback_default_working_directory(directory: &Path) -> bool {
-    is_filesystem_root_directory(directory) || is_windows_system_startup_directory(directory)
+    workspace_root_rejection_reason(directory).is_some()
 }
 
 fn workspace_common_broad_area_name(name: &str) -> bool {
@@ -1237,6 +1237,397 @@ fn normalized_path_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn normalized_literal_path_key(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn normalized_path_key_is_same_or_child(path_key: &str, parent_key: &str) -> bool {
+    if parent_key.is_empty() {
+        return path_key.is_empty();
+    }
+
+    path_key == parent_key
+        || path_key
+            .strip_prefix(parent_key)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn normalized_path_key_matches_literal(path_key: &str, literal: &str, include_children: bool) -> bool {
+    let literal_key = normalized_literal_path_key(literal);
+    if include_children {
+        normalized_path_key_is_same_or_child(path_key, &literal_key)
+    } else {
+        path_key == literal_key
+    }
+}
+
+fn workspace_path_is_same_or_child(path: &Path, parent: &Path) -> bool {
+    let path_key = normalized_path_key(path);
+    let parent_key = normalized_path_key(parent);
+    normalized_path_key_is_same_or_child(&path_key, &parent_key)
+}
+
+fn workspace_root_is_user_collection_or_profile(root: &Path, home: Option<&Path>) -> bool {
+    let root_key = normalized_path_key(root);
+
+    if home.is_some_and(|home| root_key == normalized_path_key(home)) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        let parts = root_key
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() == 2 && parts[1] == "users" {
+            return true;
+        }
+        if parts.len() == 3 && parts[1] == "users" {
+            return true;
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if root_key == "/users" || root_key == "/home" {
+            return true;
+        }
+
+        let parts = root_key
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() == 2 && matches!(parts[0], "users" | "home") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn workspace_root_is_common_user_folder(root: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+
+    root.parent()
+        .map(|parent| normalized_path_key(parent) == normalized_path_key(home))
+        .unwrap_or(false)
+        && root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(workspace_common_broad_area_name)
+}
+
+fn workspace_root_is_cloud_storage_root(root: &Path, home: Option<&Path>) -> bool {
+    let name_is_cloud_root = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "dropbox" | "google drive" | "icloud drive" | "onedrive"
+            ) || name.to_ascii_lowercase().starts_with("onedrive - ")
+        })
+        .unwrap_or(false);
+
+    if name_is_cloud_root
+        && home.is_some_and(|home| {
+            root.parent()
+                .map(|parent| normalized_path_key(parent) == normalized_path_key(home))
+                .unwrap_or(false)
+        })
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        let root_key = normalized_path_key(root);
+        for key in ["OneDrive", "OneDriveCommercial", "OneDriveConsumer"] {
+            if let Some(path) = env::var_os(key).map(PathBuf::from) {
+                if root_key == normalized_path_key(&path) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn workspace_root_is_known_user_state_directory(root: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+
+    let candidates = [
+        home.join(".cache"),
+        home.join(".config"),
+        home.join(".local"),
+        home.join(".local").join("share"),
+        home.join(".npm"),
+        home.join(".cargo"),
+        home.join(".rustup"),
+        home.join(".pyenv"),
+        home.join(".nvm"),
+        home.join(".bun"),
+    ];
+
+    if candidates
+        .iter()
+        .any(|candidate| workspace_path_is_same_or_child(root, candidate))
+    {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = [
+            home.join("Library"),
+            home.join("Library").join("Application Support"),
+            home.join("Library").join("Caches"),
+            home.join("Library").join("Containers"),
+            home.join("Library").join("Developer"),
+            home.join("Library").join("Mobile Documents"),
+        ];
+        if candidates
+            .iter()
+            .any(|candidate| workspace_path_is_same_or_child(root, candidate))
+        {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let temp_dir = env::temp_dir();
+        if workspace_path_is_same_or_child(root, &temp_dir) {
+            return normalized_path_key(root) == normalized_path_key(&temp_dir);
+        }
+
+        let candidates = [
+            home.join("AppData"),
+            home.join("AppData").join("Local"),
+            home.join("AppData").join("Roaming"),
+            home.join("AppData").join("LocalLow"),
+        ];
+        if candidates
+            .iter()
+            .any(|candidate| workspace_path_is_same_or_child(root, candidate))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn workspace_root_is_known_system_or_app_directory(root: &Path) -> Option<&'static str> {
+    let root_key = normalized_path_key(root);
+
+    #[cfg(target_os = "macos")]
+    {
+        for literal in [
+            "/Applications",
+            "/System",
+            "/Library",
+            "/Network",
+            "/bin",
+            "/sbin",
+            "/etc",
+            "/usr",
+        ] {
+            if normalized_path_key_matches_literal(&root_key, literal, true) {
+                return Some(
+                    "Workspace root directory cannot be a system or application install folder.",
+                );
+            }
+        }
+
+        for literal in ["/Users", "/Volumes", "/private", "/private/tmp", "/private/var", "/tmp", "/var"] {
+            if normalized_path_key_matches_literal(&root_key, literal, false) {
+                return Some("Workspace root directory is too broad; choose a specific project folder.");
+            }
+        }
+
+        if root
+            .parent()
+            .map(|parent| normalized_path_key(parent) == "/volumes")
+            .unwrap_or(false)
+        {
+            return Some("Workspace root directory cannot be a mounted volume root.");
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for literal in [
+            "/bin",
+            "/boot",
+            "/dev",
+            "/etc",
+            "/lib",
+            "/lib64",
+            "/proc",
+            "/root",
+            "/run",
+            "/sbin",
+            "/sys",
+            "/usr",
+            "/var/cache",
+            "/var/lib",
+            "/var/log",
+            "/var/run",
+        ] {
+            if normalized_path_key_matches_literal(&root_key, literal, true) {
+                return Some("Workspace root directory cannot be a system folder.");
+            }
+        }
+
+        for literal in ["/home", "/media", "/mnt", "/opt", "/srv", "/tmp", "/var", "/var/tmp", "/lost+found"] {
+            if normalized_path_key_matches_literal(&root_key, literal, false) {
+                return Some("Workspace root directory is too broad; choose a specific project folder.");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut protected_roots = Vec::new();
+        for key in ["SystemRoot", "WINDIR", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+            if let Some(path) = env::var_os(key).map(PathBuf::from) {
+                protected_roots.push(path);
+            }
+        }
+
+        for protected_root in protected_roots {
+            if workspace_path_is_same_or_child(root, &protected_root) {
+                return Some(
+                    "Workspace root directory cannot be a system or application install folder.",
+                );
+            }
+        }
+
+        let parts = root_key
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.len() >= 2
+            && matches!(
+                parts.get(1).copied().unwrap_or_default(),
+                "$recycle.bin"
+                    | "recovery"
+                    | "system volume information"
+                    | "perflogs"
+                    | "windows.old"
+            )
+        {
+            return Some("Workspace root directory cannot be a Windows system folder.");
+        }
+
+        if workspace_windows_unc_share_root(root) {
+            return Some("Workspace root directory cannot be a network share root.");
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn workspace_windows_unc_share_root(root: &Path) -> bool {
+    let text = windows_non_verbatim_path_text(root.to_string_lossy().as_ref()).replace('\\', "/");
+    let trimmed = text.trim_matches('/');
+    let parts = trimmed
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    text.starts_with("//") && parts.len() == 2
+}
+
+fn workspace_root_has_selected_project_signal(root: &Path) -> bool {
+    workspace_project_kind_for_selected_root(root).is_some()
+}
+
+fn workspace_root_immediate_entry_count_exceeds(root: &Path, limit: usize) -> bool {
+    let Ok(read_dir) = fs::read_dir(root) else {
+        return false;
+    };
+
+    let mut count = 0usize;
+    for entry in read_dir {
+        if entry.is_ok() {
+            count += 1;
+            if count > limit {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn workspace_root_rejection_reason(root: &Path) -> Option<&'static str> {
+    let home = user_home_dir()
+        .and_then(|home| home.canonicalize().ok().or(Some(home)));
+    workspace_root_rejection_reason_for_home(root, home.as_deref())
+}
+
+fn workspace_root_rejection_reason_for_home(
+    root: &Path,
+    home: Option<&Path>,
+) -> Option<&'static str> {
+    if is_filesystem_root_directory(root) {
+        return Some("Workspace root directory cannot be the filesystem root.");
+    }
+
+    if is_windows_system_startup_directory(root) {
+        return Some("Workspace root directory cannot be a Windows system folder.");
+    }
+
+    if let Some(reason) = workspace_root_is_known_system_or_app_directory(root) {
+        return Some(reason);
+    }
+
+    if workspace_root_is_user_collection_or_profile(root, home) {
+        return Some(
+            "Workspace root directory cannot be a user account or user collection root.",
+        );
+    }
+
+    if workspace_root_is_known_user_state_directory(root, home) {
+        return Some(
+            "Workspace root directory cannot be an application settings, cache, or package manager folder.",
+        );
+    }
+
+    if workspace_root_is_cloud_storage_root(root, home) {
+        return Some("Workspace root directory cannot be a cloud storage root.");
+    }
+
+    if workspace_root_is_common_user_folder(root, home) {
+        return Some(
+            "Workspace root directory is too broad; choose a specific project folder inside it.",
+        );
+    }
+
+    if !workspace_root_has_selected_project_signal(root)
+        && workspace_root_immediate_entry_count_exceeds(
+            root,
+            MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES,
+        )
+    {
+        return Some(
+            "Workspace root directory has too many immediate entries; choose a specific project folder.",
+        );
+    }
+
+    None
+}
+
 fn is_windows_system_startup_directory(directory: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -1306,12 +1697,8 @@ fn resolve_workspace_root_directory(value: Option<&str>) -> Result<PathBuf, Stri
         return Err("Workspace root directory must be an existing directory.".to_string());
     }
 
-    if is_filesystem_root_directory(&canonical) {
-        return Err("Workspace root directory cannot be the filesystem root.".to_string());
-    }
-
-    if is_windows_system_startup_directory(&canonical) {
-        return Err("Workspace root directory cannot be a Windows system folder.".to_string());
+    if let Some(reason) = workspace_root_rejection_reason(&canonical) {
+        return Err(reason.to_string());
     }
 
     Ok(canonical)
@@ -2906,6 +3293,44 @@ mod workspace_files_tests {
     fn filesystem_root_is_not_a_valid_workspace_root() {
         let error = resolve_workspace_root_directory(Some("/")).unwrap_err();
         assert!(error.contains("filesystem root"));
+    }
+
+    #[test]
+    fn broad_user_folder_without_project_marker_is_not_a_valid_workspace_root() {
+        let home = test_workspace_root("diffforge-policy-home");
+        let documents = home.join("Documents");
+        fs::create_dir_all(&documents).unwrap();
+
+        let error = workspace_root_rejection_reason_for_home(&documents, Some(&home)).unwrap();
+        assert!(error.contains("too broad"));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn project_folder_with_project_marker_is_allowed() {
+        let home = test_workspace_root("diffforge-policy-project-home");
+        let project = home.join("Documents").join("app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("package.json"), "{}\n").unwrap();
+
+        assert!(workspace_root_rejection_reason_for_home(&project, Some(&home)).is_none());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn huge_plain_folder_is_not_a_valid_workspace_root() {
+        let root = test_workspace_root("diffforge-policy-huge");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..=MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES {
+            fs::create_dir_all(root.join(format!("entry-{index}"))).unwrap();
+        }
+
+        let error = workspace_root_rejection_reason_for_home(&root, None).unwrap();
+        assert!(error.contains("too many immediate entries"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(not(windows))]
