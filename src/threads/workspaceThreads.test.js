@@ -251,7 +251,7 @@ test("prompt-ready can make a terminal visually idle without releasing pending s
   assert.equal(normalizedThread.providerBindings.codex.inputReady, true);
 });
 
-test("detached session transcript hydration does not revive idle thread as thinking", () => {
+test("detached session transcript completion settles matching idle running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -375,9 +375,121 @@ test("detached session transcript hydration does not revive idle thread as think
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
   assert.equal(hydratedThread.status, "exited");
-  assert.equal(hydratedThread.latestTurn.state, "running");
+  assert.equal(hydratedThread.latestTurn.state, "completed");
   assert.equal(hydratedThread.activityStatus, "idle");
   assert.equal(hydratedThread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(hydratedThread.providerBindings.codex.inputReady, true);
+  assert.equal(
+    hydratedThread.providerBindings.codex.inputReadyConfidence,
+    "transcript-explicit-completion",
+  );
+});
+
+test("session transcript completion does not settle running turn for a later prompt", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "prompt-test";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-05-31T04:15:07.094Z";
+  const laterSubmittedAt = "2026-05-31T04:15:20.000Z";
+  const completedAt = "2026-05-31T04:15:33.000Z";
+  const sessionId = "session-test";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            startedAt: submittedAt,
+            state: "running",
+            turnId,
+          },
+          messages: [{
+            createdAt: submittedAt,
+            id: promptId,
+            role: "user",
+            text: "interesting",
+            turnId,
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "turn-start",
+            messageId: promptId,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }, {
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "user-message",
+            messageId: promptId,
+            role: "user",
+            source: "codex-session",
+            status: "submitted",
+            text: "interesting",
+            turnId,
+            type: "thread.message.user",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          transcriptSessionId: sessionId,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "interesting",
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: "interesting",
+    }, {
+      createdAt: laterSubmittedAt,
+      id: "later-user",
+      role: "user",
+      text: "new task",
+    }, {
+      createdAt: completedAt,
+      id: "task-complete",
+      kind: "task_complete",
+      role: "assistant",
+      text: "Done.",
+    }],
+    promptAccepted: true,
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    threadId,
+    workspaceId,
+  });
+
+  const hydratedThread = hydrated[workspaceId].threads[threadId];
+  assert.equal(hydratedThread.latestTurn.state, "running");
+  assert.equal(hydratedThread.activityStatus, "thinking");
 });
 
 test("provider turn interruption settles running thread and keeps terminal input ready", () => {

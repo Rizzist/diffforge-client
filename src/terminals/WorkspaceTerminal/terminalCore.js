@@ -7,7 +7,7 @@ import { stripLiveViewControlSequences } from "../liveViewSanitizer.js";
 export const TERMINAL_THEME_BACKGROUND = "#020304";
 export const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 export const MIN_WORKSPACE_TERMINAL_COUNT = 1;
-export const MAX_WORKSPACE_TERMINAL_COUNT = 12;
+export const MAX_WORKSPACE_TERMINAL_COUNT = 24;
 export const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 export const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 export const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;

@@ -1302,7 +1302,7 @@ const MCP_REGISTRY_STORAGE_KEY = "diffforge.mcpRegistry.v1";
 const MCP_TEXT_LIMIT = 12000;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH = 2048;
 const MIN_WORKSPACE_TERMINAL_COUNT = 1;
-const MAX_WORKSPACE_TERMINAL_COUNT = 12;
+const MAX_WORKSPACE_TERMINAL_COUNT = 24;
 const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -5815,12 +5815,11 @@ export default function App() {
       activatedWorkspaceIdRef.current
       || selectedWorkspaceIdRef.current
       || workspaceLifecycleSettingsRef.current?.defaultWorkspaceId
-      || currentWorkspaces[0]?.id
       || ""
     );
     const workspace = targetWorkspaceId
       ? findWorkspaceById(currentWorkspaces, targetWorkspaceId)
-      : currentWorkspaces[0] || null;
+      : null;
     const workspaceId = workspace?.id || targetWorkspaceId || "";
     const repoPath = (
       (workspaceId ? getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId) : "")
@@ -6278,15 +6277,8 @@ export default function App() {
       const existingEnabledWorkspaceIds = configuredEnabledWorkspaceIds.filter((workspaceId) => (
         Boolean(findWorkspaceById(nextWorkspaces, workspaceId))
       ));
-      const enabledFallbackWorkspace = existingEnabledWorkspaceIds
-        .map((workspaceId) => findWorkspaceById(nextWorkspaces, workspaceId))
-        .find(Boolean)
-        || null;
-      const firstWorkspace = nextWorkspaces[0] || null;
       const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId)
         || defaultWorkspace
-        || enabledFallbackWorkspace
-        || firstWorkspace
         || null;
       const nextEnabledWorkspaceIds = (() => {
         if (nextActivated?.id) {
@@ -9573,10 +9565,7 @@ export default function App() {
     const eligibleTargets = workspaceMcpSyncTargets.filter((target) => (
       target?.workspaceId && target?.repoPath
     ));
-    const activeTargets = eligibleTargets.filter((target) => target.workspaceActive);
-    const targets = activeTargets.length > 0
-      ? activeTargets
-      : eligibleTargets.slice(0, 1);
+    const targets = eligibleTargets;
 
     if (targets.length === 0) {
       return undefined;
@@ -10225,7 +10214,7 @@ export default function App() {
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
-  const cloudSqliteResetTarget = activatedWorkspace || selectedWorkspace || defaultWorkspace || workspaces[0] || null;
+  const cloudSqliteResetTarget = activatedWorkspace || selectedWorkspace || defaultWorkspace || null;
   const cloudSqliteResetTargetId = String(cloudSqliteResetTarget?.id || "").trim();
   const cloudSqliteResetTargetName = String(cloudSqliteResetTarget?.name || "").trim();
   const cloudSqliteResetRepoPath = cloudSqliteResetTargetId
@@ -10531,7 +10520,6 @@ export default function App() {
       }
       return activatedWorkspaceIdRef.current
         || selectedWorkspaceIdRef.current
-        || workspaces[0]?.id
         || "";
     };
 
@@ -11354,31 +11342,49 @@ export default function App() {
               && rawTurnCompleteSeen
               && !transcriptTargetsLatestRunningTurn,
           );
+          const authoritativeTranscriptCompletionCanSettleTurn = Boolean(
+            activeRunningTurnAtTranscriptResult
+              && rawTurnCompleteSeen
+              && promptAccepted
+              && transcriptTargetsLatestRunningTurn,
+          );
           const matchedTranscriptCompletionCanSettleTurn = Boolean(
-            pollUntilTurnComplete
+            (pollUntilTurnComplete || authoritativeTranscriptCompletionCanSettleTurn)
               && activeRunningTurnAtTranscriptResult
               && promptAccepted
               && transcriptTargetsLatestRunningTurn
               && rawTurnCompleteSeen
           );
           const sessionTranscriptCanSettleTurn = Boolean(
-            pollUntilTurnComplete
-              && activeRunningTurnAtTranscriptResult
-              && promptAccepted
-              && transcriptTargetsLatestRunningTurn
-              && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
-              && (
-                rawTurnCompleteSeen
-                || settledAssistantResponseSeen
+            authoritativeTranscriptCompletionCanSettleTurn
+              || (
+                pollUntilTurnComplete
+                && activeRunningTurnAtTranscriptResult
+                && promptAccepted
+                && transcriptTargetsLatestRunningTurn
+                && (
+                  terminalLifecycleCanSettleTurn
+                  || matchedTranscriptCompletionCanSettleTurn
+                )
+                && (
+                  rawTurnCompleteSeen
+                  || settledAssistantResponseSeen
+                )
               )
           );
           const transcriptExplicitCompletionCanSettleTurn = Boolean(
-            pollUntilTurnComplete
-              && activeRunningTurnAtTranscriptResult
-              && rawTurnCompleteSeen
-              && promptAccepted
-              && transcriptTargetsLatestRunningTurn
-              && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
+            authoritativeTranscriptCompletionCanSettleTurn
+              || (
+                pollUntilTurnComplete
+                && activeRunningTurnAtTranscriptResult
+                && rawTurnCompleteSeen
+                && promptAccepted
+                && transcriptTargetsLatestRunningTurn
+                && (
+                  terminalLifecycleCanSettleTurn
+                  || matchedTranscriptCompletionCanSettleTurn
+                )
+              )
           );
           const assistantResponseCompletesTurn = Boolean(
             pollUntilTurnComplete
@@ -11397,7 +11403,11 @@ export default function App() {
                 !activeRunningTurnAtTranscriptResult
                 || (
                   transcriptTargetsLatestRunningTurn
-                  && (terminalLifecycleCanSettleTurn || matchedTranscriptCompletionCanSettleTurn)
+                  && (
+                    terminalLifecycleCanSettleTurn
+                    || matchedTranscriptCompletionCanSettleTurn
+                    || authoritativeTranscriptCompletionCanSettleTurn
+                  )
                 )
               ),
           );
@@ -11416,6 +11426,7 @@ export default function App() {
             agentId,
             activeRunningTurnAtTranscriptResult,
             allowTranscriptTurnCompletion,
+            authoritativeTranscriptCompletionCanSettleTurn,
             assistantResponseCompletesTurn,
             latestTimestampPresent: Boolean(result?.latestTimestamp),
             matchedBy: result?.matchedBy || "",
@@ -11450,6 +11461,7 @@ export default function App() {
             agentId,
             activeRunningTurnAtTranscriptResult,
             allowTranscriptTurnCompletion,
+            authoritativeTranscriptCompletionCanSettleTurn,
             assistantResponseCompletesTurn,
             matchedBy: result?.matchedBy || "",
             matchedTranscriptCompletionCanSettleTurn,

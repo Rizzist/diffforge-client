@@ -1377,6 +1377,32 @@ function isTranscriptTurnCompleteMessage(message) {
     || title === "task complete";
 }
 
+function transcriptHasTurnCompleteForExpectedPrompt(messages, expectedPromptMessageId) {
+  const safeExpectedPromptMessageId = cleanText(expectedPromptMessageId);
+  if (!safeExpectedPromptMessageId) {
+    return false;
+  }
+
+  let sawExpectedPrompt = false;
+  const normalizedMessages = normalizeThreadMessages(messages);
+  for (const message of normalizedMessages) {
+    if (!sawExpectedPrompt) {
+      sawExpectedPrompt = message.role === "user" && cleanText(message.id) === safeExpectedPromptMessageId;
+      continue;
+    }
+
+    if (message.role === "user" && !isSlashCommandPrompt(message.text)) {
+      return false;
+    }
+
+    if (isTranscriptTurnCompleteMessage(message)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function isTranscriptTurnErrorMessage(message) {
   const kind = cleanText(message?.kind).toLowerCase();
   const status = cleanText(message?.status).toLowerCase();
@@ -1578,9 +1604,43 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
   const expectedPromptTurnId = promptEventId ? createTurnIdForMessage(thread, promptEventId) : "";
   const promptAccepted = event.promptAccepted === true;
-  const allowTranscriptTurnCompletion = event.allowTranscriptTurnCompletion === true;
+  const latestUserMessage = [...normalizeThreadMessages(thread?.messages)]
+    .reverse()
+    .find((message) => message.role === "user") || null;
+  const latestUserMessageMatchesExpectedPrompt = Boolean(
+    expectedUserMessage
+      && cleanSubmittedUserMessage(latestUserMessage?.text) === expectedUserMessage,
+  );
+  const latestRunningTurnMatchesExpectedPrompt = Boolean(
+    runningLatestTurnId
+      && (
+        (expectedPromptTurnId && expectedPromptTurnId === runningLatestTurnId)
+        || (
+          promptEventId
+          && (
+            cleanText(latestTurn?.messageId) === promptEventId
+            || runningLatestTurnId.includes(promptEventId)
+            || cleanText(latestUserMessage?.id) === promptEventId
+          )
+        )
+        || latestUserMessageMatchesExpectedPrompt
+      )
+  );
+  const transcriptExplicitCompletionCanSettleRunningTurn = Boolean(
+    runningLatestTurnId
+      && latestRunningTurnMatchesExpectedPrompt
+      && (promptAccepted || Boolean(expectedPromptTranscriptMessageId))
+      && transcriptHasTurnCompleteForExpectedPrompt(
+        normalizedIncomingMessages,
+        expectedPromptTranscriptMessageId,
+      )
+  );
+  const allowTranscriptTurnCompletion = event.allowTranscriptTurnCompletion === true
+    || transcriptExplicitCompletionCanSettleRunningTurn;
   const assistantResponseCompletesTurn = allowTranscriptTurnCompletion
     && event.assistantResponseCompletesTurn === true;
+  const transcriptTurnCompleteSeen = event.turnCompleteSeen === true
+    || transcriptExplicitCompletionCanSettleRunningTurn;
   let currentTurnId = "";
   let transcriptAdvancedTurn = false;
 
@@ -1782,7 +1842,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     allowTranscriptTurnCompletion
       && runningLatestTurnId
       && (
-        event.turnCompleteSeen === true
+        transcriptTurnCompleteSeen
         || assistantResponseCompletesTurn
       )
       && (
@@ -1797,7 +1857,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       : "";
   if (
     allowTranscriptTurnCompletion
-    && (event.turnCompleteSeen === true || assistantResponseCompletesTurn)
+    && (transcriptTurnCompleteSeen || assistantResponseCompletesTurn)
     && completedTurnId
     && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", completedTurnId)
   ) {
@@ -4442,10 +4502,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
   const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
   const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
-  const transcriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
-  const transcriptExplicitInputReadyAt = transcriptExplicitCompletionCanSettleTurn
-    ? cleanText(event.completedAt, now)
-    : "";
+  const eventTranscriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
     agentId,
     completedAt: event.completedAt,
@@ -4459,7 +4516,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     submittedAt: event.submittedAt,
     allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
     assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-    transcriptExplicitCompletionCanSettleTurn,
+    transcriptExplicitCompletionCanSettleTurn: eventTranscriptExplicitCompletionCanSettleTurn,
     turnCompleteSeen: event.turnCompleteSeen,
   });
   const projectionEvents = appendThreadProjectionEvents(
@@ -4468,6 +4525,21 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   );
   const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
   const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
+  const transcriptCompletionSettledTurn = Boolean(
+    eventTranscriptExplicitCompletionCanSettleTurn
+      || (
+        existingLatestTurn?.state === "running"
+        && projectedLatestTurn?.state === "completed"
+        && projectionEventsToAdd.some((projectionEvent) => (
+          projectionEvent?.type === "thread.turn.completed"
+          && cleanText(projectionEvent.turnId) === cleanText(existingLatestTurn.turnId)
+        ))
+      )
+  );
+  const transcriptExplicitInputReadyAt = transcriptCompletionSettledTurn
+    ? cleanText(event.completedAt || projectedLatestTurn?.completedAt || event.latestTimestamp, now)
+    : "";
   const pendingPromptId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
   const shouldClearAcceptedPendingPrompt = Boolean(
     event.promptAccepted === true
@@ -4538,11 +4610,11 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
         ? now
         : providerBindings[agentId].nativeSessionTitleUpdatedAt || now,
       nativeSessionUpdatedAt: now,
-      inputReady: transcriptExplicitCompletionCanSettleTurn ? true : providerBindings[agentId].inputReady,
-      inputReadyAt: transcriptExplicitCompletionCanSettleTurn
+      inputReady: transcriptCompletionSettledTurn ? true : providerBindings[agentId].inputReady,
+      inputReadyAt: transcriptCompletionSettledTurn
         ? transcriptExplicitInputReadyAt
         : providerBindings[agentId].inputReadyAt,
-      inputReadyConfidence: transcriptExplicitCompletionCanSettleTurn
+      inputReadyConfidence: transcriptCompletionSettledTurn
         ? "transcript-explicit-completion"
         : providerBindings[agentId].inputReadyConfidence,
       updatedAt: now,
@@ -4551,11 +4623,11 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
       activityStatus,
-      inputReady: transcriptExplicitCompletionCanSettleTurn ? true : providerBindings[agentId].inputReady,
-      inputReadyAt: transcriptExplicitCompletionCanSettleTurn
+      inputReady: transcriptCompletionSettledTurn ? true : providerBindings[agentId].inputReady,
+      inputReadyAt: transcriptCompletionSettledTurn
         ? transcriptExplicitInputReadyAt
         : providerBindings[agentId].inputReadyAt,
-      inputReadyConfidence: transcriptExplicitCompletionCanSettleTurn
+      inputReadyConfidence: transcriptCompletionSettledTurn
         ? "transcript-explicit-completion"
         : providerBindings[agentId].inputReadyConfidence,
       updatedAt: now,
