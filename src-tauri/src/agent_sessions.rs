@@ -21,6 +21,7 @@ struct CodexThreadSessionDiscoverRequest {
     cwd: Option<String>,
     expected_user_message: Option<String>,
     fallback_window_ms: Option<u64>,
+    home_search_cwd: Option<String>,
     max_messages: Option<usize>,
     submitted_at: Option<String>,
 }
@@ -1793,12 +1794,18 @@ fn find_opencode_session(
 fn discover_codex_session_by_prompt(
     expected_user_message: &str,
     cwd: &str,
+    home_search_cwd: &str,
     allow_timestamp_fallback: bool,
     submitted_at: &str,
     _fallback_window_ms: u64,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
-    let files = collect_codex_rollout_candidates(cwd)?;
+    let search_cwd = if home_search_cwd.trim().is_empty() {
+        cwd
+    } else {
+        home_search_cwd
+    };
+    let files = collect_codex_rollout_candidates(search_cwd)?;
 
     for path in files {
         let initial_meta = codex_rollout_meta(&path).unwrap_or_default();
@@ -2135,6 +2142,7 @@ async fn agent_thread_session_discover(
     }
 
     let cwd = request.cwd.unwrap_or_default();
+    let home_search_cwd = request.home_search_cwd.unwrap_or_else(|| cwd.clone());
     let max_messages = request
         .max_messages
         .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
@@ -2151,6 +2159,7 @@ async fn agent_thread_session_discover(
     discover_codex_session_by_prompt(
         &expected_user_message,
         &cwd,
+        &home_search_cwd,
         allow_timestamp_fallback,
         &submitted_at,
         fallback_window_ms,

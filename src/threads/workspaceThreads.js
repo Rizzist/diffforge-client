@@ -1402,6 +1402,49 @@ function transcriptHasTurnCompleteForExpectedPrompt(messages, expectedPromptMess
   return false;
 }
 
+function transcriptExpectedPromptMessageId(messages, event = {}, expectedUserMessage = "") {
+  const normalizedIncomingMessages = normalizeThreadMessages(messages);
+  const expectedText = cleanSubmittedUserMessage(expectedUserMessage);
+  if (expectedText) {
+    return cleanText([...normalizedIncomingMessages].reverse().find((message) => (
+      message?.role === "user"
+        && !isSlashCommandPrompt(message.text)
+        && cleanSubmittedUserMessage(message.text) === expectedText
+    ))?.id);
+  }
+
+  if (event.promptAccepted !== true) {
+    return "";
+  }
+
+  const matchedBy = cleanText(event.matchedBy).toLowerCase();
+  const canUseTimestampRecovery = Boolean(
+    event.allowTimestampFallback === true
+      || matchedBy.includes("timestamp")
+      || matchedBy.includes("recovery")
+  );
+  if (!canUseTimestampRecovery) {
+    return "";
+  }
+
+  const submittedAtMs = threadMessageTimestampMs({
+    createdAt: event.expectedMessageCreatedAt
+      || event.promptEventSubmittedAt
+      || event.submittedAt
+      || event.createdAt,
+  });
+  if (!submittedAtMs) {
+    return "";
+  }
+
+  const candidate = normalizedIncomingMessages.find((message) => (
+    message?.role === "user"
+      && !isSlashCommandPrompt(message.text)
+      && threadMessageTimestampMs(message) >= submittedAtMs - 5000
+  ));
+  return cleanText(candidate?.id);
+}
+
 function isTranscriptTurnErrorMessage(message) {
   const kind = cleanText(message?.kind).toLowerCase();
   const status = cleanText(message?.status).toLowerCase();
@@ -1545,7 +1588,13 @@ function findMatchingProjectedMessage(projectedMessages, message) {
 }
 
 function createSubmittedUserProjectionEvents(thread, event = {}) {
-  const text = cleanSubmittedUserMessage(event.userMessage || event.message);
+  const text = cleanSubmittedUserMessage(
+    event.expectedUserMessage
+      || event.terminalText
+      || event.terminalMessage
+      || event.userMessage
+      || event.message,
+  );
   if (!text || isSlashCommandPrompt(text)) {
     return [];
   }
@@ -1573,6 +1622,17 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
     status: "running",
     turnId,
     type: "thread.turn.started",
+  }, {
+    agentId,
+    createdAt,
+    id: `projection-user-submitted-${stableProjectionKey(messageId, "message")}`,
+    messageId,
+    role: "user",
+    source,
+    status: "submitted",
+    text,
+    turnId,
+    type: "thread.message.user",
   }];
 }
 
@@ -1586,13 +1646,11 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       || event.message,
   );
   const normalizedIncomingMessages = normalizeThreadMessages(incomingMessages);
-  const expectedPromptTranscriptMessageId = expectedUserMessage
-    ? cleanText([...normalizedIncomingMessages].reverse().find((message) => (
-      message?.role === "user"
-        && !isSlashCommandPrompt(message.text)
-        && cleanSubmittedUserMessage(message.text) === expectedUserMessage
-    ))?.id)
-    : "";
+  const expectedPromptTranscriptMessageId = transcriptExpectedPromptMessageId(
+    normalizedIncomingMessages,
+    event,
+    expectedUserMessage,
+  );
   let projectionEvents = ensureThreadProjectionEvents(thread);
   let projectedMessages = projectThreadProjectionMessages(
     projectionEvents.filter(isTranscriptHistoryProjectionEvent),
@@ -3897,6 +3955,7 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
     expectedMessageCreatedAt: event.expectedMessageCreatedAt,
     expectedUserMessage: event.expectedUserMessage,
     latestTimestamp: event.latestTimestamp,
+    matchedBy: event.matchedBy,
     promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
     promptAccepted: event.promptAccepted,
     promptEventSubmittedAt: event.promptEventSubmittedAt,
@@ -4508,6 +4567,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     expectedMessageCreatedAt: event.expectedMessageCreatedAt,
     expectedUserMessage: event.expectedUserMessage,
     latestTimestamp: event.latestTimestamp,
+    matchedBy: event.matchedBy,
     promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
     promptAccepted: event.promptAccepted,
     promptEventSubmittedAt: event.promptEventSubmittedAt,

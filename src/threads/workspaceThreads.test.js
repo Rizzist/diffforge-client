@@ -233,6 +233,43 @@ test("session acceptance clears a locally pending submitted prompt", () => {
   assert.equal(acceptedThread.activityStatus, "thinking");
 });
 
+test("message submission persists the actual submitted user prompt", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "todo-drop-prompt-test";
+  const submittedAt = "2026-06-01T17:26:05.508Z";
+
+  const materialized = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    expectedUserMessage: "Full terminal prompt sent to Codex",
+    instanceId: 1,
+    messageCreatedAt: submittedAt,
+    messageId: promptId,
+    paneId: "pane-test",
+    pendingPromptDeliveryMode: "session-acceptance",
+    pendingPromptId: promptId,
+    pendingPromptText: "Short queue label",
+    promptEventId: promptId,
+    promptEventSubmittedAt: submittedAt,
+    sessionAcceptancePending: true,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Short queue label",
+    workspaceId,
+  });
+
+  const thread = materialized[workspaceId].threads[threadId];
+  assert.equal(thread.messages.length, 1);
+  assert.equal(thread.messages[0].role, "user");
+  assert.equal(thread.messages[0].text, "Full terminal prompt sent to Codex");
+  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(
+    thread.projectionEvents.filter((event) => event.type === "thread.message.user").length,
+    1,
+  );
+});
+
 test("prompt-ready can make a terminal visually idle without releasing pending session acceptance", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
@@ -428,6 +465,110 @@ test("detached session transcript completion settles matching idle running turn"
     hydratedThread.providerBindings.codex.inputReadyConfidence,
     "transcript-explicit-completion",
   );
+});
+
+test("timestamp recovered transcript settles queued running turn without prior user projection", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "todo-drop-prompt-test";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-06-01T17:26:05.508Z";
+  const acceptedAt = "2026-06-01T17:26:07.276Z";
+  const completedAt = "2026-06-01T17:26:10.521Z";
+  const sessionId = "session-test";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "idle",
+          coordination: {
+            worktreePath: "/repo/.agents/worktrees/2",
+          },
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            startedAt: submittedAt,
+            state: "running",
+            turnId,
+          },
+          materialized: true,
+          messageCount: 1,
+          messages: [],
+          pendingPrompt: null,
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "turn-start",
+            messageId: promptId,
+            source: "tui-todo-auto-queue",
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "idle",
+              inputReady: false,
+              nativeSessionId: "",
+              status: "exited",
+              terminalBinding: null,
+            },
+          },
+          status: "exited",
+          terminalBinding: null,
+          terminalIndex: 1,
+          transcriptSessionId: "",
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "",
+    latestTimestamp: completedAt,
+    matchedBy: "cwd+timestamp-recovery",
+    messages: [{
+      createdAt: acceptedAt,
+      id: "codex-user",
+      role: "user",
+      text: "i need your help",
+    }, {
+      createdAt: completedAt,
+      id: "assistant-final",
+      kind: "message",
+      role: "assistant",
+      text: "What do you need help with?",
+    }, {
+      createdAt: completedAt,
+      id: "task-complete",
+      kind: "task_complete",
+      role: "assistant",
+      text: "What do you need help with?",
+    }],
+    promptAccepted: true,
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    threadId,
+    workspaceId,
+  });
+
+  const thread = hydrated[workspaceId].threads[threadId];
+  assert.equal(thread.latestTurn.state, "completed");
+  assert.equal(thread.latestTurn.turnId, turnId);
+  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.messages[0].text, "i need your help");
+  assert.equal(thread.transcriptSessionId, sessionId);
+  assert.equal(thread.providerBindings.codex.inputReady, true);
 });
 
 test("session transcript completion does not settle running turn for a later prompt", () => {

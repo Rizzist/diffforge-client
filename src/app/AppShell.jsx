@@ -10941,9 +10941,14 @@ export default function App() {
         || event.providerSessionId
         || "",
     ).trim();
-    const requestedCwd = String(
+    const requestedWorktreePath = String(
       event.worktreePath
-        || event.cwd
+        || event.coordination?.worktreePath
+        || "",
+    ).trim();
+    const requestedCwd = String(
+      event.cwd
+        || event.workingDirectory
         || "",
     ).trim();
     const requestedRepoPath = String(event.repoPath || "").trim();
@@ -11089,12 +11094,27 @@ export default function App() {
           || providerBinding?.nativeSessionId
           || "",
       ).trim();
-      const discoveryCwd = String(
-        requestedCwd
-          || thread.coordination?.worktreePath
+      const threadWorktreePath = String(
+        thread.coordination?.worktreePath
+          || providerBinding?.coordination?.worktreePath
+          || "",
+      ).trim();
+      const homeSearchCwd = String(
+        event.homeSearchCwd
+          || event.home_search_cwd
+          || requestedWorktreePath
+          || threadWorktreePath
+          || requestedCwd
           || requestedRepoPath
           || "",
       ).trim();
+      const discoveryCwd = cleanWorkspaceRootDirectory(
+        requestedCwd
+          || requestedRepoPath
+          || threadWorktreePath
+          || homeSearchCwd
+          || "",
+      );
       const canDiscoverProviderSession = Boolean(
         !providerSessionId
           && (expectedUserMessage || (allowTimestampFallback && discoveryCwd && submittedAt))
@@ -11242,6 +11262,7 @@ export default function App() {
           cwd: discoveryCwd,
           expectedUserMessage,
           fallbackWindowMs: 90000,
+          homeSearchCwd,
           maxMessages: 320,
           submittedAt,
         };
