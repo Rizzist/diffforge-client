@@ -95,14 +95,16 @@ test("fresh prompt readiness still completes a completed turn", () => {
   assert.equal(groundTruth.terminalIsComplete, true);
 });
 
-test("idle terminal status is sendable when prompt readiness is fresh", () => {
+test("idle terminal activity is sendable when prompt readiness is fresh", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
+      activityStatus: "idle",
       inputReady: true,
       inputReadyAt: "2026-05-30T10:01:00.000Z",
       status: "idle",
     },
     providerBinding: {
+      activityStatus: "idle",
       inputReady: true,
       inputReadyAt: "2026-05-30T10:01:00.000Z",
       status: "idle",
@@ -135,11 +137,13 @@ test("idle terminal status is sendable when prompt readiness is fresh", () => {
 test("fresh prompt readiness settles a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
+      activityStatus: "idle",
       inputReady: true,
       inputReadyAt: "2026-05-30T10:15:00.000Z",
       status: "active",
     },
     providerBinding: {
+      activityStatus: "idle",
       inputReady: true,
       inputReadyAt: "2026-05-30T10:15:00.000Z",
       status: "active",

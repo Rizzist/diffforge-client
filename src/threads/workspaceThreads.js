@@ -817,6 +817,21 @@ function providerBindingsHaveNativeSession(providerBindings) {
   ));
 }
 
+function pendingPromptTurnHasInputReady({
+  activityStatus = "",
+  latestTurn = null,
+  pendingPrompt = null,
+  providerBinding = null,
+} = {}) {
+  const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
+  return Boolean(
+    latestTurnState === "running"
+      && pendingPrompt
+      && normalizeThreadActivityStatus(activityStatus) === "idle"
+      && providerBinding?.inputReady === true
+  );
+}
+
 function isOrphanRunningThreadState({
   latestTurn,
   messageCount = 0,
@@ -2124,15 +2139,26 @@ function normalizeThread(thread, workspaceId, options = {}) {
       && !terminalBinding
       && ["closed", "exited", "idle"].includes(safeStatus)
   );
+  const storedActivityStatus = normalizeThreadActivityStatus(
+    thread.activityStatus,
+    providerBindings[currentAgent]?.activityStatus,
+  );
   const activityStatus = options.stripLiveBindings
     ? "idle"
     : orphanRunningThreadState
       ? "idle"
       : detachedNonLiveRunningThread
         ? "idle"
+        : pendingPromptTurnHasInputReady({
+          activityStatus: storedActivityStatus,
+          latestTurn,
+          pendingPrompt,
+          providerBinding: providerBindings[currentAgent],
+        })
+          ? "idle"
         : activityStatusForLatestTurn(
           latestTurn,
-          normalizeThreadActivityStatus(thread.activityStatus, providerBindings[currentAgent]?.activityStatus),
+          storedActivityStatus,
         );
   const normalizedProviderBindings = orphanRunningThreadState
     ? clearOrphanRunningProviderBindings(providerBindings)

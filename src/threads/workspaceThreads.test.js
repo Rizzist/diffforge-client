@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   appendWorkspaceThreadProjectionEvents,
   hydrateWorkspaceThreadSessionTranscript,
+  markWorkspaceThreadAgentActivity,
   materializeWorkspaceThreadForTerminal,
+  normalizeWorkspaceThreads,
 } from "./workspaceThreads.js";
 
 test("session transcript completion settles the active running turn", () => {
@@ -184,6 +186,69 @@ test("session acceptance clears a locally pending submitted prompt", () => {
   assert.equal(acceptedThread.pendingPrompt, null);
   assert.equal(acceptedThread.latestTurn.state, "running");
   assert.equal(acceptedThread.activityStatus, "thinking");
+});
+
+test("prompt-ready can make a terminal visually idle without releasing pending session acceptance", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "prompt-test";
+  const submittedAt = "2026-05-31T04:15:07.094Z";
+  const promptReadyAt = "2026-05-31T04:15:11.000Z";
+
+  const materialized = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 1,
+    messageCreatedAt: submittedAt,
+    messageId: promptId,
+    paneId: "pane-test",
+    pendingPromptDeliveryMode: "session-acceptance",
+    pendingPromptId: promptId,
+    pendingPromptText: "Explain this codebase",
+    promptEventId: promptId,
+    promptEventSubmittedAt: submittedAt,
+    sessionAcceptancePending: true,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Explain this codebase",
+    workspaceId,
+  });
+
+  const nextState = markWorkspaceThreadAgentActivity(materialized, {
+    activityStatus: "idle",
+    agentId: "codex",
+    inputReady: true,
+    inputReadyAt: promptReadyAt,
+    instanceId: 1,
+    paneId: "pane-test",
+    promptEventId: promptId,
+    promptReadyAt,
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "terminal-prompt-ready",
+    workspaceId,
+  });
+
+  const nextThread = nextState[workspaceId].threads[threadId];
+  assert.equal(nextThread.activityStatus, "idle");
+  assert.equal(nextThread.latestTurn.state, "running");
+  assert.equal(nextThread.pendingPrompt.id, promptId);
+  assert.equal(nextThread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(nextThread.providerBindings.codex.inputReady, true);
+  assert.equal(nextThread.providerBindings.codex.inputReadyAt, promptReadyAt);
+
+  const terminal = nextState[workspaceId].terminals["0"];
+  assert.equal(terminal.inputReady, true);
+  assert.equal(terminal.inputReadyAt, promptReadyAt);
+  assert.equal(terminal.status, "active");
+
+  const normalizedState = normalizeWorkspaceThreads(nextState);
+  const normalizedThread = normalizedState[workspaceId].threads[threadId];
+  assert.equal(normalizedThread.activityStatus, "idle");
+  assert.equal(normalizedThread.latestTurn.state, "running");
+  assert.equal(normalizedThread.pendingPrompt.id, promptId);
+  assert.equal(normalizedThread.providerBindings.codex.inputReady, true);
 });
 
 test("detached session transcript hydration does not revive idle thread as thinking", () => {

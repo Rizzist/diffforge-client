@@ -29,6 +29,12 @@ import {
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
+import {
+  terminalPresenceStatusFromActivityStatus,
+  terminalRailStateFromActivityStatus,
+  terminalReadinessFromPresenceStatus,
+  terminalTurnStatusFromActivityStatus,
+} from "../terminals/terminalActivityState.js";
 import { logTerminalStatus } from "../terminals/terminalStatusLog";
 import {
   getBigViewTextDiagnosticFields,
@@ -1693,112 +1699,6 @@ function getTerminalNativeRailStateFields(state, label = "") {
     native_rail_label: nativeRailLabel,
     native_rail_state: nativeRailState,
   };
-}
-
-function resolveTerminalNativeRailState({
-  activityStatus = "",
-  eventType = "",
-  nativeRailState = "",
-  rawStatus = "",
-  readiness = "",
-  state = "",
-  status = "",
-  terminalIsParked = false,
-  terminalIsPromptingUser = false,
-  terminalLifecycle = "",
-  turnStatus = "",
-} = {}) {
-  const explicit = normalizeTerminalNativeRailState(nativeRailState, "");
-  if (explicit) {
-    return explicit;
-  }
-
-  const normalizedEventType = normalizeTerminalNativeRailState(eventType, "");
-  const normalizedState = normalizeTerminalNativeRailState(state, "");
-  const normalizedActivity = normalizeTerminalNativeRailState(activityStatus, "");
-  const normalizedRawStatus = normalizeTerminalNativeRailState(rawStatus, "");
-  const normalizedStatus = normalizeTerminalNativeRailState(status, "");
-  const normalizedReadiness = normalizeTerminalNativeRailState(readiness, "");
-  const normalizedLifecycle = normalizeTerminalNativeRailState(terminalLifecycle, "");
-  const normalizedTurnStatus = normalizeTerminalNativeRailState(turnStatus, "");
-
-  if (terminalIsParked || terminalIsPromptingUser) {
-    return "paused";
-  }
-  if (
-    ["paused", "parked", "resume_ready", "resume_requested", "waiting"].includes(normalizedRawStatus)
-    || ["paused", "parked", "resume_ready", "resume_requested", "waiting"].includes(normalizedStatus)
-    || normalizedReadiness === "needs_input"
-  ) {
-    return "paused";
-  }
-  if (
-    normalizedEventType === "exited"
-    || normalizedState === "exited"
-    || normalizedRawStatus === "exited"
-    || normalizedStatus === "exited"
-  ) {
-    return "exited";
-  }
-  if (
-    normalizedEventType === "closing"
-    || normalizedState === "closing"
-    || normalizedRawStatus === "closing"
-    || normalizedStatus === "closing"
-    || normalizedLifecycle === "closing"
-  ) {
-    return "closing";
-  }
-  if (
-    normalizedEventType === "closed"
-    || normalizedState === "closed"
-    || normalizedRawStatus === "closed"
-    || normalizedStatus === "closed"
-    || normalizedLifecycle === "closed"
-  ) {
-    return "closed";
-  }
-  if (
-    normalizedEventType === "error"
-    || normalizedState === "error"
-    || ["error", "failed"].includes(normalizedRawStatus)
-    || ["error", "failed"].includes(normalizedStatus)
-    || ["error", "failed"].includes(normalizedReadiness)
-    || ["error", "failed"].includes(normalizedTurnStatus)
-  ) {
-    return "error";
-  }
-  if (["blocked"].includes(normalizedState) || ["blocked"].includes(normalizedRawStatus) || ["blocked"].includes(normalizedStatus)) {
-    return "blocked";
-  }
-  if (["starting"].includes(normalizedState) || ["starting"].includes(normalizedRawStatus) || ["starting"].includes(normalizedStatus)) {
-    return "starting";
-  }
-  if (
-    ["thinking", "reasoning"].includes(normalizedActivity)
-    || ["thinking", "reasoning", "working", "running", "busy"].includes(normalizedRawStatus)
-    || ["thinking", "working"].includes(normalizedStatus)
-    || ["queued", "submitted", "pending", "running", "thinking", "reasoning", "working"].includes(normalizedTurnStatus)
-    || normalizedReadiness === "busy"
-  ) {
-    return "thinking";
-  }
-  if (
-    ["idle", "ready", "prompt_ready", "input_ready"].includes(normalizedActivity)
-    || ["idle", "ready", "prompt_ready", "input_ready", "active", "connected", "session_attached"].includes(normalizedRawStatus)
-    || ["idle", "ready", "active"].includes(normalizedStatus)
-    || ["ready", "input_ready"].includes(normalizedReadiness)
-    || ["complete", "completed", "done", "cancelled", "canceled", "interrupted"].includes(normalizedTurnStatus)
-  ) {
-    return "idle";
-  }
-  if (normalizedState && !["prewarmed", "running", "active"].includes(normalizedState)) {
-    return normalizedState;
-  }
-  if (normalizedActivity) {
-    return normalizedActivity;
-  }
-  return normalizedState || normalizedStatus || normalizedRawStatus || "unknown";
 }
 
 function readCachedAgentStatuses() {
@@ -7997,12 +7897,6 @@ export default function App() {
         targetRole: agentId,
         thread,
       });
-      const latestTurnState = String(
-        groundTruth.effectiveLatestTurnState
-          || thread?.latestTurn?.state
-          || thread?.latestTurn?.status
-          || "",
-      ).trim().toLowerCase();
       const activityStatus = String(
         groundTruth.effectiveActivityStatus
           || thread?.activityStatus
@@ -8011,40 +7905,54 @@ export default function App() {
       ).trim().toLowerCase();
       const terminalWorkState = String(groundTruth.terminalWorkState || "").trim().toLowerCase();
       const presenceStatus = String(presenceTerminal?.status || "").trim().toLowerCase();
-      const readiness = String(presenceTerminal?.readiness || "").trim().toLowerCase();
-      const nativeRailLabel = cleanAppCloseText(
-        presenceTerminal?.nativeRailLabel || presenceTerminal?.native_rail_label,
+      const visibleStatus = terminalPresenceStatusFromActivityStatus(
+        activityStatus
+          || presenceTerminal?.nativeRailState
+          || presenceTerminal?.native_rail_state
+          || presenceStatus
+          || "",
+        {
+          fallbackStatus: presenceStatus || "idle",
+          liveStatus: ["closed", "closing", "exited", "offline"].includes(presenceStatus)
+            ? presenceStatus
+            : "",
+          terminalIsParked: groundTruth.terminalIsParked || session.parked,
+          terminalIsPromptingUser: groundTruth.terminalIsPromptingUser,
+          terminalLifecycle: "open",
+        },
+      );
+      const readiness = terminalReadinessFromPresenceStatus(visibleStatus);
+      const nativeRailLabel = formatTerminalNativeRailLabel(
+        terminalRailStateFromActivityStatus(activityStatus || visibleStatus, visibleStatus),
       );
       const isReady = Boolean(
         groundTruth.agentInputReady
           || groundTruth.terminalIsComplete
           || readiness === "ready"
-          || presenceStatus === "ready"
+          || ["idle", "ready"].includes(visibleStatus)
       );
       const isWorking = Boolean(
-        session.hasActiveTask
-          || session.activeTask
-          || latestTurnState === "running"
-          || activityStatus === "thinking"
-          || terminalWorkState === "running"
+        ["thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
-          || ["thinking", "working", "running", "starting"].includes(presenceStatus)
+          || (
+            !activityStatus
+            && !presenceTerminal
+            && Boolean(session.hasActiveTask || session.activeTask)
+          )
       );
       const needsInput = Boolean(
-        session.parked
+        visibleStatus === "paused"
+          || session.parked
           || session.parkedPrompt
           || groundTruth.terminalIsParked
           || groundTruth.terminalIsPromptingUser
-          || terminalWorkState === "parked"
-          || terminalWorkState === "prompting_user"
-          || readiness === "needs_input"
-          || ["paused", "parked", "waiting", "resume_ready"].includes(presenceStatus)
+          || (!activityStatus && terminalWorkState === "parked")
+          || (!activityStatus && terminalWorkState === "prompting_user")
       );
       const hasError = Boolean(
-        terminalWorkState === "error"
+        visibleStatus === "error"
+          || (!activityStatus && terminalWorkState === "error")
           || readiness === "error"
-          || presenceStatus === "error"
-          || latestTurnState === "error"
       );
       const isUnknownOpen = Boolean(
         !presenceTerminal
@@ -9208,85 +9116,32 @@ export default function App() {
             const latestTurn = thread?.latestTurn && typeof thread.latestTurn === "object"
               ? thread.latestTurn
               : {};
-            const effectiveLatestTurnState = String(
-              terminalGroundTruth.effectiveLatestTurnState
-                || latestTurn?.state
-                || latestTurn?.status
-                || "",
-            ).trim().toLowerCase();
-            const turnStatus = (() => {
-              if (["queued", "submitted", "pending"].includes(effectiveLatestTurnState)) return "submitted";
-              if (["running", "thinking", "reasoning", "working", "busy"].includes(effectiveLatestTurnState)) return "running";
-              if (["complete", "completed", "done", "idle"].includes(effectiveLatestTurnState)) return "completed";
-              if (["error", "failed", "failure"].includes(effectiveLatestTurnState)) return "failed";
-              if (["cancelled", "canceled"].includes(effectiveLatestTurnState)) return "cancelled";
-              if (effectiveLatestTurnState === "interrupted") return "interrupted";
-              return "";
-            })();
             const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
+            const terminalLifecycle = liveTerminal || hasSession ? "open" : "closed";
             const rawActivity = String(
               terminalGroundTruth.effectiveActivityStatus
                 || thread?.activityStatus
-                || thread?.latestTurn?.status
-                || thread?.status
+                || providerBinding?.activityStatus
                 || "",
             ).trim().toLowerCase();
-            const status = (() => {
-              if (liveStatus === "error" || rawActivity === "error" || rawActivity === "failed") return "error";
-              if (terminalGroundTruth.terminalIsParked || ["paused", "parked", "waiting", "resume_ready"].includes(rawActivity)) return "paused";
-              if (liveStatus === "starting" || rawActivity === "starting") return "working";
-              if (terminalGroundTruth.terminalIsPromptingUser) return "paused";
-              if (["thinking", "reasoning"].includes(rawActivity)) return "thinking";
-              if (effectiveLatestTurnState === "running") return "thinking";
-              if ([
-                "busy",
-                "running",
-                "working",
-                "dispatched",
-                "implementing",
-                "resume_requested",
-                "resumed",
-              ].includes(rawActivity)) return "working";
-              if (["closed", "closing", "stopped"].includes(rawActivity)) return "idle";
-              if (liveTerminal && ["active", "running"].includes(liveStatus)) {
-                return terminalGroundTruth.agentInputReady || terminalGroundTruth.terminalIsComplete
-                  ? "ready"
-                  : "working";
-              }
-              if (!liveTerminal && !hasSession) return "idle";
-              return "idle";
-            })();
-            const readiness = (() => {
-              if (status === "thinking" || status === "working") return "busy";
-              if (status === "paused") return "needs_input";
-              if (status === "error") return "error";
-              return "ready";
-            })();
-            const terminalLifecycle = liveTerminal || hasSession ? "open" : "closed";
-            const nativeRailState = resolveTerminalNativeRailState({
-              activityStatus: rawActivity,
-              nativeRailState: liveTerminal?.nativeRailState
-                || liveTerminal?.native_rail_state
-                || thread?.nativeRailState
-                || thread?.native_rail_state
-                || "",
-              rawStatus: rawActivity,
-              readiness,
-              state: liveStatus || terminalLifecycle,
-              status,
+            const statusActivity = rawActivity
+              || (liveStatus === "error" ? "error" : "")
+              || (liveStatus === "starting" ? "thinking" : "");
+            const status = terminalPresenceStatusFromActivityStatus(statusActivity, {
+              fallbackStatus: "idle",
+              liveStatus: ["closed", "closing", "exited", "offline"].includes(liveStatus)
+                ? liveStatus
+                : "",
               terminalIsParked: terminalGroundTruth.terminalIsParked,
               terminalIsPromptingUser: terminalGroundTruth.terminalIsPromptingUser,
               terminalLifecycle,
-              turnStatus,
             });
-            const nativeRailFields = getTerminalNativeRailStateFields(
-              nativeRailState,
-              liveTerminal?.nativeRailLabel
-                || liveTerminal?.native_rail_label
-                || thread?.nativeRailLabel
-                || thread?.native_rail_label
-                || "",
-            );
+            const readiness = terminalReadinessFromPresenceStatus(status);
+            const turnStatus = terminalTurnStatusFromActivityStatus(statusActivity || status, status);
+            const nativeRailState = ["closed", "closing", "exited", "offline"].includes(status)
+              ? status
+              : terminalRailStateFromActivityStatus(statusActivity || status, status);
+            const nativeRailFields = getTerminalNativeRailStateFields(nativeRailState);
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
               ? "Terminal"
               : getManagedAgentLabel(normalizedRole);
@@ -9310,13 +9165,15 @@ export default function App() {
               agentId: normalizedRole,
               agentKind: normalizedRole,
               agentLabel,
+              activityStatus: nativeRailState,
+              activity_status: nativeRailState,
               color,
               colorSlot,
-              inputReady: Boolean(terminalGroundTruth.agentInputReady),
+              inputReady: Boolean(terminalLifecycle === "open" && readiness === "ready"),
               ...nativeRailFields,
               paneId,
               readiness,
-              sessionState: hasSession ? "session_attached" : "no_session",
+              sessionState: terminalLifecycle === "open" ? "session_attached" : "no_session",
               status,
               statusSeq,
               terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
@@ -9412,46 +9269,53 @@ export default function App() {
 
     const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
-    const statusAfter = (() => {
-      if (options.statusAfter || options.status) return String(options.statusAfter || options.status).trim().toLowerCase();
-      if (["closed", "exited"].includes(eventType)) return "closed";
-      if (eventType === "closing" || rawStatus === "closing") return "closing";
-      if (eventType === "provider-turn-error" || rawStatus === "error" || rawStatus === "failed") return "error";
-      if (
+    const eventActivityStatus = String(options.activityStatus || event.activityStatus || "").trim().toLowerCase();
+    const statusLifecycleHint = (
+      ["closed", "exited"].includes(eventType)
+        ? "closed"
+        : eventType === "closing" || rawStatus === "closing"
+          ? "closing"
+          : "open"
+    );
+    const statusActivity = eventActivityStatus
+      || (
         eventType === "terminal-prompt-ready"
         || eventType === "terminal-input-ready"
         || eventType === "provider-turn-completed"
         || eventType === "provider-turn-interrupted"
-      ) {
-        return "idle";
-      }
-      if (
+          ? "idle"
+          : ""
+      )
+      || (
         eventType === "message-submitted"
         || eventType === "provider-turn-started"
         || eventType === "thread-starting"
         || eventType === "agent-output"
-        || ["thinking", "running", "working", "busy"].includes(rawStatus)
-      ) {
-        return "working";
-      }
-      if (["paused", "parked", "waiting", "resume_ready"].includes(rawStatus)) return "paused";
-      return String(presenceTerminal?.status || rawStatus || "idle").trim().toLowerCase();
+          ? "thinking"
+          : ""
+      )
+      || rawStatus
+      || "";
+    const statusAfter = (() => {
+      if (["closed", "exited"].includes(eventType)) return "closed";
+      if (eventType === "closing" || rawStatus === "closing") return "closing";
+      if (eventType === "provider-turn-error" || rawStatus === "error" || rawStatus === "failed") return "error";
+      return terminalPresenceStatusFromActivityStatus(statusActivity, {
+        fallbackStatus: "idle",
+        liveStatus: ["closed", "closing", "exited", "offline"].includes(rawStatus)
+          ? rawStatus
+          : "",
+        terminalIsParked: event.terminalIsParked === true || event.terminal_is_parked === true,
+        terminalIsPromptingUser: event.terminalIsPromptingUser === true || event.terminal_is_prompting_user === true,
+        terminalLifecycle: statusLifecycleHint,
+      });
     })();
     const readinessAfter = String(options.readiness || options.readinessAfter || "").trim().toLowerCase() || (() => {
-      if (statusAfter === "working") return "busy";
-      if (statusAfter === "paused") return "needs_input";
-      if (statusAfter === "error") return "error";
-      if (statusAfter === "closing") return "closing";
-      if (statusAfter === "closed") return "closed";
-      return "ready";
+      return terminalReadinessFromPresenceStatus(statusAfter);
     })();
     const turnStatus = String(options.turnStatus || event.turnStatus || "").trim().toLowerCase() || (() => {
-      if (statusAfter === "working") return "running";
-      if (statusAfter === "error") return "failed";
       if (eventType === "provider-turn-interrupted") return "interrupted";
-      if (statusAfter === "closed" || statusAfter === "closing") return "interrupted";
-      if (statusAfter === "idle") return "completed";
-      return "";
+      return terminalTurnStatusFromActivityStatus(statusActivity || statusAfter, statusAfter);
     })();
     const agentId = String(
       options.agentId
@@ -9522,33 +9386,25 @@ export default function App() {
       : statusAfter === "closing"
         ? "closing"
         : "open";
-    const nativeRailState = resolveTerminalNativeRailState({
-      activityStatus: options.activityStatus || event.activityStatus || rawStatus,
-      eventType,
-      nativeRailState: options.nativeRailState
+    const explicitNativeRailState = String(
+      options.nativeRailState
         || options.native_rail_state
         || event.nativeRailState
         || event.native_rail_state
-        || presenceTerminal?.nativeRailState
-        || presenceTerminal?.native_rail_state
         || "",
-      rawStatus,
-      readiness: readinessAfter,
-      state: event.state || options.state || "",
-      status: statusAfter,
-      terminalIsParked: event.terminalIsParked === true || event.terminal_is_parked === true,
-      terminalIsPromptingUser: event.terminalIsPromptingUser === true || event.terminal_is_prompting_user === true,
-      terminalLifecycle,
-      turnStatus,
-    });
+    ).trim().toLowerCase();
+    const nativeRailState = explicitNativeRailState || (
+      ["closed", "closing", "exited", "offline"].includes(statusAfter)
+        ? statusAfter
+        : terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter)
+    );
+    const visibleActivityStatus = terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter);
     const nativeRailFields = getTerminalNativeRailStateFields(
       nativeRailState,
       options.nativeRailLabel
         || options.native_rail_label
         || event.nativeRailLabel
         || event.native_rail_label
-        || presenceTerminal?.nativeRailLabel
-        || presenceTerminal?.native_rail_label
         || "",
     );
     const terminalPayload = {
@@ -9557,6 +9413,8 @@ export default function App() {
       agentLabel: presenceTerminal?.agentLabel
         || presenceTerminal?.agent_label
         || getManagedAgentLabel(agentId),
+      activityStatus: visibleActivityStatus,
+      activity_status: visibleActivityStatus,
       color: presenceTerminal?.color || "",
       colorSlot: presenceTerminal?.colorSlot ?? presenceTerminal?.color_slot ?? getTerminalAgentColorSlot(safeTerminalIndex),
       eventId: `${terminalKey}:${statusSeq}`,
@@ -12763,13 +12621,8 @@ export default function App() {
             : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
               ? {
                 ...lifecycleEvent,
-                activityStatus: "thinking",
-                inputReady: false,
-                inputReadyAt: "",
-                inputReadyConfidence: "",
-                promptReadyAt: "",
-                promptReadyConfidence: "",
-                type: "agent-output",
+                activityStatus: "idle",
+                inputReady: true,
               }
               : {
                 ...lifecycleEvent,
@@ -12822,13 +12675,8 @@ export default function App() {
             : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
               ? {
                 ...lifecycleEvent,
-                activityStatus: "thinking",
-                inputReady: false,
-                inputReadyAt: "",
-                inputReadyConfidence: "",
-                promptReadyAt: "",
-                promptReadyConfidence: "",
-                type: "agent-output",
+                activityStatus: "idle",
+                inputReady: true,
               }
               : {
                 ...lifecycleEvent,

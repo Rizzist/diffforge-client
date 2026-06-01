@@ -1,3 +1,10 @@
+import {
+  terminalActivityStatusIsBusy,
+  terminalActivityStatusIsClosed,
+  terminalActivityStatusIsError,
+  terminalActivityStatusIsSendable,
+} from "../terminals/terminalActivityState.js";
+
 const DEFAULT_AGENT_READY_ROLES = new Set(["codex", "claude", "opencode"]);
 const COMPLETED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
 const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
@@ -7,7 +14,6 @@ const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
   "thread-starting",
 ]);
 export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
-const SENDABLE_TERMINAL_STATUSES = new Set(["active", "running", "idle", "ready", "prompt_ready", "input_ready"]);
 const READINESS_MAX_AGE_MS = 10 * 60 * 1000;
 let readinessVersion = 0;
 const readinessListeners = new Set();
@@ -355,14 +361,18 @@ export function getLiveTerminalForThread(thread, providerBinding, workspaceThrea
     return null;
   }
 
+  const activityStatus = cleanText(
+    terminal.activityStatus
+      || terminal.activity_status
+      || providerBinding?.activityStatus
+      || providerBinding?.activity_status
+      || thread?.activityStatus
+      || "",
+  ).toLowerCase();
   if (
     terminal.threadId !== thread?.id
-    || ![
-      "active",
-      "running",
-      "starting",
-      ...PARKED_TERMINAL_STATUSES,
-    ].includes(cleanText(terminal.status).toLowerCase())
+    || !activityStatus
+    || terminalActivityStatusIsClosed(activityStatus)
   ) {
     return null;
   }
@@ -395,19 +405,25 @@ export function getThreadTerminalGroundTruth({
   const lifecycleTerminalWorkState = cleanText(
     lifecycleEvent?.terminalWorkState || lifecycleEvent?.statusTruth || lifecycleEvent?.status_truth,
   ).toLowerCase();
+  const latestTurn = thread?.latestTurn || null;
+  const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const terminalStatus = cleanText(liveTerminal?.status).toLowerCase();
-  const providerStatus = cleanText(providerBinding?.status).toLowerCase();
-  const parkedStatus = [providerStatus, terminalStatus].find((status) => (
+  const providerActivityStatus = cleanText(
+    providerBinding?.activityStatus
+      || providerBinding?.activity_status
+      || "",
+  ).toLowerCase();
+  const activityStatus = cleanText(
+    liveTerminal?.activityStatus
+      || liveTerminal?.activity_status
+      || providerActivityStatus
+      || thread?.activityStatus
+      || "",
+  ).toLowerCase();
+  const parkedStatus = [providerActivityStatus, activityStatus].find((status) => (
     PARKED_TERMINAL_STATUSES.has(status)
   )) || "";
   const terminalIsParked = Boolean(parkedStatus);
-  const latestTurn = thread?.latestTurn || null;
-  const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
-  const activityStatus = cleanText(
-    thread?.activityStatus
-      || providerBinding?.activityStatus
-      || "",
-  ).toLowerCase();
   const providerBindings = thread?.providerBindings
     && typeof thread.providerBindings === "object"
     && !Array.isArray(thread.providerBindings)
@@ -444,8 +460,8 @@ export function getThreadTerminalGroundTruth({
       || latestTurn?.updatedAt,
   );
   const turnStartedAtMs = parseTimestampMs(turnStartedAt);
-  const terminalLooksActive = ["active", "running"].includes(terminalStatus);
-  const terminalLooksSendable = SENDABLE_TERMINAL_STATUSES.has(terminalStatus);
+  const terminalLooksActive = terminalActivityStatusIsBusy(activityStatus);
+  const terminalLooksSendable = terminalActivityStatusIsSendable(activityStatus);
   const inputReadyIsFreshForTurn = Boolean(
     recordedAgentInputReady
       && inputReadyAtMs > 0
@@ -464,7 +480,7 @@ export function getThreadTerminalGroundTruth({
   );
   const completedTurnLooksStaleActive = Boolean(
     latestTurnState === "completed"
-      && activityStatus === "thinking"
+      && terminalActivityStatusIsBusy(activityStatus)
       && terminalLooksActive
       && !recordedAgentInputReady
       && !hasPendingPrompt
@@ -475,9 +491,9 @@ export function getThreadTerminalGroundTruth({
       ? "running"
     : latestTurnState;
   const latestTurnFinished = COMPLETED_TURN_STATES.has(latestTurnState);
-  const effectiveActivityStatus = (runningTurnLooksIdle || (latestTurnFinished && !completedTurnLooksStaleActive)) && activityStatus === "thinking"
+  const effectiveActivityStatus = (runningTurnLooksIdle || (latestTurnFinished && !completedTurnLooksStaleActive)) && terminalActivityStatusIsBusy(activityStatus)
     ? "idle"
-    : orphanRunningLooksIdle && activityStatus === "thinking"
+    : orphanRunningLooksIdle && terminalActivityStatusIsBusy(activityStatus)
       ? "idle"
       : activityStatus;
   const safeAgentReadyRoles = agentReadyRoles instanceof Set
@@ -490,7 +506,7 @@ export function getThreadTerminalGroundTruth({
       && inputReadyIsFreshForTurn
       && (COMPLETED_TURN_STATES.has(latestTurnState) || runningTurnLooksIdle || orphanRunningLooksIdle)
       && !completedTurnLooksStaleActive
-      && effectiveActivityStatus !== "thinking"
+      && !terminalActivityStatusIsBusy(effectiveActivityStatus)
       && !hasPendingPrompt
       && terminalLooksSendable
   );
@@ -506,7 +522,7 @@ export function getThreadTerminalGroundTruth({
       && terminalLooksSendable
     )
       ? "idle_or_prompt_ready"
-      : latestTurnState === "running" || activityStatus === "thinking"
+      : latestTurnState === "running" || terminalActivityStatusIsBusy(activityStatus)
         ? "processing_or_active"
         : "idle_or_unknown";
   const promptClearedByLifecycle = Boolean(
@@ -559,9 +575,9 @@ export function getThreadTerminalGroundTruth({
     ? "parked"
     : terminalIsPromptingUser
       ? "prompting_user"
-      : latestTurnState === "error" || terminalStatus === "error" || providerStatus === "error"
+      : latestTurnState === "error" || terminalActivityStatusIsError(effectiveActivityStatus || activityStatus)
         ? "error"
-        : latestTurnState === "running" || effectiveActivityStatus === "thinking"
+        : latestTurnState === "running" || terminalActivityStatusIsBusy(effectiveActivityStatus)
           ? "running"
           : (
               terminalGroundTruthStatus === "idle_or_prompt_ready"
@@ -621,7 +637,7 @@ export function threadLooksEffectivelyThinking(groundTruth = {}) {
   ).toLowerCase();
   return Boolean(
     latestTurnState === "running"
-      || activityStatus === "thinking"
+      || terminalActivityStatusIsBusy(activityStatus)
   );
 }
 

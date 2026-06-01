@@ -1,5 +1,9 @@
+import {
+  terminalActivityStatusIsBusy,
+  terminalActivityStatusIsSendable,
+} from "./terminalActivityState.js";
+
 const DEFAULT_CLOSED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
-const SENDABLE_TERMINAL_STATUSES = new Set(["active", "running", "idle", "ready", "prompt_ready", "input_ready"]);
 
 function cleanText(value) {
   return String(value || "").trim();
@@ -219,13 +223,21 @@ export function evaluateTodoQueueInFlightPrompt({
       && terminalInputReadyAtMs
       && terminalInputReadyAtMs >= submittedAtMs - readyGraceMs,
   );
-  const normalizedTerminalStatus = normalizeTurnState(terminalStatus || liveTerminal?.status);
+  const normalizedActivityStatus = normalizeTurnState(
+    effectiveActivityStatus
+      || terminalGroundTruth?.effectiveActivityStatus
+      || targetThread?.activityStatus
+      || providerBinding?.activityStatus
+      || liveTerminal?.activityStatus
+      || liveTerminal?.activity_status
+      || "",
+  );
   const terminalReadyForNextPrompt = Boolean(
     liveTerminal
-      && SENDABLE_TERMINAL_STATUSES.has(normalizedTerminalStatus)
+      && terminalActivityStatusIsSendable(normalizedActivityStatus)
       && !terminalGroundTruth?.hasPendingPrompt
       && normalizeTurnState(effectiveLatestTurnState || terminalGroundTruth?.effectiveLatestTurnState) !== "running"
-      && normalizeTurnState(effectiveActivityStatus || terminalGroundTruth?.effectiveActivityStatus) !== "thinking"
+      && !terminalActivityStatusIsBusy(normalizedActivityStatus)
       && (
         terminalGroundTruth?.agentInputReady
           || terminalGroundTruth?.completedTurnLooksSendable
@@ -355,6 +367,7 @@ export function evaluateTodoQueueInFlightPrompt({
     terminalInputReadyAtMs,
     terminalInstanceChanged,
     terminalReadyForNextPrompt,
+    terminalReadyActivityStatus: normalizedActivityStatus,
     threadChanged,
   };
 }

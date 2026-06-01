@@ -4,8 +4,14 @@ import test from "node:test";
 import {
   buildTerminalReadinessEpochKey,
   isReadyLifecycleEmittedForEpoch,
+  terminalActivityStatusIsBusy,
+  terminalActivityStatusIsSendable,
   shouldEmitPromptReadyLifecycle,
   shouldSuppressThreadPropThinking,
+  terminalPresenceStatusFromActivityStatus,
+  terminalRailStateFromActivityStatus,
+  terminalReadinessFromPresenceStatus,
+  terminalTurnStatusFromActivityStatus,
 } from "./terminalActivityState.js";
 
 test("prompt-ready backend output is accepted on cold startup", () => {
@@ -95,4 +101,41 @@ test("fresh submitted prompts are allowed to move a terminal into thinking", () 
     },
     threadId: "thread-1",
   }), false);
+});
+
+test("visible terminal presence follows activity status instead of running turn state", () => {
+  assert.equal(terminalRailStateFromActivityStatus("idle"), "idle");
+  assert.equal(terminalPresenceStatusFromActivityStatus("idle", {
+    fallbackStatus: "thinking",
+    terminalLifecycle: "open",
+  }), "idle");
+  assert.equal(terminalReadinessFromPresenceStatus("idle"), "ready");
+  assert.equal(terminalTurnStatusFromActivityStatus("idle"), "completed");
+});
+
+test("visible terminal rail preserves exact activity status", () => {
+  assert.equal(terminalRailStateFromActivityStatus("running"), "running");
+  assert.equal(terminalActivityStatusIsBusy("running"), true);
+  assert.equal(terminalActivityStatusIsSendable("running"), false);
+  assert.equal(terminalPresenceStatusFromActivityStatus("thinking", {
+    terminalLifecycle: "open",
+  }), "thinking");
+  assert.equal(terminalReadinessFromPresenceStatus("thinking"), "busy");
+  assert.equal(terminalTurnStatusFromActivityStatus("thinking"), "running");
+});
+
+test("queue sendability is driven by idle activity status only", () => {
+  assert.equal(terminalActivityStatusIsSendable("idle"), true);
+  assert.equal(terminalActivityStatusIsSendable("prompt_ready"), true);
+  assert.equal(terminalActivityStatusIsSendable("input_ready"), true);
+  assert.equal(terminalActivityStatusIsSendable("active"), false);
+  assert.equal(terminalActivityStatusIsSendable("thinking"), false);
+});
+
+test("closed lifecycle wins over idle activity for terminal presence", () => {
+  assert.equal(terminalPresenceStatusFromActivityStatus("idle", {
+    terminalLifecycle: "closed",
+  }), "closed");
+  assert.equal(terminalReadinessFromPresenceStatus("closed"), "closed");
+  assert.equal(terminalTurnStatusFromActivityStatus("closed"), "interrupted");
 });

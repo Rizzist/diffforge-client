@@ -3882,19 +3882,19 @@ function WorkspaceTerminal({
       const lifecycleTerminalIndex = Number.isFinite(Number(payload.terminalIndex ?? payload.terminal_index))
         ? Number(payload.terminalIndex ?? payload.terminal_index)
         : terminalIndex;
-      const parkedStatus = String(payload.status || "").trim().toLowerCase();
+      const parkedStatus = String(payload.activityStatus || payload.activity_status || payload.status || "").trim().toLowerCase();
       if (TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES.has(parkedStatus)) {
         if (cancellingParkedPromptKeysRef.current.has(promptKey)) {
           return;
         }
-        setParkedPrompt({ ...payload, status: parkedStatus });
+        setParkedPrompt({ ...payload, activityStatus: parkedStatus, status: parkedStatus });
         if (lifecycleThreadId && lifecycleWorkspaceId) {
           onThreadTerminalLifecycle?.({
-            activityStatus: "idle",
+            activityStatus: parkedStatus,
             agentId: terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
-            ...getTerminalNativeRailStateFields("paused"),
+            ...getTerminalNativeRailStateFields(parkedStatus),
             paneId,
             pendingPromptId: promptEventId,
             promptEventId,
@@ -3910,7 +3910,7 @@ function WorkspaceTerminal({
         cancellingParkedPromptKeysRef.current.delete(promptKey);
         setParkedPrompt(null);
         if (
-          payload.status === "resumed"
+          parkedStatus === "resumed"
           && String(payload.reason || "").trim() !== "task_terminal"
           && lifecycleThreadId
           && lifecycleWorkspaceId
@@ -3919,11 +3919,11 @@ function WorkspaceTerminal({
           const userMessageId = promptEventId || String(payload.taskId || "").trim() || createThreadProjectionToken("message-user");
           const turnId = `turn-${userMessageId}`;
           onThreadTerminalLifecycle?.({
-            activityStatus: "thinking",
+            activityStatus: parkedStatus,
             agentId: terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
-            ...getTerminalNativeRailStateFields("thinking"),
+            ...getTerminalNativeRailStateFields(parkedStatus),
             paneId,
             pendingPromptId: promptEventId || userMessageId,
             promptEventId: promptEventId || userMessageId,

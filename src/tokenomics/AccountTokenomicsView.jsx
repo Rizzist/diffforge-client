@@ -23,6 +23,8 @@ import {
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
+const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = 7;
+const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
 
 const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
@@ -143,12 +145,27 @@ function addUtcDays(date, days) {
 function compactDayLabel(key, todayKey) {
   const today = dateFromDayKey(todayKey);
   const yesterdayKey = dayKeyUtc(addUtcDays(today, -1));
-  if (key === todayKey) return "Today";
-  if (key === yesterdayKey) return "Yest.";
-  return dateFromDayKey(key).toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" });
+  if (key === todayKey) return "T";
+  if (key === yesterdayKey) return "Y";
+  return dateFromDayKey(key)
+    .toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" })
+    .slice(0, 1);
 }
 
-function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
+function fullDayLabel(key, todayKey) {
+  const today = dateFromDayKey(todayKey);
+  const yesterdayKey = dayKeyUtc(addUtcDays(today, -1));
+  if (key === todayKey) return "Today";
+  if (key === yesterdayKey) return "Yesterday";
+  return dateFromDayKey(key).toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey);
   const byDay = new Map();
   for (const row of filtered) {
@@ -164,7 +181,7 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
   const endKey = latestDataKey > todayKey ? latestDataKey : todayKey;
   const endDate = dateFromDayKey(endKey);
   const buckets = [];
-  for (let offset = TOKENOMICS_DAILY_WINDOW_DAYS - 1; offset >= 0; offset -= 1) {
+  for (let offset = Math.max(1, windowDays) - 1; offset >= 0; offset -= 1) {
     const date = addUtcDays(endDate, -offset);
     const key = dayKeyUtc(date);
     const match = byDay.get(key);
@@ -177,6 +194,7 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey) {
   return buckets.map((row) => ({
     ...row,
     label: compactDayLabel(row.key, todayKey),
+    titleLabel: fullDayLabel(row.key, todayKey),
   }));
 }
 
@@ -452,28 +470,29 @@ function dailyBarHeight(value, maxValue) {
 
 function modelBreakdown(modelRows, providerRows, selectedProvider, selectedAccountKey) {
   const rows = filterRows(modelRows.length ? modelRows : providerRows, selectedProvider, selectedAccountKey);
-  const total = rows.reduce((sum, row) => sum + rowTotal(row), 0);
-  if (selectedProvider === "all") {
-    return rows
-      .map((row) => ({
-        label: row?.model && row.model !== row.agent_kind ? row.model : providerLabel(row),
-        percent: total > 0 ? Math.round((rowTotal(row) / total) * 100) : 0,
-      }))
-      .filter((row) => row.percent > 0)
-      .slice(0, 3);
+  const byModel = new Map();
+  for (const row of rows) {
+    const rawModel = String(row?.model || "").trim();
+    const agentKind = String(row?.agent_kind || row?.agentKind || "").trim();
+    const label = rawModel && rawModel !== agentKind ? rawModel : providerLabel(row);
+    const key = label || "Unknown model";
+    const current = byModel.get(key) || { label: key, total: 0 };
+    current.total += rowActivityTokens(row);
+    byModel.set(key, current);
+  }
+  const total = [...byModel.values()].reduce((sum, row) => sum + row.total, 0);
+  if (total <= 0) {
+    return (PROVIDER_MODELS[selectedProvider] || []).map((label) => ({ label, percent: 0 })).slice(0, 5);
   }
 
-  if (total > 0) {
-    return rows
-      .map((row) => ({
-        label: row?.model && row.model !== row.agent_kind ? row.model : providerLabel(row),
-        percent: Math.round((rowTotal(row) / total) * 100),
-      }))
-      .filter((row) => row.percent > 0)
-      .slice(0, 3);
-  }
-
-  return (PROVIDER_MODELS[selectedProvider] || []).map((label) => ({ label, percent: 0 })).slice(0, 3);
+  return [...byModel.values()]
+    .filter((row) => row.total > 0)
+    .sort((left, right) => right.total - left.total || left.label.localeCompare(right.label))
+    .slice(0, 5)
+    .map((row) => ({
+      label: row.label,
+      percent: Math.max(1, Math.round((row.total / total) * 100)),
+    }));
 }
 
 function providerAccountOptions(summary, selectedProvider) {
@@ -795,6 +814,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     selectedAccountKey,
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
+  const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
 
   const refresh = useCallback(async ({ scan = false } = {}) => {
     await loadTokenomicsStore({ scan, force: true });
@@ -849,8 +869,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     ? summary.session_hourly_by_provider
     : (Array.isArray(summary?.hourly_by_provider) ? summary.hourly_by_provider : []);
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey),
-    [dailyRaw, selectedAccountKey, selectedProvider],
+    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedProvider],
   );
   const today = useMemo(
     () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey),
@@ -1032,15 +1052,27 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               <BarsIcon aria-hidden="true" />
               Daily Usage
             </span>
-            <RangePill>30d</RangePill>
+            <RangeToggle aria-label="Daily usage range" role="group">
+              {TOKENOMICS_DAILY_RANGE_OPTIONS.map((days) => (
+                <RangeToggleButton
+                  key={days}
+                  $active={dailyWindowDays === days}
+                  aria-pressed={dailyWindowDays === days}
+                  onClick={() => setDailyWindowDays(days)}
+                  type="button"
+                >
+                  {days}d
+                </RangeToggleButton>
+              ))}
+            </RangeToggle>
           </PanelTitle>
-          <DailyChart>
+          <DailyChart $days={dailyRows.length}>
             {dailyRows.map((row) => (
               <DailyColumn key={row.key}>
                 <DailyBar
                   $tone={dailyTone(dailyUsageValue(row), dailyAverage)}
                   style={{ height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
-                  title={dailyUsageTitle(row)}
+                  title={dailyUsageTitle({ ...row, label: row.titleLabel || row.label })}
                 />
                 <small>{row.label}</small>
               </DailyColumn>
@@ -1074,7 +1106,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 <CostCell value={today.cost} />
               </tr>
               <tr>
-                <td>Last 30 Days</td>
+                <td title="Last 30 Days">Last 30 Days</td>
                 <TokenCell value={last30Days.input} />
                 <TokenCell value={last30Days.output} />
                 <TokenCell value={last30Days.cache} />
@@ -1659,22 +1691,57 @@ const SessionRateLabels = styled.div`
   }
 `;
 
-const RangePill = styled.small`
+const RangeToggle = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.72);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.16);
+    background: rgba(241, 245, 249, 0.82);
+  }
+`;
+
+const RangeToggleButton = styled.button`
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 38px;
-  min-height: 22px;
+  min-width: 30px;
+  min-height: 20px;
+  padding: 0 7px;
+  border: 0;
   border-radius: 999px;
-  color: #60a5fa;
-  background: rgba(96, 165, 250, 0.12);
+  color: ${({ $active }) => ($active ? "#bfdbfe" : "#738196")};
+  background: ${({ $active }) => ($active ? "rgba(96, 165, 250, 0.20)" : "transparent")};
+  font: inherit;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  cursor: pointer;
+
+  &:hover {
+    color: #e5eefb;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: ${({ $active }) => ($active ? "#1d4ed8" : "#64748b")};
+    background: ${({ $active }) => ($active ? "rgba(37, 99, 235, 0.12)" : "transparent")};
+
+    &:hover {
+      color: #0f172a;
+    }
+  }
 `;
 
 const DailyChart = styled.div`
   display: grid;
-  grid-template-columns: repeat(30, minmax(0, 1fr));
+  grid-template-columns: repeat(${({ $days }) => $days || TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS}, minmax(0, 1fr));
   align-items: end;
-  gap: 4px;
+  gap: ${({ $days }) => (($days || 0) > 7 ? "4px" : "7px")};
   min-height: 96px;
 `;
 
@@ -1744,21 +1811,27 @@ const UsageTable = styled.table`
 
   th:first-child,
   td:first-child {
-    width: 28%;
+    width: 32%;
     color: #7f9ac1;
     text-align: left;
   }
 
+  th:last-child,
+  td:last-child {
+    width: 21%;
+  }
+
   th {
     color: #7f9ac1;
-    font-size: clamp(8px, 2.1vw, 10px);
+    font-size: 9px;
     font-weight: 800;
   }
 
   td {
     color: #e5eefb;
-    font-size: clamp(9px, 2.5vw, 11px);
+    font-size: 10px;
     font-weight: 750;
+    font-variant-numeric: tabular-nums;
     letter-spacing: 0;
   }
 
@@ -1793,6 +1866,13 @@ const ModelRow = styled.div`
   color: #dfe9f8;
   font-size: clamp(10px, 2.6vw, 12px);
   font-weight: 800;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 
   strong {
     color: #a8c3ee;
