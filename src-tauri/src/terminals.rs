@@ -1281,6 +1281,61 @@ struct TerminalCoordinationLaunchTarget {
     allows_git_init: bool,
 }
 
+fn terminal_workspace_topology_cache_key(root: &Path) -> String {
+    root.canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(root))
+}
+
+fn terminal_workspace_topology_cache_fresh(
+    snapshot: &TerminalWorkspaceTopologySnapshot,
+    now_ms: u64,
+) -> bool {
+    now_ms.saturating_sub(snapshot.scanned_ms) <= TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS
+}
+
+async fn terminal_workspace_topology_mounts_for_launch_from_cache(
+    cache: &Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
+    workspace_root: &Path,
+    now_ms: u64,
+    scanned_ms_override: Option<u64>,
+) -> Vec<WorkspaceProjectMount> {
+    let key = terminal_workspace_topology_cache_key(workspace_root);
+    {
+        let cache = cache.read().await;
+        if let Some(snapshot) = cache.get(&key) {
+            if terminal_workspace_topology_cache_fresh(snapshot, now_ms) {
+                return snapshot.mounts.clone();
+            }
+        }
+    }
+
+    let mounts = workspace_project_mounts(workspace_root);
+    let scanned_ms = scanned_ms_override.unwrap_or_else(terminal_now_ms);
+    let mut cache = cache.write().await;
+    cache.insert(
+        key,
+        TerminalWorkspaceTopologySnapshot {
+            mounts: mounts.clone(),
+            scanned_ms,
+        },
+    );
+    mounts
+}
+
+async fn terminal_workspace_topology_mounts_for_launch(
+    state: &TerminalState,
+    workspace_root: &Path,
+) -> Vec<WorkspaceProjectMount> {
+    terminal_workspace_topology_mounts_for_launch_from_cache(
+        &state.workspace_topology_cache,
+        workspace_root,
+        terminal_now_ms(),
+        None,
+    )
+    .await
+}
+
 fn terminal_git_root_for_coordination_target(root: &Path) -> Option<PathBuf> {
     let top_level = workspace_git_top_level(root)?;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -1298,6 +1353,34 @@ fn terminal_coordination_launch_target(
     _selected_workspace_was_empty_at_selection: bool,
     session_mode: TerminalSessionMode,
 ) -> Result<TerminalCoordinationLaunchTarget, String> {
+    terminal_coordination_launch_target_with_mounts(
+        workspace_root,
+        None,
+        requested_project_root,
+        requested_mount_id,
+        _selected_workspace_was_empty_at_selection,
+        session_mode,
+    )
+}
+
+fn terminal_coordination_launch_target_with_mounts(
+    workspace_root: &Path,
+    topology_mounts: Option<&[WorkspaceProjectMount]>,
+    requested_project_root: Option<&str>,
+    requested_mount_id: Option<&str>,
+    _selected_workspace_was_empty_at_selection: bool,
+    session_mode: TerminalSessionMode,
+) -> Result<TerminalCoordinationLaunchTarget, String> {
+    let workspace_root_canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let owned_mounts;
+    let mounts = if let Some(mounts) = topology_mounts {
+        mounts
+    } else {
+        owned_mounts = workspace_project_mounts(&workspace_root_canonical);
+        owned_mounts.as_slice()
+    };
     let requested_target = requested_project_root
         .map(str::trim)
         .is_some_and(|value| !value.is_empty())
@@ -1305,15 +1388,16 @@ fn terminal_coordination_launch_target(
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
     let mut target_root = match session_mode {
-        TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal(
+        TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal_with_mounts(
             workspace_root,
+            &workspace_root_canonical,
+            mounts,
             requested_project_root,
             requested_mount_id,
         )?,
         TerminalSessionMode::General => {
             if !requested_target {
-                let mounts = workspace_project_mounts(workspace_root);
-                let selected_root = workspace_selected_root_mount(workspace_root, &mounts);
+                let selected_root = workspace_selected_root_mount(&workspace_root_canonical, mounts);
                 let project_count = mounts
                     .iter()
                     .filter(|mount| mount.mount_kind == "project")
@@ -1327,23 +1411,29 @@ fn terminal_coordination_launch_target(
                     });
                 }
             }
-            workspace_coordination_root_for_terminal(
+            workspace_coordination_root_for_terminal_with_mounts(
                 workspace_root,
+                &workspace_root_canonical,
+                mounts,
                 requested_project_root,
                 requested_mount_id,
             )?
         }
         TerminalSessionMode::DirectEdit => {
-            let coordination_root = workspace_coordination_root_for_terminal(
+            let coordination_root = workspace_coordination_root_for_terminal_with_mounts(
                 workspace_root,
+                &workspace_root_canonical,
+                mounts,
                 requested_project_root,
                 requested_mount_id,
             )?;
             if terminal_git_root_for_coordination_target(&coordination_root).is_some() {
                 coordination_root
             } else {
-                workspace_direct_edit_root_for_terminal(
+                workspace_direct_edit_root_for_terminal_with_mounts(
                     workspace_root,
+                    &workspace_root_canonical,
+                    mounts,
                     requested_project_root,
                     requested_mount_id,
                 )?
@@ -2682,8 +2772,11 @@ async fn terminal_open(
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if (!is_prewarm_pty || !plain_shell) && session_mode.should_prepare_coordination() {
-        let coordination_target = terminal_coordination_launch_target(
+        let topology_mounts =
+            terminal_workspace_topology_mounts_for_launch(&state, &working_directory).await;
+        let coordination_target = terminal_coordination_launch_target_with_mounts(
             &working_directory,
+            Some(&topology_mounts),
             requested_project_root.as_deref(),
             requested_mount_id.as_deref(),
             workspace_root_was_empty_at_selection,
@@ -8133,6 +8226,65 @@ mod terminal_tests {
             normalized_path_key(&selected.root.canonicalize().unwrap()),
             normalized_path_key(&frontend.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn terminal_workspace_topology_cache_reuses_fresh_burst_snapshot_then_rechecks() {
+        let container = terminal_test_directory("topology_cache_burst");
+        let frontend = container.join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&frontend)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+            &cache,
+            &container,
+            1_000,
+            Some(1_000),
+        ));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].workspace_relative_path, "frontend");
+
+        let backend = container.join("backend");
+        fs::create_dir_all(&backend).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&backend)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let burst = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+            &cache,
+            &container,
+            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1,
+            Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS - 1),
+        ));
+        assert_eq!(burst.len(), 1);
+        assert_eq!(burst[0].workspace_relative_path, "frontend");
+
+        let later = runtime.block_on(terminal_workspace_topology_mounts_for_launch_from_cache(
+            &cache,
+            &container,
+            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
+            Some(1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1),
+        ));
+        let mount_paths = later
+            .iter()
+            .map(|mount| mount.workspace_relative_path.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(mount_paths.len(), 2);
+        assert!(mount_paths.contains("frontend"));
+        assert!(mount_paths.contains("backend"));
     }
 
     #[test]

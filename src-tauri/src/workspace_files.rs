@@ -923,7 +923,23 @@ fn workspace_coordination_root_for_terminal(
 ) -> Result<PathBuf, String> {
     let workspace_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mounts = workspace_project_mounts(root);
-    let selected_root_mount = workspace_selected_root_mount(root, &mounts);
+    workspace_coordination_root_for_terminal_with_mounts(
+        root,
+        &workspace_root,
+        &mounts,
+        requested_project_root,
+        requested_mount_id,
+    )
+}
+
+fn workspace_coordination_root_for_terminal_with_mounts(
+    root: &Path,
+    workspace_root: &Path,
+    mounts: &[WorkspaceProjectMount],
+    requested_project_root: Option<&str>,
+    requested_mount_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    let selected_root_mount = workspace_selected_root_mount(workspace_root, mounts);
 
     if let Some(requested_mount_id) = requested_mount_id
         .map(str::trim)
@@ -944,19 +960,19 @@ fn workspace_coordination_root_for_terminal(
         let requested = PathBuf::from(requested_project_root)
             .canonicalize()
             .map_err(|error| format!("Unable to resolve requested project root: {error}"))?;
-        if normalized_path_key(&requested) == normalized_path_key(&workspace_root) {
+        if normalized_path_key(&requested) == normalized_path_key(workspace_root) {
             if selected_root_mount.is_some() {
-                return Ok(workspace_root);
+                return Ok(workspace_root.to_path_buf());
             }
             if !mounts.is_empty() {
                 return Err("Container aggregate root is not a project target. Select one of its mounted projects before launching an isolated agent terminal.".to_string());
             }
-            if workspace_root_is_broad_area(&workspace_root, &mounts) {
+            if workspace_root_is_broad_area(workspace_root, mounts) {
                 return Err("Broad workspace folders are discovery views, not project targets. Select or create a project folder before launching an isolated agent terminal.".to_string());
             }
-            return Ok(workspace_root);
+            return Ok(workspace_root.to_path_buf());
         }
-        if !requested.starts_with(&workspace_root) && selected_root_mount.is_none() {
+        if !requested.starts_with(workspace_root) && selected_root_mount.is_none() {
             return Err("Requested project root must stay inside the selected workspace.".to_string());
         }
         if selected_root_mount
@@ -970,8 +986,8 @@ fn workspace_coordination_root_for_terminal(
         {
             return Ok(mount.root_path.clone());
         }
-        if workspace_root_is_broad_area(&workspace_root, &mounts)
-            && requested.starts_with(&workspace_root)
+        if workspace_root_is_broad_area(workspace_root, mounts)
+            && requested.starts_with(workspace_root)
             && workspace_project_kind_for_root(&requested).is_some()
         {
             return Ok(requested);
@@ -982,7 +998,7 @@ fn workspace_coordination_root_for_terminal(
     }
 
     if selected_root_mount.is_some() || mounts.is_empty() {
-        if selected_root_mount.is_none() && workspace_root_is_broad_area(&workspace_root, &mounts) {
+        if selected_root_mount.is_none() && workspace_root_is_broad_area(workspace_root, mounts) {
             return Err("Broad workspace folders are discovery views, not project targets. Select or create a project folder before launching an isolated agent terminal.".to_string());
         }
         return Ok(root.to_path_buf());
@@ -1011,7 +1027,23 @@ fn workspace_direct_edit_root_for_terminal(
 ) -> Result<PathBuf, String> {
     let workspace_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mounts = workspace_project_mounts(root);
-    let selected_root_mount = workspace_selected_root_mount(root, &mounts);
+    workspace_direct_edit_root_for_terminal_with_mounts(
+        root,
+        &workspace_root,
+        &mounts,
+        requested_project_root,
+        requested_mount_id,
+    )
+}
+
+fn workspace_direct_edit_root_for_terminal_with_mounts(
+    _root: &Path,
+    workspace_root: &Path,
+    mounts: &[WorkspaceProjectMount],
+    requested_project_root: Option<&str>,
+    requested_mount_id: Option<&str>,
+) -> Result<PathBuf, String> {
+    let selected_root_mount = workspace_selected_root_mount(workspace_root, mounts);
 
     let ensure_non_git_direct_root = |candidate: &Path, label: &str| -> Result<PathBuf, String> {
         if workspace_has_git_marker(candidate) {
@@ -1056,20 +1088,20 @@ fn workspace_direct_edit_root_for_terminal(
             .canonicalize()
             .map_err(|error| format!("Unable to resolve requested direct edit root: {error}"))?;
 
-        if normalized_path_key(&requested) == normalized_path_key(&workspace_root) {
+        if normalized_path_key(&requested) == normalized_path_key(workspace_root) {
             if let Some(mount) = selected_root_mount {
                 if mount.has_git {
                     return Err("Selected workspace root is a Git project. Use managed patch mode or free terminal mode instead of direct edit mode.".to_string());
                 }
-                return ensure_non_git_direct_root(&workspace_root, "Selected workspace root");
+                return ensure_non_git_direct_root(workspace_root, "Selected workspace root");
             }
             if !mounts.is_empty() {
                 return Err("Container aggregate root is not a direct edit project. Select one of its non-Git mounted projects or use free terminal mode.".to_string());
             }
-            return ensure_non_git_direct_root(&workspace_root, "Selected workspace root");
+            return ensure_non_git_direct_root(workspace_root, "Selected workspace root");
         }
 
-        if !requested.starts_with(&workspace_root) && selected_root_mount.is_none() {
+        if !requested.starts_with(workspace_root) && selected_root_mount.is_none() {
             return Err("Requested direct edit root must stay inside the selected workspace.".to_string());
         }
         if let Some(mount) = mounts
@@ -1087,13 +1119,13 @@ fn workspace_direct_edit_root_for_terminal(
         if selected_root_mount.is_some() {
             return Err("Requested direct edit root must match the selected project root.".to_string());
         }
-        if workspace_root_is_broad_area(&workspace_root, &mounts)
+        if workspace_root_is_broad_area(workspace_root, mounts)
             && workspace_project_kind_for_root(&requested)
                 .is_some_and(|kind| matches!(kind, WorkspaceProjectKind::Marker))
         {
             return ensure_non_git_direct_root(&requested, "Requested direct edit root");
         }
-        if requested.starts_with(&workspace_root)
+        if requested.starts_with(workspace_root)
             && requested.is_dir()
             && !workspace_has_git_marker(&requested)
             && !workspace_root_is_broad_area(&requested, &[])

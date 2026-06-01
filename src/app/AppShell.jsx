@@ -3981,6 +3981,7 @@ export default function App() {
   const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
   const workspaceMcpSyncKeyRef = useRef("");
+  const workspaceCloudSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
@@ -4888,6 +4889,11 @@ export default function App() {
     setWorkspaceTerminalLogicalIndexes({});
     setWorkspaceTerminalDisplayLayouts({});
     agentInitialStatusUserRef.current = "";
+    terminalPresenceSyncKeyRef.current = "";
+    workspaceMcpSyncKeyRef.current = "";
+    workspaceCloudSyncKeyRef.current = "";
+    tokenomicsSyncCursorRef.current = "";
+    tokenomicsSyncInFlightRef.current = false;
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     setStartupAgentGateState("idle");
@@ -4911,6 +4917,11 @@ export default function App() {
       isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
     );
     void syncCloudMcpDesktopSessionToken(authStore.getToken());
+    terminalPresenceSyncKeyRef.current = "";
+    workspaceMcpSyncKeyRef.current = "";
+    workspaceCloudSyncKeyRef.current = "";
+    tokenomicsSyncCursorRef.current = "";
+    tokenomicsSyncInFlightRef.current = false;
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -5429,6 +5440,7 @@ export default function App() {
       ));
       terminalPresenceSyncKeyRef.current = "";
       workspaceMcpSyncKeyRef.current = "";
+      workspaceCloudSyncKeyRef.current = "";
 
       if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
         const nextActivatedWorkspace = nextEnabledWorkspaceIds
@@ -6254,16 +6266,23 @@ export default function App() {
       const existingEnabledWorkspaceIds = configuredEnabledWorkspaceIds.filter((workspaceId) => (
         Boolean(findWorkspaceById(nextWorkspaces, workspaceId))
       ));
+      const enabledFallbackWorkspace = existingEnabledWorkspaceIds
+        .map((workspaceId) => findWorkspaceById(nextWorkspaces, workspaceId))
+        .find(Boolean)
+        || null;
+      const firstWorkspace = nextWorkspaces[0] || null;
       const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId)
         || defaultWorkspace
+        || enabledFallbackWorkspace
+        || firstWorkspace
         || null;
       const nextEnabledWorkspaceIds = (() => {
-        if (currentActivatedId && nextActivated?.id) {
+        if (nextActivated?.id) {
           return existingEnabledWorkspaceIds.includes(nextActivated.id)
             ? existingEnabledWorkspaceIds
             : [...existingEnabledWorkspaceIds, nextActivated.id];
         }
-        return defaultWorkspace?.id ? [defaultWorkspace.id] : [];
+        return [];
       })();
 
       if (
@@ -9570,6 +9589,128 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || shouldShowWorkspaceSetup
+      || workspaceSyncState === "loading"
+      || workspaceSyncState === "creating"
+    ) {
+      return undefined;
+    }
+
+    const eligibleTargets = workspaceMcpSyncTargets.filter((target) => (
+      target?.workspaceId && target?.repoPath
+    ));
+    const activeTargets = eligibleTargets.filter((target) => target.workspaceActive);
+    const targets = activeTargets.length > 0
+      ? activeTargets
+      : eligibleTargets.slice(0, 1);
+
+    if (targets.length === 0) {
+      return undefined;
+    }
+
+    const accountKey = user?.id || user?.email || "paid-user";
+    const syncKey = JSON.stringify({
+      accountKey,
+      targets: targets.map((target) => ({
+        repoPath: getWorkspaceRootIdentity(target.repoPath),
+        workspaceId: target.workspaceId,
+        workspaceName: target.workspaceName || "",
+      })),
+    });
+
+    if (workspaceCloudSyncKeyRef.current === syncKey) {
+      return undefined;
+    }
+
+    workspaceCloudSyncKeyRef.current = syncKey;
+    let disposed = false;
+    const diagnosticToken = authStore.getToken();
+
+    void recordCloudConnectionDiagnostic(diagnosticToken, {
+      channel: "rust-client-sync",
+      step: "rust.sync.workspace_state",
+      status: "start",
+      message: "Rust client is syncing hydrated workspaces to cloud.",
+      details: {
+        workspaceCount: targets.length,
+      },
+    });
+
+    const syncHydratedWorkspaces = async () => {
+      const results = [];
+
+      for (const target of targets) {
+        if (disposed) {
+          return;
+        }
+
+        try {
+          await invoke("cloud_mcp_sync_workspace", {
+            repoPath: target.repoPath,
+            workspaceId: target.workspaceId,
+            workspaceName: target.workspaceName || target.workspaceId,
+          });
+          results.push({ ok: true, workspaceId: target.workspaceId });
+        } catch (error) {
+          results.push({
+            ok: false,
+            message: getErrorMessage(error, "Unable to sync workspace."),
+            workspaceId: target.workspaceId,
+          });
+        }
+      }
+
+      if (disposed) {
+        return;
+      }
+
+      const failed = results.filter((result) => !result.ok);
+      if (failed.length === results.length) {
+        workspaceCloudSyncKeyRef.current = "";
+      }
+
+      await recordCloudConnectionDiagnostic(diagnosticToken, {
+        channel: "rust-client-sync",
+        step: "rust.sync.workspace_state",
+        status: failed.length === 0 ? "ok" : failed.length === results.length ? "error" : "warn",
+        message: failed.length === 0
+          ? "Rust client hydrated workspace sync completed."
+          : "Rust client hydrated workspace sync completed with failures.",
+        details: {
+          failedWorkspaceIds: failed.map((result) => result.workspaceId),
+          workspaceCount: results.length,
+        },
+      });
+    };
+
+    void syncHydratedWorkspaces().catch((error) => {
+      if (!disposed) {
+        workspaceCloudSyncKeyRef.current = "";
+        logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_sync.failed", {
+          message: getErrorMessage(error, "Unable to sync hydrated workspaces."),
+          workspaceCount: targets.length,
+        });
+      }
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [
+    authState,
+    shouldShowWorkspaceSetup,
+    user,
+    workspaceHydrationReady,
+    workspaceMcpSyncTargetKey,
+    workspaceMcpSyncTargets,
+    workspaceSyncState,
+  ]);
+
+  useEffect(() => {
     if (authState !== "authenticated" || !isPaidUser(user) || !workspaceHydrationReady) {
       return undefined;
     }
@@ -9660,15 +9801,23 @@ export default function App() {
       disposed = true;
     };
   }, [
+    authState,
     shouldShowWorkspaceSetup,
     terminalPresenceSyncKey,
     terminalPresenceWorkspaces,
+    user,
     workspaceHydrationReady,
     workspaceSyncState,
   ]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady || shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || shouldShowWorkspaceSetup
+      || workspaceSyncState === "loading"
+    ) {
       return undefined;
     }
 
@@ -9780,7 +9929,9 @@ export default function App() {
       window.clearInterval(intervalId);
     };
   }, [
+    authState,
     shouldShowWorkspaceSetup,
+    user,
     workspaceMcpSyncTargetKey,
     workspaceMcpSyncTargets,
     workspaceHydrationReady,
@@ -9889,7 +10040,13 @@ export default function App() {
   }, [authState, user]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady || shouldShowWorkspaceSetup || workspaceSyncState === "loading") {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || shouldShowWorkspaceSetup
+      || workspaceSyncState === "loading"
+    ) {
       return;
     }
 
@@ -9930,11 +10087,13 @@ export default function App() {
       });
     });
   }, [
+    authState,
     defaultWorkingDirectory,
     enabledWorkspaceRuntimeDescriptors,
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    user,
     workspaceHydrationReady,
     workspaceSyncState,
   ]);

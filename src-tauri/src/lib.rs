@@ -96,6 +96,7 @@ const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const TERMINAL_DROP_CLEANUP_TRACKER_WAIT_MS: u64 = 1_500;
+const TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS: u64 = 3_000;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
@@ -387,6 +388,12 @@ fn configure_windows_process_error_mode() {
 #[cfg(not(windows))]
 fn configure_windows_process_error_mode() {}
 
+#[derive(Clone)]
+struct TerminalWorkspaceTopologySnapshot {
+    mounts: Vec<WorkspaceProjectMount>,
+    scanned_ms: u64,
+}
+
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
@@ -394,6 +401,7 @@ struct TerminalState {
     lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
     cleanup_tracker: Arc<TerminalCleanupTracker>,
+    workspace_topology_cache: Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
     next_terminal_instance_id: AtomicU64,
 }
 
@@ -3199,6 +3207,7 @@ pub fn run() {
             lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
             cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
+            workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
             next_terminal_instance_id: AtomicU64::new(1),
         })
         .manage(TerminalDiagnosticState::new())
