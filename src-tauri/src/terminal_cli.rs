@@ -694,8 +694,6 @@ fn terminal_args_with_codex_mcp_identity(
             (candidate == key && !value.trim().is_empty()).then(|| value.clone())
         })
     };
-    let write_root = env_value("COORDINATION_AGENT_BRANCH_ROOT")
-        .or_else(|| env_value("COORDINATION_WORKTREE_PATH"));
     let codex_profile = env_value("DIFFFORGE_CODEX_PROFILE");
     let codex_bypass_hook_trust = env_value("DIFFFORGE_CODEX_BYPASS_HOOK_TRUST")
         .is_some_and(|value| terminal_env_truthy(&value));
@@ -737,12 +735,10 @@ fn terminal_args_with_codex_mcp_identity(
         let _ = (enforcement_mode.as_str(), file_authority.as_str());
         apply_codex_coordinated_auto_approval_args(
             &mut next,
-            write_root.as_deref(),
             codex_profile.as_deref(),
             codex_bypass_hook_trust,
         );
 
-        append_codex_global_mcp_disable_args(&mut next);
         append_codex_mcp_server_config_args(
             &mut next,
             "coordination-kernel",
@@ -753,7 +749,8 @@ fn terminal_args_with_codex_mcp_identity(
             append_codex_mcp_tool_approval_arg(&mut next, "coordination-kernel", tool);
         }
 
-        let gateway_args = terminal_workspace_gateway_args_from_coordination_args(&coordination_args);
+        let gateway_args =
+            terminal_workspace_gateway_args_from_coordination_args(&coordination_args);
         append_codex_mcp_server_config_args(
             &mut next,
             "workspace-mcp-gateway",
@@ -764,7 +761,11 @@ fn terminal_args_with_codex_mcp_identity(
             append_codex_mcp_tool_approval_arg(&mut next, "workspace-mcp-gateway", tool);
         }
         if let Some(value) = env_value("DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS") {
-            for tool in value.split(',').map(str::trim).filter(|tool| !tool.is_empty()) {
+            for tool in value
+                .split(',')
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+            {
                 append_codex_mcp_tool_approval_arg(&mut next, "workspace-mcp-gateway", tool);
             }
         }
@@ -776,10 +777,6 @@ fn terminal_args_with_codex_mcp_identity(
     }
     next
 }
-
-const TERMINAL_DIFFFORGE_MCP_SERVERS: &[&str] =
-    &["coordination-kernel", "workspace-mcp-gateway"];
-const TERMINAL_KNOWN_GLOBAL_CODEX_MCP_SERVERS: &[&str] = &["codex_apps"];
 
 const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
@@ -797,10 +794,7 @@ fn append_codex_mcp_server_config_args(
 ) {
     let key = terminal_toml_key_segment(server_key);
     for value in [
-        (
-            format!("mcp_servers.{key}.enabled"),
-            "true".to_string(),
-        ),
+        (format!("mcp_servers.{key}.enabled"), "true".to_string()),
         (
             format!("mcp_servers.{key}.command"),
             terminal_toml_string(command),
@@ -829,114 +823,11 @@ fn append_codex_mcp_tool_approval_arg(args: &mut Vec<String>, server_key: &str, 
     ));
 }
 
-fn append_codex_global_mcp_disable_args(args: &mut Vec<String>) {
-    let mut server_keys = terminal_codex_global_config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .map(|body| codex_global_mcp_server_keys_from_config(&body))
-        .unwrap_or_default();
-    for server_key in TERMINAL_KNOWN_GLOBAL_CODEX_MCP_SERVERS {
-        if !server_keys.iter().any(|key| key == server_key) {
-            server_keys.push((*server_key).to_string());
-        }
-    }
-    for server_key in server_keys {
-        args.push("-c".to_string());
-        args.push(format!(
-            "mcp_servers.{}.enabled=false",
-            terminal_toml_key_segment(&server_key)
-        ));
-    }
-}
-
-fn terminal_codex_global_config_path() -> Option<PathBuf> {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
-        .map(|home| home.join("config.toml"))
-}
-
-fn codex_global_mcp_server_keys_from_config(body: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    let mut seen = HashSet::new();
-    for line in body.lines() {
-        let Some(section) = terminal_toml_section_name(line) else {
-            continue;
-        };
-        let Some(server_key) = terminal_codex_mcp_server_key_from_section(section) else {
-            continue;
-        };
-        if TERMINAL_DIFFFORGE_MCP_SERVERS.contains(&server_key.as_str()) {
-            continue;
-        }
-        if seen.insert(server_key.clone()) {
-            keys.push(server_key);
-        }
-    }
-    keys
-}
-
-fn terminal_toml_section_name(line: &str) -> Option<&str> {
-    let trimmed = line.trim();
-    if trimmed.starts_with("[[") {
-        return None;
-    }
-    trimmed
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
-fn terminal_codex_mcp_server_key_from_section(section: &str) -> Option<String> {
-    let rest = section.trim().strip_prefix("mcp_servers.")?;
-    terminal_toml_first_key_segment(rest).filter(|key| !key.trim().is_empty())
-}
-
-fn terminal_toml_first_key_segment(value: &str) -> Option<String> {
-    let value = value.trim_start();
-    let quote = value.chars().next().filter(|quote| *quote == '"' || *quote == '\'');
-    if let Some(quote) = quote {
-        let mut key = String::new();
-        let mut escaped = false;
-        for character in value[quote.len_utf8()..].chars() {
-            if quote == '"' && escaped {
-                key.push(match character {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    '"' => '"',
-                    '\\' => '\\',
-                    other => other,
-                });
-                escaped = false;
-                continue;
-            }
-            if quote == '"' && character == '\\' {
-                escaped = true;
-                continue;
-            }
-            if character == quote {
-                return Some(key);
-            }
-            key.push(character);
-        }
-        return None;
-    }
-
-    value
-        .split('.')
-        .next()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string)
-}
-
 fn terminal_toml_key_segment(value: &str) -> String {
     if !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
     {
         value.to_string()
     } else {
@@ -990,7 +881,6 @@ fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
 
 fn apply_codex_coordinated_auto_approval_args(
     args: &mut Vec<String>,
-    write_root: Option<&str>,
     codex_profile: Option<&str>,
     bypass_hook_trust: bool,
 ) {
@@ -1007,14 +897,18 @@ fn apply_codex_coordinated_auto_approval_args(
     // profile layered on the normal Codex home. Keep older sandbox flags out
     // of the launch args so profile read/write carveouts actually take effect.
     strip_terminal_arg_option(args, "--sandbox", "-s", true);
-    strip_terminal_arg_option(args, "--dangerously-bypass-approvals-and-sandbox", "", false);
+    strip_terminal_arg_option(
+        args,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "",
+        false,
+    );
     strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);
-
-    if let Some(write_root) = write_root.filter(|value| !value.trim().is_empty()) {
-        strip_terminal_arg_option(args, "--cd", "-C", true);
-        args.push("--cd".to_string());
-        args.push(write_root.to_string());
-    }
+    strip_terminal_arg_option_value(args, "--enable", "", "apps");
+    strip_terminal_arg_option_value(args, "--disable", "", "apps");
+    strip_terminal_arg_option(args, "--cd", "-C", true);
+    args.push("--disable".to_string());
+    args.push("apps".to_string());
 
     if !terminal_args_have_option_value(args, "--enable", "", "hooks") {
         args.push("--enable".to_string());
@@ -1057,24 +951,57 @@ fn strip_terminal_arg_option(args: &mut Vec<String>, long: &str, short: &str, ta
     *args = next;
 }
 
+fn strip_terminal_arg_option_value(args: &mut Vec<String>, long: &str, short: &str, value: &str) {
+    let value = value.trim();
+    let mut next = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let exact = arg == long || (!short.is_empty() && arg == short);
+        if exact && index + 1 < args.len() && args[index + 1].trim() == value {
+            index += 2;
+            continue;
+        }
+
+        let inline_matches = (!long.is_empty()
+            && arg
+                .strip_prefix(&format!("{long}="))
+                .is_some_and(|candidate| candidate.trim() == value))
+            || (!short.is_empty()
+                && arg
+                    .strip_prefix(&format!("{short}="))
+                    .is_some_and(|candidate| candidate.trim() == value));
+        if inline_matches {
+            index += 1;
+            continue;
+        }
+
+        next.push(arg.clone());
+        index += 1;
+    }
+    *args = next;
+}
+
 fn apply_claude_coordinated_auto_approval_args(
     args: &mut Vec<String>,
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
 ) {
-    let coordination_root = terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
-        .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| coordination.repo_path.clone());
+    let coordination_root =
+        terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
+            .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| coordination.repo_path.clone());
     let enforcement_mode =
         terminal_coordination_env_value(coordination, "COORDINATION_ENFORCEMENT_MODE")
             .unwrap_or_default();
-    let file_authority = terminal_coordination_env_value(coordination, "COORDINATION_FILE_AUTHORITY")
-        .unwrap_or_default();
+    let file_authority =
+        terminal_coordination_env_value(coordination, "COORDINATION_FILE_AUTHORITY")
+            .unwrap_or_default();
     let worktree_required = enforcement_mode.trim() == "worktree_required"
         || file_authority.trim() == "git_worktree_patch";
-    let general_worker = enforcement_mode.trim() == "general_worker"
-        || file_authority.trim() == "task_scoped";
+    let general_worker =
+        enforcement_mode.trim() == "general_worker" || file_authority.trim() == "task_scoped";
     let direct_edit_allowed = enforcement_mode.trim() == "bounded_direct_edit"
         || file_authority.trim() == "bounded_direct_edit";
     let edit_root = if worktree_required || direct_edit_allowed {
@@ -1121,7 +1048,10 @@ fn apply_claude_coordinated_auto_approval_args(
         args.push("acceptEdits".to_string());
     }
 
-    if let Some(edit_root) = edit_root.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(edit_root) = edit_root
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         strip_terminal_arg_option(args, "--settings", "", true);
         args.push("--settings".to_string());
         args.push(claude_write_authority_guard_settings(
@@ -1537,10 +1467,7 @@ fn diff_forge_write_guard_decision(
     agent_kind: &str,
     identity: &DiffForgeWriteGuardIdentity,
 ) -> Result<Option<Value>, String> {
-    let tool_name = hook_input["tool_name"]
-        .as_str()
-        .unwrap_or_default()
-        .trim();
+    let tool_name = hook_input["tool_name"].as_str().unwrap_or_default().trim();
     let tool_key = tool_name.to_ascii_lowercase();
     let tool_input = &hook_input["tool_input"];
 
@@ -1582,15 +1509,9 @@ fn diff_forge_write_guard_decision(
                 .filter(|value| !value.trim().is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| coordination_root.to_path_buf());
-            if let Some(reason) =
-                diff_forge_shell_git_write_denial_reason(
-                    tool_input,
-                    &cwd,
-                    slot_key,
-                    agent_kind,
-                    identity,
-                )?
-            {
+            if let Some(reason) = diff_forge_shell_git_write_denial_reason(
+                tool_input, &cwd, slot_key, agent_kind, identity,
+            )? {
                 return Err(reason);
             }
         }
@@ -1598,9 +1519,9 @@ fn diff_forge_write_guard_decision(
     }
 
     if provider.eq_ignore_ascii_case("codex") && tool_key == "apply_patch" {
-        let command = tool_input["command"]
-            .as_str()
-            .ok_or_else(|| "Diff Forge denied apply_patch because the patch command was missing.".to_string())?;
+        let command = tool_input["command"].as_str().ok_or_else(|| {
+            "Diff Forge denied apply_patch because the patch command was missing.".to_string()
+        })?;
         let cwd = hook_input["cwd"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -1642,15 +1563,13 @@ fn diff_forge_write_guard_decision(
         }
         for candidate in candidate_paths {
             let candidate_path = claude_guard_resolved_path(&PathBuf::from(candidate), &cwd);
-            if let Some(reason) =
-                diff_forge_git_write_denial_reason(
-                    &candidate_path,
-                    slot_key,
-                    agent_kind,
-                    identity,
-                    true,
-                )?
-            {
+            if let Some(reason) = diff_forge_git_write_denial_reason(
+                &candidate_path,
+                slot_key,
+                agent_kind,
+                identity,
+                true,
+            )? {
                 return Err(reason);
             }
         }
@@ -1765,8 +1684,13 @@ fn diff_forge_git_write_denial_reason(
     identity: &DiffForgeWriteGuardIdentity,
     require_lease: bool,
 ) -> Result<Option<String>, String> {
-    let Some(route) =
-        diff_forge_git_write_route(candidate_path, slot_key, agent_kind, identity, require_lease)?
+    let Some(route) = diff_forge_git_write_route(
+        candidate_path,
+        slot_key,
+        agent_kind,
+        identity,
+        require_lease,
+    )?
     else {
         return Ok(None);
     };
@@ -1797,15 +1721,9 @@ fn diff_forge_shell_git_write_denial_reason(
     let mut cwd_is_slot_worktree_git_root = false;
     if let Some(repo_root) = diff_forge_nearest_git_root(cwd) {
         if !diff_forge_path_is_slot_worktree_root(&repo_root, slot_key) {
-            if let Some(reason) =
-                diff_forge_git_write_denial_reason(
-                    &repo_root,
-                    slot_key,
-                    agent_kind,
-                    identity,
-                    false,
-                )?
-            {
+            if let Some(reason) = diff_forge_git_write_denial_reason(
+                &repo_root, slot_key, agent_kind, identity, false,
+            )? {
                 return Ok(Some(format!(
                     "{reason} Shell commands that mutate Git repositories must run through the routed worktree path."
                 )));
@@ -1848,8 +1766,7 @@ fn diff_forge_shell_command_may_write(command: &str) -> bool {
         return true;
     }
 
-    let normalized = lowered
-        .replace(['\n', '\r', '\t', ';', '&', '|', '(', ')'], " ");
+    let normalized = lowered.replace(['\n', '\r', '\t', ';', '&', '|', '(', ')'], " ");
     let tokens = normalized.split_whitespace().collect::<Vec<_>>();
     tokens.iter().enumerate().any(|(index, token)| {
         matches!(
@@ -1929,9 +1846,7 @@ fn diff_forge_shell_command_path_candidates(command: &str, cwd: &Path) -> Vec<Pa
 
 fn diff_forge_clean_shell_path_token(token: &str) -> String {
     token
-        .trim_matches(|ch: char| {
-            matches!(ch, '\'' | '"' | '`' | ',' | ':' | '[' | ']' | '{' | '}')
-        })
+        .trim_matches(|ch: char| matches!(ch, '\'' | '"' | '`' | ',' | ':' | '[' | ']' | '{' | '}'))
         .trim()
         .to_string()
 }
@@ -2015,7 +1930,12 @@ fn diff_forge_git_write_route(
             diff_forge_active_git_write_authority(&worktree.repo_root, slot_key, identity)?;
         diff_forge_validate_authority_worktree(&authority, &worktree.worktree_root)?;
         if require_lease {
-            diff_forge_validate_active_write_lease(&worktree.repo_root, identity, &authority, None)?;
+            diff_forge_validate_active_write_lease(
+                &worktree.repo_root,
+                identity,
+                &authority,
+                None,
+            )?;
         }
         return Ok(Some(DiffForgeGitWriteRoute {
             mapped_path: candidate_path,
@@ -2030,18 +1950,21 @@ fn diff_forge_git_write_route(
 
     let authority = diff_forge_active_git_write_authority(&repo_root, slot_key, identity)?;
     let worktree = authority.worktree_root.clone();
-    let relative = candidate_path
-        .strip_prefix(&repo_root)
-        .map_err(|_| {
-            format!(
-                "Unable to map {} relative to Git root {}.",
-                candidate_path.display(),
-                repo_root.display()
-            )
-        })?;
+    let relative = candidate_path.strip_prefix(&repo_root).map_err(|_| {
+        format!(
+            "Unable to map {} relative to Git root {}.",
+            candidate_path.display(),
+            repo_root.display()
+        )
+    })?;
     let resource_key = diff_forge_file_resource_key(&candidate_path, &repo_root);
     if require_lease {
-        diff_forge_validate_active_write_lease(&repo_root, identity, &authority, resource_key.as_deref())?;
+        diff_forge_validate_active_write_lease(
+            &repo_root,
+            identity,
+            &authority,
+            resource_key.as_deref(),
+        )?;
     }
     Ok(Some(DiffForgeGitWriteRoute {
         mapped_path: worktree.join(relative),
@@ -2086,13 +2009,14 @@ fn diff_forge_slot_worktree_context(path: &Path) -> Option<DiffForgeSlotWorktree
             continue;
         }
         let repo_root = built.parent()?.to_path_buf();
-        let worktree_root = components
-            .iter()
-            .take(index + 3)
-            .fold(PathBuf::new(), |mut path, segment| {
-                path.push(segment);
-                path
-            });
+        let worktree_root =
+            components
+                .iter()
+                .take(index + 3)
+                .fold(PathBuf::new(), |mut path, segment| {
+                    path.push(segment);
+                    path
+                });
         return Some(DiffForgeSlotWorktreeContext {
             repo_root,
             worktree_root,
@@ -2166,7 +2090,9 @@ fn diff_forge_active_git_write_authority(
                 .to_string(),
         );
     }
-    if let Some(recorded_slot_key) = session["slot_key"].as_str().filter(|value| !value.is_empty())
+    if let Some(recorded_slot_key) = session["slot_key"]
+        .as_str()
+        .filter(|value| !value.is_empty())
     {
         if recorded_slot_key != slot_key {
             return Err(format!(
@@ -2174,7 +2100,10 @@ fn diff_forge_active_git_write_authority(
             ));
         }
     }
-    let Some(task_id) = session["task_id"].as_str().filter(|value| !value.trim().is_empty()) else {
+    let Some(task_id) = session["task_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+    else {
         return Err(diff_forge_start_task_required_message());
     };
     let claimed_session_id = session["claimed_session_id"].as_str().unwrap_or_default();
@@ -2320,7 +2249,7 @@ fn diff_forge_task_status_is_terminal(status: &str) -> bool {
 }
 
 fn diff_forge_start_task_required_message() -> String {
-    "Diff Forge denied this Git write because this terminal has no active task-owned worktree. Call coordination-kernel.start_task, then acquire_lease for the file, then use coordination-kernel.write_file/delete_file or a task-owned worktree edit."
+    "Diff Forge denied this Git write because this terminal has no active task-owned worktree. Call coordination-kernel.start_task, acquire_lease for the file, then use normal edit tools; Diff Forge will route permitted writes into the assigned worktree."
         .to_string()
 }
 
@@ -2446,10 +2375,7 @@ fn claude_worktree_guard_denial_reason(
     slot_key: &str,
     identity: &DiffForgeWriteGuardIdentity,
 ) -> Option<String> {
-    let tool_name = hook_input["tool_name"]
-        .as_str()
-        .unwrap_or_default()
-        .trim();
+    let tool_name = hook_input["tool_name"].as_str().unwrap_or_default().trim();
     let tool_key = tool_name.to_ascii_lowercase();
     let tool_input = &hook_input["tool_input"];
 
@@ -2469,11 +2395,7 @@ fn claude_worktree_guard_denial_reason(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| worktree_path.to_path_buf());
             match diff_forge_shell_git_write_denial_reason(
-                tool_input,
-                &cwd,
-                slot_key,
-                "claude",
-                identity,
+                tool_input, &cwd, slot_key, "claude", identity,
             ) {
                 Ok(Some(reason)) => return Some(reason),
                 Ok(None) => {}
@@ -2497,11 +2419,10 @@ fn claude_worktree_guard_denial_reason(
                 .to_string(),
         );
     }
-    let authority =
-        match diff_forge_active_git_write_authority(repo_path, slot_key, identity) {
-            Ok(authority) => authority,
-            Err(error) => return Some(error),
-        };
+    let authority = match diff_forge_active_git_write_authority(repo_path, slot_key, identity) {
+        Ok(authority) => authority,
+        Err(error) => return Some(error),
+    };
     if let Err(error) = diff_forge_validate_authority_worktree(&authority, &worktree) {
         return Some(error);
     }
@@ -2529,9 +2450,12 @@ fn claude_worktree_guard_denial_reason(
             ));
         }
         let resource_key = diff_forge_file_resource_key(&candidate_path, &worktree);
-        if let Err(error) =
-            diff_forge_validate_active_write_lease(repo_path, identity, &authority, resource_key.as_deref())
-        {
+        if let Err(error) = diff_forge_validate_active_write_lease(
+            repo_path,
+            identity,
+            &authority,
+            resource_key.as_deref(),
+        ) {
             return Some(error);
         }
     }
@@ -2629,7 +2553,8 @@ fn claude_guard_path_is_inside(path: &Path, root: &Path) -> bool {
 }
 
 fn claude_guard_path_is_under_worktree(path: &Path, repo_path: &Path, slot_key: &str) -> bool {
-    let worktrees_root = claude_guard_resolved_path(&repo_path.join(".agents").join("worktrees"), repo_path);
+    let worktrees_root =
+        claude_guard_resolved_path(&repo_path.join(".agents").join("worktrees"), repo_path);
     if !claude_guard_path_is_inside(path, &worktrees_root) {
         return false;
     }
@@ -2941,11 +2866,7 @@ fn terminal_env_vars_with_opencode_tui_config(
     env_vars: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
     let mut next = env_vars.to_vec();
-    if !provider_id
-        .trim()
-        .to_ascii_lowercase()
-        .contains("opencode")
-    {
+    if !provider_id.trim().to_ascii_lowercase().contains("opencode") {
         return Ok(next);
     }
 
@@ -3470,14 +3391,18 @@ fn agent_image_input_status(provider: AgentProvider) -> AgentImageInputStatus {
                 Some(true) => AgentImageInputStatus {
                     supported: true,
                     support: "supported",
-                    reason: format!("OpenCode is configured with an image-capable model ({active_model})."),
+                    reason: format!(
+                        "OpenCode is configured with an image-capable model ({active_model})."
+                    ),
                     active_model,
                     active_model_supports_images: true,
                 },
                 Some(false) => AgentImageInputStatus {
                     supported: false,
                     support: "unsupported",
-                    reason: format!("OpenCode is configured with a text-only model ({active_model})."),
+                    reason: format!(
+                        "OpenCode is configured with a text-only model ({active_model})."
+                    ),
                     active_model,
                     active_model_supports_images: false,
                 },
@@ -4140,9 +4065,7 @@ fn save_todo_image_attachments_for(
     }
 
     if images.len() > MAX_FORGE_IMAGES {
-        return Err(format!(
-            "Attach up to {MAX_FORGE_IMAGES} images per todo."
-        ));
+        return Err(format!("Attach up to {MAX_FORGE_IMAGES} images per todo."));
     }
 
     let mut decoded_images = Vec::with_capacity(images.len());
@@ -4278,9 +4201,7 @@ fn extract_session_id_from_json(value: &Value) -> Option<String> {
                 }
             }
 
-            object
-                .values()
-                .find_map(extract_session_id_from_json)
+            object.values().find_map(extract_session_id_from_json)
         }
         Value::Array(items) => items.iter().find_map(extract_session_id_from_json),
         _ => None,
@@ -4315,8 +4236,12 @@ fn json_content_text(value: &Value) -> String {
 fn collect_agent_turn_texts(value: &Value, texts: &mut Vec<String>) {
     match value {
         Value::Object(object) => {
-            let event_type = json_string(object.get("type")).unwrap_or_default().to_ascii_lowercase();
-            let role = json_string(object.get("role")).unwrap_or_default().to_ascii_lowercase();
+            let event_type = json_string(object.get("type"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let role = json_string(object.get("role"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
 
             if event_type == "result" {
                 if let Some(result) = json_string(object.get("result")) {
@@ -4324,7 +4249,10 @@ fn collect_agent_turn_texts(value: &Value, texts: &mut Vec<String>) {
                 }
             }
 
-            if role == "assistant" || event_type.contains("assistant") || event_type.contains("message") {
+            if role == "assistant"
+                || event_type.contains("assistant")
+                || event_type.contains("message")
+            {
                 for key in ["message", "content", "text", "delta", "output"] {
                     if let Some(child) = object.get(key) {
                         let text = json_content_text(child);
@@ -4340,7 +4268,9 @@ fn collect_agent_turn_texts(value: &Value, texts: &mut Vec<String>) {
                 .for_each(|child| collect_agent_turn_texts(child, texts));
         }
         Value::Array(items) => {
-            items.iter().for_each(|child| collect_agent_turn_texts(child, texts));
+            items
+                .iter()
+                .for_each(|child| collect_agent_turn_texts(child, texts));
         }
         _ => {}
     }
@@ -4416,7 +4346,11 @@ fn build_codex_turn_args(
     args
 }
 
-fn build_claude_turn_args(model: Option<&str>, provider_session_id: &str, prompt: &str) -> Vec<String> {
+fn build_claude_turn_args(
+    model: Option<&str>,
+    provider_session_id: &str,
+    prompt: &str,
+) -> Vec<String> {
     let mut args = vec![
         "--print".to_string(),
         "--output-format".to_string(),
@@ -4434,7 +4368,12 @@ fn build_claude_turn_args(model: Option<&str>, provider_session_id: &str, prompt
     args
 }
 
-fn build_opencode_turn_args(model: Option<&str>, provider_session_id: &str, prompt: &str, cwd: &Path) -> Vec<String> {
+fn build_opencode_turn_args(
+    model: Option<&str>,
+    provider_session_id: &str,
+    prompt: &str,
+    cwd: &Path,
+) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
         "--dir".to_string(),
@@ -4452,12 +4391,15 @@ fn build_opencode_turn_args(model: Option<&str>, provider_session_id: &str, prom
     args
 }
 
-fn run_agent_thread_turn_for(request: AgentThreadTurnRequest) -> Result<AgentThreadTurnResult, String> {
+fn run_agent_thread_turn_for(
+    request: AgentThreadTurnRequest,
+) -> Result<AgentThreadTurnResult, String> {
     let provider = parse_agent_provider(&request.agent_id)?;
     let definition = agent_definition(provider);
     let prompt = request.prompt.trim();
     let model = normalize_forge_model(request.model)?;
-    let requested_provider_session_id = clean_codex_id(request.provider_session_id.unwrap_or_default());
+    let requested_provider_session_id =
+        clean_codex_id(request.provider_session_id.unwrap_or_default());
 
     if prompt.is_empty() {
         return Err("Write a message before sending.".to_string());
@@ -4472,11 +4414,8 @@ fn run_agent_thread_turn_for(request: AgentThreadTurnRequest) -> Result<AgentThr
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {
             let path = temporary_agent_output_path("codex")?;
-            let args = build_codex_turn_args(
-                model.as_deref(),
-                &requested_provider_session_id,
-                &path,
-            );
+            let args =
+                build_codex_turn_args(model.as_deref(), &requested_provider_session_id, &path);
             output_path = Some(path);
             (args, Some(prompt))
         }
@@ -4531,7 +4470,10 @@ fn run_agent_thread_turn_for(request: AgentThreadTurnRequest) -> Result<AgentThr
     } else if !parsed_output.is_empty() {
         parsed_output
     } else {
-        clean_codex_transcript_text(command_output_text(&stdout, &stderr), CODEX_TRANSCRIPT_MAX_TEXT)
+        clean_codex_transcript_text(
+            command_output_text(&stdout, &stderr),
+            CODEX_TRANSCRIPT_MAX_TEXT,
+        )
     };
 
     Ok(AgentThreadTurnResult {

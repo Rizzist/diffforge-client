@@ -95,6 +95,43 @@ test("fresh prompt readiness still completes a completed turn", () => {
   assert.equal(groundTruth.terminalIsComplete, true);
 });
 
+test("idle terminal status is sendable when prompt readiness is fresh", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:01:00.000Z",
+      status: "idle",
+    },
+    providerBinding: {
+      inputReady: true,
+      inputReadyAt: "2026-05-30T10:01:00.000Z",
+      status: "idle",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "thinking",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "completed",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "summarize the repo" },
+        { role: "assistant", text: "Done." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.terminalLooksSendable, true);
+  assert.equal(groundTruth.completedTurnLooksSendable, true);
+  assert.equal(groundTruth.effectiveActivityStatus, "idle");
+  assert.equal(groundTruth.terminalWorkState, "complete");
+});
+
 test("fresh prompt readiness settles a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {

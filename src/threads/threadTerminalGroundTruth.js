@@ -7,6 +7,7 @@ const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
   "thread-starting",
 ]);
 export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
+const SENDABLE_TERMINAL_STATUSES = new Set(["active", "running", "idle", "ready", "prompt_ready", "input_ready"]);
 const READINESS_MAX_AGE_MS = 10 * 60 * 1000;
 let readinessVersion = 0;
 const readinessListeners = new Set();
@@ -444,6 +445,7 @@ export function getThreadTerminalGroundTruth({
   );
   const turnStartedAtMs = parseTimestampMs(turnStartedAt);
   const terminalLooksActive = ["active", "running"].includes(terminalStatus);
+  const terminalLooksSendable = SENDABLE_TERMINAL_STATUSES.has(terminalStatus);
   const inputReadyIsFreshForTurn = Boolean(
     recordedAgentInputReady
       && inputReadyAtMs > 0
@@ -454,7 +456,7 @@ export function getThreadTerminalGroundTruth({
       && (
         orphanRunningLooksIdle
         || (
-          terminalLooksActive
+          terminalLooksSendable
           && inputReadyIsFreshForTurn
           && !hasPendingPrompt
         )
@@ -490,7 +492,7 @@ export function getThreadTerminalGroundTruth({
       && !completedTurnLooksStaleActive
       && effectiveActivityStatus !== "thinking"
       && !hasPendingPrompt
-      && terminalLooksActive
+      && terminalLooksSendable
   );
   const agentInputReady = !hasPendingPrompt && (
     !requiresAgentInputReady
@@ -501,7 +503,7 @@ export function getThreadTerminalGroundTruth({
     : runningTurnLooksIdle || (
       recordedAgentInputReady
       && inputReadyIsFreshForTurn
-      && terminalLooksActive
+      && terminalLooksSendable
     )
       ? "idle_or_prompt_ready"
       : latestTurnState === "running" || activityStatus === "thinking"
@@ -600,6 +602,7 @@ export function getThreadTerminalGroundTruth({
     terminalWorkState,
     parkedStatus,
     terminalLooksActive,
+    terminalLooksSendable,
     terminalStatus,
     turnStartedAt,
     turnStartedAtMs,

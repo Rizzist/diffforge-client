@@ -120,6 +120,7 @@ const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index)
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
 const TODO_QUEUE_CLOSED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
 const TODO_QUEUE_PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
+const TODO_QUEUE_SENDABLE_TERMINAL_STATUSES = new Set(["active", "running", "idle", "ready", "prompt_ready", "input_ready"]);
 const TODO_QUEUE_BUSY_REASONS = new Set([
   "busy_activity",
   "busy_turn",
@@ -4119,6 +4120,15 @@ function normalizeTodoTerminalIndex(value) {
   return Number.isInteger(number) && number >= 0 ? number : null;
 }
 
+function todoQueueTimestampMs(value) {
+  const parsed = Date.parse(String(value || "").trim());
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isTodoQueueSendableTerminalStatus(value) {
+  return TODO_QUEUE_SENDABLE_TERMINAL_STATUSES.has(String(value || "").trim().toLowerCase());
+}
+
 function getTodoQueueTargetAgentId(item) {
   const queueState = getTodoQueueRawQueueState(item);
   return normalizeTodoTerminalAgentId(
@@ -7667,16 +7677,37 @@ function TerminalView({
     const configuredThread = getTerminalThread(normalizedIndex);
     const workspaceStatus = String(workspaceLiveTerminal?.status || "").trim().toLowerCase();
     const runtimeStatus = String(runtimeTerminal?.status || "").trim().toLowerCase();
-    const mergedStatus = workspaceStatus && workspaceStatus !== "starting"
-      ? workspaceStatus
-      : runtimeStatus || workspaceStatus || "active";
     const workspaceInputReadyAt = workspaceLiveTerminal?.inputReadyAt
       || workspaceLiveTerminal?.promptReadyAt
       || "";
     const runtimeInputReadyAt = runtimeTerminal?.inputReadyAt
       || runtimeTerminal?.promptReadyAt
       || "";
-    const inputReadyAt = workspaceInputReadyAt || runtimeInputReadyAt;
+    const workspaceStatusMs = Number(workspaceLiveTerminal?.statusSeq || 0)
+      || todoQueueTimestampMs(workspaceLiveTerminal?.updatedAt)
+      || todoQueueTimestampMs(workspaceInputReadyAt);
+    const runtimeStatusMs = Number(runtimeTerminal?.statusSeq || 0)
+      || todoQueueTimestampMs(runtimeTerminal?.updatedAt)
+      || todoQueueTimestampMs(runtimeInputReadyAt);
+    const runtimeReadyOverridesParked = Boolean(
+      runtimeStatus
+        && TODO_QUEUE_PARKED_TERMINAL_STATUSES.has(workspaceStatus)
+        && isTodoQueueSendableTerminalStatus(runtimeStatus)
+        && (
+          runtimeTerminal?.inputReady
+            || runtimeInputReadyAt
+            || !workspaceStatusMs
+            || !runtimeStatusMs
+            || runtimeStatusMs >= workspaceStatusMs - 1000
+        )
+    );
+    const runtimeIsNewer = Boolean(runtimeStatus && runtimeStatusMs && (!workspaceStatusMs || runtimeStatusMs > workspaceStatusMs));
+    const mergedStatus = runtimeReadyOverridesParked || workspaceStatus === "starting" || runtimeIsNewer
+      ? runtimeStatus || workspaceStatus || "active"
+      : workspaceStatus || runtimeStatus || "active";
+    const inputReadyAt = runtimeStatusMs > workspaceStatusMs
+      ? runtimeInputReadyAt || workspaceInputReadyAt
+      : workspaceInputReadyAt || runtimeInputReadyAt;
     const promptReadyAt = workspaceLiveTerminal?.promptReadyAt
       || runtimeTerminal?.promptReadyAt
       || inputReadyAt;
@@ -7840,17 +7871,16 @@ function TerminalView({
       return "";
     }
 
-    const terminal = Object.values(workspaceThreadEntry.terminals).find((candidate) => (
-      candidate?.threadId === safeThreadId
-      && [
-        "active",
-        "parked",
-        "resume_ready",
-        "resume_requested",
-        "starting",
-      ].includes(String(candidate.status || "").toLowerCase())
-      && Number.isInteger(Number.parseInt(candidate.terminalIndex, 10))
-    ));
+    const terminal = Object.values(workspaceThreadEntry.terminals).find((candidate) => {
+      const status = String(candidate?.status || "").toLowerCase();
+      return candidate?.threadId === safeThreadId
+        && (
+          TODO_QUEUE_SENDABLE_TERMINAL_STATUSES.has(status)
+          || TODO_QUEUE_PARKED_TERMINAL_STATUSES.has(status)
+          || status === "starting"
+        )
+        && Number.isInteger(Number.parseInt(candidate.terminalIndex, 10));
+    });
 
     return terminal ? getTerminalPaneId(Number.parseInt(terminal.terminalIndex, 10)) : "";
   }, [getTerminalPaneId, workspaceThreadEntry]);
@@ -8217,7 +8247,7 @@ function TerminalView({
       turnStartedAt,
     } = terminalGroundTruth;
       const sendableByCompletedIdleTerminal = Boolean(
-        ["active", "running"].includes(terminalStatus)
+        isTodoQueueSendableTerminalStatus(terminalStatus)
           && !targetThread?.pendingPrompt
           && effectiveLatestTurnState !== "running"
           && effectiveActivityStatus !== "thinking"
@@ -8311,17 +8341,27 @@ function TerminalView({
     const resumeLock = todoQueueTerminalResumeLocksRef.current.get(targetTerminalIndex);
     if (resumeLock) {
       const lockAgeMs = Date.now() - Number(resumeLock.startedAtMs || 0);
+      const readyAfterResume = Boolean(
+        !terminalIsParked
+          && isTodoQueueSendableTerminalStatus(terminalStatus)
+          && (
+            !String(effectiveLatestTurnState || latestTurnState || "").trim()
+            || TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState || latestTurnState)
+          )
+          && queueAgentInputReady
+          && !targetThread?.pendingPrompt
+      );
       const staleAndReady = Boolean(
         lockAgeMs > TODO_QUEUE_RESUME_LOCK_STALE_MS
           && TODO_QUEUE_CLOSED_TURN_STATES.has(effectiveLatestTurnState || latestTurnState)
-          && agentInputReady
+          && queueAgentInputReady
       );
-      if (staleAndReady) {
+      if (readyAfterResume || staleAndReady) {
         todoQueueTerminalResumeLocksRef.current.delete(targetTerminalIndex);
         logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
           lockAgeMs,
           lockId: resumeLock.lockId || "",
-          reason: "stale_but_terminal_ready",
+          reason: readyAfterResume ? "terminal_ready_after_resume" : "stale_but_terminal_ready",
           targetTerminalIndex,
           threadId: resumeLock.threadId || "",
           workspaceId: resumeLock.workspaceId || workspaceId,
@@ -8448,7 +8488,7 @@ function TerminalView({
         );
       }
     }
-    if (!liveTerminal || !["active", "running"].includes(terminalStatus)) {
+    if (!liveTerminal || !isTodoQueueSendableTerminalStatus(terminalStatus)) {
       return unavailable("terminal_starting", "This terminal is still starting.", targetFields);
     }
     if (!targetThread?.id) {
@@ -8881,6 +8921,16 @@ function TerminalView({
           && terminalInputReadyAtMs
           && terminalInputReadyAtMs >= lockStartedAtMs
       );
+      const terminalReadyAfterResume = Boolean(
+        liveTerminal
+          && !terminalIsParked
+          && isTodoQueueSendableTerminalStatus(liveStatus)
+          && (
+            !latestTurnState
+            || TODO_QUEUE_CLOSED_TURN_STATES.has(latestTurnState)
+          )
+          && (liveTerminal?.inputReady || providerBinding?.inputReady)
+      );
       const resumedTurnConfirmedFinished = Boolean(
         resumeLock?.mode === "resume"
           && TODO_QUEUE_CLOSED_TURN_STATES.has(latestTurnState)
@@ -8903,18 +8953,19 @@ function TerminalView({
         return;
       }
 
-      if (resumedTurnConfirmedFinished) {
+      if (terminalReadyAfterResume || resumedTurnConfirmedFinished) {
         resumeLocks.delete(terminalIndex);
         changed = true;
         logTerminalStatus("frontend.todo_queue.resume_lock_cleared", {
           freshInputReady,
+          terminalReadyAfterResume,
           latestMessageId,
           latestTurnId,
           latestTurnState,
           lockAgeMs,
           lockId: resumeLock?.lockId || "",
           promptTurnMatches,
-          reason: "resumed_turn_finished",
+          reason: terminalReadyAfterResume ? "terminal_ready_after_resume" : "resumed_turn_finished",
           targetTerminalIndex: terminalIndex,
           terminalInputReadyAt: liveTerminal?.inputReadyAt
             || liveTerminal?.promptReadyAt
@@ -8932,7 +8983,7 @@ function TerminalView({
         && liveTerminal
         && !terminalIsParked
       ) {
-        if (["active", "running"].includes(liveStatus)) {
+        if (["active", "running"].includes(liveStatus) && !terminalReadyAfterResume) {
           resumeLocks.set(terminalIndex, {
             ...resumeLock,
             mode: "resume",

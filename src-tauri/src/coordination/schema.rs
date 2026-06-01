@@ -31,6 +31,8 @@ pub const WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME: &str =
 pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION: i64 = 14;
 pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_agent_config_access";
+pub const WORKTREE_TASK_BINDING_MIGRATION_VERSION: i64 = 15;
+pub const WORKTREE_TASK_BINDING_MIGRATION_NAME: &str = "coordination_kernel_worktree_task_binding";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -233,6 +235,7 @@ CREATE TABLE IF NOT EXISTS events(
 
 CREATE TABLE IF NOT EXISTS worktrees(
   id TEXT PRIMARY KEY,
+  task_id TEXT,
   agent_slot_id TEXT,
   agent_id TEXT NOT NULL,
   session_id TEXT,

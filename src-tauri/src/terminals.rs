@@ -1062,11 +1062,91 @@ fn emit_terminal_close_all_progress(
     );
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalLiveActiveTaskSummary {
+    task_id: String,
+    title: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalLiveCoordinationSummary {
+    repo_path: String,
+    agent_id: String,
+    agent_kind: String,
+    session_id: String,
+    terminal_launch_epoch: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalLiveParkedPromptSummary {
+    pane_id: String,
+    instance_id: u64,
+    task_id: String,
+    title: String,
+    prompt_preview: String,
+    waiting_on: Vec<TerminalParkedWaitingOn>,
+    resume_claimed: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalLiveSessionSummary {
+    pane_id: String,
+    instance_id: u64,
+    workspace_id: String,
+    workspace_name: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+    working_directory: String,
+    session_mode: String,
+    file_authority: String,
+    coordination: Option<TerminalLiveCoordinationSummary>,
+    active_task: Option<TerminalLiveActiveTaskSummary>,
+    parked_prompt: Option<TerminalLiveParkedPromptSummary>,
+    has_active_task: bool,
+    parked: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalLiveSessionsResult {
+    generated_at_ms: u64,
+    sessions: Vec<TerminalLiveSessionSummary>,
+    parked_prompts: Vec<TerminalLiveParkedPromptSummary>,
+}
+
+fn terminal_live_prompt_preview(prompt: &str) -> String {
+    const MAX_PROMPT_PREVIEW_CHARS: usize = 240;
+    prompt.chars().take(MAX_PROMPT_PREVIEW_CHARS).collect()
+}
+
+fn terminal_live_parked_prompt_summary(
+    parked: &TerminalParkedPrompt,
+) -> TerminalLiveParkedPromptSummary {
+    TerminalLiveParkedPromptSummary {
+        pane_id: parked.pane_id.clone(),
+        instance_id: parked.instance_id,
+        task_id: parked.task_id.clone(),
+        title: parked.title.clone(),
+        prompt_preview: terminal_live_prompt_preview(&parked.prompt),
+        waiting_on: parked.waiting_on.clone(),
+        resume_claimed: parked.resume_claimed,
+    }
+}
+
 fn terminal_instance_matches_workspace(
     instance: &TerminalInstance,
     workspace_id: Option<&str>,
 ) -> bool {
-    let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return true;
     };
 
@@ -1211,36 +1291,6 @@ fn terminal_git_root_for_coordination_target(root: &Path) -> Option<PathBuf> {
     }
 }
 
-fn terminal_requested_or_current_root(
-    workspace_root: &Path,
-    requested_project_root: Option<&str>,
-    requested_mount_id: Option<&str>,
-) -> Result<PathBuf, String> {
-    if let Some(requested_mount_id) = requested_mount_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let mounts = workspace_project_mounts(workspace_root);
-        if let Some(mount) = mounts.iter().find(|mount| mount.mount_id == requested_mount_id) {
-            return Ok(mount.root_path.clone());
-        }
-        return Err(format!(
-            "Requested project mount {requested_mount_id} is not available in this workspace."
-        ));
-    }
-
-    if let Some(requested_project_root) = requested_project_root
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return PathBuf::from(requested_project_root)
-            .canonicalize()
-            .map_err(|error| format!("Unable to resolve requested project root: {error}"));
-    }
-
-    Ok(workspace_root.to_path_buf())
-}
-
 fn terminal_coordination_launch_target(
     workspace_root: &Path,
     requested_project_root: Option<&str>,
@@ -1248,17 +1298,60 @@ fn terminal_coordination_launch_target(
     _selected_workspace_was_empty_at_selection: bool,
     session_mode: TerminalSessionMode,
 ) -> Result<TerminalCoordinationLaunchTarget, String> {
+    let requested_target = requested_project_root
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        || requested_mount_id
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
     let mut target_root = match session_mode {
-        TerminalSessionMode::ManagedPatch
-        | TerminalSessionMode::General
-        | TerminalSessionMode::DirectEdit => terminal_requested_or_current_root(
+        TerminalSessionMode::ManagedPatch => workspace_coordination_root_for_terminal(
             workspace_root,
             requested_project_root,
             requested_mount_id,
         )?,
-        TerminalSessionMode::Activity | TerminalSessionMode::RemoteOps | TerminalSessionMode::Free => {
-            workspace_root.to_path_buf()
+        TerminalSessionMode::General => {
+            if !requested_target {
+                let mounts = workspace_project_mounts(workspace_root);
+                let selected_root = workspace_selected_root_mount(workspace_root, &mounts);
+                let project_count = mounts
+                    .iter()
+                    .filter(|mount| mount.mount_kind == "project")
+                    .count();
+                if selected_root.is_none() && project_count > 1 {
+                    return Ok(TerminalCoordinationLaunchTarget {
+                        root: workspace_root.to_path_buf(),
+                        enforcement_mode: "activity_only",
+                        requires_git_bootstrap: false,
+                        allows_git_init: false,
+                    });
+                }
+            }
+            workspace_coordination_root_for_terminal(
+                workspace_root,
+                requested_project_root,
+                requested_mount_id,
+            )?
         }
+        TerminalSessionMode::DirectEdit => {
+            let coordination_root = workspace_coordination_root_for_terminal(
+                workspace_root,
+                requested_project_root,
+                requested_mount_id,
+            )?;
+            if terminal_git_root_for_coordination_target(&coordination_root).is_some() {
+                coordination_root
+            } else {
+                workspace_direct_edit_root_for_terminal(
+                    workspace_root,
+                    requested_project_root,
+                    requested_mount_id,
+                )?
+            }
+        }
+        TerminalSessionMode::Activity
+        | TerminalSessionMode::RemoteOps
+        | TerminalSessionMode::Free => workspace_root.to_path_buf(),
     };
 
     if matches!(
@@ -1298,7 +1391,7 @@ fn terminal_coordination_launch_target(
                     .to_string(),
             );
         }
-        TerminalSessionMode::General if has_git_or_selected_empty_bootstrap => "general_worker",
+        TerminalSessionMode::General if has_git_or_selected_empty_bootstrap => "worktree_required",
         TerminalSessionMode::General => "bounded_direct_edit",
         TerminalSessionMode::DirectEdit if has_git => "worktree_required",
         TerminalSessionMode::DirectEdit => "bounded_direct_edit",
@@ -1325,6 +1418,24 @@ fn terminal_context_requires_isolated_worktree(
     context.enforcement_mode == "worktree_required"
 }
 
+fn terminal_process_working_directory_for_context(
+    context: &crate::coordination::models::TerminalCoordinationContext,
+    discovery_working_directory: &Path,
+) -> PathBuf {
+    if terminal_context_requires_isolated_worktree(context) {
+        PathBuf::from(&context.write_root)
+    } else {
+        workspace_path_for_process(discovery_working_directory)
+    }
+}
+
+fn terminal_session_mode_from_context(
+    context: &crate::coordination::models::TerminalCoordinationContext,
+    fallback: TerminalSessionMode,
+) -> TerminalSessionMode {
+    TerminalSessionMode::from_request(Some(context.session_mode()), fallback).unwrap_or(fallback)
+}
+
 fn terminal_path_key_after_canonicalize(path: &Path) -> String {
     path.canonicalize()
         .map(|path| normalized_path_key(&path))
@@ -1337,12 +1448,13 @@ fn terminal_is_slot_worktree_path(path: &Path, worktrees_root: &Path, slot_key: 
         return false;
     }
     let relative = path.strip_prefix(worktrees_root).ok();
-    let Some(slot_segment) = relative
-        .and_then(|path| path.components().next())
-        .and_then(|component| match component {
-            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
-            _ => None,
-        })
+    let Some(slot_segment) =
+        relative
+            .and_then(|path| path.components().next())
+            .and_then(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                _ => None,
+            })
     else {
         return false;
     };
@@ -1389,9 +1501,9 @@ fn validate_terminal_isolated_worktree_context(
         .zip(worktrees_root.canonicalize().ok())
         .map(|(write_root, worktrees_root)| write_root.starts_with(worktrees_root))
         .unwrap_or_else(|| write_root.starts_with(&worktrees_root));
-    let write_root_matches_worktree_path = worktree_path
-        .as_ref()
-        .is_some_and(|worktree_path| write_root_key == terminal_path_key_after_canonicalize(worktree_path));
+    let write_root_matches_worktree_path = worktree_path.as_ref().is_some_and(|worktree_path| {
+        write_root_key == terminal_path_key_after_canonicalize(worktree_path)
+    });
     let slot_key = context
         .slot_key
         .as_deref()
@@ -1434,6 +1546,7 @@ async fn prepare_terminal_coordination_launch(
     pty_id: String,
     terminal_launch_epoch: String,
     working_directory: PathBuf,
+    discovery_working_directory: PathBuf,
     kind: String,
     provider_for_coordination: Option<String>,
     label: String,
@@ -1506,8 +1619,6 @@ async fn prepare_terminal_coordination_launch(
                     return Err(error);
                 }
 
-                let process_working_directory =
-                    workspace_path_for_process(&PathBuf::from(&context.write_root));
                 let launch_worktree = if context.worktree_id.is_some() {
                     let branch_name = context
                         .slot_key
@@ -1531,6 +1642,8 @@ async fn prepare_terminal_coordination_launch(
                         "slotKey": context.slot_key.clone(),
                     })
                 };
+                let process_working_directory =
+                    terminal_process_working_directory_for_context(&context, &discovery_working_directory);
                 Ok((context, launch_worktree, process_working_directory))
             }
             Err(error) => Err(format!(
@@ -1910,8 +2023,13 @@ async fn close_terminal_session(
 
     if let Some(instance) = instance {
         let cleanup_instance_id = instance.id;
-        remove_terminal_parked_prompts_for_close(state, pane_id, cleanup_instance_id, "terminal_close")
-            .await;
+        remove_terminal_parked_prompts_for_close(
+            state,
+            pane_id,
+            cleanup_instance_id,
+            "terminal_close",
+        )
+        .await;
         log_terminal_crash_forensics_event(
             "backend.terminal_close.removed",
             json!({
@@ -2125,14 +2243,7 @@ async fn close_all_terminal_sessions(
         .await;
     }
 
-    emit_terminal_close_all_progress(
-        &app,
-        0,
-        total,
-        None,
-        None,
-        target_workspace_id.clone(),
-    );
+    emit_terminal_close_all_progress(&app, 0, total, None, None, target_workspace_id.clone());
 
     if scoped_close && total == 0 {
         log_terminal_crash_forensics_event(
@@ -2453,8 +2564,9 @@ async fn terminal_open(
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
     let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
     let working_directory_request = request.working_directory;
-    let workspace_root_was_empty_at_selection =
-        request.workspace_root_was_empty_at_selection.unwrap_or(false);
+    let workspace_root_was_empty_at_selection = request
+        .workspace_root_was_empty_at_selection
+        .unwrap_or(false);
     let requested_project_root = request.project_root;
     let requested_mount_id = request.mount_id;
     let requested_session_mode = request.session_mode;
@@ -2500,10 +2612,9 @@ async fn terminal_open(
         }),
     );
 
-    let preserve_coordination_session =
-        request.preserve_coordination_session.unwrap_or(false)
-            && !fresh_session
-            && session_mode.should_prepare_coordination();
+    let preserve_coordination_session = request.preserve_coordination_session.unwrap_or(false)
+        && !fresh_session
+        && session_mode.should_prepare_coordination();
     close_terminal_session(
         &state,
         Some(cloud_mcp_state.inner()),
@@ -2597,6 +2708,7 @@ async fn terminal_open(
             coordination_pty_id,
             terminal_launch_epoch,
             coordination_working_directory,
+            working_directory.clone(),
             kind.clone(),
             provider_for_coordination.clone(),
             label.clone(),
@@ -2620,6 +2732,10 @@ async fn terminal_open(
     let terminal_coordination = coordination_context
         .as_ref()
         .map(terminal_coordination_session_from_context);
+    let effective_session_mode = coordination_context
+        .as_ref()
+        .map(|context| terminal_session_mode_from_context(context, session_mode))
+        .unwrap_or(session_mode);
 
     let shell_pty = is_prewarm_pty || plain_shell;
     let warm_pty = if shell_pty {
@@ -2732,7 +2848,7 @@ async fn terminal_open(
         process_working_directory.clone(),
         agent_started,
         terminal_coordination.clone(),
-        session_mode,
+        effective_session_mode,
         terminal_metadata,
     );
 
@@ -2782,8 +2898,9 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
             "plain_shell": plain_shell,
             "rows": size.rows,
-            "completion_mode": session_mode.completion_mode(),
-            "session_mode": session_mode.as_str(),
+            "completion_mode": effective_session_mode.completion_mode(),
+            "requested_session_mode": session_mode.as_str(),
+            "session_mode": effective_session_mode.as_str(),
             "shell_pty": shell_pty,
         }),
     );
@@ -2799,8 +2916,9 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
             "plain_shell": plain_shell,
             "rows": size.rows,
-            "completion_mode": session_mode.completion_mode(),
-            "session_mode": session_mode.as_str(),
+            "completion_mode": effective_session_mode.completion_mode(),
+            "requested_session_mode": session_mode.as_str(),
+            "session_mode": effective_session_mode.as_str(),
             "shell_pty": shell_pty,
         }),
     );
@@ -2818,8 +2936,9 @@ async fn terminal_open(
             "plain_shell": plain_shell,
             "pty_backend": if cfg!(windows) { "conpty" } else { "native" },
             "rows": size.rows,
-            "completion_mode": session_mode.completion_mode(),
-            "session_mode": session_mode.as_str(),
+            "completion_mode": effective_session_mode.completion_mode(),
+            "requested_session_mode": session_mode.as_str(),
+            "session_mode": effective_session_mode.as_str(),
             "shell_pty": shell_pty,
             "term": TERMINAL_EMULATION_TERM,
             "term_program": TERMINAL_EMULATION_PROGRAM,
@@ -2879,11 +2998,11 @@ async fn terminal_open(
         session_mode: coordination_context
             .as_ref()
             .map(|context| context.session_mode().to_string())
-            .unwrap_or_else(|| session_mode.as_str().to_string()),
+            .unwrap_or_else(|| effective_session_mode.as_str().to_string()),
         file_authority: coordination_context
             .as_ref()
             .map(|context| context.file_authority().to_string())
-            .unwrap_or_else(|| session_mode.file_authority().to_string()),
+            .unwrap_or_else(|| effective_session_mode.file_authority().to_string()),
     })
 }
 
@@ -2920,9 +3039,9 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
             }
         };
         let mounts = workspace_project_mounts(&working_directory);
-        let exact_repo = mounts
-            .iter()
-            .any(|mount| normalized_path_key(&mount.root_path) == normalized_path_key(&working_directory));
+        let exact_repo = mounts.iter().any(|mount| {
+            normalized_path_key(&mount.root_path) == normalized_path_key(&working_directory)
+        });
         let recovery_roots = if !exact_repo && !mounts.is_empty() {
             mounts
                 .iter()
@@ -3579,11 +3698,13 @@ fn terminal_input_gate_apply_csi(gate: &mut TerminalInputGate) {
     match final_char {
         'C' => {
             if word_mode {
-                gate.cursor_position =
-                    terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
+                gate.cursor_position = terminal_input_gate_next_word_boundary(
+                    &gate.current_line,
+                    gate.cursor_position,
+                );
             } else {
-                gate.cursor_position = (gate.cursor_position + amount)
-                    .min(terminal_input_gate_line_char_len(gate));
+                gate.cursor_position =
+                    (gate.cursor_position + amount).min(terminal_input_gate_line_char_len(gate));
             }
         }
         'D' => {
@@ -3625,16 +3746,15 @@ fn terminal_observe_input_gate_submitted_prompt(
     }
 
     let normalized_data;
-    let data = if data.contains(TERMINAL_ENTER_SEQUENCE)
-        || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
-    {
-        normalized_data = data
-            .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
-            .replace(TERMINAL_ENTER_SEQUENCE, "\r");
-        normalized_data.as_str()
-    } else {
-        data
-    };
+    let data =
+        if data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
+            normalized_data = data
+                .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
+                .replace(TERMINAL_ENTER_SEQUENCE, "\r");
+            normalized_data.as_str()
+        } else {
+            data
+        };
     let stripped_color_reply_data = strip_bare_terminal_color_reply_input(data);
     let data = stripped_color_reply_data.as_deref().unwrap_or(data);
 
@@ -3675,8 +3795,8 @@ fn terminal_observe_input_gate_submitted_prompt(
         if gate.ansi_ss3_active {
             match character {
                 'C' => {
-                    gate.cursor_position = (gate.cursor_position + 1)
-                        .min(terminal_input_gate_line_char_len(gate));
+                    gate.cursor_position =
+                        (gate.cursor_position + 1).min(terminal_input_gate_line_char_len(gate));
                 }
                 'D' => {
                     gate.cursor_position = gate.cursor_position.saturating_sub(1);
@@ -3715,8 +3835,10 @@ fn terminal_observe_input_gate_submitted_prompt(
                     gate.ansi_escape_active = false;
                 }
                 'f' | 'F' => {
-                    gate.cursor_position =
-                        terminal_input_gate_next_word_boundary(&gate.current_line, gate.cursor_position);
+                    gate.cursor_position = terminal_input_gate_next_word_boundary(
+                        &gate.current_line,
+                        gate.cursor_position,
+                    );
                     gate.ansi_escape_active = false;
                 }
                 'd' => {
@@ -3753,7 +3875,9 @@ fn terminal_observe_input_gate_submitted_prompt(
                 gate.current_line_user_touched = true;
             }
             '\u{11}' => {
-                let start = gate.cursor_position.min(terminal_input_gate_line_char_len(gate));
+                let start = gate
+                    .cursor_position
+                    .min(terminal_input_gate_line_char_len(gate));
                 let end = terminal_input_gate_line_char_len(gate);
                 terminal_input_gate_replace_char_range(gate, start, end, "");
             }
@@ -3863,7 +3987,8 @@ fn terminal_input_write_diagnostic_kind(
     prompt_event_id: &Option<String>,
     prompt_event_text: &Option<String>,
 ) -> Option<&'static str> {
-    let has_prompt_event = terminal_input_write_has_prompt_event(prompt_event_id, prompt_event_text);
+    let has_prompt_event =
+        terminal_input_write_has_prompt_event(prompt_event_id, prompt_event_text);
     if has_prompt_event && matches!(data, "\r" | "\n") {
         return Some("prompt_submit");
     }
@@ -3924,9 +4049,7 @@ fn find_bare_terminal_color_reply_start(data: &str) -> Option<usize> {
     ["]10;rgb:", "]11;rgb:", "]12;rgb:"]
         .iter()
         .filter_map(|pattern| lower.find(pattern))
-        .filter(|index| {
-            *index == 0 || data.as_bytes().get(index.saturating_sub(1)) != Some(&0x1b)
-        })
+        .filter(|index| *index == 0 || data.as_bytes().get(index.saturating_sub(1)) != Some(&0x1b))
         .min()
 }
 
@@ -3936,8 +4059,8 @@ fn strip_bare_terminal_color_reply_input(data: &str) -> Option<String> {
     let mut changed = false;
 
     while cursor < data.len() {
-        let Some(mut start) = find_bare_terminal_color_reply_start(&data[cursor..])
-            .map(|index| cursor + index)
+        let Some(mut start) =
+            find_bare_terminal_color_reply_start(&data[cursor..]).map(|index| cursor + index)
         else {
             output.push_str(&data[cursor..]);
             break;
@@ -4072,7 +4195,9 @@ fn is_terminal_model_picker_ui_prompt(prompt: &str) -> bool {
         || lower.contains("access legacy models by running codex -m")
         || (lower.contains("select model") && lower.contains("gpt-"))
         || lower.contains("select reasoning level")
-        || (lower.contains("press enter to confirm") && lower.contains("esc") && lower.contains("go back"))
+        || (lower.contains("press enter to confirm")
+            && lower.contains("esc")
+            && lower.contains("go back"))
 }
 
 fn terminal_prompt_task_title(prompt: &str) -> String {
@@ -4225,11 +4350,7 @@ fn terminal_parked_waiting_on_from_blocking_dependencies(
         let agent_label = agent_id
             .as_deref()
             .map(terminal_waiting_agent_label)
-            .or_else(|| {
-                slot_key
-                    .as_deref()
-                    .map(terminal_waiting_slot_label)
-            });
+            .or_else(|| slot_key.as_deref().map(terminal_waiting_slot_label));
         terminal_push_unique_waiting_on(
             &mut waiting_on,
             TerminalParkedWaitingOn {
@@ -5397,8 +5518,14 @@ async fn terminal_emit_parked_prompt_interrupted(
     reason: &str,
     body: &str,
 ) {
-    mark_terminal_parked_prompt_lifecycle_in_cloud(app, cloud_mcp_state, parked, "interrupted", body)
-        .await;
+    mark_terminal_parked_prompt_lifecycle_in_cloud(
+        app,
+        cloud_mcp_state,
+        parked,
+        "interrupted",
+        body,
+    )
+    .await;
     emit_terminal_parked_prompt_event(app, parked, "interrupted", Some(reason));
 }
 
@@ -6807,7 +6934,9 @@ async fn terminal_delete_selection(
                     "stage": "write_all",
                 }),
             );
-            return Err(format!("Unable to write terminal selection delete: {error}"));
+            return Err(format!(
+                "Unable to write terminal selection delete: {error}"
+            ));
         }
         if let Err(error) = writer.flush() {
             log_terminal_crash_forensics_event(
@@ -6820,7 +6949,9 @@ async fn terminal_delete_selection(
                     "stage": "flush",
                 }),
             );
-            return Err(format!("Unable to flush terminal selection delete: {error}"));
+            return Err(format!(
+                "Unable to flush terminal selection delete: {error}"
+            ));
         }
         log_terminal_crash_forensics_event(
             "backend.terminal_selection_delete.write.done",
@@ -7339,6 +7470,109 @@ async fn terminal_close_all(
     Ok(TerminalCloseAllResult { closed })
 }
 
+#[tauri::command]
+async fn terminal_live_sessions(
+    state: State<'_, TerminalState>,
+) -> Result<TerminalLiveSessionsResult, String> {
+    let sessions = {
+        let terminals = state.terminals.read().await;
+        terminals
+            .iter()
+            .map(|(pane_id, instance)| (pane_id.clone(), instance.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let parked_prompts = {
+        let parked = state.parked_prompts.read().await;
+        parked
+            .values()
+            .cloned()
+            .map(|prompt| {
+                let key = terminal_parked_prompt_key(
+                    &prompt.pane_id,
+                    prompt.instance_id,
+                    &prompt.task_id,
+                );
+                (key, terminal_live_parked_prompt_summary(&prompt))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    let mut summaries = Vec::with_capacity(sessions.len());
+
+    for (pane_id, instance) in sessions {
+        let active_task =
+            instance
+                .active_task
+                .lock()
+                .await
+                .clone()
+                .map(|task| TerminalLiveActiveTaskSummary {
+                    task_id: task.task_id,
+                    title: task.title,
+                });
+        let parked_prompt = parked_prompts
+            .values()
+            .find(|prompt| prompt.pane_id == pane_id && prompt.instance_id == instance.id)
+            .cloned();
+        let coordination =
+            instance
+                .coordination
+                .as_ref()
+                .map(|coordination| TerminalLiveCoordinationSummary {
+                    repo_path: coordination.repo_path.clone(),
+                    agent_id: coordination.agent_id.clone(),
+                    agent_kind: coordination.agent_kind.clone(),
+                    session_id: coordination.session_id.clone(),
+                    terminal_launch_epoch: coordination.terminal_launch_epoch.clone(),
+                });
+        let metadata = instance.metadata.clone();
+        let has_active_task = active_task.is_some();
+        let parked = parked_prompt.is_some();
+
+        summaries.push(TerminalLiveSessionSummary {
+            pane_id,
+            instance_id: instance.id,
+            workspace_id: metadata.workspace_id,
+            workspace_name: metadata.workspace_name,
+            terminal_index: metadata.terminal_index,
+            thread_id: metadata.thread_id,
+            agent_id: metadata.agent_id,
+            agent_kind: metadata.agent_kind,
+            working_directory: instance.working_directory.to_string_lossy().to_string(),
+            session_mode: instance.session_mode.as_str().to_string(),
+            file_authority: instance.session_mode.file_authority().to_string(),
+            coordination,
+            active_task,
+            parked_prompt,
+            has_active_task,
+            parked,
+        });
+    }
+
+    summaries.sort_by(|left, right| {
+        left.workspace_name
+            .cmp(&right.workspace_name)
+            .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+            .then_with(|| left.terminal_index.cmp(&right.terminal_index))
+            .then_with(|| left.pane_id.cmp(&right.pane_id))
+    });
+
+    let mut parked_prompt_summaries = parked_prompts.into_values().collect::<Vec<_>>();
+    parked_prompt_summaries.sort_by(|left, right| {
+        left.pane_id
+            .cmp(&right.pane_id)
+            .then_with(|| left.instance_id.cmp(&right.instance_id))
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+
+    Ok(TerminalLiveSessionsResult {
+        generated_at_ms: terminal_now_ms(),
+        sessions: summaries,
+        parked_prompts: parked_prompt_summaries,
+    })
+}
+
 #[cfg(test)]
 mod terminal_tests {
     use super::*;
@@ -7501,7 +7735,11 @@ mod terminal_tests {
             worktree_path: Some(worktree_path.display().to_string()),
             write_root: write_root.display().to_string(),
             enforcement_mode: "worktree_required".to_string(),
-            db_path: repo.join(".agents").join("coordination.sqlite").display().to_string(),
+            db_path: repo
+                .join(".agents")
+                .join("coordination.sqlite")
+                .display()
+                .to_string(),
             repo_path: repo.display().to_string(),
             mcp_config_path: String::new(),
             codex_mcp_config_path: String::new(),
@@ -7531,8 +7769,7 @@ mod terminal_tests {
             TerminalSessionMode::ManagedPatch
         );
         assert_eq!(
-            TerminalSessionMode::from_request(Some("worktree"), TerminalSessionMode::Free)
-                .unwrap(),
+            TerminalSessionMode::from_request(Some("worktree"), TerminalSessionMode::Free).unwrap(),
             TerminalSessionMode::ManagedPatch
         );
         assert_eq!(
@@ -7551,8 +7788,11 @@ mod terminal_tests {
             TerminalSessionMode::DirectEdit
         );
         assert_eq!(
-            TerminalSessionMode::from_request(Some("free-terminal"), TerminalSessionMode::ManagedPatch)
-                .unwrap(),
+            TerminalSessionMode::from_request(
+                Some("free-terminal"),
+                TerminalSessionMode::ManagedPatch
+            )
+            .unwrap(),
             TerminalSessionMode::Free
         );
         assert_eq!(
@@ -7561,9 +7801,11 @@ mod terminal_tests {
             TerminalSessionMode::RemoteOps
         );
 
-        let invalid =
-            TerminalSessionMode::from_request(Some("root-sync-everything"), TerminalSessionMode::Free)
-                .unwrap_err();
+        let invalid = TerminalSessionMode::from_request(
+            Some("root-sync-everything"),
+            TerminalSessionMode::Free,
+        )
+        .unwrap_err();
         assert!(invalid.contains("managed_patch"));
 
         assert_eq!(TerminalSessionMode::General.file_authority(), "task_scoped");
@@ -7587,36 +7829,41 @@ mod terminal_tests {
     }
 
     #[test]
-    fn codex_coordination_context_uses_profile_without_private_home_env() {
+    fn codex_coordination_context_uses_private_home_and_profile_env() {
         let repo = terminal_test_repo("codex_profile_env");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
         let mut context = terminal_test_isolated_context(&repo, "1", &worktree, &worktree);
         context.codex_profile = Some("diffforge-test-profile".to_string());
-        context.codex_home_path = Some("/tmp/should-not-be-used".to_string());
+        context.codex_home_path = Some("/tmp/diffforge-managed-codex-home".to_string());
 
         let env_vars = context.env_vars();
 
         assert!(env_vars.iter().any(|(key, value)| {
             key == "DIFFFORGE_CODEX_PROFILE" && value == "diffforge-test-profile"
         }));
-        assert!(!env_vars.iter().any(|(key, _)| key == "CODEX_HOME"));
+        assert!(env_vars.iter().any(|(key, value)| {
+            key == "CODEX_HOME" && value == "/tmp/diffforge-managed-codex-home"
+        }));
+        assert!(env_vars.iter().any(|(key, value)| {
+            key == "DIFFFORGE_CODEX_HOME" && value == "/tmp/diffforge-managed-codex-home"
+        }));
     }
 
     #[test]
-    fn codex_home_candidates_include_legacy_private_coordination_home() {
-        let repo = terminal_test_repo("codex_legacy_home_candidates");
+    fn codex_home_candidates_include_managed_private_coordination_home() {
+        let repo = terminal_test_repo("codex_managed_home_candidates");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
-        let legacy_home = coordination::db::coordination_repo_state_root(&repo)
+        let managed_home = coordination::db::coordination_repo_state_root(&repo)
             .join("codex-home")
             .join("coordinated")
             .join("1");
-        fs::create_dir_all(&legacy_home).unwrap();
+        fs::create_dir_all(&managed_home).unwrap();
 
         let candidates = codex_home_candidates(&worktree.display().to_string());
 
-        assert!(candidates.iter().any(|path| path == &legacy_home));
+        assert!(candidates.iter().any(|path| path == &managed_home));
     }
 
     #[test]
@@ -7659,7 +7906,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_uses_general_worker_for_git_root() {
+    fn general_terminal_launch_target_uses_worktree_for_git_root() {
         let repo = terminal_test_repo("general_git_launch_target");
 
         let target = terminal_coordination_launch_target(
@@ -7671,7 +7918,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "general_worker");
+        assert_eq!(target.enforcement_mode, "worktree_required");
         assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
@@ -7713,7 +7960,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "general_worker");
+        assert_eq!(target.enforcement_mode, "worktree_required");
         assert!(target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
@@ -7728,7 +7975,11 @@ mod terminal_tests {
         fs::create_dir_all(workspace.join(".agents").join("cloud-mcp")).unwrap();
         fs::write(workspace.join(".gitignore"), ".agents/\n/logs/\n").unwrap();
         fs::create_dir_all(workspace.join("logs")).unwrap();
-        fs::write(workspace.join("logs").join("coordination-events.jsonl"), "{}\n").unwrap();
+        fs::write(
+            workspace.join("logs").join("coordination-events.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
 
         let target = terminal_coordination_launch_target(
             &workspace,
@@ -7739,7 +7990,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "general_worker");
+        assert_eq!(target.enforcement_mode, "worktree_required");
         assert!(target.requires_git_bootstrap);
         assert!(target.allows_git_init);
         assert_eq!(
@@ -7826,7 +8077,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "general_worker");
+        assert_eq!(target.enforcement_mode, "worktree_required");
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -7834,15 +8085,24 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_keeps_container_direct_until_git_path_selected() {
+    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected(
+    ) {
         let container = terminal_test_directory("general_multi_repo_container");
         let frontend = container.join("frontend");
         let backend = container.join("backend");
         fs::create_dir_all(&frontend).unwrap();
         fs::create_dir_all(&backend).unwrap();
-        let status = Command::new("git").arg("init").arg(&frontend).status().unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&frontend)
+            .status()
+            .unwrap();
         assert!(status.success());
-        let status = Command::new("git").arg("init").arg(&backend).status().unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&backend)
+            .status()
+            .unwrap();
         assert!(status.success());
 
         let container_target = terminal_coordination_launch_target(
@@ -7853,7 +8113,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
         )
         .unwrap();
-        assert_eq!(container_target.enforcement_mode, "bounded_direct_edit");
+        assert_eq!(container_target.enforcement_mode, "activity_only");
         assert!(!container_target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&container_target.root.canonicalize().unwrap()),
@@ -7868,10 +8128,72 @@ mod terminal_tests {
             TerminalSessionMode::General,
         )
         .unwrap();
-        assert_eq!(selected.enforcement_mode, "general_worker");
+        assert_eq!(selected.enforcement_mode, "worktree_required");
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
             normalized_path_key(&frontend.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_auto_selects_single_git_mount() {
+        let container = terminal_test_directory("general_single_repo_container");
+        let frontend = container.join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&frontend)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let target = terminal_coordination_launch_target(
+            &container,
+            None,
+            None,
+            false,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert!(!target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&frontend.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_finds_deep_selected_git_mount() {
+        let container = terminal_test_directory("general_deep_repo_container");
+        let deep_repo = container
+            .join("clients")
+            .join("acme")
+            .join("services")
+            .join("api");
+        fs::create_dir_all(&deep_repo).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&deep_repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let selected = terminal_coordination_launch_target(
+            &container,
+            None,
+            Some("clients/acme/services/api"),
+            false,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(selected.enforcement_mode, "worktree_required");
+        assert!(!selected.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&selected.root.canonicalize().unwrap()),
+            normalized_path_key(&deep_repo.canonicalize().unwrap())
         );
     }
 
@@ -7893,6 +8215,33 @@ mod terminal_tests {
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn worktree_required_context_process_cwd_is_assigned_worktree() {
+        let repo = terminal_test_directory("isolated_context_process_cwd");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let context = terminal_test_isolated_context(&repo, "1", &worktree, &worktree);
+        let process_cwd = terminal_process_working_directory_for_context(&context, &repo);
+
+        assert_eq!(
+            normalized_path_key(&process_cwd),
+            normalized_path_key(&worktree)
+        );
+    }
+
+    #[test]
+    fn worktree_required_context_promotes_live_session_mode_to_managed_patch() {
+        let repo = terminal_test_directory("isolated_context_effective_mode");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let context = terminal_test_isolated_context(&repo, "1", &worktree, &worktree);
+
+        assert_eq!(
+            terminal_session_mode_from_context(&context, TerminalSessionMode::General),
+            TerminalSessionMode::ManagedPatch
         );
     }
 
@@ -8145,9 +8494,10 @@ mod terminal_tests {
             "DIFFFORGE_CODEX_PROFILE".to_string(),
             "diffforge-test-profile".to_string(),
         ));
-        coordination
-            .env_vars
-            .push(("COORDINATION_WORKSPACE_ID".to_string(), "workspace-1".to_string()));
+        coordination.env_vars.push((
+            "COORDINATION_WORKSPACE_ID".to_string(),
+            "workspace-1".to_string(),
+        ));
         coordination.env_vars.push((
             "COORDINATION_OBJECTIVE_KEY".to_string(),
             "workspace-1".to_string(),
@@ -8174,17 +8524,13 @@ mod terminal_tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
-        assert!(!args.windows(2).any(|pair| pair == ["--disable", "apps"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--enable", "hooks"]));
+        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+        assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--cd", "/tmp/diffforge-agent-worktree"]));
+        assert!(!args.iter().any(|arg| arg == "--cd"));
         assert!(args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") }));
@@ -8220,9 +8566,9 @@ mod terminal_tests {
         assert!(!args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
-        assert!(args
+        assert!(!args
             .iter()
-            .any(|arg| arg == "mcp_servers.codex_apps.enabled=false"));
+            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "--no-alt-screen")
@@ -8261,50 +8607,29 @@ mod terminal_tests {
     }
 
     #[test]
-    fn codex_global_mcp_disable_args_skip_diffforge_servers() {
-        let body = r#"
-[mcp_servers.appwrite-api]
-command = "uvx"
-
-[mcp_servers.appwrite-api.env]
-APPWRITE_ENDPOINT = "https://example.test/v1"
-
-[mcp_servers.node_repl.env]
-NODE_REPL_ALLOWED = "1"
-
-[mcp_servers."foo.bar"]
-command = "foo"
-
-[mcp_servers.coordination-kernel]
-command = "diffforge"
-
-[mcp_servers.workspace-mcp-gateway]
-command = "diffforge"
-"#;
-
-        let keys = codex_global_mcp_server_keys_from_config(body);
-
-        assert_eq!(
-            keys,
-            vec![
-                "appwrite-api".to_string(),
-                "node_repl".to_string(),
-                "foo.bar".to_string()
-            ]
+    fn coordinated_codex_launch_has_no_global_plugin_disable_shims() {
+        let coordination = terminal_test_coordination("codex_no_global_plugin_shims");
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &["--model".to_string(), "gpt-5.2".to_string()],
+            Some(&coordination),
+            "pane-auto",
+            42,
         );
-        let disable_args = keys
+
+        assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
+        assert!(!args.iter().any(|arg| arg.starts_with("plugins.")));
+        assert!(!args.iter().any(|arg| arg.contains("computer-use")));
+        assert!(!args
             .iter()
-            .map(|key| format!("mcp_servers.{}.enabled=false", terminal_toml_key_segment(key)))
-            .collect::<Vec<_>>();
-        assert!(disable_args.contains(&"mcp_servers.appwrite-api.enabled=false".to_string()));
-        assert!(disable_args.contains(&"mcp_servers.node_repl.enabled=false".to_string()));
-        assert!(disable_args.contains(&"mcp_servers.\"foo.bar\".enabled=false".to_string()));
-        assert!(!disable_args
+            .any(|arg| arg.contains("browser@openai-bundled")));
+        assert!(!args.iter().any(|arg| arg.contains("codex_apps")));
+        assert!(args
             .iter()
-            .any(|arg| arg.contains("coordination-kernel")));
-        assert!(!disable_args
+            .any(|arg| arg.starts_with("mcp_servers.coordination-kernel.")));
+        assert!(args
             .iter()
-            .any(|arg| arg.contains("workspace-mcp-gateway")));
+            .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway.")));
     }
 
     #[test]
@@ -8433,14 +8758,19 @@ command = "diffforge"
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
             .unwrap();
         let settings: Value = serde_json::from_str(settings_arg).unwrap();
-        assert_eq!(settings["disableBypassPermissionsMode"].as_str(), Some("disable"));
+        assert_eq!(
+            settings["disableBypassPermissionsMode"].as_str(),
+            Some("disable")
+        );
         assert_eq!(
             settings["permissions"]["defaultMode"].as_str(),
             Some("acceptEdits")
         );
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().iter().any(
-            |hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")
-        ));
+        assert!(settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
         assert_eq!(settings["sandbox"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             settings["sandbox"]["allowUnsandboxedCommands"].as_bool(),
@@ -8470,7 +8800,10 @@ command = "diffforge"
 
         let args = terminal_args_with_codex_mcp_identity(
             "claude",
-            &["--permission-mode".to_string(), "bypassPermissions".to_string()],
+            &[
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
             Some(&coordination),
             "pane-direct",
             43,
@@ -8490,9 +8823,11 @@ command = "diffforge"
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
             .unwrap();
         let settings: Value = serde_json::from_str(settings_arg).unwrap();
-        assert!(settings["hooks"]["PreToolUse"].as_array().unwrap().iter().any(
-            |hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")
-        ));
+        assert!(settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
         assert!(settings_arg.contains("--diff-forge-write-guard"));
         let allowed_tools = args
             .windows(2)
@@ -8548,7 +8883,10 @@ command = "diffforge"
 
         let args = terminal_args_with_codex_mcp_identity(
             "claude",
-            &["--permission-mode".to_string(), "bypassPermissions".to_string()],
+            &[
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
             Some(&coordination),
             "pane-general",
             44,
@@ -8752,20 +9090,15 @@ command = "diffforge"
             repo.join("src/main.rs").display()
         );
 
-        let rewrite = diff_forge_rewrite_apply_patch(
-            &patch,
-            &repo,
-            "slot1",
-            "codex",
-            &identity,
-        )
-        .unwrap();
+        let rewrite =
+            diff_forge_rewrite_apply_patch(&patch, &repo, "slot1", "codex", &identity).unwrap();
 
         assert!(rewrite.changed);
         assert!(rewrite.command.contains(".agents/worktrees/slot1"));
-        assert!(!rewrite
-            .command
-            .contains(&format!("*** Update File: {}", repo.join("src/main.rs").display())));
+        assert!(!rewrite.command.contains(&format!(
+            "*** Update File: {}",
+            repo.join("src/main.rs").display()
+        )));
     }
 
     #[test]
@@ -8780,16 +9113,15 @@ command = "diffforge"
             }
         });
 
-        let decision =
-            diff_forge_write_guard_decision(
-                "claude",
-                &hook_input,
-                &root,
-                "slot1",
-                "claude",
-                &DiffForgeWriteGuardIdentity::default(),
-            )
-            .unwrap();
+        let decision = diff_forge_write_guard_decision(
+            "claude",
+            &hook_input,
+            &root,
+            "slot1",
+            "claude",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap();
 
         assert!(decision.is_none());
     }
@@ -8835,11 +9167,44 @@ command = "diffforge"
             }
         });
 
-        let error =
-            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
-                .unwrap_err();
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
 
         assert!(error.contains("no active write lease"));
+    }
+
+    #[test]
+    fn diff_forge_write_guard_allows_worktree_edit_with_active_lease() {
+        let repo = terminal_test_repo_with_commit("write_guard_worktree_with_lease");
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:pricing.html"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": worktree.join("pricing.html").display().to_string()
+            }
+        });
+
+        let decision = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap();
+
+        assert!(decision.is_none());
     }
 
     #[test]
@@ -8857,9 +9222,15 @@ command = "diffforge"
             }
         });
 
-        let error =
-            diff_forge_write_guard_decision("claude", &hook_input, &repo, "slot1", "claude", &identity)
-                .unwrap_err();
+        let error = diff_forge_write_guard_decision(
+            "claude",
+            &hook_input,
+            &repo,
+            "slot1",
+            "claude",
+            &identity,
+        )
+        .unwrap_err();
 
         assert!(error.contains("direct Git repository edit"));
         assert!(error.contains(".agents/worktrees/slot1"));
@@ -8951,9 +9322,15 @@ command = "diffforge"
 
         let (identity, _worktree) =
             terminal_test_task_guard_identity(&repo, "slot1", Some("file:pricing.html"));
-        let error =
-            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
-                .unwrap_err();
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
 
         assert!(error.contains("direct Git repository edit"));
         assert!(error.contains("Shell commands that mutate Git repositories"));
@@ -8972,9 +9349,15 @@ command = "diffforge"
             }
         });
 
-        let error =
-            diff_forge_write_guard_decision("codex", &hook_input, &repo, "slot1", "codex", &identity)
-                .unwrap_err();
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
 
         assert!(error.contains("no active write lease"));
     }
@@ -9024,6 +9407,34 @@ command = "diffforge"
     }
 
     #[test]
+    fn coordinated_codex_launch_disables_apps_without_codex_apps_mcp_config() {
+        let coordination = terminal_test_coordination("codex_disable_apps");
+        let args = terminal_args_with_codex_mcp_identity(
+            "codex",
+            &[
+                "--enable".to_string(),
+                "apps".to_string(),
+                "--disable".to_string(),
+                "apps".to_string(),
+            ],
+            Some(&coordination),
+            "pane-auto",
+            42,
+        );
+
+        assert!(!args.windows(2).any(|pair| pair == ["--enable", "apps"]));
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--disable" && pair[1] == "apps")
+                .count(),
+            1
+        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
+    }
+
+    #[test]
     fn opencode_launch_env_uses_system_tui_theme_config() {
         let env_vars = terminal_env_vars_with_opencode_tui_config(
             "opencode",
@@ -9047,7 +9458,10 @@ command = "diffforge"
         assert_eq!(config_paths.len(), 1);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(config_paths[0]).unwrap()).unwrap();
-        assert_eq!(config["$schema"].as_str(), Some("https://opencode.ai/tui.json"));
+        assert_eq!(
+            config["$schema"].as_str(),
+            Some("https://opencode.ai/tui.json")
+        );
         assert_eq!(config["theme"].as_str(), Some(OPENCODE_TUI_SYSTEM_THEME));
     }
 
@@ -9081,7 +9495,7 @@ command = "diffforge"
     }
 
     #[test]
-    fn coordinated_codex_launch_uses_managed_permissions_and_worktree_cwd() {
+    fn coordinated_codex_launch_uses_managed_permissions_without_overriding_cwd() {
         let mut coordination = terminal_test_coordination("codex_existing_approval_args");
         coordination.env_vars.push((
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
@@ -9129,9 +9543,11 @@ command = "diffforge"
                 .count(),
             0
         );
-        assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 1);
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "--cd").count(), 0);
         assert_eq!(
-            args.iter().filter(|arg| arg.as_str() == "--profile").count(),
+            args.iter()
+                .filter(|arg| arg.as_str() == "--profile")
+                .count(),
             1
         );
         assert!(!args
@@ -9143,16 +9559,11 @@ command = "diffforge"
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--enable", "hooks"]));
+        assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--cd", "/tmp/diffforge-agent-worktree"]));
         assert!(!args
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
@@ -9169,9 +9580,10 @@ command = "diffforge"
             "COORDINATION_ENFORCEMENT_MODE".to_string(),
             "activity_only".to_string(),
         ));
-        coordination
-            .env_vars
-            .push(("COORDINATION_FILE_AUTHORITY".to_string(), "none".to_string()));
+        coordination.env_vars.push((
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "none".to_string(),
+        ));
         coordination.env_vars.push((
             "DIFFFORGE_CODEX_PROFILE".to_string(),
             "diffforge-activity-profile".to_string(),
@@ -9191,9 +9603,7 @@ command = "diffforge"
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--profile", "diffforge-activity-profile"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--enable", "hooks"]));
+        assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
     }
 }

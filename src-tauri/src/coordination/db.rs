@@ -24,6 +24,7 @@ use super::schema::{
     WORKSPACE_MCP_INDEX_MIGRATION_NAME, WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
     WORKSPACE_MCP_INDEX_SCHEMA_SQL, WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
     WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION, WORKSPACE_MCP_REGISTRY_SCHEMA_SQL,
+    WORKTREE_TASK_BINDING_MIGRATION_NAME, WORKTREE_TASK_BINDING_MIGRATION_VERSION,
 };
 
 pub const REPO_ID: &str = "local";
@@ -391,6 +392,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_workspace_mcp_agent_config_access_migration(
         connection,
     )?);
+    diagnostics.push(apply_worktree_task_binding_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -810,6 +812,43 @@ fn apply_workspace_mcp_agent_config_access_migration(
     Ok(migration)
 }
 
+fn apply_worktree_task_binding_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    let added = ensure_column(connection, "worktrees", "task_id", "TEXT")?;
+    with_sqlite_lock_retry("Unable to initialize worktree task index", || {
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worktrees_task ON worktrees(task_id, status, updated_at)",
+            [],
+        )
+    })?;
+    let mut migration = if migration_applied(connection, WORKTREE_TASK_BINDING_MIGRATION_VERSION)? {
+        SchemaMigrationDiagnostics::new(
+            WORKTREE_TASK_BINDING_MIGRATION_VERSION,
+            WORKTREE_TASK_BINDING_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        )
+    } else {
+        record_migration_if_missing(
+            connection,
+            WORKTREE_TASK_BINDING_MIGRATION_VERSION,
+            WORKTREE_TASK_BINDING_MIGRATION_NAME,
+        )?
+    };
+    migration.details.splice(
+        0..0,
+        [
+            format!(
+                "worktrees.task_id {}",
+                if added { "added" } else { "already_present" }
+            ),
+            "idx_worktrees_task ensured".to_string(),
+        ],
+    );
+    Ok(migration)
+}
+
 fn migration_applied(connection: &Connection, version: i64) -> Result<bool, String> {
     let applied: i64 =
         with_sqlite_lock_retry("Unable to inspect coordination schema migrations", || {
@@ -956,10 +995,20 @@ fn is_lock_error(error: &SqliteError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(windows))]
     use super::*;
-    #[cfg(not(windows))]
     use std::fs;
+
+    fn temp_repo(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge_db_test_{name}_{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[cfg(not(windows))]
     #[test]
@@ -968,16 +1017,9 @@ mod tests {
         assert!(error.contains("filesystem root"));
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn mcp_temp_cleanup_leaves_fresh_temp_files_alone() {
-        let root = std::env::temp_dir().join(format!(
-            "diffforge_mcp_temp_cleanup_{}",
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = temp_repo("mcp_temp_cleanup");
         let agents = root.join("agents");
         fs::create_dir_all(&agents).unwrap();
         let root_temp = root.join("coordination.codex.toml.123.fresh.tmp");
@@ -991,5 +1033,80 @@ mod tests {
         assert!(root_temp.exists());
         assert!(agent_temp.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_worktrees_schema_without_task_id_migrates_to_v15() {
+        let repo = temp_repo("worktrees_task_id_migration");
+        let paths = StoragePaths::new(repo.clone(), None);
+        fs::create_dir_all(paths.db_path.parent().unwrap()).unwrap();
+        let legacy = Connection::open(&paths.db_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations(
+                  version INTEGER PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  applied_at TEXT NOT NULL
+                );
+                CREATE TABLE worktrees(
+                  id TEXT PRIMARY KEY,
+                  agent_slot_id TEXT,
+                  agent_id TEXT NOT NULL,
+                  session_id TEXT,
+                  path TEXT NOT NULL,
+                  branch_name TEXT NOT NULL,
+                  base_sha TEXT NOT NULL,
+                  current_sha TEXT,
+                  status TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        for version in 1..WORKTREE_TASK_BINDING_MIGRATION_VERSION {
+            legacy
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?1, ?2, 'legacy')",
+                    rusqlite::params![version, format!("legacy_{version}")],
+                )
+                .unwrap();
+        }
+        drop(legacy);
+
+        let (connection, existed, _diagnostics) = open_connection(&paths).unwrap();
+
+        assert!(existed);
+        let columns = connection
+            .prepare("PRAGMA table_info(worktrees)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "task_id"));
+
+        let indexes = connection
+            .prepare("PRAGMA index_list(worktrees)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(indexes.iter().any(|index| index == "idx_worktrees_task"));
+
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(1) FROM schema_migrations WHERE version=?1",
+                [WORKTREE_TASK_BINDING_MIGRATION_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        drop(connection);
+        let _ = fs::remove_dir_all(paths.agents_root);
+        let _ = fs::remove_dir_all(repo);
     }
 }

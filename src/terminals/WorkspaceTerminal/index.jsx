@@ -699,6 +699,42 @@ const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
 const TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS = 2500;
 const TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS = 600;
 const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
+function normalizeTerminalNativeRailState(value, fallback = "unknown") {
+  const text = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return text || fallback;
+}
+
+function formatTerminalNativeRailLabel(value) {
+  return normalizeTerminalNativeRailState(value, "unknown").replace(/[_-]+/g, " ");
+}
+
+function getTerminalNativeRailStateFields(value, label = "") {
+  const nativeRailState = normalizeTerminalNativeRailState(value, "unknown");
+  const nativeRailLabel = String(label || "").trim()
+    || formatTerminalNativeRailLabel(nativeRailState);
+  return {
+    nativeRailLabel,
+    nativeRailState,
+    native_rail_label: nativeRailLabel,
+    native_rail_state: nativeRailState,
+  };
+}
+
+function resolveTerminalNativeRailState({
+  activityStatus = "",
+  parked = false,
+  terminalState = "",
+} = {}) {
+  if (parked) {
+    return "paused";
+  }
+  const state = normalizeTerminalNativeRailState(terminalState, "");
+  const activity = normalizeTerminalNativeRailState(activityStatus, "");
+  if (state && !["prewarmed", "running"].includes(state)) {
+    return state;
+  }
+  return activity || state || "unknown";
+}
 const TERMINAL_URL_LINK_PATTERN = /((?:https?:\/\/|mailto:|tel:)[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_FILE_URL_LINK_PATTERN = /(file:\/\/\/?[^\s"'`<>()\[\]{}|]+)/gi;
 const TERMINAL_QUOTED_PATH_LINK_PATTERN = /(["'`])((?:(?:[A-Za-z]:[\\/])|(?:\\\\[^\\/\s"'`<>()\[\]{}|;,]+[\\/][^\\/\s"'`<>()\[\]{}|;,]+[\\/])|(?:\/\/[^/\s"'`<>()\[\]{}|;,]+\/[^/\s"'`<>()\[\]{}|;,]+\/)|(?:~[A-Za-z0-9_.-]*[\\/])|(?:\/)|(?:\.{1,2}[\\/]))(?:(?!\1).)*?\.[A-Za-z0-9][A-Za-z0-9_.-]*(?::\d+(?::\d+)?)?)\1/g;
@@ -1602,6 +1638,7 @@ function WorkspaceTerminal({
       agentId: terminalAgentKind,
       inputReady: false,
       instanceId: terminalInstanceIdRef.current || undefined,
+      ...getTerminalNativeRailStateFields("thinking"),
       outputText: String(outputText || "").slice(-1200),
       paneId,
       source,
@@ -2425,6 +2462,7 @@ function WorkspaceTerminal({
       activityStatus: "thinking",
       agentId: safeAgentId,
       instanceId,
+      ...getTerminalNativeRailStateFields("thinking"),
       paneId: lifecyclePaneId,
       status: "active",
       terminalIndex: lifecycleTerminalIndex,
@@ -2441,6 +2479,7 @@ function WorkspaceTerminal({
       nativeSessionId: previousProviderSessionId,
       nativeSessionKind: previousProviderSessionId ? "session" : "",
       nativeSessionSource: previousProviderSessionId ? "provider-api" : "",
+      ...getTerminalNativeRailStateFields("thinking"),
       paneId: lifecyclePaneId,
       pendingPromptId,
       projectionEvents: buildProviderTurnStartProjectionEvents({
@@ -3768,6 +3807,7 @@ function WorkspaceTerminal({
           nativeSessionId: threadProviderSessionId || "",
           nativeSessionKind: threadProviderSessionId ? "session" : "",
           nativeSessionSource: threadProviderSessionId ? promptReadySource : "",
+          ...getTerminalNativeRailStateFields("idle"),
           outputText: String(outputText || "").slice(-1200),
           paneId,
           promptReadyAt: inputReadyAt,
@@ -3854,6 +3894,7 @@ function WorkspaceTerminal({
             agentId: terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
+            ...getTerminalNativeRailStateFields("paused"),
             paneId,
             pendingPromptId: promptEventId,
             promptEventId,
@@ -3882,6 +3923,7 @@ function WorkspaceTerminal({
             agentId: terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
+            ...getTerminalNativeRailStateFields("thinking"),
             paneId,
             pendingPromptId: promptEventId || userMessageId,
             promptEventId: promptEventId || userMessageId,
@@ -8651,6 +8693,7 @@ function WorkspaceTerminal({
                 nativeSessionId: capturedProviderSessionId || threadProviderSessionId || "",
                 nativeSessionKind: capturedProviderSessionId || threadProviderSessionId ? "session" : "",
                 nativeSessionSource: capturedProviderSessionId || threadProviderSessionId ? promptReadySource : "",
+                ...getTerminalNativeRailStateFields("idle"),
                 outputText: readyOutputText.slice(-1200),
                 paneId,
                 promptReadyAt: inputReadyAt,
@@ -8760,6 +8803,7 @@ function WorkspaceTerminal({
             );
             onThreadTerminalLifecycle?.({
               instanceId: terminalInstanceId,
+              ...getTerminalNativeRailStateFields("exited"),
               paneId,
               terminalIndex,
               threadId: startupThreadId,
@@ -11964,6 +12008,16 @@ function WorkspaceTerminal({
       title: "Closing Terminal",
       visible: false,
     });
+    onThreadTerminalLifecycle?.({
+      instanceId: terminalInstanceIdRef.current || undefined,
+      ...getTerminalNativeRailStateFields("closing"),
+      paneId,
+      status: "closing",
+      terminalIndex,
+      threadId: terminalThreadIdRef.current,
+      type: "closing",
+      workspaceId: workspace?.id || "",
+    });
 
     try {
       await invoke("terminal_close", {
@@ -11982,6 +12036,16 @@ function WorkspaceTerminal({
         visible: true,
       });
       setTerminalError(errorMessage);
+      onThreadTerminalLifecycle?.({
+        instanceId: terminalInstanceIdRef.current || undefined,
+        ...getTerminalNativeRailStateFields("error"),
+        paneId,
+        status: "error",
+        terminalIndex,
+        threadId: terminalThreadIdRef.current,
+        type: "error",
+        workspaceId: workspace?.id || "",
+      });
       return;
     }
 
@@ -11996,6 +12060,7 @@ function WorkspaceTerminal({
     });
     onThreadTerminalLifecycle?.({
       instanceId: terminalInstanceIdRef.current || undefined,
+      ...getTerminalNativeRailStateFields("closed"),
       paneId,
       terminalIndex,
       threadId: terminalThreadIdRef.current,
@@ -12260,14 +12325,11 @@ function WorkspaceTerminal({
   const terminalStatusMode = isTerminalStatusErrorOverlay
     ? "detail"
     : terminalStatus?.mode || (terminalState === "starting" ? "compact" : "detail");
-  const terminalStateDebugLabel = (() => {
-    const state = String(terminalState || "").trim();
-    const activity = String(terminalThreadActivityStatus || "").trim();
-    const raw = state && !["prewarmed", "running"].includes(state)
-      ? state
-      : activity || state || "unknown";
-    return raw.replace(/[_-]+/g, " ");
-  })();
+  const terminalStateDebugLabel = formatTerminalNativeRailLabel(resolveTerminalNativeRailState({
+    activityStatus: terminalThreadActivityStatus,
+    parked: Boolean(parkedPrompt),
+    terminalState,
+  }));
   if (!agent) {
     return (
       <TerminalWorkspaceSurface>

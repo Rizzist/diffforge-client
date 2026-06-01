@@ -801,6 +801,7 @@ function readMainWindowFocusedFallback() {
 const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const APP_SHUTDOWN_PROGRESS_EVENT = "forge-app-shutdown-progress";
+const APP_CLOSE_REQUESTED_EVENT = "forge-app-close-requested";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT = "forge-terminal-close-all-progress";
 const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 const AGENT_STATUS_CACHE_KEY = "diffforge.agentStatuses.v1";
@@ -1502,6 +1503,16 @@ const WORKSPACE_CLOSE_INITIAL_STATE = {
   terminalTotalKnown: false,
   totalSteps: WORKSPACE_SHUTDOWN_STEPS.length,
 };
+const APP_CLOSE_CONFIRM_INITIAL_STATE = {
+  isOpen: false,
+  isLoading: false,
+  source: "",
+  error: "",
+  generatedAtMs: 0,
+  blockingCount: 0,
+  terminalCount: 0,
+  workspaces: [],
+};
 const WORKSPACE_DEACTIVATION_INITIAL_STATE = {
   isActive: false,
   workspaceId: "",
@@ -1661,6 +1672,133 @@ function normalizeCachedAgentStatus(status) {
       ? status.version.slice(0, 120)
       : defaults.version,
   };
+}
+
+function normalizeTerminalNativeRailState(value, fallback = "") {
+  const text = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return text || fallback;
+}
+
+function formatTerminalNativeRailLabel(value) {
+  return normalizeTerminalNativeRailState(value, "unknown").replace(/[_-]+/g, " ");
+}
+
+function getTerminalNativeRailStateFields(state, label = "") {
+  const nativeRailState = normalizeTerminalNativeRailState(state, "unknown");
+  const nativeRailLabel = String(label || "").trim()
+    || formatTerminalNativeRailLabel(nativeRailState);
+  return {
+    nativeRailLabel,
+    nativeRailState,
+    native_rail_label: nativeRailLabel,
+    native_rail_state: nativeRailState,
+  };
+}
+
+function resolveTerminalNativeRailState({
+  activityStatus = "",
+  eventType = "",
+  nativeRailState = "",
+  rawStatus = "",
+  readiness = "",
+  state = "",
+  status = "",
+  terminalIsParked = false,
+  terminalIsPromptingUser = false,
+  terminalLifecycle = "",
+  turnStatus = "",
+} = {}) {
+  const explicit = normalizeTerminalNativeRailState(nativeRailState, "");
+  if (explicit) {
+    return explicit;
+  }
+
+  const normalizedEventType = normalizeTerminalNativeRailState(eventType, "");
+  const normalizedState = normalizeTerminalNativeRailState(state, "");
+  const normalizedActivity = normalizeTerminalNativeRailState(activityStatus, "");
+  const normalizedRawStatus = normalizeTerminalNativeRailState(rawStatus, "");
+  const normalizedStatus = normalizeTerminalNativeRailState(status, "");
+  const normalizedReadiness = normalizeTerminalNativeRailState(readiness, "");
+  const normalizedLifecycle = normalizeTerminalNativeRailState(terminalLifecycle, "");
+  const normalizedTurnStatus = normalizeTerminalNativeRailState(turnStatus, "");
+
+  if (terminalIsParked || terminalIsPromptingUser) {
+    return "paused";
+  }
+  if (
+    ["paused", "parked", "resume_ready", "resume_requested", "waiting"].includes(normalizedRawStatus)
+    || ["paused", "parked", "resume_ready", "resume_requested", "waiting"].includes(normalizedStatus)
+    || normalizedReadiness === "needs_input"
+  ) {
+    return "paused";
+  }
+  if (
+    normalizedEventType === "exited"
+    || normalizedState === "exited"
+    || normalizedRawStatus === "exited"
+    || normalizedStatus === "exited"
+  ) {
+    return "exited";
+  }
+  if (
+    normalizedEventType === "closing"
+    || normalizedState === "closing"
+    || normalizedRawStatus === "closing"
+    || normalizedStatus === "closing"
+    || normalizedLifecycle === "closing"
+  ) {
+    return "closing";
+  }
+  if (
+    normalizedEventType === "closed"
+    || normalizedState === "closed"
+    || normalizedRawStatus === "closed"
+    || normalizedStatus === "closed"
+    || normalizedLifecycle === "closed"
+  ) {
+    return "closed";
+  }
+  if (
+    normalizedEventType === "error"
+    || normalizedState === "error"
+    || ["error", "failed"].includes(normalizedRawStatus)
+    || ["error", "failed"].includes(normalizedStatus)
+    || ["error", "failed"].includes(normalizedReadiness)
+    || ["error", "failed"].includes(normalizedTurnStatus)
+  ) {
+    return "error";
+  }
+  if (["blocked"].includes(normalizedState) || ["blocked"].includes(normalizedRawStatus) || ["blocked"].includes(normalizedStatus)) {
+    return "blocked";
+  }
+  if (["starting"].includes(normalizedState) || ["starting"].includes(normalizedRawStatus) || ["starting"].includes(normalizedStatus)) {
+    return "starting";
+  }
+  if (
+    ["thinking", "reasoning"].includes(normalizedActivity)
+    || ["thinking", "reasoning", "working", "running", "busy"].includes(normalizedRawStatus)
+    || ["thinking", "working"].includes(normalizedStatus)
+    || ["queued", "submitted", "pending", "running", "thinking", "reasoning", "working"].includes(normalizedTurnStatus)
+    || normalizedReadiness === "busy"
+  ) {
+    return "thinking";
+  }
+  if (
+    ["idle", "ready", "prompt_ready", "input_ready"].includes(normalizedActivity)
+    || ["idle", "ready", "prompt_ready", "input_ready", "active", "connected", "session_attached"].includes(normalizedRawStatus)
+    || ["idle", "ready", "active"].includes(normalizedStatus)
+    || ["ready", "input_ready"].includes(normalizedReadiness)
+    || ["complete", "completed", "done", "cancelled", "canceled", "interrupted"].includes(normalizedTurnStatus)
+  ) {
+    return "idle";
+  }
+  if (normalizedState && !["prewarmed", "running", "active"].includes(normalizedState)) {
+    return normalizedState;
+  }
+  if (normalizedActivity) {
+    return normalizedActivity;
+  }
+  return normalizedState || normalizedStatus || normalizedRawStatus || "unknown";
 }
 
 function readCachedAgentStatuses() {
@@ -2361,6 +2499,106 @@ function normalizeShutdownProgress(payload) {
       ? Math.floor(rawTotalSteps)
       : WORKSPACE_SHUTDOWN_STEPS.length,
   };
+}
+
+function cleanAppCloseText(value, fallback = "") {
+  const text = String(value ?? "").trim();
+  return text || fallback;
+}
+
+function normalizeAppCloseTerminalIndex(value) {
+  const terminalIndex = Number.parseInt(value, 10);
+  return Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : null;
+}
+
+function normalizeAppCloseLiveTask(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const taskId = cleanAppCloseText(value.taskId || value.task_id);
+  const title = cleanAppCloseText(value.title, taskId || "Active task");
+  return taskId || title ? { taskId, title } : null;
+}
+
+function normalizeAppCloseParkedPrompt(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const taskId = cleanAppCloseText(value.taskId || value.task_id);
+  const title = cleanAppCloseText(value.title, taskId || "Waiting for input");
+  return {
+    instanceId: normalizeCloseCount(value.instanceId || value.instance_id),
+    paneId: cleanAppCloseText(value.paneId || value.pane_id),
+    promptPreview: cleanAppCloseText(value.promptPreview || value.prompt_preview),
+    resumeClaimed: value.resumeClaimed === true || value.resume_claimed === true,
+    taskId,
+    title,
+    waitingOn: Array.isArray(value.waitingOn || value.waiting_on)
+      ? (value.waitingOn || value.waiting_on)
+      : [],
+  };
+}
+
+function normalizeTerminalLiveSessionsPayload(payload) {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+  const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+  return {
+    generatedAtMs: normalizeCloseCount(data?.generatedAtMs || data?.generated_at_ms),
+    parkedPrompts: Array.isArray(data?.parkedPrompts || data?.parked_prompts)
+      ? (data.parkedPrompts || data.parked_prompts).map(normalizeAppCloseParkedPrompt).filter(Boolean)
+      : [],
+    sessions: sessions
+      .map((session) => {
+        if (!session || typeof session !== "object") {
+          return null;
+        }
+        const paneId = cleanAppCloseText(session.paneId || session.pane_id);
+        const instanceId = normalizeCloseCount(session.instanceId || session.instance_id);
+        if (!paneId || !instanceId) {
+          return null;
+        }
+        const coordination = session.coordination && typeof session.coordination === "object"
+          ? {
+              agentId: cleanAppCloseText(session.coordination.agentId || session.coordination.agent_id),
+              agentKind: cleanAppCloseText(session.coordination.agentKind || session.coordination.agent_kind),
+              repoPath: cleanAppCloseText(session.coordination.repoPath || session.coordination.repo_path),
+              sessionId: cleanAppCloseText(session.coordination.sessionId || session.coordination.session_id),
+              terminalLaunchEpoch: cleanAppCloseText(
+                session.coordination.terminalLaunchEpoch || session.coordination.terminal_launch_epoch,
+              ),
+            }
+          : null;
+        const activeTask = normalizeAppCloseLiveTask(session.activeTask || session.active_task);
+        const parkedPrompt = normalizeAppCloseParkedPrompt(session.parkedPrompt || session.parked_prompt);
+        return {
+          activeTask,
+          agentId: cleanAppCloseText(session.agentId || session.agent_id),
+          agentKind: cleanAppCloseText(session.agentKind || session.agent_kind),
+          coordination,
+          fileAuthority: cleanAppCloseText(session.fileAuthority || session.file_authority),
+          hasActiveTask: session.hasActiveTask === true || session.has_active_task === true || Boolean(activeTask),
+          instanceId,
+          paneId,
+          parked: session.parked === true || Boolean(parkedPrompt),
+          parkedPrompt,
+          sessionMode: cleanAppCloseText(session.sessionMode || session.session_mode),
+          terminalIndex: normalizeAppCloseTerminalIndex(session.terminalIndex ?? session.terminal_index),
+          threadId: cleanAppCloseText(session.threadId || session.thread_id),
+          workingDirectory: cleanAppCloseText(session.workingDirectory || session.working_directory),
+          workspaceId: cleanAppCloseText(session.workspaceId || session.workspace_id),
+          workspaceName: cleanAppCloseText(session.workspaceName || session.workspace_name),
+        };
+      })
+      .filter(Boolean),
+  };
+}
+
+function appCloseTerminalRiskLabel(risk) {
+  if (risk === "working") return "Working";
+  if (risk === "needs_input") return "Needs input";
+  if (risk === "open_unknown") return "Open";
+  if (risk === "error") return "Error";
+  return "Idle";
 }
 
 function requestWorkspaceWebClose(reason = "app_close") {
@@ -3122,9 +3360,13 @@ function normalizeWorkspaceLifecycleSettings(value) {
 
 function readWorkspaceLifecycleSettings() {
   try {
-    return normalizeWorkspaceLifecycleSettings(
+    const settings = normalizeWorkspaceLifecycleSettings(
       JSON.parse(window.localStorage.getItem(WORKSPACE_LIFECYCLE_STORAGE_KEY) || "{}"),
     );
+    return {
+      defaultWorkspaceId: settings.defaultWorkspaceId,
+      enabledWorkspaceIds: [],
+    };
   } catch {
     return { defaultWorkspaceId: "", enabledWorkspaceIds: [] };
   }
@@ -3132,12 +3374,16 @@ function readWorkspaceLifecycleSettings() {
 
 function persistWorkspaceLifecycleSettings(settings) {
   try {
+    const normalizedSettings = normalizeWorkspaceLifecycleSettings(settings);
     window.localStorage.setItem(
       WORKSPACE_LIFECYCLE_STORAGE_KEY,
-      JSON.stringify(normalizeWorkspaceLifecycleSettings(settings)),
+      JSON.stringify({
+        defaultWorkspaceId: normalizedSettings.defaultWorkspaceId,
+        enabledWorkspaceIds: [],
+      }),
     );
   } catch {
-    // Workspace lifecycle preferences are convenience state; default startup can remain manual.
+    // Runtime activation is session-only; only the explicit startup default is persisted.
   }
 }
 
@@ -3675,6 +3921,7 @@ export default function App() {
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
   const [mainWindowFocused, setMainWindowFocused] = useState(readMainWindowFocusedFallback);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
+  const [appCloseConfirmState, setAppCloseConfirmState] = useState(APP_CLOSE_CONFIRM_INITIAL_STATE);
   const [workspaceDeactivationState, setWorkspaceDeactivationState] = useState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
   const [billingStatus, setBillingStatus] = useState(null);
   const [billingStatusState, setBillingStatusState] = useState("idle");
@@ -3723,6 +3970,7 @@ export default function App() {
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
+  const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
   const sharedMcpActiveRuntimeTargetsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
   const workspaceDeactivationInFlightRef = useRef("");
@@ -3911,6 +4159,9 @@ export default function App() {
   );
   const workspaceThreadsHydrated = workspaceThreadsHydratedKey === workspaceThreadStoreKey;
   const workspaceCloseAllowNativeRef = useRef(false);
+  useEffect(() => {
+    appCloseConfirmStateRef.current = appCloseConfirmState;
+  }, [appCloseConfirmState]);
 
   const setWorkspaceGraphStatus = useCallback((repoPath, workspaceId, statusPatch) => {
     const key = workspaceGraphStateKey(repoPath, workspaceId);
@@ -6003,19 +6254,17 @@ export default function App() {
       const existingEnabledWorkspaceIds = configuredEnabledWorkspaceIds.filter((workspaceId) => (
         Boolean(findWorkspaceById(nextWorkspaces, workspaceId))
       ));
-      const firstEnabledWorkspace = existingEnabledWorkspaceIds
-        .map((workspaceId) => findWorkspaceById(nextWorkspaces, workspaceId))
-        .find(Boolean);
       const nextActivated = findWorkspaceById(nextWorkspaces, currentActivatedId)
         || defaultWorkspace
-        || firstEnabledWorkspace
         || null;
-      const startupAutoActivation = !currentActivatedId && Boolean(nextActivated?.id);
-      const nextEnabledWorkspaceIds = startupAutoActivation
-        ? [nextActivated.id]
-        : nextActivated?.id && !existingEnabledWorkspaceIds.includes(nextActivated.id)
-          ? [...existingEnabledWorkspaceIds, nextActivated.id]
-          : existingEnabledWorkspaceIds;
+      const nextEnabledWorkspaceIds = (() => {
+        if (currentActivatedId && nextActivated?.id) {
+          return existingEnabledWorkspaceIds.includes(nextActivated.id)
+            ? existingEnabledWorkspaceIds
+            : [...existingEnabledWorkspaceIds, nextActivated.id];
+        }
+        return defaultWorkspace?.id ? [defaultWorkspace.id] : [];
+      })();
 
       if (
         (configuredDefaultWorkspaceId && !nextDefaultWorkspaceId)
@@ -6036,8 +6285,7 @@ export default function App() {
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId((currentSelectedId) => {
         const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId)
-          || nextActivated
-          || defaultWorkspace;
+          || nextActivated;
 
         return nextSelected?.id || "";
       });
@@ -6185,7 +6433,7 @@ export default function App() {
       setSelectedWorkspaceId(workspace.id);
       setActivatedWorkspaceId(workspace.id);
       updateWorkspaceLifecycleSettings({
-        defaultWorkspaceId: currentLifecycleSettings.defaultWorkspaceId || workspace.id,
+        defaultWorkspaceId: currentLifecycleSettings.defaultWorkspaceId || "",
         enabledWorkspaceIds: nextEnabledWorkspaceIds,
       });
       setWorkspaceName("");
@@ -7524,7 +7772,225 @@ export default function App() {
     toggleWindowSize();
   }, [toggleWindowSize]);
 
-  const closeWindow = useCallback((event) => {
+  const buildAppCloseActiveTerminalSnapshot = useCallback((livePayload, source = "app_close") => {
+    const liveSnapshot = normalizeTerminalLiveSessionsPayload(livePayload);
+    const presenceWorkspaces = terminalPresenceWorkspacesRef.current || [];
+    const threadsSnapshot = workspaceThreadsRef.current || {};
+    const workspaceList = workspacesRef.current || [];
+    const workspaceSettingsSnapshot = workspaceSettingsRef.current || {};
+    const grouped = new Map();
+
+    const findPresenceWorkspace = (session) => presenceWorkspaces.find((workspace) => (
+      (session.workspaceId && workspace.workspaceId === session.workspaceId)
+      || (
+        session.workingDirectory
+        && workspace.repoPath
+        && cleanWorkspaceRootDirectory(workspace.repoPath) === cleanWorkspaceRootDirectory(session.workingDirectory)
+      )
+    )) || null;
+
+    const findPresenceTerminal = (presenceWorkspace, session) => {
+      if (!presenceWorkspace?.terminals?.length) {
+        return null;
+      }
+      return presenceWorkspace.terminals.find((terminal) => (
+        (terminal.paneId && terminal.paneId === session.paneId)
+        || (
+          terminal.terminalInstanceId
+          && Number(terminal.terminalInstanceId) === Number(session.instanceId)
+        )
+        || (
+          session.terminalIndex != null
+          && Number(terminal.terminalIndex) === Number(session.terminalIndex)
+        )
+      )) || null;
+    };
+
+    const ensureWorkspace = (session, presenceWorkspace) => {
+      const workspaceId = session.workspaceId || presenceWorkspace?.workspaceId || "";
+      const workspace = workspaceId ? findWorkspaceById(workspaceList, workspaceId) : null;
+      const repoPath = session.workingDirectory
+        || presenceWorkspace?.repoPath
+        || getWorkspaceRootDirectory(workspaceSettingsSnapshot, workspaceId)
+        || defaultWorkingDirectoryRef.current
+        || "";
+      const workspaceName = session.workspaceName
+        || presenceWorkspace?.workspaceName
+        || workspace?.name
+        || (repoPath ? getDirectoryName(repoPath) : "Workspace");
+      const key = workspaceId || repoPath || workspaceName;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          repoPath,
+          workspaceId,
+          workspaceName,
+          terminals: [],
+        });
+      }
+
+      return grouped.get(key);
+    };
+
+    liveSnapshot.sessions.forEach((session) => {
+      const presenceWorkspace = findPresenceWorkspace(session);
+      const presenceTerminal = findPresenceTerminal(presenceWorkspace, session);
+      const workspaceId = session.workspaceId || presenceWorkspace?.workspaceId || "";
+      const terminalIndex = session.terminalIndex ?? presenceTerminal?.terminalIndex ?? null;
+      const agentId = normalizeWorkspaceTerminalRole(
+        session.agentId || session.agentKind || presenceTerminal?.agentId || WORKSPACE_TERMINAL_ROLE_GENERIC,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      );
+      const workspaceEntry = workspaceId ? threadsSnapshot?.[workspaceId] : null;
+      let thread = session.threadId && workspaceEntry?.threads
+        ? workspaceEntry.threads[session.threadId]
+        : null;
+      if (!thread && workspaceId && terminalIndex != null) {
+        thread = getWorkspaceThreadForTerminalIndex(threadsSnapshot, workspaceId, terminalIndex);
+      }
+      const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+      const liveTerminal = {
+        ...(presenceTerminal || {}),
+        agentId,
+        inputReady: presenceTerminal?.inputReady,
+        instanceId: session.instanceId,
+        paneId: session.paneId,
+        status: presenceTerminal?.status || "active",
+        terminalIndex,
+        threadId: session.threadId || presenceTerminal?.threadId || thread?.id || "",
+      };
+      const groundTruth = getThreadTerminalGroundTruth({
+        liveTerminal,
+        providerBinding,
+        targetRole: agentId,
+        thread,
+      });
+      const latestTurnState = String(
+        groundTruth.effectiveLatestTurnState
+          || thread?.latestTurn?.state
+          || thread?.latestTurn?.status
+          || "",
+      ).trim().toLowerCase();
+      const activityStatus = String(
+        groundTruth.effectiveActivityStatus
+          || thread?.activityStatus
+          || providerBinding?.activityStatus
+          || "",
+      ).trim().toLowerCase();
+      const terminalWorkState = String(groundTruth.terminalWorkState || "").trim().toLowerCase();
+      const presenceStatus = String(presenceTerminal?.status || "").trim().toLowerCase();
+      const readiness = String(presenceTerminal?.readiness || "").trim().toLowerCase();
+      const nativeRailLabel = cleanAppCloseText(
+        presenceTerminal?.nativeRailLabel || presenceTerminal?.native_rail_label,
+      );
+      const isReady = Boolean(
+        groundTruth.agentInputReady
+          || groundTruth.terminalIsComplete
+          || readiness === "ready"
+          || presenceStatus === "ready"
+      );
+      const isWorking = Boolean(
+        session.hasActiveTask
+          || session.activeTask
+          || latestTurnState === "running"
+          || activityStatus === "thinking"
+          || terminalWorkState === "running"
+          || readiness === "busy"
+          || ["thinking", "working", "running", "starting"].includes(presenceStatus)
+      );
+      const needsInput = Boolean(
+        session.parked
+          || session.parkedPrompt
+          || groundTruth.terminalIsParked
+          || groundTruth.terminalIsPromptingUser
+          || terminalWorkState === "parked"
+          || terminalWorkState === "prompting_user"
+          || readiness === "needs_input"
+          || ["paused", "parked", "waiting", "resume_ready"].includes(presenceStatus)
+      );
+      const hasError = Boolean(
+        terminalWorkState === "error"
+          || readiness === "error"
+          || presenceStatus === "error"
+          || latestTurnState === "error"
+      );
+      const isUnknownOpen = Boolean(
+        !presenceTerminal
+          || (!isReady && agentId === WORKSPACE_TERMINAL_ROLE_GENERIC)
+          || (!isReady && !isWorking && !needsInput && !hasError)
+      );
+      const risk = needsInput
+        ? "needs_input"
+        : isWorking
+          ? "working"
+          : hasError
+            ? "error"
+            : isUnknownOpen
+              ? "open_unknown"
+              : "idle";
+
+      if (risk === "idle") {
+        return;
+      }
+
+      const group = ensureWorkspace(session, presenceWorkspace);
+      const terminalNumber = terminalIndex == null ? "" : String(Number(terminalIndex) + 1);
+      group.terminals.push({
+        activeTaskTitle: session.activeTask?.title || "",
+        agentId,
+        agentLabel: presenceTerminal?.agentLabel
+          || (agentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(agentId)),
+        color: presenceTerminal?.color || TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(getTerminalAgentColorSlot(terminalIndex || 0))] || "",
+        instanceId: session.instanceId,
+        nativeRailLabel,
+        paneId: session.paneId,
+        parkedPromptTitle: session.parkedPrompt?.title || "",
+        readiness,
+        risk,
+        riskLabel: appCloseTerminalRiskLabel(risk),
+        sessionMode: session.sessionMode,
+        terminalIndex,
+        terminalLabel: terminalNumber ? `Terminal ${terminalNumber}` : "Terminal",
+        terminalWorkState,
+        threadId: session.threadId || thread?.id || "",
+      });
+    });
+
+    const workspaces = [...grouped.values()]
+      .map((workspace) => ({
+        ...workspace,
+        terminals: workspace.terminals.sort((left, right) => (
+          Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
+        )),
+      }))
+      .filter((workspace) => workspace.terminals.length > 0)
+      .sort((left, right) => left.workspaceName.localeCompare(right.workspaceName));
+    const blockingCount = workspaces.reduce((total, workspace) => total + workspace.terminals.length, 0);
+
+    return {
+      ...APP_CLOSE_CONFIRM_INITIAL_STATE,
+      blockingCount,
+      generatedAtMs: liveSnapshot.generatedAtMs || Date.now(),
+      isOpen: blockingCount > 0,
+      source,
+      terminalCount: liveSnapshot.sessions.length,
+      workspaces,
+    };
+  }, [workspaceTerminalFallbackRole, workspaceTerminalRoleOptions]);
+
+  const readAppCloseActiveTerminalSnapshot = useCallback(async (source = "app_close") => {
+    const liveSessions = await invoke("terminal_live_sessions");
+    return buildAppCloseActiveTerminalSnapshot(liveSessions, source);
+  }, [buildAppCloseActiveTerminalSnapshot]);
+
+  const performCloseWindow = useCallback((eventOrOptions = null, maybeOptions = {}) => {
+    const options = eventOrOptions && typeof eventOrOptions === "object" && typeof eventOrOptions.stopPropagation !== "function"
+      ? eventOrOptions
+      : maybeOptions;
+    const event = eventOrOptions && typeof eventOrOptions.stopPropagation === "function"
+      ? eventOrOptions
+      : null;
     event?.stopPropagation?.();
 
     const appWindow = getSafeCurrentWindow();
@@ -7536,7 +8002,7 @@ export default function App() {
     if (workspaceCloseInFlightRef.current) {
       logTerminalStatus("frontend.app_close.requested", {
         expectedTerminalTotal: normalizeCloseCount(workspaceCloseExpectedTotalRef.current),
-        reason: "app_close_retry",
+        reason: `${options.reason || "app_close"}_retry`,
       });
       requestWorkspaceWebClose("app_close_retry");
       return;
@@ -7544,10 +8010,12 @@ export default function App() {
 
     workspaceCloseInFlightRef.current = true;
     workspaceCloseAllowNativeRef.current = false;
-    const expectedTerminalTotal = normalizeCloseCount(workspaceCloseExpectedTotalRef.current);
+    const expectedTerminalTotal = normalizeCloseCount(
+      options.expectedTerminalTotal ?? workspaceCloseExpectedTotalRef.current,
+    );
     logTerminalStatus("frontend.app_close.requested", {
       expectedTerminalTotal,
-      reason: "app_close",
+      reason: options.reason || "app_close",
     });
     const browserClosePromise = requestWorkspaceWebClose("app_close");
     setWorkspaceCloseState({
@@ -7678,6 +8146,82 @@ export default function App() {
     });
   }, []);
 
+  const closeWindow = useCallback((eventOrOptions = null, maybeOptions = {}) => {
+    const options = eventOrOptions && typeof eventOrOptions === "object" && typeof eventOrOptions.stopPropagation !== "function"
+      ? eventOrOptions
+      : maybeOptions;
+    const event = eventOrOptions && typeof eventOrOptions.stopPropagation === "function"
+      ? eventOrOptions
+      : null;
+    const reason = options.reason || "app_close";
+
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+
+    if (workspaceCloseInFlightRef.current) {
+      performCloseWindow({ reason: `${reason}_retry` });
+      return;
+    }
+
+    if (appCloseConfirmStateRef.current.isOpen || appCloseConfirmStateRef.current.isLoading) {
+      return;
+    }
+
+    const loadingConfirmation = {
+      ...APP_CLOSE_CONFIRM_INITIAL_STATE,
+      isLoading: true,
+      source: reason,
+    };
+    appCloseConfirmStateRef.current = loadingConfirmation;
+    setAppCloseConfirmState(loadingConfirmation);
+
+    runWindowAction(async () => {
+      try {
+        const snapshot = await readAppCloseActiveTerminalSnapshot(reason);
+        if (snapshot.blockingCount > 0) {
+          appCloseConfirmStateRef.current = snapshot;
+          setAppCloseConfirmState(snapshot);
+          return;
+        }
+
+        appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
+        setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
+        performCloseWindow({
+          expectedTerminalTotal: snapshot.terminalCount,
+          reason,
+        });
+      } catch (error) {
+        const errorConfirmation = {
+          ...APP_CLOSE_CONFIRM_INITIAL_STATE,
+          error: getErrorMessage(error, "Unable to inspect running terminals before shutdown."),
+          isOpen: true,
+          source: reason,
+        };
+        appCloseConfirmStateRef.current = errorConfirmation;
+        setAppCloseConfirmState(errorConfirmation);
+      }
+    });
+  }, [performCloseWindow, readAppCloseActiveTerminalSnapshot]);
+
+  const cancelAppCloseConfirmation = useCallback(() => {
+    const currentConfirmation = appCloseConfirmStateRef.current;
+    appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
+    setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
+    logTerminalStatus("frontend.app_close.cancelled", {
+      reason: currentConfirmation.source || "app_close",
+    });
+  }, []);
+
+  const continueAppCloseAfterConfirmation = useCallback(() => {
+    const currentConfirmation = appCloseConfirmStateRef.current;
+    appCloseConfirmStateRef.current = APP_CLOSE_CONFIRM_INITIAL_STATE;
+    setAppCloseConfirmState(APP_CLOSE_CONFIRM_INITIAL_STATE);
+    performCloseWindow({
+      expectedTerminalTotal: currentConfirmation.terminalCount,
+      reason: `${currentConfirmation.source || "app_close"}_confirmed`,
+    });
+  }, [performCloseWindow]);
+
   useEffect(() => {
     let isMounted = true;
     let unlistenCloseRequested = null;
@@ -7693,7 +8237,7 @@ export default function App() {
       }
 
       event.preventDefault();
-      closeWindow();
+      closeWindow({ reason: "native_window_close" });
     })
       .then((unlisten) => {
         if (!isMounted && typeof unlisten === "function") {
@@ -7710,6 +8254,35 @@ export default function App() {
 
       if (typeof unlistenCloseRequested === "function") {
         unlistenCloseRequested();
+      }
+    };
+  }, [closeWindow]);
+
+  useEffect(() => {
+    let isMounted = true;
+    let unlistenAppCloseRequested = null;
+
+    listen(APP_CLOSE_REQUESTED_EVENT, (event) => {
+      const payload = event.payload || {};
+      closeWindow({
+        reason: payload.reason || payload.source || "app_exit_requested",
+      });
+    })
+      .then((unlisten) => {
+        if (!isMounted && typeof unlisten === "function") {
+          unlisten();
+          return;
+        }
+
+        unlistenAppCloseRequested = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      isMounted = false;
+
+      if (typeof unlistenAppCloseRequested === "function") {
+        unlistenAppCloseRequested();
       }
     };
   }, [closeWindow]);
@@ -8558,6 +9131,31 @@ export default function App() {
               if (status === "error") return "error";
               return "ready";
             })();
+            const terminalLifecycle = liveTerminal || hasSession ? "open" : "closed";
+            const nativeRailState = resolveTerminalNativeRailState({
+              activityStatus: rawActivity,
+              nativeRailState: liveTerminal?.nativeRailState
+                || liveTerminal?.native_rail_state
+                || thread?.nativeRailState
+                || thread?.native_rail_state
+                || "",
+              rawStatus: rawActivity,
+              readiness,
+              state: liveStatus || terminalLifecycle,
+              status,
+              terminalIsParked: terminalGroundTruth.terminalIsParked,
+              terminalIsPromptingUser: terminalGroundTruth.terminalIsPromptingUser,
+              terminalLifecycle,
+              turnStatus,
+            });
+            const nativeRailFields = getTerminalNativeRailStateFields(
+              nativeRailState,
+              liveTerminal?.nativeRailLabel
+                || liveTerminal?.native_rail_label
+                || thread?.nativeRailLabel
+                || thread?.native_rail_label
+                || "",
+            );
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
               ? "Terminal"
               : getManagedAgentLabel(normalizedRole);
@@ -8584,6 +9182,7 @@ export default function App() {
               color,
               colorSlot,
               inputReady: Boolean(terminalGroundTruth.agentInputReady),
+              ...nativeRailFields,
               paneId,
               readiness,
               sessionState: hasSession ? "session_attached" : "no_session",
@@ -8592,7 +9191,7 @@ export default function App() {
               terminalEpoch: `${paneId}:${terminalInstanceId || "0"}`,
               terminalIndex,
               terminalInstanceId,
-              terminalLifecycle: liveTerminal || hasSession ? "open" : "closed",
+              terminalLifecycle,
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
               turnId: latestTurn?.id || latestTurn?.turnId || "",
               turnStatus,
@@ -8685,6 +9284,7 @@ export default function App() {
     const statusAfter = (() => {
       if (options.statusAfter || options.status) return String(options.statusAfter || options.status).trim().toLowerCase();
       if (["closed", "exited"].includes(eventType)) return "closed";
+      if (eventType === "closing" || rawStatus === "closing") return "closing";
       if (eventType === "provider-turn-error" || rawStatus === "error" || rawStatus === "failed") return "error";
       if (
         eventType === "terminal-prompt-ready"
@@ -8710,6 +9310,7 @@ export default function App() {
       if (statusAfter === "working") return "busy";
       if (statusAfter === "paused") return "needs_input";
       if (statusAfter === "error") return "error";
+      if (statusAfter === "closing") return "closing";
       if (statusAfter === "closed") return "closed";
       return "ready";
     })();
@@ -8717,7 +9318,7 @@ export default function App() {
       if (statusAfter === "working") return "running";
       if (statusAfter === "error") return "failed";
       if (eventType === "provider-turn-interrupted") return "interrupted";
-      if (statusAfter === "closed") return "interrupted";
+      if (statusAfter === "closed" || statusAfter === "closing") return "interrupted";
       if (statusAfter === "idle") return "completed";
       return "";
     })();
@@ -8785,6 +9386,40 @@ export default function App() {
         || workspaceId,
       workspaceStatus: "active",
     };
+    const terminalLifecycle = statusAfter === "closed"
+      ? "closed"
+      : statusAfter === "closing"
+        ? "closing"
+        : "open";
+    const nativeRailState = resolveTerminalNativeRailState({
+      activityStatus: options.activityStatus || event.activityStatus || rawStatus,
+      eventType,
+      nativeRailState: options.nativeRailState
+        || options.native_rail_state
+        || event.nativeRailState
+        || event.native_rail_state
+        || presenceTerminal?.nativeRailState
+        || presenceTerminal?.native_rail_state
+        || "",
+      rawStatus,
+      readiness: readinessAfter,
+      state: event.state || options.state || "",
+      status: statusAfter,
+      terminalIsParked: event.terminalIsParked === true || event.terminal_is_parked === true,
+      terminalIsPromptingUser: event.terminalIsPromptingUser === true || event.terminal_is_prompting_user === true,
+      terminalLifecycle,
+      turnStatus,
+    });
+    const nativeRailFields = getTerminalNativeRailStateFields(
+      nativeRailState,
+      options.nativeRailLabel
+        || options.native_rail_label
+        || event.nativeRailLabel
+        || event.native_rail_label
+        || presenceTerminal?.nativeRailLabel
+        || presenceTerminal?.native_rail_label
+        || "",
+    );
     const terminalPayload = {
       agentId,
       agentKind: agentId,
@@ -8796,6 +9431,7 @@ export default function App() {
       eventId: `${terminalKey}:${statusSeq}`,
       eventType,
       inputReady: readinessAfter === "ready",
+      ...nativeRailFields,
       observedAtMs,
       paneId,
       readiness: readinessAfter,
@@ -8808,7 +9444,7 @@ export default function App() {
       terminalId: paneId,
       terminalIndex: safeTerminalIndex,
       terminalInstanceId,
-      terminalLifecycle: statusAfter === "closed" ? "closed" : "open",
+      terminalLifecycle,
       threadId,
       turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
       turnStatus,
@@ -12792,6 +13428,8 @@ export default function App() {
         : "No live terminals to close"
       : "Counting live terminals"
     : `Step ${Math.min(workspaceClosePhaseIndex + 1, workspaceCloseTotalSteps)} / ${workspaceCloseTotalSteps}`;
+  const appCloseConfirmTerminalLabel = appCloseConfirmState.blockingCount === 1 ? "terminal" : "terminals";
+  const appCloseConfirmWorkspaceLabel = appCloseConfirmState.workspaces.length === 1 ? "workspace" : "workspaces";
   const workspaceDeactivateReportedClosed = normalizeCloseCount(workspaceDeactivationState.closed);
   const workspaceDeactivateTotal = Math.max(
     normalizeCloseCount(workspaceDeactivationState.total),
@@ -14610,7 +15248,87 @@ export default function App() {
               </LoginLayout>
             </LoginScreen>
           )}
-        </AppContent>
+	        </AppContent>
+
+        {appCloseConfirmState.isOpen && (
+          <CrashRecoveryOverlay>
+            <CrashRecoveryDialog
+              aria-labelledby="app-close-confirm-title"
+              aria-modal="true"
+              role="dialog"
+            >
+              <WorkspaceSettingsDialogHeader>
+                <WorkspaceSettingsHeaderMain>
+                  <PanelKicker>Shutdown check</PanelKicker>
+                  <PanelHeading id="app-close-confirm-title">
+                    {appCloseConfirmState.error ? "Confirm shutdown" : "Terminals still active"}
+                  </PanelHeading>
+                </WorkspaceSettingsHeaderMain>
+                <WorkspaceSettingsHeaderActions>
+                  <WorkspaceModalCloseButton
+                    aria-label="Cancel shutdown"
+                    onClick={cancelAppCloseConfirmation}
+                    type="button"
+                  >
+                    <ButtonCloseIcon aria-hidden="true" />
+                  </WorkspaceModalCloseButton>
+                </WorkspaceSettingsHeaderActions>
+              </WorkspaceSettingsDialogHeader>
+
+              <CrashRecoveryIntro>
+                {appCloseConfirmState.error ? (
+                  <p>{appCloseConfirmState.error}</p>
+                ) : (
+                  <p>
+                    {appCloseConfirmState.blockingCount} {appCloseConfirmTerminalLabel} across{" "}
+                    {appCloseConfirmState.workspaces.length} {appCloseConfirmWorkspaceLabel} are not idle.
+                  </p>
+                )}
+                <p>Shutting down now will stop those terminal processes.</p>
+              </CrashRecoveryIntro>
+
+              {!appCloseConfirmState.error && (
+                <CrashRecoveryList>
+                  {appCloseConfirmState.workspaces.map((workspace) => (
+                    <CrashRecoveryItem key={workspace.workspaceId || workspace.repoPath || workspace.workspaceName}>
+                      <CrashRecoveryItemTitle>
+                        {workspace.workspaceName}
+                      </CrashRecoveryItemTitle>
+                      <CrashRecoveryItemBody>
+                        {workspace.terminals.length} active {workspace.terminals.length === 1 ? "terminal" : "terminals"}
+                      </CrashRecoveryItemBody>
+                      {workspace.terminals.map((terminal) => (
+                        <CrashRecoveryMeta key={`${terminal.paneId}:${terminal.instanceId}`}>
+                          <span>{terminal.terminalLabel}</span>
+                          <span>{terminal.agentLabel}</span>
+                          <span>{terminal.riskLabel}</span>
+                          {(terminal.activeTaskTitle || terminal.parkedPromptTitle || terminal.nativeRailLabel) && (
+                            <span>
+                              {terminal.activeTaskTitle
+                                || terminal.parkedPromptTitle
+                                || terminal.nativeRailLabel}
+                            </span>
+                          )}
+                        </CrashRecoveryMeta>
+                      ))}
+                    </CrashRecoveryItem>
+                  ))}
+                </CrashRecoveryList>
+              )}
+
+              <CrashRecoveryActions>
+                <SecondaryButton onClick={cancelAppCloseConfirmation} type="button">
+                  <ButtonCloseIcon aria-hidden="true" />
+                  <span>Cancel</span>
+                </SecondaryButton>
+                <PrimaryDangerButton onClick={continueAppCloseAfterConfirmation} type="button">
+                  <ButtonCheckIcon aria-hidden="true" />
+                  <span>Shut down anyway</span>
+                </PrimaryDangerButton>
+              </CrashRecoveryActions>
+            </CrashRecoveryDialog>
+          </CrashRecoveryOverlay>
+        )}
 
         {workspaceCloseState.isActive && (
           <WorkspaceCloseOverlay aria-live="polite" role="status">

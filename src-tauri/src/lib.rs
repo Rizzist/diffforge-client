@@ -130,6 +130,7 @@ const WHISPER_LOCAL_AUDIO_LOGGING_ENABLED: bool = false;
 const WHISPER_LOCAL_AUDIO_LOG_FILE: &str = "whisper-local-audio.jsonl";
 const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
+const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
@@ -2746,22 +2747,74 @@ fn workspace_delete_remove_path(path: &Path, agents_root: &Path) -> Result<bool,
     Ok(false)
 }
 
+fn workspace_delete_remove_private_state_root(
+    state_root: &Path,
+    workspace_root: &Path,
+) -> Result<bool, String> {
+    if normalized_path_key(state_root) == normalized_path_key(workspace_root)
+        || state_root.starts_with(workspace_root)
+    {
+        return Err(format!(
+            "Refusing to delete private coordination state inside workspace root: {}",
+            state_root.display()
+        ));
+    }
+
+    let metadata = match fs::symlink_metadata(state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Unable to inspect private coordination state {}: {error}",
+                state_root.display()
+            ));
+        }
+    };
+
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        fs::remove_file(state_root).map_err(|error| {
+            format!(
+                "Unable to remove private coordination state {}: {error}",
+                state_root.display()
+            )
+        })?;
+        return Ok(true);
+    }
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(state_root).map_err(|error| {
+            format!(
+                "Unable to remove private coordination state {}: {error}",
+                state_root.display()
+            )
+        })?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn delete_workspace_local_metadata_for(
     repo_path: String,
     discard_dirty_worktrees: bool,
 ) -> Result<Value, String> {
     let root = resolve_workspace_root_directory(Some(&repo_path))?;
     let agents_root = root.join(".agents");
+    let private_state_root = coordination::db::coordination_repo_state_root(&root);
     let agents_metadata = match fs::symlink_metadata(&agents_root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let private_state_root_removed =
+                workspace_delete_remove_private_state_root(&private_state_root, &root)?;
             return Ok(json!({
                 "ok": true,
                 "repoPath": root.display().to_string(),
                 "agentsRoot": agents_root.display().to_string(),
+                "privateStateRoot": private_state_root.display().to_string(),
                 "removed": [],
-                "removedCount": 0,
+                "removedCount": if private_state_root_removed { 1 } else { 0 },
                 "agentsRootRemoved": false,
+                "privateStateRootRemoved": private_state_root_removed,
                 "skipped": true,
             }));
         }
@@ -2816,16 +2869,23 @@ fn delete_workspace_local_metadata_for(
         }
     };
 
+    let private_state_root_removed =
+        workspace_delete_remove_private_state_root(&private_state_root, &root)?;
+    if private_state_root_removed {
+        removed.push(private_state_root.display().to_string());
+    }
     let removed_count = removed.len();
 
     Ok(json!({
         "ok": true,
         "repoPath": root.display().to_string(),
         "agentsRoot": agents_root.display().to_string(),
+        "privateStateRoot": private_state_root.display().to_string(),
         "removed": removed,
         "removedCount": removed_count,
         "dirtyWorktrees": dirty_worktrees,
         "agentsRootRemoved": agents_root_removed,
+        "privateStateRootRemoved": private_state_root_removed,
         "skipped": false,
     }))
 }
@@ -2934,9 +2994,13 @@ mod workspace_delete_local_metadata_tests {
     #[test]
     fn delete_workspace_local_metadata_removes_only_owned_agents_paths() {
         let root = temp_workspace("workspace-delete-metadata");
+        let resolved_root =
+            resolve_workspace_root_directory(Some(&root.display().to_string())).unwrap();
         let agents = root.join(".agents");
+        let private_state_root = coordination::db::coordination_repo_state_root(&resolved_root);
         fs::create_dir_all(agents.join("spec-graph")).unwrap();
         fs::create_dir_all(agents.join("worktrees").join("slot-1")).unwrap();
+        fs::create_dir_all(&private_state_root).unwrap();
         fs::write(agents.join("spec-graph").join("cache.json"), "{}").unwrap();
         fs::write(
             agents.join("worktrees").join("slot-1").join("note.txt"),
@@ -2944,6 +3008,7 @@ mod workspace_delete_local_metadata_tests {
         )
         .unwrap();
         fs::write(agents.join("kernel.sqlite"), "").unwrap();
+        fs::write(private_state_root.join("kernel.sqlite"), "").unwrap();
         fs::write(root.join("source.txt"), "keep").unwrap();
 
         let result =
@@ -2951,7 +3016,30 @@ mod workspace_delete_local_metadata_tests {
 
         assert_eq!(result["ok"], json!(true));
         assert_eq!(result["agentsRootRemoved"], json!(true));
+        assert_eq!(result["privateStateRootRemoved"], json!(true));
         assert!(!agents.exists());
+        assert!(!private_state_root.exists());
+        assert_eq!(fs::read_to_string(root.join("source.txt")).unwrap(), "keep");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_workspace_local_metadata_removes_private_state_without_agents_root() {
+        let root = temp_workspace("workspace-delete-private-state-only");
+        let resolved_root =
+            resolve_workspace_root_directory(Some(&root.display().to_string())).unwrap();
+        let private_state_root = coordination::db::coordination_repo_state_root(&resolved_root);
+        fs::create_dir_all(&private_state_root).unwrap();
+        fs::write(private_state_root.join("kernel.sqlite"), "").unwrap();
+        fs::write(root.join("source.txt"), "keep").unwrap();
+
+        let result =
+            delete_workspace_local_metadata_for(root.display().to_string(), false).unwrap();
+
+        assert_eq!(result["ok"], json!(true));
+        assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["privateStateRootRemoved"], json!(true));
+        assert!(!private_state_root.exists());
         assert_eq!(fs::read_to_string(root.join("source.txt")).unwrap(), "keep");
         let _ = fs::remove_dir_all(root);
     }
@@ -3290,6 +3378,7 @@ pub fn run() {
             terminal_resize,
             terminal_close,
             terminal_close_all,
+            terminal_live_sessions,
             coordination::tauri_commands::coordination_init,
             coordination::tauri_commands::coordination_workspace_targets,
             coordination::tauri_commands::coordination_get_snapshot,
@@ -3354,9 +3443,37 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
                 let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
 
+                if phase == APP_SHUTDOWN_PHASE_RUNNING {
+                    api.prevent_exit();
+                    let emit_result = app.emit(
+                        APP_CLOSE_REQUESTED_EVENT,
+                        json!({
+                            "reason": "app_exit_requested",
+                            "source": "tauri_exit_requested",
+                        }),
+                    );
+
+                    if emit_result.is_err() {
+                        let _ = begin_app_shutdown();
+                        let _ = schedule_app_force_exit(app.clone(), "main".to_string());
+
+                        if APP_CLOSE_SHUTDOWN_IN_FLIGHT
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            let app_for_shutdown = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                run_backend_app_shutdown(app_for_shutdown, "main".to_string())
+                                    .await;
+                            });
+                        }
+                    }
+
+                    return;
+                }
+
                 if phase < APP_SHUTDOWN_PHASE_EXITING {
                     api.prevent_exit();
-                    let _ = begin_app_shutdown();
                     let _ = schedule_app_force_exit(app.clone(), "main".to_string());
 
                     if APP_CLOSE_SHUTDOWN_IN_FLIGHT

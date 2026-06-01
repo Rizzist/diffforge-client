@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { layoutSpecGraph } from "../specGraphLayout.js";
 import ThreeGraphRenderer from "./ThreeGraphRenderer.jsx";
+
+const MAX_VIEWPORT_CACHE_ENTRIES = 24;
+const graphViewportCache = new Map();
 
 function graphTopologyKey(nodes, edges) {
   const nodeKey = (nodes || [])
@@ -15,6 +18,30 @@ function graphTopologyKey(nodes, edges) {
   return `${nodeKey}::${edgeKey}`;
 }
 
+function graphViewportCacheKey(viewKey, topologyKey) {
+  const owner = String(viewKey || "spec-graph").trim() || "spec-graph";
+  return `${owner}::${topologyKey || "empty"}`;
+}
+
+function readGraphViewportCache(cacheKey) {
+  return graphViewportCache.get(cacheKey) || null;
+}
+
+function writeGraphViewportCache(cacheKey, cameraState) {
+  if (!cacheKey || !cameraState) return;
+  const next = {
+    x: Number(cameraState.x),
+    y: Number(cameraState.y),
+    zoom: Number(cameraState.zoom),
+  };
+  if (!Number.isFinite(next.x) || !Number.isFinite(next.y) || !Number.isFinite(next.zoom)) return;
+  if (graphViewportCache.has(cacheKey)) graphViewportCache.delete(cacheKey);
+  graphViewportCache.set(cacheKey, next);
+  while (graphViewportCache.size > MAX_VIEWPORT_CACHE_ENTRIES) {
+    graphViewportCache.delete(graphViewportCache.keys().next().value);
+  }
+}
+
 export default function GraphRendererHost({
   nodes,
   edges,
@@ -23,11 +50,23 @@ export default function GraphRendererHost({
   state,
   emptyLabel,
   layoutLabel,
+  viewKey,
 }) {
   const [layout, setLayout] = useState(() => new Map());
   const [layoutPending, setLayoutPending] = useState(false);
   const lastLayoutKeyRef = useRef("");
   const topologyKey = useMemo(() => graphTopologyKey(nodes, edges), [edges, nodes]);
+  const viewportCacheKey = useMemo(
+    () => graphViewportCacheKey(viewKey, topologyKey),
+    [topologyKey, viewKey],
+  );
+  const initialCameraState = useMemo(
+    () => readGraphViewportCache(viewportCacheKey),
+    [viewportCacheKey],
+  );
+  const handleCameraChange = useCallback((cameraState) => {
+    writeGraphViewportCache(viewportCacheKey, cameraState);
+  }, [viewportCacheKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -89,9 +128,12 @@ export default function GraphRendererHost({
       layoutPending={layoutPending}
       selectedNodeId={selectedNodeId}
       onSelect={onSelect}
+      initialCameraState={initialCameraState}
+      onCameraChange={handleCameraChange}
       state={state}
       emptyLabel={emptyLabel}
       layoutLabel={layoutLabel}
+      viewportCacheKey={viewportCacheKey}
     />
   );
 }

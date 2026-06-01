@@ -26,8 +26,6 @@ pub const TOOL_NAMES: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
-    "write_file",
-    "delete_file",
     "complete_task",
     "submit_patch",
     "submit_patch_status",
@@ -2479,12 +2477,7 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
     apply_context_defaults(context, &mut input);
     if matches!(
         tool,
-        "acquire_lease"
-            | "checkpoint"
-            | "write_file"
-            | "delete_file"
-            | "complete_task"
-            | "submit_patch"
+        "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
     ) && !explicit_task_id
     {
         if let Some(object) = input.as_object_mut() {
@@ -2539,8 +2532,6 @@ fn dispatch_tool_result(
         "start_task" => kernel_start_task(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
-        "write_file" => kernel_write_file(&kernel, &input),
-        "delete_file" => kernel_delete_file(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
         "submit_patch" => kernel_submit_patch(&kernel, &input),
         "submit_patch_status" => kernel_submit_patch_status(&kernel, &input),
@@ -2963,7 +2954,7 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
     let mut authority_resolution = Value::Null;
     if enforcement_mode == "general_worker" && cloud_file_resource_key(resource_key) {
         authority_resolution =
-            kernel.resolve_general_worker_file_authority(agent_id, session_id)?;
+            kernel.resolve_general_worker_file_authority(agent_id, session_id, Some(task_id))?;
         if let Some(value) = authority_resolution["enforcement_mode"]
             .as_str()
             .filter(|value| !value.trim().is_empty())
@@ -3068,58 +3059,11 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         if cloud_file_resource_key(resource_key) {
             data.insert(
                 "write_guidance".to_string(),
-                json!("For already-running coordinated terminals, use write_file/delete_file after this lease. Native write tools may remain read-only until a task-scoped worktree terminal is launched."),
+                json!("After this lease, use normal edit tools against the shared repo paths; Diff Forge hooks route permitted writes into this task's assigned worktree and block anything outside the lease."),
             );
         }
     }
     Ok(response)
-}
-
-fn kernel_write_file(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
-    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
-        return Ok(api_error(
-            "task_id_required_after_start_task",
-            "write_file requires the task_id returned by start_task; implicit session task defaults are not allowed for managed writes.",
-            json!({}),
-        ));
-    }
-    let task_id = req(input, "task_id")?;
-    let agent_id = req(input, "agent_id")?;
-    let session_id = req(input, "session_id")?;
-    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
-        return Ok(api_error(
-            "start_task_required_before_write",
-            "Call start_task for this session, then acquire_lease for the file, before using write_file.",
-            json!({"task_id": task_id, "session_id": session_id}),
-        ));
-    }
-    let path = req(input, "path")?;
-    let content = input["content"]
-        .as_str()
-        .ok_or_else(|| "content is required and must be a string for write_file.".to_string())?;
-    kernel.write_file_for_task(task_id, agent_id, session_id, path, content)
-}
-
-fn kernel_delete_file(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
-    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
-        return Ok(api_error(
-            "task_id_required_after_start_task",
-            "delete_file requires the task_id returned by start_task; implicit session task defaults are not allowed for managed writes.",
-            json!({}),
-        ));
-    }
-    let task_id = req(input, "task_id")?;
-    let agent_id = req(input, "agent_id")?;
-    let session_id = req(input, "session_id")?;
-    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
-        return Ok(api_error(
-            "start_task_required_before_write",
-            "Call start_task for this session, then acquire_lease for the file, before using delete_file.",
-            json!({"task_id": task_id, "session_id": session_id}),
-        ));
-    }
-    let path = req(input, "path")?;
-    kernel.delete_file_for_task(task_id, agent_id, session_id, path)
 }
 
 fn existing_local_task_id_for_start(
@@ -3915,8 +3859,6 @@ fn tool_description(name: &str) -> String {
         "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
-        "write_file" => "Write or replace a text file through Diff Forge authority after start_task and acquire_lease. In Git repos this writes to the assigned task worktree; do not use native file-write tools before a lease.".to_string(),
-        "delete_file" => "Delete one file through Diff Forge authority after start_task and acquire_lease. In Git repos this deletes from the assigned task worktree; do not use native file-write tools before a lease.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
@@ -3954,25 +3896,6 @@ fn tool_input_schema(name: &str) -> Value {
                 "summary": {"type": "string", "description": "One short public summary of active task progress. Do not call checkpoint before start_task."}
             },
             "required": ["task_id", "summary"],
-            "additionalProperties": true
-        }),
-        "write_file" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
-                "path": {"type": "string", "description": "Required repository-relative path, for example src/App.tsx. Must be covered by an active write lease."},
-                "content": {"type": "string", "description": "Required complete text content to write to the file."}
-            },
-            "required": ["task_id", "path", "content"],
-            "additionalProperties": true
-        }),
-        "delete_file" => json!({
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
-                "path": {"type": "string", "description": "Required repository-relative path. Must be covered by an active write lease."}
-            },
-            "required": ["task_id", "path"],
             "additionalProperties": true
         }),
         "complete_task" => json!({

@@ -1,4 +1,5 @@
 const DEFAULT_CLOSED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
+const SENDABLE_TERMINAL_STATUSES = new Set(["active", "running", "idle", "ready", "prompt_ready", "input_ready"]);
 
 function cleanText(value) {
   return String(value || "").trim();
@@ -221,7 +222,7 @@ export function evaluateTodoQueueInFlightPrompt({
   const normalizedTerminalStatus = normalizeTurnState(terminalStatus || liveTerminal?.status);
   const terminalReadyForNextPrompt = Boolean(
     liveTerminal
-      && ["active", "running"].includes(normalizedTerminalStatus)
+      && SENDABLE_TERMINAL_STATUSES.has(normalizedTerminalStatus)
       && !terminalGroundTruth?.hasPendingPrompt
       && normalizeTurnState(effectiveLatestTurnState || terminalGroundTruth?.effectiveLatestTurnState) !== "running"
       && normalizeTurnState(effectiveActivityStatus || terminalGroundTruth?.effectiveActivityStatus) !== "thinking"

@@ -322,6 +322,7 @@ export default function SpecGraphWorkspaceView({
                 selectedNodeId={selectedNode?.id}
                 onSelect={setSelectedNodeId}
                 state={state}
+                viewKey={`${workspaceId || "workspace"}:${repoPath || "repo"}:spec-graph`}
               />
             </SpecGraphMain>
 

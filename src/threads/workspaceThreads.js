@@ -20,6 +20,7 @@ const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
 const LIVE_TERMINAL_STATUSES = new Set([
   "active",
   "closed",
+  "closing",
   "error",
   "exited",
   "idle",

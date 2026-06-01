@@ -7,8 +7,7 @@ const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = true;
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_APP_WS_URL";
-const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str =
-    "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
+const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL: &str = "ws://127.0.0.1:8080/v1/app/ws";
 const CLOUD_MCP_LOCAL_DOCKER_PROBE_TIMEOUT_MS: u64 = 180;
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
@@ -117,6 +116,7 @@ struct CloudMcpTerminalContextState {
     agent_id: String,
     lane: String,
     working_directory: PathBuf,
+    repo_root: PathBuf,
     prompt_event_id: Option<String>,
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
@@ -321,16 +321,19 @@ fn cloud_mcp_normalized_base_url(value: &str) -> Option<String> {
 }
 
 fn cloud_mcp_base_url_override_allowed() -> bool {
-    [CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV, "CLOUD_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP"]
-        .iter()
-        .any(|key| {
-            env::var(key).ok().is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
+    [
+        CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV,
+        "CLOUD_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP",
+    ]
+    .iter()
+    .any(|key| {
+        env::var(key).ok().is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
         })
+    })
 }
 
 fn cloud_mcp_dev_auth_token() -> Option<String> {
@@ -407,9 +410,7 @@ fn cloud_mcp_preserved_cache_sync_fields(
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
-    if cached_state == Some("error")
-        && cached_error.is_some_and(cloud_mcp_is_transient_ws_error)
-    {
+    if cached_state == Some("error") && cached_error.is_some_and(cloud_mcp_is_transient_ws_error) {
         return (
             fallback_sync_state.to_string(),
             fallback_sync_error.to_string(),
@@ -501,7 +502,8 @@ async fn cloud_mcp_record_signin_diagnostic_with_token(
         return;
     }
 
-    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS)) else {
+    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))
+    else {
         return;
     };
     let payload = DesktopSigninDiagnosticRequest {
@@ -555,7 +557,8 @@ async fn cloud_mcp_record_connection_diagnostic_with_token(
         return;
     }
 
-    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS)) else {
+    let Ok(client) = http_client(Duration::from_secs(DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS))
+    else {
         return;
     };
     let payload = json!({
@@ -589,10 +592,8 @@ async fn cloud_mcp_record_connection_diagnostic(
     };
 
     if let Some(token) = token {
-        cloud_mcp_record_connection_diagnostic_with_token(
-            token, step, status, message, details,
-        )
-        .await;
+        cloud_mcp_record_connection_diagnostic_with_token(token, step, status, message, details)
+            .await;
     }
 }
 
@@ -646,8 +647,10 @@ fn cloud_mcp_fetch_appwrite_jwt_blocking(
         .bearer_auth(desktop_session_token)
         .send()
         .map_err(|error| format!("Unable to prepare Cloud MCP Appwrite auth: {error}"))?;
-    let body =
-        cloud_mcp_read_blocking_api_response(response, "Unable to prepare Cloud MCP Appwrite auth.")?;
+    let body = cloud_mcp_read_blocking_api_response(
+        response,
+        "Unable to prepare Cloud MCP Appwrite auth.",
+    )?;
 
     cloud_mcp_parse_appwrite_jwt_response(body)
 }
@@ -676,9 +679,7 @@ fn cloud_mcp_update_process_auth_cache(
     }
 }
 
-async fn cloud_mcp_authorization_bearer(
-    state: &CloudMcpState,
-) -> Result<Option<String>, String> {
+async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<String>, String> {
     if let Some(token) = cloud_mcp_static_appwrite_jwt() {
         return Ok(Some(token));
     }
@@ -782,7 +783,9 @@ fn cloud_mcp_process_authorization_bearer() -> Option<String> {
     cloud_mcp_dev_auth_token()
 }
 
-async fn cloud_mcp_runtime_env_vars(state: &CloudMcpState) -> Result<Vec<(String, String)>, String> {
+async fn cloud_mcp_runtime_env_vars(
+    state: &CloudMcpState,
+) -> Result<Vec<(String, String)>, String> {
     let base_url = {
         let runtime = state.inner.lock().await;
         runtime.base_url.clone()
@@ -937,10 +940,9 @@ async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
         let loop_state = state.clone();
-        let result =
-            std::panic::AssertUnwindSafe(cloud_mcp_global_ws_loop(loop_state))
-                .catch_unwind()
-                .await;
+        let result = std::panic::AssertUnwindSafe(cloud_mcp_global_ws_loop(loop_state))
+            .catch_unwind()
+            .await;
         if result.is_err() {
             state.global_ws_started.store(false, Ordering::SeqCst);
             cloud_mcp_mark_global_ws_disconnected(
@@ -1006,7 +1008,13 @@ fn cloud_mcp_voice_ws_kind(kind: &str) -> bool {
     kind.starts_with("voice_agent_")
 }
 
-fn cloud_mcp_log_voice_shared_ws(phase: &str, kind: &str, status: &str, reason: &str, details: Value) {
+fn cloud_mcp_log_voice_shared_ws(
+    phase: &str,
+    kind: &str,
+    status: &str,
+    reason: &str,
+    details: Value,
+) {
     log_voice_orchestrator_diagnostic_event(
         phase,
         json!({
@@ -1094,7 +1102,10 @@ async fn cloud_mcp_open_global_ws(
     let request = build_request(&opened_target)?;
     let (stream, response) = match connect_async(request).await {
         Ok(result) => result,
-        Err(error) if opened_target.route_token.is_some() || opened_target.transport == "local_docker_cloud" => {
+        Err(error)
+            if opened_target.route_token.is_some()
+                || opened_target.transport == "local_docker_cloud" =>
+        {
             let direct_message = format!("Unable to open Cloud MCP app websocket: {error}");
             cloud_mcp_record_connection_diagnostic(
                 state,
@@ -1520,7 +1531,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 }),
             );
         }
-        if matches!(event_kind, "client_liveness_ping" | "dashboard_liveness_ping") {
+        if matches!(
+            event_kind,
+            "client_liveness_ping" | "dashboard_liveness_ping"
+        ) {
             let _ = cloud_mcp_send_liveness_pong_event(state, &event).await;
         }
         let _ = state.global_ws_events.send(event);
@@ -1850,15 +1864,14 @@ async fn cloud_mcp_start_remote_command_listener(
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")
             } else {
-                ("failed", "Desktop UI was not available for the remote command.")
+                (
+                    "failed",
+                    "Desktop UI was not available for the remote command.",
+                )
             };
-            let _ = cloud_mcp_send_remote_command_status_event(
-                &state_clone,
-                &event,
-                status,
-                message,
-            )
-            .await;
+            let _ =
+                cloud_mcp_send_remote_command_status_event(&state_clone, &event, status, message)
+                    .await;
         }
     });
     Ok(json!({"ok": true, "started": true}))
@@ -2208,7 +2221,9 @@ fn cloud_mcp_local_docker_ws_target(endpoint_path: &str) -> Option<CloudMcpWsTar
     });
     let ws_url = configured_url
         .map(|value| cloud_mcp_rewrite_ws_endpoint(&value, endpoint_path))
-        .unwrap_or_else(|| cloud_mcp_rewrite_ws_endpoint(CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL, endpoint_path));
+        .unwrap_or_else(|| {
+            cloud_mcp_rewrite_ws_endpoint(CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL, endpoint_path)
+        });
     if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
         return None;
     }
@@ -2252,7 +2267,9 @@ fn cloud_mcp_ws_target_reachable_blocking(ws_url: &str) -> bool {
         return false;
     };
     let timeout = Duration::from_millis(CLOUD_MCP_LOCAL_DOCKER_PROBE_TIMEOUT_MS);
-    addrs.into_iter().any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
+    addrs
+        .into_iter()
+        .any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
 }
 
 async fn cloud_mcp_fetch_direct_route_async(
@@ -2539,8 +2556,7 @@ async fn cloud_mcp_ws_request_once_with_timeout(
             }),
         );
     }
-    let response = match timeout(response_timeout, response_rx).await
-    {
+    let response = match timeout(response_timeout, response_rx).await {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
             state.global_ws_pending.lock().await.remove(&request_id);
@@ -3566,11 +3582,8 @@ fn cloud_mcp_prepare_filetree_sync_seeds(
     workspace_name: Option<String>,
 ) -> Result<Vec<CloudMcpFiletreeSyncSeed>, String> {
     let root = resolve_workspace_root_directory(Some(&repo_path))?;
-    let primary = cloud_mcp_prepare_filetree_sync_seed_from_root(
-        root,
-        workspace_id.clone(),
-        workspace_name,
-    );
+    let primary =
+        cloud_mcp_prepare_filetree_sync_seed_from_root(root, workspace_id.clone(), workspace_name);
     let mut seen = HashSet::new();
     seen.insert(normalized_path_key(&primary.root));
     let mut pending_mounts = VecDeque::from(primary.project_mounts.clone());
@@ -3821,7 +3834,10 @@ fn cloud_mcp_filetree_snapshot_payload(
     payload.insert("workspaceId".to_string(), json!(workspace_id));
     payload.insert("workspace_name".to_string(), json!(workspace_name));
     payload.insert("workspaceName".to_string(), json!(workspace_name));
-    payload.insert("workspace_root".to_string(), json!(workspace_root_display.clone()));
+    payload.insert(
+        "workspace_root".to_string(),
+        json!(workspace_root_display.clone()),
+    );
     payload.insert("workspaceRoot".to_string(), json!(workspace_root_display));
     payload.insert("reason".to_string(), json!(reason));
     payload.insert("filetree".to_string(), filetree_value);
@@ -3883,10 +3899,7 @@ fn cloud_mcp_filetree_snapshot_payload(
         "container_workspace".to_string(),
         json!(container_workspace),
     );
-    payload.insert(
-        "containerWorkspace".to_string(),
-        json!(container_workspace),
-    );
+    payload.insert("containerWorkspace".to_string(), json!(container_workspace));
     payload.insert("broad_area".to_string(), json!(broad_area));
     payload.insert("broadArea".to_string(), json!(broad_area));
     payload.insert("project_mounts".to_string(), project_mounts_value.clone());
@@ -4212,7 +4225,10 @@ fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
     let mut workspace_ids = Vec::new();
     let mut repo_ids = Vec::new();
     if let Some(workspace_id) = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]) {
-        if !workspace_ids.iter().any(|value: &String| value == &workspace_id) {
+        if !workspace_ids
+            .iter()
+            .any(|value: &String| value == &workspace_id)
+        {
             workspace_ids.push(workspace_id);
         }
     }
@@ -4250,7 +4266,10 @@ fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
             if let Some(workspace_id) =
                 cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
             {
-                if !workspace_ids.iter().any(|value: &String| value == &workspace_id) {
+                if !workspace_ids
+                    .iter()
+                    .any(|value: &String| value == &workspace_id)
+                {
                     workspace_ids.push(workspace_id);
                 }
             }
@@ -4771,9 +4790,9 @@ async fn cloud_mcp_push_filetree_snapshot(
     reason: &str,
     sync_session: Option<&CloudMcpFiletreeSyncSession>,
 ) -> Result<Value, String> {
-    let sync_session = sync_session.cloned().unwrap_or_else(|| {
-        cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 0)
-    });
+    let sync_session = sync_session
+        .cloned()
+        .unwrap_or_else(|| cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 0));
     for payload in cloud_mcp_filetree_progressive_payloads(
         repo_id,
         workspace_root,
@@ -4850,8 +4869,7 @@ async fn cloud_mcp_push_filetree_sync_begins_for_workspace_request(
     };
     let mut sessions = HashMap::new();
     for seed in seeds {
-        let mut session =
-            cloud_mcp_filetree_sync_session(&seed.repo_id, &seed.root, reason, 1);
+        let mut session = cloud_mcp_filetree_sync_session(&seed.repo_id, &seed.root, reason, 1);
         if cloud_mcp_push_filetree_sync_begin(state, &seed, reason, &session)
             .await
             .is_err()
@@ -4873,8 +4891,11 @@ async fn cloud_mcp_push_current_filetree_snapshot(
 ) -> Result<Value, String> {
     let detected_mounts = workspace_project_mounts(workspace_root);
     let workspace_kind = workspace_kind_for_mounts(workspace_root, &detected_mounts);
-    let project_mounts =
-        cloud_mcp_project_mounts_for_workspace_sync(workspace_root, &workspace_kind, &detected_mounts);
+    let project_mounts = cloud_mcp_project_mounts_for_workspace_sync(
+        workspace_root,
+        &workspace_kind,
+        &detected_mounts,
+    );
     let (seed_workspace_id, seed_workspace_name) =
         cloud_mcp_workspace_identity(workspace_root, workspace_id, workspace_name);
     let seed = CloudMcpFiletreeSyncSeed {
@@ -4932,18 +4953,17 @@ async fn cloud_mcp_push_current_filetree_snapshot(
 
     let root = workspace_root.to_path_buf();
     let project_mounts_for_scan = project_mounts.clone();
-    let (filetree, filetree_truncated) =
-        tauri::async_runtime::spawn_blocking(move || {
-            let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(&root);
-            cloud_mcp_apply_project_mount_boundaries(
-                &root,
-                filetree,
-                filetree_truncated,
-                &project_mounts_for_scan,
-            )
-        })
-            .await
-            .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
+    let (filetree, filetree_truncated) = tauri::async_runtime::spawn_blocking(move || {
+        let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(&root);
+        cloud_mcp_apply_project_mount_boundaries(
+            &root,
+            filetree,
+            filetree_truncated,
+            &project_mounts_for_scan,
+        )
+    })
+    .await
+    .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
     cloud_mcp_push_filetree_snapshot(
         state,
         repo_id,
@@ -5581,6 +5601,7 @@ async fn cloud_mcp_claim_terminal_lane(
     if lane.trim().is_empty() {
         return;
     }
+    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let agent_label = cloud_mcp_short_agent_label(agent_id);
     let agent_label = agent_label.as_deref();
     let payload = json!({
@@ -5592,7 +5613,7 @@ async fn cloud_mcp_claim_terminal_lane(
         "reason": format!("Starting terminal task: {}", cloud_mcp_prompt_summary(prompt)),
         "metadata": {
             "agent_label": agent_label,
-            "workspace_root": workspace_path_display(working_directory),
+            "workspace_root": workspace_path_display(&status_working_directory),
             "session_id": coordination.map(|coordination| coordination.session_id.clone()),
         },
         "ts_ms": cloud_mcp_now_ms(),
@@ -5606,10 +5627,12 @@ async fn cloud_mcp_release_terminal_lane(
     agent_id: &str,
     lane: &str,
     working_directory: &Path,
+    coordination: Option<&TerminalCoordinationSession>,
     pane_id: &str,
     instance_id: u64,
     reason: &str,
 ) {
+    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let agent_label = cloud_mcp_short_agent_label(agent_id);
     let agent_label = agent_label.as_deref();
     let payload = json!({
@@ -5620,7 +5643,7 @@ async fn cloud_mcp_release_terminal_lane(
         "self_agent_id": agent_id,
         "current_agent_id": agent_id,
         "lane": lane,
-        "workspace_root": workspace_path_display(working_directory),
+        "workspace_root": workspace_path_display(&status_working_directory),
         "terminal_id": pane_id,
         "terminal_instance_id": instance_id,
         "reason": reason,
@@ -5651,6 +5674,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
     session_mode: Option<&str>,
     reason: &str,
 ) {
+    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let claimed_paths = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
     let has_claimed_paths = !claimed_paths.is_empty();
     let agent_label = cloud_mcp_short_agent_label(agent_id);
@@ -5671,7 +5695,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
         "task_id": local_task_id,
         "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
         "claimed_paths": claimed_paths,
-        "workspace_root": workspace_path_display(working_directory),
+        "workspace_root": workspace_path_display(&status_working_directory),
         "terminal_id": pane_id,
         "terminal_instance_id": instance_id,
         "metadata": {
@@ -5682,7 +5706,7 @@ async fn cloud_mcp_sync_terminal_agent_status(
             "reason": reason,
             "terminal_id": pane_id,
             "terminal_instance_id": instance_id,
-            "workspace_root": workspace_path_display(working_directory),
+            "workspace_root": workspace_path_display(&status_working_directory),
             "session_id": coordination.map(|coordination| coordination.session_id.clone()),
             "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
             "local_coordination_task_id": local_task_id,
@@ -5809,7 +5833,12 @@ async fn cloud_mcp_sync_terminal_agent_status(
 }
 
 fn cloud_mcp_task_spec_status(status: &str) -> &'static str {
-    match status.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+    match status
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
         "done" | "completed" | "complete" | "idle" | "ready" | "prompt_ready" => "done",
         "merged" | "applied" => "merged",
         "skipped" => "skipped",
@@ -5918,7 +5947,12 @@ async fn cloud_mcp_voice_plan_prompt_metadata_for_terminal_task(
 }
 
 fn cloud_mcp_voice_plan_status_for_terminal_lifecycle(status: &str) -> Option<&'static str> {
-    match status.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+    match status
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
         "parked" | "blocked" | "waiting_on_dependency" => Some("parked"),
         "resume_ready" | "ready_to_resume" => Some("resume_ready"),
         "resume_requested" | "resuming" => Some("resume_requested"),
@@ -6162,7 +6196,11 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
         instance_id,
         coordination,
         local_task_id,
-        Some(if coordination.is_some() { "managed_patch" } else { "free" }),
+        Some(if coordination.is_some() {
+            "managed_patch"
+        } else {
+            "free"
+        }),
         "terminal_task_lifecycle",
     )
     .await;
@@ -6220,6 +6258,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
             &agent_id,
             lane,
             working_directory,
+            coordination,
             pane_id,
             instance_id,
             status,
@@ -6360,6 +6399,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
         &agent_id,
         &lane,
         working_directory,
+        coordination,
         pane_id,
         instance_id,
         reason,
@@ -6606,6 +6646,7 @@ async fn cloud_mcp_observe_terminal_output(
                     entry.session_mode.clone(),
                     brief,
                     entry.working_directory.clone(),
+                    entry.repo_root.clone(),
                 ))
             }
         } else {
@@ -6623,6 +6664,7 @@ async fn cloud_mcp_observe_terminal_output(
                     entry.last_prompt.clone(),
                     entry.work_brief.clone(),
                     entry.working_directory.clone(),
+                    entry.repo_root.clone(),
                     entry.prompt_event_id.clone(),
                     entry.prompt_event_source.clone(),
                     entry.prompt_event_submitted_at.clone(),
@@ -6672,8 +6714,16 @@ async fn cloud_mcp_observe_terminal_output(
         }),
     );
 
-    if let Some((repo_id, agent_id, lane, local_task_id, session_mode, brief, working_directory)) =
-        work_update
+    if let Some((
+        repo_id,
+        agent_id,
+        lane,
+        local_task_id,
+        session_mode,
+        brief,
+        _working_directory,
+        repo_root,
+    )) = work_update
     {
         cloud_mcp_sync_terminal_agent_status(
             &state,
@@ -6683,7 +6733,7 @@ async fn cloud_mcp_observe_terminal_output(
             "active",
             None,
             &brief,
-            &working_directory,
+            &repo_root,
             pane_id,
             instance_id,
             None,
@@ -6702,6 +6752,7 @@ async fn cloud_mcp_observe_terminal_output(
         _prompt,
         work_brief,
         working_directory,
+        repo_root,
         prompt_event_id,
         prompt_event_source,
         prompt_event_submitted_at,
@@ -6769,7 +6820,7 @@ async fn cloud_mcp_observe_terminal_output(
             "inactive",
             None,
             &brief,
-            &working_directory,
+            &repo_root,
             pane_id,
             instance_id,
             None,
@@ -6796,7 +6847,7 @@ async fn cloud_mcp_observe_terminal_output(
         cloud_mcp_work_subject(&work_brief)
     );
     let _ = cloud_mcp_workspace_log(
-        &working_directory,
+        &repo_root,
         "cloud_mcp.context_pack.work_review",
         "",
         "",
@@ -6820,7 +6871,7 @@ async fn cloud_mcp_observe_terminal_output(
         "inactive",
         None,
         &brief,
-        &working_directory,
+        &repo_root,
         pane_id,
         instance_id,
         None,
@@ -6834,7 +6885,8 @@ async fn cloud_mcp_observe_terminal_output(
         &repo_id,
         &agent_id,
         &lane,
-        &working_directory,
+        &repo_root,
+        None,
         pane_id,
         instance_id,
         "terminal_prompt_ready",
@@ -6864,6 +6916,8 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
     let started_at = Instant::now();
     let agent_id = cloud_mcp_terminal_agent_id(&pane_id, instance_id, coordination.as_ref());
     let repo_id = cloud_mcp_terminal_repo_id(&working_directory, coordination.as_ref());
+    let status_working_directory =
+        cloud_mcp_terminal_repo_root_path(&working_directory, coordination.as_ref());
     let terminal_key = cloud_mcp_terminal_key(&pane_id, instance_id);
     let prompt_metadata = prompt_metadata.unwrap_or_else(|| CloudMcpTerminalPromptMetadata {
         prompt_event_id: None,
@@ -6884,6 +6938,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 agent_id: agent_id.clone(),
                 lane: String::new(),
                 working_directory: working_directory.clone(),
+                repo_root: status_working_directory.clone(),
                 prompt_event_id: prompt_metadata.prompt_event_id.clone(),
                 prompt_event_source: prompt_metadata.prompt_event_source.clone(),
                 prompt_event_submitted_at: prompt_metadata.prompt_event_submitted_at.clone(),
@@ -6909,7 +6964,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
 
     if let Err(error) = cloud_mcp_connected_or_connect(&state).await {
         let _ = cloud_mcp_workspace_log(
-            &working_directory,
+            &status_working_directory,
             "cloud_mcp.context_pack.error",
             "",
             "",
@@ -6945,7 +7000,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "prompt": prompt,
         "session_mode": session_mode.as_str(),
         "file_authority": session_mode.file_authority(),
-        "workspace_root": workspace_path_display(&working_directory),
+        "workspace_root": workspace_path_display(&status_working_directory),
         "coordination": coordination.as_ref().map(|coordination| json!({
             "agent_id": coordination.agent_id.clone(),
             "agent_kind": coordination.agent_kind.clone(),
@@ -6971,7 +7026,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         } else {
             "Terminal prompt submitted without managed patch coordination."
         },
-        &working_directory,
+        &status_working_directory,
         &pane_id,
         instance_id,
         coordination.as_ref(),
@@ -6997,7 +7052,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
             "active",
             payload["prompt"].as_str(),
             "Terminal activity is running outside managed patch mode.",
-            &working_directory,
+        &status_working_directory,
             &pane_id,
             instance_id,
             coordination.as_ref(),
@@ -7023,7 +7078,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 .map(Vec::len)
                 .unwrap_or(0);
             let _ = cloud_mcp_workspace_log(
-                &working_directory,
+            &status_working_directory,
                 "cloud_mcp.context_pack.prompt_started",
                 "",
                 "",
@@ -7052,7 +7107,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 "active",
                 payload["prompt"].as_str(),
                 "Terminal context is ready; waiting for agent start_task intent.",
-                &working_directory,
+                &status_working_directory,
                 &pane_id,
                 instance_id,
                 coordination.as_ref(),
@@ -7067,7 +7122,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 &agent_id,
                 &suggested_lane,
                 payload["prompt"].as_str().unwrap_or_default(),
-                &working_directory,
+                &status_working_directory,
                 coordination.as_ref(),
             )
             .await;
@@ -7089,7 +7144,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         }
         Err(error) => {
             let _ = cloud_mcp_workspace_log(
-                &working_directory,
+                &status_working_directory,
                 "cloud_mcp.context_pack.prompt_error",
                 "",
                 "",
@@ -7117,20 +7172,19 @@ async fn cloud_mcp_track_terminal_file_changes(
     agent_id: String,
     lane: String,
 ) {
+    let status_working_directory =
+        cloud_mcp_terminal_repo_root_path(&working_directory, coordination.as_ref());
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_secs(8)).await;
         if let Some((local_task_id, work_brief, session_mode)) = {
             let runtime = state.inner.lock().await;
-            runtime
-                .terminal_contexts
-                .get(&terminal_key)
-                .map(|entry| {
-                    (
-                        entry.local_task_id.clone(),
-                        entry.work_brief.clone(),
-                        entry.session_mode.clone(),
-                    )
-                })
+            runtime.terminal_contexts.get(&terminal_key).map(|entry| {
+                (
+                    entry.local_task_id.clone(),
+                    entry.work_brief.clone(),
+                    entry.session_mode.clone(),
+                )
+            })
         } {
             let heartbeat_brief = if work_brief.trim().is_empty() {
                 "Terminal task is active.".to_string()
@@ -7256,7 +7310,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                 fallback_title.as_deref().unwrap_or(&work_subject)
             );
             let _ = cloud_mcp_workspace_log(
-                &working_directory,
+                &status_working_directory,
                 "cloud_mcp.context_pack.work_review",
                 "",
                 "",
@@ -7320,7 +7374,7 @@ async fn cloud_mcp_track_terminal_file_changes(
             "brief": brief,
             "changed_files": changed_files,
             "agent_status": "active",
-            "workspace_root": workspace_path_display(&working_directory),
+            "workspace_root": workspace_path_display(&status_working_directory),
             "metadata": {
                 "session_id": coordination.as_ref().map(|coordination| coordination.session_id.clone()),
                 "change_hash": changed_hash,
@@ -7336,7 +7390,7 @@ async fn cloud_mcp_track_terminal_file_changes(
                     .map(Vec::len)
                     .unwrap_or(0);
                 let _ = cloud_mcp_workspace_log(
-                    &working_directory,
+                    &status_working_directory,
                     "cloud_mcp.context_pack.subtask_checkpoint",
                     "",
                     "",
@@ -7353,7 +7407,7 @@ async fn cloud_mcp_track_terminal_file_changes(
             }
             Err(error) => {
                 let _ = cloud_mcp_workspace_log(
-                    &working_directory,
+                    &status_working_directory,
                     "cloud_mcp.context_pack.subtask_checkpoint_error",
                     "",
                     "",
@@ -7402,10 +7456,7 @@ async fn cloud_mcp_connect(state: State<'_, CloudMcpState>) -> Result<CloudMcpSt
     cloud_mcp_connect_state(state.inner()).await
 }
 
-async fn cloud_mcp_signal_desktop_closing(
-    app: &AppHandle,
-    reason: &str,
-) -> Result<Value, String> {
+async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Result<Value, String> {
     let state = app.state::<CloudMcpState>().inner().clone();
     if !cloud_mcp_status_snapshot(&state).await.global_ws_connected {
         return Ok(json!({
@@ -7641,7 +7692,8 @@ async fn cloud_mcp_sync_terminal_presence(
             continue;
         }
 
-        let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+        let workspace_id =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
         let workspace_active = workspace
@@ -7730,6 +7782,8 @@ async fn cloud_mcp_sync_terminal_presence(
                     "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch", "terminalEpoch"]),
                     "terminal_instance_id": terminal_instance_id,
                     "terminal_lifecycle": cloud_mcp_payload_text(terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
+                    "native_rail_state": cloud_mcp_payload_text(terminal, &["native_rail_state", "nativeRailState", "rail_state", "railState", "top_rail_state", "topRailState"]),
+                    "native_rail_label": cloud_mcp_payload_text(terminal, &["native_rail_label", "nativeRailLabel", "rail_label", "railLabel", "top_rail_label", "topRailLabel"]),
                     "readiness": cloud_mcp_payload_text(terminal, &["readiness", "terminal_readiness", "terminalReadiness"]),
                     "turn_id": cloud_mcp_payload_text(terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId"]),
                     "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
@@ -7926,7 +7980,13 @@ async fn cloud_mcp_sync_terminal_status_event(
         .unwrap_or_else(|| json!(cloud_mcp_now_ms()));
     let event_type = cloud_mcp_payload_text(
         &terminal,
-        &["event_type", "eventType", "type", "terminal_event_type", "terminalEventType"],
+        &[
+            "event_type",
+            "eventType",
+            "type",
+            "terminal_event_type",
+            "terminalEventType",
+        ],
     )
     .unwrap_or_else(|| "terminal.status".to_string());
     let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
@@ -7959,6 +8019,8 @@ async fn cloud_mcp_sync_terminal_status_event(
         "terminal_epoch": terminal_epoch,
         "terminal_instance_id": terminal_instance_id,
         "terminal_lifecycle": cloud_mcp_payload_text(&terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
+        "native_rail_state": cloud_mcp_payload_text(&terminal, &["native_rail_state", "nativeRailState", "rail_state", "railState", "top_rail_state", "topRailState"]),
+        "native_rail_label": cloud_mcp_payload_text(&terminal, &["native_rail_label", "nativeRailLabel", "rail_label", "railLabel", "top_rail_label", "topRailLabel"]),
         "readiness": readiness,
         "readiness_after": readiness,
         "turn_id": cloud_mcp_payload_text(&terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId", "active_turn_id", "activeTurnId"]),
@@ -8069,7 +8131,8 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             continue;
         }
 
-        let workspace_id = cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
+        let workspace_id =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"]);
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]);
         let workspace_active = workspace
@@ -8258,7 +8321,9 @@ fn cloud_mcp_filter_deleted_workspace_snapshot(
         };
 
         let before = workspaces.len();
-        workspaces.retain(|workspace| !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id));
+        workspaces.retain(|workspace| {
+            !cloud_mcp_workspace_payload_matches_delete(workspace, workspace_id)
+        });
         let removed = before.saturating_sub(workspaces.len());
         if removed == 0 {
             return 0;
@@ -8389,11 +8454,8 @@ async fn cloud_mcp_delete_workspace(
         cloud_delete_repo_ids.dedup();
     }
 
-    let stopped_syncs = cloud_mcp_stop_spec_graph_syncs_for_repo_ids(
-        state.inner(),
-        &runtime_repo_ids,
-    )
-    .await;
+    let stopped_syncs =
+        cloud_mcp_stop_spec_graph_syncs_for_repo_ids(state.inner(), &runtime_repo_ids).await;
     let (removed_terminal_snapshots, removed_mcp_snapshots) = {
         let mut snapshots = state.runtime_snapshots.lock().await;
         let terminal_removed = cloud_mcp_filter_deleted_workspace_snapshot(
@@ -8445,7 +8507,8 @@ async fn cloud_mcp_delete_workspace(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
-    let response = cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
+    let response =
+        cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
     Ok(json!({
         "ok": true,
         "workspaceId": payload["workspace_id"].clone(),
@@ -8622,12 +8685,9 @@ async fn cloud_mcp_reset_workspace_graph_state(
         "current_agent_id": "rust-diffforge",
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/workspace/reset-graph-state",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/reset-graph-state", &payload)
+            .await?;
     cloud_mcp_clear_graph_reset_caches(&req.root, &req.repo_id, normalized_scope)?;
     Ok(cloud_mcp_response_data(&response))
 }
@@ -8674,12 +8734,9 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         "current_agent_id": "rust-diffforge",
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/cloud/sqlite/hard-reset",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/sqlite/hard-reset", &payload)
+            .await?;
     {
         let mut snapshots = state.runtime_snapshots.lock().await;
         *snapshots = CloudMcpRuntimeSnapshots::default();
@@ -8931,10 +8988,7 @@ fn cloud_mcp_mount_node_id(mount: &WorkspaceProjectMount) -> String {
 }
 
 fn cloud_mcp_prefix_mount_graph_id(mount: &WorkspaceProjectMount, id: &str) -> String {
-    format!(
-        "mount-{}-{id}",
-        cloud_mcp_short_hash(&mount.project_root)
-    )
+    format!("mount-{}-{id}", cloud_mcp_short_hash(&mount.project_root))
 }
 
 fn cloud_mcp_mount_project_relative_path(mount: &WorkspaceProjectMount, raw_path: &str) -> String {
@@ -8948,7 +9002,11 @@ fn cloud_mcp_mount_project_relative_path(mount: &WorkspaceProjectMount, raw_path
         return String::new();
     }
 
-    let project_root = mount.project_root.replace('\\', "/").trim_end_matches('/').to_string();
+    let project_root = mount
+        .project_root
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
     if normalized == project_root {
         return String::new();
     }
@@ -8973,7 +9031,10 @@ fn cloud_mcp_mount_project_relative_path(mount: &WorkspaceProjectMount, raw_path
     normalized
 }
 
-fn cloud_mcp_mount_visible_path(mount: &WorkspaceProjectMount, project_relative_path: &str) -> String {
+fn cloud_mcp_mount_visible_path(
+    mount: &WorkspaceProjectMount,
+    project_relative_path: &str,
+) -> String {
     let mount_path = mount
         .workspace_relative_path
         .replace('\\', "/")
@@ -9007,11 +9068,26 @@ fn cloud_mcp_attach_mount_metadata(
     object.insert("mountId".to_string(), json!(mount.mount_id.clone()));
     object.insert("mount_kind".to_string(), json!(mount.mount_kind.clone()));
     object.insert("mountKind".to_string(), json!(mount.mount_kind.clone()));
-    object.insert("parent_mount_id".to_string(), json!(mount.parent_mount_id.clone()));
-    object.insert("parentMountId".to_string(), json!(mount.parent_mount_id.clone()));
-    object.insert("workspace_root".to_string(), json!(workspace_path_display(workspace_root)));
-    object.insert("workspaceRoot".to_string(), json!(workspace_path_display(workspace_root)));
-    object.insert("project_root".to_string(), json!(mount.project_root.clone()));
+    object.insert(
+        "parent_mount_id".to_string(),
+        json!(mount.parent_mount_id.clone()),
+    );
+    object.insert(
+        "parentMountId".to_string(),
+        json!(mount.parent_mount_id.clone()),
+    );
+    object.insert(
+        "workspace_root".to_string(),
+        json!(workspace_path_display(workspace_root)),
+    );
+    object.insert(
+        "workspaceRoot".to_string(),
+        json!(workspace_path_display(workspace_root)),
+    );
+    object.insert(
+        "project_root".to_string(),
+        json!(mount.project_root.clone()),
+    );
     object.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
     object.insert(
         "project_relative_path".to_string(),
@@ -9035,11 +9111,26 @@ fn cloud_mcp_attach_mount_metadata(
         metadata.insert("mountId".to_string(), json!(mount.mount_id.clone()));
         metadata.insert("mount_kind".to_string(), json!(mount.mount_kind.clone()));
         metadata.insert("mountKind".to_string(), json!(mount.mount_kind.clone()));
-        metadata.insert("parent_mount_id".to_string(), json!(mount.parent_mount_id.clone()));
-        metadata.insert("parentMountId".to_string(), json!(mount.parent_mount_id.clone()));
-        metadata.insert("workspace_root".to_string(), json!(workspace_path_display(workspace_root)));
-        metadata.insert("workspaceRoot".to_string(), json!(workspace_path_display(workspace_root)));
-        metadata.insert("project_root".to_string(), json!(mount.project_root.clone()));
+        metadata.insert(
+            "parent_mount_id".to_string(),
+            json!(mount.parent_mount_id.clone()),
+        );
+        metadata.insert(
+            "parentMountId".to_string(),
+            json!(mount.parent_mount_id.clone()),
+        );
+        metadata.insert(
+            "workspace_root".to_string(),
+            json!(workspace_path_display(workspace_root)),
+        );
+        metadata.insert(
+            "workspaceRoot".to_string(),
+            json!(workspace_path_display(workspace_root)),
+        );
+        metadata.insert(
+            "project_root".to_string(),
+            json!(mount.project_root.clone()),
+        );
         metadata.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
         metadata.insert(
             "project_relative_path".to_string(),
@@ -9130,14 +9221,14 @@ fn cloud_mcp_prefix_container_node(
     mut node: Value,
     index: usize,
 ) -> Option<(Value, String, bool)> {
-    let original_id = cloud_mcp_spec_graph_item_id(&node)
-        .unwrap_or_else(|| format!("node-{index}"));
+    let original_id =
+        cloud_mcp_spec_graph_item_id(&node).unwrap_or_else(|| format!("node-{index}"));
     let prefixed_id = cloud_mcp_prefix_mount_graph_id(mount, &original_id);
     let node_type = cloud_mcp_payload_text(&node, &["node_type", "nodeType", "type"])
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let raw_path = cloud_mcp_payload_text(&node, &["path", "display_path", "displayPath"])
-        .unwrap_or_default();
+    let raw_path =
+        cloud_mcp_payload_text(&node, &["path", "display_path", "displayPath"]).unwrap_or_default();
     let project_relative_path = cloud_mcp_mount_project_relative_path(mount, &raw_path);
     let visible_path = cloud_mcp_mount_visible_path(mount, &project_relative_path);
     let is_root_like = matches!(
@@ -9166,8 +9257,14 @@ fn cloud_mcp_prefix_container_node(
     object.insert("sourceNodeId".to_string(), json!(source_node_id.clone()));
     object.insert("source_repo_id".to_string(), json!(source_repo_id.clone()));
     object.insert("sourceRepoId".to_string(), json!(source_repo_id.clone()));
-    object.insert("immediate_source_node_id".to_string(), json!(original_id.clone()));
-    object.insert("immediateSourceNodeId".to_string(), json!(original_id.clone()));
+    object.insert(
+        "immediate_source_node_id".to_string(),
+        json!(original_id.clone()),
+    );
+    object.insert(
+        "immediateSourceNodeId".to_string(),
+        json!(original_id.clone()),
+    );
     object.insert(
         "immediate_source_repo_id".to_string(),
         json!(immediate_source_repo_id.clone()),
@@ -9190,7 +9287,13 @@ fn cloud_mcp_prefix_container_node(
     if object.contains_key("nodeId") {
         object.insert("nodeId".to_string(), json!(prefixed_id.clone()));
     }
-    if !visible_path.is_empty() || is_root_like || matches!(node_type.as_str(), "file" | "folder" | "implementation_unit") {
+    if !visible_path.is_empty()
+        || is_root_like
+        || matches!(
+            node_type.as_str(),
+            "file" | "folder" | "implementation_unit"
+        )
+    {
         object.insert("path".to_string(), json!(visible_path.clone()));
     }
     cloud_mcp_attach_mount_metadata(
@@ -9256,7 +9359,13 @@ fn cloud_mcp_prefix_container_edge(
     if object.contains_key("toNodeId") {
         object.insert("toNodeId".to_string(), json!(prefixed_to));
     }
-    cloud_mcp_attach_mount_metadata(object, workspace_root, mount, "", &mount.workspace_relative_path);
+    cloud_mcp_attach_mount_metadata(
+        object,
+        workspace_root,
+        mount,
+        "",
+        &mount.workspace_relative_path,
+    );
     Some(edge)
 }
 
@@ -9266,8 +9375,8 @@ fn cloud_mcp_selected_root_has_project_graph(root: &Path) -> bool {
 }
 
 fn cloud_mcp_relative_spec_node_path(root: &Path, node: &Value) -> String {
-    let raw_path = cloud_mcp_payload_text(node, &["path", "display_path", "displayPath"])
-        .unwrap_or_default();
+    let raw_path =
+        cloud_mcp_payload_text(node, &["path", "display_path", "displayPath"]).unwrap_or_default();
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -9287,8 +9396,7 @@ fn cloud_mcp_path_is_inside_mount(relative_path: &str, mount_paths: &[String]) -
     let relative_path = normalize_git_status_path(relative_path);
     !relative_path.is_empty()
         && mount_paths.iter().any(|mount_path| {
-            relative_path == *mount_path
-                || relative_path.starts_with(&format!("{mount_path}/"))
+            relative_path == *mount_path || relative_path.starts_with(&format!("{mount_path}/"))
         })
 }
 
@@ -9377,10 +9485,13 @@ fn cloud_mcp_append_parent_spec_graph(
     }
 
     for edge in parent_edges {
-        let Some(from) = cloud_mcp_payload_text(&edge, &["from_node_id", "fromNodeId", "from", "source"]) else {
+        let Some(from) =
+            cloud_mcp_payload_text(&edge, &["from_node_id", "fromNodeId", "from", "source"])
+        else {
             continue;
         };
-        let Some(to) = cloud_mcp_payload_text(&edge, &["to_node_id", "toNodeId", "to", "target"]) else {
+        let Some(to) = cloud_mcp_payload_text(&edge, &["to_node_id", "toNodeId", "to", "target"])
+        else {
             continue;
         };
         if kept_node_ids.contains(&from) && kept_node_ids.contains(&to) {
@@ -9390,7 +9501,11 @@ fn cloud_mcp_append_parent_spec_graph(
 
     if let Some(tasks) = parent_snapshot
         .get("taskHistory")
-        .or_else(|| parent_snapshot.get("raw").and_then(|raw| raw.get("task_history")))
+        .or_else(|| {
+            parent_snapshot
+                .get("raw")
+                .and_then(|raw| raw.get("task_history"))
+        })
         .and_then(|history| history.get("tasks"))
         .and_then(Value::as_array)
     {
@@ -9458,7 +9573,11 @@ fn cloud_mcp_container_spec_graph_snapshot(
     for mount in &manifest_mounts {
         let mount_node_id = cloud_mcp_mount_node_id(mount);
         mount_node_ids.insert(mount.mount_id.clone(), mount_node_id.clone());
-        nodes.push(cloud_mcp_container_mount_node(&req.root, &req.repo_id, mount));
+        nodes.push(cloud_mcp_container_mount_node(
+            &req.root,
+            &req.repo_id,
+            mount,
+        ));
     }
 
     for mount in &manifest_mounts {
@@ -9537,22 +9656,20 @@ fn cloud_mcp_container_spec_graph_snapshot(
         let mut root_like_child_node_id: Option<String> = None;
 
         for (index, node) in child_nodes.into_iter().enumerate() {
-            let original_id = cloud_mcp_spec_graph_item_id(&node)
-                .unwrap_or_else(|| format!("node-{index}"));
+            let original_id =
+                cloud_mcp_spec_graph_item_id(&node).unwrap_or_else(|| format!("node-{index}"));
             let source_node_hash = child_node_hashes
                 .and_then(|hashes| hashes.get(&original_id))
                 .and_then(Value::as_str);
-            if let Some((node, prefixed_id, is_root_like)) =
-                cloud_mcp_prefix_container_node(
-                    &req.root,
-                    mount,
-                    &project_req.repo_id,
-                    child_cursor,
-                    source_node_hash,
-                    node,
-                    index,
-                )
-            {
+            if let Some((node, prefixed_id, is_root_like)) = cloud_mcp_prefix_container_node(
+                &req.root,
+                mount,
+                &project_req.repo_id,
+                child_cursor,
+                source_node_hash,
+                node,
+                index,
+            ) {
                 if first_child_node_id.is_none() {
                     first_child_node_id = Some(prefixed_id.clone());
                 }
@@ -9595,7 +9712,10 @@ fn cloud_mcp_container_spec_graph_snapshot(
                 if let Some(object) = task.as_object_mut() {
                     object.insert("mount_id".to_string(), json!(mount.mount_id.clone()));
                     object.insert("mountId".to_string(), json!(mount.mount_id.clone()));
-                    object.insert("project_root".to_string(), json!(mount.project_root.clone()));
+                    object.insert(
+                        "project_root".to_string(),
+                        json!(mount.project_root.clone()),
+                    );
                     object.insert("projectRoot".to_string(), json!(mount.project_root.clone()));
                 }
                 task_history_tasks.push(task);
@@ -9603,7 +9723,10 @@ fn cloud_mcp_container_spec_graph_snapshot(
         }
     }
 
-    let cursor = format!("container-local-{}", cloud_mcp_short_hash(&cursor_parts.join("|")));
+    let cursor = format!(
+        "container-local-{}",
+        cloud_mcp_short_hash(&cursor_parts.join("|"))
+    );
     let raw = json!({
         "kind": "container_project_spec_graph",
         "version": 1,
@@ -9627,13 +9750,8 @@ fn cloud_mcp_container_spec_graph_snapshot(
         "node_hashes": {},
         "edge_hashes": {},
     });
-    let mut snapshot = cloud_mcp_spec_graph_snapshot_from_data(
-        req,
-        raw,
-        Path::new(""),
-        sync_state,
-        sync_error,
-    );
+    let mut snapshot =
+        cloud_mcp_spec_graph_snapshot_from_data(req, raw, Path::new(""), sync_state, sync_error);
     if let Some(object) = snapshot.as_object_mut() {
         object.insert("cachePath".to_string(), json!(""));
         object.insert("projectMounts".to_string(), json!(mount_values));
@@ -9660,9 +9778,8 @@ fn cloud_mcp_container_spec_graph_snapshot_for_repo_path(
 ) -> Option<Value> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
     let mounts = cloud_mcp_container_project_mounts(&req.root);
-    (!mounts.is_empty()).then(|| {
-        cloud_mcp_container_spec_graph_snapshot(&req, &mounts, sync_state, sync_error)
-    })
+    (!mounts.is_empty())
+        .then(|| cloud_mcp_container_spec_graph_snapshot(&req, &mounts, sync_state, sync_error))
 }
 
 fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &Value) -> bool {
@@ -10052,7 +10169,9 @@ fn cloud_mcp_build_container_local_ignored_spec_graph_overlay(
     let mut nodes = Vec::new();
 
     for mount in mounts {
-        for (project_relative_path, path) in cloud_mcp_local_ignored_whitelist_candidates(&mount.root_path) {
+        for (project_relative_path, path) in
+            cloud_mcp_local_ignored_whitelist_candidates(&mount.root_path)
+        {
             let visible_path = cloud_mcp_mount_visible_path(mount, &project_relative_path);
             let Some(mut node) =
                 cloud_mcp_local_ignored_overlay_node(&repo_id, &visible_path, &path)
@@ -10760,9 +10879,10 @@ async fn cloud_mcp_container_snapshots_for_child_sync(
         syncs
             .values()
             .filter(|runtime| {
-                runtime.mounts.iter().any(|mount| {
-                    normalized_path_key(&mount.root_path) == child_root_key
-                })
+                runtime
+                    .mounts
+                    .iter()
+                    .any(|mount| normalized_path_key(&mount.root_path) == child_root_key)
             })
             .cloned()
             .collect::<Vec<_>>()
@@ -10815,8 +10935,8 @@ async fn cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
 ) {
     let sync_state = cloud_mcp_payload_text(&snapshot, &["syncState", "sync_state"])
         .unwrap_or_else(|| "local_mounts".to_string());
-    let sync_error = cloud_mcp_payload_text(&snapshot, &["syncError", "sync_error"])
-        .unwrap_or_default();
+    let sync_error =
+        cloud_mcp_payload_text(&snapshot, &["syncError", "sync_error"]).unwrap_or_default();
     cloud_mcp_emit_spec_graph_snapshot(app, snapshot);
     if let Some(mut composed_snapshot) =
         cloud_mcp_container_snapshot_for_root_sync(state, req, &sync_state, &sync_error).await
@@ -10829,13 +10949,9 @@ async fn cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
         }
         cloud_mcp_emit_spec_graph_snapshot(app, composed_snapshot);
     }
-    for parent_snapshot in cloud_mcp_container_snapshots_for_child_sync(
-        state,
-        &req.root,
-        &sync_state,
-        &sync_error,
-    )
-    .await
+    for parent_snapshot in
+        cloud_mcp_container_snapshots_for_child_sync(state, &req.root, &sync_state, &sync_error)
+            .await
     {
         cloud_mcp_emit_spec_graph_snapshot(app, parent_snapshot);
     }
@@ -10901,13 +11017,8 @@ async fn cloud_mcp_sync_spec_graph_cycle(
     match sync_result {
         Ok((snapshot, changed)) => {
             if *first_sync || changed || filetree_synced {
-                cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                    app,
-                    state,
-                    req,
-                    snapshot,
-                )
-                .await;
+                cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(app, state, req, snapshot)
+                    .await;
             }
             *first_sync = false;
             false
@@ -10967,10 +11078,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                     &format!("Unable to watch workspace filetree changes: {error}"),
                 );
                 cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                    &app,
-                    &state,
-                    &req,
-                    snapshot,
+                    &app, &state, &req, snapshot,
                 )
                 .await;
                 None
@@ -10982,13 +11090,8 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 "syncing",
                 &format!("Unable to start workspace filetree watcher: {error}"),
             );
-            cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                &app,
-                &state,
-                &req,
-                snapshot,
-            )
-            .await;
+            cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(&app, &state, &req, snapshot)
+                .await;
             None
         }
     };
@@ -11079,10 +11182,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                     let snapshot = cloud_mcp_read_spec_graph_cache(&req, "syncing", "");
                     let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
                     cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                        &app,
-                        &state,
-                        &req,
-                        snapshot,
+                        &app, &state, &req, snapshot,
                     )
                     .await;
                     retry_soon = true;
@@ -11095,10 +11195,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                 );
                 let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
                 cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                    &app,
-                    &state,
-                    &req,
-                    snapshot,
+                    &app, &state, &req, snapshot,
                 )
                 .await;
                 break;
@@ -11130,10 +11227,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                                 &format!("Workspace filetree watcher failed: {error}"),
                             );
                             cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                                &app,
-                                &state,
-                                &req,
-                                snapshot,
+                                &app, &state, &req, snapshot,
                             )
                             .await;
                         }
@@ -11158,10 +11252,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
                     &format!("Workspace filetree watcher failed: {error}"),
                 );
                 cloud_mcp_emit_spec_graph_snapshot_and_parent_containers(
-                    &app,
-                    &state,
-                    &req,
-                    snapshot,
+                    &app, &state, &req, snapshot,
                 )
                 .await;
                 filetree_watcher = None;
@@ -11211,8 +11302,7 @@ async fn cloud_mcp_get_local_ignored_spec_graph_overlay(
     let mounts = cloud_mcp_container_project_mounts(&root);
     if !mounts.is_empty() {
         return Ok(cloud_mcp_build_container_local_ignored_spec_graph_overlay(
-            &root,
-            &mounts,
+            &root, &mounts,
         ));
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -11265,12 +11355,8 @@ async fn cloud_mcp_start_spec_graph_sync(
                 cloud_mcp_start_project_spec_graph_sync(&app, state.inner(), child_req).await?,
             );
         }
-        let mut snapshot = cloud_mcp_container_spec_graph_snapshot(
-            &req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
+        let mut snapshot =
+            cloud_mcp_container_spec_graph_snapshot(&req, &mounts, "local_mounts", "");
         if let Some(object) = snapshot.as_object_mut() {
             object.insert("syncGeneration".to_string(), json!(sync_generation));
             object.insert("childSyncs".to_string(), Value::Array(child_syncs));
@@ -11397,11 +11483,7 @@ async fn cloud_mcp_stop_spec_graph_sync(
         .unwrap_or_default()
         .into_iter()
         .map(|mount| {
-            cloud_mcp_spec_graph_sync_request(
-                workspace_path_display(&mount.root_path),
-                None,
-                None,
-            )
+            cloud_mcp_spec_graph_sync_request(workspace_path_display(&mount.root_path), None, None)
         })
         .collect::<Vec<_>>();
     let mut syncs = state.spec_graph_syncs.lock().await;
@@ -11444,7 +11526,11 @@ async fn cloud_mcp_stop_spec_graph_sync(
     }))
 }
 
-fn cloud_mcp_clear_graph_reset_caches(root: &Path, repo_id: &str, scope: &str) -> Result<(), String> {
+fn cloud_mcp_clear_graph_reset_caches(
+    root: &Path,
+    repo_id: &str,
+    scope: &str,
+) -> Result<(), String> {
     if scope == "spec" || scope == "all" {
         if let Ok(path) = cloud_mcp_safe_spec_graph_repo_cache_path(root, repo_id) {
             if path.exists() {
@@ -11641,7 +11727,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_output_classifier_keeps_codex_working_screen_active() {
-        let working_screen = "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m \u{1b}[2m(10s • esc to interrupt)\u{1b}[39m\
+        let working_screen =
+            "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m \u{1b}[2m(10s • esc to interrupt)\u{1b}[39m\
 \u{1b}[47;1H\u{1b}[22m\u{1b}[1m›\u{1b}[47;3H\u{1b}[22m\u{1b}[2mExplain this codebase";
 
         assert!(!cloud_mcp_terminal_output_looks_ready(working_screen));
@@ -11812,13 +11899,12 @@ mod cloud_mcp_tests {
             Some("Suite".to_string()),
         );
         let mounts = cloud_mcp_container_project_mounts(&root);
-        let snapshot = cloud_mcp_container_spec_graph_snapshot(
-            &container_req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
-        let nodes = snapshot["specNodes"].as_array().cloned().unwrap_or_default();
+        let snapshot =
+            cloud_mcp_container_spec_graph_snapshot(&container_req, &mounts, "local_mounts", "");
+        let nodes = snapshot["specNodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let routed_node = nodes
             .iter()
             .find(|node| node["sourceNodeId"].as_str() == Some("file-app"))
@@ -11827,13 +11913,28 @@ mod cloud_mcp_tests {
         assert_eq!(snapshot["containerWorkspace"].as_bool(), Some(true));
         assert_eq!(snapshot["projectMounts"].as_array().map(Vec::len), Some(1));
         assert_ne!(routed_node["id"].as_str(), Some("file-app"));
-        assert_eq!(routed_node["sourceRepoId"].as_str(), Some(child_req.repo_id.as_str()));
-        assert_eq!(routed_node["sourceGraphCursor"].as_str(), Some("cursor-one"));
+        assert_eq!(
+            routed_node["sourceRepoId"].as_str(),
+            Some(child_req.repo_id.as_str())
+        );
+        assert_eq!(
+            routed_node["sourceGraphCursor"].as_str(),
+            Some("cursor-one")
+        );
         assert_eq!(routed_node["sourceNodeHash"].as_str(), Some("hash-app"));
         assert_eq!(routed_node["mountId"].as_str(), Some("frontend"));
-        assert_eq!(routed_node["projectRoot"].as_str(), Some(child_req.root_display.as_str()));
-        assert_eq!(routed_node["projectRelativePath"].as_str(), Some("src/App.jsx"));
-        assert_eq!(routed_node["visiblePath"].as_str(), Some("frontend/src/App.jsx"));
+        assert_eq!(
+            routed_node["projectRoot"].as_str(),
+            Some(child_req.root_display.as_str())
+        );
+        assert_eq!(
+            routed_node["projectRelativePath"].as_str(),
+            Some("src/App.jsx")
+        );
+        assert_eq!(
+            routed_node["visiblePath"].as_str(),
+            Some("frontend/src/App.jsx")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -11925,14 +12026,16 @@ mod cloud_mcp_tests {
         cloud_mcp_write_spec_graph_cache(&child_req, &child_snapshot).unwrap();
 
         let mounts = cloud_mcp_container_project_mounts(&root);
-        let snapshot = cloud_mcp_container_spec_graph_snapshot(
-            &parent_req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
-        let mount_values = snapshot["projectMounts"].as_array().cloned().unwrap_or_default();
-        let nodes = snapshot["specNodes"].as_array().cloned().unwrap_or_default();
+        let snapshot =
+            cloud_mcp_container_spec_graph_snapshot(&parent_req, &mounts, "local_mounts", "");
+        let mount_values = snapshot["projectMounts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let nodes = snapshot["specNodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
 
         assert_eq!(mounts.len(), 1);
         assert_eq!(snapshot["containerWorkspace"].as_bool(), Some(true));
@@ -11997,15 +12100,20 @@ mod cloud_mcp_tests {
             Some("Suite".to_string()),
         );
         let mounts = cloud_mcp_container_project_mounts(&root);
-        let snapshot = cloud_mcp_container_spec_graph_snapshot(
-            &container_req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
-        let mount_values = snapshot["projectMounts"].as_array().cloned().unwrap_or_default();
-        let nodes = snapshot["specNodes"].as_array().cloned().unwrap_or_default();
-        let edges = snapshot["specEdges"].as_array().cloned().unwrap_or_default();
+        let snapshot =
+            cloud_mcp_container_spec_graph_snapshot(&container_req, &mounts, "local_mounts", "");
+        let mount_values = snapshot["projectMounts"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let nodes = snapshot["specNodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let edges = snapshot["specEdges"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let product_a_mount = mount_values
             .iter()
             .find(|mount| mount["mountId"].as_str() == Some("product-a"))
@@ -12075,12 +12183,8 @@ mod cloud_mcp_tests {
             Some("Suite".to_string()),
         );
         let mounts = cloud_mcp_container_project_mounts(&root);
-        let first_container = cloud_mcp_container_spec_graph_snapshot(
-            &container_req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
+        let first_container =
+            cloud_mcp_container_spec_graph_snapshot(&container_req, &mounts, "local_mounts", "");
 
         let second_child_snapshot = cloud_mcp_spec_graph_snapshot_from_data(
             &child_req,
@@ -12096,12 +12200,8 @@ mod cloud_mcp_tests {
             "",
         );
         cloud_mcp_write_spec_graph_cache(&child_req, &second_child_snapshot).unwrap();
-        let second_container = cloud_mcp_container_spec_graph_snapshot(
-            &container_req,
-            &mounts,
-            "local_mounts",
-            "",
-        );
+        let second_container =
+            cloud_mcp_container_spec_graph_snapshot(&container_req, &mounts, "local_mounts", "");
 
         assert_ne!(
             first_container["cursor"].as_str(),
@@ -12158,13 +12258,9 @@ mod cloud_mcp_tests {
             );
         }
 
-        let snapshots = cloud_mcp_container_snapshots_for_child_sync(
-            &state,
-            &child_req.root,
-            "ready",
-            "",
-        )
-        .await;
+        let snapshots =
+            cloud_mcp_container_snapshots_for_child_sync(&state, &child_req.root, "ready", "")
+                .await;
 
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0]["syncGeneration"].as_u64(), Some(generation));
@@ -12297,7 +12393,10 @@ mod cloud_mcp_tests {
         );
         assert_eq!(final_payload["filetree_complete"].as_bool(), Some(true));
         assert_eq!(final_payload["filetree_partial"].as_bool(), Some(false));
-        assert_eq!(final_payload["filetree_authoritative"].as_bool(), Some(true));
+        assert_eq!(
+            final_payload["filetree_authoritative"].as_bool(),
+            Some(true)
+        );
         assert_eq!(final_payload["filetree_sync_batch_index"].as_u64(), Some(4));
         assert_eq!(
             final_payload["filetree_sync_epoch_id"].as_str(),
@@ -12373,7 +12472,10 @@ mod cloud_mcp_tests {
 
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0]["container_workspace"].as_bool(), Some(true));
-        assert_eq!(payloads[0]["filetreeRoot"]["kind"].as_str(), Some("container"));
+        assert_eq!(
+            payloads[0]["filetreeRoot"]["kind"].as_str(),
+            Some("container")
+        );
         let mount_paths = payloads[1]["filetree"]
             .as_array()
             .cloned()
@@ -12397,7 +12499,10 @@ mod cloud_mcp_tests {
             &session,
         );
         assert_eq!(final_payload["filetree_complete"].as_bool(), Some(true));
-        assert_eq!(final_payload["filetree_authoritative"].as_bool(), Some(false));
+        assert_eq!(
+            final_payload["filetree_authoritative"].as_bool(),
+            Some(false)
+        );
         assert_eq!(final_payload["container_workspace"].as_bool(), Some(true));
 
         let _ = fs::remove_dir_all(root);
@@ -12412,7 +12517,9 @@ mod cloud_mcp_tests {
             first_unsent_depth: 0,
         };
 
-        assert!(!cloud_mcp_workspace_kind_filetree_authoritative("broad_area"));
+        assert!(!cloud_mcp_workspace_kind_filetree_authoritative(
+            "broad_area"
+        ));
 
         let payload = cloud_mcp_filetree_complete_payload(
             "repo-broad",
@@ -12441,8 +12548,11 @@ mod cloud_mcp_tests {
     fn plain_unknown_workspace_bundle_is_discovery_only_not_authoritative_filetree() {
         let root = test_cloud_root("diffforge-cloud-plain-discovery-filetree");
         fs::create_dir_all(root.join("archive")).unwrap();
-        fs::write(root.join("private-notes.txt"), "do not sync this filename as a project\n")
-            .unwrap();
+        fs::write(
+            root.join("private-notes.txt"),
+            "do not sync this filename as a project\n",
+        )
+        .unwrap();
         fs::write(root.join("archive").join("large.log"), "metadata only\n").unwrap();
 
         let bundle = cloud_mcp_prepare_workspace_bundle(
@@ -12505,7 +12615,8 @@ mod cloud_mcp_tests {
         assert_eq!(batch_indexes, vec![0, 1, 2, 3]);
         assert!(payloads
             .iter()
-            .all(|payload| payload["filetree_sync_epoch_id"].as_str() == Some(first.epoch_id.as_str())));
+            .all(|payload| payload["filetree_sync_epoch_id"].as_str()
+                == Some(first.epoch_id.as_str())));
     }
 
     #[test]
@@ -13140,8 +13251,11 @@ fn cloud_mcp_proxy_push_current_filetree_snapshot(
     };
     let detected_mounts = workspace_project_mounts(workspace_root);
     let workspace_kind = workspace_kind_for_mounts(workspace_root, &detected_mounts);
-    let project_mounts =
-        cloud_mcp_project_mounts_for_workspace_sync(workspace_root, &workspace_kind, &detected_mounts);
+    let project_mounts = cloud_mcp_project_mounts_for_workspace_sync(
+        workspace_root,
+        &workspace_kind,
+        &detected_mounts,
+    );
     let mut sync_session = cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 1);
     let (seed_workspace_id, seed_workspace_name) =
         cloud_mcp_workspace_identity(workspace_root, workspace_id, workspace_name);
@@ -13179,21 +13293,21 @@ fn cloud_mcp_proxy_push_current_filetree_snapshot(
     let sync_workspace_name = Some(seed.workspace_name.as_str());
     let (filetree, filetree_truncated, filetree_authoritative) =
         if cloud_mcp_workspace_kind_is_container(&workspace_kind) {
-        let (filetree, filetree_truncated) =
-            cloud_mcp_container_mount_filetree(workspace_root, &project_mounts);
-        (filetree, filetree_truncated, false)
-    } else if cloud_mcp_workspace_kind_is_discovery_only(&workspace_kind) {
-        (Vec::new(), false, false)
-    } else {
-        let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(workspace_root);
-        let (filetree, filetree_truncated) = cloud_mcp_apply_project_mount_boundaries(
-            workspace_root,
-            filetree,
-            filetree_truncated,
-            &project_mounts,
-        );
-        (filetree, filetree_truncated, true)
-    };
+            let (filetree, filetree_truncated) =
+                cloud_mcp_container_mount_filetree(workspace_root, &project_mounts);
+            (filetree, filetree_truncated, false)
+        } else if cloud_mcp_workspace_kind_is_discovery_only(&workspace_kind) {
+            (Vec::new(), false, false)
+        } else {
+            let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(workspace_root);
+            let (filetree, filetree_truncated) = cloud_mcp_apply_project_mount_boundaries(
+                workspace_root,
+                filetree,
+                filetree_truncated,
+                &project_mounts,
+            );
+            (filetree, filetree_truncated, true)
+        };
     for payload in cloud_mcp_filetree_progressive_payloads(
         repo_id,
         workspace_root,
@@ -13801,10 +13915,7 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     arguments.insert("run_id".to_string(), json!(active_task_id));
     arguments.insert("session_mode".to_string(), json!(session_mode_text));
     arguments.insert("file_authority".to_string(), json!(file_authority_text));
-    arguments.insert(
-        "enforcement_mode".to_string(),
-        json!(enforcement_mode_text),
-    );
+    arguments.insert("enforcement_mode".to_string(), json!(enforcement_mode_text));
     arguments.insert("completion_mode".to_string(), json!(completion_mode_text));
     arguments.insert("record_spec_activity".to_string(), json!(false));
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
@@ -14305,19 +14416,31 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
-    if let Some(session_mode) = session_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(session_mode) = session_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         metadata.insert("session_mode".to_string(), json!(session_mode));
         metadata.insert("sessionMode".to_string(), json!(session_mode));
     }
-    if let Some(file_authority) = file_authority.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(file_authority) = file_authority
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         metadata.insert("file_authority".to_string(), json!(file_authority));
         metadata.insert("fileAuthority".to_string(), json!(file_authority));
     }
-    if let Some(enforcement_mode) = enforcement_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(enforcement_mode) = enforcement_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         metadata.insert("enforcement_mode".to_string(), json!(enforcement_mode));
         metadata.insert("enforcementMode".to_string(), json!(enforcement_mode));
     }
-    if let Some(completion_mode) = completion_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(completion_mode) = completion_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         metadata.insert("completion_mode".to_string(), json!(completion_mode));
         metadata.insert("completionMode".to_string(), json!(completion_mode));
     }
@@ -14339,16 +14462,28 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         arguments.insert("agent_kind".to_string(), json!(agent_kind));
         arguments.insert("coding_agent".to_string(), json!(agent_kind));
     }
-    if let Some(session_mode) = session_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(session_mode) = session_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("session_mode".to_string(), json!(session_mode));
     }
-    if let Some(file_authority) = file_authority.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(file_authority) = file_authority
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("file_authority".to_string(), json!(file_authority));
     }
-    if let Some(enforcement_mode) = enforcement_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(enforcement_mode) = enforcement_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("enforcement_mode".to_string(), json!(enforcement_mode));
     }
-    if let Some(completion_mode) = completion_mode.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(completion_mode) = completion_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         arguments.insert("completion_mode".to_string(), json!(completion_mode));
     }
     if let Some(task_body) = task_body.map(str::trim).filter(|value| !value.is_empty()) {
@@ -15311,7 +15446,9 @@ fn cloud_mcp_proxy_websocket_url(base_url: &str, endpoint_path: &str) -> Result<
     } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
         trimmed.to_string()
     } else {
-        return Err("Cloud MCP URL must start with http://, https://, ws://, or wss://".to_string());
+        return Err(
+            "Cloud MCP URL must start with http://, https://, ws://, or wss://".to_string(),
+        );
     };
 
     Ok(format!(
@@ -15321,7 +15458,10 @@ fn cloud_mcp_proxy_websocket_url(base_url: &str, endpoint_path: &str) -> Result<
     ))
 }
 
-fn cloud_mcp_proxy_resolve_blocking_target(base_url: &str, endpoint_path: &str) -> CloudMcpWsTarget {
+fn cloud_mcp_proxy_resolve_blocking_target(
+    base_url: &str,
+    endpoint_path: &str,
+) -> CloudMcpWsTarget {
     let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
     if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
         if cloud_mcp_ws_target_reachable_blocking(&target.ws_url) {
@@ -15359,7 +15499,10 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .json::<Value>()
         .map_err(|error| format!("Cloud MCP route response was invalid JSON: {error}"))?;
     if !status.is_success() {
-        return Err(format!("Cloud MCP route request returned {}", status.as_u16()));
+        return Err(format!(
+            "Cloud MCP route request returned {}",
+            status.as_u16()
+        ));
     }
     Ok(cloud_mcp_direct_target_from_route(&parsed, endpoint_path))
 }

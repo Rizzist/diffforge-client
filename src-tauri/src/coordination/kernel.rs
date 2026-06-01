@@ -50,8 +50,6 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
-    "write_file",
-    "delete_file",
     "complete_task",
     "submit_patch",
     "submit_patch_status",
@@ -61,8 +59,6 @@ const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
     "start_task",
     "acquire_lease",
     "checkpoint",
-    "write_file",
-    "delete_file",
     "complete_task",
     "submit_patch",
     "submit_patch_status",
@@ -1993,11 +1989,9 @@ fn remember_workspace_mcp_activation(key: String, response: &Value) {
 }
 
 fn worktree_mutation_lock_for_repo(repo_path: &Path) -> Arc<Mutex<()>> {
-    let mut key = process_path_text(repo_path);
+    let key = process_path_text(repo_path);
     #[cfg(windows)]
-    {
-        key = key.to_ascii_lowercase();
-    }
+    let key = key.to_ascii_lowercase();
 
     match worktree_mutation_locks().lock() {
         Ok(mut locks) => Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(())))),
@@ -3527,6 +3521,17 @@ impl CoordinationKernel {
                     params![task_id, now, session_id],
                 )
                 .map_err(|error| format!("Unable to attach session to claimed task: {error}"))?;
+            if let Some(worktree_id) = session["worktree_id"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.conn
+                    .execute(
+                        "UPDATE worktrees SET task_id=?1, updated_at=?2 WHERE id=?3",
+                        params![task_id, now, worktree_id],
+                    )
+                    .map_err(|error| format!("Unable to bind worktree to claimed task: {error}"))?;
+            }
             self.emit_event(
                 "task_claimed",
                 "agent",
@@ -5166,7 +5171,7 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
-            codex_home_path: None,
+            codex_home_path: codex_launch.home_path,
             codex_profile: codex_launch.profile,
             codex_bypass_hook_trust: codex_launch.bypass_hook_trust,
             claude_mcp_config_path,
@@ -5308,7 +5313,7 @@ impl CoordinationKernel {
             repo_path: self.paths.repo_path.display().to_string(),
             mcp_config_path,
             codex_mcp_config_path,
-            codex_home_path: None,
+            codex_home_path: codex_launch.home_path,
             codex_profile: codex_launch.profile,
             codex_bypass_hook_trust: codex_launch.bypass_hook_trust,
             claude_mcp_config_path,
@@ -9987,324 +9992,6 @@ impl CoordinationKernel {
             json!({"paths": normalized_paths, "changes": changes}),
             warnings,
         ))
-    }
-
-    pub fn write_file_for_task(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        session_id: &str,
-        path: &str,
-        content: &str,
-    ) -> Result<Value, String> {
-        let authority = match self.managed_file_authority_for_task(
-            task_id,
-            agent_id,
-            session_id,
-            path,
-            "write_file",
-        )? {
-            Ok(authority) => authority,
-            Err(response) => return Ok(response),
-        };
-        if authority.target_path.is_dir() {
-            return Ok(api_error(
-                "target_is_directory",
-                "write_file can only write regular files.",
-                json!({"path": authority.normalized_path}),
-            ));
-        }
-        let existed = authority.target_path.exists();
-        write_text_file_atomic(&authority.target_path, content)?;
-        let change_kind = if existed { "modified" } else { "added" };
-        let change = self.record_workspace_change(WorkspaceChangeInput {
-            task_id: Some(task_id),
-            agent_id: Some(agent_id),
-            agent_slot_id: authority.session["agent_slot_id"].as_str(),
-            session_id: Some(session_id),
-            worktree_id: authority.worktree_id.as_deref(),
-            change_source: "managed_write_file",
-            path: &authority.normalized_path,
-            resource_key: &authority.resource_key,
-            change_kind,
-            lease: Some(&authority.lease),
-            violation_id: None,
-            summary: Some("Managed coordination write"),
-            details: json!({
-                "authority": &authority.authority,
-                "target_path": process_path_text(&authority.target_path),
-                "byte_len": content.as_bytes().len(),
-            }),
-        })?;
-        self.emit_event(
-            "managed_file_written",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_slot_id: authority.session["agent_slot_id"]
-                    .as_str()
-                    .map(str::to_string),
-                session_id: Some(session_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({
-                "path": &authority.normalized_path,
-                "resource_key": &authority.resource_key,
-                "change_kind": change_kind,
-                "authority": &authority.authority,
-                "write_root": process_path_text(&authority.write_root),
-                "target_path": process_path_text(&authority.target_path),
-                "change": change.clone(),
-            }),
-        )?;
-        Ok(api_ok(json!({
-            "status": "written",
-            "path": authority.normalized_path,
-            "resource_key": authority.resource_key,
-            "change_kind": change_kind,
-            "authority": authority.authority,
-            "write_root": process_path_text(&authority.write_root),
-            "target_path": process_path_text(&authority.target_path),
-            "worktree_id": authority.worktree_id,
-            "completion_mode": authority.completion_mode,
-            "change": change,
-        })))
-    }
-
-    pub fn delete_file_for_task(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        session_id: &str,
-        path: &str,
-    ) -> Result<Value, String> {
-        let authority = match self.managed_file_authority_for_task(
-            task_id,
-            agent_id,
-            session_id,
-            path,
-            "delete_file",
-        )? {
-            Ok(authority) => authority,
-            Err(response) => return Ok(response),
-        };
-        if !authority.target_path.exists() {
-            return Ok(api_error(
-                "file_not_found",
-                "delete_file could not find the requested file.",
-                json!({"path": authority.normalized_path}),
-            ));
-        }
-        if authority.target_path.is_dir() {
-            return Ok(api_error(
-                "target_is_directory",
-                "delete_file can only delete regular files.",
-                json!({"path": authority.normalized_path}),
-            ));
-        }
-        fs::remove_file(&authority.target_path).map_err(|error| {
-            format!(
-                "Unable to delete {} through managed coordination write: {error}",
-                authority.target_path.display()
-            )
-        })?;
-        let change = self.record_workspace_change(WorkspaceChangeInput {
-            task_id: Some(task_id),
-            agent_id: Some(agent_id),
-            agent_slot_id: authority.session["agent_slot_id"].as_str(),
-            session_id: Some(session_id),
-            worktree_id: authority.worktree_id.as_deref(),
-            change_source: "managed_delete_file",
-            path: &authority.normalized_path,
-            resource_key: &authority.resource_key,
-            change_kind: "deleted",
-            lease: Some(&authority.lease),
-            violation_id: None,
-            summary: Some("Managed coordination delete"),
-            details: json!({
-                "authority": &authority.authority,
-                "target_path": process_path_text(&authority.target_path),
-            }),
-        })?;
-        self.emit_event(
-            "managed_file_deleted",
-            "agent",
-            agent_id,
-            EventRefs {
-                task_id: Some(task_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-                agent_slot_id: authority.session["agent_slot_id"]
-                    .as_str()
-                    .map(str::to_string),
-                session_id: Some(session_id.to_string()),
-                ..EventRefs::default()
-            },
-            json!({
-                "path": &authority.normalized_path,
-                "resource_key": &authority.resource_key,
-                "authority": &authority.authority,
-                "write_root": process_path_text(&authority.write_root),
-                "target_path": process_path_text(&authority.target_path),
-                "change": change.clone(),
-            }),
-        )?;
-        Ok(api_ok(json!({
-            "status": "deleted",
-            "path": authority.normalized_path,
-            "resource_key": authority.resource_key,
-            "authority": authority.authority,
-            "write_root": process_path_text(&authority.write_root),
-            "target_path": process_path_text(&authority.target_path),
-            "worktree_id": authority.worktree_id,
-            "completion_mode": authority.completion_mode,
-            "change": change,
-        })))
-    }
-
-    fn managed_file_authority_for_task(
-        &self,
-        task_id: &str,
-        agent_id: &str,
-        session_id: &str,
-        path: &str,
-        operation: &str,
-    ) -> Result<Result<ManagedFileAuthority, Value>, String> {
-        let session = self.ensure_session_active(session_id, agent_id)?;
-        self.ensure_session_owns_task(session_id, task_id)?;
-        reject_path_escape(path)?;
-        let normalized_path = normalize_change_path(path)?;
-        if is_coordination_owned_root_status_path(&normalized_path) {
-            return Ok(Err(api_error(
-                "coordination_path_denied",
-                "Diff Forge coordination metadata files are managed by the app and cannot be edited through agent file tools.",
-                json!({"path": normalized_path}),
-            )));
-        }
-
-        let requested_path = self.paths.repo_path.join(&normalized_path);
-        if let Some(git_root) = nearest_git_root_for_requested_path(&requested_path) {
-            let repo_root = self
-                .paths
-                .repo_path
-                .canonicalize()
-                .unwrap_or_else(|_| self.paths.repo_path.clone());
-            if !same_path_text(
-                &process_path_text(&git_root),
-                &process_path_text(&repo_root),
-            ) {
-                let nested_relative = requested_path
-                    .strip_prefix(&git_root)
-                    .ok()
-                    .map(|value| value.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|| normalized_path.clone());
-                return Ok(Err(api_error(
-                    "nested_git_repo_requires_repo_path",
-                    "This file is inside a nested Git repository. Use the coordination tools with repo_path set to that nested repository and path relative to it, so the nested repo gets its own task worktree lifecycle.",
-                    json!({
-                        "operation": operation,
-                        "path": normalized_path,
-                        "nested_repo_path": process_path_text(&git_root),
-                        "nested_repo_relative_path": nested_relative,
-                    }),
-                )));
-            }
-        }
-
-        let resource_key = path_to_file_resource(&normalized_path);
-        let Some(lease) = self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?
-        else {
-            return Ok(Err(api_error(
-                "lease_required_before_write",
-                "Call acquire_lease with a write lease covering this file before using managed file writes.",
-                json!({
-                    "operation": operation,
-                    "path": normalized_path,
-                    "resource_key": resource_key,
-                }),
-            )));
-        };
-
-        let enforcement_mode = session["enforcement_mode"]
-            .as_str()
-            .unwrap_or("coordination_only");
-        let (write_root, authority, completion_mode) = match enforcement_mode {
-            "worktree_required" => {
-                if let Some(problem) = self.session_worktree_isolation_problem(&session)? {
-                    return Ok(Err(api_error(
-                        "invalid_worktree_authority",
-                        "This task's assigned worktree is not safe to write. Start a fresh task or reset the terminal session.",
-                        json!({"problem": problem}),
-                    )));
-                }
-                let Some(write_root) = session["write_root"]
-                    .as_str()
-                    .filter(|value| !value.trim().is_empty())
-                else {
-                    return Ok(Err(api_error(
-                        "missing_write_root",
-                        "This task has no assigned writable root.",
-                        json!({"task_id": task_id, "session_id": session_id}),
-                    )));
-                };
-                (
-                    PathBuf::from(write_root),
-                    "git_worktree_patch".to_string(),
-                    "submit_patch".to_string(),
-                )
-            }
-            "bounded_direct_edit" => {
-                let write_root = session["write_root"]
-                    .as_str()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| self.paths.repo_path.to_str().unwrap_or(""));
-                (
-                    PathBuf::from(write_root),
-                    "bounded_direct_edit".to_string(),
-                    "complete_task".to_string(),
-                )
-            }
-            "general_worker" if repo_has_git(&self.paths.repo_path) => {
-                return Ok(Err(api_error(
-                    "acquire_lease_required_before_write",
-                    "This general worker still has no task worktree. Call acquire_lease for this file first; the lease step assigns the worktree.",
-                    json!({
-                        "operation": operation,
-                        "path": normalized_path,
-                        "resource_key": resource_key,
-                    }),
-                )));
-            }
-            _ => {
-                return Ok(Err(api_error(
-                    "no_file_write_authority",
-                    "This terminal session does not have local file write authority for managed writes.",
-                    json!({
-                        "operation": operation,
-                        "path": normalized_path,
-                        "enforcement_mode": enforcement_mode,
-                    }),
-                )));
-            }
-        };
-        let target_path = managed_write_target_path(&write_root, &normalized_path)?;
-        let worktree_id = if enforcement_mode == "worktree_required" {
-            session["worktree_id"].as_str().map(str::to_string)
-        } else {
-            None
-        };
-        Ok(Ok(ManagedFileAuthority {
-            session,
-            normalized_path,
-            resource_key,
-            lease,
-            write_root,
-            target_path,
-            worktree_id,
-            authority,
-            completion_mode,
-        }))
     }
 
     pub fn list_workspace_changes(
@@ -17591,6 +17278,24 @@ impl CoordinationKernel {
                         .map_err(|error| {
                             format!("Unable to attach session to started task: {error}")
                         })?;
+                    let session_worktree_id = self.query_one(
+                        "SELECT worktree_id FROM agent_sessions WHERE id=?1",
+                        &[&session_id],
+                        "Session does not exist.",
+                    )?["worktree_id"]
+                        .as_str()
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string);
+                    if let Some(worktree_id) = session_worktree_id {
+                        self.conn
+                            .execute(
+                                "UPDATE worktrees SET task_id=?1, updated_at=?2 WHERE id=?3",
+                                params![&effective_task_id, now, &worktree_id],
+                            )
+                            .map_err(|error| {
+                                format!("Unable to bind worktree to started task: {error}")
+                            })?;
+                    }
                 } else {
                     return Ok(api_error(
                         "task_claimed_by_another_session",
@@ -20571,7 +20276,7 @@ impl CoordinationKernel {
         &self,
         agent_id: &str,
         session_id: &str,
-        _task_id: Option<&str>,
+        task_id: Option<&str>,
     ) -> Result<Value, String> {
         let session = self.query_one(
             "SELECT * FROM agent_sessions WHERE id=?1 AND agent_id=?2",
@@ -20605,6 +20310,14 @@ impl CoordinationKernel {
             .as_str()
             .ok_or_else(|| "Created worktree did not return an id.".to_string())?;
         self.bind_worktree_to_session(worktree_id, &agent_slot_id, agent_id, session_id)?;
+        if let Some(task_id) = task_id.filter(|value| !value.trim().is_empty()) {
+            self.conn
+                .execute(
+                    "UPDATE worktrees SET task_id=?1, updated_at=?2 WHERE id=?3",
+                    params![task_id, now_rfc3339(), worktree_id],
+                )
+                .map_err(|error| format!("Unable to bind worktree to task: {error}"))?;
+        }
         self.conn
             .execute(
                 "UPDATE agent_sessions
@@ -20621,6 +20334,17 @@ impl CoordinationKernel {
                 ],
             )
             .map_err(|error| format!("Unable to attach stable worktree to session: {error}"))?;
+        let mut worktree = worktree;
+        if let Some(object) = worktree.as_object_mut() {
+            object.insert(
+                "taskId".to_string(),
+                task_id.map(Value::from).unwrap_or(Value::Null),
+            );
+            object.insert(
+                "task_id".to_string(),
+                task_id.map(Value::from).unwrap_or(Value::Null),
+            );
+        }
         Ok(worktree)
     }
 
@@ -20628,6 +20352,7 @@ impl CoordinationKernel {
         &self,
         agent_id: &str,
         session_id: &str,
+        task_id: Option<&str>,
     ) -> Result<Value, String> {
         let session = self.ensure_session_active(session_id, agent_id)?;
         let enforcement_mode = session["enforcement_mode"]
@@ -20650,13 +20375,14 @@ impl CoordinationKernel {
         }
 
         if repo_has_git(&self.paths.repo_path) {
-            let worktree = self.create_worktree_for_session(agent_id, session_id, None)?;
+            let worktree = self.create_worktree_for_session(agent_id, session_id, task_id)?;
             return Ok(json!({
                 "changed": true,
                 "enforcement_mode": "worktree_required",
                 "file_authority": "git_worktree_patch",
                 "completion_mode": "submit_patch",
                 "session_mode": "managed_patch",
+                "task_id": task_id,
                 "worktree_id": worktree["id"].clone(),
                 "worktree_path": worktree["path"].clone(),
                 "agent_branch_root": worktree["path"].clone(),
@@ -21352,18 +21078,6 @@ struct ChangedFile {
     untracked: bool,
 }
 
-struct ManagedFileAuthority {
-    session: Value,
-    normalized_path: String,
-    resource_key: String,
-    lease: Value,
-    write_root: PathBuf,
-    target_path: PathBuf,
-    worktree_id: Option<String>,
-    authority: String,
-    completion_mode: String,
-}
-
 struct WorktreeDiffContext {
     worktree_path: PathBuf,
     worktree_id: Option<String>,
@@ -21964,83 +21678,6 @@ fn write_text_file_atomic(path: &Path, value: &str) -> Result<(), String> {
     write_bytes_atomic(path, value.as_bytes())
 }
 
-fn managed_write_target_path(write_root: &Path, normalized_path: &str) -> Result<PathBuf, String> {
-    reject_path_escape(normalized_path)?;
-    let root = write_root
-        .canonicalize()
-        .map_err(|error| format!("Unable to canonicalize managed write root: {error}"))?;
-    let target = root.join(normalized_path);
-    if target.exists() {
-        let canonical_target = target.canonicalize().map_err(|error| {
-            format!(
-                "Unable to canonicalize managed write target {}: {error}",
-                target.display()
-            )
-        })?;
-        if !canonical_target.starts_with(&root) {
-            return Err(format!(
-                "Managed write target {} escapes write root {}.",
-                canonical_target.display(),
-                root.display()
-            ));
-        }
-    }
-    let parent = target.parent().ok_or_else(|| {
-        format!(
-            "Managed write target {} has no parent directory.",
-            target.display()
-        )
-    })?;
-    if parent.exists() {
-        let canonical_parent = parent.canonicalize().map_err(|error| {
-            format!(
-                "Unable to canonicalize managed write parent {}: {error}",
-                parent.display()
-            )
-        })?;
-        if !canonical_parent.starts_with(&root) {
-            return Err(format!(
-                "Managed write parent {} escapes write root {}.",
-                canonical_parent.display(),
-                root.display()
-            ));
-        }
-    }
-    Ok(target)
-}
-
-fn nearest_git_root_for_requested_path(path: &Path) -> Option<PathBuf> {
-    let mut cursor = existing_or_parent_canonical_path(path);
-    if cursor.is_file() {
-        cursor = cursor.parent()?.to_path_buf();
-    }
-    loop {
-        let dot_git = cursor.join(".git");
-        if dot_git.is_dir() || dot_git.is_file() {
-            return Some(cursor);
-        }
-        let Some(parent) = cursor.parent() else {
-            return None;
-        };
-        cursor = parent.to_path_buf();
-    }
-}
-
-fn existing_or_parent_canonical_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
-    }
-    let mut cursor = path;
-    while let Some(parent) = cursor.parent() {
-        if let Ok(canonical) = parent.canonicalize() {
-            let suffix = path.strip_prefix(parent).unwrap_or_else(|_| Path::new(""));
-            return canonical.join(suffix);
-        }
-        cursor = parent;
-    }
-    path.to_path_buf()
-}
-
 fn json_file_matches(path: &Path, value: &Value) -> bool {
     serde_json::to_vec_pretty(value)
         .ok()
@@ -22054,6 +21691,7 @@ fn text_file_matches(path: &Path, value: &str) -> bool {
 #[derive(Debug, Clone)]
 struct ManagedCodexProfileLaunch {
     profile: Option<String>,
+    home_path: Option<String>,
     bypass_hook_trust: bool,
 }
 
@@ -22070,6 +21708,7 @@ fn prepare_managed_codex_profile_for_terminal(
     if !agent_kind.to_ascii_lowercase().contains("codex") {
         return Ok(ManagedCodexProfileLaunch {
             profile: None,
+            home_path: None,
             bypass_hook_trust: false,
         });
     }
@@ -22086,7 +21725,7 @@ fn prepare_managed_codex_profile_for_terminal(
             }
         });
     let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
-    let profile_home = codex_profile_home_for_launch()?;
+    let profile_home = codex_profile_home_for_launch(paths, &slot_segment)?;
     let hooks_path = codex_managed_hooks_path(&profile_home, &profile);
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
     let hooks_config = codex_managed_hooks_config(
@@ -22126,25 +21765,101 @@ fn prepare_managed_codex_profile_for_terminal(
 
     Ok(ManagedCodexProfileLaunch {
         profile: Some(profile),
+        home_path: Some(process_path_text(&profile_home)),
         bypass_hook_trust,
     })
 }
 
-fn codex_profile_home_for_launch() -> Result<PathBuf, String> {
-    let Some(home) = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
-    else {
-        return Err("Unable to determine Codex home for Diff Forge launch profile.".to_string());
-    };
+fn codex_profile_home_for_launch(
+    paths: &StoragePaths,
+    slot_segment: &str,
+) -> Result<PathBuf, String> {
+    let home = crate::coordination::db::coordination_repo_state_root(&paths.repo_path)
+        .join("codex-home")
+        .join("coordinated")
+        .join(safe_id(slot_segment));
     fs::create_dir_all(&home).map_err(|error| {
         format!(
             "Unable to create Codex profile home {}: {error}",
             home.display()
         )
     })?;
+    codex_prepare_private_home(&home)?;
     Ok(home)
+}
+
+fn codex_prepare_private_home(home: &Path) -> Result<(), String> {
+    write_text_file_atomic(
+        &home.join("config.toml"),
+        "# Diff Forge managed Codex home. Workspace terminals do not inherit global plugins or apps.\n",
+    )?;
+
+    let Some(source_home) = codex_user_home_for_auth_bridge() else {
+        return Ok(());
+    };
+    for file_name in ["auth.json", "installation_id", "version.json"] {
+        codex_bridge_private_home_file(&source_home, home, file_name)?;
+    }
+    Ok(())
+}
+
+fn codex_user_home_for_auth_bridge() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
+        .filter(|path| path.exists())
+}
+
+fn codex_bridge_private_home_file(
+    source_home: &Path,
+    private_home: &Path,
+    file_name: &str,
+) -> Result<(), String> {
+    let source = source_home.join(file_name);
+    if !source.is_file() {
+        return Ok(());
+    }
+    let destination = private_home.join(file_name);
+    if fs::symlink_metadata(&destination).is_ok() {
+        let source_key = source.canonicalize().unwrap_or_else(|_| source.clone());
+        let destination_key = destination
+            .canonicalize()
+            .unwrap_or_else(|_| destination.clone());
+        if source_key == destination_key {
+            return Ok(());
+        }
+        fs::remove_file(&destination).map_err(|error| {
+            format!(
+                "Unable to replace managed Codex home file {}: {error}",
+                destination.display()
+            )
+        })?;
+    }
+    codex_link_or_copy_private_home_file(&source, &destination).map_err(|error| {
+        format!(
+            "Unable to bridge Codex file {} into managed home {}: {error}",
+            source.display(),
+            private_home.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, destination)
+        .or_else(|_| fs::copy(source, destination).map(|_| ()))
+}
+
+#[cfg(windows)]
+fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(source, destination)
+        .or_else(|_| fs::copy(source, destination).map(|_| ()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::copy(source, destination).map(|_| ())
 }
 
 fn codex_managed_hooks_path(profile_home: &Path, profile: &str) -> PathBuf {
@@ -23062,7 +22777,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-4. Use normal shell and edit tools only inside the write authority returned for the leased task. In Git workspaces this is the assigned isolated worktree/agent branch root; in non-Git direct-edit workspaces it is the bounded project root. Never edit the shared Git project root or another agent slot's worktree.\n\
+4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts inside its assigned isolated worktree/agent branch root, so target ordinary repository-relative paths from that cwd. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never edit the shared Git project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -24646,6 +24361,22 @@ mod tests {
         assert_ne!(first.agent_id, second.agent_id);
         assert_eq!(first.slot_key.as_deref(), Some("codex-01"));
         assert_eq!(second.slot_key.as_deref(), Some("codex-02"));
+        let first_codex_home = first.codex_home_path.as_deref().unwrap_or_default();
+        let second_codex_home = second.codex_home_path.as_deref().unwrap_or_default();
+        assert!(!first_codex_home.is_empty());
+        assert!(!second_codex_home.is_empty());
+        assert_ne!(first_codex_home, second_codex_home);
+        assert!(first_codex_home.contains("codex-home"));
+        assert!(PathBuf::from(first_codex_home).join("config.toml").exists());
+        assert!(PathBuf::from(first_codex_home)
+            .join(format!(
+                "{}.config.toml",
+                first.codex_profile.as_deref().unwrap_or_default()
+            ))
+            .exists());
+        assert!(first
+            .env_vars()
+            .contains(&("CODEX_HOME".to_string(), first_codex_home.to_string())));
     }
 
     #[test]
@@ -25225,125 +24956,6 @@ hooksPath = "{}"
     }
 
     #[test]
-    fn managed_write_file_writes_assigned_worktree_only_after_lease() {
-        let repo = init_git_repo("managed_write_file_worktree");
-        let kernel = CoordinationKernel::init(&repo, None).unwrap();
-        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
-        let agent_id = agent["id"].as_str().unwrap();
-        let session = kernel
-            .create_session(agent_id, None, None, false, None, None)
-            .unwrap();
-        let session_id = session["id"].as_str().unwrap();
-        let task = kernel
-            .create_task("Edit file", None, 0, 1, None, None, None, None)
-            .unwrap();
-        let task_id = task["id"].as_str().unwrap();
-        kernel.claim_task(task_id, agent_id, session_id).unwrap();
-        let worktree = kernel
-            .create_worktree_for_session(agent_id, session_id, Some(task_id))
-            .unwrap();
-        kernel
-            .acquire_lease(
-                task_id,
-                agent_id,
-                session_id,
-                "file:src.txt",
-                "write",
-                None,
-                Some("managed write"),
-            )
-            .unwrap();
-
-        let result = kernel
-            .write_file_for_task(task_id, agent_id, session_id, "src.txt", "updated\n")
-            .unwrap();
-
-        assert_eq!(result["ok"].as_bool(), Some(true));
-        let worktree_path = PathBuf::from(worktree["path"].as_str().unwrap());
-        assert_eq!(
-            fs::read_to_string(worktree_path.join("src.txt")).unwrap(),
-            "updated\n"
-        );
-        assert_eq!(
-            fs::read_to_string(repo.join("src.txt")).unwrap(),
-            "initial\n"
-        );
-    }
-
-    #[test]
-    fn managed_write_file_rejects_nested_git_repo_without_repo_path_override() {
-        let container = temp_repo("managed_write_nested_container");
-        let child = container.join("nested").join("repo");
-        fs::create_dir_all(&child).unwrap();
-        run(&child, "git", &["init"]);
-        fs::write(child.join("src.txt"), "initial\n").unwrap();
-        run(&child, "git", &["add", "src.txt"]);
-        run(
-            &child,
-            "git",
-            &[
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "user.name=Test",
-                "commit",
-                "-m",
-                "init",
-            ],
-        );
-        let kernel = CoordinationKernel::init(&container, None).unwrap();
-        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
-        let agent_id = agent["id"].as_str().unwrap();
-        let session = kernel
-            .create_session(agent_id, None, None, false, None, None)
-            .unwrap();
-        let session_id = session["id"].as_str().unwrap();
-        let task = kernel
-            .create_task("Edit nested repo", None, 0, 1, None, None, None, None)
-            .unwrap();
-        let task_id = task["id"].as_str().unwrap();
-        kernel.claim_task(task_id, agent_id, session_id).unwrap();
-        kernel
-            .conn
-            .execute(
-                "UPDATE agent_sessions SET enforcement_mode='bounded_direct_edit', write_root=?1 WHERE id=?2",
-                params![container.display().to_string(), session_id],
-            )
-            .unwrap();
-        kernel
-            .acquire_lease(
-                task_id,
-                agent_id,
-                session_id,
-                "file:nested/repo/src.txt",
-                "write",
-                None,
-                Some("managed write"),
-            )
-            .unwrap();
-
-        let result = kernel
-            .write_file_for_task(
-                task_id,
-                agent_id,
-                session_id,
-                "nested/repo/src.txt",
-                "updated\n",
-            )
-            .unwrap();
-
-        assert_eq!(result["ok"].as_bool(), Some(false));
-        assert_eq!(
-            result["error"]["code"].as_str(),
-            Some("nested_git_repo_requires_repo_path")
-        );
-        assert_eq!(
-            fs::read_to_string(child.join("src.txt")).unwrap(),
-            "initial\n"
-        );
-    }
-
-    #[test]
     fn workspace_mcp_approval_policy_controls_gateway_tool_auto_approval() {
         let repo = init_git_repo("workspace_mcp_gateway_approval_policy");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -25524,8 +25136,6 @@ hooksPath = "{}"
                 "start_task",
                 "acquire_lease",
                 "checkpoint",
-                "write_file",
-                "delete_file",
                 "complete_task",
                 "submit_patch",
                 "submit_patch_status"
@@ -26812,6 +26422,7 @@ hooksPath = "{}"
             .resolve_general_worker_file_authority(
                 context.agent_id.as_str(),
                 context.session_id.as_str(),
+                None,
             )
             .unwrap();
 
@@ -26852,6 +26463,7 @@ hooksPath = "{}"
             .resolve_general_worker_file_authority(
                 context.agent_id.as_str(),
                 context.session_id.as_str(),
+                None,
             )
             .unwrap();
 
@@ -26904,6 +26516,7 @@ hooksPath = "{}"
             .resolve_general_worker_file_authority(
                 context.agent_id.as_str(),
                 context.session_id.as_str(),
+                None,
             )
             .unwrap();
         let worktree_id = authority["worktree_id"].as_str().unwrap();

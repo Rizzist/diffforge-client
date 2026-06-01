@@ -113,6 +113,52 @@ test("queued prompt completes after exact prompt has a later assistant completio
   assert.equal(evaluation.releaseReason, "terminal_confirmed_finished");
 });
 
+test("idle terminal status can release an accepted completed queued prompt", () => {
+  const evaluation = baseEvaluation({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:35:12.000Z",
+      instanceId: 4,
+      status: "idle",
+      threadId: "thread-1",
+    },
+    providerBinding: {
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:35:12.000Z",
+      nativeSessionId: "session-1",
+      status: "idle",
+    },
+    terminalStatus: "idle",
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "codex-82-user",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-codex-82-user",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "codex-82-user",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:10.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "terminal_confirmed_finished");
+});
+
 test("exact matching turn id can release the terminal lane when closed", () => {
   const evaluation = baseEvaluation({
     targetThread: {
