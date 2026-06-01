@@ -373,6 +373,13 @@ import {
   terminalOutputLooksPromptReady,
 } from "../../threads/threadTerminalGroundTruth.js";
 import {
+  buildTerminalReadinessEpochKey,
+  isReadyLifecycleEmittedForEpoch,
+  parseTerminalStateTimestampMs,
+  shouldEmitPromptReadyLifecycle,
+  shouldSuppressThreadPropThinking,
+} from "../terminalActivityState.js";
+import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
 } from "../../threads/workspaceThreads";
@@ -1300,11 +1307,14 @@ function WorkspaceTerminal({
   const terminalThreadThinkingSinceRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
   const terminalThreadReadyDetectionArmedRef = useRef(false);
   const terminalThreadReadyLifecycleEmittedRef = useRef(false);
+  const terminalThreadReadyLifecycleEpochRef = useRef("");
   const terminalThreadPromptReadyPendingRef = useRef(null);
   const terminalThreadSawAgentOutputRef = useRef(false);
   const terminalThreadSubmittedPromptRef = useRef(null);
+  const terminalThreadLastReadyAtMsRef = useRef(0);
   const terminalThreadLastWorkStartedAtRef = useRef(terminalThreadActivityStatus === "thinking" ? performance.now() : 0);
   const terminalThreadLastActiveOutputLifecycleAtRef = useRef(0);
+  const pendingThreadStartingLifecycleRef = useRef(null);
   const threadsViewSelectedThreadRef = useRef(null);
   const terminalAgentKind = getTerminalAgentKind(paneAgentId);
   const terminalDefaultSessionMode = defaultTerminalSessionModeForRole(terminalRoleId, prewarmShell && !agentLaunchReady);
@@ -1333,27 +1343,101 @@ function WorkspaceTerminal({
     workspaceId: workspace?.id || "",
     ...fields,
   });
+  const getTerminalReadyEpochKey = ({
+    instanceId = terminalInstanceIdRef.current,
+    threadId = terminalThreadIdRef.current,
+  } = {}) => buildTerminalReadinessEpochKey({
+    instanceId,
+    paneId,
+    threadId,
+  });
+  const hasTerminalReadyLifecycleForEpoch = ({
+    instanceId = terminalInstanceIdRef.current,
+    threadId = terminalThreadIdRef.current,
+  } = {}) => isReadyLifecycleEmittedForEpoch({
+    currentEpoch: getTerminalReadyEpochKey({ instanceId, threadId }),
+    readyLifecycleEmitted: terminalThreadReadyLifecycleEmittedRef.current,
+    readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
+  });
+  const clearTerminalReadyLifecycleEpoch = () => {
+    terminalThreadReadyLifecycleEmittedRef.current = false;
+    terminalThreadReadyLifecycleEpochRef.current = "";
+  };
+  const markTerminalReadyLifecycleEpoch = ({
+    instanceId = terminalInstanceIdRef.current,
+    threadId = terminalThreadIdRef.current,
+  } = {}) => {
+    const readyEpoch = getTerminalReadyEpochKey({ instanceId, threadId });
+    terminalThreadReadyLifecycleEmittedRef.current = Boolean(readyEpoch);
+    terminalThreadReadyLifecycleEpochRef.current = readyEpoch;
+    return readyEpoch;
+  };
+  const resetTerminalReadinessForEpoch = ({
+    activityStatus = "idle",
+    instanceId = terminalInstanceIdRef.current,
+    reason = "terminal_epoch_reset",
+    threadId = terminalThreadIdRef.current,
+  } = {}) => {
+    clearTerminalReadyLifecycleEpoch();
+    terminalThreadThinkingSinceRef.current = 0;
+    terminalThreadReadyDetectionArmedRef.current = false;
+    terminalThreadPromptReadyPendingRef.current = null;
+    terminalThreadSawAgentOutputRef.current = false;
+    terminalThreadSubmittedPromptRef.current = null;
+    terminalThreadLastReadyAtMsRef.current = 0;
+    terminalThreadLastWorkStartedAtRef.current = 0;
+    terminalThreadActivityStatusRef.current = String(activityStatus || "idle").trim().toLowerCase() || "idle";
+    if (!isGenericTerminal) {
+      logTerminalStatus("frontend.terminal_cli.instance_epoch_reset", getTerminalCliStatusLogBase({
+        activityStatus: terminalThreadActivityStatusRef.current,
+        instanceId,
+        readyEpoch: getTerminalReadyEpochKey({ instanceId, threadId }),
+        reason,
+        source: reason,
+        threadId,
+      }));
+    }
+  };
   const markTerminalThreadActivityStatus = (status, options = {}) => {
     const nextStatus = String(status || "idle").trim().toLowerCase() || "idle";
     const previousStatus = String(terminalThreadActivityStatusRef.current || "").trim().toLowerCase();
+    if (shouldSuppressThreadPropThinking({
+      latestTurn: thread?.latestTurn || null,
+      lastReadyAtMs: terminalThreadLastReadyAtMsRef.current,
+      nextStatus,
+      pendingPrompt: thread?.pendingPrompt || null,
+      previousStatus,
+      readyLifecycleEmitted: hasTerminalReadyLifecycleForEpoch(),
+      source: options.reason || "",
+      submittedPrompt: terminalThreadSubmittedPromptRef.current,
+      threadId: terminalThreadIdRef.current,
+    })) {
+      logTerminalStatus("frontend.terminal_cli.thread_prop_thinking_suppressed", getTerminalCliStatusLogBase({
+        lastReadyAtMs: terminalThreadLastReadyAtMsRef.current || 0,
+        latestTurnState: thread?.latestTurn?.state || thread?.latestTurn?.status || "",
+        previousStatus,
+        source: options.reason || "",
+      }));
+      return false;
+    }
     const thinkingSinceBefore = Number(terminalThreadThinkingSinceRef.current || 0);
     const thinkingElapsedBeforeMs = thinkingSinceBefore > 0
       ? Math.max(0, Math.round(performance.now() - thinkingSinceBefore))
       : 0;
     const readyDetectionArmedBefore = Boolean(terminalThreadReadyDetectionArmedRef.current);
-    const readyLifecycleEmittedBefore = Boolean(terminalThreadReadyLifecycleEmittedRef.current);
+    const readyLifecycleEmittedBefore = hasTerminalReadyLifecycleForEpoch();
     const sawAgentOutputBefore = Boolean(terminalThreadSawAgentOutputRef.current);
     if (nextStatus === "thinking" && (previousStatus !== "thinking" || options.forceNewTurn === true)) {
       terminalThreadThinkingSinceRef.current = performance.now();
       terminalThreadLastWorkStartedAtRef.current = terminalThreadThinkingSinceRef.current;
       terminalThreadReadyDetectionArmedRef.current = false;
-      terminalThreadReadyLifecycleEmittedRef.current = false;
+      clearTerminalReadyLifecycleEpoch();
       terminalThreadPromptReadyPendingRef.current = null;
       terminalThreadSawAgentOutputRef.current = false;
     } else if (nextStatus !== "thinking" && previousStatus === "thinking") {
       terminalThreadThinkingSinceRef.current = 0;
       terminalThreadReadyDetectionArmedRef.current = false;
-      terminalThreadReadyLifecycleEmittedRef.current = false;
+      clearTerminalReadyLifecycleEpoch();
       terminalThreadSawAgentOutputRef.current = false;
       terminalThreadSubmittedPromptRef.current = null;
     }
@@ -1369,14 +1453,16 @@ function WorkspaceTerminal({
         promptReadySource: options.promptReadySource || "",
         readyDetectionArmedAfter: Boolean(terminalThreadReadyDetectionArmedRef.current),
         readyDetectionArmedBefore,
-        readyLifecycleEmittedAfter: Boolean(terminalThreadReadyLifecycleEmittedRef.current),
+        readyLifecycleEmittedAfter: hasTerminalReadyLifecycleForEpoch(),
         readyLifecycleEmittedBefore,
+        readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
         sawAgentOutputAfter: Boolean(terminalThreadSawAgentOutputRef.current),
         sawAgentOutputBefore,
         source: options.reason || "",
         thinkingElapsedBeforeMs,
       }));
     }
+    return true;
   };
   const armTerminalPromptReadyDetection = () => {
     if (isGenericTerminal || terminalThreadReadyDetectionArmedRef.current) {
@@ -1384,7 +1470,7 @@ function WorkspaceTerminal({
     }
     terminalThreadThinkingSinceRef.current = performance.now();
     terminalThreadReadyDetectionArmedRef.current = true;
-    terminalThreadReadyLifecycleEmittedRef.current = false;
+    clearTerminalReadyLifecycleEpoch();
     terminalThreadSawAgentOutputRef.current = false;
     logTerminalStatus("frontend.terminal_cli.prompt_ready_detection_armed", getTerminalCliStatusLogBase({
       source: "arm_terminal_prompt_ready_detection",
@@ -1495,7 +1581,7 @@ function WorkspaceTerminal({
     );
     if (
       !recentWorkStarted
-      || terminalThreadReadyLifecycleEmittedRef.current
+      || hasTerminalReadyLifecycleForEpoch()
       || now - Number(terminalThreadLastActiveOutputLifecycleAtRef.current || 0) < 500
     ) {
       return false;
@@ -1627,10 +1713,10 @@ function WorkspaceTerminal({
     }
   }, [startupReady]);
   useEffect(() => {
-    markTerminalThreadActivityStatus(terminalThreadActivityStatus, {
+    const applied = markTerminalThreadActivityStatus(terminalThreadActivityStatus, {
       reason: "thread_prop_status_sync",
     });
-    if (String(terminalThreadActivityStatus || "").trim().toLowerCase() === "thinking") {
+    if (applied !== false && String(terminalThreadActivityStatus || "").trim().toLowerCase() === "thinking") {
       armTerminalPromptReadyDetection();
     }
   }, [terminalThreadActivityStatus]);
@@ -3483,7 +3569,11 @@ function WorkspaceTerminal({
 
   const restartWithEmptyTerminalSession = useCallback((detail = {}) => {
     const nextSlotKey = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
-    const nextThreadId = String(detail.nextThreadId || "").trim();
+    const nextThreadId = String(
+      detail.nextThreadId
+        || detail.threadId
+        || createWorkspaceThreadId(workspace?.id || "", terminalIndex),
+    ).trim();
 
     setRestartRoleMenuOpen(false);
     setTerminalClosed(false);
@@ -3493,6 +3583,21 @@ function WorkspaceTerminal({
     forceFreshSessionOnNextOpenRef.current = true;
     terminalThreadIdRef.current = nextThreadId;
     terminalThreadSlotKeyRef.current = nextSlotKey;
+    pendingThreadStartingLifecycleRef.current = {
+      agentId: detail.agentId || terminalAgentKind,
+      paneId,
+      repoPath: detail.repoPath || workingDirectory || "",
+      terminalIndex,
+      threadId: nextThreadId,
+      workspaceId: workspace?.id || "",
+      workspaceName: detail.workspaceName || workspace?.name || "",
+    };
+    resetTerminalReadinessForEpoch({
+      activityStatus: "idle",
+      instanceId: 0,
+      reason: "restart_empty_terminal_session",
+      threadId: nextThreadId,
+    });
     markTerminalThreadActivityStatus("idle", {
       reason: "restart_empty_terminal_session",
     });
@@ -3517,7 +3622,7 @@ function WorkspaceTerminal({
       visible: true,
     });
     setRestartKey((key) => key + 1);
-  }, [paneId, terminalIndex, thread?.id, workspace?.id]);
+  }, [paneId, terminalAgentKind, terminalIndex, thread?.id, workingDirectory, workspace?.id, workspace?.name]);
 
   useEffect(() => {
     const handleEmptyThreadReset = (event) => {
@@ -3616,24 +3721,31 @@ function WorkspaceTerminal({
           return;
         }
 
-        const currentThreadActivityStatus = String(
-          terminalThreadActivityStatusRef.current || "",
-        ).trim().toLowerCase();
-        const latestThreadTurnState = String(
-          thread?.latestTurn?.state || "",
-        ).trim().toLowerCase();
-        const readyCanRepairThread = currentThreadActivityStatus === "thinking"
-          || latestThreadTurnState === "running";
         if (
-          isGenericTerminal
-          || !terminalThreadIdRef.current
-          || !readyCanRepairThread
-          || terminalThreadReadyLifecycleEmittedRef.current
+          !shouldEmitPromptReadyLifecycle({
+            currentReadyEpoch: getTerminalReadyEpochKey(),
+            isGenericTerminal,
+            looksActive: payload.looksActive,
+            looksReady: payload.looksReady,
+            readyLifecycleEmitted: terminalThreadReadyLifecycleEmittedRef.current,
+            readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
+            threadId: terminalThreadIdRef.current,
+          })
         ) {
+          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_ignored", getTerminalCliStatusLogBase({
+            currentReadyEpoch: getTerminalReadyEpochKey(),
+            outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+            readyLifecycleEmitted: terminalThreadReadyLifecycleEmittedRef.current,
+            readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
+            reason: "should_emit_prompt_ready_rejected",
+            source: promptReadySource,
+            statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
+          }));
           return;
         }
 
         const inputReadyAt = new Date().toISOString();
+        terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
         logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_output", getTerminalCliStatusLogBase({
           inputReadyAt,
           outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
@@ -3644,7 +3756,7 @@ function WorkspaceTerminal({
           promptReadySource,
           reason: promptReadySource,
         });
-        terminalThreadReadyLifecycleEmittedRef.current = true;
+        markTerminalReadyLifecycleEpoch();
 
         const promptReadyLifecycle = {
           activityStatus: "idle",
@@ -4021,6 +4133,33 @@ function WorkspaceTerminal({
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
     terminalInstanceIdRef.current = terminalInstanceId;
+    resetTerminalReadinessForEpoch({
+      activityStatus: "idle",
+      instanceId: terminalInstanceId,
+      reason: "terminal_instance_allocated",
+      threadId: startupThreadId,
+    });
+    const pendingThreadStartingLifecycle = pendingThreadStartingLifecycleRef.current;
+    if (
+      pendingThreadStartingLifecycle
+      && String(pendingThreadStartingLifecycle.workspaceId || "") === String(workspace?.id || "")
+      && Number(pendingThreadStartingLifecycle.terminalIndex) === terminalIndex
+      && (
+        !pendingThreadStartingLifecycle.paneId
+        || pendingThreadStartingLifecycle.paneId === paneId
+      )
+    ) {
+      pendingThreadStartingLifecycleRef.current = null;
+      materializeFreshThreadForTerminalSession({
+        ...pendingThreadStartingLifecycle,
+        instanceId: terminalInstanceId,
+        paneId,
+        terminalIndex,
+        threadId: startupThreadId || pendingThreadStartingLifecycle.threadId,
+        workspaceId: workspace?.id || pendingThreadStartingLifecycle.workspaceId || "",
+        workspaceName: workspace?.name || pendingThreadStartingLifecycle.workspaceName || "",
+      });
+    }
     terminalFirstVisibleOutputAtRef.current = 0;
     terminalRunningSinceRef.current = 0;
     const terminalDiagnosticsEnabled = isTerminalDiagnosticLoggingEnabled();
@@ -4153,6 +4292,10 @@ function WorkspaceTerminal({
         || isGenericTerminal
         || runtimeTerminalState !== "running"
         || terminalThreadActivityStatusRef.current === "thinking"
+        || hasTerminalReadyLifecycleForEpoch({
+          instanceId: terminalInstanceId,
+          threadId: terminalThreadIdRef.current || startupThreadId || "",
+        })
       ) {
         return false;
       }
@@ -4162,6 +4305,15 @@ function WorkspaceTerminal({
 
       codingAgentInputReadyEmitted = true;
       const inputReadyAt = new Date().toISOString();
+      markTerminalThreadActivityStatus("idle", {
+        promptReadySource: source,
+        reason: source,
+      });
+      markTerminalReadyLifecycleEpoch({
+        instanceId: terminalInstanceId,
+        threadId: terminalThreadIdRef.current || startupThreadId || "",
+      });
+      terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
       logThreadBridgeDiagnostic("frontend.thread_terminal_input_ready_timer", {
         agentId: terminalAgentKind,
         instanceId: terminalInstanceId,
@@ -8401,6 +8553,10 @@ function WorkspaceTerminal({
               terminalThreadSawAgentOutputRef.current = true;
             }
             const sawAgentOutput = Boolean(terminalThreadSawAgentOutputRef.current);
+            const readyLifecycleAlreadyEmitted = hasTerminalReadyLifecycleForEpoch({
+              instanceId: terminalInstanceId,
+              threadId: terminalThreadIdRef.current,
+            });
             logThreadBridgeDiagnostic("frontend.thread_agent_output_status", {
               activityStatusBefore: "thinking",
               activityStatusAfter: "thinking",
@@ -8418,7 +8574,7 @@ function WorkspaceTerminal({
               workspaceId: workspace?.id || "",
             });
             const shouldEmitPromptReady = Boolean(
-              !terminalThreadReadyLifecycleEmittedRef.current
+              !readyLifecycleAlreadyEmitted
               && outputLooksPromptReady
               && !promptReadySuppressionReason
               && (
@@ -8435,10 +8591,11 @@ function WorkspaceTerminal({
             );
             if (outputLooksPromptReady) {
               logTerminalStatus("frontend.terminal_cli.prompt_ready_match", getTerminalCliStatusLogBase({
-                lifecycleAlreadyEmitted: Boolean(terminalThreadReadyLifecycleEmittedRef.current),
+                lifecycleAlreadyEmitted: readyLifecycleAlreadyEmitted,
                 outputPreview: sanitizeTerminalDiagnosticText(readyOutputText, 320),
                 promptReadyDetectionArmed,
                 promptReadySuppressionReason,
+                readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
                 sawAgentOutput,
                 shouldEmitPromptReady,
                 source: "terminal_output_prompt_ready_match",
@@ -8466,7 +8623,11 @@ function WorkspaceTerminal({
                 promptReadySource,
                 reason: "terminal_output_prompt_ready",
               });
-              terminalThreadReadyLifecycleEmittedRef.current = true;
+              markTerminalReadyLifecycleEpoch({
+                instanceId: terminalInstanceId,
+                threadId: terminalThreadIdRef.current,
+              });
+              terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
               logThreadBridgeDiagnostic("frontend.thread_terminal_prompt_ready_output", {
                 agentId: terminalAgentKind,
                 inputReadyAt,
@@ -10248,6 +10409,55 @@ function WorkspaceTerminal({
               paneId,
               instanceId: terminalInstanceId,
               reason: "escape_key",
+            }).then((result) => {
+              if (isDisposed) {
+                return;
+              }
+              const interruptedActiveTask = Boolean(
+                result?.interruptedActiveTask
+                  ?? result?.interrupted_active_task
+                  ?? false,
+              );
+              const interruptedParkedPromptCount = Number(
+                result?.interruptedParkedPromptCount
+                  ?? result?.interrupted_parked_prompt_count
+                  ?? 0,
+              ) || 0;
+              const inputReadyAt = new Date().toISOString();
+              const interruptSource = interruptedActiveTask || interruptedParkedPromptCount > 0
+                ? "escape_key_task_interrupted"
+                : "escape_key_manual_cancel";
+              markTerminalThreadActivityStatus("idle", {
+                promptReadySource: interruptSource,
+                reason: interruptSource,
+              });
+              markTerminalReadyLifecycleEpoch({
+                instanceId: terminalInstanceId,
+                threadId: terminalThreadIdRef.current || "",
+              });
+              terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
+              terminalThreadSubmittedPromptRef.current = null;
+              terminalThreadPromptReadyPendingRef.current = null;
+              onThreadTerminalLifecycle?.({
+                activityStatus: "idle",
+                agentId: terminalAgentKind,
+                inputReady: true,
+                inputReadyAt,
+                inputReadyConfidence: interruptSource,
+                instanceId: terminalInstanceId,
+                paneId,
+                promptReadyAt: inputReadyAt,
+                promptReadyConfidence: interruptSource,
+                source: interruptSource,
+                status: "active",
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                turnStatus: interruptedActiveTask || interruptedParkedPromptCount > 0 ? "interrupted" : "",
+                type: interruptedActiveTask || interruptedParkedPromptCount > 0
+                  ? "provider-turn-interrupted"
+                  : "terminal-input-ready",
+                workspaceId: workspace?.id || "",
+              });
             }).catch((error) => {
               if (!isDisposed) {
                 setTerminalError(getErrorMessage(error, "Unable to interrupt terminal agent."));
@@ -11868,15 +12078,26 @@ function WorkspaceTerminal({
       threadId: terminalThreadIdRef.current || thread?.id || "",
       workspaceId: workspace?.id || "",
     });
-    const nextThreadId = materializeFreshThreadForTerminalSession({
-      agentId: nextRoleId || terminalAgentKind,
-      instanceId: terminalInstanceIdRef.current || undefined,
-      paneId,
-      terminalIndex,
-      workspaceId: workspace?.id || "",
-    });
+    const nextThreadId = createWorkspaceThreadId(workspace?.id || "", terminalIndex);
 
     if (nextRoleId && nextRoleId !== terminalAgentKind) {
+      pendingThreadStartingLifecycleRef.current = {
+        agentId: nextRoleId,
+        paneId,
+        repoPath: workingDirectory || "",
+        terminalIndex,
+        threadId: nextThreadId,
+        workspaceId: workspace?.id || "",
+        workspaceName: workspace?.name || "",
+      };
+      terminalThreadIdRef.current = nextThreadId;
+      terminalThreadSlotKeyRef.current = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
+      resetTerminalReadinessForEpoch({
+        activityStatus: "idle",
+        instanceId: 0,
+        reason: "terminal_restart_role_change",
+        threadId: nextThreadId,
+      });
       onChangeTerminalRole?.({
         role: nextRoleId,
         source: "terminal_restart_menu_new_session",
@@ -11888,12 +12109,12 @@ function WorkspaceTerminal({
     }
 
     restartWithEmptyTerminalSession({
+      agentId: nextRoleId || terminalAgentKind,
       nextThreadId,
       statusDetail: "Starting a new terminal session.",
     });
   }, [
     detachThreadForNewTerminalSession,
-    materializeFreshThreadForTerminalSession,
     onChangeTerminalRole,
     paneId,
     restartWithEmptyTerminalSession,
@@ -11901,7 +12122,9 @@ function WorkspaceTerminal({
     terminalClosing,
     terminalIndex,
     thread,
+    workingDirectory,
     workspace?.id,
+    workspace?.name,
   ]);
 
   const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;

@@ -2710,6 +2710,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
     || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error";
   const marksInputBusy = explicitInputReady === false
     || (eventType === "opened" && !openedExistingReadyInstance)
@@ -4618,6 +4619,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
     || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error"
     ? true
     : latestTurnState === "running"
@@ -4779,6 +4781,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
     || eventType === "provider-turn-completed"
+    || eventType === "provider-turn-interrupted"
     || eventType === "provider-turn-error";
   const marksInputBusy = explicitInputReady === false || activityStatus === "thinking";
   const inputReady = marksInputReady

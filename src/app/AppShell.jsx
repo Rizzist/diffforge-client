@@ -1087,6 +1087,39 @@ function buildTerminalReadyProjectionEvents(thread, event = {}, groundTruth = nu
   }];
 }
 
+function buildTerminalInterruptedProjectionEvents(thread, event = {}) {
+  const latestTurn = thread?.latestTurn || null;
+  const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+  const turnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  if (latestTurnState !== "running" || !turnId) {
+    return [];
+  }
+
+  const interruptedAt = String(
+    event.interruptedAt
+      || event.inputReadyAt
+      || event.promptReadyAt
+      || event.completedAt
+      || new Date().toISOString(),
+  ).trim();
+  const eventKey = workspaceThreadProjectionIdPart(
+    event.promptEventId || event.pendingPromptId || turnId,
+    "terminal-interrupted",
+  );
+  return [{
+    agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
+    assistantMessageId: latestTurn.assistantMessageId || "",
+    completedAt: interruptedAt,
+    createdAt: interruptedAt,
+    id: `projection-terminal-interrupted-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
+    messageId: latestTurn.messageId || "",
+    source: event.source || event.type || "terminal-interrupted",
+    status: "interrupted",
+    turnId,
+    type: "thread.turn.interrupted",
+  }];
+}
+
 function transcriptSubmittedPromptIndex(messages, event = {}) {
   const promptText = normalizeWorkspaceThreadProjectionText(
     event.expectedUserMessage || event.userMessage || event.message,
@@ -8657,6 +8690,7 @@ export default function App() {
         eventType === "terminal-prompt-ready"
         || eventType === "terminal-input-ready"
         || eventType === "provider-turn-completed"
+        || eventType === "provider-turn-interrupted"
       ) {
         return "idle";
       }
@@ -8682,6 +8716,7 @@ export default function App() {
     const turnStatus = String(options.turnStatus || event.turnStatus || "").trim().toLowerCase() || (() => {
       if (statusAfter === "working") return "running";
       if (statusAfter === "error") return "failed";
+      if (eventType === "provider-turn-interrupted") return "interrupted";
       if (statusAfter === "closed") return "interrupted";
       if (statusAfter === "idle") return "completed";
       return "";
@@ -11584,6 +11619,7 @@ export default function App() {
       || lifecycleEvent.type === "provider-turn-completed"
       || lifecycleEvent.type === "terminal-prompt-ready"
       || lifecycleEvent.type === "provider-turn-error"
+      || lifecycleEvent.type === "provider-turn-interrupted"
     ) {
       const projectionEvents = Array.isArray(lifecycleEvent.projectionEvents)
         ? lifecycleEvent.projectionEvents
@@ -11628,6 +11664,7 @@ export default function App() {
     if (
       lifecycleEvent.type === "pending-prompt-sent"
       || lifecycleEvent.type === "provider-turn-completed"
+      || lifecycleEvent.type === "provider-turn-interrupted"
       || lifecycleEvent.type === "terminal-prompt-ready"
       || lifecycleEvent.type === "terminal-input-ready"
     ) {
@@ -11767,6 +11804,24 @@ export default function App() {
       } else if (lifecycleEvent.type === "provider-turn-started") {
         operation = "provider_turn_started";
         nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+      } else if (lifecycleEvent.type === "provider-turn-interrupted") {
+        operation = "provider_turn_interrupted";
+        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+        const projectionEvents = buildTerminalInterruptedProjectionEvents(existingThread, lifecycleEvent);
+        nextThreads = projectionEvents.length
+          ? appendWorkspaceThreadProjectionEvents(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+            clearPendingPrompt: true,
+            inputReady: true,
+            projectionEvents,
+          })
+          : markWorkspaceThreadAgentActivity(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+            inputReady: true,
+            status: lifecycleEvent.status || "active",
+          });
       } else if (lifecycleEvent.type === "provider-turn-completed" || lifecycleEvent.type === "provider-turn-error") {
         operation = lifecycleEvent.type === "provider-turn-error"
           ? "provider_turn_error"

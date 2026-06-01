@@ -779,6 +779,7 @@ fn terminal_args_with_codex_mcp_identity(
 
 const TERMINAL_DIFFFORGE_MCP_SERVERS: &[&str] =
     &["coordination-kernel", "workspace-mcp-gateway"];
+const TERMINAL_KNOWN_GLOBAL_CODEX_MCP_SERVERS: &[&str] = &["codex_apps"];
 
 const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
@@ -829,13 +830,16 @@ fn append_codex_mcp_tool_approval_arg(args: &mut Vec<String>, server_key: &str, 
 }
 
 fn append_codex_global_mcp_disable_args(args: &mut Vec<String>) {
-    let Some(path) = terminal_codex_global_config_path() else {
-        return;
-    };
-    let Ok(body) = fs::read_to_string(path) else {
-        return;
-    };
-    for server_key in codex_global_mcp_server_keys_from_config(&body) {
+    let mut server_keys = terminal_codex_global_config_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|body| codex_global_mcp_server_keys_from_config(&body))
+        .unwrap_or_default();
+    for server_key in TERMINAL_KNOWN_GLOBAL_CODEX_MCP_SERVERS {
+        if !server_keys.iter().any(|key| key == server_key) {
+            server_keys.push((*server_key).to_string());
+        }
+    }
+    for server_key in server_keys {
         args.push("-c".to_string());
         args.push(format!(
             "mcp_servers.{}.enabled=false",

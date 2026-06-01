@@ -7017,7 +7017,7 @@ async fn interrupt_terminal_parked_prompts(
     instance: &TerminalInstance,
     reason: &str,
     skip_kernel_task_id: Option<&str>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let parked_to_interrupt = {
         let mut parked = state.parked_prompts.write().await;
         let matching_keys = parked
@@ -7031,6 +7031,7 @@ async fn interrupt_terminal_parked_prompts(
             .filter_map(|key| parked.remove(&key))
             .collect::<Vec<_>>()
     };
+    let interrupted_count = parked_to_interrupt.len();
     for parked in parked_to_interrupt {
         if skip_kernel_task_id != Some(parked.task_id.as_str()) {
             mark_terminal_parked_prompt_stopped(&parked, "interrupted", reason);
@@ -7050,7 +7051,15 @@ async fn interrupt_terminal_parked_prompts(
         .await;
         emit_terminal_parked_prompt_event(app, &parked, "interrupted", Some("escape_key"));
     }
-    Ok(())
+    Ok(interrupted_count)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInterruptAgentResult {
+    interrupted_active_task: bool,
+    interrupted_parked_prompt_count: usize,
+    wrote_escape: bool,
 }
 
 #[tauri::command]
@@ -7061,11 +7070,15 @@ async fn terminal_interrupt_agent(
     pane_id: String,
     instance_id: Option<u64>,
     reason: Option<String>,
-) -> Result<(), String> {
+) -> Result<TerminalInterruptAgentResult, String> {
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
-        return Ok(());
+        return Ok(TerminalInterruptAgentResult {
+            interrupted_active_task: false,
+            interrupted_parked_prompt_count: 0,
+            wrote_escape: false,
+        });
     };
     let reason = reason.unwrap_or_else(|| "escape_key".to_string());
 
@@ -7085,18 +7098,16 @@ async fn terminal_interrupt_agent(
     )
     .await?;
     if !interrupted_active_task {
-        let close_context = TerminalCloudMcpCloseContext::from_instance(&instance);
-        cloud_mcp_mark_terminal_context_interrupted(
-            cloud_mcp_state.inner(),
-            &pane_id,
-            instance.id,
-            &close_context,
-            &reason,
-            "Interrupted by Escape before an active task was attached; clearing terminal presence.",
-        )
-        .await;
+        log_terminal_status_event(
+            "backend.terminal_interrupt.manual_escape",
+            json!({
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "reason": clean_terminal_diagnostic_log_text(&reason),
+            }),
+        );
     }
-    interrupt_terminal_parked_prompts(
+    let interrupted_parked_prompt_count = interrupt_terminal_parked_prompts(
         &app,
         state.inner(),
         cloud_mcp_state.inner(),
@@ -7107,7 +7118,11 @@ async fn terminal_interrupt_agent(
     )
     .await?;
 
-    Ok(())
+    Ok(TerminalInterruptAgentResult {
+        interrupted_active_task,
+        interrupted_parked_prompt_count,
+        wrote_escape: true,
+    })
 }
 
 async fn resize_terminal_instance(
@@ -8205,6 +8220,9 @@ mod terminal_tests {
         assert!(!args
             .iter()
             .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.codex_apps.enabled=false"));
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "--no-alt-screen")

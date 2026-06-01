@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  appendWorkspaceThreadProjectionEvents,
   hydrateWorkspaceThreadSessionTranscript,
   materializeWorkspaceThreadForTerminal,
 } from "./workspaceThreads.js";
@@ -312,4 +313,119 @@ test("detached session transcript hydration does not revive idle thread as think
   assert.equal(hydratedThread.latestTurn.state, "running");
   assert.equal(hydratedThread.activityStatus, "idle");
   assert.equal(hydratedThread.providerBindings.codex.activityStatus, "idle");
+});
+
+test("provider turn interruption settles running thread and keeps terminal input ready", () => {
+  const workspaceId = "workspace-interrupt";
+  const threadId = "thread-interrupt";
+  const promptId = "prompt-interrupt";
+  const turnId = `turn-${promptId}`;
+  const startedAt = "2026-05-31T10:00:00.000Z";
+  const interruptedAt = "2026-05-31T10:00:05.000Z";
+  const paneId = "pane-interrupt";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      terminals: {
+        0: {
+          agentId: "codex",
+          inputReady: false,
+          instanceId: 1,
+          paneId,
+          status: "active",
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            startedAt,
+            state: "running",
+            turnId,
+          },
+          messages: [{
+            createdAt: startedAt,
+            id: promptId,
+            role: "user",
+            text: "cancel me",
+            turnId,
+          }],
+          materialized: true,
+          pendingPrompt: {
+            id: promptId,
+          },
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: startedAt,
+            id: "turn-start",
+            messageId: promptId,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              status: "active",
+              terminalBinding: {
+                instanceId: 1,
+                paneId,
+                terminalIndex: 0,
+              },
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId,
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const next = appendWorkspaceThreadProjectionEvents(state, {
+    activityStatus: "idle",
+    agentId: "codex",
+    clearPendingPrompt: true,
+    inputReady: true,
+    inputReadyAt: interruptedAt,
+    inputReadyConfidence: "escape_key_task_interrupted",
+    instanceId: 1,
+    paneId,
+    projectionEvents: [{
+      agentId: "codex",
+      completedAt: interruptedAt,
+      createdAt: interruptedAt,
+      id: "turn-interrupted",
+      messageId: promptId,
+      status: "interrupted",
+      turnId,
+      type: "thread.turn.interrupted",
+    }],
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "provider-turn-interrupted",
+    workspaceId,
+  });
+
+  const thread = next[workspaceId].threads[threadId];
+  assert.equal(thread.latestTurn.state, "interrupted");
+  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.pendingPrompt, null);
+  assert.equal(thread.providerBindings.codex.inputReady, true);
+  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(next[workspaceId].terminals[0].inputReady, true);
 });
