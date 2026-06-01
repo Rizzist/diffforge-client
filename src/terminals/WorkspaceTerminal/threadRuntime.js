@@ -1247,17 +1247,33 @@ export async function createTerminalPromptSubmittedWaiter({
         return;
       }
       if (requirePromptMatch && !submittedPromptMatchesExpected) {
+        const observedPrompt = String(payload.observedPrompt || "").trim();
+        const promptSource = String(payload.promptSource || "").trim();
         logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
           agentId,
           expectedPromptLength: safeExpectedPrompt.length,
           instanceId: eventInstanceId,
-          observedPromptLength: String(payload.observedPrompt || payload.prompt || "").trim().length,
+          observedPromptLength: observedPrompt.length,
           paneId: eventPaneId,
           promptId: eventPromptId,
-          promptSource: payload.promptSource || "",
+          promptSource,
           threadId: eventThreadId,
           workspaceId: payload.workspaceId || workspaceId || "",
         });
+        settled = true;
+        window.clearTimeout(timeoutId);
+        unlistenPromptSubmitted?.();
+        const error = new Error(
+          observedPrompt
+            ? "The terminal submitted a different prompt than the queued todo."
+            : "The queued todo was written, but the terminal did not submit it.",
+        );
+        error.terminalPromptSubmitMismatch = true;
+        error.terminalPromptSubmitUnobserved = !observedPrompt;
+        error.promptSource = promptSource;
+        error.promptId = eventPromptId;
+        error.workspaceId = payload.workspaceId || workspaceId || "";
+        rejectPromptSubmitted?.(error);
         return;
       }
 

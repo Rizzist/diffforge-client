@@ -134,6 +134,41 @@ test("idle terminal activity is sendable when prompt readiness is fresh", () => 
   assert.equal(groundTruth.terminalWorkState, "complete");
 });
 
+test("live idle activity is sendable even when explicit inputReady was not persisted", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: false,
+      status: "idle",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: false,
+      status: "idle",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        state: "completed",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "summarize the repo" },
+        { role: "assistant", text: "Done." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.activityStatusLooksInputReady, true);
+  assert.equal(groundTruth.completedTurnLooksSendable, true);
+  assert.equal(groundTruth.agentInputReady, true);
+});
+
 test("fresh prompt readiness settles a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {

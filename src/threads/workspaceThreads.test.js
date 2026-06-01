@@ -130,6 +130,51 @@ test("session transcript completion settles the active running turn", () => {
   );
 });
 
+test("normalization clears orphan running turn with stale message count only", () => {
+  const workspaceId = "workspace-orphan";
+  const threadId = "thread-orphan";
+
+  const normalized = normalizeWorkspaceThreads({
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "idle",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: "terminal-prompt-stale",
+            startedAt: "2026-06-01T17:00:14.984Z",
+            state: "running",
+            turnId: "turn-terminal-prompt-stale",
+          },
+          messageCount: 1,
+          messages: [],
+          projectionEvents: [],
+          providerBindings: {
+            codex: {
+              activityStatus: "idle",
+              inputReady: false,
+              nativeSessionId: "",
+              status: "active",
+            },
+          },
+          status: "idle",
+          terminalIndex: 1,
+          transcriptSessionId: "",
+          workspaceId,
+        },
+      },
+    },
+  });
+
+  const thread = normalized[workspaceId].threads[threadId];
+  assert.equal(thread.latestTurn, null);
+  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
+});
+
 test("session acceptance clears a locally pending submitted prompt", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";

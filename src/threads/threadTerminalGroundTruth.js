@@ -413,6 +413,12 @@ export function getThreadTerminalGroundTruth({
       || providerBinding?.activity_status
       || "",
   ).toLowerCase();
+  const liveActivityStatus = cleanText(
+    liveTerminal?.activityStatus
+      || liveTerminal?.activity_status
+      || providerActivityStatus
+      || "",
+  ).toLowerCase();
   const activityStatus = cleanText(
     liveTerminal?.activityStatus
       || liveTerminal?.activity_status
@@ -438,7 +444,6 @@ export function getThreadTerminalGroundTruth({
   const hasTranscriptSession = Boolean(cleanText(thread?.transcriptSessionId));
   const orphanRunningLooksIdle = Boolean(
     latestTurnState === "running"
-      && messageCount <= 0
       && !hasMessages
       && !hasProjectionEvents
       && !hasPendingPrompt
@@ -478,6 +483,17 @@ export function getThreadTerminalGroundTruth({
         )
       )
   );
+  const activityStatusLooksInputReady = Boolean(
+    terminalActivityStatusIsSendable(liveActivityStatus)
+      && !terminalIsParked
+      && !hasPendingPrompt
+      && (
+        !latestTurnState
+        || COMPLETED_TURN_STATES.has(latestTurnState)
+        || runningTurnLooksIdle
+        || orphanRunningLooksIdle
+      )
+  );
   const completedTurnLooksStaleActive = Boolean(
     latestTurnState === "completed"
       && terminalActivityStatusIsBusy(activityStatus)
@@ -502,8 +518,7 @@ export function getThreadTerminalGroundTruth({
   const requiresAgentInputReady = safeAgentReadyRoles.has(cleanText(targetRole).toLowerCase());
   const completedTurnLooksSendable = Boolean(
     requiresAgentInputReady
-      && recordedAgentInputReady
-      && inputReadyIsFreshForTurn
+      && (activityStatusLooksInputReady || (recordedAgentInputReady && inputReadyIsFreshForTurn))
       && (COMPLETED_TURN_STATES.has(latestTurnState) || runningTurnLooksIdle || orphanRunningLooksIdle)
       && !completedTurnLooksStaleActive
       && !terminalActivityStatusIsBusy(effectiveActivityStatus)
@@ -512,6 +527,7 @@ export function getThreadTerminalGroundTruth({
   );
   const agentInputReady = !hasPendingPrompt && (
     !requiresAgentInputReady
+      || activityStatusLooksInputReady
       || (recordedAgentInputReady && inputReadyIsFreshForTurn)
   );
   const terminalGroundTruthStatus = promptSubmissionPending
@@ -593,6 +609,7 @@ export function getThreadTerminalGroundTruth({
     agentInputReady,
     completedTurnLooksSendable,
     completedTurnLooksStaleActive,
+    activityStatusLooksInputReady,
     effectiveActivityStatus,
     effectiveLatestTurnState,
     hasNativeSession,
@@ -601,6 +618,7 @@ export function getThreadTerminalGroundTruth({
     inputReadyAtMs,
     inputReadyIsFreshForTurn,
     latestTurnState,
+    liveActivityStatus,
     messageCount,
     orphanRunningLooksIdle,
     promptSubmissionPending,

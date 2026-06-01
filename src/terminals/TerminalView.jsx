@@ -120,6 +120,7 @@ const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
 const TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS = 1200;
+const TODO_QUEUE_SUBMIT_RETRY_DELAYS_MS = [350, 900];
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
@@ -10540,16 +10541,6 @@ function TerminalView({
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_80ms", 80);
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_300ms", 300);
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_900ms", 900);
-        const submittedWaiter = await createTerminalPromptSubmittedWaiter({
-          agentId: targetRole,
-          expectedPrompt: terminalText,
-          instanceId: targetBinding?.instanceId,
-          paneId,
-          promptId,
-          requirePromptMatch: true,
-          threadId: targetThread.id,
-          workspaceId,
-        });
         const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
           agentId: targetRole,
           expectedPrompt: terminalText,
@@ -10558,85 +10549,195 @@ function TerminalView({
           timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
           workspaceId,
         });
-        try {
-          const submittedAt = new Date().toISOString();
-          const promptEventSource = getTodoQueuePromptEventSource(source, currentItem);
-          registerInFlightPrompt(submittedAt);
-          logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
-            agentId: targetRole,
-            paneId,
-            promptId,
-            source,
-            submitSequenceLength: terminalSubmitSequence.length,
-            syncKey,
-            surface: "tui_terminal_grid",
-            targetTerminalIndex: targetLogIndex,
-            terminalText: getBigViewTextDiagnosticFields(terminalText),
-            threadId: targetThread.id,
-            workspaceId,
-          });
-          const submitWriteStartedAt = performance.now();
-          logTerminalStatus("frontend.todo_queue.terminal_write.submit_start", {
-            ...terminalWriteLogBase,
-            instanceId: targetBinding?.instanceId || "",
-            promptEventId: promptId,
-            promptEventSource,
-            promptEventSubmittedAt: submittedAt,
-            promptTextLength: terminalText.length,
-            submitSequenceLength: terminalSubmitSequence.length,
-            threadId: targetThread.id,
-          });
-          let writeResult = null;
+        const clearUnconfirmedSubmitDraft = async (reason, submitError) => {
+          if (!syncKey) {
+            return;
+          }
+          const currentDraft = String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "");
+          if (currentDraft !== terminalText) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.unconfirmed_clear_skip", {
+              ...terminalWriteLogBase,
+              currentDraftLength: currentDraft.length,
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              reason: "draft_changed",
+              submitError: submitError?.message || String(submitError || ""),
+              threadId: targetThread.id,
+            });
+            return;
+          }
+
+          setWorkspaceThreadComposerDraft(syncKey, "");
+          const clearInputData = buildTerminalComposerDraftInput(terminalText, "", true);
+          if (!clearInputData) {
+            return;
+          }
           try {
-            writeResult = await invoke("terminal_write", {
-              data: terminalSubmitSequence,
+            await invoke("terminal_write", {
+              data: clearInputData,
               instanceId: targetBinding?.instanceId,
               paneId,
-              promptEventId: promptId,
-              promptEventSource,
-              promptEventSubmittedAt: submittedAt,
-              promptEventText: terminalText,
               threadId: targetThread.id,
             });
-            logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
+            logTerminalStatus("frontend.todo_queue.terminal_write.unconfirmed_clear_done", {
               ...terminalWriteLogBase,
-              elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
               instanceId: targetBinding?.instanceId || "",
               promptEventId: promptId,
-              promptEventSource,
-              promptEventSubmittedAt: submittedAt,
-              promptTextLength: terminalText.length,
-              submitSequenceLength: terminalSubmitSequence.length,
+              reason,
               threadId: targetThread.id,
             });
-          } catch (error) {
-            logTerminalStatus("frontend.todo_queue.terminal_write.submit_error", {
+          } catch (clearError) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.unconfirmed_clear_error", {
               ...terminalWriteLogBase,
-              elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
               instanceId: targetBinding?.instanceId || "",
-              message: error?.message || String(error || ""),
+              message: clearError?.message || String(clearError || ""),
               promptEventId: promptId,
-              promptEventSource,
-              promptEventSubmittedAt: submittedAt,
-              promptTextLength: terminalText.length,
-              submitSequenceLength: terminalSubmitSequence.length,
+              reason,
               threadId: targetThread.id,
             });
-            throw error;
           }
-          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
-            submitSequenceLength: terminalSubmitSequence.length,
-          });
-          requestDropSubmitSnapshot("tui.text.drop_after_enter_write", 160, {
-            submitSequenceLength: terminalSubmitSequence.length,
-          });
-          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_500ms", 500, {
-            submitSequenceLength: terminalSubmitSequence.length,
-          });
-          requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
-            submitSequenceLength: terminalSubmitSequence.length,
-          });
-          const submittedPayload = await submittedWaiter.promise;
+        };
+        try {
+          let submittedAt = new Date().toISOString();
+          const promptEventSource = getTodoQueuePromptEventSource(source, currentItem);
+          registerInFlightPrompt(submittedAt);
+          let writeResult = null;
+          let submittedPayload = null;
+          let lastSubmitError = null;
+          const submitAttemptDelays = [0, ...TODO_QUEUE_SUBMIT_RETRY_DELAYS_MS];
+          for (let submitAttemptIndex = 0; submitAttemptIndex < submitAttemptDelays.length; submitAttemptIndex += 1) {
+            const retryDelayMs = Number(submitAttemptDelays[submitAttemptIndex] || 0);
+            const isRetry = submitAttemptIndex > 0;
+            if (retryDelayMs > 0) {
+              await new Promise((resolve) => {
+                window.setTimeout(resolve, retryDelayMs);
+              });
+            }
+            const currentDraft = syncKey
+              ? String(getWorkspaceThreadComposerDraftStore().get(syncKey) || "")
+              : terminalText;
+            if (isRetry && currentDraft !== terminalText) {
+              const draftChangedError = new Error("The terminal draft changed before the queued todo could be submitted.");
+              draftChangedError.terminalPromptSubmitMismatch = true;
+              draftChangedError.terminalPromptSubmitUnobserved = true;
+              throw draftChangedError;
+            }
+            const attemptSubmittedAt = isRetry ? new Date().toISOString() : submittedAt;
+            const submittedWaiter = await createTerminalPromptSubmittedWaiter({
+              agentId: targetRole,
+              expectedPrompt: terminalText,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              promptId,
+              requirePromptMatch: true,
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
+              agentId: targetRole,
+              attempt: submitAttemptIndex + 1,
+              paneId,
+              promptId,
+              retry: isRetry,
+              source,
+              submitSequenceLength: terminalSubmitSequence.length,
+              syncKey,
+              surface: "tui_terminal_grid",
+              targetTerminalIndex: targetLogIndex,
+              terminalText: getBigViewTextDiagnosticFields(terminalText),
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            const submitWriteStartedAt = performance.now();
+            logTerminalStatus("frontend.todo_queue.terminal_write.submit_start", {
+              ...terminalWriteLogBase,
+              attempt: submitAttemptIndex + 1,
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              promptEventSource,
+              promptEventSubmittedAt: attemptSubmittedAt,
+              promptTextLength: terminalText.length,
+              retry: isRetry,
+              submitSequenceLength: terminalSubmitSequence.length,
+              threadId: targetThread.id,
+            });
+            try {
+              writeResult = await invoke("terminal_write", {
+                data: terminalSubmitSequence,
+                instanceId: targetBinding?.instanceId,
+                paneId,
+                promptEventId: promptId,
+                promptEventSource,
+                promptEventSubmittedAt: attemptSubmittedAt,
+                promptEventText: terminalText,
+                threadId: targetThread.id,
+              });
+              logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
+                ...terminalWriteLogBase,
+                attempt: submitAttemptIndex + 1,
+                elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
+                instanceId: targetBinding?.instanceId || "",
+                promptEventId: promptId,
+                promptEventSource,
+                promptEventSubmittedAt: attemptSubmittedAt,
+                promptTextLength: terminalText.length,
+                retry: isRetry,
+                submitSequenceLength: terminalSubmitSequence.length,
+                threadId: targetThread.id,
+              });
+              requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
+                attempt: submitAttemptIndex + 1,
+                submitSequenceLength: terminalSubmitSequence.length,
+              });
+              requestDropSubmitSnapshot("tui.text.drop_after_enter_write", 160, {
+                attempt: submitAttemptIndex + 1,
+                submitSequenceLength: terminalSubmitSequence.length,
+              });
+              requestDropSubmitSnapshot("tui.text.drop_after_enter_write_500ms", 500, {
+                attempt: submitAttemptIndex + 1,
+                submitSequenceLength: terminalSubmitSequence.length,
+              });
+              requestDropSubmitSnapshot("tui.text.drop_after_enter_write_1200ms", 1200, {
+                attempt: submitAttemptIndex + 1,
+                submitSequenceLength: terminalSubmitSequence.length,
+              });
+              submittedPayload = await submittedWaiter.promise;
+              submittedAt = attemptSubmittedAt;
+              break;
+            } catch (error) {
+              submittedWaiter.cancel();
+              lastSubmitError = error;
+              logTerminalStatus("frontend.todo_queue.terminal_write.submit_error", {
+                ...terminalWriteLogBase,
+                attempt: submitAttemptIndex + 1,
+                elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
+                instanceId: targetBinding?.instanceId || "",
+                message: error?.message || String(error || ""),
+                promptEventId: promptId,
+                promptEventSource,
+                promptEventSubmittedAt: attemptSubmittedAt,
+                promptTextLength: terminalText.length,
+                retry: isRetry,
+                submitSequenceLength: terminalSubmitSequence.length,
+                threadId: targetThread.id,
+                willRetry: submitAttemptIndex < submitAttemptDelays.length - 1,
+              });
+              if (submitAttemptIndex >= submitAttemptDelays.length - 1) {
+                throw error;
+              }
+            }
+          }
+          if (!submittedPayload) {
+            throw lastSubmitError || new Error("Timed out waiting for the prompt to be observed in the terminal.");
+          }
+          const inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(Number(target.targetTerminalIndex));
+          if (String(inFlightPrompt?.promptId || "") === promptId) {
+            todoQueueTerminalInFlightPromptsRef.current.set(Number(target.targetTerminalIndex), {
+              ...inFlightPrompt,
+              submittedAt,
+              submittedAtMs: Date.parse(submittedAt) || Date.now(),
+            });
+          }
           logTerminalStatus("frontend.todo_queue.terminal_write.submit_observed", {
             ...terminalWriteLogBase,
             instanceId: targetBinding?.instanceId || "",
@@ -10808,8 +10909,13 @@ function TerminalView({
             };
         } catch (submitError) {
           clearInFlightPromptOnError("submit_error");
-          submittedWaiter.cancel();
           acceptedWaiter.cancel();
+          if (
+            submitError?.terminalPromptSubmitUnobserved
+            || String(submitError?.message || "").includes("Timed out waiting for the prompt")
+          ) {
+            await clearUnconfirmedSubmitDraft("submit_not_observed", submitError);
+          }
           requestTerminalSubmitDiagnosticSnapshot({
             agentId: targetRole,
             expectedPrompt: terminalText,

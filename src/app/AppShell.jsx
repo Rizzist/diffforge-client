@@ -12973,9 +12973,10 @@ export default function App() {
 
     listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
       const payload = promptEvent?.payload || {};
-      const observedPrompt = String(payload.observedPrompt || payload.prompt || "").trim();
+      const observedPrompt = String(payload.observedPrompt || "").trim();
       const expectedPrompt = String(payload.expectedPrompt || "").trim();
-      const userMessage = observedPrompt || expectedPrompt || String(payload.prompt || "").trim();
+      const fallbackPrompt = String(payload.prompt || "").trim();
+      const userMessage = observedPrompt || expectedPrompt || fallbackPrompt;
       let workspaceId = String(payload.workspaceId || "").trim();
       if (!workspaceId && payload.threadId) {
         workspaceId = Object.entries(workspaceThreadsRef.current || {})
@@ -13005,6 +13006,19 @@ export default function App() {
           paneId: payload.paneId || "",
           promptText: getBigViewTextDiagnosticFields(userMessage),
           reason: "terminal_control_prompt",
+          threadId: payload.threadId || "",
+          workspaceId,
+        });
+        return;
+      }
+      if (payload.promptMatch === false && !observedPrompt) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
+          expectedPromptLength: expectedPrompt.length,
+          instanceId: payload.instanceId || "",
+          paneId: payload.paneId || "",
+          promptEventIdPresent: Boolean(payload.promptEventId),
+          promptSource: payload.promptSource || "",
+          reason: "prompt_not_observed",
           threadId: payload.threadId || "",
           workspaceId,
         });

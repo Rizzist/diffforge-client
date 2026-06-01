@@ -844,7 +844,6 @@ function isOrphanRunningThreadState({
   const normalizedLatestTurn = normalizeThreadLatestTurn(latestTurn);
   return Boolean(
     normalizedLatestTurn?.state === "running"
-    && normalizeMessageCount(messageCount) === 0
     && !messages.length
     && !projectionEvents.length
     && !normalizePendingPrompt(pendingPrompt)
