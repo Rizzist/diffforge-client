@@ -512,6 +512,7 @@ import {
   buildProviderTurnProjectionEvents,
   buildProviderTurnStartProjectionEvents,
   buildTerminalSubmittedInput,
+  clearWorkspaceThreadComposerDraftIfRevision,
   closeWorkspaceTerminalPane,
   createTerminalComposerState,
   createTerminalPromptSubmittedWaiter,
@@ -2034,7 +2035,9 @@ function WorkspaceTerminal({
       reason,
       syncKey: key,
     });
-    setWorkspaceThreadComposerDraft(key, value);
+    return setWorkspaceThreadComposerDraft(key, value, {
+      source: reason,
+    });
   }, []);
 
   const getCurrentThreadComposerSyncKey = useCallback((instanceId = terminalInstanceIdRef.current) => {
@@ -11881,21 +11884,61 @@ function WorkspaceTerminal({
     });
     const promptEventId = createThreadProjectionToken("native-drop-prompt");
     const promptEventSubmittedAt = new Date().toISOString();
-    recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt);
+    const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceIdRef.current || 0);
+    const previousDraft = syncKey
+      ? String(threadComposerDraftsRef.current.get(syncKey) || "")
+      : "";
+    const submitSequence = getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal);
+    const draftTransaction = syncKey
+      ? setThreadComposerDraftValue(syncKey, prompt, "native_drop_submit_sync")
+      : null;
+    const syncData = buildTerminalComposerDraftInput(previousDraft, prompt, true);
+    let submittedWaiter = null;
 
     try {
+      submittedWaiter = submitSequence
+        ? await createTerminalPromptSubmittedWaiter({
+          agentId: terminalAgentKind,
+          expectedPrompt: prompt,
+          instanceId: terminalInstanceIdRef.current || undefined,
+          paneId,
+          promptId: promptEventId,
+          requirePromptMatch: true,
+          threadId: terminalThreadIdRef.current,
+          workspaceId: workspace?.id || "",
+        })
+        : null;
       await invoke("terminal_write", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
-        data: buildTerminalSubmittedInput(prompt, terminalAgentKind, isGenericTerminal),
-        promptEventId,
-        promptEventSource: "native-drop",
-        promptEventSubmittedAt,
-        promptEventText: prompt,
+        data: `${syncData}${submitSequence}` || prompt,
+        promptEventId: submitSequence ? promptEventId : undefined,
+        promptEventSource: submitSequence ? "native-drop" : undefined,
+        promptEventSubmittedAt: submitSequence ? promptEventSubmittedAt : undefined,
+        promptEventText: submitSequence ? prompt : undefined,
         threadId: terminalThreadIdRef.current,
       });
+      if (submittedWaiter) {
+        await submittedWaiter.promise;
+        recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt, {
+          messageCreatedAt: promptEventSubmittedAt,
+          messageId: promptEventId,
+          messageSource: "native-drop",
+          promptEventId,
+          source: "native-drop",
+          turnId: `turn-${promptEventId}`,
+        });
+        if (syncKey) {
+          clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
+            expectedValue: prompt,
+            source: "native_drop_submit_observed_clear",
+            transactionId: promptEventId,
+          });
+        }
+      }
       logBigViewSyncDiagnosticEvent("tui.image.native_drop_write_done", {
         agentId: terminalAgentKind,
+        draftRevision: draftTransaction?.revision || 0,
         hasImageAttachmentBlock: prompt.includes("[image-attached"),
         instanceId: terminalInstanceIdRef.current || "",
         paneId,
@@ -11906,6 +11949,7 @@ function WorkspaceTerminal({
       });
       logBigViewSyncDiagnosticEvent("tui.text.native_drop_write_done", {
         agentId: terminalAgentKind,
+        draftRevision: draftTransaction?.revision || 0,
         instanceId: terminalInstanceIdRef.current || "",
         paneId,
         promptText: getBigViewTextDiagnosticFields(prompt),
@@ -11914,9 +11958,33 @@ function WorkspaceTerminal({
         workspaceId: workspace?.id || "",
       });
     } catch (error) {
+      submittedWaiter?.cancel?.();
+      if (syncKey) {
+        const clearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
+          expectedValue: prompt,
+          source: "native_drop_submit_error_clear",
+          transactionId: promptEventId,
+        });
+        const clearInputData = clearResult.cleared
+          ? buildTerminalComposerDraftInput(prompt, "", true)
+          : "";
+        if (clearInputData) {
+          try {
+            await invoke("terminal_write", {
+              data: clearInputData,
+              instanceId: terminalInstanceIdRef.current || undefined,
+              paneId,
+              threadId: terminalThreadIdRef.current,
+            });
+          } catch (_) {
+            // Best-effort cleanup; the original send error is more useful to show.
+          }
+        }
+      }
       setTerminalError(getErrorMessage(error, "Unable to send terminal input."));
       logBigViewSyncDiagnosticEvent("tui.image.native_drop_write_error", {
         agentId: terminalAgentKind,
+        draftRevision: draftTransaction?.revision || 0,
         hasImageAttachmentBlock: prompt.includes("[image-attached"),
         instanceId: terminalInstanceIdRef.current || "",
         message: error?.message || String(error || ""),
@@ -11928,6 +11996,7 @@ function WorkspaceTerminal({
       });
       logBigViewSyncDiagnosticEvent("tui.text.native_drop_write_error", {
         agentId: terminalAgentKind,
+        draftRevision: draftTransaction?.revision || 0,
         instanceId: terminalInstanceIdRef.current || "",
         message: error?.message || String(error || ""),
         paneId,
@@ -11945,6 +12014,7 @@ function WorkspaceTerminal({
     paneId,
     recordSubmittedAgentMessage,
     requestTerminalAudioInputTarget,
+    setThreadComposerDraftValue,
     terminalAgentKind,
     terminalClosed,
     terminalClosing,

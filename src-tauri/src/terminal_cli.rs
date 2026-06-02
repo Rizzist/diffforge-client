@@ -1490,7 +1490,7 @@ fn diff_forge_write_guard_decision(
         return Ok(None);
     }
 
-    if provider.eq_ignore_ascii_case("codex") && tool_key == "apply_patch" {
+    if provider.eq_ignore_ascii_case("codex") && diff_forge_tool_is_apply_patch(&tool_key) {
         let command = tool_input["command"].as_str().ok_or_else(|| {
             "Diff Forge denied apply_patch because the patch command was missing.".to_string()
         })?;
@@ -1499,20 +1499,10 @@ fn diff_forge_write_guard_decision(
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| coordination_root.to_path_buf());
-        let rewrite =
-            diff_forge_rewrite_apply_patch(command, &cwd, slot_key, agent_kind, identity)?;
-        if rewrite.changed {
-            return Ok(Some(json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "permissionDecisionReason": "Diff Forge routed Git repository edits to the assigned worktree.",
-                    "updatedInput": {
-                        "command": rewrite.command
-                    },
-                    "additionalContext": rewrite.summary
-                }
-            })));
+        if let Some(reason) =
+            diff_forge_apply_patch_git_write_denial_reason(command, &cwd, slot_key, agent_kind, identity)?
+        {
+            return Err(reason);
         }
         return Ok(None);
     }
@@ -1550,13 +1540,6 @@ fn diff_forge_write_guard_decision(
     Ok(None)
 }
 
-#[derive(Debug, Clone)]
-struct DiffForgeApplyPatchRewrite {
-    command: String,
-    changed: bool,
-    summary: String,
-}
-
 #[derive(Debug, Clone, Default)]
 struct DiffForgeWriteGuardIdentity {
     agent_id: Option<String>,
@@ -1591,18 +1574,19 @@ struct DiffForgeGitWriteRoute {
     mapped_path: PathBuf,
 }
 
-fn diff_forge_rewrite_apply_patch(
+fn diff_forge_tool_is_apply_patch(tool_key: &str) -> bool {
+    matches!(tool_key, "apply_patch" | "functions.apply_patch")
+        || tool_key.ends_with(".apply_patch")
+}
+
+fn diff_forge_apply_patch_git_write_denial_reason(
     command: &str,
     cwd: &Path,
     slot_key: &str,
     agent_kind: &str,
     identity: &DiffForgeWriteGuardIdentity,
-) -> Result<DiffForgeApplyPatchRewrite, String> {
-    let mut changed = false;
-    let mut routes = Vec::new();
-    let mut lines = Vec::new();
+) -> Result<Option<String>, String> {
     for line in command.lines() {
-        let mut rewritten = line.to_string();
         for prefix in [
             "*** Update File: ",
             "*** Add File: ",
@@ -1613,40 +1597,23 @@ fn diff_forge_rewrite_apply_patch(
                 let path = path.trim();
                 if !path.is_empty() {
                     let absolute = claude_guard_resolved_path(&PathBuf::from(path), cwd);
-                    if let Some(route) =
-                        diff_forge_git_write_route(&absolute, slot_key, agent_kind, identity, true)?
-                    {
-                        rewritten = format!("{prefix}{}", route.mapped_path.display());
-                        changed = true;
-                        routes.push(format!(
-                            "{} -> {}",
-                            absolute.display(),
-                            route.mapped_path.display()
-                        ));
+                    if let Some(reason) = diff_forge_git_write_denial_reason(
+                        &absolute,
+                        slot_key,
+                        agent_kind,
+                        identity,
+                        true,
+                    )? {
+                        return Ok(Some(format!(
+                            "{reason} apply_patch must target this terminal's assigned worktree path explicitly."
+                        )));
                     }
                 }
                 break;
             }
         }
-        lines.push(rewritten);
     }
-    let mut next = lines.join("\n");
-    if command.ends_with('\n') {
-        next.push('\n');
-    }
-    let summary = if routes.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "Diff Forge routed Git repository patch paths through worktrees: {}",
-            routes.join("; ")
-        )
-    };
-    Ok(DiffForgeApplyPatchRewrite {
-        command: next,
-        changed,
-        summary,
-    })
+    Ok(None)
 }
 
 fn diff_forge_git_write_denial_reason(
@@ -1697,7 +1664,7 @@ fn diff_forge_shell_git_write_denial_reason(
                 &repo_root, slot_key, agent_kind, identity, false,
             )? {
                 return Ok(Some(format!(
-                    "{reason} Shell commands that mutate Git repositories must run through the routed worktree path."
+                    "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
                 )));
             }
         } else {
@@ -1719,7 +1686,7 @@ fn diff_forge_shell_git_write_denial_reason(
             diff_forge_git_write_denial_reason(&candidate, slot_key, agent_kind, identity, true)?
         {
             return Ok(Some(format!(
-                "{reason} Shell commands that mutate Git repositories must run through the routed worktree path."
+                "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
             )));
         }
     }
@@ -1734,6 +1701,7 @@ fn diff_forge_shell_command_may_write(command: &str) -> bool {
         || lowered.contains("perl -pi")
         || lowered.contains("python -c")
         || lowered.contains("node -e")
+        || lowered.contains("apply_patch")
     {
         return true;
     }
@@ -1753,6 +1721,7 @@ fn diff_forge_shell_command_may_write(command: &str) -> bool {
                 | "install"
                 | "truncate"
                 | "patch"
+                | "apply_patch"
         ) || (*token == "git"
             && tokens
                 .iter()

@@ -12580,6 +12580,13 @@ impl CoordinationKernel {
             worktree_id,
             &lease_covered_resource_keys,
         )?;
+        self.resolve_recovered_direct_project_root_write_violations(
+            task_id,
+            session_id,
+            worktree_id,
+            &changed,
+            &lease_covered_resource_keys,
+        )?;
         self.resolve_recovered_shutdown_worktree_violations(session_id, worktree_id)?;
 
         let open_violations = self.open_blocking_violations(
@@ -13018,6 +13025,121 @@ impl CoordinationKernel {
                     "reason": "superseded_by_current_lease_validation",
                     "resolved_violation_ids": resolved_ids,
                     "resource_keys": lease_covered_resource_keys,
+                }),
+            )?;
+        }
+        Ok(resolved_count)
+    }
+
+    fn resolve_recovered_direct_project_root_write_violations(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        worktree_id: &str,
+        changed_files: &[ChangedFile],
+        lease_covered_resource_keys: &[String],
+    ) -> Result<usize, String> {
+        if changed_files.is_empty() || lease_covered_resource_keys.is_empty() {
+            return Ok(0);
+        }
+        if !self.repo_dirty_project_files()?.is_empty() {
+            return Ok(0);
+        }
+
+        let changed_paths = changed_files
+            .iter()
+            .map(|file| normalize_status_path(&file.path))
+            .collect::<HashSet<_>>();
+        let violations = self.query_json(
+            "SELECT * FROM workspace_violations
+             WHERE status='open'
+               AND task_id=?1
+               AND violation_kind='direct_project_root_write'
+               AND (session_id=?2 OR worktree_id=?3)",
+            &[&task_id, &session_id, &worktree_id],
+        )?;
+        let mut resolved_ids = Vec::new();
+        let mut recovered_files = Vec::new();
+        let now = now_rfc3339();
+
+        for violation in violations {
+            let Some(mut details) = workspace_violation_details(&violation) else {
+                continue;
+            };
+            let changed = details["changed_files"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(normalize_status_path)
+                        .filter(|path| !path.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if changed.is_empty() {
+                continue;
+            }
+            let all_recovered = changed.iter().all(|path| {
+                changed_paths.contains(path)
+                    && lease_covered_resource_keys.iter().any(|covered| {
+                        let resource = path_to_file_resource(path);
+                        resource_covers(covered, &resource) || resource_covers(&resource, covered)
+                    })
+            });
+            if !all_recovered {
+                continue;
+            }
+
+            let violation_id = violation["id"].as_str().unwrap_or_default();
+            if violation_id.is_empty() {
+                continue;
+            }
+            details["resolution_reason"] = json!("recovered_after_root_write_moved_to_worktree");
+            details["resolved_by"] = json!("coordination_kernel");
+            details["revalidated_at"] = json!(now.clone());
+            details["root_clean"] = json!(true);
+            details["recovered_changed_files"] = json!(changed);
+            self.conn
+                .execute(
+                    "UPDATE workspace_violations
+                     SET status='resolved',
+                         resolved_at=?1,
+                         details_json=?2
+                     WHERE id=?3 AND status='open'",
+                    params![&now, details.to_string(), violation_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to auto-resolve recovered root-write violation: {error}")
+                })?;
+            resolved_ids.push(violation_id.to_string());
+            recovered_files.extend(
+                details["recovered_changed_files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+
+        let resolved_count = resolved_ids.len();
+        if resolved_count > 0 {
+            recovered_files.sort();
+            recovered_files.dedup();
+            self.emit_event(
+                "workspace_violations_auto_resolved",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "reason": "recovered_after_root_write_moved_to_worktree",
+                    "resolved_violation_ids": resolved_ids,
+                    "recovered_changed_files": recovered_files,
                 }),
             )?;
         }
@@ -17465,7 +17587,7 @@ impl CoordinationKernel {
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
-                    "Use normal shell and edit tools from the visible project root; Git-managed writes must route to the assigned agent branch root.",
+                    "Use normal shell and edit tools from the visible project root; Git-managed writes must target the assigned agent branch root explicitly.",
                     "Managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
                 ],
                 "cloud_mcp": {
@@ -21332,6 +21454,14 @@ fn is_coordination_owned_root_status_path(path: &str) -> bool {
         || normalized == "logs/coordination-alignment.jsonl"
 }
 
+fn normalize_status_path(path: &str) -> String {
+    let mut normalized = path.trim().replace('\\', "/");
+    while let Some(next) = normalized.strip_prefix("./") {
+        normalized = next.to_string();
+    }
+    normalized
+}
+
 fn is_ignored_system_status_path(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     normalized == ".DS_Store" || normalized.ends_with("/.DS_Store")
@@ -21923,6 +22053,20 @@ fn prepare_managed_codex_profile_for_terminal(
         &paths.repo_path,
         hook_trusted,
     )?;
+    if enforcement_mode == "worktree_required" {
+        codex_managed_git_launch_self_test(
+            &config,
+            &hooks_config,
+            &hooks_path,
+            &paths.repo_path,
+            Path::new(write_root),
+            &paths.db_path,
+            agent_id,
+            session_id,
+            slot_key.unwrap_or(&slot_segment),
+            agent_kind,
+        )?;
+    }
     write_text_file_atomic(&profile_path, &config)?;
     write_json_file_atomic(&hooks_path, &hooks_config)?;
 
@@ -22174,7 +22318,7 @@ fn codex_managed_hooks_config(
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
+                    "matcher": "apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
                     "hooks": [
                         {
                             "type": "command",
@@ -22188,13 +22332,120 @@ fn codex_managed_hooks_config(
                                 agent_kind,
                             ),
                             "timeout": 30,
-                            "statusMessage": "Routing Diff Forge writes"
+                            "statusMessage": "Validating Diff Forge writes"
                         }
                     ]
                 }
             ]
         }
     })
+}
+
+fn codex_managed_git_launch_self_test(
+    config: &str,
+    hooks_config: &Value,
+    hooks_path: &Path,
+    repo_path: &Path,
+    write_root: &Path,
+    db_path: &Path,
+    agent_id: &str,
+    session_id: &str,
+    slot_key: &str,
+    agent_kind: &str,
+) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let hooks_path_text = process_path_text(hooks_path);
+    for expected in [
+        "default_permissions = \"diffforge-coordinated\"",
+        "extends = \":workspace\"",
+        "[permissions.diffforge-coordinated.workspace_roots]",
+        "[permissions.diffforge-coordinated.filesystem]",
+        "\":root\" = \"read\"",
+        "[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]",
+        "\".\" = \"write\"",
+        &format!(
+            "[projects.\"{}\"]",
+            toml_escape(&process_path_text(repo_path))
+        ),
+        &format!(
+            "[projects.\"{}\"]",
+            toml_escape(&process_path_text(write_root))
+        ),
+        &format!("hooksPath = \"{}\"", toml_escape(&hooks_path_text)),
+    ] {
+        if !config.contains(expected) {
+            missing.push(format!("profile missing {expected}"));
+        }
+    }
+
+    let pre_tool_use = hooks_config
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .and_then(|hooks| hooks.first())
+        .ok_or_else(|| {
+            "Diff Forge managed Codex launch self-test failed: missing PreToolUse hook.".to_string()
+        })?;
+    let matcher = pre_tool_use
+        .get("matcher")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for expected in [
+        "apply_patch",
+        "functions.apply_patch",
+        "Edit",
+        "Write",
+        "Bash",
+        "Shell",
+        "functions.exec_command",
+    ] {
+        if !matcher.contains(expected) {
+            missing.push(format!("hook matcher missing {expected}"));
+        }
+    }
+
+    let command = pre_tool_use
+        .get("hooks")
+        .and_then(Value::as_array)
+        .and_then(|hooks| hooks.first())
+        .and_then(|hook| hook.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    for expected in [
+        "--diff-forge-write-guard".to_string(),
+        format!("--provider {}", quote_shell_literal_for_config("codex")),
+        format!(
+            "--repo-path {}",
+            quote_shell_literal_for_config(&process_path_text(repo_path))
+        ),
+        format!(
+            "--db-path {}",
+            quote_shell_literal_for_config(&process_path_text(db_path))
+        ),
+        format!("--agent-id {}", quote_shell_literal_for_config(agent_id)),
+        format!(
+            "--session-id {}",
+            quote_shell_literal_for_config(session_id)
+        ),
+        format!("--slot-key {}", quote_shell_literal_for_config(slot_key)),
+        format!(
+            "--agent-kind {}",
+            quote_shell_literal_for_config(agent_kind)
+        ),
+    ] {
+        if !command.contains(&expected) {
+            missing.push(format!("hook command missing {expected}"));
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Diff Forge managed Codex launch self-test failed: {}.",
+            missing.join("; ")
+        ))
+    }
 }
 
 fn codex_managed_profile_config_with_preserved_hook_state(
@@ -22940,7 +23191,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; permitted writes are routed to the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT`. If a tool cannot route automatically, target that branch-root path explicitly. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
+4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; the visible root is read-only for writes. Target the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT` explicitly for every Git-managed edit. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -24951,6 +25202,67 @@ hooksPath = "{}"
         assert!(!config.contains("permission_profile ="));
         let permissions_index = config.find("[permissions.diffforge-coordinated]").unwrap();
         assert!(permissions_index > 0);
+    }
+
+    #[test]
+    fn managed_codex_git_launch_self_test_requires_apply_patch_hook() {
+        let repo = init_git_repo("managed_codex_launch_self_test");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        let hooks_path = worktree.join("diffforge.hooks.json");
+        let db_path = repo.join(".agents").join("coordination.db");
+        fs::create_dir_all(&worktree).unwrap();
+
+        let config = codex_managed_profile_config(
+            &repo,
+            &worktree,
+            "worktree_required",
+            Some("slot1"),
+            "codex",
+            Some(hooks_path.as_path()),
+        )
+        .unwrap();
+        let hooks = codex_managed_hooks_config(
+            "diffforge",
+            &repo,
+            &db_path,
+            "agent-1",
+            "session-1",
+            "slot1",
+            "codex",
+        );
+
+        codex_managed_git_launch_self_test(
+            &config,
+            &hooks,
+            &hooks_path,
+            &repo,
+            &worktree,
+            &db_path,
+            "agent-1",
+            "session-1",
+            "slot1",
+            "codex",
+        )
+        .unwrap();
+
+        let mut broken_hooks = hooks.clone();
+        broken_hooks["hooks"]["PreToolUse"][0]["matcher"] =
+            Value::String("Edit|Write|Bash|Shell".to_string());
+
+        let error = codex_managed_git_launch_self_test(
+            &config,
+            &broken_hooks,
+            &hooks_path,
+            &repo,
+            &worktree,
+            &db_path,
+            "agent-1",
+            "session-1",
+            "slot1",
+            "codex",
+        )
+        .unwrap_err();
+        assert!(error.contains("functions.apply_patch"));
     }
 
     #[test]
@@ -28882,6 +29194,95 @@ hooksPath = "{}"
             )
             .unwrap();
         assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn recovered_direct_project_root_write_auto_resolves_on_submit() {
+        let repo = init_git_repo("dirty_root_recovered_patch");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src.txt",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+
+        fs::write(repo.join("src.txt"), "direct root change\n").unwrap();
+        fs::write(write_root.join("src.txt"), "branch change\n").unwrap();
+        let failed = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("dirty root"),
+            )
+            .unwrap();
+        assert_eq!(failed["ok"].as_bool(), Some(false));
+        let violations = kernel
+            .query_json(
+                "SELECT * FROM workspace_violations
+                 WHERE violation_kind='direct_project_root_write'
+                   AND status='open'
+                   AND task_id=?1",
+                &[&task_id],
+            )
+            .unwrap();
+        assert_eq!(violations.len(), 1);
+        let violation_id = violations[0]["id"].as_str().unwrap().to_string();
+
+        fs::write(repo.join("src.txt"), "initial\n").unwrap();
+        let passed = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("recovered root write"),
+            )
+            .unwrap();
+        assert_eq!(
+            passed["ok"].as_bool(),
+            Some(true),
+            "unexpected submit response: {passed}"
+        );
+        assert_eq!(passed["data"]["validation_status"].as_str(), Some("passed"));
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            violation["details_json"]["resolution_reason"].as_str(),
+            Some("recovered_after_root_write_moved_to_worktree")
+        );
+        assert_eq!(
+            violation["details_json"]["root_clean"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

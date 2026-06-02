@@ -8769,7 +8769,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn worktree_required_context_advertises_visible_root_with_routed_writes() {
+    fn worktree_required_context_advertises_visible_root_with_explicit_worktree_writes() {
         let repo = terminal_test_directory("isolated_context_visible_root_env");
         let worktree = repo.join(".agents").join("worktrees").join("1");
         fs::create_dir_all(&worktree).unwrap();
@@ -8778,7 +8778,7 @@ mod terminal_tests {
 
         assert!(env.contains(&(
             "COORDINATION_SHELL_CWD_POLICY".to_string(),
-            "visible_project_root_with_routed_worktree_writes".to_string()
+            "visible_project_root_with_explicit_worktree_writes".to_string()
         )));
         assert!(env.contains(&(
             "COORDINATION_SHELL_CWD_IS_PROJECT_ROOT".to_string(),
@@ -8786,7 +8786,7 @@ mod terminal_tests {
         )));
         assert!(env.contains(&(
             "COORDINATION_DIRECT_PROJECT_ROOT_WRITES_POLICY".to_string(),
-            "routed_to_agent_branch_root".to_string()
+            "deny_root_use_agent_branch_root".to_string()
         )));
         assert!(env.contains(&(
             "COORDINATION_VISIBLE_ROOT".to_string(),
@@ -9661,7 +9661,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_apply_patch_guard_rewrites_git_paths_to_slot_worktree() {
+    fn diff_forge_apply_patch_guard_denies_git_root_paths() {
         let repo = terminal_test_repo_with_commit("codex_apply_patch_route");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
@@ -9672,34 +9672,116 @@ mod terminal_tests {
             repo.join("src/main.rs").display()
         );
 
-        let rewrite =
-            diff_forge_rewrite_apply_patch(&patch, &repo, "slot1", "codex", &identity).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "functions.apply_patch",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "command": patch
+            }
+        });
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
 
-        assert!(rewrite.changed);
-        assert!(rewrite.command.contains(".agents/worktrees/slot1"));
-        assert!(!rewrite.command.contains(&format!(
-            "*** Update File: {}",
-            repo.join("src/main.rs").display()
-        )));
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains("apply_patch must target this terminal's assigned worktree path explicitly"));
     }
 
     #[test]
-    fn diff_forge_apply_patch_guard_rewrites_visible_root_relative_paths_to_slot_worktree() {
-        let repo = terminal_test_repo_with_commit("codex_apply_patch_route_relative");
+    fn diff_forge_apply_patch_guard_denies_visible_root_relative_paths() {
+        let repo = terminal_test_repo_with_commit("codex_apply_patch_relative_root");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
         let (identity, _worktree) =
             terminal_test_task_guard_identity(&repo, "slot1", Some("file:src/main.rs"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "functions.apply_patch",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "command": "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n*** End Patch\n"
+            }
+        });
+
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains(".agents/worktrees/slot1"));
+    }
+
+    #[test]
+    fn diff_forge_apply_patch_guard_allows_explicit_worktree_paths() {
+        let repo = terminal_test_repo_with_commit("codex_apply_patch_route_relative");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (identity, worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:src/main.rs"));
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join("src/main.rs"), "fn main() {}\n").unwrap();
         let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-fn main() {}\n+fn main() { println!(\"hi\"); }\n*** End Patch\n";
 
-        let rewrite =
-            diff_forge_rewrite_apply_patch(patch, &repo, "slot1", "codex", &identity).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "functions.apply_patch",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "command": patch
+            }
+        });
+        let decision = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap();
 
-        assert!(rewrite.changed);
-        assert!(rewrite
-            .command
-            .contains(".agents/worktrees/slot1/src/main.rs"));
-        assert!(!rewrite.command.contains("*** Update File: src/main.rs"));
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn diff_forge_write_guard_denies_shell_apply_patch_in_git_root() {
+        let repo = terminal_test_repo_with_commit("write_guard_shell_apply_patch_root");
+        let (identity, _worktree) =
+            terminal_test_task_guard_identity(&repo, "slot1", Some("file:index.html"));
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "command": "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: index.html\n+hello\n*** End Patch\nPATCH"
+            }
+        });
+
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains("Shell commands that mutate Git repositories"));
     }
 
     #[test]

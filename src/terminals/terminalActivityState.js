@@ -211,7 +211,7 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
   const phase = normalizeActivityText(executionPhase, "");
   if (["offline", "closed", "closing", "exited"].includes(phase)) return phase;
   if (phase === "failed") return "error";
-  if (phase === "needs_input" || phase === "paused" || phase === "parked") return "paused";
+  if (phase === "needs_input" || phase === "paused" || phase === "parked" || phase === "resume_ready") return "paused";
   if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
   if (["cancelled", "canceled", "interrupted", "completed", "complete", "done", "idle"].includes(phase)) return "idle";
   return terminalRailStateFromActivityStatus("", fallback);

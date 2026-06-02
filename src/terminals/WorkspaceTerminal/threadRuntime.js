@@ -748,6 +748,7 @@ export function isPlainShiftEnterEvent(event) {
 }
 
 const workspaceThreadComposerDraftStore = new Map();
+const workspaceThreadComposerDraftMetadataStore = new Map();
 const workspaceThreadComposerDraftSubscribers = new Set();
 const workspaceThreadComposerAttachmentStore = new Map();
 const workspaceThreadComposerAttachmentSubscribers = new Set();
@@ -759,6 +760,34 @@ export function getWorkspaceThreadComposerDraftStore() {
 
 export function getWorkspaceThreadComposerDraftSnapshot() {
   return Object.fromEntries(workspaceThreadComposerDraftStore.entries());
+}
+
+export function getWorkspaceThreadComposerDraftRecord(syncKey) {
+  const key = String(syncKey || "");
+  if (!key) {
+    return {
+      revision: 0,
+      source: "",
+      syncKey: "",
+      transactionId: "",
+      updatedAt: "",
+      value: "",
+    };
+  }
+
+  const metadata = workspaceThreadComposerDraftMetadataStore.get(key) || {};
+  return {
+    revision: Number(metadata.revision || 0),
+    source: String(metadata.source || ""),
+    syncKey: key,
+    transactionId: String(metadata.transactionId || ""),
+    updatedAt: String(metadata.updatedAt || ""),
+    value: workspaceThreadComposerDraftStore.get(key) || "",
+  };
+}
+
+export function getWorkspaceThreadComposerDraftRevision(syncKey) {
+  return getWorkspaceThreadComposerDraftRecord(syncKey).revision;
 }
 
 function getComposerAttachmentLogSummary(attachments) {
@@ -894,24 +923,78 @@ export function subscribeWorkspaceThreadComposerAttachments(listener) {
   };
 }
 
-export function setWorkspaceThreadComposerDraft(syncKey, value) {
+export function setWorkspaceThreadComposerDraft(syncKey, value, options = {}) {
   const key = String(syncKey || "");
   if (!key) {
-    return;
+    return getWorkspaceThreadComposerDraftRecord("");
   }
 
   const nextValue = String(value || "");
   const currentValue = workspaceThreadComposerDraftStore.get(key) || "";
-  if (currentValue === nextValue) {
-    return;
+  const currentMetadata = workspaceThreadComposerDraftMetadataStore.get(key) || {};
+  const changed = currentValue !== nextValue;
+  const transactionId = String(options.transactionId || options.dispatchId || "").trim();
+  const source = String(options.source || currentMetadata.source || "").trim();
+  const shouldUpdateMetadata = changed
+    || Boolean(transactionId)
+    || Boolean(options.forceRevision);
+  if (!changed && !shouldUpdateMetadata) {
+    return getWorkspaceThreadComposerDraftRecord(key);
   }
+
+  const revision = Number(currentMetadata.revision || 0) + (shouldUpdateMetadata ? 1 : 0);
 
   if (nextValue) {
     workspaceThreadComposerDraftStore.set(key, nextValue);
   } else {
     workspaceThreadComposerDraftStore.delete(key);
   }
+  workspaceThreadComposerDraftMetadataStore.set(key, {
+    revision,
+    source,
+    transactionId,
+    updatedAt: new Date().toISOString(),
+  });
   notifyWorkspaceThreadComposerDraftSubscribers();
+
+  return getWorkspaceThreadComposerDraftRecord(key);
+}
+
+export function clearWorkspaceThreadComposerDraftIfRevision(syncKey, expectedRevision, options = {}) {
+  const key = String(syncKey || "");
+  const expected = Number(expectedRevision || 0);
+  const record = getWorkspaceThreadComposerDraftRecord(key);
+  if (!key || !expected || record.revision !== expected) {
+    return {
+      ...record,
+      cleared: false,
+      reason: !key ? "missing_sync_key" : !expected ? "missing_expected_revision" : "revision_mismatch",
+    };
+  }
+
+  const expectedValue = Object.prototype.hasOwnProperty.call(options, "expectedValue")
+    ? String(options.expectedValue || "")
+    : null;
+  if (expectedValue !== null && record.value !== expectedValue) {
+    return {
+      ...record,
+      cleared: false,
+      reason: "value_mismatch",
+    };
+  }
+
+  const nextRecord = setWorkspaceThreadComposerDraft(key, "", {
+    forceRevision: true,
+    source: options.source || "revision_clear",
+    transactionId: options.transactionId || record.transactionId || "",
+  });
+  return {
+    ...nextRecord,
+    cleared: true,
+    previousRevision: record.revision,
+    previousValue: record.value,
+    reason: "cleared",
+  };
 }
 
 export function setWorkspaceThreadComposerAttachments(syncKey, attachments, options = {}) {

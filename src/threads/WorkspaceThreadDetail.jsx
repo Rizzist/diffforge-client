@@ -37,6 +37,7 @@ import {
   clearActiveWorkspaceFileDrag,
   getActiveWorkspaceFileDrag,
   getDraggedWorkspaceFile,
+  getThreadComposerSyncKey,
   isWorkspaceFileDragTransfer,
   removeWorkspaceThreadComposerAttachment,
   setWorkspaceThreadComposerAttachments,
@@ -4980,11 +4981,13 @@ function WorkspaceThreadDetail({
     : null;
   const hasActiveTerminalBinding = Boolean(activeTerminalBinding?.paneId && activeTerminalBinding?.instanceId);
   const hasProviderSession = getWorkspaceThreadHasSession(thread);
-  const composerSyncKey = [
-    thread?.workspaceId || workspace?.id || "",
-    thread?.id || "",
-    activeTerminalBinding?.paneId || "",
-  ].join(":");
+  const composerSyncKey = getThreadComposerSyncKey(
+    {
+      id: thread?.id || "",
+      workspaceId: thread?.workspaceId || workspace?.id || "",
+    },
+    activeTerminalBinding,
+  );
   const syncedComposerDraft = String(composerDrafts?.[composerSyncKey] || "");
   const attachments = Array.isArray(composerAttachments?.[composerSyncKey])
     ? composerAttachments[composerSyncKey]

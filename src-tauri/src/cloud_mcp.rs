@@ -7789,11 +7789,31 @@ async fn cloud_mcp_sync_terminal_presence(
                     "turn_status": cloud_mcp_payload_text(terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
                     "status_seq": status_seq,
                     "input_ready": input_ready,
+                    "parked": terminal
+                        .get("parked")
+                        .or_else(|| terminal.get("terminal_parked"))
+                        .or_else(|| terminal.get("terminalParked"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "parked_prompt_title": cloud_mcp_payload_text(
+                        terminal,
+                        &[
+                            "parked_prompt_title",
+                            "parkedPromptTitle",
+                            "parked_title",
+                            "parkedTitle",
+                        ],
+                    ),
                     "pane_id": cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]),
                     "terminal_id": cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId", "pane_id", "paneId"]),
                     "thread_id": cloud_mcp_payload_text(terminal, &["thread_id", "threadId"]),
                     "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
                     "color_slot": cloud_mcp_payload_text(terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
+                    "waiting_on": terminal
+                        .get("waiting_on")
+                        .or_else(|| terminal.get("waitingOn"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
                 })
             })
             .collect::<Vec<_>>();
@@ -8043,11 +8063,31 @@ async fn cloud_mcp_sync_terminal_status_event(
             .or_else(|| terminal.get("inputReady"))
             .cloned()
             .unwrap_or(Value::Null),
+        "parked": terminal
+            .get("parked")
+            .or_else(|| terminal.get("terminal_parked"))
+            .or_else(|| terminal.get("terminalParked"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "parked_prompt_title": cloud_mcp_payload_text(
+            &terminal,
+            &[
+                "parked_prompt_title",
+                "parkedPromptTitle",
+                "parked_title",
+                "parkedTitle",
+            ],
+        ),
         "pane_id": pane_id,
         "terminal_id": terminal_id,
         "thread_id": cloud_mcp_payload_text(&terminal, &["thread_id", "threadId"]),
         "color": cloud_mcp_payload_text(&terminal, &["color", "accent", "accentColor"]),
         "color_slot": cloud_mcp_payload_text(&terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
+        "waiting_on": terminal
+            .get("waiting_on")
+            .or_else(|| terminal.get("waitingOn"))
+            .cloned()
+            .unwrap_or(Value::Null),
     });
     let workspace_payload = json!({
         "device": device_profile.clone(),

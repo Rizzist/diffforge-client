@@ -32,6 +32,7 @@ import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics
 import {
   terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
+  terminalActivityStatusIsPaused,
   terminalExecutionPhaseFromState,
   terminalPresenceStatusFromActivityStatus,
   terminalRailStateFromExecutionPhase,
@@ -872,6 +873,44 @@ const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
 
 function terminalStatusEventForcesIdle(eventType) {
   return TERMINAL_IDLE_STATUS_EVENT_TYPES.has(String(eventType || "").trim().toLowerCase());
+}
+
+function terminalStatusEventIndicatesPaused(event = {}, options = {}) {
+  if (
+    event.terminalIsParked === true
+    || event.terminal_is_parked === true
+    || event.parked === true
+    || options.terminalIsParked === true
+    || options.terminal_is_parked === true
+    || options.parked === true
+  ) {
+    return true;
+  }
+
+  return [
+    options.activityStatus,
+    options.activity_status,
+    options.displayStatus,
+    options.display_status,
+    options.executionPhase,
+    options.execution_phase,
+    options.nativeRailState,
+    options.native_rail_state,
+    options.readiness,
+    options.status,
+    options.statusAfter,
+    event.activityStatus,
+    event.activity_status,
+    event.displayStatus,
+    event.display_status,
+    event.executionPhase,
+    event.execution_phase,
+    event.nativeRailState,
+    event.native_rail_state,
+    event.readiness,
+    event.status,
+    event.statusAfter,
+  ].some((value) => terminalActivityStatusIsPaused(value));
 }
 
 function getThreadDiagnosticTextLength(value) {
@@ -4770,9 +4809,57 @@ export default function App() {
 
     listen(TERMINAL_PARKED_PROMPT_EVENT, (parkedEvent) => {
       const payload = parkedEvent?.payload || {};
-      const workspaceId = activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current;
+      const workspaceId = String(
+        payload.workspaceId
+          || payload.workspace_id
+          || activatedWorkspaceIdRef.current
+          || selectedWorkspaceIdRef.current
+          || "",
+      ).trim();
       if (!workspaceId) {
         return;
+      }
+      const parkedStatus = String(payload.status || payload.activityStatus || payload.activity_status || "").trim().toLowerCase();
+      const terminalIndex = Number.parseInt(payload.terminalIndex ?? payload.terminal_index ?? 0, 10);
+      const terminalPaused = ["parked", "resume_ready"].includes(parkedStatus);
+      const terminalResuming = ["resume_requested", "resumed"].includes(parkedStatus);
+      const terminalStopped = ["cancelled", "canceled", "interrupted"].includes(parkedStatus);
+      if (terminalPaused || terminalResuming || terminalStopped) {
+        terminalStatusEventEmitterRef.current?.({
+          activityStatus: terminalPaused ? "paused" : terminalResuming ? "thinking" : "idle",
+          commandPhase: terminalPaused ? parkedStatus : terminalResuming ? "running" : parkedStatus,
+          executionPhase: terminalPaused ? parkedStatus : terminalResuming ? "running" : parkedStatus,
+          inputReady: terminalStopped,
+          instanceId: payload.instanceId || payload.instance_id || undefined,
+          nativeRailLabel: terminalPaused ? "paused" : terminalResuming ? "thinking" : "idle",
+          nativeRailState: terminalPaused ? "paused" : terminalResuming ? "thinking" : "idle",
+          paneId: payload.paneId || payload.pane_id || "",
+          parked: terminalPaused,
+          clearsParked: terminalResuming || terminalStopped,
+          parkedPromptTitle: payload.title || "",
+          readiness: terminalPaused ? "needs_input" : terminalResuming ? "busy" : "ready",
+          source: `terminal-parked-${parkedStatus || "status"}`,
+          status: terminalPaused ? "paused" : terminalResuming ? "active" : "active",
+          terminalIndex: Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : 0,
+          terminalIsParked: terminalPaused,
+          threadId: payload.threadId || payload.thread_id || "",
+          turnStatus: terminalPaused ? "pending" : terminalResuming ? "running" : parkedStatus,
+          type: "agent-output",
+          waitingOn: Array.isArray(payload.waitingOn || payload.waiting_on)
+            ? (payload.waitingOn || payload.waiting_on)
+            : [],
+          workspaceId,
+          workspaceName: payload.workspaceName || payload.workspace_name || "",
+        }, {
+          activityStatus: terminalPaused ? "paused" : terminalResuming ? "thinking" : "idle",
+          commandPhase: terminalPaused ? parkedStatus : terminalResuming ? "running" : parkedStatus,
+          executionPhase: terminalPaused ? parkedStatus : terminalResuming ? "running" : parkedStatus,
+          reason: `terminal-parked-${parkedStatus || "status"}`,
+          readiness: terminalPaused ? "needs_input" : terminalResuming ? "busy" : "ready",
+          status: terminalPaused ? "paused" : terminalResuming ? "thinking" : "idle",
+          terminalIndex: Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : 0,
+          turnStatus: terminalPaused ? "pending" : terminalResuming ? "running" : parkedStatus,
+        });
       }
       setWorkspaceNotifications((current) => reduceTerminalParkedNotificationEvent(
         current,
@@ -9311,27 +9398,34 @@ export default function App() {
       return;
     }
 
-    const terminalIndex = Number.parseInt(
-      options.terminalIndex ?? event.terminalIndex ?? 0,
+    const requestedTerminalIndex = Number.parseInt(
+      options.terminalIndex ?? event.terminalIndex ?? "",
       10,
     );
-    const safeTerminalIndex = Number.isInteger(terminalIndex) && terminalIndex >= 0
-      ? terminalIndex
-      : 0;
+    const hasRequestedTerminalIndex = Number.isInteger(requestedTerminalIndex) && requestedTerminalIndex >= 0;
     const presenceWorkspace = terminalPresenceWorkspacesRef.current.find((workspace) => (
       String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
     ));
-    const presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
-      Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? -1) === safeTerminalIndex
-        || (
-          event.paneId
-          && String(terminal?.paneId || terminal?.pane_id || "").trim() === String(event.paneId).trim()
-        )
-        || (
-          event.threadId
-          && String(terminal?.threadId || terminal?.thread_id || "").trim() === String(event.threadId).trim()
-        )
-    )) || null;
+    const eventPaneId = String(options.paneId || event.paneId || event.pane_id || "").trim();
+    const eventThreadId = String(options.threadId || event.threadId || event.thread_id || "").trim();
+    let presenceTerminal = null;
+    if (eventPaneId || eventThreadId) {
+      presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
+        (eventPaneId && String(terminal?.paneId || terminal?.pane_id || "").trim() === eventPaneId)
+          || (eventThreadId && String(terminal?.threadId || terminal?.thread_id || "").trim() === eventThreadId)
+      )) || null;
+    }
+    if (!presenceTerminal && hasRequestedTerminalIndex) {
+      presenceTerminal = (presenceWorkspace?.terminals || []).find((terminal) => (
+        Number(terminal?.terminalIndex ?? terminal?.terminal_index ?? -1) === requestedTerminalIndex
+      )) || null;
+    }
+    const presenceTerminalIndex = Number(presenceTerminal?.terminalIndex ?? presenceTerminal?.terminal_index);
+    const safeTerminalIndex = hasRequestedTerminalIndex
+      ? requestedTerminalIndex
+      : Number.isInteger(presenceTerminalIndex) && presenceTerminalIndex >= 0
+        ? presenceTerminalIndex
+        : 0;
     const workspaceRecord = workspaces.find((workspace) => String(workspace?.id || "").trim() === workspaceId);
     const repoPath = String(
       presenceWorkspace?.repoPath
@@ -9347,7 +9441,8 @@ export default function App() {
 
     const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
-    const idleStatusEvent = terminalStatusEventForcesIdle(eventType);
+    const pausedStatusEvent = terminalStatusEventIndicatesPaused(event, options);
+    const idleStatusEvent = terminalStatusEventForcesIdle(eventType) && !pausedStatusEvent;
     const eventActivityStatus = idleStatusEvent
       ? ""
       : String(options.activityStatus || event.activityStatus || "").trim().toLowerCase();
@@ -9386,7 +9481,7 @@ export default function App() {
         liveStatus: ["closed", "closing", "exited", "offline"].includes(rawStatus)
           ? rawStatus
           : "",
-        terminalIsParked: event.terminalIsParked === true || event.terminal_is_parked === true,
+        terminalIsParked: pausedStatusEvent || event.terminalIsParked === true || event.terminal_is_parked === true,
         terminalIsPromptingUser: event.terminalIsPromptingUser === true || event.terminal_is_prompting_user === true,
         terminalLifecycle: statusLifecycleHint,
       });
@@ -9516,6 +9611,33 @@ export default function App() {
       nativeRailState,
       safeExplicitNativeRailLabel,
     );
+    const parkedPromptTitle = String(
+      options.parkedPromptTitle
+        || options.parked_prompt_title
+        || options.parkedTitle
+        || options.parked_title
+        || event.parkedPromptTitle
+        || event.parked_prompt_title
+        || event.parkedTitle
+        || event.parked_title
+        || event.title
+        || "",
+    ).trim();
+    const waitingOn = Array.isArray(options.waitingOn || options.waiting_on)
+      ? (options.waitingOn || options.waiting_on)
+      : Array.isArray(event.waitingOn || event.waiting_on)
+        ? (event.waitingOn || event.waiting_on)
+        : [];
+    const explicitlyClearsParked = Boolean(
+      options.clearsParked === true
+        || options.clears_parked === true
+        || options.clearParked === true
+        || options.clear_parked === true
+        || event.clearsParked === true
+        || event.clears_parked === true
+        || event.clearParked === true
+        || event.clear_parked === true,
+    );
     const terminalPayload = {
       agentId,
       agentKind: agentId,
@@ -9538,6 +9660,9 @@ export default function App() {
       ...nativeRailFields,
       observedAtMs,
       paneId,
+      parked: pausedStatusEvent ? true : explicitlyClearsParked ? false : undefined,
+      parkedPromptTitle: parkedPromptTitle || undefined,
+      parked_prompt_title: parkedPromptTitle || undefined,
       readiness: readinessAfter,
       readinessAfter,
       sessionState: statusAfter === "closed" ? "no_session" : "session_attached",
@@ -9552,6 +9677,8 @@ export default function App() {
       threadId,
       turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
       turnStatus,
+      waitingOn,
+      waiting_on: waitingOn,
     };
 
     const diagnosticToken = authStore.getToken();
