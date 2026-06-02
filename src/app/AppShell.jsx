@@ -1950,6 +1950,70 @@ function WorkspaceIdleState({ detail = "No workspace selected.", viewMotion }) {
   );
 }
 
+function FirstWorkspaceSetup({
+  chooseNewWorkspaceRootDirectory,
+  createFirstWorkspace,
+  defaultWorkingDirectory,
+  newWorkspaceRootDraft,
+  setWorkspaceName,
+  useDefaultNewWorkspaceRoot,
+  workspaceError,
+  workspaceName,
+  workspaceSyncState,
+}) {
+  return (
+    <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
+      <SetupHeader>
+        <Kicker>First workspace</Kicker>
+        <DashboardTitle>Create your workspace</DashboardTitle>
+        <PageSubline>Name it and choose the project root that will be bound to this workspace.</PageSubline>
+      </SetupHeader>
+      {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
+      <SetupField>
+        <SettingsLabel>Workspace name</SettingsLabel>
+        <SetupInput
+          maxLength={80}
+          onChange={(event) => setWorkspaceName(event.target.value)}
+          placeholder="My workspace"
+          value={workspaceName}
+        />
+      </SetupField>
+      <WorkspaceRootChooser>
+        <SettingsLabel>Root directory</SettingsLabel>
+        <RootDirectoryInput
+          maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+          placeholder={defaultWorkingDirectory || "Choose project root"}
+          readOnly
+          title={newWorkspaceRootDraft || defaultWorkingDirectory}
+          value={newWorkspaceRootDraft || defaultWorkingDirectory}
+        />
+        <WorkspaceRootActions>
+          <SecondaryButton
+            disabled={workspaceSyncState === "creating"}
+            onClick={chooseNewWorkspaceRootDirectory}
+            type="button"
+          >
+            <ButtonFolderIcon aria-hidden="true" />
+            <span>Choose directory</span>
+          </SecondaryButton>
+          <SecondaryButton
+            disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
+            onClick={useDefaultNewWorkspaceRoot}
+            type="button"
+          >
+            <ButtonFolderIcon aria-hidden="true" />
+            <span>Use app dir</span>
+          </SecondaryButton>
+        </WorkspaceRootActions>
+      </WorkspaceRootChooser>
+      <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
+        <ButtonForgeIcon aria-hidden="true" />
+        <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
+      </PrimaryButton>
+    </WorkspaceSetupPanel>
+  );
+}
+
 function createAuthState() {
   const bytes = new Uint8Array(32);
   window.crypto.getRandomValues(bytes);
@@ -10763,11 +10827,11 @@ export default function App() {
   ]);
   const hasSelectedWorkspace = Boolean(selectedWorkspace);
   const shouldKeepWorkspaceTerminalMounted = Boolean(
-    shouldShowWorkspaceSetup || enabledWorkspaceRuntimeDescriptors.length > 0,
+    enabledWorkspaceRuntimeDescriptors.length > 0,
   );
   const shouldRevealWorkspaceTerminal = Boolean(
     shouldKeepWorkspaceTerminalMounted
-      && (shouldShowWorkspaceSetup || hasSelectedWorkspace),
+      && hasSelectedWorkspace,
   );
   const shouldShowDefaultWorkspaceIdle = Boolean(
     !shouldShowWorkspaceSetup
@@ -10776,7 +10840,7 @@ export default function App() {
   const defaultWorkspaceIdleDetail = hasSelectedWorkspace
     ? "No active workspace."
     : "No workspace selected.";
-  const shouldShowTerminalNav = Boolean(hasSelectedWorkspace || shouldShowWorkspaceSetup);
+  const shouldShowTerminalNav = hasSelectedWorkspace;
   const shouldShowWorkspaceDetailNav = hasSelectedWorkspace;
   const isSelectedWorkspaceActivated = Boolean(
     selectedWorkspace && enabledRuntimeWorkspaceIds.includes(selectedWorkspace.id),
@@ -11023,7 +11087,7 @@ export default function App() {
         repoPath: cloudSqliteResetRepoPath,
         workspaceId: cloudSqliteResetTargetId,
         workspaceName: cloudSqliteResetTargetName || null,
-        resetScope: isAccountReset ? "account_preserve_filetree" : "client_preserve_filetree",
+        resetScope: isAccountReset ? "account" : "client",
       });
       const data = unwrapCloudCommandData(response, {});
       const resetMode = data?.reset_mode || data?.resetMode || "";
@@ -14759,70 +14823,25 @@ export default function App() {
                   aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                   data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                 >
-                  {shouldKeepWorkspaceTerminalMounted && (
-                    shouldShowWorkspaceSetup ? (
-                      <WorkspaceRuntimeLayer
-                        aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !shouldRevealWorkspaceTerminal}
-                        data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && shouldRevealWorkspaceTerminal}
-                      >
-                        <TerminalView
-                          accountKey={user?.id || user?.email || ""}
-                          billingStatus={billingStatus}
-                          defaultWorkingDirectory={defaultWorkingDirectory}
-                          terminalWorkspace={activatedWorkspace}
-                          terminalAgentsByIndex={activatedWorkspaceTerminalAgentsByIndex}
-                          terminalRolesByIndex={activatedWorkspaceTerminalRolesByIndex}
-                          terminalWorkspaceRootWasEmptyAtSelection={activatedWorkspaceRootWasEmptyAtSelection}
-                          terminalWorkspaceWorkingDirectory={activatedWorkspaceTerminalWorkingDirectory}
-                          terminalWorkspaceLogicalIndexes={activatedWorkspaceLogicalTerminalIndexes}
-                          terminalWorkspaceLogicalTerminalCount={activatedWorkspaceLogicalTerminalCount}
-                          agentStatusError={agentStatusError}
-                          agentStatuses={agentStatuses}
-                          agentStatusState={agentStatusState}
-                          addWorkspaceTerminal={addWorkspaceTerminal}
-                          closeWorkspaceTerminal={closeWorkspaceTerminal}
-                          changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
-                          createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
-                          createFirstWorkspace={createFirstWorkspace}
-                          chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
-                          handlePreparedTerminalChange={handlePreparedTerminalChange}
-                          isAppClosing={workspaceCloseState.isActive}
-                          isWorkspaceRuntimeVisible={shouldRevealWorkspaceTerminal}
-                          isWorkspaceRuntimeDeactivating={Boolean(
-                            workspaceDeactivationState.isActive
-                              && workspaceDeactivationState.workspaceId === activatedWorkspace?.id,
-                          )}
-                          manageWorkspaceAgents={manageWorkspaceAgents}
-                          onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
-                          onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
-                          onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
-                          onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
-                          onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
-                          onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
-                          refreshAgentStatuses={refreshAgentStatuses}
-                          reorderWorkspaceTerminalDisplayLayout={reorderWorkspaceTerminalDisplayLayout}
-                          setWorkspaceName={setWorkspaceName}
-                          newWorkspaceRootDraft={newWorkspaceRootDraft}
-                          shouldPrewarmWorkspaceTerminals={shouldPrewarmWorkspaceTerminals}
-                          shouldShowWorkspaceSetup={shouldShowWorkspaceSetup}
-                          showSettingsView={showSettingsView}
-                          splitWorkspaceTerminal={splitWorkspaceTerminal}
-                          terminalDisplayRows={activatedWorkspaceDisplayTerminalRows}
-                          terminalThreadsByIndex={activatedWorkspaceThreadsByIndex}
-                          viewMotion={viewMotion}
-                          workspaceAgentLaunchEpoch={workspaceAgentLaunchEpoch}
-                          workspaceError={workspaceError}
-                          workspaceName={workspaceName}
-                          workspaceSyncState={workspaceSyncState}
-                          workspaceThreadRestoreReady={workspaceThreadsHydrated}
-                          workspaceTerminalAgentLaunchReady={workspaceTerminalAgentLaunchReady}
-                          workspaceTerminalRenderAgent={workspaceTerminalRenderAgent}
-                          workspaceThreads={workspaceThreads}
-                          workspaces={workspaces}
-                          useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
-                        />
-                      </WorkspaceRuntimeLayer>
-                    ) : enabledWorkspaceRuntimeDescriptors.map((runtimeDescriptor) => {
+                  {shouldShowWorkspaceSetup ? (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
+                      data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
+                    >
+                      <FirstWorkspaceSetup
+                        chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
+                        createFirstWorkspace={createFirstWorkspace}
+                        defaultWorkingDirectory={defaultWorkingDirectory}
+                        newWorkspaceRootDraft={newWorkspaceRootDraft}
+                        setWorkspaceName={setWorkspaceName}
+                        useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
+                        workspaceError={workspaceError}
+                        workspaceName={workspaceName}
+                        workspaceSyncState={workspaceSyncState}
+                      />
+                    </WorkspaceRuntimeLayer>
+                  ) : shouldKeepWorkspaceTerminalMounted && (
+                    enabledWorkspaceRuntimeDescriptors.map((runtimeDescriptor) => {
                       const runtimeWorkspace = runtimeDescriptor.workspace;
                       const runtimeVisible = Boolean(
                         runtimeWorkspace?.id
@@ -15452,55 +15471,17 @@ export default function App() {
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
                   {shouldShowWorkspaceSetup ? (
-                    <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
-                      <SetupHeader>
-                        <Kicker>First workspace</Kicker>
-                        <DashboardTitle>Create your workspace</DashboardTitle>
-                        <PageSubline>Name it and choose the project root that will be bound to this workspace.</PageSubline>
-                      </SetupHeader>
-                      {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
-                      <SetupField>
-                        <SettingsLabel>Workspace name</SettingsLabel>
-                        <SetupInput
-                          maxLength={80}
-                          onChange={(event) => setWorkspaceName(event.target.value)}
-                          placeholder="My workspace"
-                          value={workspaceName}
-                        />
-                      </SetupField>
-                      <WorkspaceRootChooser>
-                        <SettingsLabel>Root directory</SettingsLabel>
-                        <RootDirectoryInput
-                          maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
-                          placeholder={defaultWorkingDirectory || "Choose project root"}
-                          readOnly
-                          title={newWorkspaceRootDraft || defaultWorkingDirectory}
-                          value={newWorkspaceRootDraft || defaultWorkingDirectory}
-                        />
-                        <WorkspaceRootActions>
-                          <SecondaryButton
-                            disabled={workspaceSyncState === "creating"}
-                            onClick={chooseNewWorkspaceRootDirectory}
-                            type="button"
-                          >
-                            <ButtonFolderIcon aria-hidden="true" />
-                            <span>Choose directory</span>
-                          </SecondaryButton>
-                          <SecondaryButton
-                            disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
-                            onClick={useDefaultNewWorkspaceRoot}
-                            type="button"
-                          >
-                            <ButtonFolderIcon aria-hidden="true" />
-                            <span>Use app dir</span>
-                          </SecondaryButton>
-                        </WorkspaceRootActions>
-                      </WorkspaceRootChooser>
-                      <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
-                        <ButtonForgeIcon aria-hidden="true" />
-                        <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
-                      </PrimaryButton>
-                    </WorkspaceSetupPanel>
+                    <FirstWorkspaceSetup
+                      chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
+                      createFirstWorkspace={createFirstWorkspace}
+                      defaultWorkingDirectory={defaultWorkingDirectory}
+                      newWorkspaceRootDraft={newWorkspaceRootDraft}
+                      setWorkspaceName={setWorkspaceName}
+                      useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
+                      workspaceError={workspaceError}
+                      workspaceName={workspaceName}
+                      workspaceSyncState={workspaceSyncState}
+                    />
                   ) : selectedWorkspace ? (
                     <FilesWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}

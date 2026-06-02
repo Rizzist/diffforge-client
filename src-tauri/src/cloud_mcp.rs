@@ -8522,6 +8522,7 @@ async fn cloud_mcp_delete_workspace(
         "runtime_repo_ids": runtime_repo_ids,
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
+        "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(&root),
         "workspace_root": root_display,
         "include_child_projects": include_child_projects,
         "child_repo_count": child_repo_ids.len(),
@@ -8540,6 +8541,18 @@ async fn cloud_mcp_delete_workspace(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
+    let workspace_unregister_response = match cloud_mcp_ws_request_with_timeout(
+        state.inner(),
+        "workspace_unregister",
+        &payload,
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        Ok(response) => json!({"ok": true, "response": response}),
+        Err(error) => json!({"ok": false, "error": error}),
+    };
+
     let response =
         cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
     Ok(json!({
@@ -8551,6 +8564,7 @@ async fn cloud_mcp_delete_workspace(
         "stoppedSpecGraphSyncs": stopped_syncs,
         "removedTerminalSnapshots": removed_terminal_snapshots,
         "removedMcpSnapshots": removed_mcp_snapshots,
+        "workspaceUnregister": workspace_unregister_response,
         "serverResponse": response,
     }))
 }
@@ -8665,7 +8679,7 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         .as_deref()
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
-        .unwrap_or("client_preserve_filetree");
+        .unwrap_or("client");
     let payload = json!({
         "source": "rust-diffforge-cloud-sqlite-hard-reset",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
@@ -8675,7 +8689,7 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
         "scope": reset_scope,
-        "confirm": "hard_reset_cloud_sqlite_preserve_filetree",
+        "confirm": "hard_reset_cloud_sqlite",
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "device_name": device_profile["device_name"].clone(),
