@@ -1907,6 +1907,13 @@ async fn cloud_mcp_start_remote_command_listener(
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
                 continue;
             }
+            if cloud_mcp_is_tokenomics_state_event(&event_kind) {
+                if let Err(error) = tokenomics_record_cloud_account_state(&app, &event) {
+                    eprintln!("Unable to cache cloud Tokenomics state: {error}");
+                }
+                let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                continue;
+            }
             if event_kind != "remote_command_requested" {
                 continue;
             }
@@ -1938,6 +1945,10 @@ async fn cloud_mcp_start_remote_command_listener(
         }
     });
     Ok(json!({"ok": true, "started": true}))
+}
+
+fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
+    matches!(event_kind, "tokenomics_account_snapshot")
 }
 
 #[tauri::command]
@@ -2447,7 +2458,7 @@ async fn cloud_mcp_replay_runtime_snapshots(
         replay_items.push(("workspace_mcp_snapshot", payload));
     }
     if let Some(payload) = snapshots.tokenomics {
-        replay_items.push(("tokenomics_rollup_snapshot", payload));
+        replay_items.push(("tokenomics_account_snapshot", payload));
     }
     if replay_items.is_empty() {
         return;
@@ -8638,23 +8649,24 @@ async fn cloud_mcp_delete_workspace(
 #[tauri::command]
 async fn cloud_mcp_sync_tokenomics_state(
     state: State<'_, CloudMcpState>,
-    summary: Value,
+    mut summary: Value,
     reason: Option<String>,
     delta: Option<bool>,
 ) -> Result<Value, String> {
     let clean_reason = reason
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "tokenomics_rollup_snapshot".to_string());
+        .unwrap_or_else(|| "tokenomics_hourly_usage_snapshot".to_string());
     let is_delta = delta.unwrap_or(false);
     let device_profile = cloud_mcp_desktop_device_profile();
-    let rollup_count = summary
-        .get("rollups")
+    cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
+    let hourly_count = summary
+        .get("hourly")
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default();
     let event_kind = if is_delta {
-        "tokenomics_rollup_delta"
+        "tokenomics_delta"
     } else {
         "tokenomics_hourly_usage_snapshot"
     };
@@ -8675,7 +8687,7 @@ async fn cloud_mcp_sync_tokenomics_state(
         "agent_label": "Diff Forge Desktop",
         "reason": clean_reason,
         "summary": summary,
-        "rollup_count": rollup_count,
+        "hourly_count": hourly_count,
         "ts_ms": cloud_mcp_now_ms(),
     });
 
@@ -8685,6 +8697,42 @@ async fn cloud_mcp_sync_tokenomics_state(
     }
 
     cloud_mcp_post_event_endpoint(state.inner(), event_kind, &payload).await
+}
+
+fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: &Value) {
+    let Some(device_id) =
+        cloud_mcp_payload_text(device_profile, &["device_id", "deviceId", "machine_id", "machineId"])
+    else {
+        return;
+    };
+    let device_name = cloud_mcp_payload_text(device_profile, &["device_name", "deviceName"]);
+    for key in ["hourly", "limits"] {
+        if let Some(rows) = summary.get_mut(key).and_then(Value::as_array_mut) {
+            for row in rows {
+                let Some(object) = row.as_object_mut() else {
+                    continue;
+                };
+                let has_device = object
+                    .get("device_id")
+                    .or_else(|| object.get("deviceId"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty());
+                if !has_device {
+                    object.insert("device_id".to_string(), json!(device_id.as_str()));
+                    object.insert("deviceId".to_string(), json!(device_id.as_str()));
+                }
+                if let Some(name) = device_name.as_deref() {
+                    object
+                        .entry("device_name".to_string())
+                        .or_insert_with(|| json!(name));
+                    object
+                        .entry("deviceName".to_string())
+                        .or_insert_with(|| json!(name));
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]

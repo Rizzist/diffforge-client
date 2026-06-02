@@ -59,6 +59,7 @@ function createTokenomicsStoreState() {
     error: "",
     selectedProvider: "all",
     selectedAccountKey: "all",
+    selectedDeviceId: "all",
     scanProgress: null,
   };
 }
@@ -96,11 +97,23 @@ function providerLabel(row) {
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[String(row?.provider || "").toLowerCase()] || row?.label || "Agent";
 }
 
-function filterRows(rows, selectedProvider, selectedAccountKey = "all") {
+function rowDeviceId(row) {
+  return String(row?.device_id || row?.deviceId || row?.machine_id || row?.machineId || "").trim();
+}
+
+function deviceLabel(deviceId, currentDeviceId = "") {
+  if (!deviceId) return "Unknown device";
+  if (currentDeviceId && deviceId === currentDeviceId) return "This device";
+  const compact = deviceId.length > 18 ? `${deviceId.slice(0, 8)}...${deviceId.slice(-6)}` : deviceId;
+  return compact.replace(/^desktop-/, "Desktop ");
+}
+
+function filterRows(rows, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all") {
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   return rows.filter((row) => (
     provider.match(row)
       && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
+      && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId)
   ));
 }
 
@@ -165,8 +178,8 @@ function fullDayLabel(key, todayKey) {
   });
 }
 
-function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
-  const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey);
+function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+  const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId);
   const byDay = new Map();
   for (const row of filtered) {
     const key = bucketDayKey(row);
@@ -198,11 +211,11 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, windowD
   }));
 }
 
-function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const today = dateFromDayKey(dayKeyUtc(new Date()));
   const startKey = dayKeyUtc(addUtcDays(today, -(Math.max(1, windowDays) - 1)));
   const endKey = dayKeyUtc(today);
-  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey)
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId)
     .filter((row) => {
       const key = bucketDayKey(row);
       return key >= startKey && key <= endKey;
@@ -210,18 +223,19 @@ function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey,
   return aggregateRows(rows);
 }
 
-function todayAggregate(dailyRows, selectedProvider, selectedAccountKey) {
+function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
   const today = dayKeyUtc(new Date());
-  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey)
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId)
     .filter((row) => bucketDayKey(row) === today);
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider, selectedAccountKey = "all") {
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all") {
   if (!Array.isArray(limits)) return [];
   return limits.filter((limit) => (
     (selectedProvider === "all" || providerKey(limit) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
+      && (selectedDeviceId === "all" || rowDeviceId(limit) === selectedDeviceId)
   ));
 }
 
@@ -313,10 +327,10 @@ function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable =
   return "Safe at current pace";
 }
 
-function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKey) {
+function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
   const windowSeconds = sessionWindowSeconds(limit);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
-  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKey);
+  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKey, selectedDeviceId);
   if (rows.some((row) => row?.window_index != null || row?.windowIndex != null)) {
     const byIndex = new Map();
     for (const row of rows) {
@@ -468,8 +482,8 @@ function dailyBarHeight(value, maxValue) {
   return Math.max(11, Math.round((total / max) * 78));
 }
 
-function modelBreakdown(modelRows, providerRows, selectedProvider, selectedAccountKey) {
-  const rows = filterRows(modelRows.length ? modelRows : providerRows, selectedProvider, selectedAccountKey);
+function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
+  const rows = filterRows(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId);
   const byModel = new Map();
   for (const row of rows) {
     const rawModel = String(row?.model || "").trim();
@@ -495,14 +509,12 @@ function modelBreakdown(modelRows, providerRows, selectedProvider, selectedAccou
     }));
 }
 
-function providerAccountOptions(summary, selectedProvider) {
+function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all") {
   if (selectedProvider === "all") return [];
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   const rows = [
-    ...(Array.isArray(summary?.accounts) ? summary.accounts : []),
-    ...(Array.isArray(summary?.by_account) ? summary.by_account : []),
-    ...(Array.isArray(summary?.limits) ? summary.limits : []),
-  ].filter((row) => provider.match(row));
+    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
+  ].filter((row) => provider.match(row) && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId));
   const byKey = new Map();
   for (const row of rows) {
     const key = rowProviderAccountKey(row);
@@ -526,6 +538,36 @@ function providerAccountOptions(summary, selectedProvider) {
       ? "All Claude"
       : `All ${provider.label}`;
   return [{ key: "all", label: providerLabelText }, ...accounts];
+}
+
+function deviceOptions(summary) {
+  const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
+  const rows = [
+    ...(Array.isArray(summary?.by_device) ? summary.by_device : []),
+    ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
+    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
+    ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
+    ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
+    ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
+  ];
+  const byDevice = new Map();
+  for (const row of rows) {
+    const id = rowDeviceId(row);
+    if (!id) continue;
+    const current = byDevice.get(id) || {
+      key: id,
+      label: deviceLabel(id, currentDeviceId),
+      total: 0,
+    };
+    current.total += rowTotal(row);
+    byDevice.set(id, current);
+  }
+  const devices = [...byDevice.values()].sort((a, b) => {
+    if (a.key === currentDeviceId) return -1;
+    if (b.key === currentDeviceId) return 1;
+    return b.total - a.total || a.label.localeCompare(b.label);
+  });
+  return [{ key: "all", label: "All devices" }, ...devices];
 }
 
 function lastUpdatedText(value) {
@@ -580,25 +622,42 @@ function mergeProviderLimits(previousLimits, nextLimits) {
 }
 
 function mergeTokenomicsSummary(previous, next) {
-  if (!previous) return next || {};
+  if (!previous) return stripLegacyTokenomicsSummaryFields(next || {});
   if (!next) return previous;
-  return {
+  const merged = {
     ...previous,
     ...next,
     total: next.total || previous.total,
-    by_provider: next.by_provider || previous.by_provider,
-    by_account: next.by_account || previous.by_account,
-    by_model: next.by_model || previous.by_model,
-    daily: next.daily || previous.daily,
-    daily_by_provider: next.daily_by_provider || previous.daily_by_provider,
-    hourly_by_provider: next.hourly_by_provider || previous.hourly_by_provider,
-    session_hourly_by_provider: next.session_hourly_by_provider || previous.session_hourly_by_provider,
-    rollups: next.rollups || previous.rollups,
+    by_device: next.by_device || previous.by_device,
+    by_device_provider: next.by_device_provider || previous.by_device_provider,
+    by_device_account: next.by_device_account || previous.by_device_account,
+    by_device_model: next.by_device_model || previous.by_device_model,
+    daily_by_device_provider: next.daily_by_device_provider || previous.daily_by_device_provider,
+    monthly_by_device_provider: next.monthly_by_device_provider || previous.monthly_by_device_provider,
+    hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
-    accounts: next.accounts || previous.accounts,
     limits: mergeProviderLimits(previous.limits, next.limits),
     credits: next.credits || previous.credits,
   };
+  return stripLegacyTokenomicsSummaryFields(merged);
+}
+
+function stripLegacyTokenomicsSummaryFields(summary) {
+  const clean = { ...summary };
+  for (const key of [
+    "by_provider",
+    "by_account",
+    "by_model",
+    "daily_by_provider",
+    "monthly_by_provider",
+    "hourly_by_provider",
+    "session_hourly_by_provider",
+    "accounts",
+    "rollups",
+  ]) {
+    delete clean[key];
+  }
+  return clean;
 }
 
 const tokenomicsStore = {
@@ -812,6 +871,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     error,
     selectedProvider,
     selectedAccountKey,
+    selectedDeviceId,
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
@@ -828,6 +888,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     updateTokenomicsStore({ selectedAccountKey: nextAccountKey || "all" });
   }, []);
 
+  const setSelectedDeviceId = useCallback((nextDeviceId) => {
+    updateTokenomicsStore({ selectedDeviceId: nextDeviceId || "all", selectedAccountKey: "all" });
+  }, []);
+
   useEffect(() => {
     resetTokenomicsStoreForAccount(accountKey);
     void loadTokenomicsStore();
@@ -842,12 +906,23 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     };
   }, []);
 
-  const providers = Array.isArray(summary?.by_provider) ? summary.by_provider : [];
-  const modelRows = Array.isArray(summary?.by_model) ? summary.by_model : [];
+  const providers = Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : [];
+  const deviceFiltered = selectedDeviceId !== "all";
+  const modelRows = Array.isArray(summary?.by_device_model) ? summary.by_device_model : [];
+  const providerRows = providers;
+  const devices = useMemo(() => deviceOptions(summary), [summary]);
   const accountOptions = useMemo(
-    () => providerAccountOptions(summary, selectedProvider),
-    [summary, selectedProvider],
+    () => providerAccountOptions(summary, selectedProvider, selectedDeviceId),
+    [summary, selectedDeviceId, selectedProvider],
   );
+  useEffect(() => {
+    if (
+      selectedDeviceId !== "all"
+      && !devices.some((option) => option.key === selectedDeviceId)
+    ) {
+      updateTokenomicsStore({ selectedDeviceId: "all", selectedAccountKey: "all" });
+    }
+  }, [devices, selectedDeviceId]);
   useEffect(() => {
     if (selectedProvider === "all") {
       if (selectedAccountKey !== "all") {
@@ -862,39 +937,37 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       updateTokenomicsStore({ selectedAccountKey: "all" });
     }
   }, [accountOptions, selectedAccountKey, selectedProvider]);
-  const dailyRaw = selectedProvider === "all"
-    ? (Array.isArray(summary?.daily) ? summary.daily : [])
-    : (Array.isArray(summary?.daily_by_provider) ? summary.daily_by_provider : []);
-  const hourlyRaw = Array.isArray(summary?.session_hourly_by_provider)
-    ? summary.session_hourly_by_provider
-    : (Array.isArray(summary?.hourly_by_provider) ? summary.hourly_by_provider : []);
+  const dailyRaw = Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : [];
+  const hourlyRaw = Array.isArray(summary?.hourly) ? summary.hourly : [];
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedProvider],
+    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedDeviceId, selectedProvider],
   );
   const today = useMemo(
-    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey),
-    [dailyRaw, selectedAccountKey, selectedProvider],
+    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
+    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
   );
   const last30Days = useMemo(
-    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey),
-    [dailyRaw, selectedAccountKey, selectedProvider],
+    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
+    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
   );
-  const accountRows = Array.isArray(summary?.by_account) ? summary.by_account : [];
-  const totalRows = selectedProvider === "all" || selectedAccountKey === "all" ? providers : accountRows;
+  const deviceAccountRows = Array.isArray(summary?.by_device_account) ? summary.by_device_account : [];
+  const totalRows = deviceFiltered
+    ? (selectedAccountKey === "all" ? providerRows : deviceAccountRows)
+    : selectedAccountKey === "all" ? providerRows : deviceAccountRows;
   const total = useMemo(
-    () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey)),
-    [selectedAccountKey, selectedProvider, totalRows],
+    () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey, selectedDeviceId)),
+    [selectedAccountKey, selectedDeviceId, selectedProvider, totalRows],
   );
   const limits = useMemo(
-    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey),
-    [selectedAccountKey, selectedProvider, summary?.limits],
+    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId),
+    [selectedAccountKey, selectedDeviceId, selectedProvider, summary?.limits],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
   const sessionUsageRows = useMemo(
-    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey),
-    [fiveHour, hourlyRaw, selectedAccountKey, selectedProvider],
+    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
+    [fiveHour, hourlyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
   );
   const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
@@ -903,8 +976,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const dailyAverage = dailyRows.reduce((sum, row) => sum + dailyUsageValue(row), 0) / Math.max(1, dailyRows.filter((row) => dailyUsageValue(row) > 0).length);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
   const breakdown = useMemo(
-    () => modelBreakdown(modelRows, providers, selectedProvider, selectedAccountKey),
-    [modelRows, providers, selectedAccountKey, selectedProvider],
+    () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId),
+    [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider],
   );
   const credits = billingStatus?.credits || summary?.credits || {};
 
@@ -938,6 +1011,23 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 type="button"
               >
                 {account.label}
+              </AccountTab>
+            ))}
+          </AccountTabs>
+        ) : null}
+        {devices.length > 2 ? (
+          <AccountTabs role="tablist" aria-label="Tokenomics device filter">
+            {devices.map((device) => (
+              <AccountTab
+                key={device.key}
+                $active={selectedDeviceId === device.key}
+                $provider={selectedProvider}
+                onClick={() => setSelectedDeviceId(device.key)}
+                role="tab"
+                title={device.key === "all" ? device.label : `${device.label} · ${device.key}`}
+                type="button"
+              >
+                {device.label}
               </AccountTab>
             ))}
           </AccountTabs>

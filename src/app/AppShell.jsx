@@ -4096,6 +4096,8 @@ export default function App() {
   const workspaceCloudSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
+  const tokenomicsSyncPendingRefreshRef = useRef(false);
+  const tokenomicsForceResyncRef = useRef(null);
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
@@ -5054,6 +5056,8 @@ export default function App() {
     workspaceCloudSyncKeyRef.current = "";
     tokenomicsSyncCursorRef.current = "";
     tokenomicsSyncInFlightRef.current = false;
+    tokenomicsSyncPendingRefreshRef.current = false;
+    tokenomicsForceResyncRef.current = null;
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
     setStartupAgentGateState("idle");
@@ -5082,6 +5086,8 @@ export default function App() {
     workspaceCloudSyncKeyRef.current = "";
     tokenomicsSyncCursorRef.current = "";
     tokenomicsSyncInFlightRef.current = false;
+    tokenomicsSyncPendingRefreshRef.current = false;
+    tokenomicsForceResyncRef.current = null;
     setActiveView(DEFAULT_WORKSPACE_VIEW);
     setVisibleView(DEFAULT_WORKSPACE_VIEW);
     setViewMotion("entered");
@@ -10175,25 +10181,34 @@ export default function App() {
     const tokenomicsCursorFromSummary = (summary) => {
       const direct = typeof summary?.sync_cursor === "string" ? summary.sync_cursor.trim() : "";
       if (direct) return direct;
-      const rollups = Array.isArray(summary?.rollups) ? summary.rollups : [];
-      return rollups
+      const hourly = Array.isArray(summary?.hourly) ? summary.hourly : [];
+      return hourly
         .map((row) => String(row?.updated_at || row?.updatedAt || "").trim())
         .filter(Boolean)
         .sort()
         .pop() || "";
     };
     const syncTokenomics = async (reason) => {
+      const isServerRefresh = reason === "tokenomics_server_refresh";
+      if (isServerRefresh) {
+        tokenomicsSyncCursorRef.current = "";
+      }
       if (tokenomicsSyncInFlightRef.current) {
+        if (isServerRefresh) {
+          tokenomicsSyncPendingRefreshRef.current = true;
+        }
         return;
       }
       tokenomicsSyncInFlightRef.current = true;
       try {
         if (reason === "tokenomics_scan" || reason === "tokenomics_server_refresh") {
+          let summary;
           if (reason === "tokenomics_server_refresh") {
-            tokenomicsSyncCursorRef.current = "";
+            summary = await invoke("tokenomics_resync_last_30_days");
+          } else {
+            await startAccountTokenomicsStartupScan(accountKey);
+            summary = await invoke("tokenomics_get_sync_payload");
           }
-          await startAccountTokenomicsStartupScan(accountKey);
-          const summary = await invoke("tokenomics_get_sync_payload");
           if (disposed) {
             return;
           }
@@ -10213,9 +10228,11 @@ export default function App() {
         if (disposed) {
           return;
         }
-        const rollupCount = Number(summary?.rollup_count ?? summary?.rollupCount ?? 0);
+        const hourlyCount = Array.isArray(summary?.hourly)
+          ? summary.hourly.length
+          : Number(summary?.hourly_count ?? summary?.hourlyCount ?? 0);
         const limitCount = Array.isArray(summary?.limits) ? summary.limits.length : 0;
-        if (rollupCount > 0 || limitCount > 0) {
+        if (hourlyCount > 0 || limitCount > 0) {
           await invoke("cloud_mcp_sync_tokenomics_state", {
             summary,
             reason,
@@ -10233,8 +10250,13 @@ export default function App() {
         }
       } finally {
         tokenomicsSyncInFlightRef.current = false;
+        if (tokenomicsSyncPendingRefreshRef.current && !disposed) {
+          tokenomicsSyncPendingRefreshRef.current = false;
+          syncTokenomics("tokenomics_server_refresh");
+        }
       }
     };
+    tokenomicsForceResyncRef.current = () => syncTokenomics("tokenomics_server_refresh");
 
     syncTokenomics("tokenomics_scan");
     let unlistenRefresh = null;
@@ -10258,6 +10280,7 @@ export default function App() {
 
     return () => {
       disposed = true;
+      tokenomicsForceResyncRef.current = null;
       if (typeof unlistenRefresh === "function") {
         unlistenRefresh();
       }
@@ -10563,6 +10586,11 @@ export default function App() {
       const resetSummary = fullAccountWipe
         ? `Cleared all account SQLite data across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}; preserved ${preservedCreditRows} ${creditUsageLabel} and ${checkpointMessage}.`
         : `Preserved ${preservedFiletrees} ${filetreeLabel} and ${checkpointMessage}.`;
+      tokenomicsSyncCursorRef.current = "";
+      const forceTokenomicsResync = tokenomicsForceResyncRef.current;
+      if (typeof forceTokenomicsResync === "function") {
+        await forceTokenomicsResync();
+      }
       setCloudSqliteResetMessage(
         `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete. ${resetSummary}`,
       );
