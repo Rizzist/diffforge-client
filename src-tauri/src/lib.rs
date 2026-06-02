@@ -1086,6 +1086,10 @@ struct DesktopSigninDiagnosticRequest<'a> {
 #[serde(rename_all = "camelCase")]
 struct CreateWorkspaceRequest<'a> {
     name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1093,12 +1097,20 @@ struct CreateWorkspaceRequest<'a> {
 struct UpdateWorkspaceRequest<'a> {
     workspace_id: &'a str,
     name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteWorkspaceRequest<'a> {
     workspace_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_type: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    team_id: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -3352,21 +3364,22 @@ pub fn run() {
             tokenomics_get_sync_payload,
             tokenomics_get_sync_delta,
             tokenomics_record_usage,
-            cloud_mcp_reset_workspace_graph_state,
             cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
-            cloud_mcp_record_spec_edit_intent,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_get_activity,
-            cloud_mcp_get_cached_spec_graph,
-            cloud_mcp_get_local_ignored_spec_graph_overlay,
-            cloud_mcp_start_spec_graph_sync,
-            cloud_mcp_stop_spec_graph_sync,
-            cloud_mcp_get_spec_graph,
+            cloud_mcp_get_architecture_history,
             agent_thread_session_discover,
             agent_thread_transcript,
             terminal_workspace_raw_scan,
+            workspace_git_repositories,
+            workspace_git_pull_candidates,
+            workspace_git_pull_repositories,
+            workspace_git_snapshot,
+            workspace_git_file_diff,
+            workspace_git_generate_commit_message,
+            workspace_git_commit_and_push,
             terminal_open,
             terminal_start_agent,
             terminal_start_agent_many,

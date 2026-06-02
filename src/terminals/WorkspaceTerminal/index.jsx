@@ -1228,6 +1228,7 @@ function WorkspaceTerminal({
   projectRoot = "",
   mountId = "",
   startupReady = true,
+  terminalBreakoutActive = false,
   terminalIndex = 0,
   terminalCount = 1,
   terminalRole = "",
@@ -12334,7 +12335,7 @@ function WorkspaceTerminal({
       terminalClosed
       || terminalClosing
       || isFullscreen
-      || terminalCount <= 1
+      || (!terminalBreakoutActive && terminalCount <= 1)
       || event.button !== 0
     ) {
       return;
@@ -12362,6 +12363,7 @@ function WorkspaceTerminal({
     paneId,
     terminalClosed,
     terminalClosing,
+    terminalBreakoutActive,
     terminalCount,
     terminalIndex,
     workspace?.id,
@@ -12490,7 +12492,7 @@ function WorkspaceTerminal({
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"
-            disabled={terminalClosed || terminalClosing || isFullscreen || terminalCount <= 1}
+            disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
             onPointerDown={beginTerminalDrag}
             title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
             type="button"

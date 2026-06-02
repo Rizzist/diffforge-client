@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 
 const SESSION_TOKEN_KEY = "diffforge.desktop.sessionToken";
 const SESSION_USER_KEY = "diffforge.desktop.user";
+const SESSION_SCOPE_KEY = "diffforge.desktop.accountScope";
 const PENDING_STATE_KEY = "diffforge.desktop.pendingAuthState";
 const AUTH_VALUE_PATTERN = /^[A-Za-z0-9_-]{24,192}$/;
 
@@ -59,12 +60,77 @@ function readStoredUser() {
   }
 }
 
+function personalScope() {
+  return {
+    id: "personal",
+    type: "personal",
+    label: "Personal",
+    teamId: null,
+  };
+}
+
+function normalizeAccountScopes(user) {
+  const scopes = Array.isArray(user?.accountScopes)
+    ? user.accountScopes
+    : Array.isArray(user?.scopes)
+      ? user.scopes
+      : [];
+  const normalized = scopes
+    .map((scope) => {
+      const type = String(scope?.type || scope?.scopeType || "personal").trim().toLowerCase();
+      const teamId = typeof scope?.teamId === "string" ? scope.teamId.trim() : "";
+
+      if (type === "team" && teamId) {
+        return {
+          id: `team:${teamId}`,
+          type: "team",
+          label: String(scope?.label || scope?.team?.name || "Team").trim() || "Team",
+          teamId,
+          team: scope?.team || null,
+        };
+      }
+
+      return personalScope();
+    });
+  const byId = new Map();
+
+  [personalScope(), ...normalized].forEach((scope) => {
+    byId.set(scope.id, scope);
+  });
+
+  return Array.from(byId.values());
+}
+
+function normalizeAccountScope(value, user = readStoredUser()) {
+  const raw = value && typeof value === "object" ? value : {};
+  const type = String(raw.type || raw.scopeType || "personal").trim().toLowerCase();
+  const teamId = typeof raw.teamId === "string" ? raw.teamId.trim() : "";
+  const scopes = normalizeAccountScopes(user);
+
+  if (type === "team" && teamId) {
+    return scopes.find((scope) => scope.type === "team" && scope.teamId === teamId) || personalScope();
+  }
+
+  return personalScope();
+}
+
+function readStoredScope(user = readStoredUser()) {
+  try {
+    const scope = JSON.parse(readStorageValue(SESSION_SCOPE_KEY) || "null");
+
+    return normalizeAccountScope(scope, user);
+  } catch {
+    return personalScope();
+  }
+}
+
 let snapshot = {
   status: "signedOut",
   message: DEFAULT_AUTH_MESSAGE,
   error: "",
   user: readStoredUser(),
   token: readStoredToken(),
+  activeScope: readStoredScope(),
   pendingState: readPendingState(),
   version: 0,
 };
@@ -82,6 +148,7 @@ function emitAuthChange(partial) {
 function clearSessionStorage() {
   removeStorageValue(SESSION_TOKEN_KEY);
   removeStorageValue(SESSION_USER_KEY);
+  removeStorageValue(SESSION_SCOPE_KEY);
 }
 
 function clearPendingStorage() {
@@ -103,10 +170,12 @@ function getSnapshot() {
 function syncFromStorage() {
   const token = readStoredToken();
   const user = readStoredUser();
+  const activeScope = readStoredScope(user);
   const pendingState = readPendingState();
   const next = {
     token,
     user,
+    activeScope,
     pendingState,
   };
 
@@ -121,7 +190,7 @@ function syncFromStorage() {
 
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
-    if ([SESSION_TOKEN_KEY, SESSION_USER_KEY, PENDING_STATE_KEY].includes(event.key)) {
+    if ([SESSION_TOKEN_KEY, SESSION_USER_KEY, SESSION_SCOPE_KEY, PENDING_STATE_KEY].includes(event.key)) {
       syncFromStorage();
     }
   });
@@ -139,6 +208,12 @@ export const authStore = {
   getPendingState() {
     return readPendingState();
   },
+  getActiveScope() {
+    return readStoredScope(readStoredUser());
+  },
+  getAccountScopes() {
+    return normalizeAccountScopes(readStoredUser());
+  },
   setChecking(message) {
     emitAuthChange({
       status: "signedOut",
@@ -146,6 +221,7 @@ export const authStore = {
       error: "",
       user: readStoredUser(),
       token: readStoredToken(),
+      activeScope: readStoredScope(),
       pendingState: readPendingState(),
     });
   },
@@ -167,9 +243,11 @@ export const authStore = {
   },
   setAuthenticated(sessionUser, message) {
     const token = readStoredToken();
+    const activeScope = readStoredScope(sessionUser);
 
     if (sessionUser && typeof sessionUser === "object") {
       writeStorageValue(SESSION_USER_KEY, JSON.stringify(sessionUser));
+      writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
     }
 
     emitAuthChange({
@@ -178,6 +256,7 @@ export const authStore = {
       error: "",
       user: sessionUser,
       token,
+      activeScope,
       pendingState: readPendingState(),
     });
   },
@@ -188,14 +267,24 @@ export const authStore = {
 
     writeStorageValue(SESSION_TOKEN_KEY, session.token);
     writeStorageValue(SESSION_USER_KEY, JSON.stringify(session.user));
+    const activeScope = readStoredScope(session.user);
+    writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
     emitAuthChange({
       status: "authenticated",
       message: message ?? snapshot.message,
       error: "",
       user: session.user,
       token: session.token,
+      activeScope,
       pendingState: readPendingState(),
     });
+  },
+  setActiveScope(scope) {
+    const user = readStoredUser();
+    const activeScope = normalizeAccountScope(scope, user);
+
+    writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
+    emitAuthChange({ activeScope });
   },
   setSignedOut({
     message = DEFAULT_AUTH_MESSAGE,
@@ -217,6 +306,7 @@ export const authStore = {
       error,
       user: clearSession ? null : readStoredUser(),
       token: clearSession ? "" : readStoredToken(),
+      activeScope: clearSession ? personalScope() : readStoredScope(),
       pendingState: clearPending ? "" : readPendingState(),
     });
   },
@@ -231,6 +321,7 @@ export const authStore = {
     emitAuthChange({
       user: null,
       token: "",
+      activeScope: personalScope(),
     });
   },
   setMessage(message) {

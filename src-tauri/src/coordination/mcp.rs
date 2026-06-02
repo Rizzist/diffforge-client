@@ -2801,8 +2801,8 @@ fn cloud_start_task_for_agent(response: &Value) -> Value {
     );
     insert_if_present(
         &mut view,
-        "spec_graph_summary",
-        cloud_spec_graph_summary_for_agent(&response["spec_graph"]),
+        "architecture_history",
+        cloud_architecture_history_for_agent(&response["architecture_history"]),
     );
     insert_if_present(
         &mut view,
@@ -2868,18 +2868,40 @@ fn cloud_spec_summary_for_agent(spec: &Value) -> Value {
     )
 }
 
-fn cloud_spec_graph_summary_for_agent(spec_graph: &Value) -> Value {
-    pick_fields(
-        spec_graph,
-        &[
-            "ok",
-            "error",
-            "message",
-            "graph_stats",
-            "agent_work",
-            "node_count",
-        ],
-    )
+fn cloud_architecture_history_for_agent(history: &Value) -> Value {
+    let mut view = Map::new();
+    insert_if_present(
+        &mut view,
+        "context_error",
+        pick_fields(history, &["ok", "error", "message"]),
+    );
+    if let Some(tasks) = history.get("tasks").and_then(Value::as_array) {
+        view.insert("task_count".to_string(), json!(tasks.len()));
+        view.insert(
+            "recent_tasks".to_string(),
+            Value::Array(
+                tasks
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|task| {
+                        pick_fields(
+                            task,
+                            &[
+                                "task_id",
+                                "status",
+                                "title",
+                                "original_prompt",
+                                "coding_agent",
+                                "updated_at",
+                            ],
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(view)
 }
 
 fn pick_fields(source: &Value, fields: &[&str]) -> Value {
@@ -4014,13 +4036,14 @@ mod tests {
                 },
                 "guidance": ["Account for active peers before editing."]
             },
-            "spec_graph": {
-                "kind": "project_spec_graph",
+            "architecture_history": {
+                "kind": "architecture_task_history",
                 "repo_id": "repo-test",
                 "workspace_id": "workspace-test",
-                "graph_stats": {"node_count": 5},
-                "agent_work": {"active": 2},
-                "node_count": 5
+                "tasks": [
+                    {"task_id": "task-old", "status": "done", "title": "Old task"},
+                    {"task_id": "task-cloud-1", "status": "active", "title": "Cloud task"}
+                ]
             }
         });
 
@@ -4036,13 +4059,13 @@ mod tests {
             view["spec_summary"]["active_specs"][0]["statement"].as_str(),
             Some("Agents must use start_task before leases.")
         );
-        assert_eq!(view["spec_graph_summary"]["node_count"].as_u64(), Some(5));
+        assert_eq!(view["architecture_history"]["task_count"].as_u64(), Some(2));
         assert_eq!(view["spec_activity"]["recorded"].as_bool(), Some(true));
         assert!(view.get("event").is_none());
         assert!(view.get("context_pack").is_none());
         assert!(view["peer_work"][0].get("metadata_json").is_none());
         assert!(view["lane_conflicts"][0].get("payload").is_none());
-        assert!(view["spec_graph_summary"].get("repo_id").is_none());
+        assert!(view["architecture_history"].get("repo_id").is_none());
     }
 
     #[test]

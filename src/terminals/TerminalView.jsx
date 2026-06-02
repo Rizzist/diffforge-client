@@ -9,10 +9,13 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import styled, { keyframes } from "styled-components";
 
 import {
+  ButtonAddIcon,
   ButtonForgeIcon,
   ButtonFolderIcon,
   ButtonFullscreenExitIcon,
   ButtonFullscreenIcon,
+  ButtonHubIcon,
+  ButtonRefreshIcon,
   DashboardTitle,
   ForgeWorkspace,
   FormMessage,
@@ -63,6 +66,7 @@ import {
 } from "../threads/threadTerminalGroundTruth.js";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
+import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
@@ -95,6 +99,7 @@ import WorkspaceTerminal, {
   getWorkspaceTerminalPaneId,
 } from "./WorkspaceTerminal.jsx";
 import {
+  MAX_WORKSPACE_TERMINAL_COUNT,
   buildTerminalComposerDraftInput,
   getTerminalInputDebugFields,
   TERMINAL_PARKED_PROMPT_EVENT,
@@ -128,6 +133,17 @@ import {
 } from "./WorkspaceTerminal/threadRuntime.js";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
+const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
+const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
+const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
+const TERMINAL_BREAKOUT_PHASE_BREAKING_OUT = "breaking-out";
+const TERMINAL_BREAKOUT_PHASE_CANVAS = "canvas";
+const TERMINAL_BREAKOUT_PHASE_RETURNING = "returning";
+const TERMINAL_BREAKOUT_DEFAULT_VIEWPORT = { x: 0, y: 0 };
+const TERMINAL_BREAKOUT_MIN_WIDTH = 420;
+const TERMINAL_BREAKOUT_MIN_HEIGHT = 260;
+const TERMINAL_BREAKOUT_MAX_WIDTH = 840;
+const TERMINAL_BREAKOUT_MAX_HEIGHT = 560;
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
@@ -719,12 +735,17 @@ const TerminalSurfaceLayer = styled.div`
   html[data-forge-theme="light"] & {
     background: #ffffff;
   }
+
+  &[data-terminal-breakout="true"] {
+    background: transparent;
+  }
 `;
 
 const TerminalSurfaceSlot = styled.div`
   position: absolute;
   top: 0;
   left: 0;
+  z-index: var(--terminal-slot-z, 1);
   width: var(--terminal-slot-width, 0px);
   height: var(--terminal-slot-height, 0px);
   min-width: 0;
@@ -764,6 +785,161 @@ const TerminalSurfaceSlot = styled.div`
 
   &[data-terminal-fullscreen="true"] {
     z-index: 240;
+  }
+`;
+
+const TerminalGridScaffold = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  min-width: 0;
+  min-height: 0;
+  opacity: 1;
+  pointer-events: auto;
+  transition:
+    opacity 170ms ease,
+    filter 170ms ease;
+
+  &[data-breakout-visible="true"] {
+    opacity: 0;
+    pointer-events: none;
+    filter: brightness(0.62);
+  }
+`;
+
+const TerminalBreakoutCanvas = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  overflow: hidden;
+  background:
+    linear-gradient(90deg, rgba(122, 148, 186, 0.08) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(122, 148, 186, 0.07) 1px, transparent 1px),
+    radial-gradient(circle at 22% 18%, rgba(47, 128, 255, 0.12), transparent 34%),
+    #020304;
+  background-position:
+    var(--terminal-breakout-pan-x, 0px) var(--terminal-breakout-pan-y, 0px),
+    var(--terminal-breakout-pan-x, 0px) var(--terminal-breakout-pan-y, 0px),
+    center,
+    center;
+  background-size: 72px 72px, 72px 72px, auto, auto;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 170ms ease;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &[data-panning="true"] {
+    cursor: grabbing;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      linear-gradient(90deg, rgba(35, 43, 58, 0.08) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(35, 43, 58, 0.07) 1px, transparent 1px),
+      radial-gradient(circle at 22% 18%, rgba(0, 102, 204, 0.08), transparent 35%),
+      #ffffff;
+  }
+`;
+
+const TerminalBreakoutPanPlane = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  cursor: grab;
+`;
+
+const TerminalBreakoutTopBar = styled.div`
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  z-index: 74;
+  display: inline-flex;
+  max-width: calc(100% - 20px);
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(226, 232, 240, 0.12);
+  border-radius: 8px;
+  color: rgba(232, 238, 248, 0.86);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035)),
+    rgba(0, 0, 0, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.065),
+    0 16px 34px rgba(0, 0, 0, 0.28);
+  transform: translateX(-50%);
+  backdrop-filter: blur(18px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.11);
+    color: #2a2c31;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.86), rgba(255, 255, 255, 0.62)),
+      rgba(230, 232, 236, 0.58);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.76),
+      0 14px 30px rgba(15, 23, 42, 0.12);
+  }
+`;
+
+const TerminalBreakoutTopBarDivider = styled.span`
+  width: 1px;
+  height: 20px;
+  margin: 0 2px;
+  border-radius: 999px;
+  background: rgba(226, 232, 240, 0.14);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.12);
+  }
+`;
+
+const TerminalBreakoutButton = styled.button`
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+  transition:
+    background 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.11);
+  }
+
+  &:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.42;
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #05070a;
+    background: rgba(0, 0, 0, 0.07);
   }
 `;
 
@@ -819,6 +995,7 @@ const VOICE_PLAN_PARKED_STATUSES = new Set([
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
   { id: "files", label: "Files" },
+  { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics" },
 ];
 const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
@@ -879,7 +1056,8 @@ const WorkspaceToolControlButton = styled.button`
   }
 
   &:hover,
-  &:focus-visible {
+  &:focus-visible,
+  &[data-active="true"] {
     color: #ffffff;
     background: rgba(255, 255, 255, 0.1);
   }
@@ -893,7 +1071,8 @@ const WorkspaceToolControlButton = styled.button`
   }
 
   html[data-forge-theme="light"] &:hover,
-  html[data-forge-theme="light"] &:focus-visible {
+  html[data-forge-theme="light"] &:focus-visible,
+  html[data-forge-theme="light"] &[data-active="true"] {
     color: #1d1d1f;
     background: rgba(0, 0, 0, 0.07);
   }
@@ -2952,6 +3131,231 @@ function areRectsEqual(leftRect, rightRect) {
     && Math.abs(leftRect.top - rightRect.top) < 0.5
     && Math.abs(leftRect.width - rightRect.width) < 0.5
     && Math.abs(leftRect.height - rightRect.height) < 0.5;
+}
+
+function getTerminalBreakoutStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+
+  return `${TERMINAL_BREAKOUT_STORAGE_PREFIX}.${safeWorkspaceId}`;
+}
+
+function normalizeBreakoutViewport(value) {
+  const x = Number(value?.x || 0);
+  const y = Number(value?.y || 0);
+
+  return {
+    x: Number.isFinite(x) ? x : 0,
+    y: Number.isFinite(y) ? y : 0,
+  };
+}
+
+function normalizeBreakoutPlacement(value) {
+  const x = Number(value?.x);
+  const y = Number(value?.y);
+  const width = Number(value?.width);
+  const height = Number(value?.height);
+  const z = Number.parseInt(value?.z, 10);
+
+  if (
+    !Number.isFinite(x)
+    || !Number.isFinite(y)
+    || !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || width <= 0
+    || height <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    height,
+    width,
+    x,
+    y,
+    z: Number.isInteger(z) ? z : 1,
+  };
+}
+
+function normalizeBreakoutPlacements(value, terminalIndexes = []) {
+  const terminalIndexSet = new Set((terminalIndexes || [])
+    .filter((terminalIndex) => Number.isInteger(terminalIndex)));
+  const source = value && typeof value === "object" ? value : {};
+  const placements = {};
+
+  Object.keys(source).forEach((key) => {
+    const terminalIndex = Number.parseInt(key, 10);
+    if (!Number.isInteger(terminalIndex) || (terminalIndexSet.size && !terminalIndexSet.has(terminalIndex))) {
+      return;
+    }
+
+    const placement = normalizeBreakoutPlacement(source[key]);
+    if (placement) {
+      placements[terminalIndex] = placement;
+    }
+  });
+
+  return placements;
+}
+
+function readTerminalBreakoutLayout(storageKey, terminalIndexes = []) {
+  if (!canUseTodoQueueStorage()) {
+    return {
+      placements: {},
+      viewport: TERMINAL_BREAKOUT_DEFAULT_VIEWPORT,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+    return {
+      placements: normalizeBreakoutPlacements(parsed?.placements, terminalIndexes),
+      viewport: normalizeBreakoutViewport(parsed?.viewport),
+    };
+  } catch {
+    return {
+      placements: {},
+      viewport: TERMINAL_BREAKOUT_DEFAULT_VIEWPORT,
+    };
+  }
+}
+
+function writeTerminalBreakoutLayout(storageKey, layout) {
+  if (!canUseTodoQueueStorage()) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify({
+      placements: normalizeBreakoutPlacements(layout?.placements),
+      viewport: normalizeBreakoutViewport(layout?.viewport),
+    }));
+  } catch {
+    // Breakout layout is a visual preference; storage failures should not block terminals.
+  }
+}
+
+function getBreakoutBaseTerminalSize(panelRect, rects = {}) {
+  const measuredRects = Object.values(rects || {}).filter((rect) => rect?.width && rect?.height);
+  const measuredWidth = measuredRects.length
+    ? Math.max(...measuredRects.map((rect) => Number(rect.width || 0)))
+    : 0;
+  const measuredHeight = measuredRects.length
+    ? Math.max(...measuredRects.map((rect) => Number(rect.height || 0)))
+    : 0;
+  const panelWidth = Number(panelRect?.width || 0);
+  const panelHeight = Number(panelRect?.height || 0);
+
+  return {
+    height: Math.max(
+      TERMINAL_BREAKOUT_MIN_HEIGHT,
+      Math.min(TERMINAL_BREAKOUT_MAX_HEIGHT, measuredHeight || panelHeight * 0.52 || 360),
+    ),
+    width: Math.max(
+      TERMINAL_BREAKOUT_MIN_WIDTH,
+      Math.min(TERMINAL_BREAKOUT_MAX_WIDTH, measuredWidth || panelWidth * 0.56 || 620),
+    ),
+  };
+}
+
+function buildSpreadBreakoutPlacements({
+  existingPlacements = {},
+  panelRect,
+  preserveExisting = true,
+  rects = {},
+  terminalIndexes = [],
+} = {}) {
+  const baseSize = getBreakoutBaseTerminalSize(panelRect, rects);
+  const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(Math.max(1, terminalIndexes.length)))));
+  const columnGap = 92;
+  const rowGap = 112;
+  const nextPlacements = {};
+  let maxZ = 0;
+
+  (terminalIndexes || []).forEach((terminalIndex, orderIndex) => {
+    const existingPlacement = preserveExisting
+      ? normalizeBreakoutPlacement(existingPlacements?.[terminalIndex])
+      : null;
+
+    if (existingPlacement) {
+      nextPlacements[terminalIndex] = existingPlacement;
+      maxZ = Math.max(maxZ, existingPlacement.z || 0);
+      return;
+    }
+
+    const columnIndex = orderIndex % columns;
+    const rowIndex = Math.floor(orderIndex / columns);
+    const measuredRect = rects?.[terminalIndex] || {};
+    const width = Math.max(
+      TERMINAL_BREAKOUT_MIN_WIDTH,
+      Math.min(TERMINAL_BREAKOUT_MAX_WIDTH, Number(measuredRect.width || 0) || baseSize.width),
+    );
+    const height = Math.max(
+      TERMINAL_BREAKOUT_MIN_HEIGHT,
+      Math.min(TERMINAL_BREAKOUT_MAX_HEIGHT, Number(measuredRect.height || 0) || baseSize.height),
+    );
+    nextPlacements[terminalIndex] = {
+      height,
+      width,
+      x: 76 + (columnIndex * (baseSize.width + columnGap)) + (rowIndex % 2 ? 44 : 0),
+      y: 88 + (rowIndex * (baseSize.height + rowGap)),
+      z: orderIndex + 1,
+    };
+    maxZ = Math.max(maxZ, orderIndex + 1);
+  });
+
+  return {
+    maxZ,
+    placements: nextPlacements,
+  };
+}
+
+function getBreakoutScreenRect(placement, viewport) {
+  const normalizedPlacement = normalizeBreakoutPlacement(placement);
+  const normalizedViewport = normalizeBreakoutViewport(viewport);
+
+  if (!normalizedPlacement) {
+    return null;
+  }
+
+  return {
+    height: normalizedPlacement.height,
+    left: normalizedPlacement.x + normalizedViewport.x,
+    top: normalizedPlacement.y + normalizedViewport.y,
+    width: normalizedPlacement.width,
+  };
+}
+
+function getDisplayRowsFromBreakoutPlacements(terminalIndexes, placements) {
+  const orderedIndexes = (terminalIndexes || [])
+    .slice()
+    .sort((leftIndex, rightIndex) => {
+      const leftPlacement = normalizeBreakoutPlacement(placements?.[leftIndex]);
+      const rightPlacement = normalizeBreakoutPlacement(placements?.[rightIndex]);
+
+      if (!leftPlacement && !rightPlacement) {
+        return leftIndex - rightIndex;
+      }
+      if (!leftPlacement) {
+        return 1;
+      }
+      if (!rightPlacement) {
+        return -1;
+      }
+
+      const yDelta = leftPlacement.y - rightPlacement.y;
+      if (Math.abs(yDelta) > 48) {
+        return yDelta;
+      }
+
+      return (leftPlacement.x - rightPlacement.x) || (leftIndex - rightIndex);
+    });
+
+  return orderedIndexes.map((terminalIndex, rowIndex) => ({
+    rowIndex,
+    terminalIndexes: [terminalIndex],
+  }));
 }
 
 function canUseTodoQueueStorage() {
@@ -5300,6 +5704,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onRemoveItem,
   onReorderItem,
   onSubmitDraft,
+  onToggleTerminalBreakout,
   onToggleFullscreenPane,
   onUpdateItem,
   onVoiceAgentToolCall,
@@ -5307,6 +5712,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   paneMode = TODO_QUEUE_PANE_MODE_NORMAL,
   pendingItems = {},
   rootDirectory = "",
+  terminalBreakoutActive = false,
   workspace,
   workspaceError = "",
   workspaceId,
@@ -6869,6 +7275,14 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             workspaceError={workspaceError}
           />
         </WorkspaceToolSurface>
+      ) : activeWorkspaceTool === "git" ? (
+        <WorkspaceToolSurface data-tool="git">
+          <GitWorkspaceView
+            rootDirectory={rootDirectory}
+            workspace={workspace}
+            workspaceError={workspaceError}
+          />
+        </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "tokenomics" ? (
         <WorkspaceToolSurface data-tool="tokenomics">
           <AccountTokenomicsView
@@ -6887,6 +7301,16 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 type="button"
               >
                 <TitleMinimizeIcon aria-hidden="true" />
+              </WorkspaceToolControlButton>
+              <WorkspaceToolControlButton
+                aria-label={terminalBreakoutActive ? "Exit terminal breakout canvas" : "Open terminal breakout canvas"}
+                aria-pressed={terminalBreakoutActive ? "true" : "false"}
+                data-active={terminalBreakoutActive ? "true" : undefined}
+                onClick={onToggleTerminalBreakout}
+                title={terminalBreakoutActive ? "Exit breakout" : "Breakout"}
+                type="button"
+              >
+                <ButtonHubIcon aria-hidden="true" />
               </WorkspaceToolControlButton>
               <WorkspaceToolControlButton
                 aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
@@ -7350,6 +7774,7 @@ function TerminalView({
   agentStatusError,
   agentStatuses,
   agentStatusState,
+  addWorkspaceTerminal,
   changeWorkspaceTerminalRole,
   closeWorkspaceTerminal,
   createWorkspaceThreadTerminal,
@@ -7397,6 +7822,7 @@ function TerminalView({
   const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
     ? terminalWorkspaceLogicalIndexes
     : [];
+  const logicalTerminalIndexSignature = logicalTerminalIndexes.join(",");
   const normalizedTerminalWorkspaceCoordinationTargets = useMemo(
     () => normalizeTerminalCoordinationTargets(terminalWorkspaceCoordinationTargets),
     [terminalWorkspaceCoordinationTargets],
@@ -7424,11 +7850,18 @@ function TerminalView({
   const [terminalLayoutRects, setTerminalLayoutRects] = useState({});
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
   const [terminalDragState, setTerminalDragState] = useState(null);
+  const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
+  const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
+  const [terminalBreakoutViewport, setTerminalBreakoutViewport] = useState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
+  const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
   const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
   const terminalDragActive = Boolean(terminalDragState);
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
     && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
+  const terminalBreakoutVisible = terminalBreakoutPhase !== TERMINAL_BREAKOUT_PHASE_GRID;
+  const terminalBreakoutLayoutActive = terminalBreakoutPhase === TERMINAL_BREAKOUT_PHASE_BREAKING_OUT
+    || terminalBreakoutPhase === TERMINAL_BREAKOUT_PHASE_CANVAS;
   const [todoDragState, setTodoDragState] = useState(null);
   const [todoDropError, setTodoDropError] = useState("");
   const todoDragActive = Boolean(todoDragState);
@@ -7462,6 +7895,11 @@ function TerminalView({
   const todoQueuePanelMaxSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : 70;
   const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
   const fullscreenTransitionTimerRef = useRef(0);
+  const terminalBreakoutTransitionTimerRef = useRef(0);
+  const terminalBreakoutPanStateRef = useRef(null);
+  const terminalBreakoutPlacementsRef = useRef({});
+  const terminalBreakoutPhaseRef = useRef(TERMINAL_BREAKOUT_PHASE_GRID);
+  const terminalBreakoutViewportRef = useRef(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
   const layoutMeasureFrameRef = useRef(0);
   const terminalDragStateRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
@@ -7490,11 +7928,18 @@ function TerminalView({
     () => getTodoQueueStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
+  const terminalBreakoutStorageKey = useMemo(
+    () => getTerminalBreakoutStorageKey(terminalWorkspace?.id),
+    [terminalWorkspace?.id],
+  );
   const todoQueueRemoteCommandReceiptStorageKey = useMemo(
     () => getTodoQueueRemoteCommandReceiptStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
   todoQueueItemsRef.current = todoQueueItems;
+  terminalBreakoutPhaseRef.current = terminalBreakoutPhase;
+  terminalBreakoutPlacementsRef.current = terminalBreakoutPlacements;
+  terminalBreakoutViewportRef.current = terminalBreakoutViewport;
   todoQueueStorageKeyRef.current = todoQueueStorageKey;
   todoQueueRemoteCommandReceiptStorageKeyRef.current = todoQueueRemoteCommandReceiptStorageKey;
   const visibleTodoQueueItems = useMemo(() => (
@@ -7521,6 +7966,48 @@ function TerminalView({
     todoQueueRemoteCommandReceiptsRef.current = receipts;
     writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKey, receipts);
   }, [todoQueueRemoteCommandReceiptStorageKey]);
+
+  useEffect(() => {
+    const layout = readTerminalBreakoutLayout(terminalBreakoutStorageKey, logicalTerminalIndexes);
+    terminalBreakoutPlacementsRef.current = layout.placements;
+    terminalBreakoutViewportRef.current = layout.viewport;
+    setTerminalBreakoutPlacements(layout.placements);
+    setTerminalBreakoutViewport(layout.viewport);
+    setTerminalBreakoutPhase(TERMINAL_BREAKOUT_PHASE_GRID);
+    setTerminalBreakoutPanning(false);
+  }, [terminalBreakoutStorageKey]);
+
+  useEffect(() => {
+    setTerminalBreakoutPlacements((currentPlacements) => {
+      const normalizedPlacements = normalizeBreakoutPlacements(currentPlacements, logicalTerminalIndexes);
+      const missingPlacement = logicalTerminalIndexes.some((terminalIndex) => !normalizedPlacements[terminalIndex]);
+      const currentPhase = terminalBreakoutPhaseRef.current;
+      const shouldFillMissing = missingPlacement
+        && (
+          currentPhase === TERMINAL_BREAKOUT_PHASE_BREAKING_OUT
+          || currentPhase === TERMINAL_BREAKOUT_PHASE_CANVAS
+        );
+      const nextPlacements = shouldFillMissing
+        ? buildSpreadBreakoutPlacements({
+          existingPlacements: normalizedPlacements,
+          panelRect: terminalPanelRectRef.current,
+          preserveExisting: true,
+          rects: terminalLayoutRectsRef.current,
+          terminalIndexes: logicalTerminalIndexes,
+        }).placements
+        : normalizedPlacements;
+
+      terminalBreakoutPlacementsRef.current = nextPlacements;
+      return nextPlacements;
+    });
+  }, [logicalTerminalIndexSignature]);
+
+  useEffect(() => {
+    writeTerminalBreakoutLayout(terminalBreakoutStorageKey, {
+      placements: terminalBreakoutPlacements,
+      viewport: terminalBreakoutViewport,
+    });
+  }, [terminalBreakoutPlacements, terminalBreakoutStorageKey, terminalBreakoutViewport]);
 
   const recordTodoQueueRemoteCommandReceipt = useCallback((item, status, fields = {}) => {
     const workspaceId = String(fields.workspaceId || item?.workspaceId || terminalWorkspace?.id || "").trim();
@@ -7634,6 +8121,33 @@ function TerminalView({
     const capability = getTerminalImageInputSupport(terminalIndex);
     return capability?.supported ? "" : getTodoImageUnsupportedDropMessage(capability);
   }, [getTerminalImageInputSupport, todoDragState]);
+  const getTerminalHitTestRects = useCallback(() => {
+    const currentPhase = terminalBreakoutPhaseRef.current;
+    const shouldUseBreakoutRects = currentPhase === TERMINAL_BREAKOUT_PHASE_BREAKING_OUT
+      || currentPhase === TERMINAL_BREAKOUT_PHASE_CANVAS;
+
+    if (!shouldUseBreakoutRects) {
+      return terminalLayoutRectsRef.current;
+    }
+
+    const viewport = terminalBreakoutViewportRef.current;
+    const placements = terminalBreakoutPlacementsRef.current;
+    const nextRects = {};
+
+    logicalTerminalIndexes.forEach((terminalIndex) => {
+      const screenRect = getBreakoutScreenRect(placements?.[terminalIndex], viewport);
+      if (screenRect) {
+        nextRects[terminalIndex] = {
+          height: screenRect.height,
+          left: screenRect.left,
+          top: screenRect.top,
+          width: screenRect.width,
+        };
+      }
+    });
+
+    return Object.keys(nextRects).length ? nextRects : terminalLayoutRectsRef.current;
+  }, [logicalTerminalIndexes]);
   const resolveTerminalDropTarget = useCallback((clientX, clientY) => {
     const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
     if (!containerRect) {
@@ -7645,10 +8159,10 @@ function TerminalView({
       clientY,
       containerRect,
       fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-      rects: terminalLayoutRectsRef.current,
+      rects: getTerminalHitTestRects(),
       terminalIndexes: logicalTerminalIndexes,
     });
-  }, [fullscreenActive, fullscreenTerminalIndex, logicalTerminalIndexes]);
+  }, [fullscreenActive, fullscreenTerminalIndex, getTerminalHitTestRects, logicalTerminalIndexes]);
   const queueWorkspaceFileForTerminalIndex = useCallback((workspaceFile, targetTerminalIndex, source = "fileviewer_global_drop") => {
     if (!Number.isInteger(targetTerminalIndex)) {
       logFileDragDiagnosticEvent("terminal_grid.drop_skip", {
@@ -8817,6 +9331,13 @@ function TerminalView({
     }
   }, []);
 
+  const clearTerminalBreakoutTransitionTimer = useCallback(() => {
+    if (terminalBreakoutTransitionTimerRef.current) {
+      window.clearTimeout(terminalBreakoutTransitionTimerRef.current);
+      terminalBreakoutTransitionTimerRef.current = 0;
+    }
+  }, []);
+
   const getFullscreenMotionFromRect = useCallback((sourceRect) => {
     const targetRect = terminalPanelsRef.current?.getBoundingClientRect?.();
     const sourceWidth = Number(sourceRect?.width || 0);
@@ -8839,11 +9360,12 @@ function TerminalView({
 
   useEffect(() => () => {
     clearFullscreenTransitionTimer();
+    clearTerminalBreakoutTransitionTimer();
     if (layoutMeasureFrameRef.current) {
       window.cancelAnimationFrame(layoutMeasureFrameRef.current);
       layoutMeasureFrameRef.current = 0;
     }
-  }, [clearFullscreenTransitionTimer]);
+  }, [clearFullscreenTransitionTimer, clearTerminalBreakoutTransitionTimer]);
 
   useEffect(() => {
     todoQueuePendingTimersRef.current.forEach((timeoutId) => {
@@ -9340,6 +9862,260 @@ function TerminalView({
       workspaceId: terminalWorkspace?.id || "",
     });
   }, [splitWorkspaceTerminal, terminalWorkspace?.id]);
+
+  const updateTerminalBreakoutPlacements = useCallback((updater) => {
+    setTerminalBreakoutPlacements((currentPlacements) => {
+      const nextPlacements = normalizeBreakoutPlacements(
+        typeof updater === "function" ? updater(currentPlacements) : updater,
+        logicalTerminalIndexes,
+      );
+      terminalBreakoutPlacementsRef.current = nextPlacements;
+      return nextPlacements;
+    });
+  }, [logicalTerminalIndexes]);
+
+  const setTerminalBreakoutViewportState = useCallback((updater) => {
+    setTerminalBreakoutViewport((currentViewport) => {
+      const nextViewport = normalizeBreakoutViewport(
+        typeof updater === "function" ? updater(currentViewport) : updater,
+      );
+      terminalBreakoutViewportRef.current = nextViewport;
+      return nextViewport;
+    });
+  }, []);
+
+  const buildCurrentBreakoutPlacements = useCallback((options = {}) => (
+    buildSpreadBreakoutPlacements({
+      existingPlacements: terminalBreakoutPlacementsRef.current,
+      panelRect: terminalPanelRectRef.current,
+      preserveExisting: options.preserveExisting !== false,
+      rects: terminalLayoutRectsRef.current,
+      terminalIndexes: logicalTerminalIndexes,
+    })
+  ), [logicalTerminalIndexes]);
+
+  const openTerminalBreakout = useCallback(() => {
+    if (!hasVisibleWorkspaceTerminalPanes || !terminalWorkspace?.id) {
+      return;
+    }
+
+    measureTerminalLayout();
+    clearTerminalBreakoutTransitionTimer();
+    const { placements } = buildCurrentBreakoutPlacements({ preserveExisting: true });
+    updateTerminalBreakoutPlacements(placements);
+    setTerminalBreakoutPhase(TERMINAL_BREAKOUT_PHASE_BREAKING_OUT);
+    terminalBreakoutTransitionTimerRef.current = window.setTimeout(() => {
+      terminalBreakoutTransitionTimerRef.current = 0;
+      setTerminalBreakoutPhase((currentPhase) => (
+        currentPhase === TERMINAL_BREAKOUT_PHASE_BREAKING_OUT
+          ? TERMINAL_BREAKOUT_PHASE_CANVAS
+          : currentPhase
+      ));
+    }, TERMINAL_BREAKOUT_TRANSITION_MS);
+  }, [
+    buildCurrentBreakoutPlacements,
+    clearTerminalBreakoutTransitionTimer,
+    hasVisibleWorkspaceTerminalPanes,
+    measureTerminalLayout,
+    terminalWorkspace?.id,
+    updateTerminalBreakoutPlacements,
+  ]);
+
+  const closeTerminalBreakout = useCallback(() => {
+    if (terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_GRID) {
+      return;
+    }
+
+    measureTerminalLayout();
+    clearTerminalBreakoutTransitionTimer();
+    const nextDisplayRows = getDisplayRowsFromBreakoutPlacements(
+      logicalTerminalIndexes,
+      terminalBreakoutPlacementsRef.current,
+    );
+
+    if (nextDisplayRows.length) {
+      reorderWorkspaceTerminalDisplayLayout?.({
+        displayRows: nextDisplayRows,
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    }
+
+    setTerminalBreakoutPhase(TERMINAL_BREAKOUT_PHASE_RETURNING);
+    terminalBreakoutTransitionTimerRef.current = window.setTimeout(() => {
+      terminalBreakoutTransitionTimerRef.current = 0;
+      setTerminalBreakoutPhase((currentPhase) => (
+        currentPhase === TERMINAL_BREAKOUT_PHASE_RETURNING
+          ? TERMINAL_BREAKOUT_PHASE_GRID
+          : currentPhase
+      ));
+    }, TERMINAL_BREAKOUT_TRANSITION_MS);
+  }, [
+    clearTerminalBreakoutTransitionTimer,
+    logicalTerminalIndexes,
+    measureTerminalLayout,
+    reorderWorkspaceTerminalDisplayLayout,
+    terminalWorkspace?.id,
+  ]);
+
+  const toggleTerminalBreakout = useCallback(() => {
+    if (terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_GRID) {
+      openTerminalBreakout();
+      return;
+    }
+
+    closeTerminalBreakout();
+  }, [closeTerminalBreakout, openTerminalBreakout]);
+
+  const resetTerminalBreakoutLayout = useCallback(() => {
+    if (!terminalBreakoutVisible) {
+      return;
+    }
+
+    const { placements } = buildCurrentBreakoutPlacements({ preserveExisting: false });
+    updateTerminalBreakoutPlacements(placements);
+    setTerminalBreakoutViewportState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
+  }, [
+    buildCurrentBreakoutPlacements,
+    setTerminalBreakoutViewportState,
+    terminalBreakoutVisible,
+    updateTerminalBreakoutPlacements,
+  ]);
+
+  const fitTerminalBreakoutCanvas = useCallback(() => {
+    const panelRect = terminalPanelRectRef.current;
+    const placements = Object.values(terminalBreakoutPlacementsRef.current)
+      .map(normalizeBreakoutPlacement)
+      .filter(Boolean);
+
+    if (!panelRect || !placements.length) {
+      setTerminalBreakoutViewportState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
+      return;
+    }
+
+    const minX = Math.min(...placements.map((placement) => placement.x));
+    const minY = Math.min(...placements.map((placement) => placement.y));
+    const maxX = Math.max(...placements.map((placement) => placement.x + placement.width));
+    const maxY = Math.max(...placements.map((placement) => placement.y + placement.height));
+    const boundsWidth = maxX - minX;
+    const boundsHeight = maxY - minY;
+
+    setTerminalBreakoutViewportState({
+      x: Math.round(((panelRect.width - boundsWidth) / 2) - minX),
+      y: Math.round(((panelRect.height - boundsHeight) / 2) - minY),
+    });
+  }, [setTerminalBreakoutViewportState]);
+
+  const handleBreakoutPanPointerDown = useCallback((event) => {
+    if (!terminalBreakoutVisible || event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+    terminalBreakoutPanStateRef.current = {
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startViewport: terminalBreakoutViewportRef.current,
+    };
+    setTerminalBreakoutPanning(true);
+  }, [terminalBreakoutVisible]);
+
+  const handleAddTerminalToBreakout = useCallback(() => {
+    if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+
+    const activeTerminalIndex = logicalTerminalIndexes.find((terminalIndex) => (
+      getTerminalPaneId(terminalIndex) === activeTerminalPaneId
+    ));
+    const sourceTerminalIndex = Number.isInteger(activeTerminalIndex)
+      ? activeTerminalIndex
+      : logicalTerminalIndexes[logicalTerminalIndexes.length - 1];
+    const result = addWorkspaceTerminal?.({
+      role: Number.isInteger(sourceTerminalIndex) ? getTerminalRole(sourceTerminalIndex) : "",
+      workspaceId: terminalWorkspace.id,
+    });
+    const terminalIndex = Number.parseInt(result?.terminalIndex, 10);
+
+    if (!Number.isInteger(terminalIndex)) {
+      return;
+    }
+
+    const panelRect = terminalPanelRectRef.current;
+    const { width, height } = getBreakoutBaseTerminalSize(panelRect, terminalLayoutRectsRef.current);
+    const currentPlacements = terminalBreakoutPlacementsRef.current;
+    const maxZ = Object.values(currentPlacements)
+      .map((placement) => Number.parseInt(placement?.z, 10) || 0)
+      .reduce((maxValue, z) => Math.max(maxValue, z), 0);
+    const viewport = terminalBreakoutViewportRef.current;
+    const placement = {
+      height,
+      width,
+      x: Math.round(((Number(panelRect?.width || 0) || width) / 2) - viewport.x - (width / 2) + 34),
+      y: Math.round(((Number(panelRect?.height || 0) || height) / 2) - viewport.y - (height / 2) + 34),
+      z: maxZ + 1,
+    };
+
+    updateTerminalBreakoutPlacements({
+      ...currentPlacements,
+      [terminalIndex]: placement,
+    });
+    setActiveTerminalPaneId(getWorkspaceTerminalPaneId(terminalWorkspace.id, terminalIndex, result?.terminalRole || getTerminalRole(sourceTerminalIndex)));
+  }, [
+    activeTerminalPaneId,
+    addWorkspaceTerminal,
+    getTerminalPaneId,
+    getTerminalRole,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+    updateTerminalBreakoutPlacements,
+  ]);
+
+  useEffect(() => {
+    if (!terminalBreakoutPanning) {
+      return undefined;
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handlePointerMove = (event) => {
+      const panState = terminalBreakoutPanStateRef.current;
+      if (!panState || event.pointerId !== panState.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      setTerminalBreakoutViewportState({
+        x: panState.startViewport.x + (event.clientX - panState.startClientX),
+        y: panState.startViewport.y + (event.clientY - panState.startClientY),
+      });
+    };
+
+    const endPan = (event) => {
+      const panState = terminalBreakoutPanStateRef.current;
+      if (!panState || event.pointerId !== panState.pointerId) {
+        return;
+      }
+
+      terminalBreakoutPanStateRef.current = null;
+      setTerminalBreakoutPanning(false);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", endPan);
+    window.addEventListener("pointercancel", endPan);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", endPan);
+      window.removeEventListener("pointercancel", endPan);
+    };
+  }, [setTerminalBreakoutViewportState, terminalBreakoutPanning]);
 
   const updateTodoQueueItems = useCallback((updater) => {
     setTodoQueueItems((currentItems) => {
@@ -10057,37 +10833,8 @@ function TerminalView({
     const terminalInstanceId = String(targetBinding?.instanceId || "");
     const threadId = String(targetThread?.id || "");
     const agentId = String(targetRole || intentPayload.agent_id || "").trim();
-    const repoPath = specEdit.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
     const nextWorkspaceId = specEdit.workspaceId || workspaceId || terminalWorkspace?.id || "";
-    const workspaceName = specEdit.workspaceName || terminalWorkspace?.name || "";
     const dispatchedAt = new Date().toISOString();
-    const intent = {
-      ...intentPayload,
-      agent_id: agentId,
-      event_kind: "spec_edit_dispatched",
-      intent_id: specEdit.intentId,
-      status: "dispatched",
-      terminal_id: paneId || "",
-      terminal_index: targetTerminalIndex,
-      terminal_instance_id: terminalInstanceId,
-      thread_id: threadId,
-    };
-
-    try {
-      await invoke("cloud_mcp_record_spec_edit_intent", {
-        intent,
-        repoPath,
-        workspaceId: nextWorkspaceId,
-        workspaceName,
-      });
-    } catch (error) {
-      logBigViewSyncDiagnosticEvent("spec_edit.queue_dispatch_status_error", {
-        intentId: specEdit.intentId,
-        message: getTodoDropErrorMessage(error),
-        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-        workspaceId: nextWorkspaceId,
-      });
-    }
 
     window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, {
       detail: {
@@ -10103,10 +10850,8 @@ function TerminalView({
       },
     }));
   }, [
-    defaultWorkingDirectory,
     terminalWorkspace?.id,
     terminalWorkspace?.name,
-    terminalWorkspaceWorkingDirectory,
   ]);
 
   const recordTodoQueueSpecEditCancelled = useCallback((item, reason = "cancelled", message = "") => {
@@ -10115,36 +10860,7 @@ function TerminalView({
       return;
     }
 
-    const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object"
-      ? specEdit.intentPayload
-      : {};
-    const repoPath = specEdit.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
     const workspaceId = specEdit.workspaceId || terminalWorkspace?.id || "";
-    const workspaceName = specEdit.workspaceName || terminalWorkspace?.name || "";
-    const cancellationNote = message
-      ? `${intentPayload.user_instruction || ""}\n\nQueue ${reason}: ${message}`.trim()
-      : `${intentPayload.user_instruction || ""}\n\nQueue ${reason}.`.trim();
-
-    invoke("cloud_mcp_record_spec_edit_intent", {
-      intent: {
-        ...intentPayload,
-        event_kind: "spec_edit_cancelled",
-        intent_id: specEdit.intentId,
-        status: "cancelled",
-        user_instruction: cancellationNote,
-      },
-      repoPath,
-      workspaceId,
-      workspaceName,
-    }).catch((error) => {
-      logBigViewSyncDiagnosticEvent("spec_edit.queue_cancel_status_error", {
-        intentId: specEdit.intentId,
-        message: getTodoDropErrorMessage(error),
-        reason,
-        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-        workspaceId,
-      });
-    });
 
     window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, {
       detail: {
@@ -10154,10 +10870,7 @@ function TerminalView({
       },
     }));
   }, [
-    defaultWorkingDirectory,
     terminalWorkspace?.id,
-    terminalWorkspace?.name,
-    terminalWorkspaceWorkingDirectory,
   ]);
 
   const sendTodoQueueItemToTerminal = useCallback(async ({
@@ -12456,7 +13169,7 @@ function TerminalView({
       clientY: event.clientY,
       containerRect,
       fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-      rects: terminalLayoutRectsRef.current,
+      rects: getTerminalHitTestRects(),
       terminalIndexes: logicalTerminalIndexes,
     });
     const dragWidth = Math.max(220, Number(sourceRect.width || 0));
@@ -12486,6 +13199,7 @@ function TerminalView({
   }, [
     fullscreenActive,
     fullscreenTerminalIndex,
+    getTerminalHitTestRects,
     logicalTerminalIndexes,
     measureTerminalLayout,
     terminalDragActive,
@@ -12504,7 +13218,6 @@ function TerminalView({
   const handleBeginTerminalDrag = useCallback((event) => {
     if (
       fullscreenActive
-      || logicalTerminalIndexes.length <= 1
       || !terminalWorkspace?.id
       || !event?.surfaceRect
       || todoDragActive
@@ -12513,6 +13226,51 @@ function TerminalView({
     }
 
     measureTerminalLayout();
+
+    if (terminalBreakoutLayoutActive || terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_CANVAS) {
+      const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+      const sourceRect = event.surfaceRect || event.panelRect;
+      const placement = normalizeBreakoutPlacement(
+        terminalBreakoutPlacementsRef.current?.[event.terminalIndex],
+      );
+      const viewport = terminalBreakoutViewportRef.current;
+
+      if (!containerRect || !sourceRect || !placement) {
+        return;
+      }
+
+      const offsetX = Number(event.clientX || 0) - Number(containerRect.left || 0) - viewport.x - placement.x;
+      const offsetY = Number(event.clientY || 0) - Number(containerRect.top || 0) - viewport.y - placement.y;
+      const maxZ = Object.values(terminalBreakoutPlacementsRef.current)
+        .map((currentPlacement) => Number.parseInt(currentPlacement?.z, 10) || 0)
+        .reduce((maxValue, z) => Math.max(maxValue, z), 0);
+      const nextPlacement = {
+        ...placement,
+        z: maxZ + 1,
+      };
+
+      updateTerminalBreakoutPlacements({
+        ...terminalBreakoutPlacementsRef.current,
+        [event.terminalIndex]: nextPlacement,
+      });
+      setActiveTerminalPaneId(event.paneId || "");
+      updateTerminalDragState({
+        height: nextPlacement.height,
+        mode: "canvas",
+        offsetX,
+        offsetY,
+        paneId: event.paneId || "",
+        pointerId: event.pointerId,
+        terminalIndex: event.terminalIndex,
+        width: nextPlacement.width,
+        workspaceId: event.workspaceId || terminalWorkspace.id,
+      });
+      return;
+    }
+
+    if (logicalTerminalIndexes.length <= 1) {
+      return;
+    }
 
     const sourceRows = cloneTerminalRows(displayTerminalRows);
     const sourceRect = event.surfaceRect || event.panelRect;
@@ -12546,8 +13304,10 @@ function TerminalView({
     fullscreenActive,
     logicalTerminalIndexes.length,
     measureTerminalLayout,
+    terminalBreakoutLayoutActive,
     terminalWorkspace?.id,
     todoDragActive,
+    updateTerminalBreakoutPlacements,
     updateTerminalDragState,
   ]);
 
@@ -12564,19 +13324,7 @@ function TerminalView({
     document.body.style.userSelect = "none";
 
     const resolveDropTarget = (clientX, clientY) => {
-      const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
-      if (!containerRect) {
-        return null;
-      }
-
-      return getTodoDropTargetFromPoint({
-        clientX,
-        clientY,
-        containerRect,
-        fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-        rects: terminalLayoutRectsRef.current,
-        terminalIndexes: logicalTerminalIndexes,
-      });
+      return resolveTerminalDropTarget(clientX, clientY);
     };
 
     const cancelDrag = () => {
@@ -12870,8 +13618,6 @@ function TerminalView({
     };
   }, [
     clearTodoQueueItemPending,
-    fullscreenActive,
-    fullscreenTerminalIndex,
     getTerminalImageInputSupport,
     getTerminalRole,
     getTerminalPaneId,
@@ -12879,6 +13625,7 @@ function TerminalView({
     getTodoQueueTerminalSendTarget,
     logicalTerminalIndexes,
     recordVoicePlanTaskStatus,
+    resolveTerminalDropTarget,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
@@ -12910,6 +13657,28 @@ function TerminalView({
         return;
       }
 
+      if (currentDrag.mode === "canvas") {
+        const currentPlacement = normalizeBreakoutPlacement(
+          terminalBreakoutPlacementsRef.current?.[currentDrag.terminalIndex],
+        );
+        if (!currentPlacement) {
+          return;
+        }
+
+        const viewport = terminalBreakoutViewportRef.current;
+        const nextPlacement = {
+          ...currentPlacement,
+          x: event.clientX - containerRect.left - viewport.x - currentDrag.offsetX,
+          y: event.clientY - containerRect.top - viewport.y - currentDrag.offsetY,
+        };
+
+        updateTerminalBreakoutPlacements({
+          ...terminalBreakoutPlacementsRef.current,
+          [currentDrag.terminalIndex]: nextPlacement,
+        });
+        return;
+      }
+
       const target = getDragTargetFromPoint({
         clientX: event.clientX,
         clientY: event.clientY,
@@ -12937,6 +13706,11 @@ function TerminalView({
     const commitDrag = () => {
       const currentDrag = terminalDragStateRef.current;
       if (!currentDrag) {
+        return;
+      }
+
+      if (currentDrag.mode === "canvas") {
+        updateTerminalDragState(null);
         return;
       }
 
@@ -12988,6 +13762,7 @@ function TerminalView({
   }, [
     reorderWorkspaceTerminalDisplayLayout,
     terminalDragActive,
+    updateTerminalBreakoutPlacements,
     updateTerminalDragState,
   ]);
 
@@ -13265,7 +14040,7 @@ function TerminalView({
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
     const fullscreenThisTerminal = fullscreenActive && fullscreenTerminalIndex === terminalIndex;
 
-    if (draggingThisTerminal) {
+    if (draggingThisTerminal && terminalDragState?.mode !== "canvas") {
       return {
         "--terminal-slot-height": `${Math.max(0, terminalDragState.height || 0)}px`,
         "--terminal-slot-width": `${Math.max(0, terminalDragState.width || 0)}px`,
@@ -13281,6 +14056,23 @@ function TerminalView({
         "--terminal-slot-x": "0px",
         "--terminal-slot-y": "0px",
       };
+    }
+
+    if (terminalBreakoutLayoutActive) {
+      const screenRect = getBreakoutScreenRect(
+        terminalBreakoutPlacements[terminalIndex],
+        terminalBreakoutViewport,
+      );
+
+      if (screenRect) {
+        return {
+          "--terminal-slot-height": `${Math.max(0, screenRect.height || 0)}px`,
+          "--terminal-slot-width": `${Math.max(0, screenRect.width || 0)}px`,
+          "--terminal-slot-x": `${screenRect.left || 0}px`,
+          "--terminal-slot-y": `${screenRect.top || 0}px`,
+          "--terminal-slot-z": normalizeBreakoutPlacement(terminalBreakoutPlacements[terminalIndex])?.z || 1,
+        };
+      }
     }
 
     const rect = terminalLayoutRects[terminalIndex];
@@ -13303,6 +14095,9 @@ function TerminalView({
     fullscreenActive,
     fullscreenTerminalIndex,
     terminalDragState,
+    terminalBreakoutLayoutActive,
+    terminalBreakoutPlacements,
+    terminalBreakoutViewport,
     terminalLayoutRects,
     terminalPanelRect,
   ]);
@@ -13315,6 +14110,7 @@ function TerminalView({
   const todoDragHasPreview = Boolean(todoDragImage || todoDragNote);
   const terminalWorkspaceContent = hasVisibleWorkspaceTerminalPanes ? (
     <WorkspaceTerminalPanels
+      data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
       data-terminal-fullscreen={fullscreenActive ? "true" : "false"}
       data-terminal-fullscreen-state={fullscreenState}
@@ -13322,62 +14118,82 @@ function TerminalView({
       ref={terminalPanelsRef}
       style={fullscreenMotionStyle}
     >
-      <ResizePanelGroup
-        id={`workspace-terminal-rows-${terminalWorkspace.id}`}
-        orientation="vertical"
+      <TerminalGridScaffold
+        aria-hidden={terminalBreakoutVisible ? "true" : undefined}
+        data-breakout-visible={terminalBreakoutVisible ? "true" : "false"}
       >
-        {activeDisplayRows.map((row, rowOrderIndex) => (
-          <Fragment key={`row-${row.rowIndex}`}>
-            {rowOrderIndex > 0 && (
-              <ResizeHandle
-                data-direction="vertical"
-              />
-            )}
-            <ResizePanel
-              data-terminal-row="true"
-              defaultSize={`${100 / activeDisplayRows.length}%`}
-              id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
-              minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
-            >
-              <ResizePanelGroup
-                id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
-                orientation="horizontal"
+        <ResizePanelGroup
+          id={`workspace-terminal-rows-${terminalWorkspace.id}`}
+          orientation="vertical"
+        >
+          {activeDisplayRows.map((row, rowOrderIndex) => (
+            <Fragment key={`row-${row.rowIndex}`}>
+              {rowOrderIndex > 0 && (
+                <ResizeHandle
+                  data-direction="vertical"
+                />
+              )}
+              <ResizePanel
+                data-terminal-row="true"
+                defaultSize={`${100 / activeDisplayRows.length}%`}
+                id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
+                minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
               >
-                {row.terminalIndexes.map((terminalIndex, columnIndex) => (
-                  <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
-                    {columnIndex > 0 && (
-                      <ResizeHandle
-                        data-direction="horizontal"
-                      />
-                    )}
-                    <ResizePanel
-                      data-terminal-column="true"
-                      data-terminal-leaf="true"
-                      defaultSize={`${100 / row.terminalIndexes.length}%`}
-                      id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
-                      minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                    >
-                      <TerminalPanelAnchor
-                        data-terminal-drag-placeholder={
-                          terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
-                        }
-                        data-terminal-index={terminalIndex}
-                        data-terminal-panel-anchor="true"
-                      />
-                    </ResizePanel>
-                  </Fragment>
-                ))}
-              </ResizePanelGroup>
-            </ResizePanel>
-          </Fragment>
-        ))}
-      </ResizePanelGroup>
-      <TerminalSurfaceLayer aria-hidden={false}>
+                <ResizePanelGroup
+                  id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
+                  orientation="horizontal"
+                >
+                  {row.terminalIndexes.map((terminalIndex, columnIndex) => (
+                    <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
+                      {columnIndex > 0 && (
+                        <ResizeHandle
+                          data-direction="horizontal"
+                        />
+                      )}
+                      <ResizePanel
+                        data-terminal-column="true"
+                        data-terminal-leaf="true"
+                        defaultSize={`${100 / row.terminalIndexes.length}%`}
+                        id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
+                        minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                      >
+                        <TerminalPanelAnchor
+                          data-terminal-drag-placeholder={
+                            terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
+                          }
+                          data-terminal-index={terminalIndex}
+                          data-terminal-panel-anchor="true"
+                        />
+                      </ResizePanel>
+                    </Fragment>
+                  ))}
+                </ResizePanelGroup>
+              </ResizePanel>
+            </Fragment>
+          ))}
+        </ResizePanelGroup>
+      </TerminalGridScaffold>
+      <TerminalBreakoutCanvas
+        aria-hidden={terminalBreakoutVisible ? undefined : "true"}
+        data-panning={terminalBreakoutPanning ? "true" : undefined}
+        data-visible={terminalBreakoutVisible ? "true" : "false"}
+        style={{
+          "--terminal-breakout-pan-x": `${Math.round(terminalBreakoutViewport.x || 0)}px`,
+          "--terminal-breakout-pan-y": `${Math.round(terminalBreakoutViewport.y || 0)}px`,
+        }}
+      >
+        <TerminalBreakoutPanPlane onPointerDown={handleBreakoutPanPointerDown} />
+      </TerminalBreakoutCanvas>
+      <TerminalSurfaceLayer
+        aria-hidden={false}
+        data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
+      >
         {logicalTerminalIndexes.map((terminalIndex) => {
           const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
           const terminalProjectTarget = getTerminalProjectTarget(terminalIndex);
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
+            || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
             || fullscreenThisTerminal;
 
@@ -13419,6 +14235,7 @@ function TerminalView({
                 projectRoot={terminalProjectTarget?.mountId ? terminalProjectTarget.repoPath : ""}
                 mountId={terminalProjectTarget?.mountId || ""}
                 startupReady={terminalStartupReady}
+                terminalBreakoutActive={terminalBreakoutLayoutActive}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
@@ -13444,6 +14261,49 @@ function TerminalView({
           );
         })}
       </TerminalSurfaceLayer>
+      {terminalBreakoutVisible && (
+        <TerminalBreakoutTopBar data-terminal-control="true">
+          <TerminalBreakoutButton
+            aria-label="Add terminal to canvas"
+            disabled={!addWorkspaceTerminal || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+            onClick={handleAddTerminalToBreakout}
+            title={
+              logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+                ? "Terminal limit reached"
+                : "Add terminal"
+            }
+            type="button"
+          >
+            <ButtonAddIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+          <TerminalBreakoutTopBarDivider aria-hidden="true" />
+          <TerminalBreakoutButton
+            aria-label="Fit terminals"
+            onClick={fitTerminalBreakoutCanvas}
+            title="Fit terminals"
+            type="button"
+          >
+            <ButtonFullscreenIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+          <TerminalBreakoutButton
+            aria-label="Reset terminal canvas layout"
+            onClick={resetTerminalBreakoutLayout}
+            title="Reset layout"
+            type="button"
+          >
+            <ButtonRefreshIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+          <TerminalBreakoutTopBarDivider aria-hidden="true" />
+          <TerminalBreakoutButton
+            aria-label="Exit terminal breakout canvas"
+            onClick={closeTerminalBreakout}
+            title="Exit breakout"
+            type="button"
+          >
+            <ButtonFullscreenExitIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+        </TerminalBreakoutTopBar>
+      )}
     </WorkspaceTerminalPanels>
   ) : !hasWorkspaceTerminals ? (
     <WorkspaceTerminal
@@ -13477,6 +14337,7 @@ function TerminalView({
         : ""}
       mountId={getTerminalProjectTarget(logicalTerminalIndexes[0] || 0)?.mountId || ""}
       startupReady={terminalStartupReady}
+      terminalBreakoutActive={false}
       terminalCount={terminalWorkspaceLogicalTerminalCount}
       terminalIndex={logicalTerminalIndexes[0] || 0}
       terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
@@ -13618,6 +14479,7 @@ function TerminalView({
                           onRemoveItem={removeTodoQueueItem}
                           onReorderItem={reorderTodoQueueItem}
                           onSubmitDraft={submitTodoQueueDraft}
+                          onToggleTerminalBreakout={toggleTerminalBreakout}
                           onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
                           onUpdateItem={updateTodoQueueItemText}
                           onVoiceAgentToolCall={handleVoiceAgentToolCall}
@@ -13625,6 +14487,7 @@ function TerminalView({
                           paneMode={todoQueuePaneMode}
                           pendingItems={todoQueuePendingItems}
                           rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+                          terminalBreakoutActive={terminalBreakoutVisible}
                           workspace={terminalWorkspace}
                           workspaceError={workspaceError}
                           workspaceId={terminalWorkspace.id}

@@ -1812,6 +1812,1124 @@ async fn terminal_workspace_raw_scan(
     }))
 }
 
+fn workspace_git_repo_root(repo_path: &str) -> Result<PathBuf, String> {
+    let requested = resolve_workspace_root_directory(Some(repo_path))?;
+    let top_level = workspace_git_top_level(&requested).ok_or_else(|| {
+        format!(
+            "No Git repository was found for {}.",
+            workspace_path_display(&requested)
+        )
+    })?;
+    let metadata = fs::metadata(&top_level)
+        .map_err(|error| format!("Unable to inspect Git repository root: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("Git repository root is not a directory.".to_string());
+    }
+    Ok(top_level)
+}
+
+fn workspace_git_repo_key(path: &Path) -> String {
+    path.canonicalize()
+        .map(|path| normalized_path_key(&path))
+        .unwrap_or_else(|_| normalized_path_key(path))
+}
+
+fn workspace_git_run_owned(
+    root: &Path,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_git_for_workspace(root, &borrowed, timeout)
+}
+
+fn workspace_git_run_noninteractive(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CommandCapture, String> {
+    let safe_directory = format!("safe.directory={}", git_safe_directory_value(root));
+    let mut owned_args = Vec::with_capacity(args.len() + 2);
+    owned_args.push("-c".to_string());
+    owned_args.push(safe_directory);
+    owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command_capture_with_env(
+        "git",
+        &borrowed_args,
+        None,
+        timeout,
+        Some(root),
+        &[
+            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ("GCM_INTERACTIVE".to_string(), "Never".to_string()),
+        ],
+    )
+}
+
+fn workspace_git_text_or_empty(root: &Path, args: &[&str], timeout: Duration) -> String {
+    run_git_text(root, args, timeout, "git")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn workspace_git_output_or_empty(root: &Path, args: &[&str], timeout: Duration) -> String {
+    run_git_for_workspace(root, args, timeout)
+        .ok()
+        .filter(|capture| capture.exit_code == Some(0))
+        .map(|capture| capture.stdout)
+        .unwrap_or_default()
+}
+
+fn workspace_git_current_branch(root: &Path) -> String {
+    let branch = workspace_git_text_or_empty(
+        root,
+        &["branch", "--show-current"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    if !branch.is_empty() {
+        return branch;
+    }
+    let short_head = workspace_git_text_or_empty(
+        root,
+        &["rev-parse", "--short", "HEAD"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    if short_head.is_empty() {
+        "unborn".to_string()
+    } else {
+        format!("detached:{short_head}")
+    }
+}
+
+fn workspace_git_head_sha(root: &Path) -> String {
+    workspace_git_text_or_empty(
+        root,
+        &["rev-parse", "HEAD"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    )
+}
+
+fn workspace_git_upstream(root: &Path) -> String {
+    workspace_git_text_or_empty(
+        root,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    )
+}
+
+fn workspace_git_remotes(root: &Path) -> Vec<Value> {
+    let output = workspace_git_output_or_empty(
+        root,
+        &["remote", "-v"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let name = parts.next()?.trim();
+            let url = parts.next()?.trim();
+            let direction = parts
+                .next()
+                .unwrap_or_default()
+                .trim_matches(|character| character == '(' || character == ')');
+            if name.is_empty() || url.is_empty() {
+                return None;
+            }
+            Some(json!({
+                "name": name,
+                "url": url,
+                "direction": direction,
+            }))
+        })
+        .collect()
+}
+
+fn workspace_git_ahead_behind(root: &Path, upstream: &str) -> (u64, u64) {
+    if upstream.trim().is_empty() {
+        return (0, 0);
+    }
+    let output = workspace_git_text_or_empty(
+        root,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    let mut parts = output.split_whitespace();
+    let ahead = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let behind = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    (ahead, behind)
+}
+
+fn workspace_git_path_exists(root: &Path, git_path: &str) -> bool {
+    let path = workspace_git_text_or_empty(
+        root,
+        &["rev-parse", "--git-path", git_path],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    if path.is_empty() {
+        return false;
+    }
+    let candidate = PathBuf::from(path);
+    let resolved = if candidate.is_absolute() {
+        candidate
+    } else {
+        root.join(candidate)
+    };
+    resolved.exists()
+}
+
+fn workspace_git_operation_state(root: &Path) -> Value {
+    let merge = workspace_git_path_exists(root, "MERGE_HEAD");
+    let cherry_pick = workspace_git_path_exists(root, "CHERRY_PICK_HEAD");
+    let rebase = workspace_git_path_exists(root, "rebase-merge")
+        || workspace_git_path_exists(root, "rebase-apply");
+    let clean = !(merge || cherry_pick || rebase);
+    json!({
+        "clean": clean,
+        "merge": merge,
+        "cherryPick": cherry_pick,
+        "rebase": rebase,
+        "state": if merge {
+            "merge"
+        } else if cherry_pick {
+            "cherry_pick"
+        } else if rebase {
+            "rebase"
+        } else {
+            "clean"
+        },
+    })
+}
+
+fn workspace_git_status_kind(code: &str) -> &'static str {
+    let bytes = code.as_bytes();
+    let index = bytes.first().copied().unwrap_or(b' ');
+    let worktree = bytes.get(1).copied().unwrap_or(b' ');
+    if code == "??" {
+        return "untracked";
+    }
+    if [index, worktree]
+        .iter()
+        .any(|value| matches!(*value, b'U'))
+        || matches!((index, worktree), (b'A', b'A') | (b'D', b'D'))
+    {
+        return "conflicted";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'R')) {
+        return "renamed";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'C')) {
+        return "copied";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'A')) {
+        return "added";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'D')) {
+        return "deleted";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'T')) {
+        return "typechange";
+    }
+    if [index, worktree].iter().any(|value| matches!(*value, b'M')) {
+        return "modified";
+    }
+    "changed"
+}
+
+fn workspace_git_status_label(kind: &str) -> &'static str {
+    match kind {
+        "added" => "Added",
+        "conflicted" => "Conflicted",
+        "copied" => "Copied",
+        "deleted" => "Deleted",
+        "modified" => "Modified",
+        "renamed" => "Renamed",
+        "typechange" => "Type changed",
+        "untracked" => "Untracked",
+        _ => "Changed",
+    }
+}
+
+fn workspace_git_status_files(root: &Path) -> Vec<Value> {
+    let capture = match run_git_for_workspace(
+        root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    ) {
+        Ok(capture) if capture.exit_code == Some(0) => capture,
+        _ => return Vec::new(),
+    };
+    let parts = capture.stdout.split('\0').collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut index = 0usize;
+    while index < parts.len() {
+        let entry = parts[index];
+        if entry.is_empty() {
+            index += 1;
+            continue;
+        }
+        let code = entry.get(0..2).unwrap_or("  ");
+        let path = normalize_git_status_path(entry.get(3..).unwrap_or(""));
+        if path.is_empty() {
+            index += 1;
+            continue;
+        }
+        let old_path = if code.starts_with('R') || code.starts_with('C') {
+            index += 1;
+            parts
+                .get(index)
+                .map(|value| normalize_git_status_path(value))
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+        let kind = workspace_git_status_kind(code);
+        let bytes = code.as_bytes();
+        let index_status = bytes.first().copied().unwrap_or(b' ') as char;
+        let worktree_status = bytes.get(1).copied().unwrap_or(b' ') as char;
+        files.push(json!({
+            "path": path,
+            "oldPath": old_path,
+            "code": code,
+            "kind": kind,
+            "label": workspace_git_status_label(kind),
+            "staged": index_status != ' ' && index_status != '?',
+            "unstaged": worktree_status != ' ' || code == "??",
+            "untracked": code == "??",
+            "conflicted": kind == "conflicted",
+        }));
+        index += 1;
+    }
+    files.sort_by(|left, right| {
+        let left_path = left["path"].as_str().unwrap_or_default();
+        let right_path = right["path"].as_str().unwrap_or_default();
+        left_path.cmp(right_path)
+    });
+    files
+}
+
+fn workspace_git_status_counts(files: &[Value]) -> Value {
+    let staged = files
+        .iter()
+        .filter(|file| file["staged"].as_bool().unwrap_or(false))
+        .count();
+    let unstaged = files
+        .iter()
+        .filter(|file| file["unstaged"].as_bool().unwrap_or(false))
+        .count();
+    let untracked = files
+        .iter()
+        .filter(|file| file["untracked"].as_bool().unwrap_or(false))
+        .count();
+    let conflicted = files
+        .iter()
+        .filter(|file| file["conflicted"].as_bool().unwrap_or(false))
+        .count();
+    json!({
+        "total": files.len(),
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "conflicted": conflicted,
+    })
+}
+
+fn workspace_git_history(root: &Path) -> Vec<Value> {
+    let output = workspace_git_output_or_empty(
+        root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "log",
+            "--name-status",
+            "--date=iso-strict",
+            "--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s",
+            "-n",
+            "40",
+        ],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    output
+        .split('\x1e')
+        .filter_map(|record| {
+            let trimmed = record.trim_matches('\n');
+            if trimmed.trim().is_empty() {
+                return None;
+            }
+            let mut lines = trimmed.lines();
+            let header = lines.next().unwrap_or_default();
+            let fields = header.split('\x1f').collect::<Vec<_>>();
+            if fields.len() < 6 {
+                return None;
+            }
+            let files = lines
+                .filter_map(|line| {
+                    let mut parts = line.split('\t');
+                    let status = parts.next()?.trim();
+                    let path = parts.next()?.trim();
+                    if status.is_empty() || path.is_empty() {
+                        return None;
+                    }
+                    let old_path = parts.next().map(str::trim).filter(|value| !value.is_empty());
+                    Some(json!({
+                        "status": status,
+                        "path": normalize_git_status_path(path),
+                        "oldPath": old_path.map(normalize_git_status_path),
+                    }))
+                })
+                .collect::<Vec<_>>();
+            Some(json!({
+                "sha": fields[0],
+                "shortSha": fields[1],
+                "authorName": fields[2],
+                "authorEmail": fields[3],
+                "date": fields[4],
+                "subject": fields[5],
+                "files": files,
+            }))
+        })
+        .collect()
+}
+
+fn workspace_git_repository_summary(root: &Path, workspace_root: &Path) -> Value {
+    let branch = workspace_git_current_branch(root);
+    let upstream = workspace_git_upstream(root);
+    let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
+    let files = workspace_git_status_files(root);
+    let counts = workspace_git_status_counts(&files);
+    json!({
+        "path": workspace_path_display(root),
+        "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+        "relativePath": child_relative_path(workspace_root, root).unwrap_or_default(),
+        "branch": branch,
+        "headSha": workspace_git_head_sha(root),
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": !files.is_empty(),
+        "statusCounts": counts,
+    })
+}
+
+fn workspace_git_discovered_repositories(
+    workspace_root: &Path,
+    mounts: &[WorkspaceProjectMount],
+) -> Vec<PathBuf> {
+    let mut repos = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_repo = |path: PathBuf| {
+        let key = workspace_git_repo_key(&path);
+        if seen.insert(key) {
+            repos.push(path);
+        }
+    };
+
+    if let Some(top_level) = workspace_git_top_level(workspace_root) {
+        if top_level.starts_with(workspace_root) {
+            push_repo(top_level);
+        }
+    } else if workspace_is_exact_git_root(workspace_root) {
+        push_repo(workspace_root.to_path_buf());
+    }
+
+    for mount in mounts {
+        if mount.has_git {
+            push_repo(mount.root_path.clone());
+        }
+    }
+
+    repos.sort_by(|left, right| {
+        child_relative_path(workspace_root, left)
+            .unwrap_or_else(|| workspace_path_display(left))
+            .cmp(&child_relative_path(workspace_root, right).unwrap_or_else(|| workspace_path_display(right)))
+    });
+    repos
+}
+
+fn workspace_git_snapshot_for(root: &Path) -> Value {
+    let upstream = workspace_git_upstream(root);
+    let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
+    let files = workspace_git_status_files(root);
+    let counts = workspace_git_status_counts(&files);
+    json!({
+        "generatedAtMs": terminal_now_ms(),
+        "repo": {
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "branch": workspace_git_current_branch(root),
+            "headSha": workspace_git_head_sha(root),
+            "upstream": upstream,
+            "ahead": ahead,
+            "behind": behind,
+            "remotes": workspace_git_remotes(root),
+        },
+        "operationState": workspace_git_operation_state(root),
+        "status": {
+            "dirty": !files.is_empty(),
+            "counts": counts,
+            "files": files,
+        },
+        "history": workspace_git_history(root),
+    })
+}
+
+fn workspace_git_limited_output(stdout: &str, stderr: &str) -> String {
+    command_output_text(stdout, stderr)
+        .chars()
+        .take(4000)
+        .collect::<String>()
+}
+
+fn workspace_git_fetch(root: &Path) -> Result<String, String> {
+    let capture = workspace_git_run_noninteractive(
+        root,
+        &["fetch", "--prune", "--quiet"],
+        Duration::from_secs(60),
+    )?;
+    if capture.exit_code == Some(0) {
+        return Ok(workspace_git_limited_output(&capture.stdout, &capture.stderr));
+    }
+    let output = workspace_git_limited_output(&capture.stdout, &capture.stderr);
+    if output.trim().is_empty() {
+        Err("git fetch failed.".to_string())
+    } else {
+        Err(output)
+    }
+}
+
+fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> Value {
+    let branch = workspace_git_current_branch(root);
+    let upstream = workspace_git_upstream(root);
+    let files = workspace_git_status_files(root);
+    let counts = workspace_git_status_counts(&files);
+    let dirty = !files.is_empty();
+    let operation_state = workspace_git_operation_state(root);
+    let operation_clean = operation_state["clean"].as_bool().unwrap_or(false);
+    let (fetch_ok, fetch_error) = if upstream.trim().is_empty() || !operation_clean {
+        (false, String::new())
+    } else {
+        match workspace_git_fetch(root) {
+            Ok(_) => (true, String::new()),
+            Err(error) => (false, error),
+        }
+    };
+    let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
+    let pullable = !upstream.trim().is_empty()
+        && operation_clean
+        && !dirty
+        && fetch_ok
+        && behind > 0
+        && ahead == 0;
+    let reason = if upstream.trim().is_empty() {
+        "No upstream branch configured.".to_string()
+    } else if !operation_clean {
+        format!(
+            "Repository is in {} state.",
+            operation_state["state"].as_str().unwrap_or("an active operation")
+        )
+    } else if dirty {
+        "Working tree has local changes.".to_string()
+    } else if !fetch_ok {
+        if fetch_error.trim().is_empty() {
+            "Unable to fetch upstream changes.".to_string()
+        } else {
+            fetch_error.clone()
+        }
+    } else if ahead > 0 && behind > 0 {
+        "Branch has diverged from upstream.".to_string()
+    } else if ahead > 0 {
+        "Local branch is ahead of upstream.".to_string()
+    } else if behind == 0 {
+        "Already up to date.".to_string()
+    } else {
+        format!("Behind upstream by {behind} commit{}.", if behind == 1 { "" } else { "s" })
+    };
+
+    json!({
+        "path": workspace_path_display(root),
+        "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+        "relativePath": child_relative_path(workspace_root, root).unwrap_or_default(),
+        "branch": branch,
+        "headSha": workspace_git_head_sha(root),
+        "upstream": upstream,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": dirty,
+        "operationState": operation_state,
+        "statusCounts": counts,
+        "fetchOk": fetch_ok,
+        "fetchError": fetch_error,
+        "pullable": pullable,
+        "selected": pullable,
+        "reason": reason,
+    })
+}
+
+fn workspace_git_pull_repository_once(root: &Path) -> Value {
+    let before_head_sha = workspace_git_head_sha(root);
+    let operation_state = workspace_git_operation_state(root);
+    if !operation_state["clean"].as_bool().unwrap_or(false) {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "error": format!(
+                "Cannot pull while repository is in {} state.",
+                operation_state["state"].as_str().unwrap_or("an active operation")
+            ),
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    let files = workspace_git_status_files(root);
+    if !files.is_empty() {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "error": "Cannot pull with local working tree changes.",
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    let upstream = workspace_git_upstream(root);
+    if upstream.trim().is_empty() {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "error": "No upstream branch configured.",
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    if let Err(error) = workspace_git_fetch(root) {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "error": error,
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
+    if ahead > 0 {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "ahead": ahead,
+            "behind": behind,
+            "error": if behind > 0 {
+                "Branch has diverged from upstream."
+            } else {
+                "Local branch is ahead of upstream."
+            },
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    if behind == 0 {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": true,
+            "pulled": false,
+            "alreadyUpToDate": true,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": before_head_sha,
+            "ahead": ahead,
+            "behind": behind,
+            "output": "Already up to date.",
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    let pull_capture = match workspace_git_run_noninteractive(
+        root,
+        &["pull", "--ff-only"],
+        Duration::from_secs(120),
+    ) {
+        Ok(capture) => capture,
+        Err(error) => {
+            return json!({
+                "path": workspace_path_display(root),
+                "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+                "ok": false,
+                "pulled": false,
+                "beforeHeadSha": before_head_sha,
+                "afterHeadSha": before_head_sha,
+                "ahead": ahead,
+                "behind": behind,
+                "error": error,
+                "snapshot": workspace_git_snapshot_for(root),
+            });
+        }
+    };
+    let output = workspace_git_limited_output(&pull_capture.stdout, &pull_capture.stderr);
+    if pull_capture.exit_code != Some(0) {
+        return json!({
+            "path": workspace_path_display(root),
+            "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+            "ok": false,
+            "pulled": false,
+            "beforeHeadSha": before_head_sha,
+            "afterHeadSha": workspace_git_head_sha(root),
+            "ahead": ahead,
+            "behind": behind,
+            "error": if output.trim().is_empty() { "git pull --ff-only failed.".to_string() } else { output.clone() },
+            "output": output,
+            "snapshot": workspace_git_snapshot_for(root),
+        });
+    }
+
+    let after_head_sha = workspace_git_head_sha(root);
+    json!({
+        "path": workspace_path_display(root),
+        "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
+        "ok": true,
+        "pulled": after_head_sha != before_head_sha,
+        "alreadyUpToDate": after_head_sha == before_head_sha,
+        "beforeHeadSha": before_head_sha,
+        "afterHeadSha": after_head_sha,
+        "ahead": ahead,
+        "behind": behind,
+        "output": output,
+        "snapshot": workspace_git_snapshot_for(root),
+    })
+}
+
+fn workspace_git_generated_commit_message(root: &Path) -> Value {
+    let files = workspace_git_status_files(root);
+    if files.is_empty() {
+        return json!({
+            "message": "",
+            "summary": "No changes to commit.",
+            "files": [],
+        });
+    }
+    let added = files
+        .iter()
+        .filter(|file| file["kind"].as_str() == Some("added") || file["kind"].as_str() == Some("untracked"))
+        .count();
+    let deleted = files
+        .iter()
+        .filter(|file| file["kind"].as_str() == Some("deleted"))
+        .count();
+    let renamed = files
+        .iter()
+        .filter(|file| file["kind"].as_str() == Some("renamed"))
+        .count();
+    let title = if files.len() == 1 {
+        let file = &files[0];
+        let path = file["path"].as_str().unwrap_or("workspace");
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        match file["kind"].as_str().unwrap_or("changed") {
+            "added" | "untracked" => format!("Add {leaf}"),
+            "deleted" => format!("Remove {leaf}"),
+            "renamed" => format!("Rename {leaf}"),
+            _ => format!("Update {leaf}"),
+        }
+    } else if added == files.len() {
+        format!("Add {} files", files.len())
+    } else if deleted == files.len() {
+        format!("Remove {} files", files.len())
+    } else if renamed == files.len() {
+        format!("Rename {} files", files.len())
+    } else {
+        format!("Update {} files", files.len())
+    };
+
+    let mut body = Vec::new();
+    body.push(String::new());
+    body.push("Changed files:".to_string());
+    for file in files.iter().take(16) {
+        let code = file["code"].as_str().unwrap_or("??");
+        let path = file["path"].as_str().unwrap_or("");
+        if !path.is_empty() {
+            body.push(format!("- {code} {path}"));
+        }
+    }
+    if files.len() > 16 {
+        body.push(format!("- ... {} more files", files.len() - 16));
+    }
+    let message = format!("{title}\n{}", body.join("\n"))
+        .trim_end()
+        .chars()
+        .take(4000)
+        .collect::<String>();
+    json!({
+        "message": message,
+        "summary": title,
+        "files": files,
+    })
+}
+
+#[tauri::command]
+async fn workspace_git_repositories(
+    state: State<'_, TerminalState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    refresh: Option<bool>,
+) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git repositories")?;
+    let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
+    let force_refresh = refresh.unwrap_or(false);
+    let mut topology = if force_refresh {
+        terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
+    } else {
+        terminal_workspace_topology_cached_scan(
+            &state.workspace_topology_cache,
+            &workspace_root,
+            terminal_now_ms(),
+        )
+        .await
+    };
+    if !force_refresh && topology.cache_status == "missing" {
+        topology = terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
+    }
+    let repos = workspace_git_discovered_repositories(&workspace_root, &topology.mounts)
+        .into_iter()
+        .map(|repo| workspace_git_repository_summary(&repo, &workspace_root))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "generatedAtMs": terminal_now_ms(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "root": workspace_path_display(&workspace_root),
+        "repositories": repos,
+        "cache": {
+            "key": topology.cache_key,
+            "status": topology.cache_status,
+            "hit": topology.cache_hit,
+            "scannedAtMs": topology.scanned_ms,
+            "ageMs": terminal_now_ms().saturating_sub(topology.scanned_ms),
+        },
+    }))
+}
+
+#[tauri::command]
+async fn workspace_git_pull_candidates(
+    state: State<'_, TerminalState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    refresh: Option<bool>,
+) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git pull check")?;
+    let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
+    let force_refresh = refresh.unwrap_or(false);
+    let mut topology = if force_refresh {
+        terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
+    } else {
+        terminal_workspace_topology_cached_scan(
+            &state.workspace_topology_cache,
+            &workspace_root,
+            terminal_now_ms(),
+        )
+        .await
+    };
+    if !force_refresh && topology.cache_status == "missing" {
+        topology = terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
+    }
+    let cache = json!({
+        "key": topology.cache_key,
+        "status": topology.cache_status,
+        "hit": topology.cache_hit,
+        "scannedAtMs": topology.scanned_ms,
+        "ageMs": terminal_now_ms().saturating_sub(topology.scanned_ms),
+    });
+    let repos = workspace_git_discovered_repositories(&workspace_root, &topology.mounts);
+    let workspace_root_for_worker = workspace_root.clone();
+    let repositories = tauri::async_runtime::spawn_blocking(move || {
+        repos
+            .into_iter()
+            .map(|repo| workspace_git_pull_candidate_summary(&repo, &workspace_root_for_worker))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| format!("Unable to join Git pull check worker: {error}"))?;
+    let pullable_count = repositories
+        .iter()
+        .filter(|repo| repo["pullable"].as_bool().unwrap_or(false))
+        .count();
+    let blocked_count = repositories
+        .iter()
+        .filter(|repo| {
+            repo["behind"].as_u64().unwrap_or(0) > 0
+                && !repo["pullable"].as_bool().unwrap_or(false)
+        })
+        .count();
+    let repository_count = repositories.len();
+    Ok(json!({
+        "generatedAtMs": terminal_now_ms(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "root": workspace_path_display(&workspace_root),
+        "repositories": repositories,
+        "repositoryCount": repository_count,
+        "pullableCount": pullable_count,
+        "blockedCount": blocked_count,
+        "cache": cache,
+    }))
+}
+
+#[tauri::command]
+async fn workspace_git_pull_repositories(repo_paths: Vec<String>) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git pull")?;
+    if repo_paths.is_empty() {
+        return Err("Choose at least one Git repository to pull.".to_string());
+    }
+    if repo_paths.len() > 64 {
+        return Err("Too many Git repositories selected for one pull.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut seen = HashSet::new();
+        let mut results = Vec::new();
+        for repo_path in repo_paths {
+            match workspace_git_repo_root(&repo_path) {
+                Ok(root) => {
+                    let key = workspace_git_repo_key(&root);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    results.push(workspace_git_pull_repository_once(&root));
+                }
+                Err(error) => {
+                    results.push(json!({
+                        "path": repo_path,
+                        "name": "repository",
+                        "ok": false,
+                        "pulled": false,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+        let ok_count = results
+            .iter()
+            .filter(|result| result["ok"].as_bool().unwrap_or(false))
+            .count();
+        let pulled_count = results
+            .iter()
+            .filter(|result| result["pulled"].as_bool().unwrap_or(false))
+            .count();
+        let result_count = results.len();
+        Ok(json!({
+            "generatedAtMs": terminal_now_ms(),
+            "ok": ok_count == result_count,
+            "okCount": ok_count,
+            "pulledCount": pulled_count,
+            "failedCount": result_count.saturating_sub(ok_count),
+            "results": results,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Unable to join Git pull worker: {error}"))?
+}
+
+#[tauri::command]
+async fn workspace_git_snapshot(repo_path: String) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git snapshot")?;
+    let root = workspace_git_repo_root(&repo_path)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(workspace_git_snapshot_for(&root)))
+        .await
+        .map_err(|error| format!("Unable to join Git snapshot worker: {error}"))?
+}
+
+#[tauri::command]
+async fn workspace_git_file_diff(
+    repo_path: String,
+    file_path: String,
+    staged: Option<bool>,
+) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git file diff")?;
+    let root = workspace_git_repo_root(&repo_path)?;
+    let cleaned = clean_workspace_relative_path(&file_path)?;
+    let relative_path = workspace_relative_display(&cleaned);
+    if relative_path.trim().is_empty() {
+        return Err("Git file path is required.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec![
+            "-c".to_string(),
+            "core.quotepath=false".to_string(),
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--unified=5".to_string(),
+        ];
+        if staged.unwrap_or(false) {
+            args.push("--cached".to_string());
+        }
+        args.push("--".to_string());
+        args.push(relative_path.clone());
+        let capture = workspace_git_run_owned(
+            &root,
+            args,
+            Duration::from_secs(GIT_DIFF_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&capture, "git diff")?;
+        let (diff, truncated) = truncate_workspace_diff(capture.stdout);
+        Ok(json!({
+            "repoPath": workspace_path_display(&root),
+            "filePath": relative_path,
+            "staged": staged.unwrap_or(false),
+            "diff": diff,
+            "truncated": truncated,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Unable to join Git diff worker: {error}"))?
+}
+
+#[tauri::command]
+async fn workspace_git_generate_commit_message(repo_path: String) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git commit message")?;
+    let root = workspace_git_repo_root(&repo_path)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(workspace_git_generated_commit_message(&root)))
+        .await
+        .map_err(|error| format!("Unable to join Git message worker: {error}"))?
+}
+
+#[tauri::command]
+async fn workspace_git_commit_and_push(
+    repo_path: String,
+    message: String,
+    push: Option<bool>,
+) -> Result<Value, String> {
+    ensure_app_not_shutting_down("workspace Git commit")?;
+    let root = workspace_git_repo_root(&repo_path)?;
+    let push_after_commit = push.unwrap_or(true);
+    let commit_message = message
+        .replace('\r', "\n")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .chars()
+        .take(4000)
+        .collect::<String>();
+    if commit_message.is_empty() {
+        return Err("Commit message is required.".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let operation_state = workspace_git_operation_state(&root);
+        if !operation_state["clean"].as_bool().unwrap_or(false) {
+            return Err(format!(
+                "Cannot commit while repository is in {} state.",
+                operation_state["state"].as_str().unwrap_or("an active operation")
+            ));
+        }
+        let before_files = workspace_git_status_files(&root);
+        if before_files.is_empty() {
+            return Err("No Git changes to commit.".to_string());
+        }
+        ensure_workspace_git_identity(&root)?;
+        let add_capture = run_git_for_workspace(
+            &root,
+            &["add", "-A"],
+            Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&add_capture, "git add -A")?;
+        let diff_capture = run_git_for_workspace(
+            &root,
+            &["diff", "--cached", "--quiet", "--exit-code"],
+            Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+        )?;
+        if diff_capture.exit_code == Some(0) {
+            return Err("No staged Git changes to commit after git add -A.".to_string());
+        }
+        if diff_capture.exit_code != Some(1) {
+            ensure_git_success(&diff_capture, "git diff --cached --quiet")?;
+        }
+        let commit_capture = run_git_for_workspace(
+            &root,
+            &["commit", "-m", commit_message.as_str()],
+            Duration::from_secs(GIT_COMMIT_TIMEOUT_SECS),
+        )?;
+        ensure_git_success(&commit_capture, "git commit")?;
+        let commit_sha = workspace_git_head_sha(&root);
+        let mut pushed = false;
+        let mut push_error = String::new();
+        let upstream = workspace_git_upstream(&root);
+        if push_after_commit {
+            let push_result = if !upstream.trim().is_empty() {
+                run_git_for_workspace(&root, &["push"], Duration::from_secs(120))
+            } else {
+                let has_origin = workspace_git_remotes(&root)
+                    .iter()
+                    .any(|remote| remote["name"].as_str() == Some("origin"));
+                if has_origin {
+                    run_git_for_workspace(&root, &["push", "-u", "origin", "HEAD"], Duration::from_secs(120))
+                } else {
+                    Err("No upstream branch or origin remote is configured.".to_string())
+                }
+            };
+            match push_result {
+                Ok(capture) if capture.exit_code == Some(0) => {
+                    pushed = true;
+                }
+                Ok(capture) => {
+                    push_error = command_output_text(&capture.stdout, &capture.stderr);
+                    if push_error.is_empty() {
+                        push_error = "git push failed.".to_string();
+                    }
+                }
+                Err(error) => {
+                    push_error = error;
+                }
+            }
+        }
+        Ok(json!({
+            "repoPath": workspace_path_display(&root),
+            "commitSha": commit_sha,
+            "committed": true,
+            "pushed": pushed,
+            "pushError": push_error,
+            "snapshot": workspace_git_snapshot_for(&root),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Unable to join Git commit worker: {error}"))?
+}
+
 fn terminal_git_root_for_coordination_target(root: &Path) -> Option<PathBuf> {
     let top_level = workspace_git_top_level(root)?;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());

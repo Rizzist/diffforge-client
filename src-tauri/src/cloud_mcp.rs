@@ -22,7 +22,6 @@ const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
-const CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT: &str = "cloud-mcp-spec-graph-cache";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
@@ -59,6 +58,8 @@ struct CloudMcpAuthRuntime {
     desktop_session_token: Option<String>,
     appwrite_jwt: Option<String>,
     appwrite_jwt_expires_ms: Option<u64>,
+    billing_scope_type: String,
+    team_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -66,6 +67,8 @@ struct CloudMcpProcessAuthCache {
     desktop_session_token: Option<String>,
     appwrite_jwt: Option<String>,
     appwrite_jwt_expires_ms: Option<u64>,
+    billing_scope_type: String,
+    team_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -664,6 +667,8 @@ fn cloud_mcp_update_process_auth_cache(
     desktop_session_token: Option<String>,
     appwrite_jwt: Option<String>,
     appwrite_jwt_expires_ms: Option<u64>,
+    billing_scope_type: Option<String>,
+    team_id: Option<String>,
 ) {
     let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() else {
         return;
@@ -682,6 +687,49 @@ fn cloud_mcp_update_process_auth_cache(
         cache.appwrite_jwt = None;
         cache.appwrite_jwt_expires_ms = None;
     }
+    if let Some(billing_scope_type) = billing_scope_type {
+        cache.billing_scope_type = billing_scope_type;
+        cache.team_id = team_id;
+    }
+}
+
+fn cloud_mcp_account_scope_from_values(
+    scope_type: Option<String>,
+    team_id: Option<String>,
+) -> (String, Option<String>) {
+    let scope_type = scope_type
+        .unwrap_or_else(|| "personal".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    let team_id = team_id
+        .map(|value| {
+            value
+                .replace(|character: char| character.is_control(), "")
+                .trim()
+                .to_string()
+        })
+        .filter(|value| !value.is_empty());
+
+    if scope_type == "team" {
+        if let Some(team_id) = team_id {
+            return ("team".to_string(), Some(team_id));
+        }
+    }
+
+    ("personal".to_string(), None)
+}
+
+async fn cloud_mcp_account_scope(state: &CloudMcpState) -> (String, Option<String>) {
+    let auth = state.auth.lock().await;
+    cloud_mcp_account_scope_from_values(Some(auth.billing_scope_type.clone()), auth.team_id.clone())
+}
+
+fn cloud_mcp_process_account_scope() -> (String, Option<String>) {
+    let Ok(cache) = cloud_mcp_process_auth_cache().lock() else {
+        return ("personal".to_string(), None);
+    };
+    cloud_mcp_account_scope_from_values(Some(cache.billing_scope_type.clone()), cache.team_id.clone())
 }
 
 async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<String>, String> {
@@ -742,6 +790,8 @@ async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<
             Some(desktop_session_token),
             Some(jwt.clone()),
             Some(expires_ms),
+            None,
+            None,
         );
         return Ok(Some(jwt));
     }
@@ -780,6 +830,8 @@ fn cloud_mcp_process_authorization_bearer() -> Option<String> {
                 Some(desktop_session_token),
                 Some(jwt.clone()),
                 Some(expires_ms),
+                None,
+                None,
             );
             return Some(jwt);
         }
@@ -1065,6 +1117,7 @@ async fn cloud_mcp_open_global_ws(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
         String,
@@ -1087,6 +1140,25 @@ async fn cloud_mcp_open_global_ws(
             HeaderValue::from_str(&device_id)
                 .map_err(|error| format!("Invalid Cloud MCP device id header: {error}"))?,
         );
+        request.headers_mut().insert(
+            "x-diffforge-billing-scope-type",
+            HeaderValue::from_str(&billing_scope_type)
+                .map_err(|error| format!("Invalid Cloud MCP billing scope header: {error}"))?,
+        );
+        request.headers_mut().insert(
+            "x-diffforge-scope-type",
+            HeaderValue::from_str(&billing_scope_type)
+                .map_err(|error| format!("Invalid Cloud MCP scope header: {error}"))?,
+        );
+        if billing_scope_type == "team" {
+            if let Some(team_id) = team_id.as_deref() {
+                request.headers_mut().insert(
+                    "x-diffforge-team-id",
+                    HeaderValue::from_str(team_id)
+                        .map_err(|error| format!("Invalid Cloud MCP team id header: {error}"))?,
+                );
+            }
+        }
         if let Some(token) = auth_bearer.as_deref() {
             request.headers_mut().insert(
                 "authorization",
@@ -2217,7 +2289,16 @@ async fn cloud_mcp_resolve_ws_target(
         return fallback;
     };
 
-    match cloud_mcp_fetch_direct_route_async(base_url, endpoint_path, &bearer).await {
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    match cloud_mcp_fetch_direct_route_async(
+        base_url,
+        endpoint_path,
+        &bearer,
+        &billing_scope_type,
+        team_id.as_deref(),
+    )
+    .await
+    {
         Ok(Some(target)) => {
             cloud_mcp_record_signin_diagnostic(
                 state,
@@ -2350,6 +2431,8 @@ async fn cloud_mcp_fetch_direct_route_async(
     base_url: &str,
     endpoint_path: &str,
     bearer: &str,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({"requestedPath": endpoint_path});
@@ -2360,6 +2443,19 @@ async fn cloud_mcp_fetch_direct_route_async(
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
+        .header("x-diffforge-billing-scope-type", billing_scope_type)
+        .header("x-diffforge-scope-type", billing_scope_type)
+        .headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            if billing_scope_type == "team" {
+                if let Some(team_id) = team_id {
+                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
+                        headers.insert("x-diffforge-team-id", value);
+                    }
+                }
+            }
+            headers
+        })
         .json(&body)
         .send()
         .await
@@ -4169,19 +4265,8 @@ fn cloud_mcp_prepare_workspace_from_root(
         cloud_mcp_project_mounts_for_workspace_sync(&root, &workspace_kind, &detected_mounts);
     let (workspace_id, workspace_name) =
         cloud_mcp_workspace_identity(&root, workspace_id.as_deref(), workspace_name.as_deref());
-    let (filetree, filetree_truncated) = if cloud_mcp_workspace_kind_is_container(&workspace_kind) {
-        cloud_mcp_container_mount_filetree(&root, &project_mounts)
-    } else if cloud_mcp_workspace_kind_is_discovery_only(&workspace_kind) {
-        (Vec::new(), false)
-    } else {
-        let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(&root);
-        cloud_mcp_apply_project_mount_boundaries(
-            &root,
-            filetree,
-            filetree_truncated,
-            &project_mounts,
-        )
-    };
+    let filetree = Vec::new();
+    let filetree_truncated = false;
     let (policy_graph_path, policy_graph) = cloud_mcp_find_policy_graph(&root)
         .map(|(path, value)| (path, Some(value)))
         .unwrap_or_else(|| (String::new(), None));
@@ -4276,11 +4361,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/sync/push" => Some("sync_push"),
         "/v1/sync/pull" => Some("sync_pull"),
         "/v1/context/pack" => Some("context_pack"),
-        "/v1/spec/graph" => Some("spec_graph"),
-        "/v1/spec/graph/delta" => Some("spec_graph_delta"),
-        "/v1/spec/task-history" => Some("spec_task_history"),
-        "/v1/spec/nodes" => Some("spec_node"),
-        "/v1/workspace/reset-graph-state" => Some("reset_workspace_graph_state"),
+        "/v1/architecture/history" => Some("architecture_history"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -4406,9 +4487,7 @@ fn cloud_mcp_post_log_context(
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
-        "/v1/spec/graph" => "cloud_get_spec_graph",
-        "/v1/spec/graph/delta" => "cloud_get_spec_graph_delta",
-        "/v1/spec/nodes" => "cloud_get_spec_node",
+        "/v1/architecture/history" => "cloud_get_architecture_history",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -4645,7 +4724,7 @@ async fn cloud_mcp_register_prepared_workspace(
     state: &CloudMcpState,
     prepared: CloudMcpPreparedWorkspace,
     reason: &str,
-    sync_session: Option<&CloudMcpFiletreeSyncSession>,
+    _sync_session: Option<&CloudMcpFiletreeSyncSession>,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let now_ms = cloud_mcp_now_ms();
     let repo_id = format!("repo-{}", cloud_mcp_short_hash(&prepared.root_display));
@@ -4713,20 +4792,13 @@ async fn cloud_mcp_register_prepared_workspace(
         )
         .await;
     }
-    let filetree_response = cloud_mcp_push_filetree_snapshot(
-        state,
-        &repo_id,
-        &prepared.root,
-        Some(&prepared.workspace_id),
-        Some(&prepared.workspace_name),
-        prepared.filetree.clone(),
-        prepared.filetree_truncated,
-        cloud_mcp_workspace_kind_filetree_authoritative(&prepared.workspace_kind),
-        &prepared.project_mounts,
-        reason,
-        sync_session,
-    )
-    .await;
+    let filetree_response: Result<Value, String> = Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "filetree_sync_disabled",
+        "repoId": repo_id.clone(),
+        "repoPath": prepared.root_display.clone(),
+    }));
     let log_path = cloud_mcp_workspace_log(
         &prepared.root,
         reason,
@@ -4852,206 +4924,67 @@ fn cloud_mcp_response_data(value: &Value) -> Value {
 }
 
 async fn cloud_mcp_push_filetree_snapshot(
-    state: &CloudMcpState,
+    _state: &CloudMcpState,
     repo_id: &str,
     workspace_root: &Path,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-    filetree: Vec<CloudMcpFileEntry>,
-    filetree_truncated: bool,
-    filetree_authoritative: bool,
-    project_mounts: &[WorkspaceProjectMount],
-    reason: &str,
-    sync_session: Option<&CloudMcpFiletreeSyncSession>,
+    _workspace_id: Option<&str>,
+    _workspace_name: Option<&str>,
+    _filetree: Vec<CloudMcpFileEntry>,
+    _filetree_truncated: bool,
+    _filetree_authoritative: bool,
+    _project_mounts: &[WorkspaceProjectMount],
+    _reason: &str,
+    _sync_session: Option<&CloudMcpFiletreeSyncSession>,
 ) -> Result<Value, String> {
-    let sync_session = sync_session
-        .cloned()
-        .unwrap_or_else(|| cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 0));
-    for payload in cloud_mcp_filetree_progressive_payloads(
-        repo_id,
-        workspace_root,
-        workspace_id,
-        workspace_name,
-        &filetree,
-        filetree_truncated,
-        filetree_authoritative,
-        project_mounts,
-        reason,
-        &sync_session,
-    ) {
-        let _ = cloud_mcp_post_event_endpoint(state, "filetree_snapshot", &payload).await;
-    }
-    let payload = cloud_mcp_filetree_complete_payload(
-        repo_id,
-        workspace_root,
-        workspace_id,
-        workspace_name,
-        &filetree,
-        filetree_truncated,
-        filetree_authoritative,
-        project_mounts,
-        reason,
-        &sync_session,
-    );
-    cloud_mcp_post_event_endpoint(state, "filetree_snapshot", &payload).await
+    Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "filetree_sync_disabled",
+        "repoId": repo_id,
+        "repoPath": workspace_path_display(workspace_root),
+    }))
 }
 
 async fn cloud_mcp_push_filetree_sync_begin(
-    state: &CloudMcpState,
+    _state: &CloudMcpState,
     seed: &CloudMcpFiletreeSyncSeed,
-    reason: &str,
-    sync_session: &CloudMcpFiletreeSyncSession,
+    _reason: &str,
+    _sync_session: &CloudMcpFiletreeSyncSession,
 ) -> Result<Value, String> {
-    let payload = cloud_mcp_filetree_snapshot_payload(
-        &seed.repo_id,
-        &seed.root,
-        Some(&seed.workspace_id),
-        Some(&seed.workspace_name),
-        Vec::new(),
-        Vec::new(),
-        0,
-        false,
-        cloud_mcp_workspace_kind_filetree_authoritative(&seed.workspace_kind),
-        &seed.project_mounts,
-        reason,
-        sync_session,
-        0,
-        0,
-        0,
-        false,
-    );
-    cloud_mcp_post_event_endpoint(state, "filetree_snapshot", &payload).await
+    Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "filetree_sync_disabled",
+        "repoId": seed.repo_id,
+        "repoPath": seed.root_display,
+    }))
 }
 
 async fn cloud_mcp_push_filetree_sync_begins_for_workspace_request(
-    state: &CloudMcpState,
-    repo_path: &str,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-    reason: &str,
+    _state: &CloudMcpState,
+    _repo_path: &str,
+    _workspace_id: Option<&str>,
+    _workspace_name: Option<&str>,
+    _reason: &str,
 ) -> HashMap<String, CloudMcpFiletreeSyncSession> {
-    let repo_path = repo_path.to_string();
-    let workspace_id = workspace_id.map(ToOwned::to_owned);
-    let workspace_name = workspace_name.map(ToOwned::to_owned);
-    let seeds = match tauri::async_runtime::spawn_blocking(move || {
-        cloud_mcp_prepare_filetree_sync_seeds(repo_path, workspace_id, workspace_name)
-    })
-    .await
-    {
-        Ok(Ok(seeds)) => seeds,
-        _ => return HashMap::new(),
-    };
-    let mut sessions = HashMap::new();
-    for seed in seeds {
-        let mut session = cloud_mcp_filetree_sync_session(&seed.repo_id, &seed.root, reason, 1);
-        if cloud_mcp_push_filetree_sync_begin(state, &seed, reason, &session)
-            .await
-            .is_err()
-        {
-            session.first_unsent_depth = 0;
-        }
-        sessions.insert(seed.root_display.clone(), session);
-    }
-    sessions
+    HashMap::new()
 }
 
 async fn cloud_mcp_push_current_filetree_snapshot(
-    state: &CloudMcpState,
+    _state: &CloudMcpState,
     repo_id: &str,
     workspace_root: &Path,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-    reason: &str,
+    _workspace_id: Option<&str>,
+    _workspace_name: Option<&str>,
+    _reason: &str,
 ) -> Result<Value, String> {
-    let detected_mounts = workspace_project_mounts(workspace_root);
-    let workspace_kind = workspace_kind_for_mounts(workspace_root, &detected_mounts);
-    let project_mounts = cloud_mcp_project_mounts_for_workspace_sync(
-        workspace_root,
-        &workspace_kind,
-        &detected_mounts,
-    );
-    let (seed_workspace_id, seed_workspace_name) =
-        cloud_mcp_workspace_identity(workspace_root, workspace_id, workspace_name);
-    let seed = CloudMcpFiletreeSyncSeed {
-        root: workspace_root.to_path_buf(),
-        root_display: workspace_path_display(workspace_root),
-        repo_id: repo_id.to_string(),
-        workspace_kind: workspace_kind.clone(),
-        project_mounts: project_mounts.clone(),
-        workspace_id: seed_workspace_id,
-        workspace_name: seed_workspace_name,
-    };
-    let mut sync_session = cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 1);
-    if cloud_mcp_push_filetree_sync_begin(state, &seed, reason, &sync_session)
-        .await
-        .is_err()
-    {
-        sync_session.first_unsent_depth = 0;
-    }
-    let sync_workspace_id = Some(seed.workspace_id.as_str());
-    let sync_workspace_name = Some(seed.workspace_name.as_str());
-    if cloud_mcp_workspace_kind_is_container(&workspace_kind) {
-        let (filetree, filetree_truncated) =
-            cloud_mcp_container_mount_filetree(workspace_root, &project_mounts);
-        return cloud_mcp_push_filetree_snapshot(
-            state,
-            repo_id,
-            workspace_root,
-            sync_workspace_id,
-            sync_workspace_name,
-            filetree,
-            filetree_truncated,
-            false,
-            &project_mounts,
-            reason,
-            Some(&sync_session),
-        )
-        .await;
-    }
-    if cloud_mcp_workspace_kind_is_discovery_only(&workspace_kind) {
-        return cloud_mcp_push_filetree_snapshot(
-            state,
-            repo_id,
-            workspace_root,
-            sync_workspace_id,
-            sync_workspace_name,
-            Vec::new(),
-            false,
-            false,
-            &[],
-            reason,
-            Some(&sync_session),
-        )
-        .await;
-    }
-
-    let root = workspace_root.to_path_buf();
-    let project_mounts_for_scan = project_mounts.clone();
-    let (filetree, filetree_truncated) = tauri::async_runtime::spawn_blocking(move || {
-        let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(&root);
-        cloud_mcp_apply_project_mount_boundaries(
-            &root,
-            filetree,
-            filetree_truncated,
-            &project_mounts_for_scan,
-        )
-    })
-    .await
-    .map_err(|error| format!("Unable to scan Cloud MCP filetree: {error}"))?;
-    cloud_mcp_push_filetree_snapshot(
-        state,
-        repo_id,
-        workspace_root,
-        sync_workspace_id,
-        sync_workspace_name,
-        filetree,
-        filetree_truncated,
-        true,
-        &project_mounts,
-        reason,
-        Some(&sync_session),
-    )
-    .await
+    Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "filetree_sync_disabled",
+        "repoId": repo_id,
+        "repoPath": workspace_path_display(workspace_root),
+    }))
 }
 
 fn cloud_mcp_terminal_key(pane_id: &str, instance_id: u64) -> String {
@@ -6215,46 +6148,6 @@ pub(crate) async fn cloud_mcp_mark_terminal_task_lifecycle(
     let repo_id = cloud_mcp_terminal_repo_id(working_directory, coordination);
     let repo_root = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
-    let lifecycle_changed_files = if matches!(status, "done" | "review" | "merged" | "completed") {
-        cloud_mcp_terminal_changed_files_for_status(coordination, local_task_id, working_directory)
-    } else {
-        Vec::new()
-    };
-    let should_sync_main_filetree = cloud_mcp_lifecycle_status_resyncs_main_filetree(status);
-    let should_sync_filetree = should_sync_main_filetree
-        || matches!(status, "done" | "merged" | "completed")
-        || (status == "review" && !lifecycle_changed_files.is_empty());
-    if should_sync_filetree {
-        let sync_reason = if should_sync_main_filetree {
-            "terminal_task_stopped_main_repo_resync"
-        } else {
-            "terminal_work_filetree_update"
-        };
-        if let Err(error) = cloud_mcp_push_current_filetree_snapshot(
-            state,
-            &repo_id,
-            &repo_root,
-            None,
-            None,
-            sync_reason,
-        )
-        .await
-        {
-            let _ = cloud_mcp_workspace_log(
-                &repo_root,
-                "cloud_mcp.filetree.sync_error",
-                "",
-                "",
-                json!({
-                    "agent_id": clean_terminal_telemetry_text(&agent_id),
-                    "pane_id": clean_terminal_telemetry_text(pane_id),
-                    "local_task_id": local_task_id.map(clean_terminal_telemetry_text),
-                    "status": status,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-        }
-    }
 
     let agent_status = cloud_mcp_agent_status_for_lifecycle_status(status);
     cloud_mcp_sync_terminal_agent_status(
@@ -7096,7 +6989,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "starting",
         Some(payload["prompt"].as_str().unwrap_or_default()),
         if session_mode.should_request_cloud_context_pack() {
-            "Terminal prompt submitted; preparing Spec Graph context."
+            "Terminal prompt submitted; preparing Architecture history context."
         } else {
             "Terminal prompt submitted without managed patch coordination."
         },
@@ -7564,6 +7457,8 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
 async fn cloud_mcp_set_desktop_session_token(
     state: State<'_, CloudMcpState>,
     token: Option<String>,
+    scope_type: Option<String>,
+    team_id: Option<String>,
 ) -> Result<CloudMcpStatus, String> {
     let token = token
         .unwrap_or_default()
@@ -7576,14 +7471,23 @@ async fn cloud_mcp_set_desktop_session_token(
         validate_auth_value("Desktop session", &token)?;
         Some(token)
     };
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope_from_values(scope_type, team_id);
 
     {
         let mut auth = state.auth.lock().await;
         auth.desktop_session_token = desktop_session_token.clone();
         auth.appwrite_jwt = None;
         auth.appwrite_jwt_expires_ms = None;
+        auth.billing_scope_type = billing_scope_type.clone();
+        auth.team_id = team_id.clone();
     }
-    cloud_mcp_update_process_auth_cache(desktop_session_token, None, None);
+    cloud_mcp_update_process_auth_cache(
+        desktop_session_token,
+        None,
+        None,
+        Some(billing_scope_type),
+        team_id,
+    );
 
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
 }
@@ -7598,11 +7502,16 @@ async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result
     let token = cloud_mcp_authorization_bearer(state.inner())
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
         .post(format!("{API_BASE_URL}/billing/status"))
         .bearer_auth(token)
+        .json(&json!({
+            "scopeType": billing_scope_type,
+            "teamId": team_id,
+        }))
         .send()
         .await
         .map_err(|error| format!("Unable to load billing status: {error}"))?;
@@ -8660,6 +8569,7 @@ async fn cloud_mcp_sync_tokenomics_state(
     let is_delta = delta.unwrap_or(false);
     let device_profile = cloud_mcp_desktop_device_profile();
     cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
     let hourly_count = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -8674,6 +8584,8 @@ async fn cloud_mcp_sync_tokenomics_state(
         "source": "rust-diffforge-tokenomics-sync",
         "event_kind": event_kind,
         "scope": "account",
+        "billing_scope_type": billing_scope_type,
+        "team_id": team_id,
         "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
@@ -8736,124 +8648,6 @@ fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: 
 }
 
 #[tauri::command]
-async fn cloud_mcp_reset_workspace_graph_state(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
-    scope: String,
-) -> Result<Value, String> {
-    let normalized_scope = match scope.trim().to_ascii_lowercase().as_str() {
-        "spec" | "spec_graph" | "spec-graph" => "spec",
-        "all" => "all",
-        _ => return Err("Reset scope must be spec or all.".to_string()),
-    };
-    let req = cloud_mcp_spec_graph_sync_request(
-        repo_path.clone(),
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let container_mounts = cloud_mcp_container_project_mounts(&req.root);
-    if !container_mounts.is_empty() {
-        let mut parent_reset = None;
-        if cloud_mcp_selected_root_has_project_graph(&req.root) {
-            let payload = json!({
-                "source": "rust-diffforge-graph-reset",
-                "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-                "repo_id": req.repo_id,
-                "repo_path": req.root_display,
-                "workspace_root": req.root_display,
-                "workspace_id": workspace_id,
-                "workspace_name": workspace_name,
-                "scope": normalized_scope,
-                "agent_id": "rust-diffforge",
-                "self_agent_id": "rust-diffforge",
-                "current_agent_id": "rust-diffforge",
-                "ts_ms": cloud_mcp_now_ms(),
-            });
-            let response = cloud_mcp_post_json_endpoint(
-                state.inner(),
-                "/v1/workspace/reset-graph-state",
-                &payload,
-            )
-            .await?;
-            parent_reset = Some(cloud_mcp_response_data(&response));
-        }
-        let mut child_responses = Vec::new();
-        for mount in &container_mounts {
-            let child_req = cloud_mcp_spec_graph_sync_request(
-                workspace_path_display(&mount.root_path),
-                Some(workspace_id.clone()),
-                Some(mount.project_name.clone()),
-            );
-            let payload = json!({
-                "source": "rust-diffforge-graph-reset",
-                "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-                "repo_id": child_req.repo_id,
-                "repo_path": child_req.root_display,
-                "workspace_root": child_req.root_display,
-                "workspace_id": workspace_id,
-                "workspace_name": mount.project_name.clone(),
-                "scope": normalized_scope,
-                "mount_id": mount.mount_id.clone(),
-                "container_repo_id": req.repo_id,
-                "container_repo_path": req.root_display,
-                "agent_id": "rust-diffforge",
-                "self_agent_id": "rust-diffforge",
-                "current_agent_id": "rust-diffforge",
-                "ts_ms": cloud_mcp_now_ms(),
-            });
-            let response = cloud_mcp_post_json_endpoint(
-                state.inner(),
-                "/v1/workspace/reset-graph-state",
-                &payload,
-            )
-            .await?;
-            cloud_mcp_clear_graph_reset_caches(
-                &child_req.root,
-                &child_req.repo_id,
-                normalized_scope,
-            )?;
-            child_responses.push(json!({
-                "mountId": mount.mount_id.clone(),
-                "repoId": child_req.repo_id,
-                "repoPath": child_req.root_display,
-                "response": cloud_mcp_response_data(&response),
-            }));
-        }
-        cloud_mcp_clear_graph_reset_caches(&req.root, &req.repo_id, normalized_scope)?;
-        return Ok(json!({
-            "ok": true,
-            "containerWorkspace": true,
-            "repoId": req.repo_id,
-            "repoPath": req.root_display,
-            "scope": normalized_scope,
-            "parentReset": parent_reset,
-            "childResets": child_responses,
-        }));
-    }
-    let payload = json!({
-        "source": "rust-diffforge-graph-reset",
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": req.repo_id,
-        "repo_path": req.root_display,
-        "workspace_root": req.root_display,
-        "workspace_id": workspace_id,
-        "workspace_name": workspace_name,
-        "scope": normalized_scope,
-        "agent_id": "rust-diffforge",
-        "self_agent_id": "rust-diffforge",
-        "current_agent_id": "rust-diffforge",
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/reset-graph-state", &payload)
-            .await?;
-    cloud_mcp_clear_graph_reset_caches(&req.root, &req.repo_id, normalized_scope)?;
-    Ok(cloud_mcp_response_data(&response))
-}
-
-#[tauri::command]
 async fn cloud_mcp_hard_reset_cloud_sqlite(
     state: State<'_, CloudMcpState>,
     repo_path: String,
@@ -8903,42 +8697,6 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         *snapshots = CloudMcpRuntimeSnapshots::default();
     }
     Ok(cloud_mcp_response_data(&response))
-}
-
-#[tauri::command]
-async fn cloud_mcp_record_spec_edit_intent(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: String,
-    workspace_name: Option<String>,
-    intent: Value,
-) -> Result<Value, String> {
-    let req = cloud_mcp_spec_graph_sync_request(
-        repo_path.clone(),
-        Some(workspace_id.clone()),
-        workspace_name.clone(),
-    );
-    let mut payload = match intent {
-        Value::Object(object) => Value::Object(object),
-        _ => return Err("Spec edit intent payload must be an object.".to_string()),
-    };
-    let event_kind = cloud_mcp_payload_text(&payload, &["event_kind", "eventKind", "kind"])
-        .unwrap_or_else(|| "spec_edit_requested".to_string());
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("event_kind".to_string(), json!(event_kind.clone()));
-        object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
-        object.insert("repo_path".to_string(), json!(req.root_display.clone()));
-        object.insert(
-            "workspace_root".to_string(),
-            json!(req.root_display.clone()),
-        );
-        object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
-        if let Some(name) = workspace_name {
-            object.insert("workspace_name".to_string(), json!(name));
-        }
-    }
-
-    cloud_mcp_post_event_endpoint(state.inner(), &event_kind, &payload).await
 }
 
 #[tauri::command]
@@ -10583,6 +10341,58 @@ fn cloud_mcp_attach_spec_task_history(mut snapshot: Value, task_history: Value) 
     snapshot
 }
 
+fn cloud_mcp_architecture_history_snapshot(
+    req: &CloudMcpSpecGraphSyncRequest,
+    task_history: Value,
+    sync_state: &str,
+    sync_error: &str,
+) -> Value {
+    let repo_name = cloud_mcp_repo_display_name(&req.root);
+    let display_root = cloud_mcp_repo_display_root(&req.root);
+    let task_history_cursor = task_history
+        .get("cursor")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    json!({
+        "ok": true,
+        "kind": "architecture_history",
+        "repoId": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "repoName": repo_name.clone(),
+        "displayRoot": display_root.clone(),
+        "workspaceDisplay": {
+            "repoName": repo_name,
+            "displayRoot": display_root,
+            "repoPath": req.root_display.clone(),
+        },
+        "workspaceId": req.workspace_id.clone(),
+        "workspaceName": req.workspace_name.clone(),
+        "syncState": sync_state,
+        "syncError": sync_error,
+        "lastSyncedMs": cloud_mcp_now_ms(),
+        "cursor": task_history_cursor.clone(),
+        "taskHistoryCursor": task_history_cursor,
+        "taskHistory": task_history.clone(),
+        "architectureItems": [],
+        "activity": {},
+        "sourceOfTruth": {
+            "kind": "architecture_history",
+            "mode": "task_history",
+            "filetreeSync": false,
+        },
+        "raw": {
+            "kind": "architecture_history",
+            "version": 1,
+            "repo_id": req.repo_id.clone(),
+            "workspace_id": req.workspace_id.clone(),
+            "task_history": task_history,
+            "nodes": [],
+            "edges": [],
+        },
+    })
+}
+
 fn cloud_mcp_stamp_spec_graph_snapshot(
     mut snapshot: Value,
     req: &CloudMcpSpecGraphSyncRequest,
@@ -11008,7 +10818,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
     let repo_name = cloud_mcp_repo_display_name(&req.root);
     let display_root = cloud_mcp_repo_display_root(&req.root);
     let payload = json!({
-        "source": "rust-diffforge-spec-graph",
+        "source": "rust-diffforge-architecture-history",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
         "repo_name": repo_name,
@@ -11024,7 +10834,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
         "agent_limit": 100,
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(state, "/v1/spec/graph", &payload).await?;
+    let response = cloud_mcp_post_json_endpoint(state, "/v1/architecture/history", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -11034,7 +10844,7 @@ async fn cloud_mcp_fetch_spec_task_history_data(
 ) -> Result<Value, String> {
     cloud_mcp_connected_or_connect(state).await?;
     let payload = json!({
-        "source": "rust-diffforge-spec-task-history",
+        "source": "rust-diffforge-architecture-history",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
         "agent_id": "rust-diffforge",
@@ -11048,7 +10858,7 @@ async fn cloud_mcp_fetch_spec_task_history_data(
         "order": "asc",
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(state, "/v1/spec/task-history", &payload).await?;
+    let response = cloud_mcp_post_json_endpoint(state, "/v1/architecture/history", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -11077,27 +10887,8 @@ async fn cloud_mcp_sync_spec_graph_once(
     let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
     let current_cache = cloud_mcp_read_spec_graph_cache(req, "syncing", "");
     cloud_mcp_connected_or_connect(state).await?;
-    let payload = cloud_mcp_spec_graph_sync_payload(req, &current_cache);
-    let delta_response =
-        match cloud_mcp_post_json_endpoint(state, "/v1/spec/graph/delta", &payload).await {
-            Ok(response) => Some(response),
-            Err(error) if error.contains("HTTP 404") => None,
-            Err(error) => return Err(error),
-        };
-    let mut next_snapshot = if let Some(response) = delta_response {
-        let delta = cloud_mcp_response_data(&response);
-        if delta["requires_full_resync"].as_bool().unwrap_or(false)
-            || cloud_mcp_spec_graph_delta_needs_full_resync(&current_cache, &delta)
-        {
-            let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
-            cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
-        } else {
-            cloud_mcp_apply_spec_graph_delta(req, current_cache.clone(), delta, &cache_path)
-        }
-    } else {
-        let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
-        cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
-    };
+    let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
+    let mut next_snapshot = cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "");
     let task_history = cloud_mcp_fetch_spec_task_history_or_empty(state, req).await;
     next_snapshot = cloud_mcp_attach_spec_task_history(next_snapshot, task_history);
     let changed = current_cache.get("cursor").and_then(Value::as_str)
@@ -11115,8 +10906,7 @@ async fn cloud_mcp_sync_spec_graph_once(
     Ok((next_snapshot, changed))
 }
 
-fn cloud_mcp_emit_spec_graph_snapshot(app: &AppHandle, snapshot: Value) {
-    let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot);
+fn cloud_mcp_emit_spec_graph_snapshot(_app: &AppHandle, _snapshot: Value) {
 }
 
 async fn cloud_mcp_container_snapshots_for_child_sync(
@@ -11523,6 +11313,29 @@ async fn cloud_mcp_spec_graph_sync_loop(
 }
 
 #[tauri::command]
+async fn cloud_mcp_get_architecture_history(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
+    let task_history = cloud_mcp_fetch_spec_task_history_or_empty(state.inner(), &req).await;
+    let sync_error = task_history
+        .get("sync_error")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let sync_state = if sync_error.is_empty() { "ready" } else { "error" };
+    Ok(cloud_mcp_architecture_history_snapshot(
+        &req,
+        task_history,
+        sync_state,
+        &sync_error,
+    ))
+}
+
+#[tauri::command]
 async fn cloud_mcp_get_cached_spec_graph(
     repo_path: String,
     workspace_id: Option<String>,
@@ -11562,79 +11375,6 @@ async fn cloud_mcp_get_local_ignored_spec_graph_overlay(
     })
     .await
     .map_err(|error| format!("Unable to scan local ignored Spec Graph overlay: {error}"))?
-}
-
-#[tauri::command]
-async fn cloud_mcp_start_spec_graph_sync(
-    app: AppHandle,
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-) -> Result<Value, String> {
-    let req = cloud_mcp_spec_graph_sync_request(
-        repo_path.clone(),
-        workspace_id.clone(),
-        workspace_name.clone(),
-    );
-    let mounts = cloud_mcp_container_project_mounts(&req.root);
-    if !mounts.is_empty() {
-        let sync_generation = cloud_mcp_now_ms();
-        {
-            let mut container_syncs = state.spec_graph_container_syncs.lock().await;
-            container_syncs.insert(
-                req.repo_id.clone(),
-                CloudMcpSpecGraphContainerRuntime {
-                    generation: sync_generation,
-                    req: req.clone(),
-                    mounts: mounts.clone(),
-                },
-            );
-        }
-        let mut child_syncs = Vec::new();
-        let parent_sync = if cloud_mcp_selected_root_has_project_graph(&req.root) {
-            Some(cloud_mcp_start_project_spec_graph_sync(&app, state.inner(), req.clone()).await?)
-        } else {
-            None
-        };
-        for mount in &mounts {
-            let child_req = cloud_mcp_spec_graph_sync_request(
-                workspace_path_display(&mount.root_path),
-                workspace_id.clone(),
-                Some(mount.project_name.clone()),
-            );
-            child_syncs.push(
-                cloud_mcp_start_project_spec_graph_sync(&app, state.inner(), child_req).await?,
-            );
-        }
-        let mut snapshot =
-            cloud_mcp_container_spec_graph_snapshot(&req, &mounts, "local_mounts", "");
-        if let Some(object) = snapshot.as_object_mut() {
-            object.insert("syncGeneration".to_string(), json!(sync_generation));
-            object.insert("childSyncs".to_string(), Value::Array(child_syncs));
-            if let Some(parent_sync) = parent_sync {
-                object.insert("parentSync".to_string(), parent_sync);
-            }
-        }
-        let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot.clone());
-        return Ok(snapshot);
-    }
-
-    if let Some(mut snapshot) = cloud_mcp_container_spec_graph_snapshot_for_repo_path(
-        repo_path.clone(),
-        workspace_id.clone(),
-        workspace_name.clone(),
-        "local_mounts",
-        "",
-    ) {
-        if let Some(object) = snapshot.as_object_mut() {
-            object.insert("syncGeneration".to_string(), json!(0));
-        }
-        let _ = app.emit(CLOUD_MCP_SPEC_GRAPH_CACHE_EVENT, snapshot.clone());
-        return Ok(snapshot);
-    }
-
-    cloud_mcp_start_project_spec_graph_sync(&app, state.inner(), req).await
 }
 
 async fn cloud_mcp_start_project_spec_graph_sync(
@@ -11801,25 +11541,6 @@ fn cloud_mcp_clear_graph_reset_caches(
         }
     }
     Ok(())
-}
-
-#[tauri::command]
-async fn cloud_mcp_get_spec_graph(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-) -> Result<Value, String> {
-    let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
-    let data = cloud_mcp_fetch_full_spec_graph_data(state.inner(), &req).await?;
-    let cache_path = cloud_mcp_spec_graph_cache_path(&req.root, &req.repo_id);
-    let task_history = cloud_mcp_fetch_spec_task_history_or_empty(state.inner(), &req).await;
-    let snapshot = cloud_mcp_attach_spec_task_history(
-        cloud_mcp_spec_graph_snapshot_from_data(&req, data, &cache_path, "ready", ""),
-        task_history,
-    );
-    let _ = cloud_mcp_write_spec_graph_cache(&req, &snapshot);
-    Ok(snapshot)
 }
 
 pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
@@ -13591,110 +13312,20 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
 }
 
 fn cloud_mcp_proxy_push_current_filetree_snapshot(
-    base_url: &str,
+    _base_url: &str,
     repo_id: &str,
     workspace_root: &Path,
-    workspace_id: Option<&str>,
-    workspace_name: Option<&str>,
-    reason: &str,
+    _workspace_id: Option<&str>,
+    _workspace_name: Option<&str>,
+    _reason: &str,
 ) -> Result<Value, String> {
-    let post_filetree_payload = |payload: &Value| -> Result<Value, String> {
-        let request = json!({
-            "event_kind": "filetree_snapshot",
-            "payload": payload,
-            "ts_ms": cloud_mcp_now_ms(),
-        });
-        let response =
-            cloud_mcp_proxy_post_json_endpoint(base_url, "/v1/events", &request.to_string())?;
-        Ok(serde_json::from_str::<Value>(&response)
-            .unwrap_or_else(|_| json!({"raw_response": response})))
-    };
-    let detected_mounts = workspace_project_mounts(workspace_root);
-    let workspace_kind = workspace_kind_for_mounts(workspace_root, &detected_mounts);
-    let project_mounts = cloud_mcp_project_mounts_for_workspace_sync(
-        workspace_root,
-        &workspace_kind,
-        &detected_mounts,
-    );
-    let mut sync_session = cloud_mcp_filetree_sync_session(repo_id, workspace_root, reason, 1);
-    let (seed_workspace_id, seed_workspace_name) =
-        cloud_mcp_workspace_identity(workspace_root, workspace_id, workspace_name);
-    let seed = CloudMcpFiletreeSyncSeed {
-        root: workspace_root.to_path_buf(),
-        root_display: workspace_path_display(workspace_root),
-        repo_id: repo_id.to_string(),
-        workspace_kind: workspace_kind.clone(),
-        project_mounts: project_mounts.clone(),
-        workspace_id: seed_workspace_id,
-        workspace_name: seed_workspace_name,
-    };
-    let begin_payload = cloud_mcp_filetree_snapshot_payload(
-        &seed.repo_id,
-        &seed.root,
-        Some(&seed.workspace_id),
-        Some(&seed.workspace_name),
-        Vec::new(),
-        Vec::new(),
-        0,
-        false,
-        cloud_mcp_workspace_kind_filetree_authoritative(&seed.workspace_kind),
-        &seed.project_mounts,
-        reason,
-        &sync_session,
-        0,
-        0,
-        0,
-        false,
-    );
-    if post_filetree_payload(&begin_payload).is_err() {
-        sync_session.first_unsent_depth = 0;
-    }
-    let sync_workspace_id = Some(seed.workspace_id.as_str());
-    let sync_workspace_name = Some(seed.workspace_name.as_str());
-    let (filetree, filetree_truncated, filetree_authoritative) =
-        if cloud_mcp_workspace_kind_is_container(&workspace_kind) {
-            let (filetree, filetree_truncated) =
-                cloud_mcp_container_mount_filetree(workspace_root, &project_mounts);
-            (filetree, filetree_truncated, false)
-        } else if cloud_mcp_workspace_kind_is_discovery_only(&workspace_kind) {
-            (Vec::new(), false, false)
-        } else {
-            let (filetree, filetree_truncated) = cloud_mcp_collect_filetree(workspace_root);
-            let (filetree, filetree_truncated) = cloud_mcp_apply_project_mount_boundaries(
-                workspace_root,
-                filetree,
-                filetree_truncated,
-                &project_mounts,
-            );
-            (filetree, filetree_truncated, true)
-        };
-    for payload in cloud_mcp_filetree_progressive_payloads(
-        repo_id,
-        workspace_root,
-        sync_workspace_id,
-        sync_workspace_name,
-        &filetree,
-        filetree_truncated,
-        filetree_authoritative,
-        &project_mounts,
-        reason,
-        &sync_session,
-    ) {
-        let _ = post_filetree_payload(&payload);
-    }
-    let payload = cloud_mcp_filetree_complete_payload(
-        repo_id,
-        workspace_root,
-        sync_workspace_id,
-        sync_workspace_name,
-        &filetree,
-        filetree_truncated,
-        filetree_authoritative,
-        &project_mounts,
-        reason,
-        &sync_session,
-    );
-    post_filetree_payload(&payload)
+    Ok(json!({
+        "ok": true,
+        "skipped": true,
+        "reason": "filetree_sync_disabled",
+        "repoId": repo_id,
+        "repoPath": workspace_path_display(workspace_root),
+    }))
 }
 
 fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> {
@@ -14948,15 +14579,15 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
     .map(|value| value.get("data").cloned().unwrap_or(value))
     .unwrap_or_else(|| json!({"ok": false, "error": "context_pack_refresh_failed"}));
-    let spec_graph = cloud_mcp_proxy_post_json_endpoint(
+    let architecture_history = cloud_mcp_proxy_post_json_endpoint(
         &base_url,
-        "/v1/spec/graph",
+        "/v1/architecture/history",
         &context_request.to_string(),
     )
     .ok()
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
     .map(|value| value.get("data").cloned().unwrap_or(value))
-    .unwrap_or_else(|| json!({"ok": false, "error": "spec_graph_refresh_failed"}));
+    .unwrap_or_else(|| json!({"kind": "architecture_task_history", "version": 1, "tasks": []}));
 
     identity.log(
         "cloud_mcp.agent_start_task.done",
@@ -14975,15 +14606,7 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         "event": event_data.clone(),
         "spec_activity": event_data["spec_activity"].clone(),
         "context_pack": context_pack,
-        "spec_graph": {
-            "kind": spec_graph["kind"].clone(),
-            "version": spec_graph["version"].clone(),
-            "repo_id": spec_graph["repo_id"].clone(),
-            "workspace_id": spec_graph["workspace_id"].clone(),
-            "graph_stats": spec_graph["graph_stats"].clone(),
-            "agent_work": spec_graph["agent_work"].clone(),
-            "node_count": spec_graph["nodes"].as_array().map(Vec::len).unwrap_or(0),
-        },
+        "architecture_history": architecture_history,
     }))
 }
 
@@ -15672,6 +15295,7 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
+    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
     let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
@@ -15696,6 +15320,25 @@ fn cloud_mcp_proxy_post_json_endpoint(
             HeaderValue::from_str(&device_id)
                 .map_err(|error| format!("Invalid Cloud MCP device id header: {error}"))?,
         );
+        request.headers_mut().insert(
+            "x-diffforge-billing-scope-type",
+            HeaderValue::from_str(&billing_scope_type)
+                .map_err(|error| format!("Invalid Cloud MCP billing scope header: {error}"))?,
+        );
+        request.headers_mut().insert(
+            "x-diffforge-scope-type",
+            HeaderValue::from_str(&billing_scope_type)
+                .map_err(|error| format!("Invalid Cloud MCP scope header: {error}"))?,
+        );
+        if billing_scope_type == "team" {
+            if let Some(team_id) = team_id.as_deref() {
+                request.headers_mut().insert(
+                    "x-diffforge-team-id",
+                    HeaderValue::from_str(team_id)
+                        .map_err(|error| format!("Invalid Cloud MCP team id header: {error}"))?,
+                );
+            }
+        }
         if let Some(workspace_id) = workspace_id.as_deref() {
             request.headers_mut().insert(
                 "x-diffforge-workspace-id",
@@ -15756,6 +15399,8 @@ fn cloud_mcp_proxy_post_json_endpoint(
         "client_id": client_id,
         "repo_id": repo_id,
         "workspace_id": workspace_id,
+        "billing_scope_type": billing_scope_type,
+        "team_id": team_id,
         "request": body_value,
     });
     websocket
@@ -15831,7 +15476,14 @@ fn cloud_mcp_proxy_resolve_blocking_target(
     let Some(bearer) = cloud_mcp_process_authorization_bearer() else {
         return fallback;
     };
-    match cloud_mcp_fetch_direct_route_blocking(base_url, endpoint_path, &bearer) {
+    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+    match cloud_mcp_fetch_direct_route_blocking(
+        base_url,
+        endpoint_path,
+        &bearer,
+        &billing_scope_type,
+        team_id.as_deref(),
+    ) {
         Ok(Some(target)) => target,
         _ => fallback,
     }
@@ -15841,6 +15493,8 @@ fn cloud_mcp_fetch_direct_route_blocking(
     base_url: &str,
     endpoint_path: &str,
     bearer: &str,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({"requestedPath": endpoint_path});
@@ -15851,6 +15505,19 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .post(url)
         .header("Authorization", format!("Bearer {bearer}"))
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
+        .header("x-diffforge-billing-scope-type", billing_scope_type)
+        .header("x-diffforge-scope-type", billing_scope_type)
+        .headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            if billing_scope_type == "team" {
+                if let Some(team_id) = team_id {
+                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
+                        headers.insert("x-diffforge-team-id", value);
+                    }
+                }
+            }
+            headers
+        })
         .json(&body)
         .send()
         .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;

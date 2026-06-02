@@ -16,7 +16,7 @@
     "register:windows:dev-deeplink": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/register-windows-dev-deeplink.ps1",
     "preview": "vite preview",
     "test": "npm run test:frontend && npm run test:rust",
-    "test:frontend": "node --test src/specGraph/specGraphCore.test.js src/specGraph/specGraphLayout.test.js src/tokenomics/tokenomicsFormat.test.js src/notifications/workspaceNotifications.test.js src/terminals/providerTurnIntent.test.js src/terminals/terminalActivityState.test.js src/terminals/terminalColors.test.js src/terminals/terminalPromptSubmission.test.js src/terminals/todoQueueLaneState.test.js src/terminals/todoQueueScheduler.test.js src/terminals/todoQueueSources.test.js src/threads/threadTerminalGroundTruth.test.js src/threads/workspaceThreadTranscriptEvidence.test.js src/threads/workspaceThreads.test.js",
+    "test:frontend": "node --test src/tokenomics/tokenomicsFormat.test.js src/notifications/workspaceNotifications.test.js src/terminals/providerTurnIntent.test.js src/terminals/terminalActivityState.test.js src/terminals/terminalColors.test.js src/terminals/terminalPromptSubmission.test.js src/terminals/todoQueueLaneState.test.js src/terminals/todoQueueScheduler.test.js src/terminals/todoQueueSources.test.js src/threads/threadTerminalGroundTruth.test.js src/threads/workspaceThreadTranscriptEvidence.test.js src/threads/workspaceThreads.test.js",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "macos:accessibility:reset": "tccutil reset Accessibility ai.diffforge.desktop",
     "tauri": "tauri",
@@ -34,7 +34,6 @@
     "@vscode/codicons": "^0.0.45",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
-    "elkjs": "^0.11.1",
     "prismjs": "^1.30.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
@@ -43,8 +42,7 @@
     "react-select": "^5.10.2",
     "remark-gfm": "^4.0.1",
     "styled-components": "^6.4.1",
-    "styled-icons": "^10.47.1",
-    "three": "^0.184.0"
+    "styled-icons": "^10.47.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

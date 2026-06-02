@@ -346,6 +346,14 @@ import {
   WorkspaceSettingsDialog,
   WorkspaceSettingsBusyOverlay,
   WorkspaceSettingsBusyPanel,
+  WorkspaceGitPullOverlay,
+  WorkspaceGitPullDialog,
+  WorkspaceGitPullHeader,
+  WorkspaceGitPullSummary,
+  WorkspaceGitPullList,
+  WorkspaceGitPullRow,
+  WorkspaceGitPullRepoMeta,
+  WorkspaceGitPullActions,
   WorkspaceSettingsDialogHeader,
   WorkspaceSettingsHeaderMain,
   WorkspaceSettingsHeaderMeta,
@@ -480,7 +488,7 @@ import {
 } from "./appStyles";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import SpecGraphWorkspaceView from "../specGraph/SpecGraphWorkspaceView.jsx";
+import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
@@ -522,7 +530,42 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "specGraph", "web", "mcps"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture", "web", "mcps"]);
+const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
+  state: "idle",
+  workspaceId: "",
+  rootDirectory: "",
+  checkKey: "",
+  repositories: [],
+  selected: {},
+  blockedCount: 0,
+  error: "",
+  message: "",
+});
+
+function workspaceGitPullPromptCheckKey(workspaceId, rootDirectory) {
+  if (!workspaceId || !rootDirectory) {
+    return "";
+  }
+  return `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
+}
+
+function normalizeWorkspaceGitPullRepository(repository) {
+  const path = String(repository?.path || "").trim();
+  const name = String(repository?.name || "").trim() || getDirectoryName(path) || "repository";
+  const relativePath = String(repository?.relativePath || "").trim();
+  return {
+    path,
+    name,
+    relativePath,
+    branch: String(repository?.branch || "").trim(),
+    upstream: String(repository?.upstream || "").trim(),
+    ahead: Number(repository?.ahead) || 0,
+    behind: Number(repository?.behind) || 0,
+    reason: String(repository?.reason || "").trim(),
+    pullable: Boolean(repository?.pullable),
+  };
+}
 
 function readDismissedLowCreditWarningKey() {
   try {
@@ -728,8 +771,12 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
         hasToken: Boolean(safeToken),
       },
     });
+    const accountScope = options.accountScope || authStore.getActiveScope?.() || null;
+    const scopePayload = accountScopeInvokePayload(accountScope);
     const status = await invoke("cloud_mcp_set_desktop_session_token", {
       token: safeToken,
+      scopeType: scopePayload.scopeType,
+      teamId: scopePayload.teamId,
     });
     await recordCloudConnectionDiagnostic(safeToken, {
       channel: "rust-client-auth",
@@ -816,7 +863,6 @@ function readMainWindowFocusedFallback() {
   return document.visibilityState !== "hidden" && document.hasFocus();
 }
 
-const SPEC_GRAPH_CACHE_EVENT = "cloud-mcp-spec-graph-cache";
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const APP_SHUTDOWN_PROGRESS_EVENT = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT = "forge-app-close-requested";
@@ -1937,6 +1983,72 @@ function isPaidUser(sessionUser) {
   return sessionUser?.planStatus === "paid";
 }
 
+function accountScopeOptionsFromUser(sessionUser) {
+  const scopes = Array.isArray(sessionUser?.accountScopes)
+    ? sessionUser.accountScopes
+    : Array.isArray(sessionUser?.scopes)
+      ? sessionUser.scopes
+    : [];
+  const normalized = scopes
+    .map((scope) => {
+      const type = String(scope?.type || scope?.scopeType || "personal").trim().toLowerCase();
+      const teamId = String(scope?.teamId || "").trim();
+
+      if (type === "team" && teamId) {
+        return {
+          id: `team:${teamId}`,
+          type: "team",
+          label: String(scope?.label || scope?.team?.name || "Team").trim() || "Team",
+          teamId,
+        };
+      }
+
+      return {
+        id: "personal",
+        type: "personal",
+        label: "Personal",
+        teamId: null,
+      };
+    });
+  const byId = new Map();
+
+  [
+    {
+      id: "personal",
+      type: "personal",
+      label: "Personal",
+      teamId: null,
+    },
+    ...normalized,
+  ].forEach((scope) => {
+    byId.set(scope.id, scope);
+  });
+
+  return Array.from(byId.values());
+}
+
+function accountScopeInvokePayload(scope) {
+  const type = String(scope?.type || "personal").trim().toLowerCase();
+  const teamId = String(scope?.teamId || "").trim();
+
+  if (type === "team" && teamId) {
+    return {
+      scopeType: "team",
+      teamId,
+    };
+  }
+
+  return {
+    scopeType: "personal",
+    teamId: null,
+  };
+}
+
+function accountScopeKey(scope) {
+  const payload = accountScopeInvokePayload(scope);
+  return payload.scopeType === "team" ? `team:${payload.teamId}` : "personal";
+}
+
 function billingPlanLabelFromStatus(billingStatus, sessionUser) {
   const paid = isPaidUser(sessionUser) || billingStatus?.planStatus === "paid";
 
@@ -2072,7 +2184,7 @@ function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
     "",
     "Use coordination-kernel.start_task before changing files or specs. Include this spec_edit_intent_id in the task metadata or plan if the tool schema allows it.",
     "Acquire leases for affected paths before file edits. Checkpoint progress and submit_patch when complete.",
-    "For delete, retire or supersede the selected spec through the Spec Graph workflow; do not hard-delete history.",
+    "For delete, retire or supersede the selected spec through the Architecture history workflow; do not hard-delete history.",
   );
   return lines.join("\n");
 }
@@ -3968,6 +4080,7 @@ export default function App() {
     message: authMessage,
     error: authError,
     user,
+    activeScope,
   } = useAuthSnapshot();
   const [apiState, setApiState] = useState("checking");
   const [apiMessage, setApiMessage] = useState("Checking connection");
@@ -4020,6 +4133,7 @@ export default function App() {
   const [workspaceSettingsMessage, setWorkspaceSettingsMessage] = useState("");
   const [workspaceSettingsModalId, setWorkspaceSettingsModalId] = useState("");
   const [workspaceDeleteConfirmId, setWorkspaceDeleteConfirmId] = useState("");
+  const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -4049,9 +4163,12 @@ export default function App() {
   const dashboardShellRef = useRef(null);
   const workspaceRailRef = useRef(null);
   const workspaceRailAnimationFrameRef = useRef(0);
+  const workspaceGitPullPromptCheckRef = useRef("");
+  const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
   const agentStatusCacheHitRef = useRef(agentStatuses.some((agent) => agent.cached));
   const agentInitialStatusUserRef = useRef("");
+  const previousAccountScopeKeyRef = useRef("");
   const startupAgentFlowIdRef = useRef(0);
   const startupAgentSettingsPendingRef = useRef(false);
   const audioAutoOpenStartupKeyRef = useRef("");
@@ -4107,11 +4224,60 @@ export default function App() {
     workspaceTerminalRoleOptions,
     activeAgent,
   );
+  const accountScopes = useMemo(() => accountScopeOptionsFromUser(user), [user]);
+  const activeAccountScope = useMemo(() => {
+    const requestedKey = accountScopeKey(activeScope);
+    return accountScopes.find((scope) => accountScopeKey(scope) === requestedKey)
+      || accountScopes[0]
+      || {
+        id: "personal",
+        type: "personal",
+        label: "Personal",
+        teamId: null,
+      };
+  }, [accountScopes, activeScope]);
+  const activeAccountScopeKey = accountScopeKey(activeAccountScope);
+  const activeWorkspaceScopePayload = useMemo(
+    () => accountScopeInvokePayload(activeAccountScope),
+    [activeAccountScope],
+  );
+  const shouldShowAccountScopePicker = accountScopes.some((scope) => scope.type === "team");
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return;
+    }
+
+    if (accountScopeKey(activeScope) !== activeAccountScopeKey) {
+      authStore.setActiveScope(activeAccountScope);
+    }
+  }, [activeAccountScope, activeAccountScopeKey, activeScope, authState]);
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return;
+    }
+
+    const token = authStore.getToken();
+    if (!isSafeAuthValue(token)) {
+      return;
+    }
+
+    terminalPresenceSyncKeyRef.current = "";
+    workspaceMcpSyncKeyRef.current = "";
+    workspaceCloudSyncKeyRef.current = "";
+    tokenomicsSyncCursorRef.current = "";
+    tokenomicsSyncInFlightRef.current = false;
+    tokenomicsSyncPendingRefreshRef.current = false;
+    void syncCloudMcpDesktopSessionToken(token, {
+      accountScope: activeAccountScope,
+      flowId: `scope-${activeAccountScopeKey}`,
+    });
+  }, [activeAccountScope, activeAccountScopeKey, authState]);
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
     : "";
   const workspaceHydrationKey = authState === "authenticated" && workspaceState === "ready"
     ? [
+      activeAccountScopeKey,
       selectedWorkspaceId || "none",
       activatedWorkspaceId || "none",
       getWorkspaceRootIdentity(activeWorkspaceHydrationRoot),
@@ -4320,10 +4486,10 @@ export default function App() {
           ...previous,
           repoPath: repoPath || previous.repoPath || snapshotRepoPath,
           workspaceId: workspaceId || previous.workspaceId || snapshotWorkspaceId,
-          specSnapshot: snapshot,
-          specState: graphSnapshotSyncState(snapshot, "empty"),
-          specError: graphSnapshotSyncError(snapshot),
-          specUpdatedAt: Date.now(),
+          architectureSnapshot: snapshot,
+          architectureState: graphSnapshotSyncState(snapshot, "empty"),
+          architectureError: graphSnapshotSyncError(snapshot),
+          architectureUpdatedAt: Date.now(),
         };
       });
       return next;
@@ -4333,31 +4499,6 @@ export default function App() {
   useEffect(() => {
     clearWorkspaceThreadsBrowserPersistence();
   }, []);
-
-  useEffect(() => {
-    let disposed = false;
-    const unlisteners = [];
-
-    const attach = (eventName) => {
-      listen(eventName, (event) => {
-        if (disposed) return;
-        applyWorkspaceGraphSnapshot("", "", event?.payload);
-      }).then((unlisten) => {
-        if (disposed) {
-          unlisten();
-          return;
-        }
-        unlisteners.push(unlisten);
-      });
-    };
-
-    attach(SPEC_GRAPH_CACHE_EVENT);
-
-    return () => {
-      disposed = true;
-      unlisteners.forEach((unlisten) => unlisten());
-    };
-  }, [applyWorkspaceGraphSnapshot]);
 
   useEffect(() => {
     const targets = workspaceThreadStoreTargets;
@@ -5204,6 +5345,17 @@ export default function App() {
     setWorkspaceRailCollapsed(nextCollapsed);
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
 
+  const handleAccountScopeChange = useCallback((event) => {
+    const nextKey = event.target.value;
+    const nextScope = accountScopes.find((scope) => accountScopeKey(scope) === nextKey);
+
+    if (!nextScope || accountScopeKey(nextScope) === activeAccountScopeKey) {
+      return;
+    }
+
+    authStore.setActiveScope(nextScope);
+  }, [accountScopes, activeAccountScopeKey]);
+
   useEffect(() => {
     const platform = getWindowControlPlatform();
 
@@ -5511,6 +5663,7 @@ export default function App() {
         await invoke("delete_workspace", {
           token,
           workspaceId: targetWorkspaceId,
+          ...activeWorkspaceScopePayload,
         });
       } catch (error) {
         if (isDesktopSessionExpiredError(error)) {
@@ -5641,6 +5794,7 @@ export default function App() {
     }
   }, [
     clearPreparedWorkspaceTerminals,
+    activeWorkspaceScopePayload,
     expireDesktopSession,
     showView,
     updateWorkspaceLifecycleSettings,
@@ -6417,7 +6571,10 @@ export default function App() {
     setWorkspaceError("");
 
     try {
-      const result = await invoke("list_workspaces", { token });
+      const result = await invoke("list_workspaces", {
+        token,
+        ...activeWorkspaceScopePayload,
+      });
       const nextWorkspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
       const currentSelectedId = selectedWorkspaceIdRef.current;
       const currentActivatedId = activatedWorkspaceIdRef.current;
@@ -6509,7 +6666,33 @@ export default function App() {
       setWorkspaceListHydrated(true);
       setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
     }
-  }, [expireDesktopSession]);
+  }, [activeWorkspaceScopePayload, expireDesktopSession]);
+
+  useEffect(() => {
+    if (!previousAccountScopeKeyRef.current) {
+      previousAccountScopeKeyRef.current = activeAccountScopeKey;
+      return;
+    }
+
+    if (previousAccountScopeKeyRef.current === activeAccountScopeKey) {
+      return;
+    }
+
+    previousAccountScopeKeyRef.current = activeAccountScopeKey;
+
+    if (authState !== "authenticated" || !isPaidUser(user)) {
+      return;
+    }
+
+    setWorkspaces([]);
+    setSelectedWorkspaceId("");
+    setActivatedWorkspaceId("");
+    setWorkspaceSyncState("loading");
+    setWorkspaceListHydrated(false);
+    setWorkspaceHydrationReady(false);
+    crashRecoveryScanRef.current = false;
+    loadWorkspaces();
+  }, [activeAccountScopeKey, authState, loadWorkspaces, user]);
 
   const openCreateWorkspaceModal = useCallback(() => {
     setWorkspaceName("");
@@ -6581,6 +6764,7 @@ export default function App() {
       const result = await invoke("create_workspace", {
         token,
         name,
+        ...activeWorkspaceScopePayload,
       });
       const workspace = result?.workspace;
 
@@ -6644,6 +6828,7 @@ export default function App() {
     }
   }, [
     defaultWorkingDirectory,
+    activeWorkspaceScopePayload,
     expireDesktopSession,
     newWorkspaceRootDraft,
     updateWorkspaceLifecycleSettings,
@@ -6870,6 +7055,7 @@ export default function App() {
           token,
           workspaceId: selectedWorkspace.id,
           name: workspaceNameValue,
+          ...activeWorkspaceScopePayload,
         });
 
         if (!result?.workspace) {
@@ -6927,6 +7113,7 @@ export default function App() {
     }
   }, [
     selectedWorkspace,
+    activeWorkspaceScopePayload,
     expireDesktopSession,
     workspaceNameDraft,
     workspaceRootDraft,
@@ -7153,6 +7340,99 @@ export default function App() {
       setWorkspaceTerminalCountDraft(String(nextTerminalCount));
       setWorkspaceTerminalRolesDraft(nextTerminalRoles);
     }
+  }, [
+    workspaceSettingsModalId,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
+
+  const addWorkspaceTerminal = useCallback(({ role = "", workspaceId } = {}) => {
+    if (!workspaceId) {
+      return null;
+    }
+
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+
+    if (currentIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return null;
+    }
+
+    let nextTerminalIndex = -1;
+    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      if (!currentIndexes.includes(index)) {
+        nextTerminalIndex = index;
+        break;
+      }
+    }
+
+    if (nextTerminalIndex < 0) {
+      return null;
+    }
+
+    const currentRoles = getWorkspaceTerminalRoles(
+      currentSettings,
+      workspaceId,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const roleByIndex = Object.fromEntries(currentIndexes.map((index, orderIndex) => [
+      index,
+      currentRoles[orderIndex] || workspaceTerminalFallbackRole,
+    ]));
+    const nextRole = normalizeWorkspaceTerminalRole(
+      role || workspaceTerminalFallbackRole,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
+    const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+    const nextTerminalRoles = nextIndexes.map((index) => (
+      index === nextTerminalIndex ? nextRole : roleByIndex[index] || workspaceTerminalFallbackRole
+    ));
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = currentRows.length
+      ? [...currentRows.map((row) => row.terminalIndexes.slice()), [nextTerminalIndex]]
+      : [[nextTerminalIndex]];
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      terminalCount: nextTerminalCount,
+      terminalRoles: nextTerminalRoles,
+    });
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
+      [workspaceId]: nextIndexes,
+    };
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
+    };
+
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+
+    if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
+      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+    }
+
+    return {
+      terminalIndex: nextTerminalIndex,
+      terminalRole: nextRole,
+      workspaceId,
+    };
   }, [
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
@@ -8795,7 +9075,7 @@ export default function App() {
       return undefined;
     }
 
-    const userKey = user?.id || user?.email || "paid-user";
+    const userKey = `${user?.id || user?.email || "paid-user"}:${activeAccountScopeKey}`;
 
     if (agentInitialStatusUserRef.current !== userKey) {
       const startupFlowId = startupAgentFlowIdRef.current + 1;
@@ -8831,6 +9111,7 @@ export default function App() {
     return undefined;
   }, [
     agentStatuses,
+    activeAccountScopeKey,
     authState,
     finishStartupAgentGate,
     loadWorkspaces,
@@ -10286,7 +10567,7 @@ export default function App() {
       }
       window.clearInterval(intervalId);
     };
-  }, [authState, user]);
+  }, [activeAccountScopeKey, authState, user]);
 
   useEffect(() => {
     if (
@@ -10520,6 +10801,188 @@ export default function App() {
     || !cloudSqliteResetRepoPath;
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
+  const workspaceGitPullSelectedPaths = useMemo(
+    () => workspaceGitPullPrompt.repositories
+      .filter((repository) => workspaceGitPullPrompt.selected?.[repository.path])
+      .map((repository) => repository.path),
+    [workspaceGitPullPrompt.repositories, workspaceGitPullPrompt.selected],
+  );
+  const workspaceGitPullSelectedCount = workspaceGitPullSelectedPaths.length;
+  const isWorkspaceGitPullPromptBusy = workspaceGitPullPrompt.state === "pulling";
+  const shouldShowWorkspaceGitPullPrompt = Boolean(
+    !isWorkspaceSettingsOpen
+      && workspaceGitPullPrompt.repositories.length > 0
+      && (workspaceGitPullPrompt.state === "ready" || workspaceGitPullPrompt.state === "pulling"),
+  );
+  const toggleWorkspaceGitPullRepository = useCallback((repoPath) => {
+    setWorkspaceGitPullPrompt((current) => {
+      if (current.state === "pulling") {
+        return current;
+      }
+      return {
+        ...current,
+        selected: {
+          ...current.selected,
+          [repoPath]: !current.selected?.[repoPath],
+        },
+        error: "",
+      };
+    });
+  }, []);
+  const skipWorkspaceGitPullPrompt = useCallback(() => {
+    if (workspaceGitPullPrompt.checkKey) {
+      workspaceGitPullPromptSkippedRef.current.add(workspaceGitPullPrompt.checkKey);
+    }
+    setWorkspaceGitPullPrompt(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
+  }, [workspaceGitPullPrompt.checkKey]);
+  const pullSelectedWorkspaceGitRepositories = useCallback(async () => {
+    if (!workspaceGitPullSelectedPaths.length) {
+      setWorkspaceGitPullPrompt((current) => ({
+        ...current,
+        error: "Select at least one repository to pull.",
+      }));
+      return;
+    }
+    const checkKey = workspaceGitPullPrompt.checkKey;
+    setWorkspaceGitPullPrompt((current) => ({
+      ...current,
+      state: "pulling",
+      error: "",
+      message: "Pulling selected repositories...",
+    }));
+    try {
+      const response = await invoke("workspace_git_pull_repositories", {
+        repoPaths: workspaceGitPullSelectedPaths,
+      });
+      if (workspaceGitPullPromptCheckRef.current !== checkKey) {
+        return;
+      }
+      const failedCount = Number(response?.failedCount) || 0;
+      const pulledCount = Number(response?.pulledCount) || 0;
+      if (failedCount > 0) {
+        const firstFailure = Array.isArray(response?.results)
+          ? response.results.find((result) => !result?.ok)
+          : null;
+        setWorkspaceGitPullPrompt((current) => ({
+          ...current,
+          state: "ready",
+          error: firstFailure?.error
+            ? `${firstFailure.name || "Repository"}: ${firstFailure.error}`
+            : `${failedCount} repository${failedCount === 1 ? "" : "ies"} could not be pulled.`,
+          message: "",
+        }));
+        return;
+      }
+      if (checkKey) {
+        workspaceGitPullPromptSkippedRef.current.add(checkKey);
+      }
+      setWorkspaceGitPullPrompt({
+        ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
+        message: pulledCount > 0
+          ? `Pulled ${pulledCount} repository${pulledCount === 1 ? "" : "ies"}.`
+          : "Repositories were already current.",
+      });
+    } catch (error) {
+      if (workspaceGitPullPromptCheckRef.current !== checkKey) {
+        return;
+      }
+      setWorkspaceGitPullPrompt((current) => ({
+        ...current,
+        state: "ready",
+        error: getErrorMessage(error, "Unable to pull selected repositories."),
+        message: "",
+      }));
+    }
+  }, [workspaceGitPullPrompt.checkKey, workspaceGitPullSelectedPaths]);
+
+  useEffect(() => {
+    const workspaceId = selectedWorkspace?.id || "";
+    const workspaceNameForCheck = selectedWorkspace?.name || "";
+    const rootDirectory = selectedWorkspaceFileRoot || "";
+    const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
+
+    if (authState !== "authenticated" || shouldShowWorkspaceSetup || !workspaceId || !rootDirectory) {
+      workspaceGitPullPromptCheckRef.current = "";
+      setWorkspaceGitPullPrompt(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
+      return undefined;
+    }
+
+    if (
+      !checkKey
+        || workspaceGitPullPromptSkippedRef.current.has(checkKey)
+        || workspaceGitPullPromptCheckRef.current === checkKey
+    ) {
+      return undefined;
+    }
+
+    workspaceGitPullPromptCheckRef.current = checkKey;
+    let cancelled = false;
+    setWorkspaceGitPullPrompt({
+      ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
+      state: "checking",
+      workspaceId,
+      rootDirectory,
+      checkKey,
+    });
+
+    invoke("workspace_git_pull_candidates", {
+      repoPath: rootDirectory,
+      workspaceId,
+      workspaceName: workspaceNameForCheck,
+      refresh: false,
+    })
+      .then((response) => {
+        if (cancelled || workspaceGitPullPromptCheckRef.current !== checkKey) {
+          return;
+        }
+        const repositories = Array.isArray(response?.repositories)
+          ? response.repositories
+            .map(normalizeWorkspaceGitPullRepository)
+            .filter((repository) => repository.path && repository.pullable)
+          : [];
+        if (!repositories.length) {
+          setWorkspaceGitPullPrompt({
+            ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
+            workspaceId,
+            rootDirectory,
+            checkKey,
+          });
+          return;
+        }
+        setWorkspaceGitPullPrompt({
+          ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
+          state: "ready",
+          workspaceId,
+          rootDirectory,
+          checkKey,
+          repositories,
+          selected: Object.fromEntries(repositories.map((repository) => [repository.path, true])),
+          blockedCount: Number(response?.blockedCount) || 0,
+        });
+      })
+      .catch((error) => {
+        if (cancelled || workspaceGitPullPromptCheckRef.current !== checkKey) {
+          return;
+        }
+        setWorkspaceGitPullPrompt({
+          ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
+          workspaceId,
+          rootDirectory,
+          checkKey,
+          error: getErrorMessage(error, "Unable to check Git repositories."),
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authState,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceFileRoot,
+    shouldShowWorkspaceSetup,
+  ]);
   const isWorkspaceSettingsDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && selectedWorkspace
@@ -10547,8 +11010,8 @@ export default function App() {
     const isAccountReset = resetScope === "account";
     const confirmed = window.confirm(
       isAccountReset
-        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including filetree sync, duplicate device/client activations, task history, runtime state, logs, MCP state, terminal presence, and Spec Graph working state. Diff Forge AI credit usage is kept in the cloud credit ledger."
-        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP and terminal presence, and Spec Graph task state for this client. Workspace filetree entries are kept and the cloud checkpoint is refreshed.",
+        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including duplicate device/client activations, task history, runtime state, logs, MCP state, terminal presence, and Architecture working state. Diff Forge AI credit usage is kept in the cloud credit ledger."
+        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP state, terminal presence, and Architecture task state for this client. The cloud checkpoint is refreshed.",
     );
     if (!confirmed) {
       return;
@@ -10565,7 +11028,6 @@ export default function App() {
       const data = unwrapCloudCommandData(response, {});
       const resetMode = data?.reset_mode || data?.resetMode || "";
       const fullAccountWipe = isAccountReset && resetMode === "account_full_sqlite_wipe";
-      const preservedFiletrees = Number(data?.preserved?.repo_filetree_state || 0);
       const preservedCreditRows = Object.entries(data?.preserved || {})
         .filter(([key]) => key.startsWith("credit_"))
         .reduce((total, [, value]) => total + Number(value || 0), 0);
@@ -10573,7 +11035,6 @@ export default function App() {
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
       const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
       const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
-      const filetreeLabel = preservedFiletrees === 1 ? "filetree entry" : "filetree entries";
       const creditUsageLabel = preservedCreditRows === 1 ? "credit ledger row" : "credit ledger rows";
       let checkpointMessage = "cloud checkpoint refresh skipped";
       if (backgroundCheckpoint?.queued) {
@@ -10585,7 +11046,7 @@ export default function App() {
       }
       const resetSummary = fullAccountWipe
         ? `Cleared all account SQLite data across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}; preserved ${preservedCreditRows} ${creditUsageLabel} and ${checkpointMessage}.`
-        : `Preserved ${preservedFiletrees} ${filetreeLabel} and ${checkpointMessage}.`;
+        : `Cleared current client cloud SQLite state and ${checkpointMessage}.`;
       tokenomicsSyncCursorRef.current = "";
       const forceTokenomicsResync = tokenomicsForceResyncRef.current;
       if (typeof forceTokenomicsResync === "function") {
@@ -10621,24 +11082,15 @@ export default function App() {
     }
 
     let cancelled = false;
-    let specSyncGeneration = null;
     const workspaceId = activatedWorkspaceIdForGraphSync;
     const workspaceName = activatedWorkspaceNameForGraphSync || null;
-    const stopSyncs = () => {
-      if (specSyncGeneration) {
-        invoke("cloud_mcp_stop_spec_graph_sync", {
-          repoPath,
-          syncGeneration: specSyncGeneration,
-        }).catch(() => {});
-      }
-    };
 
     setWorkspaceGraphStatus(repoPath, workspaceId, {
-      specState: "loading",
-      specError: "",
+      architectureState: "loading",
+      architectureError: "",
     });
 
-    invoke("cloud_mcp_get_cached_spec_graph", {
+    invoke("cloud_mcp_get_architecture_history", {
       repoPath,
       workspaceId,
       workspaceName,
@@ -10649,36 +11101,14 @@ export default function App() {
       .catch((error) => {
         if (!cancelled) {
           setWorkspaceGraphStatus(repoPath, workspaceId, {
-            specState: "error",
-            specError: getErrorMessage(error, "Unable to load cached Spec Graph."),
-          });
-        }
-      });
-
-    invoke("cloud_mcp_start_spec_graph_sync", {
-      repoPath,
-      workspaceId,
-      workspaceName,
-    })
-      .then((result) => {
-        specSyncGeneration = Number(result?.syncGeneration) || null;
-        if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
-        if (cancelled) {
-          stopSyncs();
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setWorkspaceGraphStatus(repoPath, workspaceId, {
-            specState: "error",
-            specError: getErrorMessage(error, "Unable to start Spec Graph sync."),
+            architectureState: "error",
+            architectureError: getErrorMessage(error, "Unable to load Architecture history."),
           });
         }
       });
 
     return () => {
       cancelled = true;
-      stopSyncs();
     };
   }, [
     activatedWorkspaceIdForGraphSync,
@@ -10702,7 +11132,7 @@ export default function App() {
       const next = { ...current };
       Object.entries(current).forEach(([intentId, intent]) => {
         const graphKey = workspaceGraphStateKey(intent.repoPath || "", intent.workspaceId || "");
-        const graphSnapshot = graphKey ? workspaceGraphState[graphKey]?.specSnapshot : null;
+        const graphSnapshot = graphKey ? workspaceGraphState[graphKey]?.architectureSnapshot : null;
         const resolvedByGraph = specEditIntentResolvedByGraph(graphSnapshot, intent);
         const resolvedByAgent = specEditIntentAgentFinished(workspaceThreads, intent);
         if (resolvedByGraph || resolvedByAgent) {
@@ -11037,147 +11467,9 @@ export default function App() {
     };
   }, [workspaces]);
 
-  const submitSpecEditIntent = useCallback(async (payload) => {
-    if (!selectedWorkspace || !activatedWorkspace || selectedWorkspace.id !== activatedWorkspace.id) {
-      throw new Error("Activate this workspace to edit specs.");
-    }
-    if (workspaceDeactivationState.isActive) {
-      throw new Error("Workspace deactivation is in progress.");
-    }
-    const repoPath = payload.targetProjectRoot
-      || selectedWorkspaceFileRoot
-      || activatedWorkspaceTerminalWorkingDirectory
-      || defaultWorkingDirectory;
-    if (!repoPath) {
-      throw new Error("Workspace root is not available.");
-    }
-
-    const intentId = createSpecEditIntentId();
-    const intentPayload = {
-      agent_id: "",
-      base_graph_hash: payload.baseGraphHash || "",
-      base_node_hash: payload.baseNodeHash || "",
-      container_target_node_id: payload.containerTargetNodeId || "",
-      current_statement: payload.currentStatement || "",
-      desired_statement: payload.desiredStatement || "",
-      event_kind: "spec_edit_requested",
-      intent_id: intentId,
-      mount_id: payload.mountId || "",
-      operation: payload.operation || "edit",
-      source_repo_id: payload.sourceRepoId || "",
-      status: "queued",
-      target_node_id: payload.targetNodeId || "",
-      target_path: payload.targetPath || "",
-      target_project_relative_path: payload.targetProjectRelativePath || "",
-      target_project_root: payload.targetProjectRoot || "",
-      target_spec_object_id: payload.targetSpecObjectId || "",
-      target_title: payload.targetTitle || "",
-      target_visible_path: payload.targetVisiblePath || "",
-      target_workspace_root: payload.targetWorkspaceRoot || "",
-      terminal_id: "",
-      terminal_index: null,
-      terminal_instance_id: "",
-      thread_id: "",
-      user_instruction: payload.userInstruction || "",
-    };
-
-    const prompt = buildSpecEditAgentPrompt(intentId, payload, selectedWorkspace, repoPath);
-    const promptSubmittedAt = new Date().toISOString();
-    const promptSubmittedAtMs = Date.parse(promptSubmittedAt) || Date.now();
-    const requested = await invoke("cloud_mcp_record_spec_edit_intent", {
-      intent: intentPayload,
-      repoPath,
-      workspaceId: selectedWorkspace.id,
-      workspaceName: selectedWorkspace.name || "",
-    });
-
-    setPendingSpecEditIntents((current) => ({
-      ...current,
-      [intentId]: {
-        agentId: "",
-        agentLabel: "the next available agent",
-        baseGraphHash: payload.baseGraphHash || "",
-        baseNodeHash: payload.baseNodeHash || "",
-        containerTargetNodeId: payload.containerTargetNodeId || "",
-        createdAt: promptSubmittedAt,
-        currentStatement: payload.currentStatement || "",
-        desiredStatement: payload.desiredStatement || "",
-        intentId,
-        mountId: payload.mountId || "",
-        operation: payload.operation || "edit",
-        promptText: prompt,
-        repoPath,
-        sourceRepoId: payload.sourceRepoId || "",
-        submittedAt: promptSubmittedAt,
-        submittedAtMs: promptSubmittedAtMs,
-        targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
-        targetNodeId: payload.targetNodeId || "",
-        targetPath: payload.targetPath || "",
-        targetProjectRelativePath: payload.targetProjectRelativePath || "",
-        targetProjectRoot: payload.targetProjectRoot || "",
-        targetSpecObjectId: payload.targetSpecObjectId || "",
-        targetTitle: payload.targetTitle || "",
-        targetVisiblePath: payload.targetVisiblePath || "",
-        targetWorkspaceRoot: payload.targetWorkspaceRoot || "",
-        terminalId: "",
-        terminalIndex: null,
-        terminalInstanceId: "",
-        threadId: "",
-        userInstruction: payload.userInstruction || "",
-        workspaceId: selectedWorkspace.id,
-      },
-    }));
-
-    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_EVENT, {
-      detail: {
-        item: {
-          createdAt: promptSubmittedAt,
-          id: intentId,
-          kind: "spec-edit",
-          source: "tui-spec-edit-auto-queue",
-          specEdit: {
-            baseGraphHash: payload.baseGraphHash || "",
-            baseNodeHash: payload.baseNodeHash || "",
-            containerTargetNodeId: payload.containerTargetNodeId || "",
-            intentId,
-            intentPayload,
-            mountId: payload.mountId || "",
-            operation: payload.operation || "edit",
-            promptText: prompt,
-            repoPath,
-            sourceRepoId: payload.sourceRepoId || "",
-            targetNodeId: payload.targetNodeId || "",
-            targetNodeSignature: specEditNodeChangeSignature(payload.targetNode),
-            targetPath: payload.targetPath || "",
-            targetProjectRelativePath: payload.targetProjectRelativePath || "",
-            targetProjectRoot: payload.targetProjectRoot || "",
-            targetSpecObjectId: payload.targetSpecObjectId || "",
-            targetTitle: payload.targetTitle || "",
-            targetVisiblePath: payload.targetVisiblePath || "",
-            targetWorkspaceRoot: payload.targetWorkspaceRoot || "",
-            workspaceId: selectedWorkspace.id,
-            workspaceName: selectedWorkspace.name || "",
-          },
-          text: `Spec edit: ${payload.operation || "edit"} ${payload.targetTitle || payload.targetPath || "spec"}`,
-          workspaceId: selectedWorkspace.id,
-        },
-        intentId,
-        workspaceId: selectedWorkspace.id,
-      },
-    }));
-
-    return {
-      intentId,
-      requested,
-    };
-  }, [
-    activatedWorkspace?.id,
-    activatedWorkspaceTerminalWorkingDirectory,
-    defaultWorkingDirectory,
-    selectedWorkspace,
-    selectedWorkspaceFileRoot,
-    workspaceDeactivationState.isActive,
-  ]);
+  const submitSpecEditIntent = useCallback(async () => {
+    throw new Error("Spec editing has been removed. Architecture keeps task history only.");
+  }, []);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
@@ -14263,6 +14555,22 @@ export default function App() {
                       )}
                     </RailCollapseButton>
                   </RailHeader>
+                  {shouldShowAccountScopePicker && !workspaceRailCollapsed && (
+                    <WorkspaceSettingsSelectShell data-rail-selection-preserve="true">
+                      <WorkspaceSettingsSelect
+                        aria-label="Account scope"
+                        onChange={handleAccountScopeChange}
+                        value={activeAccountScopeKey}
+                      >
+                        {accountScopes.map((scope) => (
+                          <option key={accountScopeKey(scope)} value={accountScopeKey(scope)}>
+                            {scope.label}
+                          </option>
+                        ))}
+                      </WorkspaceSettingsSelect>
+                      <WorkspaceSettingsSelectIcon aria-hidden="true" />
+                    </WorkspaceSettingsSelectShell>
+                  )}
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
                       const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
@@ -14365,14 +14673,14 @@ export default function App() {
                         <span>Files</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="Spec Graph"
-                        data-active={activeView === "specGraph"}
-                        onClick={() => showView("specGraph")}
-                        title="Spec Graph"
+                        aria-label="Architecture"
+                        data-active={activeView === "architecture"}
+                        onClick={() => showView("architecture")}
+                        title="Architecture"
                         type="button"
                       >
                         <ButtonForgeIcon aria-hidden="true" />
-                        <span>Spec Graph</span>
+                        <span>Architecture</span>
                       </RailActionButton>
                       <RailActionButton
                         aria-label="MCPs"
@@ -14471,6 +14779,7 @@ export default function App() {
                           agentStatusError={agentStatusError}
                           agentStatuses={agentStatuses}
                           agentStatusState={agentStatusState}
+                          addWorkspaceTerminal={addWorkspaceTerminal}
                           closeWorkspaceTerminal={closeWorkspaceTerminal}
                           changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                           createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
@@ -14552,6 +14861,7 @@ export default function App() {
                             agentStatusError={agentStatusError}
                             agentStatuses={agentStatuses}
                             agentStatusState={agentStatusState}
+                            addWorkspaceTerminal={addWorkspaceTerminal}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}
                             changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                             createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
@@ -14971,7 +15281,7 @@ export default function App() {
                           <SettingsLabel>Hard reset</SettingsLabel>
                           <SettingsValue>Reset cloud SQLite</SettingsValue>
                           <SettingsHint>
-                            Client reset preserves workspace filetree sync. Account reset clears every local cloud SQLite row for the signed-in account except local credit-ledger rows, if present.
+                            Client reset clears this desktop client's cloud runtime state. Account reset clears every local cloud SQLite row for the signed-in account except local credit-ledger rows, if present.
                           </SettingsHint>
                         </div>
                         <AgentReadyPill data-tone="orange">
@@ -14990,8 +15300,8 @@ export default function App() {
                           <strong>{cloudSqliteResetTargetName || "No workspace"}</strong>
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
-                          <span>Preserved</span>
-                          <strong>Client filetree only</strong>
+                          <span>Graph</span>
+                          <strong>Architecture history</strong>
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Remote</span>
@@ -15203,25 +15513,23 @@ export default function App() {
                     <WorkspaceIdleState detail="Select a workspace to browse files." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "specGraph" ? (
-                <ForgeWorkspace aria-label="Workspace Spec Graph" data-motion={viewMotion}>
+              ) : visibleView === "architecture" ? (
+                <ForgeWorkspace aria-label="Workspace Architecture" data-motion={viewMotion}>
                   {selectedWorkspace ? (
-                    <SpecGraphWorkspaceView
+                    <ArchitectureWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       isWorkspaceActive={Boolean(
                         isSelectedWorkspaceActivated
                         && !workspaceDeactivationState.isActive,
                       )}
-                      onSubmitSpecEditIntent={submitSpecEditIntent}
-                      pendingSpecEdits={selectedWorkspacePendingSpecEdits}
                       rootDirectory={selectedWorkspaceFileRoot}
-                      specGraphError={selectedWorkspaceGraphState.specError || ""}
-                      specGraphSnapshot={selectedWorkspaceGraphState.specSnapshot || null}
-                      specGraphState={selectedWorkspaceGraphState.specState || "idle"}
+                      architectureError={selectedWorkspaceGraphState.architectureError || ""}
+                      architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
+                      architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
                       workspace={selectedWorkspace}
                     />
                   ) : (
-                    <WorkspaceIdleState detail="Select a workspace to view the spec graph." viewMotion={viewMotion} />
+                    <WorkspaceIdleState detail="Select a workspace to view architecture history." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (
@@ -15272,6 +15580,102 @@ export default function App() {
                 null
               )}
                 </WorkspaceViewPane>
+                {shouldShowWorkspaceGitPullPrompt && (
+                  <WorkspaceGitPullOverlay aria-label="Git pull prompt">
+                    <WorkspaceGitPullDialog
+                      aria-busy={isWorkspaceGitPullPromptBusy}
+                      aria-labelledby="workspace-git-pull-title"
+                      aria-modal="true"
+                      role="dialog"
+                    >
+                      <WorkspaceGitPullHeader>
+                        <div>
+                          <PanelKicker>Git updates</PanelKicker>
+                          <PanelHeading id="workspace-git-pull-title">Pull latest changes?</PanelHeading>
+                        </div>
+                        <AgentReadyPill data-tone="blue">
+                          {isWorkspaceGitPullPromptBusy ? (
+                            <PendingIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          )}
+                          <span>
+                            {workspaceGitPullPrompt.repositories.length} repo{workspaceGitPullPrompt.repositories.length === 1 ? "" : "s"}
+                          </span>
+                        </AgentReadyPill>
+                      </WorkspaceGitPullHeader>
+
+                      <WorkspaceGitPullSummary>
+                        <span>
+                          {workspaceGitPullSelectedCount} selected for fast-forward pull.
+                        </span>
+                        {workspaceGitPullPrompt.blockedCount > 0 && (
+                          <span>
+                            {workspaceGitPullPrompt.blockedCount} repo{workspaceGitPullPrompt.blockedCount === 1 ? "" : "s"} need manual review.
+                          </span>
+                        )}
+                      </WorkspaceGitPullSummary>
+
+                      {workspaceGitPullPrompt.error && (
+                        <FormMessage $state="error">{workspaceGitPullPrompt.error}</FormMessage>
+                      )}
+
+                      <WorkspaceGitPullList aria-label="Repositories available to pull">
+                        {workspaceGitPullPrompt.repositories.map((repository) => {
+                          const selected = Boolean(workspaceGitPullPrompt.selected?.[repository.path]);
+                          const label = repository.relativePath || repository.name;
+
+                          return (
+                            <WorkspaceGitPullRow data-selected={selected ? "true" : undefined} key={repository.path}>
+                              <input
+                                checked={selected}
+                                disabled={isWorkspaceGitPullPromptBusy}
+                                onChange={() => toggleWorkspaceGitPullRepository(repository.path)}
+                                type="checkbox"
+                              />
+                              <div>
+                                <strong>{label}</strong>
+                                <WorkspaceGitPullRepoMeta>
+                                  <span>{repository.branch || "branch"}</span>
+                                  {repository.upstream && <span>{repository.upstream}</span>}
+                                  <span>{repository.behind} behind</span>
+                                </WorkspaceGitPullRepoMeta>
+                                {repository.reason && <small>{repository.reason}</small>}
+                              </div>
+                            </WorkspaceGitPullRow>
+                          );
+                        })}
+                      </WorkspaceGitPullList>
+
+                      <WorkspaceGitPullActions>
+                        <SecondaryButton
+                          disabled={isWorkspaceGitPullPromptBusy}
+                          onClick={skipWorkspaceGitPullPrompt}
+                          type="button"
+                        >
+                          <ButtonCloseIcon aria-hidden="true" />
+                          <span>Skip</span>
+                        </SecondaryButton>
+                        <PrimaryButton
+                          disabled={isWorkspaceGitPullPromptBusy || workspaceGitPullSelectedCount === 0}
+                          onClick={pullSelectedWorkspaceGitRepositories}
+                          type="button"
+                        >
+                          {isWorkspaceGitPullPromptBusy ? (
+                            <PendingIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonRefreshIcon aria-hidden="true" />
+                          )}
+                          <span>
+                            {isWorkspaceGitPullPromptBusy
+                              ? "Pulling..."
+                              : `Pull selected (${workspaceGitPullSelectedCount})`}
+                          </span>
+                        </PrimaryButton>
+                      </WorkspaceGitPullActions>
+                    </WorkspaceGitPullDialog>
+                  </WorkspaceGitPullOverlay>
+                )}
               </WorkspaceViewStack>
               {isWorkspaceSettingsOpen && (
                 <WorkspaceSettingsOverlay

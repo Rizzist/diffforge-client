@@ -24275,8 +24275,8 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_else(|_| json!({}));
         let body = if path == "/v1/events" {
             json!({"data": fake_cloud_response_data("event", &request_json, default_task_id.as_str(), omit_task_id)})
-        } else if path == "/v1/spec/graph" {
-            json!({"data": fake_cloud_response_data("spec_graph", &request_json, default_task_id.as_str(), omit_task_id)})
+        } else if path == "/v1/architecture/history" {
+            json!({"data": fake_cloud_response_data("architecture_history", &request_json, default_task_id.as_str(), omit_task_id)})
         } else {
             json!({"data": {"ok": true}})
         }
@@ -24312,16 +24312,13 @@ mod tests {
                     "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
                 })
             }
-        } else if kind == "spec_graph" {
+        } else if kind == "architecture_history" {
             json!({
-                "kind": "project_spec_graph",
-                "version": 3,
+                "kind": "architecture_task_history",
+                "version": 1,
                 "repo_id": "repo-test",
                 "workspace_id": "workspace-test",
-                "graph_stats": {},
-                "agent_work": {},
-                "nodes": [],
-                "edges": []
+                "tasks": []
             })
         } else {
             json!({"ok": true})

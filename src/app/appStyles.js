@@ -9565,6 +9565,192 @@ export const WorkspaceSettingsBusyPanel = styled.section`
   }
 `;
 
+export const WorkspaceGitPullOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: 18px;
+  background:
+    linear-gradient(90deg, rgba(3, 5, 8, 0.64), rgba(3, 5, 8, 0.34)),
+    rgba(7, 9, 13, 0.64);
+  backdrop-filter: blur(12px);
+  animation: ${panelEnter} 160ms ease both;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(245, 245, 247, 0.72);
+    backdrop-filter: saturate(180%) blur(18px);
+  }
+`;
+
+export const WorkspaceGitPullDialog = styled.aside`
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  width: min(660px, 100%);
+  max-height: min(720px, 100%);
+  min-width: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(34, 211, 238, 0.055), rgba(255, 122, 24, 0.025)),
+    rgba(8, 13, 20, 0.98);
+  box-shadow:
+    0 24px 80px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border-strong);
+    background: var(--forge-surface);
+    box-shadow: 0 18px 52px rgba(15, 23, 42, 0.14);
+  }
+`;
+
+export const WorkspaceGitPullHeader = styled.header`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    flex-direction: column;
+  }
+`;
+
+export const WorkspaceGitPullSummary = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  color: var(--forge-text-muted);
+  font-size: 13px;
+  font-weight: 760;
+
+  span {
+    padding: 6px 8px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.42);
+  }
+
+  html[data-forge-theme="light"] & span {
+    background: rgba(241, 245, 249, 0.88);
+  }
+`;
+
+export const WorkspaceGitPullList = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  max-height: min(360px, 42vh);
+  overflow: auto;
+`;
+
+export const WorkspaceGitPullRow = styled.label`
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.45);
+  color: var(--forge-text);
+  cursor: pointer;
+
+  &[data-selected="true"] {
+    border-color: rgba(45, 212, 191, 0.34);
+    background:
+      linear-gradient(180deg, rgba(20, 184, 166, 0.11), rgba(15, 23, 42, 0.42)),
+      rgba(15, 23, 42, 0.52);
+  }
+
+  input {
+    width: 16px;
+    height: 16px;
+    margin: 2px 0 0;
+    accent-color: #2dd4bf;
+  }
+
+  strong {
+    display: block;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--forge-text);
+    font-size: 14px;
+    font-weight: 850;
+    line-height: 1.25;
+  }
+
+  small {
+    display: block;
+    min-width: 0;
+    margin-top: 6px;
+    overflow-wrap: anywhere;
+    color: var(--forge-text-muted);
+    font-size: 12px;
+    font-weight: 720;
+    line-height: 1.35;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.82);
+  }
+
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: rgba(236, 253, 245, 0.78);
+  }
+`;
+
+export const WorkspaceGitPullRepoMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  margin-top: 7px;
+
+  span {
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    padding: 4px 7px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+    color: var(--forge-text-muted);
+    background: rgba(2, 6, 23, 0.32);
+    font-size: 11px;
+    font-weight: 820;
+    line-height: 1.15;
+  }
+
+  html[data-forge-theme="light"] & span {
+    background: rgba(241, 245, 249, 0.88);
+  }
+`;
+
+export const WorkspaceGitPullActions = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    flex-direction: column-reverse;
+
+    button {
+      width: 100%;
+      justify-content: center;
+    }
+  }
+`;
+
 export const WorkspaceSettingsDialogHeader = styled.header`
   display: flex;
   min-width: 0;

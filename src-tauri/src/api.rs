@@ -115,6 +115,53 @@ async fn validate_desktop_session(token: String) -> Result<Value, String> {
     read_api_response(response, "Desktop session expired.").await
 }
 
+fn clean_account_scope_type(value: Option<String>) -> String {
+    match value
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "team" => "team".to_string(),
+        _ => "personal".to_string(),
+    }
+}
+
+fn clean_account_team_id(value: Option<String>) -> Option<String> {
+    let clean = value
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(64)
+        .collect::<String>();
+
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn clean_account_scope(
+    scope_type: Option<String>,
+    team_id: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    let scope_type = clean_account_scope_type(scope_type);
+    let team_id = clean_account_team_id(team_id);
+
+    if scope_type == "team" && team_id.is_none() {
+        return Err("Team workspace scope requires a team id.".to_string());
+    }
+
+    Ok((scope_type, team_id))
+}
+
 #[tauri::command]
 async fn logout_desktop_session(token: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
@@ -131,13 +178,25 @@ async fn logout_desktop_session(token: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn list_workspaces(token: String) -> Result<Value, String> {
+async fn list_workspaces(
+    token: String,
+    scope_type: Option<String>,
+    team_id: Option<String>,
+) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
+    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let response = client
+    let mut request = client
         .get(format!("{API_BASE_URL}/desktop/workspaces"))
         .bearer_auth(token)
+        .query(&[("scopeType", scope_type.as_str())]);
+
+    if let Some(team_id) = team_id.as_deref() {
+        request = request.query(&[("teamId", team_id)]);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|error| format!("Unable to fetch workspaces: {error}"))?;
@@ -289,10 +348,16 @@ async fn record_desktop_connection_diagnostic(
 }
 
 #[tauri::command]
-async fn create_workspace(token: String, name: String) -> Result<Value, String> {
+async fn create_workspace(
+    token: String,
+    name: String,
+    scope_type: Option<String>,
+    team_id: Option<String>,
+) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
 
     let workspace_name = clean_workspace_name(name)?;
+    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
@@ -300,6 +365,8 @@ async fn create_workspace(token: String, name: String) -> Result<Value, String> 
         .bearer_auth(token)
         .json(&CreateWorkspaceRequest {
             name: &workspace_name,
+            scope_type: Some(scope_type.as_str()),
+            team_id: team_id.as_deref(),
         })
         .send()
         .await
@@ -313,11 +380,14 @@ async fn update_workspace(
     token: String,
     workspace_id: String,
     name: String,
+    scope_type: Option<String>,
+    team_id: Option<String>,
 ) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
 
     let workspace_id = clean_workspace_id(workspace_id)?;
     let workspace_name = clean_workspace_name(name)?;
+    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
@@ -326,6 +396,8 @@ async fn update_workspace(
         .json(&UpdateWorkspaceRequest {
             workspace_id: &workspace_id,
             name: &workspace_name,
+            scope_type: Some(scope_type.as_str()),
+            team_id: team_id.as_deref(),
         })
         .send()
         .await
@@ -335,10 +407,16 @@ async fn update_workspace(
 }
 
 #[tauri::command]
-async fn delete_workspace(token: String, workspace_id: String) -> Result<Value, String> {
+async fn delete_workspace(
+    token: String,
+    workspace_id: String,
+    scope_type: Option<String>,
+    team_id: Option<String>,
+) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
 
     let workspace_id = clean_workspace_id(workspace_id)?;
+    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
 
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
@@ -346,6 +424,8 @@ async fn delete_workspace(token: String, workspace_id: String) -> Result<Value, 
         .bearer_auth(token)
         .json(&DeleteWorkspaceRequest {
             workspace_id: &workspace_id,
+            scope_type: Some(scope_type.as_str()),
+            team_id: team_id.as_deref(),
         })
         .send()
         .await
