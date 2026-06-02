@@ -33,6 +33,8 @@ const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_VERSION: u64 = 1;
 const CLOUD_MCP_LOCAL_IGNORED_OVERLAY_FILE: &str = "local-ignored-whitelist.json";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
+const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
+const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -49,6 +51,7 @@ struct CloudMcpState {
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     remote_command_listener_started: Arc<AtomicBool>,
+    remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Default)]
@@ -289,6 +292,7 @@ impl CloudMcpState {
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
+            remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1700,6 +1704,54 @@ fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
     .any(|value| value == target_device_id)
 }
 
+fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
+    let command_id = cloud_mcp_payload_text(event, &["command_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["commandId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandId"]))?
+        .trim()
+        .to_string();
+    if command_id.is_empty() {
+        return None;
+    }
+
+    let client_id = cloud_mcp_payload_text(event, &["client_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["clientId"]))
+        .unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]))
+        .unwrap_or_default();
+    Some(format!("{}::{}::{}", client_id.trim(), workspace_id.trim(), command_id))
+}
+
+async fn cloud_mcp_claim_remote_command_receipt(state: &CloudMcpState, event: &Value) -> bool {
+    let Some(receipt_key) = cloud_mcp_remote_command_receipt_key(event) else {
+        return true;
+    };
+
+    let now = cloud_mcp_now_ms();
+    let mut receipts = state.remote_command_receipts.lock().await;
+    receipts.retain(|_, received_ms| {
+        now.saturating_sub(*received_ms) <= CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS
+    });
+    if receipts.contains_key(&receipt_key) {
+        return false;
+    }
+    if receipts.len() >= CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX {
+        if let Some(oldest_key) = receipts
+            .iter()
+            .min_by_key(|(_, received_ms)| *received_ms)
+            .map(|(key, _)| key.clone())
+        {
+            receipts.remove(&oldest_key);
+        }
+    }
+    receipts.insert(receipt_key, now);
+    true
+}
+
 async fn cloud_mcp_send_remote_command_status_event(
     state: &CloudMcpState,
     event: &Value,
@@ -1858,6 +1910,16 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if !cloud_mcp_remote_command_matches_device(&event) {
+                continue;
+            }
+            if !cloud_mcp_claim_remote_command_receipt(&state_clone, &event).await {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state_clone,
+                    &event,
+                    "duplicate_ignored",
+                    "Duplicate remote command ignored by desktop.",
+                )
+                .await;
                 continue;
             }
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
@@ -11760,6 +11822,28 @@ mod cloud_mcp_tests {
             modified_ms: None,
             references: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn remote_command_receipt_claim_dedupes_command_ids() {
+        let state = CloudMcpState::new();
+        let event = json!({
+            "client_id": "client-1",
+            "workspace_id": "workspace-1",
+            "command_id": "remote-command-123",
+            "event_kind": "remote_command_requested",
+        });
+
+        assert!(cloud_mcp_claim_remote_command_receipt(&state, &event).await);
+        assert!(!cloud_mcp_claim_remote_command_receipt(&state, &event).await);
+
+        let other_workspace = json!({
+            "client_id": "client-1",
+            "workspace_id": "workspace-2",
+            "command_id": "remote-command-123",
+            "event_kind": "remote_command_requested",
+        });
+        assert!(cloud_mcp_claim_remote_command_receipt(&state, &other_workspace).await);
     }
 
     #[test]

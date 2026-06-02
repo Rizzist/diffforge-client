@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appendWorkspaceThreadProjectionEvents,
+  clearWorkspaceThreadPendingPrompt,
   hydrateWorkspaceThreadSessionTranscript,
   markWorkspaceThreadAgentActivity,
   materializeWorkspaceThreadForTerminal,
@@ -231,6 +232,114 @@ test("session acceptance clears a locally pending submitted prompt", () => {
   assert.equal(acceptedThread.pendingPrompt, null);
   assert.equal(acceptedThread.latestTurn.state, "running");
   assert.equal(acceptedThread.activityStatus, "thinking");
+});
+
+test("session acceptance clears pending prompts when transcript ids include the thread prefix", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-d8811d42-91b5-448a-99df-47c238ef5dc4-2-43b4a654-e98c-482e-959e-061087816685";
+  const promptId = "todo-drop-prompt-mpwi1po9-7c820d2f1dfda";
+  const prefixedPromptId = `${threadId}-${promptId}`;
+  const submittedAt = "2026-06-02T14:02:12.000Z";
+  const sessionId = "session-test";
+
+  const materialized = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 1,
+    messageCreatedAt: submittedAt,
+    messageId: promptId,
+    paneId: "pane-test",
+    pendingPromptDeliveryMode: "session-acceptance",
+    pendingPromptId: promptId,
+    pendingPromptText: "Queued command",
+    promptEventId: promptId,
+    promptEventSubmittedAt: submittedAt,
+    sessionAcceptancePending: true,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Queued command",
+    workspaceId,
+  });
+
+  const accepted = hydrateWorkspaceThreadSessionTranscript(materialized, {
+    agentId: "codex",
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "Queued command",
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: submittedAt,
+      id: prefixedPromptId,
+      role: "user",
+      text: "Queued command",
+    }],
+    promptAccepted: true,
+    promptEventId: prefixedPromptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    threadId,
+    workspaceId,
+  });
+
+  assert.equal(accepted[workspaceId].threads[threadId].pendingPrompt, null);
+});
+
+test("prompt clear accepts canonical pending ids without keeping a stale prompt", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "todo-drop-prompt-mpwi1po9-7c820d2f1dfda";
+  const prefixedPromptId = `${threadId}-${promptId}`;
+  const state = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    messageId: promptId,
+    pendingPromptId: promptId,
+    pendingPromptText: "Queued command",
+    sessionAcceptancePending: true,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Queued command",
+    workspaceId,
+  });
+
+  const cleared = clearWorkspaceThreadPendingPrompt(state, {
+    promptEventId: prefixedPromptId,
+    threadId,
+    workspaceId,
+  });
+
+  assert.equal(cleared[workspaceId].threads[threadId].pendingPrompt, null);
+});
+
+test("accepted materialization does not reinstall a pending prompt", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "todo-drop-prompt-accepted";
+  const submittedAt = "2026-06-02T14:02:12.000Z";
+
+  const materialized = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 1,
+    messageCreatedAt: submittedAt,
+    messageId: promptId,
+    paneId: "pane-test",
+    pendingPromptDeliveryMode: "session-acceptance",
+    pendingPromptId: promptId,
+    pendingPromptText: "Already sent",
+    promptEventId: promptId,
+    promptEventSubmittedAt: submittedAt,
+    sessionAcceptancePending: false,
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "Already sent",
+    workspaceId,
+  });
+
+  const thread = materialized[workspaceId].threads[threadId];
+  assert.equal(thread.pendingPrompt, null);
+  assert.equal(thread.latestTurn.state, "running");
 });
 
 test("message submission persists the actual submitted user prompt", () => {

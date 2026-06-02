@@ -870,6 +870,8 @@ const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
+const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
+const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
@@ -1036,15 +1038,20 @@ function getLatestWorkspaceThreadUserMessage(thread) {
 }
 
 function getPromptEventIdFromRunningThread(thread) {
-  const latestTurn = thread?.latestTurn || null;
-  const turnId = String(latestTurn?.turnId || "").trim();
-  if (turnId.startsWith("turn-")) {
-    return turnId.slice(5);
+  const pendingPromptId = String(thread?.pendingPrompt?.id || "").trim();
+  if (pendingPromptId) {
+    return pendingPromptId;
   }
 
+  const latestTurn = thread?.latestTurn || null;
   const messageId = String(latestTurn?.messageId || "").trim();
   if (messageId) {
     return messageId;
+  }
+
+  const turnId = String(latestTurn?.turnId || "").trim();
+  if (turnId.startsWith("turn-")) {
+    return turnId.slice(5);
   }
 
   const latestUserMessageId = String(getLatestWorkspaceThreadUserMessage(thread)?.id || "").trim();
@@ -4084,6 +4091,7 @@ export default function App() {
   const terminalStatusEventSeqRef = useRef(new Map());
   const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
+  const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const workspaceCloudSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
@@ -10781,6 +10789,43 @@ export default function App() {
         || selectedWorkspaceIdRef.current
         || "";
     };
+    const remoteCommandReceiptKey = (event, commandId, workspaceId) => [
+      remoteCommandStringField(event, ["client_id", "clientId"]),
+      workspaceId,
+      commandId,
+    ].map((value) => String(value || "").trim()).join("::");
+    const claimRemoteCommandReceipt = (event, commandId, workspaceId) => {
+      const receiptKey = remoteCommandReceiptKey(event, commandId, workspaceId);
+      if (!commandId || !receiptKey.endsWith(`::${commandId}`)) {
+        return true;
+      }
+      const now = Date.now();
+      const receipts = remoteCommandReceiptsRef.current;
+      for (const [key, receivedAtMs] of receipts.entries()) {
+        if (now - Number(receivedAtMs || 0) > CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS) {
+          receipts.delete(key);
+        }
+      }
+      if (receipts.has(receiptKey)) {
+        return false;
+      }
+      if (receipts.size >= CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX) {
+        let oldestKey = "";
+        let oldestMs = Number.POSITIVE_INFINITY;
+        for (const [key, receivedAtMs] of receipts.entries()) {
+          const receiptMs = Number(receivedAtMs || 0);
+          if (receiptMs < oldestMs) {
+            oldestMs = receiptMs;
+            oldestKey = key;
+          }
+        }
+        if (oldestKey) {
+          receipts.delete(oldestKey);
+        }
+      }
+      receipts.set(receiptKey, now);
+      return true;
+    };
 
     const startRemoteCommandListener = async () => {
       try {
@@ -10857,6 +10902,20 @@ export default function App() {
               message: !workspaceId
                 ? "No local workspace is available for the remote command."
                 : "Remote command did not include a task message.",
+            }).catch(() => {});
+            return;
+          }
+          if (!claimRemoteCommandReceipt(event, commandId, workspaceId)) {
+            logBigViewSyncDiagnosticEvent("remote_control.duplicate_ignored", {
+              commandId,
+              source: "app_shell",
+              surface: "remote_command_listener",
+              workspaceId,
+            });
+            await invoke("cloud_mcp_record_remote_command_status", {
+              event,
+              status: "duplicate_ignored",
+              message: "Duplicate remote command ignored by desktop UI.",
             }).catch(() => {});
             return;
           }

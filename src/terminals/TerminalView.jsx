@@ -768,6 +768,15 @@ const TerminalSurfaceSlot = styled.div`
 `;
 
 const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
+const TODO_QUEUE_REMOTE_COMMAND_RECEIPTS_PREFIX = "diffforge.todoQueue.remoteCommandReceipts.v1";
+const TODO_QUEUE_REMOTE_COMMAND_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
+const TODO_QUEUE_REMOTE_COMMAND_RECEIPT_MAX_ITEMS = 400;
+const TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES = new Set([
+  "queued",
+  "sending",
+  "submitted",
+  "completed",
+]);
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
 const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
@@ -2961,6 +2970,14 @@ function getTodoQueueStorageKey(workspaceId) {
   return `${TODO_QUEUE_STORAGE_PREFIX}.${safeWorkspaceId}`;
 }
 
+function getTodoQueueRemoteCommandReceiptStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+
+  return `${TODO_QUEUE_REMOTE_COMMAND_RECEIPTS_PREFIX}.${safeWorkspaceId}`;
+}
+
 function getOrchestratorVoiceHistoryWorkspaceId(workspaceId) {
   return String(workspaceId || "default").trim() || "default";
 }
@@ -4942,6 +4959,90 @@ function writeTodoQueueItems(storageKey, items) {
   } catch {
     // The queue is a convenience layer; storage failures should not interrupt terminal work.
   }
+}
+
+function normalizeTodoQueueRemoteCommandReceiptStatus(value) {
+  const status = String(value || "").trim().toLowerCase();
+  return [
+    "queued",
+    "sending",
+    "submitted",
+    "completed",
+    "failed",
+    "duplicate_ignored",
+  ].includes(status) ? status : "queued";
+}
+
+function pruneTodoQueueRemoteCommandReceipts(receipts, nowMs = Date.now()) {
+  const entries = Object.entries(receipts && typeof receipts === "object" ? receipts : {})
+    .map(([key, receipt]) => {
+      const receivedAtMs = Number(receipt?.receivedAtMs || receipt?.updatedAtMs || 0);
+      const updatedAtMs = Number(receipt?.updatedAtMs || receivedAtMs || 0);
+      if (!key || !updatedAtMs || nowMs - updatedAtMs > TODO_QUEUE_REMOTE_COMMAND_RECEIPT_TTL_MS) {
+        return null;
+      }
+      return [key, {
+        commandId: String(receipt?.commandId || key),
+        itemId: String(receipt?.itemId || ""),
+        receivedAtMs,
+        status: normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status),
+        text: String(receipt?.text || "").slice(0, 180),
+        updatedAtMs,
+        workspaceId: String(receipt?.workspaceId || ""),
+      }];
+    })
+    .filter(Boolean)
+    .sort((left, right) => Number(right[1].updatedAtMs || 0) - Number(left[1].updatedAtMs || 0))
+    .slice(0, TODO_QUEUE_REMOTE_COMMAND_RECEIPT_MAX_ITEMS);
+
+  return Object.fromEntries(entries);
+}
+
+function readTodoQueueRemoteCommandReceipts(storageKey) {
+  if (!canUseTodoQueueStorage()) {
+    return {};
+  }
+
+  try {
+    return pruneTodoQueueRemoteCommandReceipts(JSON.parse(window.localStorage.getItem(storageKey) || "{}"));
+  } catch {
+    return {};
+  }
+}
+
+function writeTodoQueueRemoteCommandReceipts(storageKey, receipts) {
+  if (!canUseTodoQueueStorage()) {
+    return;
+  }
+
+  try {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify(pruneTodoQueueRemoteCommandReceipts(receipts)),
+    );
+  } catch {
+    // Receipt storage is only an idempotency cache; queue flow should continue without it.
+  }
+}
+
+function getTodoQueueRemoteCommandId(item) {
+  return String(item?.remoteCommand?.commandId || item?.remoteCommand?.id || item?.id || "").trim();
+}
+
+function getTodoQueueRemoteCommandReceiptKey(item, workspaceId = "") {
+  const commandId = getTodoQueueRemoteCommandId(item);
+  if (!commandId || normalizeTodoQueueSource(item?.source) !== TODO_QUEUE_SOURCE_REMOTE_CONTROL) {
+    return "";
+  }
+  return commandId;
+}
+
+function todoQueueRemoteCommandReceiptBlocks(receipt) {
+  if (!receipt) {
+    return false;
+  }
+  const status = normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status);
+  return TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES.has(status);
 }
 
 async function readOrchestratorVoiceHistoryItemsFromAgents({
@@ -7374,6 +7475,8 @@ function TerminalView({
   const todoQueueItemsRef = useRef([]);
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
+  const todoQueueRemoteCommandReceiptsRef = useRef({});
+  const todoQueueRemoteCommandReceiptStorageKeyRef = useRef("");
   const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
   const todoQueueLiveTerminalsRef = useRef(new Map());
   const todoQueueTerminalReservationsRef = useRef(new Map());
@@ -7387,8 +7490,13 @@ function TerminalView({
     () => getTodoQueueStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
+  const todoQueueRemoteCommandReceiptStorageKey = useMemo(
+    () => getTodoQueueRemoteCommandReceiptStorageKey(terminalWorkspace?.id),
+    [terminalWorkspace?.id],
+  );
   todoQueueItemsRef.current = todoQueueItems;
   todoQueueStorageKeyRef.current = todoQueueStorageKey;
+  todoQueueRemoteCommandReceiptStorageKeyRef.current = todoQueueRemoteCommandReceiptStorageKey;
   const visibleTodoQueueItems = useMemo(() => (
     todoQueueItems.filter((item) => {
       const pendingItem = todoQueuePendingItems[item.id] || null;
@@ -7407,6 +7515,43 @@ function TerminalView({
     todoQueuePendingItemsRef.current = normalizedPendingItems;
     setTodoQueuePendingItems(normalizedPendingItems);
   }, []);
+
+  useEffect(() => {
+    const receipts = readTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKey);
+    todoQueueRemoteCommandReceiptsRef.current = receipts;
+    writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKey, receipts);
+  }, [todoQueueRemoteCommandReceiptStorageKey]);
+
+  const recordTodoQueueRemoteCommandReceipt = useCallback((item, status, fields = {}) => {
+    const workspaceId = String(fields.workspaceId || item?.workspaceId || terminalWorkspace?.id || "").trim();
+    const receiptKey = getTodoQueueRemoteCommandReceiptKey(item, workspaceId);
+    if (!receiptKey) {
+      return "";
+    }
+
+    const nowMs = Date.now();
+    const currentReceipts = pruneTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptsRef.current, nowMs);
+    const existingReceipt = currentReceipts[receiptKey] || null;
+    const nextReceipt = {
+      commandId: getTodoQueueRemoteCommandId(item),
+      itemId: String(item?.id || item?.itemId || existingReceipt?.itemId || ""),
+      receivedAtMs: Number(existingReceipt?.receivedAtMs || nowMs),
+      status: normalizeTodoQueueRemoteCommandReceiptStatus(status),
+      text: normalizeTodoQueueText(item?.text || existingReceipt?.text || "").slice(0, 180),
+      updatedAtMs: nowMs,
+      workspaceId,
+    };
+    const nextReceipts = pruneTodoQueueRemoteCommandReceipts({
+      ...currentReceipts,
+      [receiptKey]: nextReceipt,
+    }, nowMs);
+    todoQueueRemoteCommandReceiptsRef.current = nextReceipts;
+    writeTodoQueueRemoteCommandReceipts(
+      todoQueueRemoteCommandReceiptStorageKeyRef.current,
+      nextReceipts,
+    );
+    return receiptKey;
+  }, [terminalWorkspace?.id]);
 
   const updateWorkspaceFileDragState = useCallback((nextState) => {
     workspaceFileDragStateRef.current = nextState || null;
@@ -8076,6 +8221,12 @@ function TerminalView({
     }
 
     if (reason === "terminal_confirmed_finished") {
+      const completedItem = todoQueueItemsRef.current.find((item) => item.id === itemId) || null;
+      if (completedItem) {
+        recordTodoQueueRemoteCommandReceipt(completedItem, "completed", {
+          workspaceId: pendingItem?.workspaceId || terminalWorkspace?.id || "",
+        });
+      }
       if (pendingItem) {
         logTerminalStatus("frontend.todo_queue.pending_clear", {
           elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
@@ -8128,6 +8279,12 @@ function TerminalView({
       timeoutMs: 0,
       workspaceId: String(pendingItem?.workspaceId || fields.workspaceId || terminalWorkspace?.id || ""),
     };
+    const requeuedItem = todoQueueItemsRef.current.find((item) => item.id === itemId) || null;
+    if (requeuedItem) {
+      recordTodoQueueRemoteCommandReceipt(requeuedItem, "queued", {
+        workspaceId: requeuedPendingItem.workspaceId,
+      });
+    }
     replaceTodoQueuePendingItems({
       ...todoQueuePendingItemsRef.current,
       [itemId]: requeuedPendingItem,
@@ -8156,7 +8313,7 @@ function TerminalView({
       ...fields,
     });
     setTodoQueueDispatchRevision((revision) => revision + 1);
-  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id]);
+  }, [recordTodoQueueRemoteCommandReceipt, replaceTodoQueuePendingItems, terminalWorkspace?.id]);
 
   const getTodoQueueTerminalSendTarget = useCallback((terminalIndex, item = null, options = {}) => {
     const targetTerminalIndex = Number(terminalIndex);
@@ -9228,6 +9385,19 @@ function TerminalView({
     if (!pendingItem) {
       return;
     }
+    const remoteReceiptStatus = reason === "consumed" || reason === "terminal_confirmed_finished"
+      ? "completed"
+      : reason === "error"
+        ? "failed"
+        : "";
+    if (remoteReceiptStatus) {
+      const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
+      if (item) {
+        recordTodoQueueRemoteCommandReceipt(item, remoteReceiptStatus, {
+          workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
+        });
+      }
+    }
 
     logBigViewSyncDiagnosticEvent("tui.text.todo_pending_clear", {
       elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
@@ -9261,7 +9431,12 @@ function TerminalView({
           : item
       ))
     ));
-  }, [replaceTodoQueuePendingItems, terminalWorkspace?.id, updateTodoQueueItems]);
+  }, [
+    recordTodoQueueRemoteCommandReceipt,
+    replaceTodoQueuePendingItems,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
 
   const setTodoQueueItemPending = useCallback((itemId, fields = {}) => {
     const safeItemId = String(itemId || "").trim();
@@ -11622,6 +11797,36 @@ function TerminalView({
         return;
       }
 
+      const receiptKey = getTodoQueueRemoteCommandReceiptKey(item, terminalWorkspace.id);
+      const receipt = receiptKey
+        ? todoQueueRemoteCommandReceiptsRef.current[receiptKey] || null
+        : null;
+      if (receiptKey && todoQueueRemoteCommandReceiptBlocks(receipt)) {
+        logBigViewSyncDiagnosticEvent("remote_control.queue_duplicate_skip", {
+          commandId: detail.commandId || item.remoteCommand?.commandId || item.id,
+          item: getTodoQueueItemLogSummary([item])[0] || null,
+          receiptStatus: receipt?.status || "",
+          receiptUpdatedAtMs: Number(receipt?.updatedAtMs || 0),
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          targetAgentId: getTodoQueueTargetAgentId(item),
+          targetColorSlot: getTodoQueueTargetColorSlot(item),
+          targetTerminalColor: getTodoQueueTargetTerminalColor(item),
+          targetTerminalId: getTodoQueueTargetTerminalId(item),
+          targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+          targetThreadId: getTodoQueueTargetThreadId(item),
+          workspaceId: terminalWorkspace.id,
+        });
+        logTerminalStatus("frontend.todo_queue.remote_duplicate_skip", {
+          commandId: detail.commandId || item.remoteCommand?.commandId || item.id,
+          itemId: item.id,
+          receiptStatus: receipt?.status || "",
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          targetTerminalIndex: getTodoQueueTargetTerminalIndex(item) ?? "",
+          workspaceId: terminalWorkspace.id,
+        });
+        return;
+      }
+
       const duplicateItem = todoQueueItemsRef.current.find((candidate) => (
         candidate.id === item.id || todoQueueRemoteItemsMatch(candidate, item)
       ));
@@ -11651,6 +11856,9 @@ function TerminalView({
         return;
       }
 
+      recordTodoQueueRemoteCommandReceipt(item, "queued", {
+        workspaceId: terminalWorkspace.id,
+      });
       updateTodoQueueItems((currentItems) => (
         currentItems
           .filter((candidate) => candidate.id !== item.id)
@@ -11690,6 +11898,7 @@ function TerminalView({
       window.removeEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
     };
   }, [
+    recordTodoQueueRemoteCommandReceipt,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -11990,6 +12199,9 @@ function TerminalView({
     const source = getTodoQueueItemAutoQueueSource(queuedItem);
     const targetTerminalIndex = target.targetTerminalIndex;
     todoQueueDispatchingRef.current = true;
+    recordTodoQueueRemoteCommandReceipt(queuedItem, "sending", {
+      workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+    });
     logTerminalStatus("frontend.todo_queue.dispatch_start", {
       agentInputReady: Boolean(target.agentInputReady),
       effectiveLatestTurnState: target.effectiveLatestTurnState || "",
@@ -12051,6 +12263,9 @@ function TerminalView({
             workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
           });
           if (terminalSubmitConfirmed) {
+            recordTodoQueueRemoteCommandReceipt(queuedItem, "submitted", {
+              workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+            });
             setTodoQueueItemPending(queuedItem.id, {
               acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
               awaitingSessionAcceptance: !sessionAccepted,
@@ -12089,6 +12304,9 @@ function TerminalView({
           }
 
           const consumeReason = "consumed";
+          recordTodoQueueRemoteCommandReceipt(queuedItem, "completed", {
+            workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+          });
           clearTodoQueueItemPending(queuedItem.id, consumeReason, {
             acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
             awaitingSessionAcceptance: terminalSubmitConfirmed && !sessionAccepted,
@@ -12106,6 +12324,9 @@ function TerminalView({
       .catch((error) => {
         const stillQueued = todoQueueItemsRef.current.some((item) => item.id === queuedItem.id);
         if (stillQueued && isTodoQueueBusyError(error)) {
+          recordTodoQueueRemoteCommandReceipt(queuedItem, "queued", {
+            workspaceId: queuedItem.workspaceId || terminalWorkspace?.id || "",
+          });
           logTerminalStatus("frontend.todo_queue.dispatch_requeued_busy", {
             item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
             message: error?.message || String(error || ""),
@@ -12123,6 +12344,9 @@ function TerminalView({
           return;
         }
 
+        recordTodoQueueRemoteCommandReceipt(queuedItem, "failed", {
+          workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
+        });
         logTerminalStatus("frontend.todo_queue.dispatch_error", {
           item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
           message: error?.message || String(error || ""),
@@ -12180,6 +12404,7 @@ function TerminalView({
     isWorkspaceRuntimeDeactivating,
     logicalTerminalIndexes,
     recordTodoQueueSpecEditCancelled,
+    recordTodoQueueRemoteCommandReceipt,
     recordVoicePlanTaskStatus,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,

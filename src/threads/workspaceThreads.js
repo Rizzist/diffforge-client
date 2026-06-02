@@ -62,6 +62,36 @@ function cleanText(value, fallback = "") {
   return text || fallback;
 }
 
+function promptIdSuffixCanMatch(value) {
+  return /^(todo-drop-prompt|spec-edit|voice-plan-task|voice-plan|prompt|pending-prompt)-/.test(
+    cleanText(value),
+  );
+}
+
+function workspaceThreadPromptIdsMatch(left, right) {
+  const leftId = cleanText(left);
+  const rightId = cleanText(right);
+  if (!leftId || !rightId) {
+    return false;
+  }
+  if (leftId === rightId) {
+    return true;
+  }
+  if (leftId.endsWith(`-${rightId}`) && promptIdSuffixCanMatch(rightId)) {
+    return true;
+  }
+  if (rightId.endsWith(`-${leftId}`) && promptIdSuffixCanMatch(leftId)) {
+    return true;
+  }
+  const [shortId, longId] = leftId.length <= rightId.length
+    ? [leftId, rightId]
+    : [rightId, leftId];
+  if (promptIdSuffixCanMatch(shortId) && longId.includes(shortId)) {
+    return true;
+  }
+  return false;
+}
+
 function promptingUserActive(value, fallback = false) {
   if (typeof value === "boolean") {
     return value;
@@ -3274,13 +3304,19 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     event.title || submittedUserMessage,
     defaultThreadTitle(terminalIndex, agentId),
   );
-  const pendingPrompt = normalizePendingPrompt(event.pendingPrompt || {
+  const rawPendingPrompt = normalizePendingPrompt(event.pendingPrompt || {
     createdAt: event.messageCreatedAt,
     deliveryMode: event.pendingPromptDeliveryMode || event.deliveryMode,
     id: event.pendingPromptId,
     message: event.pendingPromptText || (event.sessionAcceptancePending === true ? submittedUserMessage : ""),
     model: event.model,
   });
+  const pendingPromptWasAccepted = Boolean(
+    event.promptAccepted === true
+      || event.sessionAcceptancePending === false
+      || event.sessionAccepted === true
+  );
+  const pendingPrompt = pendingPromptWasAccepted ? null : rawPendingPrompt;
   const hasSubmittedPrompt = Boolean(submittedUserMessage || pendingPrompt);
   const previousThread = entry.threads[threadId] || null;
   const previousMessages = normalizeThreadMessages(previousThread?.messages);
@@ -3361,11 +3397,14 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       projectionEvents,
       entry.threads[threadId].latestTurn,
     );
+    const nextPendingPrompt = pendingPromptWasAccepted
+      ? null
+      : pendingPrompt || entry.threads[threadId].pendingPrompt;
     const shouldClearOrphanRunning = isOrphanRunningThreadState({
       latestTurn: projectedLatestTurn,
       messageCount: messages.length,
       messages,
-      pendingPrompt: pendingPrompt || entry.threads[threadId].pendingPrompt,
+      pendingPrompt: nextPendingPrompt,
       projectionEvents,
       providerBindings: entry.threads[threadId].providerBindings,
       transcriptSessionId: entry.threads[threadId].transcriptSessionId,
@@ -3413,7 +3452,7 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       latestTurn,
       messageCount: messages.length,
       messages,
-      pendingPrompt: pendingPrompt || entry.threads[threadId].pendingPrompt,
+      pendingPrompt: nextPendingPrompt,
       projectionEvents,
       freshSessionStartedAt,
       providerBindings,
@@ -4465,8 +4504,8 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
     return state || {};
   }
 
-  const promptId = cleanText(event.pendingPromptId || event.promptId);
-  if (promptId && existing.pendingPrompt.id !== promptId) {
+  const promptId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  if (promptId && !workspaceThreadPromptIdsMatch(existing.pendingPrompt.id, promptId)) {
     return state || {};
   }
 
@@ -4605,7 +4644,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       && existing.pendingPrompt
       && (
         !pendingPromptId
-        || cleanText(existing.pendingPrompt.id) === pendingPromptId
+        || workspaceThreadPromptIdsMatch(existing.pendingPrompt.id, pendingPromptId)
       )
   );
   const shouldClearOrphanRunning = isOrphanRunningThreadState({
