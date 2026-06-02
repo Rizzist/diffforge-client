@@ -20,6 +20,9 @@ const FIT_PADDING = 190;
 const MAX_PIXEL_RATIO = 2;
 const MAX_VISIBLE_AGENT_ORBITS = 6;
 const DEFAULT_CAMERA_STATE = { x: 0, y: 0, zoom: 0.65 };
+const MIN_READY_VIEWPORT_SIZE = 120;
+const CAMERA_RESTORE_PADDING = 360;
+const CAMERA_PAN_PADDING = 260;
 const MAX_VISIBLE_LABELS = 1200;
 const KIND_TONES = {
   workspace: "#2dd4bf",
@@ -251,6 +254,71 @@ function graphBounds(nodes, layout) {
     right: Number.NEGATIVE_INFINITY,
     bottom: Number.NEGATIVE_INFINITY,
   });
+}
+
+function viewportSizeIsReady(size) {
+  return Number(size?.width || 0) >= MIN_READY_VIEWPORT_SIZE
+    && Number(size?.height || 0) >= MIN_READY_VIEWPORT_SIZE;
+}
+
+function paddedBounds(bounds, padding) {
+  if (!bounds) return null;
+  return {
+    left: bounds.left - padding,
+    top: bounds.top - padding,
+    right: bounds.right + padding,
+    bottom: bounds.bottom + padding,
+  };
+}
+
+function cameraWorldRect(cameraState, viewportSize) {
+  const camera = normalizeCameraState(cameraState, null);
+  if (!camera || !viewportSizeIsReady(viewportSize)) return null;
+  const halfWidth = viewportSize.width / (2 * camera.zoom);
+  const halfHeight = viewportSize.height / (2 * camera.zoom);
+  return {
+    left: camera.x - halfWidth,
+    top: camera.y - halfHeight,
+    right: camera.x + halfWidth,
+    bottom: camera.y + halfHeight,
+  };
+}
+
+function cameraIntersectsGraph(cameraState, bounds, viewportSize, padding = CAMERA_RESTORE_PADDING) {
+  const visibleWorld = cameraWorldRect(cameraState, viewportSize);
+  const targetBounds = paddedBounds(bounds, padding);
+  return Boolean(visibleWorld && targetBounds && rectsIntersect(visibleWorld, targetBounds));
+}
+
+function cameraCenterInsideGraph(cameraState, bounds, padding = CAMERA_RESTORE_PADDING) {
+  const camera = normalizeCameraState(cameraState, null);
+  const targetBounds = paddedBounds(bounds, padding);
+  return Boolean(
+    camera
+      && targetBounds
+      && camera.x >= targetBounds.left
+      && camera.x <= targetBounds.right
+      && camera.y >= targetBounds.top
+      && camera.y <= targetBounds.bottom,
+  );
+}
+
+function cameraCanRestoreGraph(cameraState, bounds, viewportSize) {
+  return cameraIntersectsGraph(cameraState, bounds, viewportSize)
+    && cameraCenterInsideGraph(cameraState, bounds);
+}
+
+function clampCameraToGraph(cameraState, bounds, viewportSize) {
+  const camera = normalizeCameraState(cameraState, DEFAULT_CAMERA_STATE);
+  if (!bounds || !viewportSizeIsReady(viewportSize)) return camera;
+  const padded = paddedBounds(bounds, CAMERA_PAN_PADDING);
+  const halfWidth = viewportSize.width / (2 * camera.zoom);
+  const halfHeight = viewportSize.height / (2 * camera.zoom);
+  return {
+    ...camera,
+    x: clamp(camera.x, padded.left - halfWidth, padded.right + halfWidth),
+    y: clamp(camera.y, padded.top - halfHeight, padded.bottom + halfHeight),
+  };
 }
 
 function projectGroupsForNodes(nodes, layout, selectedNodeId) {
@@ -637,7 +705,7 @@ export default function ThreeGraphRenderer({
     () => normalizeCameraState(initialCameraState, null),
     [initialCameraState, viewportCacheKey],
   );
-  const initialCamera = restoredInitialCamera || DEFAULT_CAMERA_STATE;
+  const initialCamera = DEFAULT_CAMERA_STATE;
   const containerRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
@@ -647,7 +715,9 @@ export default function ThreeGraphRenderer({
   const rafRef = useRef(0);
   const fitRetryRef = useRef({ frame: 0, timeout: 0, token: 0 });
   const dragRef = useRef(null);
-  const interactedRef = useRef(Boolean(restoredInitialCamera));
+  const interactedRef = useRef(false);
+  const viewReadyRef = useRef(false);
+  const activeGraphViewKeyRef = useRef("");
   const cameraStateRef = useRef(initialCamera);
   const layoutRef = useRef(layout || new Map());
   const nodesRef = useRef(nodes || []);
@@ -688,6 +758,17 @@ export default function ThreeGraphRenderer({
     const edgeKey = edges.map((edge) => `${edge.from}->${edge.to}:${edge.kind || ""}`).sort().join("|");
     return `${nodeKey}::${edgeKey}`;
   }, [activeLayout, edges, nodes]);
+  const graphViewKey = useMemo(
+    () => `${viewportCacheKey || "spec-graph"}::${graphKey}`,
+    [graphKey, viewportCacheKey],
+  );
+
+  useLayoutEffect(() => {
+    if (activeGraphViewKeyRef.current === graphViewKey) return;
+    activeGraphViewKeyRef.current = graphViewKey;
+    viewReadyRef.current = false;
+    interactedRef.current = false;
+  }, [graphViewKey]);
 
   useEffect(() => {
     if (typeof document === "undefined") return undefined;
@@ -733,27 +814,39 @@ export default function ThreeGraphRenderer({
     ));
   }, []);
 
-  const setCamera = useCallback((nextCameraState) => {
-    const next = normalizeCameraState(nextCameraState, DEFAULT_CAMERA_STATE);
+  const setCamera = useCallback((nextCameraState, options = {}) => {
+    const persist = options.persist !== false;
+    const shouldConstrain = options.constrain !== false;
+    const bounds = graphBounds(nodesRef.current, layoutRef.current);
+    const next = shouldConstrain
+      ? clampCameraToGraph(nextCameraState, bounds, viewportSizeRef.current)
+      : normalizeCameraState(nextCameraState, DEFAULT_CAMERA_STATE);
     cameraStateRef.current = next;
     setCameraState(next);
     updateVisibleLabels(next);
-    if (typeof onCameraChange === "function") onCameraChange(next);
+    if (
+      persist
+      && typeof onCameraChange === "function"
+      && cameraIntersectsGraph(next, bounds, viewportSizeRef.current)
+    ) {
+      onCameraChange(next);
+    }
     scheduleRender();
   }, [onCameraChange, scheduleRender, updateVisibleLabels]);
 
   const fitGraph = useCallback(() => {
     const frame = containerRef.current?.getBoundingClientRect();
     const bounds = graphBounds(nodesRef.current, layoutRef.current);
-    if (!frame?.width || !frame?.height || !bounds) return false;
+    if (!viewportSizeIsReady(frame) || !bounds) return false;
     const width = Math.max(1, bounds.right - bounds.left + FIT_PADDING * 2);
     const height = Math.max(1, bounds.bottom - bounds.top + FIT_PADDING * 2);
     const zoom = clamp(Math.min(frame.width / width, frame.height / height), MIN_ZOOM, 1.08);
+    viewReadyRef.current = true;
     setCamera({
       x: (bounds.left + bounds.right) / 2,
       y: (bounds.top + bounds.bottom) / 2,
       zoom,
-    });
+    }, { constrain: false });
     return true;
   }, [setCamera]);
 
@@ -1079,15 +1172,51 @@ export default function ThreeGraphRenderer({
   }, [activeLayout, edges, hoveredNodeId, nodes, projectGroups, scheduleRender, selectedNodeId, theme]);
 
   useEffect(() => {
-    if (restoredInitialCamera) {
-      cancelScheduledFit();
-      interactedRef.current = true;
-      setCamera(restoredInitialCamera);
-      return;
+    const currentViewKey = activeGraphViewKeyRef.current;
+    const bounds = graphBounds(nodesRef.current, layoutRef.current);
+    const size = viewportSizeRef.current;
+    if (!nodesRef.current.length || !bounds || !viewportSizeIsReady(size)) {
+      return undefined;
     }
-    interactedRef.current = false;
-    scheduleFitGraph({ attempts: 12, force: true });
-  }, [cancelScheduledFit, graphKey, restoredInitialCamera, scheduleFitGraph, setCamera]);
+
+    if (!viewReadyRef.current) {
+      const restoreCandidate = cameraCanRestoreGraph(restoredInitialCamera, bounds, size)
+        ? restoredInitialCamera
+        : null;
+
+      if (restoreCandidate) {
+        cancelScheduledFit();
+        interactedRef.current = true;
+        viewReadyRef.current = true;
+        setCamera(restoreCandidate);
+      } else {
+        interactedRef.current = false;
+        scheduleFitGraph({ attempts: 18, force: true });
+      }
+    } else if (!interactedRef.current) {
+      scheduleFitGraph({ attempts: 6 });
+    }
+
+    const transitionFitId = window.setTimeout(() => {
+      if (activeGraphViewKeyRef.current !== currentViewKey) return;
+      if (!viewReadyRef.current || !interactedRef.current) {
+        scheduleFitGraph({ attempts: 6, force: !interactedRef.current });
+      }
+    }, 260);
+
+    return () => {
+      window.clearTimeout(transitionFitId);
+    };
+  }, [
+    activeLayout,
+    cancelScheduledFit,
+    graphViewKey,
+    restoredInitialCamera,
+    scheduleFitGraph,
+    setCamera,
+    viewportSize.height,
+    viewportSize.width,
+  ]);
 
   useEffect(() => {
     if (!liveOrbitCount) return undefined;
@@ -1116,10 +1245,15 @@ export default function ThreeGraphRenderer({
 
   const handleWheel = useCallback((event) => {
     event.preventDefault();
-    cancelScheduledFit();
-    interactedRef.current = true;
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
+    const bounds = graphBounds(nodesRef.current, layoutRef.current);
+    if (!viewReadyRef.current || !viewportSizeIsReady(rect) || !bounds) {
+      scheduleFitGraph({ attempts: 8, force: true });
+      return;
+    }
+    cancelScheduledFit();
+    interactedRef.current = true;
     const current = cameraStateRef.current;
     const zoomFactor = Math.exp(-event.deltaY * 0.001);
     const nextZoom = clamp(current.zoom * zoomFactor, MIN_ZOOM, MAX_ZOOM);
@@ -1129,12 +1263,17 @@ export default function ThreeGraphRenderer({
       y: graphPoint.y - (event.clientY - rect.top - rect.height / 2) / nextZoom,
       zoom: nextZoom,
     });
-  }, [cancelScheduledFit, setCamera]);
+  }, [cancelScheduledFit, scheduleFitGraph, setCamera]);
 
   const handlePointerDown = useCallback((event) => {
     if (event.button !== 0) return;
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
+    const bounds = graphBounds(nodesRef.current, layoutRef.current);
+    if (!viewReadyRef.current || !viewportSizeIsReady(rect) || !bounds) {
+      scheduleFitGraph({ attempts: 8, force: true });
+      return;
+    }
     cancelScheduledFit();
     interactedRef.current = true;
     containerRef.current?.setPointerCapture?.(event.pointerId);
@@ -1145,7 +1284,7 @@ export default function ThreeGraphRenderer({
       startY: event.clientY,
       moved: false,
     };
-  }, [cancelScheduledFit]);
+  }, [cancelScheduledFit, scheduleFitGraph]);
 
   const clearDrag = useCallback((pointerId = null) => {
     const drag = dragRef.current;
@@ -1160,6 +1299,7 @@ export default function ThreeGraphRenderer({
     if (!rect) return;
     const drag = dragRef.current;
     if (drag?.pointerId === event.pointerId) {
+      if (!viewReadyRef.current) return;
       const dx = event.clientX - drag.startX;
       const dy = event.clientY - drag.startY;
       if (Math.hypot(dx, dy) > 3) drag.moved = true;
@@ -1215,6 +1355,10 @@ export default function ThreeGraphRenderer({
   }
 
   if (layoutPending && !activeLayout.size) {
+    return <EmptyState>{layoutLabel}</EmptyState>;
+  }
+
+  if (!activeLayout.size) {
     return <EmptyState>{layoutLabel}</EmptyState>;
   }
 

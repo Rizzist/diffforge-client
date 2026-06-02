@@ -12582,6 +12582,8 @@ impl CoordinationKernel {
         )?;
         self.resolve_recovered_direct_project_root_write_violations(
             task_id,
+            agent_id,
+            agent_slot_id.as_deref(),
             session_id,
             worktree_id,
             &changed,
@@ -13034,6 +13036,8 @@ impl CoordinationKernel {
     fn resolve_recovered_direct_project_root_write_violations(
         &self,
         task_id: &str,
+        agent_id: &str,
+        agent_slot_id: Option<&str>,
         session_id: &str,
         worktree_id: &str,
         changed_files: &[ChangedFile],
@@ -13046,26 +13050,123 @@ impl CoordinationKernel {
             return Ok(0);
         }
 
-        let changed_paths = changed_files
-            .iter()
-            .map(|file| normalize_status_path(&file.path))
-            .collect::<HashSet<_>>();
+        let mut changed_paths = HashSet::new();
+        for file in changed_files {
+            let path = normalize_status_path(&file.path);
+            if path.is_empty() {
+                continue;
+            }
+            reject_path_escape(&path)?;
+            changed_paths.insert(path);
+        }
+        if changed_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let session = self.query_one(
+            "SELECT * FROM agent_sessions WHERE id=?1",
+            &[&session_id],
+            "Session does not exist.",
+        )?;
+        if session["agent_id"].as_str() != Some(agent_id)
+            || session["worktree_id"].as_str() != Some(worktree_id)
+        {
+            return Ok(0);
+        }
+        let session_slot_id = session["agent_slot_id"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default();
+        let current_agent_slot_id = agent_slot_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(session_slot_id);
+        let worktree = self.get_worktree(worktree_id)?;
+        let worktree_slot_id = worktree["agent_slot_id"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default();
+        let slot_matches_worktree = !current_agent_slot_id.is_empty()
+            && !worktree_slot_id.is_empty()
+            && current_agent_slot_id == worktree_slot_id;
+        if !worktree_slot_id.is_empty() && !slot_matches_worktree {
+            return Ok(0);
+        }
+        let worktree_agent_id = worktree["agent_id"]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default();
+        if !worktree_agent_id.is_empty() && worktree_agent_id != agent_id {
+            return Ok(0);
+        }
+
         let violations = self.query_json(
             "SELECT * FROM workspace_violations
              WHERE status='open'
-               AND task_id=?1
                AND violation_kind='direct_project_root_write'
-               AND (session_id=?2 OR worktree_id=?3)",
-            &[&task_id, &session_id, &worktree_id],
+               AND (worktree_id=?1 OR session_id=?2)",
+            &[&worktree_id, &session_id],
         )?;
         let mut resolved_ids = Vec::new();
         let mut recovered_files = Vec::new();
+        let mut resolution_reasons = Vec::new();
         let now = now_rfc3339();
 
         for violation in violations {
             let Some(mut details) = workspace_violation_details(&violation) else {
                 continue;
             };
+            let violation_id = violation["id"].as_str().unwrap_or_default();
+            if violation_id.is_empty() {
+                continue;
+            }
+            let violation_agent_id = violation["agent_id"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default();
+            if !violation_agent_id.is_empty() && violation_agent_id != agent_id {
+                continue;
+            }
+            let violation_session_id = violation["session_id"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default();
+            let violation_worktree_id = violation["worktree_id"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default();
+            if !violation_worktree_id.is_empty() && violation_worktree_id != worktree_id {
+                continue;
+            }
+            let same_session = violation_session_id == session_id;
+            let same_worktree = violation_worktree_id == worktree_id;
+            if !same_session && !same_worktree {
+                continue;
+            }
+            if !same_session && !slot_matches_worktree {
+                continue;
+            }
+
+            let detail_agent_slot_id = details["agent_slot_id"]
+                .as_str()
+                .or_else(|| details["agentSlotId"].as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if !detail_agent_slot_id.is_empty()
+                && !current_agent_slot_id.is_empty()
+                && detail_agent_slot_id != current_agent_slot_id
+            {
+                continue;
+            }
+            let detail_worktree_id = details["worktree_id"]
+                .as_str()
+                .or_else(|| details["worktreeId"].as_str())
+                .map(str::trim)
+                .unwrap_or_default();
+            if !detail_worktree_id.is_empty() && detail_worktree_id != worktree_id {
+                continue;
+            }
+
             let changed = details["changed_files"]
                 .as_array()
                 .map(|files| {
@@ -13080,6 +13181,9 @@ impl CoordinationKernel {
             if changed.is_empty() {
                 continue;
             }
+            if changed.iter().any(|path| reject_path_escape(path).is_err()) {
+                continue;
+            }
             let all_recovered = changed.iter().all(|path| {
                 changed_paths.contains(path)
                     && lease_covered_resource_keys.iter().any(|covered| {
@@ -13091,15 +13195,23 @@ impl CoordinationKernel {
                 continue;
             }
 
-            let violation_id = violation["id"].as_str().unwrap_or_default();
-            if violation_id.is_empty() {
-                continue;
-            }
-            details["resolution_reason"] = json!("recovered_after_root_write_moved_to_worktree");
+            let same_task = violation["task_id"].as_str() == Some(task_id);
+            let resolution_reason = if same_task && same_session {
+                "recovered_after_root_write_moved_to_worktree"
+            } else {
+                "recovered_by_later_leased_worktree_submit"
+            };
+            details["resolution_reason"] = json!(resolution_reason);
             details["resolved_by"] = json!("coordination_kernel");
             details["revalidated_at"] = json!(now.clone());
             details["root_clean"] = json!(true);
             details["recovered_changed_files"] = json!(changed);
+            details["recovered_by_task_id"] = json!(task_id);
+            details["recovered_by_session_id"] = json!(session_id);
+            details["recovered_by_worktree_id"] = json!(worktree_id);
+            if !current_agent_slot_id.is_empty() {
+                details["recovered_by_agent_slot_id"] = json!(current_agent_slot_id);
+            }
             self.conn
                 .execute(
                     "UPDATE workspace_violations
@@ -13113,6 +13225,7 @@ impl CoordinationKernel {
                     format!("Unable to auto-resolve recovered root-write violation: {error}")
                 })?;
             resolved_ids.push(violation_id.to_string());
+            resolution_reasons.push(resolution_reason.to_string());
             recovered_files.extend(
                 details["recovered_changed_files"]
                     .as_array()
@@ -13127,19 +13240,26 @@ impl CoordinationKernel {
         if resolved_count > 0 {
             recovered_files.sort();
             recovered_files.dedup();
+            resolution_reasons.sort();
+            resolution_reasons.dedup();
             self.emit_event(
                 "workspace_violations_auto_resolved",
                 "kernel",
                 REPO_ID,
                 EventRefs {
                     task_id: Some(task_id.to_string()),
+                    agent_id: Some(agent_id.to_string()),
+                    agent_slot_id: (!current_agent_slot_id.is_empty())
+                        .then(|| current_agent_slot_id.to_string()),
                     session_id: Some(session_id.to_string()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "reason": "recovered_after_root_write_moved_to_worktree",
+                    "reason": "recovered_direct_project_root_write",
+                    "resolution_reasons": resolution_reasons,
                     "resolved_violation_ids": resolved_ids,
                     "recovered_changed_files": recovered_files,
+                    "worktree_id": worktree_id,
                 }),
             )?;
         }
@@ -23994,6 +24114,34 @@ mod tests {
         );
     }
 
+    fn create_direct_project_root_write_violation(
+        kernel: &CoordinationKernel,
+        task_id: &str,
+        agent_id: &str,
+        session_id: &str,
+        worktree_id: &str,
+        changed_files: &[&str],
+    ) -> String {
+        kernel
+            .create_workspace_violation(
+                Some(task_id),
+                Some(agent_id),
+                Some(session_id),
+                Some(worktree_id),
+                "direct_project_root_write",
+                None,
+                None,
+                "error",
+                json!({
+                    "changed_files": changed_files,
+                    "policy": "root_repo_write_policy",
+                    "session_id": session_id,
+                    "worktree_id": worktree_id,
+                }),
+            )
+            .unwrap()
+    }
+
     fn fake_cloud_mcp_url(default_task_id: &str, omit_task_id: bool) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -29283,6 +29431,483 @@ hooksPath = "{}"
             violation["details_json"]["root_clean"].as_bool(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_from_previous_task_auto_resolves_on_submit() {
+        let repo = init_git_repo("stale_root_write_previous_task");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Recovered task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            &["index.html"],
+        );
+
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(write_root.join("index.html"), "<h1>recovered</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("recovered stale root write"),
+            )
+            .unwrap();
+        assert_eq!(
+            response["ok"].as_bool(),
+            Some(true),
+            "unexpected submit response: {response}"
+        );
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            violation["details_json"]["resolution_reason"].as_str(),
+            Some("recovered_by_later_leased_worktree_submit")
+        );
+        assert_eq!(
+            violation["details_json"]["recovered_by_task_id"].as_str(),
+            Some(task_id)
+        );
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_from_restarted_slot_auto_resolves_on_submit() {
+        let repo = init_git_repo("stale_root_write_restarted_slot");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .create_session_for_slot_key(
+                "slot-restart",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-1"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let old_agent_id = first["agentId"].as_str().unwrap();
+        let old_session_id = first["id"].as_str().unwrap();
+        let old_worktree_id = first["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {first}"));
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            old_agent_id,
+            old_session_id,
+            old_worktree_id,
+            &["index.html"],
+        );
+        kernel
+            .interrupt_session(old_session_id, "terminal_restarted")
+            .unwrap();
+
+        let second = kernel
+            .create_session_for_slot_key(
+                "slot-restart",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-2"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_id = second["agentId"].as_str().unwrap();
+        let session_id = second["id"].as_str().unwrap();
+        let worktree_id = second["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {second}"));
+        assert_eq!(worktree_id, old_worktree_id);
+        let write_root = PathBuf::from(second["writeRoot"].as_str().unwrap());
+        let task = kernel
+            .create_task("Recovered task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(write_root.join("index.html"), "<h1>recovered</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("recovered after restart"),
+            )
+            .unwrap();
+        assert_eq!(
+            response["ok"].as_bool(),
+            Some(true),
+            "unexpected submit response: {response}"
+        );
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            violation["details_json"]["resolution_reason"].as_str(),
+            Some("recovered_by_later_leased_worktree_submit")
+        );
+        assert_eq!(
+            violation["details_json"]["recovered_by_session_id"].as_str(),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_does_not_resolve_when_root_still_dirty() {
+        let repo = init_git_repo("stale_root_write_root_dirty");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Dirty root task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            &["index.html"],
+        );
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(repo.join("index.html"), "<h1>root</h1>\n").unwrap();
+        fs::write(write_root.join("index.html"), "<h1>worktree</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("root still dirty"),
+            )
+            .unwrap();
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(
+            response["error"]["details"]["violations"][0]["violation_kind"].as_str(),
+            Some("direct_project_root_write")
+        );
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("open"));
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_does_not_resolve_without_active_lease() {
+        let repo = init_git_repo("stale_root_write_missing_lease");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Unleased task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            &["index.html"],
+        );
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        fs::write(write_root.join("index.html"), "<h1>unleased</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("missing lease"),
+            )
+            .unwrap();
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("open"));
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_does_not_resolve_when_stale_file_absent_from_diff() {
+        let repo = init_git_repo("stale_root_write_absent_file");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Different file task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            agent_id,
+            session_id,
+            worktree_id,
+            &["other.html"],
+        );
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(write_root.join("index.html"), "<h1>different</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("different file"),
+            )
+            .unwrap();
+        assert_eq!(response["ok"].as_bool(), Some(false));
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("open"));
+    }
+
+    #[test]
+    fn stale_direct_project_root_write_from_different_worktree_is_not_resolved() {
+        let repo = init_git_repo("stale_root_write_different_worktree");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let first = kernel
+            .create_session_for_slot_key(
+                "slot-a",
+                "Codex A",
+                "codex",
+                None,
+                None,
+                Some("pane-a"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_agent_id = first["agentId"].as_str().unwrap();
+        let first_session_id = first["id"].as_str().unwrap();
+        let first_worktree_id = first["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {first}"));
+        let old_task = kernel
+            .create_task("Old task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let old_task_id = old_task["id"].as_str().unwrap();
+        let violation_id = create_direct_project_root_write_violation(
+            &kernel,
+            old_task_id,
+            first_agent_id,
+            first_session_id,
+            first_worktree_id,
+            &["index.html"],
+        );
+
+        let second = kernel
+            .create_session_for_slot_key(
+                "slot-b",
+                "Codex B",
+                "codex",
+                None,
+                None,
+                Some("pane-b"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_id = second["agentId"].as_str().unwrap();
+        let session_id = second["id"].as_str().unwrap();
+        let worktree_id = second["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {second}"));
+        assert_ne!(worktree_id, first_worktree_id);
+        let write_root = PathBuf::from(second["writeRoot"].as_str().unwrap());
+        let task = kernel
+            .create_task(
+                "Different worktree task",
+                None,
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(write_root.join("index.html"), "<h1>other slot</h1>\n").unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("different worktree"),
+            )
+            .unwrap();
+        assert_eq!(
+            response["ok"].as_bool(),
+            Some(true),
+            "unexpected submit response: {response}"
+        );
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("open"));
     }
 
     #[test]

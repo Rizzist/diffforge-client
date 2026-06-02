@@ -6414,6 +6414,37 @@ fn emit_terminal_prompt_submitted(
     if prompt.is_empty() {
         return;
     }
+    if !terminal_prompt_submitted_source_is_authoritative(
+        prompt_source,
+        prompt_match,
+        observed_prompt,
+    ) {
+        let metadata = instance.metadata.clone();
+        log_terminal_status_event(
+            "backend.terminal.prompt_submitted_untrusted_skip",
+            json!({
+                "agent_id": metadata.agent_id.clone(),
+                "agent_kind": metadata.agent_kind.clone(),
+                "expected_prompt_len": expected_prompt.map(str::len).unwrap_or_default(),
+                "instance_id": instance.id,
+                "observed_prompt_len": observed_prompt.map(str::len).unwrap_or_default(),
+                "pane_id": metadata.pane_id.clone(),
+                "prompt_event_id": prompt_event_id.unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.unwrap_or_default(),
+                "prompt_len": prompt.len(),
+                "prompt_match": prompt_match,
+                "prompt_source": prompt_source,
+                "status_truth": "prompt_submit_not_authoritative",
+                "terminal_index": metadata.terminal_index,
+                "thread_id": thread_id_override
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(metadata.thread_id.as_str()),
+                "workspace_id": metadata.workspace_id.clone(),
+            }),
+        );
+        return;
+    }
 
     let metadata = instance.metadata.clone();
     log_terminal_status_event(
@@ -6480,6 +6511,24 @@ fn emit_terminal_prompt_submitted(
             prompt: prompt.to_string(),
         },
     );
+}
+
+fn terminal_prompt_submitted_source_is_authoritative(
+    prompt_source: &str,
+    prompt_match: bool,
+    observed_prompt: Option<&str>,
+) -> bool {
+    if !prompt_match {
+        return false;
+    }
+
+    match prompt_source {
+        "observed_input_gate" => observed_prompt
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        "parked_resume_backend_submit" => true,
+        _ => false,
+    }
 }
 
 fn register_terminal_input_event_listener(app: &tauri::App) {
@@ -6870,6 +6919,16 @@ async fn terminal_write_inner(
             .map(|value| value == &prompt)
             .unwrap_or(true);
         let event_prompt = prompt.clone();
+        let submitted_prompt_source = if prompt_event_text_matches_observed {
+            "observed_input_gate"
+        } else {
+            "observed_input_gate_mismatch"
+        };
+        let submitted_prompt_authoritative = terminal_prompt_submitted_source_is_authoritative(
+            submitted_prompt_source,
+            prompt_event_text_matches_observed,
+            Some(&prompt),
+        );
         emit_terminal_prompt_submitted(
             &app,
             &instance,
@@ -6881,11 +6940,7 @@ async fn terminal_write_inner(
             requested_event_prompt.as_deref(),
             Some(&prompt),
             prompt_event_text_matches_observed,
-            if prompt_event_text_matches_observed {
-                "observed_input_gate"
-            } else {
-                "observed_input_gate_mismatch"
-            },
+            submitted_prompt_source,
             thread_id.as_deref(),
         );
         log_terminal_status_event(
@@ -6901,11 +6956,8 @@ async fn terminal_write_inner(
                 "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
                 "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
                 "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
-                "submitted_event_prompt_source": if prompt_event_text_matches_observed {
-                    "observed_input_gate"
-                } else {
-                    "observed_input_gate_mismatch"
-                },
+                "submitted_event_prompt_authoritative": submitted_prompt_authoritative,
+                "submitted_event_prompt_source": submitted_prompt_source,
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             }),
         );
@@ -6930,11 +6982,12 @@ async fn terminal_write_inner(
                 "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
                 "prompt_event_text_len": requested_event_prompt.as_deref().map(str::len).unwrap_or_default(),
                 "prompt_event_text_matches_observed": prompt_event_text_matches_observed,
-                "submitted_event_prompt_source": "observed_input_gate",
+                "submitted_event_prompt_authoritative": submitted_prompt_authoritative,
+                "submitted_event_prompt_source": submitted_prompt_source,
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             },
         }));
-        if *instance.agent_started.lock().await {
+        if submitted_prompt_authoritative && *instance.agent_started.lock().await {
             let cloud_state = cloud_mcp_state.clone();
             let pane_id_for_context = pane_id.clone();
             let working_directory = instance.working_directory.as_ref().clone();
@@ -7085,58 +7138,40 @@ async fn terminal_write_inner(
                 }));
                 return Ok(());
             }
-            emit_terminal_prompt_submitted(
-                &app,
-                &instance,
-                &event_prompt,
-                prompt_event_id.as_deref(),
-                prompt_event_revision,
-                prompt_event_source.as_deref(),
-                prompt_event_submitted_at.as_deref(),
-                Some(&event_prompt),
-                None,
-                false,
-                "prompt_event_text_unobserved",
-                thread_id.as_deref(),
+            log_terminal_status_event(
+                "backend.terminal_write.prompt_event_text_unobserved_skip",
+                json!({
+                    "data_len": data.len(),
+                    "instance_id": instance.id,
+                    "observer_reason": observer_reason,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                    "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                    "prompt_text_len": event_prompt.len(),
+                    "status_truth": "prompt_submit_not_authoritative",
+                    "thread_id": thread_id.as_deref().unwrap_or_default(),
+                }),
             );
-            if *instance.agent_started.lock().await {
-                let cloud_state = cloud_mcp_state.clone();
-                let pane_id_for_context = pane_id.clone();
-                let working_directory = instance.working_directory.as_ref().clone();
-                let coordination = instance.coordination.clone();
-                let session_mode = instance.session_mode;
-                let terminal_instance_id = instance.id;
-                let active_task = instance.active_task.lock().await.clone();
-                let local_task_id = active_task.as_ref().map(|task| task.task_id.clone());
-                let local_task_title = active_task.as_ref().map(|task| task.title.clone());
-                let metadata = instance.metadata.clone();
-                let prompt_metadata = CloudMcpTerminalPromptMetadata {
-                    prompt_event_id: prompt_event_id.clone(),
-                    prompt_event_source: prompt_event_source.clone(),
-                    prompt_event_submitted_at: prompt_event_submitted_at.clone(),
-                    terminal_index: metadata.terminal_index,
-                    thread_id: thread_id
-                        .clone()
-                        .or_else(|| Some(metadata.thread_id.clone())),
-                    workspace_id: metadata.workspace_id.clone(),
-                    workspace_name: metadata.workspace_name.clone(),
-                };
-                tauri::async_runtime::spawn(async move {
-                    cloud_mcp_terminal_context_pack_for_prompt(
-                        cloud_state,
-                        pane_id_for_context,
-                        terminal_instance_id,
-                        working_directory,
-                        coordination,
-                        session_mode,
-                        local_task_id,
-                        local_task_title,
-                        event_prompt,
-                        Some(prompt_metadata),
-                    )
-                    .await;
-                });
-            }
+            write_thread_bridge_diagnostic_log_entry(json!({
+                "ts_ms": current_time_ms(),
+                "phase": "backend.bridge.prompt_event_text_unobserved_skip",
+                "source": "backend",
+                "app_pid": std::process::id(),
+                "thread": terminal_diagnostic_thread_label(),
+                "fields": {
+                    "data_len": data.len(),
+                    "has_prompt_event_id": prompt_event_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "has_prompt_event_text": true,
+                    "instance_id": instance.id,
+                    "observer_reason": observer_reason,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                    "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                    "prompt_text_len": event_prompt.len(),
+                    "thread_id": thread_id.as_deref().unwrap_or_default(),
+                },
+            }));
+            return Ok(());
         }
     } else if let Some(diagnostic_kind) = input_write_diagnostic_kind {
         let observer_reason = terminal_prompt_observer_not_observed_reason(
@@ -8888,6 +8923,40 @@ mod terminal_tests {
             ),
             Some("send from overlay".to_string())
         );
+    }
+
+    #[test]
+    fn prompt_submitted_authority_requires_observed_matching_submit() {
+        assert!(terminal_prompt_submitted_source_is_authoritative(
+            "observed_input_gate",
+            true,
+            Some("what else is there"),
+        ));
+        assert!(terminal_prompt_submitted_source_is_authoritative(
+            "parked_resume_backend_submit",
+            true,
+            None,
+        ));
+        assert!(!terminal_prompt_submitted_source_is_authoritative(
+            "observed_input_gate",
+            false,
+            Some("different prompt"),
+        ));
+        assert!(!terminal_prompt_submitted_source_is_authoritative(
+            "observed_input_gate",
+            true,
+            None,
+        ));
+        assert!(!terminal_prompt_submitted_source_is_authoritative(
+            "prompt_event_text_unobserved",
+            false,
+            None,
+        ));
+        assert!(!terminal_prompt_submitted_source_is_authoritative(
+            "prompt_event_text_unobserved",
+            true,
+            Some("what else is there"),
+        ));
     }
 
     #[test]

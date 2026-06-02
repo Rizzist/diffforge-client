@@ -28,6 +28,9 @@ import {
   normalizeWorkspaceTerminalIndexes,
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
 } from "../terminals/WorkspaceTerminal.jsx";
+import {
+  terminalPromptSubmittedPayloadIsAuthoritative,
+} from "../terminals/terminalPromptSubmission.js";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
 import {
   terminalCommandPhaseFromLifecycleEvent,
@@ -12742,8 +12745,6 @@ export default function App() {
       lifecycleEvent.type === "pending-prompt-sent"
       || lifecycleEvent.type === "provider-turn-completed"
       || lifecycleEvent.type === "provider-turn-interrupted"
-      || lifecycleEvent.type === "terminal-prompt-ready"
-      || lifecycleEvent.type === "terminal-input-ready"
     ) {
       settleWorkspacePromptDelivery(lifecycleEvent.pendingPromptId || lifecycleEvent.promptId);
     } else if (lifecycleEvent.type === "pending-prompt-error") {
@@ -13293,6 +13294,19 @@ export default function App() {
 
     listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
       const payload = promptEvent?.payload || {};
+      if (!terminalPromptSubmittedPayloadIsAuthoritative(payload)) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
+          instanceId: payload.instanceId || "",
+          paneId: payload.paneId || "",
+          promptEventIdPresent: Boolean(payload.promptEventId),
+          promptMatch: payload.promptMatch,
+          promptSource: payload.promptSource || "",
+          reason: "prompt_not_authoritative",
+          threadId: payload.threadId || "",
+          workspaceId: payload.workspaceId || "",
+        });
+        return;
+      }
       const observedPrompt = String(payload.observedPrompt || "").trim();
       const expectedPrompt = String(payload.expectedPrompt || "").trim();
       const fallbackPrompt = String(payload.prompt || "").trim();

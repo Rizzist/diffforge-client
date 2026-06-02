@@ -10794,6 +10794,45 @@ function TerminalView({
             threadMessageText,
           });
           let acceptedDetail = null;
+          let acceptedDraftClearResult = null;
+          const clearAcceptedSubmitDraft = (detail, reason = "todo_queue_submit_accepted_clear") => {
+            if (!syncKey || !detail) {
+              return null;
+            }
+
+            const clearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
+              expectedValue: terminalText,
+              source: reason,
+              transactionId: draftTransactionId,
+            });
+            acceptedDraftClearResult = clearResult;
+            logTerminalStatus("frontend.todo_queue.terminal_write.draft_clear", {
+              ...terminalWriteLogBase,
+              cleared: Boolean(clearResult?.cleared),
+              currentDraftLength: String(clearResult?.value || "").length,
+              currentDraftRevision: clearResult?.revision || 0,
+              expectedDraftRevision: draftTransaction?.revision || 0,
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              reason: clearResult?.reason || reason,
+              threadId: targetThread.id,
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear", {
+              acceptedMatchedBy: detail?.matchedBy || "",
+              agentId: targetRole,
+              cleared: Boolean(clearResult?.cleared),
+              draftRevision: draftTransaction?.revision || 0,
+              paneId,
+              promptId,
+              reason,
+              source,
+              syncKey,
+              targetTerminalIndex: targetLogIndex,
+              threadId: targetThread.id,
+              workspaceId,
+            });
+            return clearResult;
+          };
           const recordAcceptedDetail = (detail, matchedByFallback = "") => {
             if (!detail) {
               return null;
@@ -10834,7 +10873,11 @@ function TerminalView({
             return detail;
           };
           const acceptedMonitorPromise = acceptedWaiter.promise
-            .then((detail) => recordAcceptedDetail(detail, "acceptance-waiter"))
+            .then((detail) => {
+              const recordedDetail = recordAcceptedDetail(detail, "acceptance-waiter");
+              clearAcceptedSubmitDraft(recordedDetail, "todo_queue_submit_accepted_clear");
+              return recordedDetail;
+            })
             .catch((acceptError) => {
               logTerminalStatus("frontend.todo_queue.terminal_write.accept_wait_done", {
                 ...terminalWriteLogBase,
@@ -10853,14 +10896,25 @@ function TerminalView({
             }),
           ]);
           if (!acceptedDetail) {
-            acceptedWaiter.cancel();
             logTerminalStatus("frontend.todo_queue.terminal_write.accept_deferred", {
               ...terminalWriteLogBase,
               graceMs: TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS,
               instanceId: targetBinding?.instanceId || "",
               promptEventId: promptId,
-              reason: "terminal_submit_confirmed_before_session_acceptance",
+              reason: "terminal_submit_observed_waiting_for_session_acceptance",
               threadId: targetThread.id,
+            });
+            logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear_skip", {
+              agentId: targetRole,
+              draftRevision: draftTransaction?.revision || 0,
+              paneId,
+              promptId,
+              reason: "session_acceptance_pending_keep_shared_draft",
+              source,
+              syncKey,
+              targetTerminalIndex: targetLogIndex,
+              threadId: targetThread.id,
+              workspaceId,
             });
           }
           logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
@@ -10874,40 +10928,10 @@ function TerminalView({
               : "terminal_submit_confirmed_waiting_for_session_acceptance",
             threadId: targetThread.id,
           });
-          let submitClearResult = null;
-          if (syncKey) {
-            submitClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, draftTransaction?.revision || 0, {
-              expectedValue: terminalText,
-              source: "todo_queue_submit_observed_clear",
-              transactionId: draftTransactionId,
-            });
-            logTerminalStatus("frontend.todo_queue.terminal_write.draft_clear", {
-              ...terminalWriteLogBase,
-              cleared: Boolean(submitClearResult?.cleared),
-              currentDraftLength: String(submitClearResult?.value || "").length,
-              currentDraftRevision: submitClearResult?.revision || 0,
-              expectedDraftRevision: draftTransaction?.revision || 0,
-              instanceId: targetBinding?.instanceId || "",
-              promptEventId: promptId,
-              reason: submitClearResult?.reason || "",
-              threadId: targetThread.id,
-            });
-          }
-          logBigViewSyncDiagnosticEvent("tui.text.drop_visible_input_clear_skip", {
-            agentId: targetRole,
-            draftRevision: draftTransaction?.revision || 0,
-            paneId,
-            promptId,
-            reason: "submit_observed_tui_handles_prompt_clear",
-            source,
-            syncKey,
-            targetTerminalIndex: targetLogIndex,
-            threadId: targetThread.id,
-            workspaceId,
-          });
           dropResult = {
             acceptedDetail,
             confirmedSubmit: true,
+            draftClearedOnAcceptance: Boolean(acceptedDraftClearResult?.cleared),
             draftRevision: draftTransaction?.revision || 0,
             draftTransactionId,
             lifecycleDispatchedAtSubmit,
@@ -11072,19 +11096,38 @@ function TerminalView({
         workspaceId,
       });
     }
-    if (syncKey && shouldAutoSubmit) {
-      const finalClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, dropResult?.draftRevision || draftTransaction?.revision || 0, {
+    let finalDraftClearResult = null;
+    const shouldRunFinalDraftClear = Boolean(
+      syncKey
+        && shouldAutoSubmit
+        && (dropResult?.sessionAccepted || dropResult?.acceptedDetail)
+        && !dropResult?.draftClearedOnAcceptance,
+    );
+    if (shouldRunFinalDraftClear) {
+      finalDraftClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, dropResult?.draftRevision || draftTransaction?.revision || 0, {
         expectedValue: dropResult?.terminalText || terminalText,
         source: "todo_queue_final_clear",
         transactionId: dropResult?.draftTransactionId || draftTransactionId,
       });
       logTerminalStatus("frontend.todo_queue.terminal_write.final_draft_clear", {
         ...terminalWriteLogBase,
-        cleared: Boolean(finalClearResult.cleared),
-        currentDraftLength: String(finalClearResult.value || "").length,
-        currentDraftRevision: finalClearResult.revision || 0,
+        cleared: Boolean(finalDraftClearResult.cleared),
+        currentDraftLength: String(finalDraftClearResult.value || "").length,
+        currentDraftRevision: finalDraftClearResult.revision || 0,
         expectedDraftRevision: dropResult?.draftRevision || draftTransaction?.revision || 0,
-        reason: finalClearResult.reason || "",
+        reason: finalDraftClearResult.reason || "",
+        threadId: targetThread?.id || "",
+      });
+    } else if (syncKey && shouldAutoSubmit) {
+      logTerminalStatus("frontend.todo_queue.terminal_write.final_draft_clear_skip", {
+        ...terminalWriteLogBase,
+        acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
+        draftClearedOnAcceptance: Boolean(dropResult?.draftClearedOnAcceptance),
+        expectedDraftRevision: dropResult?.draftRevision || draftTransaction?.revision || 0,
+        promptEventId: dropResult?.promptId || "",
+        reason: dropResult?.sessionAccepted || dropResult?.acceptedDetail
+          ? "draft_already_cleared_on_acceptance"
+          : "session_acceptance_pending_keep_shared_draft",
         threadId: targetThread?.id || "",
       });
     }
@@ -11118,7 +11161,10 @@ function TerminalView({
       hasImage: Boolean(image),
       paneId,
       shouldAutoSubmit,
-      sharedDraftCleared: Boolean(syncKey && shouldAutoSubmit),
+      sharedDraftCleared: Boolean(
+        dropResult?.draftClearedOnAcceptance
+          || finalDraftClearResult?.cleared,
+      ),
       source,
       submitConfirmed: Boolean(dropResult?.confirmedSubmit),
       syncKey,
@@ -11959,7 +12005,7 @@ function TerminalView({
               promptId: dropResult?.promptId || "",
               reason: sessionAccepted
                 ? "session_accepted_waiting_for_completion"
-                : "terminal_submit_confirmed_waiting_for_completion",
+                : "terminal_submit_confirmed_waiting_for_session_acceptance",
               sessionAccepted,
               source,
               submitConfirmed: true,
@@ -11973,7 +12019,7 @@ function TerminalView({
                   ? getTodoQueueItemWithPersistedQueueState(item, "sending", {
                     reason: sessionAccepted
                       ? "session_accepted_waiting_for_completion"
-                      : "terminal_submit_confirmed_waiting_for_completion",
+                      : "terminal_submit_confirmed_waiting_for_session_acceptance",
                     source,
                     targetAgentId: target.targetRole,
                     targetTerminalId: target.paneId,
@@ -12367,17 +12413,58 @@ function TerminalView({
           .then(async (dropResult) => {
             setTodoDropError("");
             const planTask = getTodoQueueItemPlanTask(currentDrag);
+            const sessionAccepted = Boolean(
+              dropResult?.sessionAccepted
+                || dropResult?.acceptedDetail,
+            );
             if (dropResult?.confirmedSubmit && planTask && !dropResult?.planTaskStatusRecorded) {
               await recordVoicePlanTaskStatus(planTask, "dispatched", {
                 agentId: targetRole,
                 clientTodoId: currentDrag.itemId || "",
                 promptEventId: dropResult?.promptId || planTask.taskId,
+                sessionAccepted,
                 terminalId: paneId,
                 terminalIndex: targetTerminalIndex ?? null,
                 threadId: dropResult?.targetThread?.id || "",
               });
             }
             if (currentDrag.itemId) {
+              if (dropResult?.confirmedSubmit) {
+                setTodoQueueItemPending(currentDrag.itemId, {
+                  acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
+                  awaitingSessionAcceptance: !sessionAccepted,
+                  item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+                  paneId,
+                  phase: "sending",
+                  promptId: dropResult?.promptId || "",
+                  reason: sessionAccepted
+                    ? "session_accepted_waiting_for_completion"
+                    : "terminal_submit_confirmed_waiting_for_session_acceptance",
+                  sessionAccepted,
+                  source,
+                  submitConfirmed: true,
+                  targetRole,
+                  targetTerminalIndex: targetTerminalIndex ?? "",
+                  workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+                });
+                updateTodoQueueItems((currentItems) => (
+                  normalizeTodoQueueItems(currentItems.map((item) => (
+                    item.id === currentDrag.itemId
+                      ? getTodoQueueItemWithPersistedQueueState(item, "sending", {
+                        reason: sessionAccepted
+                          ? "session_accepted_waiting_for_completion"
+                          : "terminal_submit_confirmed_waiting_for_session_acceptance",
+                        source,
+                        targetAgentId: targetRole,
+                        targetTerminalId: paneId,
+                        targetTerminalIndex,
+                      })
+                      : item
+                  )))
+                ));
+                return;
+              }
+
               clearTodoQueueItemPending(currentDrag.itemId, "consumed", {
                 promptId: dropResult?.promptId || "",
                 source,

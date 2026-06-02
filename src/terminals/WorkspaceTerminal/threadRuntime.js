@@ -27,6 +27,9 @@ import {
   getTerminalAgentKind,
   logThreadBridgeDiagnostic,
 } from "./terminalCore.js";
+import {
+  terminalPromptSubmittedPayloadIsAuthoritative,
+} from "../terminalPromptSubmission.js";
 
 function getSubmitSequenceDiagnosticFields(sequence) {
   const value = String(sequence || "");
@@ -1325,13 +1328,14 @@ export async function createTerminalPromptSubmittedWaiter({
       const instanceMatches = !Number.isFinite(Number(instanceId))
         || eventInstanceId === Number(instanceId);
       const submittedPromptMatchesExpected = payload.promptMatch !== false;
+      const promptSource = String(payload.promptSource || "").trim();
+      const submittedPromptIsAuthoritative = terminalPromptSubmittedPayloadIsAuthoritative(payload);
 
       if (!promptMatches || !paneMatches || !threadMatches || !instanceMatches || settled) {
         return;
       }
-      if (requirePromptMatch && !submittedPromptMatchesExpected) {
+      if (!submittedPromptIsAuthoritative || (requirePromptMatch && !submittedPromptMatchesExpected)) {
         const observedPrompt = String(payload.observedPrompt || "").trim();
-        const promptSource = String(payload.promptSource || "").trim();
         logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
           agentId,
           expectedPromptLength: safeExpectedPrompt.length,
@@ -1340,6 +1344,7 @@ export async function createTerminalPromptSubmittedWaiter({
           paneId: eventPaneId,
           promptId: eventPromptId,
           promptSource,
+          reason: submittedPromptIsAuthoritative ? "prompt_mismatch" : "prompt_not_authoritative",
           threadId: eventThreadId,
           workspaceId: payload.workspaceId || workspaceId || "",
         });
@@ -1352,7 +1357,8 @@ export async function createTerminalPromptSubmittedWaiter({
             : "The queued todo was written, but the terminal did not submit it.",
         );
         error.terminalPromptSubmitMismatch = true;
-        error.terminalPromptSubmitUnobserved = !observedPrompt;
+        error.terminalPromptSubmitUnobserved = !observedPrompt || !submittedPromptIsAuthoritative;
+        error.terminalPromptSubmitNotAuthoritative = !submittedPromptIsAuthoritative;
         error.promptSource = promptSource;
         error.promptId = eventPromptId;
         error.workspaceId = payload.workspaceId || workspaceId || "";
