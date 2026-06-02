@@ -80,6 +80,7 @@ struct CloudMcpSpecGraphSyncRuntime {
     generation: u64,
     stop: Arc<AtomicBool>,
     wake: Arc<tokio::sync::Notify>,
+    request_wake: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -8516,6 +8517,7 @@ async fn cloud_mcp_stop_spec_graph_syncs_for_repo_ids(
     for runtime in runtimes {
         runtime.stop.store(true, Ordering::SeqCst);
         runtime.wake.notify_waiters();
+        runtime.request_wake.notify_waiters();
     }
     {
         let mut container_syncs = state.spec_graph_container_syncs.lock().await;
@@ -9912,6 +9914,9 @@ fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &
     {
         return false;
     }
+    if repo_id.as_deref() == Some(req.repo_id.as_str()) {
+        return true;
+    }
 
     let workspace_id = cloud_mcp_payload_text(event, &["workspace_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["workspaceId"]));
@@ -9920,6 +9925,25 @@ fn cloud_mcp_graph_ws_event_matches(req: &CloudMcpSpecGraphSyncRequest, event: &
     }
 
     true
+}
+
+async fn cloud_mcp_request_spec_graph_filetree_sync(
+    state: &CloudMcpState,
+    repo_id: &str,
+) -> u64 {
+    let request_generation = cloud_mcp_now_ms();
+    {
+        let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
+        requests.insert(repo_id.to_string(), request_generation);
+    }
+    let runtime = {
+        let syncs = state.spec_graph_syncs.lock().await;
+        syncs.get(repo_id).cloned()
+    };
+    if let Some(runtime) = runtime {
+        runtime.request_wake.notify_waiters();
+    }
+    request_generation
 }
 
 async fn cloud_mcp_graph_ws_event_forward_loop(
@@ -11521,6 +11545,7 @@ async fn cloud_mcp_start_project_spec_graph_sync(
                     generation: requested_generation,
                     stop: Arc::clone(&requested_stop),
                     wake: Arc::clone(&requested_wake),
+                    request_wake: Arc::clone(&requested_request_wake),
                 },
             );
             should_spawn = true;
@@ -11529,6 +11554,8 @@ async fn cloud_mcp_start_project_spec_graph_sync(
     if should_spawn {
         let mut requests = state.spec_graph_filetree_sync_requests.lock().await;
         requests.insert(req.repo_id.clone(), requested_generation);
+    } else {
+        cloud_mcp_request_spec_graph_filetree_sync(state, &req.repo_id).await;
     }
     let mut cached = if should_spawn {
         cloud_mcp_read_spec_graph_cache(&req, "syncing", "")
@@ -11615,12 +11642,14 @@ async fn cloud_mcp_stop_spec_graph_sync(
     if let Some(runtime) = removed {
         runtime.stop.store(true, Ordering::SeqCst);
         runtime.wake.notify_waiters();
+        runtime.request_wake.notify_waiters();
     }
     let mut child_stopped = Vec::new();
     for child_req in child_reqs {
         if let Some(runtime) = syncs.remove(&child_req.repo_id) {
             runtime.stop.store(true, Ordering::SeqCst);
             runtime.wake.notify_waiters();
+            runtime.request_wake.notify_waiters();
             child_stopped.push(json!({
                 "repoId": child_req.repo_id,
                 "repoPath": child_req.root_display,
@@ -11844,6 +11873,44 @@ mod cloud_mcp_tests {
             "event_kind": "remote_command_requested",
         });
         assert!(cloud_mcp_claim_remote_command_receipt(&state, &other_workspace).await);
+    }
+
+    #[test]
+    fn spec_graph_ws_event_matches_same_repo_even_when_workspace_display_id_differs() {
+        let root = test_cloud_root("diffforge-spec-graph-ws-repo-match");
+        fs::create_dir_all(&root).unwrap();
+        let req = cloud_mcp_spec_graph_sync_request(
+            workspace_path_display(&root),
+            Some("workspace-real".to_string()),
+            Some("Test forge".to_string()),
+        );
+        let event = json!({
+            "kind": "graph_invalidated",
+            "event_kind": "filetree_snapshot",
+            "repo_id": req.repo_id.clone(),
+            "workspace_id": "local-display-workspace",
+        });
+
+        assert!(cloud_mcp_graph_ws_event_matches(&req, &event));
+    }
+
+    #[test]
+    fn spec_graph_ws_event_rejects_other_repo_invalidation() {
+        let root = test_cloud_root("diffforge-spec-graph-ws-other-repo");
+        fs::create_dir_all(&root).unwrap();
+        let req = cloud_mcp_spec_graph_sync_request(
+            workspace_path_display(&root),
+            Some("workspace-real".to_string()),
+            Some("Test forge".to_string()),
+        );
+        let event = json!({
+            "kind": "graph_invalidated",
+            "event_kind": "filetree_snapshot",
+            "repo_id": "repo-somewhere-else",
+            "workspace_id": "workspace-real",
+        });
+
+        assert!(!cloud_mcp_graph_ws_event_matches(&req, &event));
     }
 
     #[test]

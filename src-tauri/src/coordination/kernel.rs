@@ -3194,6 +3194,19 @@ impl CoordinationKernel {
         };
         let session = self.ensure_session_active(session_id, agent_id)?;
         self.ensure_session_owns_task(session_id, task_id)?;
+        let task = self.query_one(
+            "SELECT status FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let task_status = task["status"].as_str().unwrap_or_default();
+        if !Self::task_status_allows_start_reuse(task_status) {
+            return Ok(api_error(
+                "task_not_active",
+                "Cannot complete a task that has already ended or submitted a patch.",
+                json!({"task_id": task_id, "status": task_status}),
+            ));
+        }
         let session_worktree_id = session["worktree_id"]
             .as_str()
             .filter(|value| !value.trim().is_empty());
@@ -3210,19 +3223,6 @@ impl CoordinationKernel {
                     "worktree_id": session_worktree_id,
                     "enforcement_mode": session["enforcement_mode"].as_str(),
                 }),
-            ));
-        }
-        let task = self.query_one(
-            "SELECT status FROM tasks WHERE id=?1",
-            &[&task_id],
-            "Task does not exist.",
-        )?;
-        let task_status = task["status"].as_str().unwrap_or_default();
-        if !Self::task_status_allows_start_reuse(task_status) {
-            return Ok(api_error(
-                "task_not_active",
-                "Cannot complete a task that has already ended or submitted a patch.",
-                json!({"task_id": task_id, "status": task_status}),
             ));
         }
 
@@ -10685,13 +10685,13 @@ impl CoordinationKernel {
         submit_job_id: &str,
         result: &Value,
     ) -> Result<(), String> {
-        self.set_submit_job_phase(
-            submit_job_id,
-            "done",
-            "done",
-            Some("submit_patch completed."),
-        )?;
         let data = result.get("data").unwrap_or(&Value::Null);
+        let phase_message = if data["noop"].as_bool() == Some(true) {
+            "submit_patch completed with no changes."
+        } else {
+            "submit_patch completed."
+        };
+        self.set_submit_job_phase(submit_job_id, "done", "done", Some(phase_message))?;
         let warnings = result
             .get("warnings")
             .cloned()
@@ -10798,6 +10798,19 @@ impl CoordinationKernel {
         summary: Option<&str>,
         submit_job_id: Option<&str>,
     ) -> Result<Value, String> {
+        let task = self.query_one(
+            "SELECT status FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        let task_status = task["status"].as_str().unwrap_or_default();
+        if !Self::task_status_allows_start_reuse(task_status) {
+            return Ok(api_error(
+                "task_not_active",
+                "Cannot submit_patch for a task that has already ended or submitted a patch.",
+                json!({"task_id": task_id, "status": task_status}),
+            ));
+        }
         let validation = self.run_patch_validation(
             task_id,
             agent_id,
@@ -27208,6 +27221,72 @@ hooksPath = "{}"
             completed["error"]["code"].as_str(),
             Some("managed_patch_requires_submit_patch")
         );
+    }
+
+    #[test]
+    fn interrupted_managed_patch_session_rejects_late_complete_or_submit() {
+        let repo = init_git_repo("interrupted_managed_submit_reject");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let session = kernel
+            .create_session_for_slot_key(
+                "codex-interrupted",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("pane-interrupted-managed"),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let agent_id = session["agentId"].as_str().unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let task = kernel
+            .create_task(
+                "Interrupted managed task",
+                None,
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .mark_terminal_task_stopped(task_id, session_id, "interrupted", "escape_key")
+            .unwrap();
+
+        let completed = kernel
+            .complete_terminal_task(task_id, agent_id, session_id, Some("done"), Some("done"))
+            .unwrap();
+        assert_eq!(completed["ok"].as_bool(), Some(false));
+        assert_eq!(completed["error"]["code"].as_str(), Some("task_not_active"));
+        assert_eq!(
+            completed["error"]["details"]["status"].as_str(),
+            Some("interrupted")
+        );
+
+        let submitted = kernel
+            .submit_patch(task_id, agent_id, session_id, None, Some("late submit"))
+            .unwrap();
+        assert_eq!(submitted["ok"].as_bool(), Some(false));
+        assert_eq!(submitted["error"]["code"].as_str(), Some("task_not_active"));
+        assert_eq!(
+            submitted["error"]["details"]["status"].as_str(),
+            Some("interrupted")
+        );
+
+        let noop_events = kernel
+            .query_json(
+                "SELECT id FROM events WHERE task_id=?1 AND event_type='task_noop_submitted'",
+                &[&task_id],
+            )
+            .unwrap();
+        assert!(noop_events.is_empty());
     }
 
     #[test]
