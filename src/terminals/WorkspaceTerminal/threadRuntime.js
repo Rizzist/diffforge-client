@@ -1894,10 +1894,6 @@ export function getTerminalSubmitSequence(_agentKind, isGenericTerminal = false)
     return "";
   }
 
-  if (getTerminalAgentKind(_agentKind) === "codex") {
-    return TERMINAL_ENTER_SEQUENCE;
-  }
-
   return "\r";
 }
 

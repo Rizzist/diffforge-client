@@ -700,36 +700,7 @@ fn terminal_args_with_codex_mcp_identity(
     let enforcement_mode = env_value("COORDINATION_ENFORCEMENT_MODE").unwrap_or_default();
     let file_authority = env_value("COORDINATION_FILE_AUTHORITY").unwrap_or_default();
 
-    let mut coordination_args =
-        crate::coordination::mcp::proxy_args_for_repo(&coordination.repo_path);
-    coordination_args.extend([
-        "--repo-path".to_string(),
-        coordination.repo_path.clone(),
-        "--db-path".to_string(),
-        coordination.db_path.clone(),
-        "--agent-id".to_string(),
-        coordination.agent_id.clone(),
-        "--session-id".to_string(),
-        coordination.session_id.clone(),
-    ]);
-    for (env_key, arg_key) in [
-        ("COORDINATION_AGENT_SLOT_ID", "--agent-slot-id"),
-        ("COORDINATION_SLOT_KEY", "--slot-key"),
-        (
-            "COORDINATION_TERMINAL_LAUNCH_EPOCH",
-            "--terminal-launch-epoch",
-        ),
-        ("COORDINATION_TASK_ID", "--task-id"),
-        ("COORDINATION_WORKTREE_ID", "--worktree-id"),
-        ("COORDINATION_WORKTREE_PATH", "--worktree-path"),
-        ("COORDINATION_WORKSPACE_ID", "--workspace-id"),
-        ("COORDINATION_OBJECTIVE_KEY", "--objective-key"),
-    ] {
-        if let Some(value) = env_value(env_key) {
-            coordination_args.push(arg_key.to_string());
-            coordination_args.push(value);
-        }
-    }
+    let coordination_args = terminal_coordination_proxy_args(coordination);
 
     if is_codex {
         let _ = (enforcement_mode.as_str(), file_authority.as_str());
@@ -776,6 +747,40 @@ fn terminal_args_with_codex_mcp_identity(
         apply_claude_coordinated_auto_approval_args(&mut next, coordination, &coordination_args);
     }
     next
+}
+
+fn terminal_coordination_proxy_args(coordination: &TerminalCoordinationSession) -> Vec<String> {
+    let mut coordination_args =
+        crate::coordination::mcp::proxy_args_for_repo(&coordination.repo_path);
+    coordination_args.extend([
+        "--repo-path".to_string(),
+        coordination.repo_path.clone(),
+        "--db-path".to_string(),
+        coordination.db_path.clone(),
+        "--agent-id".to_string(),
+        coordination.agent_id.clone(),
+        "--session-id".to_string(),
+        coordination.session_id.clone(),
+    ]);
+    for (env_key, arg_key) in [
+        ("COORDINATION_AGENT_SLOT_ID", "--agent-slot-id"),
+        ("COORDINATION_SLOT_KEY", "--slot-key"),
+        (
+            "COORDINATION_TERMINAL_LAUNCH_EPOCH",
+            "--terminal-launch-epoch",
+        ),
+        ("COORDINATION_TASK_ID", "--task-id"),
+        ("COORDINATION_WORKTREE_ID", "--worktree-id"),
+        ("COORDINATION_WORKTREE_PATH", "--worktree-path"),
+        ("COORDINATION_WORKSPACE_ID", "--workspace-id"),
+        ("COORDINATION_OBJECTIVE_KEY", "--objective-key"),
+    ] {
+        if let Some(value) = terminal_coordination_env_value(coordination, env_key) {
+            coordination_args.push(arg_key.to_string());
+            coordination_args.push(value);
+        }
+    }
+    coordination_args
 }
 
 const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
@@ -3186,13 +3191,38 @@ fn run_agent_command_capture(
     timeout: Duration,
     working_directory: Option<&Path>,
 ) -> Result<CommandCapture, String> {
+    run_agent_command_capture_with_env(
+        definition,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        &[],
+    )
+}
+
+fn run_agent_command_capture_with_env(
+    definition: AgentDefinition,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    env_vars: &[(String, String)],
+) -> Result<CommandCapture, String> {
     let mut last_error = format!(
         "{} is not installed or not available on PATH.",
         definition.label
     );
 
     for candidate in agent_command_candidates(definition) {
-        match run_command_capture(&candidate, args, stdin_text, timeout, working_directory) {
+        match run_command_capture_with_env(
+            &candidate,
+            args,
+            stdin_text,
+            timeout,
+            working_directory,
+            env_vars,
+        ) {
             Ok(capture) => return Ok(capture),
             Err(error) => {
                 last_error = error;
@@ -4268,11 +4298,17 @@ fn build_codex_turn_args(
     provider_session_id: &str,
     output_path: &Path,
 ) -> Vec<String> {
-    let mut args = vec!["exec".to_string()];
-    if !provider_session_id.is_empty() {
-        args.push("resume".to_string());
-    }
-
+    let mut args = vec![
+        "--ask-for-approval".to_string(),
+        "never".to_string(),
+        "--disable".to_string(),
+        "apps".to_string(),
+        "exec".to_string(),
+        "--sandbox".to_string(),
+        "workspace-write".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+    ];
     args.push("--skip-git-repo-check".to_string());
     args.push("--output-last-message".to_string());
     args.push(output_path.to_string_lossy().to_string());
@@ -4281,10 +4317,79 @@ fn build_codex_turn_args(
         args.push(model.to_string());
     }
     if !provider_session_id.is_empty() {
+        args.push("resume".to_string());
         args.push(provider_session_id.to_string());
     }
     args.push("-".to_string());
     args
+}
+
+fn insert_codex_exec_args_before_stdin_prompt(args: &mut Vec<String>, values: Vec<String>) {
+    if values.is_empty() {
+        return;
+    }
+    let insert_at = args
+        .iter()
+        .position(|arg| arg == "resume")
+        .or_else(|| args.iter().rposition(|arg| arg == "-"))
+        .unwrap_or(args.len());
+    args.splice(insert_at..insert_at, values);
+}
+
+fn apply_codex_coordinated_exec_args(
+    args: &mut Vec<String>,
+    coordination: &TerminalCoordinationSession,
+) {
+    let codex_profile = terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_PROFILE");
+    if let Some(profile) = codex_profile.filter(|value| !value.trim().is_empty()) {
+        args.insert(0, profile);
+        args.insert(0, "--profile".to_string());
+    }
+
+    let coordination_args = terminal_coordination_proxy_args(coordination);
+    let mut codex_config_args = Vec::new();
+    codex_config_args.extend([
+        "--disable".to_string(),
+        "apps".to_string(),
+        "--enable".to_string(),
+        "hooks".to_string(),
+    ]);
+    if terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_BYPASS_HOOK_TRUST")
+        .is_some_and(|value| terminal_env_truthy(&value))
+    {
+        codex_config_args.push("--dangerously-bypass-hook-trust".to_string());
+    }
+    append_codex_mcp_server_config_args(
+        &mut codex_config_args,
+        "coordination-kernel",
+        &coordination.mcp_command,
+        &coordination_args,
+    );
+    for tool in crate::coordination::mcp::TOOL_NAMES {
+        append_codex_mcp_tool_approval_arg(&mut codex_config_args, "coordination-kernel", tool);
+    }
+
+    let gateway_args = terminal_workspace_gateway_args_from_coordination_args(&coordination_args);
+    append_codex_mcp_server_config_args(
+        &mut codex_config_args,
+        "workspace-mcp-gateway",
+        &coordination.mcp_command,
+        &gateway_args,
+    );
+    for tool in TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS {
+        append_codex_mcp_tool_approval_arg(&mut codex_config_args, "workspace-mcp-gateway", tool);
+    }
+    if let Some(value) = terminal_coordination_env_value(
+        coordination,
+        "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS",
+    ) {
+        for tool in value.split(',').map(str::trim).filter(|tool| !tool.is_empty()) {
+            append_codex_mcp_tool_approval_arg(&mut codex_config_args, "workspace-mcp-gateway", tool);
+        }
+    }
+    codex_config_args.push("-c".to_string());
+    codex_config_args.push("shell_environment_policy.inherit=all".to_string());
+    insert_codex_exec_args_before_stdin_prompt(args, codex_config_args);
 }
 
 fn build_claude_turn_args(
@@ -4335,6 +4440,14 @@ fn build_opencode_turn_args(
 fn run_agent_thread_turn_for(
     request: AgentThreadTurnRequest,
 ) -> Result<AgentThreadTurnResult, String> {
+    run_agent_thread_turn_for_context(request, None, &[])
+}
+
+fn run_agent_thread_turn_for_context(
+    request: AgentThreadTurnRequest,
+    coordination: Option<&TerminalCoordinationSession>,
+    env_vars: &[(String, String)],
+) -> Result<AgentThreadTurnResult, String> {
     let provider = parse_agent_provider(&request.agent_id)?;
     let definition = agent_definition(provider);
     let prompt = request.prompt.trim();
@@ -4355,15 +4468,27 @@ fn run_agent_thread_turn_for(
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {
             let path = temporary_agent_output_path("codex")?;
-            let args =
+            let mut args =
                 build_codex_turn_args(model.as_deref(), &requested_provider_session_id, &path);
+            if let Some(coordination) = coordination {
+                apply_codex_coordinated_exec_args(&mut args, coordination);
+            }
             output_path = Some(path);
             (args, Some(prompt))
         }
-        AgentProvider::Claude => (
-            build_claude_turn_args(model.as_deref(), &requested_provider_session_id, prompt),
-            None,
-        ),
+        AgentProvider::Claude => {
+            let mut args =
+                build_claude_turn_args(model.as_deref(), &requested_provider_session_id, prompt);
+            if let Some(coordination) = coordination {
+                let coordination_args = terminal_coordination_proxy_args(coordination);
+                apply_claude_coordinated_auto_approval_args(
+                    &mut args,
+                    coordination,
+                    &coordination_args,
+                );
+            }
+            (args, None)
+        }
         AgentProvider::OpenCode => (
             build_opencode_turn_args(
                 model.as_deref(),
@@ -4376,12 +4501,13 @@ fn run_agent_thread_turn_for(
     };
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
 
-    let capture = run_agent_command_capture(
+    let capture = run_agent_command_capture_with_env(
         definition,
         &arg_refs,
         stdin_text,
         Duration::from_secs(AGENT_THREAD_TURN_TIMEOUT_SECS),
         Some(&working_directory),
+        env_vars,
     );
     let output_from_file = output_path
         .as_ref()

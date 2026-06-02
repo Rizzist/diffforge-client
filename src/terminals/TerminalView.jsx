@@ -80,6 +80,16 @@ import {
   evaluateTodoQueueInFlightPrompt,
 } from "./todoQueueLaneState.js";
 import { selectTodoQueueDispatchCandidate } from "./todoQueueScheduler.js";
+import {
+  TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+  TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
+  TODO_QUEUE_SOURCE_TODO_AUTO,
+  TODO_QUEUE_SOURCE_VOICE_AGENT,
+  TODO_QUEUE_SOURCE_VOICE_PLAN,
+  getTodoQueueAutoQueueSourceForSource,
+  getTodoQueueLifecycleSourceForSource,
+  getTodoQueuePromptEventSourceForSource,
+} from "./todoQueueSources.js";
 import WorkspaceTerminal, {
   getTerminalPaneMinSizePercent,
   getWorkspaceTerminalPaneId,
@@ -123,6 +133,7 @@ const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
 const TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS = 1200;
 const TODO_QUEUE_SUBMIT_RETRY_DELAYS_MS = [350, 900];
+const TODO_QUEUE_SUBMIT_SYNC_SETTLE_MS = 80;
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
@@ -160,9 +171,6 @@ const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
 const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-coding-agents-result";
 const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
-const TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO = "tui-spec-edit-auto-queue";
-const TODO_QUEUE_SOURCE_VOICE_PLAN = "tui-voice-plan-queue";
-const TODO_QUEUE_SOURCE_REMOTE_CONTROL = "next-remote-control";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
 const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
@@ -3309,7 +3317,7 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
       planTask,
       source: TODO_QUEUE_SOURCE_VOICE_PLAN,
     } : {
-      source: "tui-voice-agent-queue",
+      source: TODO_QUEUE_SOURCE_VOICE_AGENT,
     }),
   });
 }
@@ -4059,59 +4067,37 @@ function getTodoQueueItemThreadMessageText(item, fallback = "") {
 }
 
 function getTodoQueueItemAutoQueueSource(item) {
-  if (isSpecEditTodoQueueItem(item)) {
-    return TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO;
-  }
-
-  const source = normalizeTodoQueueSource(item?.source);
-  if (source === "tui-voice-agent-queue") {
-    return source;
-  }
-  if (source === TODO_QUEUE_SOURCE_VOICE_PLAN) {
-    return source;
-  }
-
-  return "tui-todo-auto-queue";
+  return getTodoQueueAutoQueueSourceForSource({
+    source: item?.source,
+    specEdit: isSpecEditTodoQueueItem(item),
+  });
 }
 
 function getTodoQueueAttachmentSource(source) {
   if (source === TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO) {
     return "tui_spec_edit_auto_queue";
   }
-  if (source === "tui-voice-agent-queue") {
+  if (source === TODO_QUEUE_SOURCE_VOICE_AGENT) {
     return "tui_voice_agent_queue";
   }
   if (source === TODO_QUEUE_SOURCE_VOICE_PLAN) {
     return "tui_voice_plan_queue";
   }
-  return source === "tui-todo-auto-queue" ? "tui_todo_auto_queue" : "tui_todo_drop";
+  return source === TODO_QUEUE_SOURCE_TODO_AUTO ? "tui_todo_auto_queue" : "tui_todo_drop";
 }
 
 function getTodoQueuePromptEventSource(source, item) {
-  if (isSpecEditTodoQueueItem(item)) {
-    return "spec-edit";
-  }
-  if (source === "tui-todo-auto-queue") {
-    return "todo-auto-queue";
-  }
-  if (source === "tui-voice-agent-queue") {
-    return "voice-agent-queue";
-  }
-  if (source === TODO_QUEUE_SOURCE_VOICE_PLAN) {
-    return "voice-plan-queue";
-  }
-  return "terminal-view-drop";
+  return getTodoQueuePromptEventSourceForSource({
+    source,
+    specEdit: isSpecEditTodoQueueItem(item),
+  });
 }
 
 function getTodoQueueLifecycleSource(source, item) {
-  if (isSpecEditTodoQueueItem(item)) {
-    return TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO;
-  }
-  return source === "tui-todo-auto-queue"
-    || source === "tui-voice-agent-queue"
-    || source === TODO_QUEUE_SOURCE_VOICE_PLAN
-    ? source
-    : "tui-todo-drop";
+  return getTodoQueueLifecycleSourceForSource({
+    source,
+    specEdit: isSpecEditTodoQueueItem(item),
+  });
 }
 
 function normalizeTodoTerminalAgentId(value) {
@@ -10113,6 +10099,7 @@ function TerminalView({
     const lifecycleSource = getTodoQueueLifecycleSource(source, currentItem);
     let threadMessageLifecycleDispatched = false;
     const dispatchThreadMessageLifecycle = ({
+      acceptedDetail = null,
       promptId = "",
       reason = "submit_observed",
       submittedAt = "",
@@ -10174,18 +10161,23 @@ function TerminalView({
         return false;
       }
 
+      const providerSessionId = String(acceptedDetail?.sessionId || "").trim();
       threadMessageLifecycleDispatched = true;
       logTerminalStatus("frontend.terminal_status.lifecycle_send", {
         agentId: targetRole,
         eventStatus: "active",
         eventType: "message-submitted",
         item: getTodoQueueItemLogSummary([currentItem])[0] || null,
+        acceptedMatchedBy: acceptedDetail?.matchedBy || "",
         pendingPromptId: safePromptId,
         promptEventId: safePromptId,
+        providerSessionPresent: Boolean(providerSessionId),
         reason,
         source: lifecycleSource,
         targetTerminalIndex: target.targetTerminalIndex,
-        terminalGroundTruthStatus: "processing_request_submitted",
+        terminalGroundTruthStatus: providerSessionId
+          ? "processing_request_accepted"
+          : "processing_request_submitted",
         threadId: targetThread.id,
         workspaceId,
       });
@@ -10203,8 +10195,9 @@ function TerminalView({
         pendingPromptText: safeThreadMessageText,
         promptEventId: safePromptId,
         promptEventSubmittedAt: submittedAt || "",
+        providerSessionId,
         repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
-        sessionAcceptancePending: true,
+        sessionAcceptancePending: !providerSessionId,
         slotKey: targetThread?.slotKey || targetBinding?.slotKey || "",
         source: lifecycleSource,
         status: "active",
@@ -10213,6 +10206,9 @@ function TerminalView({
         threadId: targetThread.id,
         type: "message-submitted",
         userMessage: safeThreadMessageText,
+        nativeSessionId: providerSessionId,
+        nativeSessionKind: providerSessionId ? "session" : "",
+        nativeSessionSource: providerSessionId ? "terminal-confirmed" : "",
         workspaceId,
         workspaceName: terminalWorkspace?.name || "",
       });
@@ -10266,6 +10262,8 @@ function TerminalView({
     }
 
     let dropResult = null;
+    let draftTransaction = null;
+    let draftTransactionId = "";
     if (!terminalText && queuedAttachment) {
       if (!syncKey) {
         throw new Error("Unable to queue image because this terminal has no thread composer.");
@@ -10304,16 +10302,24 @@ function TerminalView({
         shouldAutoSubmit
           && !image
           && terminalSubmitSequence
-          && targetThread?.id,
+          && targetThread?.id
+          && paneId
+          && targetBinding?.instanceId,
       );
       if (shouldAutoSubmit && !shouldConfirmAutoSubmit) {
         logBigViewSyncDiagnosticEvent("tui.text.drop_submit_blocked", {
+          hasInstanceId: Boolean(targetBinding?.instanceId),
+          hasPaneId: Boolean(paneId),
           hasSubmitSequence: Boolean(terminalSubmitSequence),
           hasTargetThread: Boolean(targetThread?.id),
           paneId,
           reason: !terminalSubmitSequence
             ? "missing_submit_sequence"
-            : "missing_thread",
+            : !targetThread?.id
+              ? "missing_thread"
+              : !paneId
+                ? "missing_pane"
+                : "missing_instance",
           source,
           surface: "tui_terminal_grid",
           targetRole,
@@ -10328,9 +10334,8 @@ function TerminalView({
           || getTodoQueueItemSpecEdit(currentItem)?.intentId
           || createThreadProjectionToken("todo-drop-prompt")
         : "";
-      const draftTransactionId = promptId
+      draftTransactionId = promptId
         || String(currentItem?.id || currentItem?.itemId || createThreadProjectionToken("todo-draft"));
-      let draftTransaction = null;
       if (syncKey) {
         draftTransaction = setWorkspaceThreadComposerDraft(syncKey, terminalText, {
           source: shouldConfirmAutoSubmit ? "todo_queue_submit_sync" : "todo_queue_draft_sync",
@@ -10344,7 +10349,7 @@ function TerminalView({
         hasQueuedImage: Boolean(queuedAttachment),
         paneId,
         shouldAutoSubmit,
-        sharedDraftSynced: Boolean(syncKey),
+        sharedDraftSynced: Boolean(syncKey && draftTransaction),
         source,
         submitConfirmationRequired: shouldConfirmAutoSubmit,
         syncKey,
@@ -10409,14 +10414,21 @@ function TerminalView({
           }
 
           todoQueueTerminalInFlightPromptsRef.current.set(Number(target.targetTerminalIndex), {
+            agentId: targetRole,
             itemId: currentItem.id || currentItem.itemId || "",
-            promptText: terminalText,
+            lifecycleSource,
+            paneId,
             promptId,
+            promptEventSubmittedAt: submittedAt,
+            promptText: terminalText,
             source,
             startedAtMs: Date.now(),
             submittedAt,
             submittedAtMs: Date.parse(submittedAt) || Date.now(),
+            targetTerminalIndex: target.targetTerminalIndex,
             terminalInstanceId: targetBinding?.instanceId || "",
+            terminalText,
+            threadMessageText,
             threadId: targetThread.id,
             workspaceId,
           });
@@ -10493,25 +10505,47 @@ function TerminalView({
         if (syncData) {
           logTerminalStatus("frontend.todo_queue.terminal_write.sync_start", {
             ...terminalWriteLogBase,
-            atomicSubmit: true,
+            atomicSubmit: false,
             draftRevision: draftTransaction?.revision || 0,
             instanceId: targetBinding?.instanceId || "",
             promptEventId: promptId,
-            reason: "deferred_to_submit_transaction",
+            reason: "composer_sync_before_submit",
             syncDataLength: syncData.length,
             threadId: targetThread.id,
           });
-          logTerminalStatus("frontend.todo_queue.terminal_write.sync_done", {
-            ...terminalWriteLogBase,
-            atomicSubmit: true,
-            draftRevision: draftTransaction?.revision || 0,
-            elapsedMs: Math.round(performance.now() - syncWriteStartedAt),
-            instanceId: targetBinding?.instanceId || "",
-            promptEventId: promptId,
-            reason: "deferred_to_submit_transaction",
-            syncDataLength: syncData.length,
-            threadId: targetThread.id,
-          });
+          try {
+            await invoke("terminal_write", {
+              data: syncData,
+              instanceId: targetBinding?.instanceId,
+              paneId,
+              threadId: targetThread.id,
+            });
+            logTerminalStatus("frontend.todo_queue.terminal_write.sync_done", {
+              ...terminalWriteLogBase,
+              atomicSubmit: false,
+              draftRevision: draftTransaction?.revision || 0,
+              elapsedMs: Math.round(performance.now() - syncWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              promptEventId: promptId,
+              reason: "composer_sync_before_submit",
+              syncDataLength: syncData.length,
+              threadId: targetThread.id,
+            });
+          } catch (syncError) {
+            logTerminalStatus("frontend.todo_queue.terminal_write.sync_error", {
+              ...terminalWriteLogBase,
+              atomicSubmit: false,
+              draftRevision: draftTransaction?.revision || 0,
+              elapsedMs: Math.round(performance.now() - syncWriteStartedAt),
+              instanceId: targetBinding?.instanceId || "",
+              message: syncError?.message || String(syncError || ""),
+              promptEventId: promptId,
+              reason: "composer_sync_before_submit",
+              syncDataLength: syncData.length,
+              threadId: targetThread.id,
+            });
+            throw syncError;
+          }
         } else {
           logTerminalStatus("frontend.todo_queue.terminal_write.sync_skip", {
             ...terminalWriteLogBase,
@@ -10525,7 +10559,7 @@ function TerminalView({
         const syncWriteDurationMs = Math.round(performance.now() - syncWriteStartedAt);
         logBigViewSyncDiagnosticEvent("tui.text.drop_sync_done", {
           agentId: targetRole,
-          atomicSubmit: true,
+          atomicSubmit: false,
           draftRevision: draftTransaction?.revision || 0,
           paneId,
           promptId,
@@ -10542,6 +10576,11 @@ function TerminalView({
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_80ms", 80);
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_300ms", 300);
         requestDropSubmitSnapshot("tui.text.drop_after_sync_before_enter_900ms", 900);
+        if (syncData && TODO_QUEUE_SUBMIT_SYNC_SETTLE_MS > 0) {
+          await new Promise((resolve) => {
+            window.setTimeout(resolve, TODO_QUEUE_SUBMIT_SYNC_SETTLE_MS);
+          });
+        }
         const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
           agentId: targetRole,
           expectedPrompt: terminalText,
@@ -10643,7 +10682,7 @@ function TerminalView({
               throw draftChangedError;
             }
             const attemptSubmittedAt = isRetry ? new Date().toISOString() : submittedAt;
-            const submitTransactionData = `${syncData}${terminalSubmitSequence}`;
+            const submitTransactionData = terminalSubmitSequence;
             const submittedWaiter = await createTerminalPromptSubmittedWaiter({
               agentId: targetRole,
               expectedPrompt: terminalText,
@@ -10656,7 +10695,7 @@ function TerminalView({
             });
             logBigViewSyncDiagnosticEvent("tui.text.drop_enter_write", {
               agentId: targetRole,
-              atomicSubmit: true,
+              atomicSubmit: false,
               attempt: submitAttemptIndex + 1,
               draftRevision: draftTransaction?.revision || 0,
               paneId,
@@ -10664,6 +10703,7 @@ function TerminalView({
               retry: isRetry,
               source,
               submitSequenceLength: terminalSubmitSequence.length,
+              syncDataLength: syncData.length,
               syncKey,
               surface: "tui_terminal_grid",
               targetTerminalIndex: targetLogIndex,
@@ -10674,7 +10714,7 @@ function TerminalView({
             const submitWriteStartedAt = performance.now();
             logTerminalStatus("frontend.todo_queue.terminal_write.submit_start", {
               ...terminalWriteLogBase,
-              atomicSubmit: true,
+              atomicSubmit: false,
               attempt: submitAttemptIndex + 1,
               draftRevision: draftTransaction?.revision || 0,
               instanceId: targetBinding?.instanceId || "",
@@ -10684,6 +10724,7 @@ function TerminalView({
               promptTextLength: terminalText.length,
               retry: isRetry,
               submitSequenceLength: terminalSubmitSequence.length,
+              syncDataLength: syncData.length,
               threadId: targetThread.id,
             });
             try {
@@ -10699,7 +10740,7 @@ function TerminalView({
               });
               logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
                 ...terminalWriteLogBase,
-                atomicSubmit: true,
+                atomicSubmit: false,
                 attempt: submitAttemptIndex + 1,
                 draftRevision: draftTransaction?.revision || 0,
                 elapsedMs: Math.round(performance.now() - submitWriteStartedAt),
@@ -10710,6 +10751,7 @@ function TerminalView({
                 promptTextLength: terminalText.length,
                 retry: isRetry,
                 submitSequenceLength: terminalSubmitSequence.length,
+                syncDataLength: syncData.length,
                 threadId: targetThread.id,
               });
               requestDropSubmitSnapshot("tui.text.drop_after_enter_write_40ms", 40, {
@@ -10786,13 +10828,7 @@ function TerminalView({
             threadId: targetThread.id,
             workspaceId,
           });
-          const lifecycleDispatchedAtSubmit = dispatchThreadMessageLifecycle({
-            promptId,
-            reason: "submit_observed",
-            submittedAt,
-            terminalText,
-            threadMessageText,
-          });
+          const lifecycleDispatchedAtSubmit = false;
           let acceptedDetail = null;
           let acceptedDraftClearResult = null;
           const clearAcceptedSubmitDraft = (detail, reason = "todo_queue_submit_accepted_clear") => {
@@ -10837,29 +10873,46 @@ function TerminalView({
             if (!detail) {
               return null;
             }
+            const acceptedMatchedBy = detail?.matchedBy || matchedByFallback || "";
             const targetTerminalNumber = Number(target.targetTerminalIndex);
             const inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(targetTerminalNumber);
+            const lifecycleDispatchedAtAcceptance = dispatchThreadMessageLifecycle({
+              acceptedDetail: {
+                ...detail,
+                matchedBy: acceptedMatchedBy,
+              },
+              promptId,
+              reason: "session_accepted",
+              submittedAt,
+              terminalText,
+              threadMessageText,
+            });
             if (String(inFlightPrompt?.promptId || "") === promptId) {
               todoQueueTerminalInFlightPromptsRef.current.set(targetTerminalNumber, {
                 ...inFlightPrompt,
                 accepted: true,
                 acceptedAt: new Date().toISOString(),
                 acceptedAtMs: Date.now(),
-                acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
+                acceptedMatchedBy,
+                lifecycleDispatched: Boolean(
+                  inFlightPrompt?.lifecycleDispatched || lifecycleDispatchedAtAcceptance,
+                ),
                 sessionId: detail?.sessionId || inFlightPrompt?.sessionId || "",
               });
             }
             logTerminalStatus("frontend.todo_queue.terminal_write.accepted", {
               ...terminalWriteLogBase,
-              acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
+              acceptedMatchedBy,
               instanceId: targetBinding?.instanceId || "",
+              lifecycleDispatched: lifecycleDispatchedAtAcceptance,
               promptEventId: promptId,
               sessionIdPresent: Boolean(detail?.sessionId),
               threadId: targetThread.id,
             });
             logBigViewSyncDiagnosticEvent("tui.text.drop_submit_accepted", {
-              acceptedMatchedBy: detail?.matchedBy || matchedByFallback || "",
+              acceptedMatchedBy,
               agentId: targetRole,
+              lifecycleDispatched: lifecycleDispatchedAtAcceptance,
               paneId,
               promptId,
               sessionIdPresent: Boolean(detail?.sessionId),
@@ -10995,6 +11048,7 @@ function TerminalView({
     const shouldDispatchThreadMessage = Boolean(
       !threadMessageLifecycleDispatched
         && dropResult?.confirmedSubmit
+        && (dropResult?.sessionAccepted || dropResult?.acceptedDetail)
         && shouldAutoSubmit
         && !image
         && resultThreadMessageText.trim()
@@ -11019,7 +11073,7 @@ function TerminalView({
         threadId: targetThread.id,
         workspaceId,
       });
-        handleWorkspaceTerminalLifecycle({
+      handleWorkspaceTerminalLifecycle({
         agentId: targetRole,
         instanceId: targetBinding?.instanceId || "",
         inputReady: false,
@@ -11097,6 +11151,7 @@ function TerminalView({
       });
     }
     let finalDraftClearResult = null;
+    const dropDraftRevision = Number(dropResult?.draftRevision || draftTransaction?.revision || 0);
     const shouldRunFinalDraftClear = Boolean(
       syncKey
         && shouldAutoSubmit
@@ -11104,7 +11159,7 @@ function TerminalView({
         && !dropResult?.draftClearedOnAcceptance,
     );
     if (shouldRunFinalDraftClear) {
-      finalDraftClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, dropResult?.draftRevision || draftTransaction?.revision || 0, {
+      finalDraftClearResult = clearWorkspaceThreadComposerDraftIfRevision(syncKey, dropDraftRevision, {
         expectedValue: dropResult?.terminalText || terminalText,
         source: "todo_queue_final_clear",
         transactionId: dropResult?.draftTransactionId || draftTransactionId,
@@ -11114,7 +11169,7 @@ function TerminalView({
         cleared: Boolean(finalDraftClearResult.cleared),
         currentDraftLength: String(finalDraftClearResult.value || "").length,
         currentDraftRevision: finalDraftClearResult.revision || 0,
-        expectedDraftRevision: dropResult?.draftRevision || draftTransaction?.revision || 0,
+        expectedDraftRevision: dropDraftRevision,
         reason: finalDraftClearResult.reason || "",
         threadId: targetThread?.id || "",
       });
@@ -11123,7 +11178,7 @@ function TerminalView({
         ...terminalWriteLogBase,
         acceptedMatchedBy: dropResult?.acceptedDetail?.matchedBy || "",
         draftClearedOnAcceptance: Boolean(dropResult?.draftClearedOnAcceptance),
-        expectedDraftRevision: dropResult?.draftRevision || draftTransaction?.revision || 0,
+        expectedDraftRevision: dropDraftRevision,
         promptEventId: dropResult?.promptId || "",
         reason: dropResult?.sessionAccepted || dropResult?.acceptedDetail
           ? "draft_already_cleared_on_acceptance"
@@ -11648,7 +11703,7 @@ function TerminalView({
     }
 
     const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
-    const source = item ? getTodoQueueItemAutoQueueSource(item) : "tui-todo-auto-queue";
+    const source = item ? getTodoQueueItemAutoQueueSource(item) : TODO_QUEUE_SOURCE_TODO_AUTO;
     clearTodoQueueItemPending(safeItemId, "cancelled", {
       source,
     });

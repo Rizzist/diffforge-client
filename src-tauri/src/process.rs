@@ -115,12 +115,33 @@ fn run_command_capture(
     timeout: Duration,
     working_directory: Option<&Path>,
 ) -> Result<CommandCapture, String> {
-    run_command_capture_with_cancel(
+    run_command_capture_with_cancel_and_env(
         binary,
         args,
         stdin_text,
         timeout,
         working_directory,
+        &[],
+        || false,
+        "Command canceled.",
+    )
+}
+
+fn run_command_capture_with_env(
+    binary: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    env_vars: &[(String, String)],
+) -> Result<CommandCapture, String> {
+    run_command_capture_with_cancel_and_env(
+        binary,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        env_vars,
         || false,
         "Command canceled.",
     )
@@ -132,6 +153,31 @@ fn run_command_capture_with_cancel<F>(
     stdin_text: Option<&str>,
     timeout: Duration,
     working_directory: Option<&Path>,
+    should_cancel: F,
+    canceled_message: &str,
+) -> Result<CommandCapture, String>
+where
+    F: FnMut() -> bool,
+{
+    run_command_capture_with_cancel_and_env(
+        binary,
+        args,
+        stdin_text,
+        timeout,
+        working_directory,
+        &[],
+        should_cancel,
+        canceled_message,
+    )
+}
+
+fn run_command_capture_with_cancel_and_env<F>(
+    binary: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    env_vars: &[(String, String)],
     mut should_cancel: F,
     canceled_message: &str,
 ) -> Result<CommandCapture, String>
@@ -149,6 +195,9 @@ where
     let mut command = Command::new(binary);
     apply_desktop_command_environment(&mut command);
     command.args(args);
+    for (key, value) in env_vars {
+        command.env(key, value);
+    }
 
     if let Some(directory) = working_directory {
         command.current_dir(workspace_path_for_process(directory));

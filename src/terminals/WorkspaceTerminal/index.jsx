@@ -11639,7 +11639,6 @@ function WorkspaceTerminal({
     isGenericTerminal,
     onThreadTerminalLifecycle,
     paneId,
-    runWorkspaceThreadProviderTurn,
     setThreadComposerDraftValue,
     terminalAgentKind,
     terminalClosed,

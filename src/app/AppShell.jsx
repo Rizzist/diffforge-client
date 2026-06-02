@@ -31,6 +31,10 @@ import {
 import {
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminals/terminalPromptSubmission.js";
+import {
+  getProviderTurnCompletionIntent,
+  shouldReconcileProviderTurnCompletion,
+} from "../terminals/providerTurnIntent.js";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
 import {
   terminalCommandPhaseFromLifecycleEvent,
@@ -12565,29 +12569,42 @@ export default function App() {
       });
     }
     if (lifecycleEvent.type === "provider-turn-completed" && lifecycleEvent.paneId) {
-      invoke("terminal_provider_turn_completed", {
-        paneId: lifecycleEvent.paneId,
-        instanceId: Number.isFinite(Number(lifecycleEvent.instanceId))
-          ? Number(lifecycleEvent.instanceId)
-          : null,
-        reason: lifecycleEvent.source || lifecycleEvent.completionSource || "provider-turn-completed",
-      }).then((result) => {
-        logTerminalStatus("frontend.provider_turn_completed.reconcile_result", {
+      const shouldReconcileCoordination = shouldReconcileProviderTurnCompletion(lifecycleEvent);
+      if (!shouldReconcileCoordination) {
+        logTerminalStatus("frontend.provider_turn_completed.reconcile_skip", {
           paneId: lifecycleEvent.paneId || "",
           promptEventId: lifecyclePromptEventId,
-          result,
+          providerTurnIntent: getProviderTurnCompletionIntent(lifecycleEvent),
+          reason: "provider_turn_not_coordination_scoped",
           threadId: lifecycleThreadId,
           workspaceId: lifecycleWorkspaceId,
         });
-      }).catch((error) => {
-        logTerminalStatus("frontend.provider_turn_completed.reconcile_error", {
-          message: error?.message || String(error || ""),
-          paneId: lifecycleEvent.paneId || "",
-          promptEventId: lifecyclePromptEventId,
-          threadId: lifecycleThreadId,
-          workspaceId: lifecycleWorkspaceId,
+      } else {
+        invoke("terminal_provider_turn_completed", {
+          paneId: lifecycleEvent.paneId,
+          instanceId: Number.isFinite(Number(lifecycleEvent.instanceId))
+            ? Number(lifecycleEvent.instanceId)
+            : null,
+          reason: lifecycleEvent.source || lifecycleEvent.completionSource || "provider-turn-completed",
+          reconcileCoordination: true,
+        }).then((result) => {
+          logTerminalStatus("frontend.provider_turn_completed.reconcile_result", {
+            paneId: lifecycleEvent.paneId || "",
+            promptEventId: lifecyclePromptEventId,
+            result,
+            threadId: lifecycleThreadId,
+            workspaceId: lifecycleWorkspaceId,
+          });
+        }).catch((error) => {
+          logTerminalStatus("frontend.provider_turn_completed.reconcile_error", {
+            message: error?.message || String(error || ""),
+            paneId: lifecycleEvent.paneId || "",
+            promptEventId: lifecyclePromptEventId,
+            threadId: lifecycleThreadId,
+            workspaceId: lifecycleWorkspaceId,
+          });
         });
-      });
+      }
     }
     if (
       lifecyclePromptEventId.startsWith("voice-plan-")

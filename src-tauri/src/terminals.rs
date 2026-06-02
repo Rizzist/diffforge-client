@@ -7235,6 +7235,12 @@ async fn terminal_write(
     .await
 }
 
+fn terminal_provider_turn_should_reconcile_coordination(
+    reconcile_coordination: Option<bool>,
+) -> bool {
+    reconcile_coordination.unwrap_or(false)
+}
+
 #[tauri::command]
 async fn terminal_provider_turn_completed(
     app: AppHandle,
@@ -7242,8 +7248,16 @@ async fn terminal_provider_turn_completed(
     pane_id: String,
     instance_id: Option<u64>,
     reason: Option<String>,
+    reconcile_coordination: Option<bool>,
 ) -> Result<Value, String> {
     validate_terminal_pane_id(&pane_id)?;
+    if !terminal_provider_turn_should_reconcile_coordination(reconcile_coordination) {
+        return Ok(json!({
+            "ok": true,
+            "status": "skipped",
+            "reason": "provider_turn_not_coordination_scoped",
+        }));
+    }
     let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
     else {
         return Ok(json!({
@@ -8089,6 +8103,13 @@ async fn terminal_live_sessions(
 mod terminal_tests {
     use super::*;
 
+    #[test]
+    fn provider_turn_completion_reconciliation_requires_explicit_opt_in() {
+        assert!(!terminal_provider_turn_should_reconcile_coordination(None));
+        assert!(!terminal_provider_turn_should_reconcile_coordination(Some(false)));
+        assert!(terminal_provider_turn_should_reconcile_coordination(Some(true)));
+    }
+
     fn terminal_test_repo(name: &str) -> PathBuf {
         let repo = std::env::temp_dir().join(format!(
             "diffforge_terminal_test_{}_{}",
@@ -8922,6 +8943,20 @@ mod terminal_tests {
                 &format!("send from overlay{TERMINAL_ENTER_SEQUENCE}"),
             ),
             Some("send from overlay".to_string())
+        );
+    }
+
+    #[test]
+    fn split_composer_sync_then_enter_submits_prompt() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "\x15hey there"),
+            None
+        );
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "\r"),
+            Some("hey there".to_string())
         );
     }
 

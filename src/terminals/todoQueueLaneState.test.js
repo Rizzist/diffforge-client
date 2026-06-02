@@ -79,6 +79,69 @@ test("accepted queued prompt is not complete just because input is fresh again",
   assert.equal(evaluation.releaseReason, "");
 });
 
+test("queued prompt is released when its terminal closes before acceptance", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "idle",
+    effectiveLatestTurnState: "",
+    inFlightPrompt: {
+      accepted: false,
+      itemId: "todo-1",
+      promptId: "todo-drop-prompt-1",
+      promptText: "i want to make some pages",
+      startedAtMs: submittedAtMs,
+      submittedAt,
+      submittedAtMs,
+      terminalInstanceId: 4,
+      threadId: "thread-1",
+    },
+    liveTerminal: {
+      inputReady: false,
+      instanceId: 4,
+      status: "exited",
+      threadId: "thread-1",
+      terminalLifecycle: "closed",
+    },
+    providerBinding: null,
+    terminalStatus: "exited",
+    targetThread: {
+      id: "thread-1",
+      messages: [],
+      status: "exited",
+    },
+  });
+
+  assert.equal(evaluation.terminalClosed, true);
+  assert.equal(evaluation.releaseReason, "terminal_closed");
+});
+
+test("queued prompt is released when its terminal disappears before acceptance", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "",
+    effectiveLatestTurnState: "",
+    inFlightPrompt: {
+      accepted: false,
+      itemId: "todo-1",
+      promptId: "todo-drop-prompt-1",
+      promptText: "i want to make some pages",
+      startedAtMs: submittedAtMs,
+      submittedAt,
+      submittedAtMs,
+      terminalInstanceId: 4,
+      threadId: "thread-1",
+    },
+    liveTerminal: null,
+    providerBinding: null,
+    terminalStatus: "",
+    targetThread: {
+      id: "thread-1",
+      messages: [],
+    },
+  });
+
+  assert.equal(evaluation.terminalUnavailable, true);
+  assert.equal(evaluation.releaseReason, "terminal_unavailable");
+});
+
 test("queued prompt completes after exact prompt has a later assistant completion", () => {
   const evaluation = baseEvaluation({
     targetThread: {

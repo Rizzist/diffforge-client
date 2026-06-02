@@ -217,6 +217,22 @@ export function evaluateTodoQueueInFlightPrompt({
       || "",
   );
   const terminalInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
+  const normalizedTerminalStatus = normalizeTurnState(
+    terminalStatus
+      || liveTerminal?.status
+      || providerBinding?.status
+      || targetThread?.status
+      || "",
+  );
+  const terminalClosed = Boolean(
+    ["closed", "exited", "terminated"].includes(normalizedTerminalStatus)
+      || normalizeTurnState(liveTerminal?.terminalLifecycle || liveTerminal?.terminal_lifecycle) === "closed"
+  );
+  const terminalUnavailable = Boolean(
+    submittedAtMs
+      && !liveTerminal
+      && !providerBinding
+  );
   const freshInputReady = Boolean(
     terminalInputReady
       && submittedAtMs
@@ -329,13 +345,17 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const releaseReason = terminalConfirmedFinished
     ? "terminal_confirmed_finished"
-    : terminalInstanceChanged
-      ? "terminal_instance_changed"
-      : threadChanged
-        ? "terminal_thread_changed"
-        : expired
-          ? "timeout"
-          : "";
+    : terminalClosed
+      ? "terminal_closed"
+      : terminalUnavailable
+        ? "terminal_unavailable"
+        : terminalInstanceChanged
+          ? "terminal_instance_changed"
+          : threadChanged
+            ? "terminal_thread_changed"
+            : expired
+              ? "timeout"
+              : "";
 
   return {
     assistantCompletionAfterPrompt: completionEvidence.assistantCompletionAfterPrompt,
@@ -363,11 +383,13 @@ export function evaluateTodoQueueInFlightPrompt({
     sessionAcceptedByThread,
     submittedAtMs,
     terminalConfirmedFinished,
+    terminalClosed,
     terminalInputReady,
     terminalInputReadyAtMs,
     terminalInstanceChanged,
     terminalReadyForNextPrompt,
     terminalReadyActivityStatus: normalizedActivityStatus,
+    terminalUnavailable,
     threadChanged,
   };
 }
