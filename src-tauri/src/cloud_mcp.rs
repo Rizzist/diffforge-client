@@ -10805,6 +10805,73 @@ fn cloud_mcp_spec_graph_delta_string_array(delta: &Value, key: &str) -> Vec<Stri
         .unwrap_or_default()
 }
 
+fn cloud_mcp_spec_graph_hash_ids(value: Option<&Value>) -> HashSet<String> {
+    value
+        .and_then(Value::as_object)
+        .map(|hashes| {
+            hashes
+                .iter()
+                .filter(|(_, hash)| hash.as_str().map(str::trim).is_some_and(|value| !value.is_empty()))
+                .map(|(id, _)| id.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_spec_graph_delta_changed_ids(delta: &Value, key: &str) -> HashSet<String> {
+    cloud_mcp_spec_graph_delta_array(delta, key)
+        .into_iter()
+        .filter_map(|item| cloud_mcp_spec_graph_item_id(&item))
+        .collect()
+}
+
+fn cloud_mcp_spec_graph_delta_missing_cached_items(
+    cache: &Value,
+    delta: &Value,
+    camel_items_key: &str,
+    raw_items_key: &str,
+    delta_hash_key: &str,
+    changed_key: &str,
+    removed_key: &str,
+) -> bool {
+    let current_ids = cloud_mcp_spec_graph_array(cache, camel_items_key, raw_items_key)
+        .iter()
+        .filter_map(cloud_mcp_spec_graph_item_id)
+        .collect::<HashSet<_>>();
+    let next_hash_ids = cloud_mcp_spec_graph_hash_ids(delta.get(delta_hash_key));
+    if next_hash_ids.is_empty() {
+        return false;
+    }
+    let changed_ids = cloud_mcp_spec_graph_delta_changed_ids(delta, changed_key);
+    let removed_ids = cloud_mcp_spec_graph_delta_string_array(delta, removed_key)
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    next_hash_ids
+        .iter()
+        .any(|id| !current_ids.contains(id) && !changed_ids.contains(id) && !removed_ids.contains(id))
+}
+
+fn cloud_mcp_spec_graph_delta_needs_full_resync(cache: &Value, delta: &Value) -> bool {
+    cloud_mcp_spec_graph_delta_missing_cached_items(
+        cache,
+        delta,
+        "specNodes",
+        "nodes",
+        "node_hashes",
+        "changed_nodes",
+        "removed_node_ids",
+    ) || cloud_mcp_spec_graph_delta_missing_cached_items(
+        cache,
+        delta,
+        "specEdges",
+        "edges",
+        "edge_hashes",
+        "changed_edges",
+        "removed_edge_ids",
+    )
+}
+
 fn cloud_mcp_apply_spec_graph_delta(
     req: &CloudMcpSpecGraphSyncRequest,
     cache: Value,
@@ -11019,7 +11086,9 @@ async fn cloud_mcp_sync_spec_graph_once(
         };
     let mut next_snapshot = if let Some(response) = delta_response {
         let delta = cloud_mcp_response_data(&response);
-        if delta["requires_full_resync"].as_bool().unwrap_or(false) {
+        if delta["requires_full_resync"].as_bool().unwrap_or(false)
+            || cloud_mcp_spec_graph_delta_needs_full_resync(&current_cache, &delta)
+        {
             let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
             cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "")
         } else {
@@ -11959,6 +12028,49 @@ mod cloud_mcp_tests {
         });
 
         assert!(!cloud_mcp_graph_ws_event_matches(&req, &event));
+    }
+
+    #[test]
+    fn spec_graph_delta_requires_full_resync_when_cached_items_are_missing() {
+        let cache = json!({
+            "specNodes": [],
+            "specEdges": [],
+            "nodeHashes": {"workspace-root": "hash-root"},
+            "edgeHashes": {},
+            "raw": {
+                "nodes": [],
+                "edges": []
+            }
+        });
+        let delta = json!({
+            "changed_nodes": [],
+            "removed_node_ids": [],
+            "changed_edges": [],
+            "removed_edge_ids": [],
+            "node_hashes": {"workspace-root": "hash-root"},
+            "edge_hashes": {}
+        });
+
+        assert!(cloud_mcp_spec_graph_delta_needs_full_resync(&cache, &delta));
+
+        let recoverable_delta = json!({
+            "changed_nodes": [{
+                "id": "workspace-root",
+                "node_type": "workspace",
+                "title": "testforge",
+                "path": ""
+            }],
+            "removed_node_ids": [],
+            "changed_edges": [],
+            "removed_edge_ids": [],
+            "node_hashes": {"workspace-root": "hash-root"},
+            "edge_hashes": {}
+        });
+
+        assert!(!cloud_mcp_spec_graph_delta_needs_full_resync(
+            &cache,
+            &recoverable_delta
+        ));
     }
 
     #[test]

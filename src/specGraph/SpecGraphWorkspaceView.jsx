@@ -14,6 +14,7 @@ import {
   field,
   freshnessLabel,
   graphRootNode,
+  isCoreAppDirectoryNode,
   isLeasedFileNode,
   isLocalOnlyNode,
   isUnspecifiedStructuralNode,
@@ -81,7 +82,7 @@ export default function SpecGraphWorkspaceView({
     if (showLocalIgnored) loadLocalIgnoredOverlay();
   }, [loadLocalIgnoredOverlay, showLocalIgnored]);
 
-  const loadRawScan = useCallback(() => {
+  const loadRawScan = useCallback((options = {}) => {
     if (!repoPath || !workspaceId) {
       setRawScan(null);
       setRawScanError("");
@@ -89,9 +90,11 @@ export default function SpecGraphWorkspaceView({
       return;
     }
 
-    setRawScanState((current) => (current === "idle" ? "loading" : "refreshing"));
+    const includeFolderTrace = options?.includeFolderTrace === true;
+    setRawScanState((current) => (includeFolderTrace && current !== "idle" ? "refreshing" : "loading"));
     setRawScanError("");
     invoke("terminal_workspace_raw_scan", {
+      includeFolderTrace,
       repoPath,
       workspaceId,
       workspaceName,
@@ -120,6 +123,7 @@ export default function SpecGraphWorkspaceView({
     }),
     [baseSpecGraph, localIgnoredOverlay, showLocalIgnored, workspaceDisplayIdentity],
   );
+  const visibleLocalIgnoredCount = Number(specGraph.graphStats?.localIgnoredOverlayCount) || 0;
   const selectedNode = selectedFallback(specGraph.nodes, selectedNodeId);
   const selectedNodePendingSpecEdits = useMemo(() => {
     const nodeId = text(selectedNode?.id, "");
@@ -326,7 +330,7 @@ export default function SpecGraphWorkspaceView({
               {localIgnoredState === "loading"
                 ? "checking local cache"
                 : showLocalIgnored
-                  ? `${localIgnoredCount} local-only whitelisted path${localIgnoredCount === 1 ? "" : "s"}`
+                  ? `${visibleLocalIgnoredCount} visible local-only path${visibleLocalIgnoredCount === 1 ? "" : "s"}`
                   : "local only, not synced"}
             </LocalIgnoredHint>
           </>
@@ -373,7 +377,7 @@ export default function SpecGraphWorkspaceView({
                 selectedNodeId={selectedNode?.id}
                 onSelect={setSelectedNodeId}
                 state={state}
-                viewKey={`${workspaceId || "workspace"}:${repoPath || "repo"}:spec-graph`}
+                viewKey={`${workspaceId || "workspace"}:${repoPath || "repo"}:spec-graph:${showLocalIgnored ? "local-ignored" : "base"}`}
               />
             </SpecGraphMain>
 
@@ -569,16 +573,18 @@ function TaskHistoryInspector({ task, node }) {
 function RawScanMain({ error, onRefresh, scan, state }) {
   const loading = state === "loading" || state === "refreshing";
   const graph = useMemo(() => buildRawScanGraph(scan), [scan]);
+  const status = rawScanStatus(scan, state);
 
   return (
     <RawScanGraphPane>
       <RawScanGraphToolbar>
         {error && <RawScanGraphError>{error}</RawScanGraphError>}
+        {status.label && <RawScanGraphStatus data-state={status.state}>{status.label}</RawScanGraphStatus>}
         <RawScanRefreshButton
-          aria-label={loading ? "Scanning raw workspace graph" : "Refresh raw workspace graph"}
+          aria-label={loading ? "Refreshing live raw workspace graph" : "Refresh live raw workspace graph"}
           disabled={loading}
-          onClick={onRefresh}
-          title={loading ? "Scanning" : "Refresh"}
+          onClick={() => onRefresh({ includeFolderTrace: true })}
+          title={loading ? "Refreshing live trace" : "Refresh live trace"}
           type="button"
         >
           <RefreshIcon aria-hidden="true" data-spinning={loading ? "true" : "false"} />
@@ -615,7 +621,7 @@ function RawScanMain({ error, onRefresh, scan, state }) {
           ))}
         </RawScanGraphCanvas>
       ) : (
-        <RawScanGraphEmpty>{loading ? "Scanning" : "No scan graph"}</RawScanGraphEmpty>
+        <RawScanGraphEmpty>{loading ? "Loading cached topology" : "No cached topology"}</RawScanGraphEmpty>
       )}
     </RawScanGraphPane>
   );
@@ -726,6 +732,7 @@ function rawScanGraphNodeState(entry) {
   if (entry?.selectedRoot) return "root";
   if (action === "skipped_by_mount_scan") return "skipped";
   if (action.startsWith("ignored")) return "ignored";
+  if (action === "cached_mount") return "mount";
   if (action === "detected_mount") return "mount";
   if (action === "max_depth") return "max_depth";
   if (entry?.isExactGitRoot || entry?.hasGitMarker) return "git";
@@ -752,6 +759,23 @@ function rawScanGraphBadges(entry) {
   if (entry?.hasAgents) badges.push({ label: ".agents", state: "agents" });
   if (entry?.hasSpecGraphCache) badges.push({ label: "spec cache", state: "cache" });
   return badges.slice(0, 4);
+}
+
+function rawScanStatus(scan, state) {
+  if (state === "loading") return { label: "cached topology", state: "cached" };
+  if (state === "refreshing") return { label: "live trace", state: "live" };
+  const mode = text(scan?.scanMode);
+  const cacheStatus = text(scan?.cache?.status);
+  const cacheFresh = scan?.cache?.fresh === true;
+  if (mode === "live_folder_trace") {
+    return { label: cacheStatus ? `live trace · ${cacheStatus}` : "live trace", state: "live" };
+  }
+  if (mode === "cached_topology") {
+    if (cacheStatus === "missing") return { label: "cache missing", state: "missing" };
+    if (cacheStatus === "stale_cached") return { label: "stale cached topology", state: "stale" };
+    return { label: cacheFresh ? "fresh cached topology" : "cached topology", state: "cached" };
+  }
+  return { label: "", state: "" };
 }
 
 function rawScanGraphEdgePath(source, target) {
@@ -1166,6 +1190,7 @@ function SpecInspector({
         </InspectorTitleBlock>
         <InspectorFacts>
           <span data-state={node.freshness_state}>{freshnessLabel(node.freshness_state)}</span>
+          {isCoreAppDirectoryNode(node) && <span data-state="core_app">core app dir</span>}
           {isUnspecifiedStructuralNode(node) && <span data-state="no_spec">structural</span>}
           {isLocalOnlyNode(node) && <span data-state="local_only">local only</span>}
           {isLeasedFileNode(node) && <span data-state="leased">leased</span>}
@@ -1653,6 +1678,33 @@ const RawScanGraphError = styled.div`
   }
 `;
 
+const RawScanGraphStatus = styled.div`
+  background: rgba(20, 24, 31, 0.9);
+  border: 1px solid rgba(136, 165, 200, 0.24);
+  border-radius: 7px;
+  color: var(--history-blue);
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1;
+  padding: 10px 11px;
+  text-transform: uppercase;
+
+  &[data-state="live"] {
+    border-color: rgba(184, 160, 106, 0.34);
+    color: var(--history-amber);
+  }
+
+  &[data-state="missing"],
+  &[data-state="stale"] {
+    border-color: rgba(185, 135, 109, 0.34);
+    color: var(--history-orange);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.94);
+  }
+`;
+
 const RawScanRefreshButton = styled.button`
   align-items: center;
   background: rgba(20, 24, 31, 0.9);
@@ -1834,7 +1886,8 @@ const RawScanGraphNodeBadges = styled.div`
   span[data-state="git"],
   span[data-state="project"],
   span[data-state="agents"],
-  span[data-state="cache"] {
+  span[data-state="cache"],
+  span[data-state="cached_mount"] {
     border-color: rgba(138, 168, 146, 0.32);
     color: var(--history-green);
   }
@@ -2448,6 +2501,11 @@ const InspectorFacts = styled.div`
 
   span[data-state="updated"] {
     border-color: rgba(138, 168, 146, 0.3);
+    color: var(--history-green);
+  }
+
+  span[data-state="core_app"] {
+    border-color: rgba(52, 211, 153, 0.32);
     color: var(--history-green);
   }
 

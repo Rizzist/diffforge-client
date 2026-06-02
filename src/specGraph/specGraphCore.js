@@ -292,6 +292,24 @@ export function isLocalOnlyNode(node) {
     || node?.file_source === "local_ignored";
 }
 
+export function isCoreAppDirectoryNode(node) {
+  const meta = node?.metadata || {};
+  const nodeType = text(field(node, "node_type", "nodeType", "type")).toLowerCase();
+  if (!isWorkspaceNodeType(nodeType)) return false;
+  const nodePath = text(field(node, "path") || field(meta, "path"));
+  const slug = text(field(node, "slug") || field(meta, "slug")).toLowerCase();
+  return (
+    booleanField(node, "app_directory_location", "appDirectoryLocation", "core_app_directory", "coreAppDirectory")
+    || booleanField(meta, "app_directory_location", "appDirectoryLocation", "core_app_directory", "coreAppDirectory")
+    || meta?.root === true
+    || meta?.static_repo_root === true
+    || !nodePath
+    || nodePath === "."
+    || nodePath === "/"
+    || slug === "workspace-root"
+  );
+}
+
 export function nodeSourceState(node) {
   const meta = node?.metadata || {};
   const source = text(
@@ -427,7 +445,61 @@ function normalizeNode(raw, index = 0, options = {}) {
     || booleanField(meta, "local_only", "localOnly");
   const ignoredOverlay = booleanField(raw, "ignored_overlay", "ignoredOverlay")
     || booleanField(meta, "ignored_overlay", "ignoredOverlay");
-  const projectContext = nodeProjectContext({ ...raw, metadata: meta, id });
+  const workspaceRootLike = isWorkspaceNodeType(nodeType) && (
+    !path
+    || path === "."
+    || path === "/"
+    || booleanField(raw, "root")
+    || booleanField(meta, "root")
+    || text(field(raw, "slug") || field(meta, "slug")).toLowerCase() === "workspace-root"
+  );
+  const coreAppDirectory = isWorkspaceNodeType(nodeType) && (
+    workspaceRootLike
+    || booleanField(raw, "app_directory_location", "appDirectoryLocation", "core_app_directory", "coreAppDirectory")
+    || booleanField(meta, "app_directory_location", "appDirectoryLocation", "core_app_directory", "coreAppDirectory")
+    || meta?.static_repo_root === true
+  );
+  const directoryLocation = text(
+    field(raw, "directory_location", "directoryLocation", "workspace_root", "workspaceRoot")
+      || field(meta, "directory_location", "directoryLocation", "workspace_root", "workspaceRoot"),
+    displayIdentity?.coreRoot || "",
+  );
+  const displayRootPath = text(
+    field(raw, "display_path", "displayPath") || field(meta, "display_path", "displayPath"),
+    displayIdentity?.displayRoot || "",
+  );
+  const normalizedMeta = coreAppDirectory
+    ? {
+      ...meta,
+      path: text(field(meta, "path"), path),
+      display_path: displayRootPath,
+      directory_location: directoryLocation,
+      app_directory_location: true,
+      core_app_directory: true,
+      workspace_root: text(field(meta, "workspace_root", "workspaceRoot"), directoryLocation),
+      code_artifact: meta?.code_artifact === undefined ? true : meta.code_artifact,
+      spec_node_class: text(field(meta, "spec_node_class", "specNodeClass"), "workspace"),
+      source: text(field(meta, "source", "file_source", "fileSource"), fileSource || "filetree"),
+      origin: text(field(meta, "origin", "file_origin", "fileOrigin"), fileOrigin || "main"),
+      root: true,
+      static_repo_root: meta?.static_repo_root === undefined ? true : meta.static_repo_root,
+    }
+    : meta;
+  const normalizedFileSource = text(
+    fileSource || field(normalizedMeta, "source", "file_source", "fileSource"),
+    coreAppDirectory ? "filetree" : "",
+  ).toLowerCase();
+  const normalizedFileOrigin = text(
+    fileOrigin || field(normalizedMeta, "origin", "file_origin", "fileOrigin"),
+    normalizedFileSource,
+  ).toLowerCase();
+  const projectContext = nodeProjectContext({
+    ...raw,
+    file_source: normalizedFileSource,
+    file_origin: normalizedFileOrigin,
+    metadata: normalizedMeta,
+    id,
+  });
   const notificationCount = Math.max(
     0,
     Number(field(raw, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
@@ -460,8 +532,8 @@ function normalizeNode(raw, index = 0, options = {}) {
     notifications: jsonArray(field(raw, "notifications")),
     notification_count: notificationCount,
     out_of_spec_count: outOfSpecCount,
-    file_source: fileSource,
-    file_origin: fileOrigin,
+    file_source: normalizedFileSource,
+    file_origin: normalizedFileOrigin,
     file_state: fileState,
     lease_state: leaseState,
     container_node_id: projectContext.containerNodeId,
@@ -486,13 +558,15 @@ function normalizeNode(raw, index = 0, options = {}) {
     sourceNodeHash: projectContext.sourceNodeHash,
     local_only: localOnly,
     ignored_overlay: ignoredOverlay,
+    app_directory_location: coreAppDirectory,
+    core_app_directory: coreAppDirectory,
     provisional,
     pending_main_sync: pendingMainSync,
     markdown: typeof rawMarkdown === "string" && rawMarkdown.trim()
       ? rawMarkdown
       : fallbackMarkdown({ title, summary, purpose, freshness_state: freshnessState }),
     markdown_path: text(field(raw, "markdown_path", "markdownPath")),
-    metadata: meta,
+    metadata: normalizedMeta,
   };
 }
 

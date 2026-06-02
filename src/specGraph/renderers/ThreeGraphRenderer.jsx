@@ -4,6 +4,8 @@ import styled from "styled-components";
 import {
   dimensionsForNode,
   isContainmentEdge,
+  isCoreAppDirectoryNode,
+  isLocalOnlyNode,
   isNoSpecNode,
   liveAgentsFor,
   nodeProjectContext,
@@ -16,6 +18,7 @@ import {
 
 const MIN_ZOOM = 0.15;
 const MAX_ZOOM = 1.85;
+const MIN_RESTORED_ZOOM = 0.34;
 const FIT_PADDING = 190;
 const MAX_PIXEL_RATIO = 2;
 const MAX_VISIBLE_AGENT_ORBITS = 6;
@@ -304,8 +307,10 @@ function cameraCenterInsideGraph(cameraState, bounds, padding = CAMERA_RESTORE_P
 }
 
 function cameraCanRestoreGraph(cameraState, bounds, viewportSize) {
-  return cameraIntersectsGraph(cameraState, bounds, viewportSize)
-    && cameraCenterInsideGraph(cameraState, bounds);
+  const camera = normalizeCameraState(cameraState, null);
+  if (!camera || camera.zoom < MIN_RESTORED_ZOOM) return false;
+  return cameraIntersectsGraph(camera, bounds, viewportSize, Math.min(CAMERA_RESTORE_PADDING, 120))
+    && cameraCenterInsideGraph(camera, bounds, Math.min(CAMERA_RESTORE_PADDING, 160));
 }
 
 function clampCameraToGraph(cameraState, bounds, viewportSize) {
@@ -408,14 +413,27 @@ function edgeColor(edge, sourceNode, targetNode) {
 
 function nodeFillColor(node, active, hovered, theme) {
   const noSpec = isNoSpecNode(node);
+  const coreApp = isCoreAppDirectoryNode(node);
   const sourceState = nodeSourceState(node);
   if (theme === "light") {
+    if (coreApp) return active || hovered ? "#ccfbf1" : "#ecfeff";
+    if (sourceState === "local") return active || hovered ? "#e2e8f0" : "#f1f5f9";
     if (noSpec) return "#f8fafc";
     if (active) return mixHex(lightReadableTone(nodeTone(node)), "#ffffff", 0.82);
     if (hovered) return mixHex(lightReadableTone(nodeSourceTone(node)), "#ffffff", 0.88);
     return mixHex(lightReadableTone(nodeTone(node)), "#ffffff", 0.94);
   }
+  if (coreApp) {
+    if (active) return "#12403f";
+    if (hovered) return "#103a3c";
+    return "#0c2f34";
+  }
   if (noSpec) {
+    if (sourceState === "local") {
+      if (active) return "#263244";
+      if (hovered) return "#223047";
+      return "#1e293b";
+    }
     if (active) return mixHex("#64748b", "#111827", 0.7);
     if (hovered) return mixHex("#64748b", "#0f172a", 0.74);
     return "#0f172a";
@@ -428,6 +446,14 @@ function nodeFillColor(node, active, hovered, theme) {
 }
 
 function nodeBorderColor(node, active, hovered, theme) {
+  if (isCoreAppDirectoryNode(node)) {
+    const coreColor = active || hovered ? "#67e8f9" : "#2dd4bf";
+    return theme === "light" ? lightReadableTone(coreColor) : coreColor;
+  }
+  if (nodeSourceState(node) === "local") {
+    const localColor = active || hovered ? "#e2e8f0" : "#94a3b8";
+    return theme === "light" ? lightReadableTone(localColor) : localColor;
+  }
   if (isNoSpecNode(node)) {
     const noSpecColor = active || hovered ? "#94a3b8" : "#64748b";
     return theme === "light" ? lightReadableTone(noSpecColor) : noSpecColor;
@@ -666,6 +692,11 @@ function visibleLabelIdsFor(nodes, layout, cameraState, viewportSize, selectedNo
   [selectedNodeId, hoveredNodeId].forEach((nodeId) => {
     if (nodeId && candidateIds.has(nodeId)) visibleIds.add(nodeId);
   });
+  const anchoredNodeIds = nodes
+    .filter((node) => layout.has(node.id))
+    .filter((node) => node.id === selectedNodeId || node.id === hoveredNodeId || nodeKind(node) === "workspace" || isLocalOnlyNode(node))
+    .map((node) => node.id);
+  anchoredNodeIds.forEach((nodeId) => visibleIds.add(nodeId));
   return visibleIds;
 }
 
@@ -840,7 +871,8 @@ export default function ThreeGraphRenderer({
     if (!viewportSizeIsReady(frame) || !bounds) return false;
     const width = Math.max(1, bounds.right - bounds.left + FIT_PADDING * 2);
     const height = Math.max(1, bounds.bottom - bounds.top + FIT_PADDING * 2);
-    const zoom = clamp(Math.min(frame.width / width, frame.height / height), MIN_ZOOM, 1.08);
+    const minFitZoom = nodesRef.current.length <= 8 ? MIN_RESTORED_ZOOM : MIN_ZOOM;
+    const zoom = clamp(Math.min(frame.width / width, frame.height / height), minFitZoom, 1.08);
     viewReadyRef.current = true;
     setCamera({
       x: (bounds.left + bounds.right) / 2,
@@ -1194,7 +1226,7 @@ export default function ThreeGraphRenderer({
         scheduleFitGraph({ attempts: 18, force: true });
       }
     } else if (!interactedRef.current) {
-      scheduleFitGraph({ attempts: 6 });
+      scheduleFitGraph({ attempts: 6, force: true });
     }
 
     const transitionFitId = window.setTimeout(() => {
@@ -1433,6 +1465,9 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
   const title = text(node.display_title || node.displayTitle || node.title);
   const path = text(node.display_path || node.displayPath || node.path);
   const noSpec = isNoSpecNode(node);
+  const localOnly = isLocalOnlyNode(node);
+  const coreApp = isCoreAppDirectoryNode(node);
+  const metaLabel = coreApp ? "core app dir" : localOnly ? "local only" : noSpec ? "no spec" : kind;
 
   return (
     <LabelCard
@@ -1443,6 +1478,7 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
       $kind={kind}
       $kindTone={nodeKindTone}
       $live={liveCount > 0}
+      $localOnly={localOnly}
       $noSpec={noSpec}
       $selected={selected}
       $sourceState={sourceState}
@@ -1457,17 +1493,18 @@ function NodeLabel({ compact, node, onSelect, selected, style }) {
       <SourceAccent
         aria-hidden="true"
         $kind={kind}
+        $localOnly={localOnly}
         $noSpec={noSpec}
         $sourceState={sourceState}
         $sourceTone={nodeSourceTone(node)}
       />
       {liveCount > 0 && <LabelBadge>{liveCount}</LabelBadge>}
       {outOfSpecCount > 0 && <OutOfSpecBadge title={`${outOfSpecCount} out of spec`}>{outOfSpecCount}</OutOfSpecBadge>}
-      <LabelMeta $kind={kind} $noSpec={noSpec} $statusTone={nodeTone(node)}>
-        {noSpec ? "no spec" : kind}
-        {!compact && source && kind !== "folder" && !noSpec ? <LabelSource $sourceTone={nodeSourceTone(node)}>{source}</LabelSource> : null}
+      <LabelMeta $kind={kind} $localOnly={localOnly} $noSpec={noSpec} $statusTone={nodeTone(node)}>
+        {metaLabel}
+        {!compact && source && kind !== "folder" && (!noSpec || localOnly) ? <LabelSource $sourceTone={nodeSourceTone(node)}>{source}</LabelSource> : null}
       </LabelMeta>
-      <LabelTitle $kind={kind} $noSpec={noSpec}>{title}</LabelTitle>
+      <LabelTitle $kind={kind} $localOnly={localOnly} $noSpec={noSpec}>{title}</LabelTitle>
       {!compact && path && kind === "file" ? <LabelPath>{path}</LabelPath> : null}
     </LabelCard>
   );
@@ -1583,7 +1620,13 @@ const ProjectGroupCount = styled.div`
 
 const LabelCard = styled.button`
   align-items: center;
-  background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+  background: ${({ $kind, $kindTone, $localOnly, $noSpec, $statusTone }) => {
+    if ($localOnly) {
+      return `
+        linear-gradient(135deg, rgba(148, 163, 184, 0.22), rgba(15, 23, 42, 0.92) 58%),
+        rgba(15, 23, 42, 0.96)
+      `;
+    }
     if ($noSpec) return "rgba(15, 23, 42, 0.64)";
     if ($kind === "abstract") {
       return `
@@ -1597,7 +1640,9 @@ const LabelCard = styled.button`
       rgba(13, 17, 23, 0.94)
     `;
   }};
-  border: ${({ $kind, $kindTone, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+  border: ${({ $kind, $kindTone, $localOnly, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+    if ($localOnly && $selected) return "1.5px solid rgba(226, 232, 240, 0.86)";
+    if ($localOnly) return "1.3px dotted rgba(203, 213, 225, 0.72)";
     if ($selected && $noSpec) return "1px solid rgba(148, 163, 184, 0.58)";
     if ($selected) return `1.5px solid ${$statusTone || "#38bdf8"}`;
     if ($noSpec) return "1px solid rgba(100, 116, 139, 0.32)";
@@ -1614,7 +1659,9 @@ const LabelCard = styled.button`
     if ($kind === "abstract") return "22px 9px 22px 9px";
     return "999px";
   }};
-  box-shadow: ${({ $live, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+  box-shadow: ${({ $live, $localOnly, $selected, $noSpec, $sourceState, $sourceTone, $statusTone }) => {
+    if ($localOnly && $selected) return "0 0 0 2px rgba(203, 213, 225, 0.22), 0 16px 36px rgba(0, 0, 0, 0.3)";
+    if ($localOnly) return "0 0 0 1px rgba(148, 163, 184, 0.24), 0 12px 28px rgba(0, 0, 0, 0.24)";
     if ($selected && $noSpec) return "0 0 0 2px rgba(100, 116, 139, 0.14), 0 10px 24px rgba(0, 0, 0, 0.18)";
     if ($selected) return `0 0 0 2px ${colorWithAlpha($statusTone || "#38bdf8", "55")}, 0 0 0 5px ${colorWithAlpha($sourceTone || "#38bdf8", "22")}, 0 18px 44px rgba(0, 0, 0, 0.34)`;
     if ($sourceState === "lease") return `0 0 0 1px ${colorWithAlpha($sourceTone || "#f59e0b", "44")}, 0 0 24px ${colorWithAlpha($sourceTone || "#f59e0b", "22")}, 0 12px 30px rgba(0, 0, 0, 0.24)`;
@@ -1631,7 +1678,8 @@ const LabelCard = styled.button`
   justify-content: center;
   left: 0;
   min-width: 0;
-  opacity: ${({ $noSpec, $selected, $sourceState }) => {
+  opacity: ${({ $localOnly, $noSpec, $selected, $sourceState }) => {
+    if ($localOnly) return $selected ? 0.98 : 0.94;
     if ($noSpec) return $selected ? 0.86 : 0.7;
     return $sourceState === "local" ? 0.76 : 1;
   }};
@@ -1652,7 +1700,8 @@ const LabelCard = styled.button`
   user-select: none;
 
   html[data-forge-theme="light"] & {
-    background: ${({ $kind, $kindTone, $noSpec, $statusTone }) => {
+    background: ${({ $kind, $kindTone, $localOnly, $noSpec, $statusTone }) => {
+      if ($localOnly) return "#f1f5f9";
       if ($noSpec) return "#f8fafc";
       if ($kind === "abstract") return `linear-gradient(135deg, ${colorWithAlpha(lightReadableTone($kindTone, "#7e22ce"), "12")}, #ffffff 58%)`;
       return `linear-gradient(180deg, #ffffff, ${colorWithAlpha(lightReadableTone($statusTone || "#0066cc"), "08")})`;
@@ -1667,7 +1716,8 @@ const LabelCard = styled.button`
         ? `0 0 0 2px ${colorWithAlpha(lightReadableTone($noSpec ? "#64748b" : ($statusTone || $sourceTone)), "24")}, 0 1px 2px rgba(0, 0, 0, 0.06)`
         : "0 1px 2px rgba(0, 0, 0, 0.05)"
     )};
-    opacity: ${({ $noSpec, $selected, $sourceState }) => {
+    opacity: ${({ $localOnly, $noSpec, $selected, $sourceState }) => {
+      if ($localOnly) return $selected ? 1 : 0.92;
       if ($noSpec) return $selected ? 0.94 : 0.82;
       return $sourceState === "local" ? 0.84 : 1;
     }};
@@ -1816,7 +1866,8 @@ const SourceAccent = styled.span`
 
 const LabelMeta = styled.div`
   align-items: center;
-  color: ${({ $kind, $noSpec, $statusTone }) => {
+  color: ${({ $kind, $localOnly, $noSpec, $statusTone }) => {
+    if ($localOnly) return "rgba(226, 232, 240, 0.84)";
     if ($noSpec) return "rgba(203, 213, 225, 0.62)";
     if ($kind === "workspace") return "rgba(167, 243, 208, 0.9)";
     return colorWithAlpha($statusTone || "#e2e8f0", "dd");
@@ -1854,7 +1905,10 @@ const LabelSource = styled.span`
 `;
 
 const LabelTitle = styled.div`
-  color: ${({ $noSpec }) => ($noSpec ? "rgba(226, 232, 240, 0.72)" : "var(--forge-text-soft, #eef5ff)")};
+  color: ${({ $localOnly, $noSpec }) => {
+    if ($localOnly) return "rgba(248, 250, 252, 0.92)";
+    return $noSpec ? "rgba(226, 232, 240, 0.72)" : "var(--forge-text-soft, #eef5ff)";
+  }};
   display: -webkit-box;
   font-size: ${({ $kind }) => {
     if ($kind === "workspace") return "14px";
@@ -1879,7 +1933,10 @@ const LabelTitle = styled.div`
   word-break: break-word;
 
   html[data-forge-theme="light"] & {
-    color: ${({ $noSpec }) => ($noSpec ? "#5f6673" : "#1d1d1f")};
+    color: ${({ $localOnly, $noSpec }) => {
+      if ($localOnly) return "#334155";
+      return $noSpec ? "#5f6673" : "#1d1d1f";
+    }};
   }
 `;
 

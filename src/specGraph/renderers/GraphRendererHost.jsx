@@ -87,6 +87,7 @@ export default function GraphRendererHost({
       };
     }
 
+    setLayout(new Map());
     setLayoutPending(true);
     const runLayout = () => {
       layoutSpecGraph(nodes, edges)

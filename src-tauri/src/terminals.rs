@@ -1303,6 +1303,39 @@ struct TerminalWorkspaceTopologyScan {
     cache_age_ms: Option<u64>,
 }
 
+async fn terminal_workspace_topology_cached_scan(
+    cache: &Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
+    workspace_root: &Path,
+    now_ms: u64,
+) -> TerminalWorkspaceTopologyScan {
+    let key = terminal_workspace_topology_cache_key(workspace_root);
+    let cache = cache.read().await;
+    if let Some(snapshot) = cache.get(&key) {
+        let age_ms = now_ms.saturating_sub(snapshot.scanned_ms);
+        return TerminalWorkspaceTopologyScan {
+            mounts: snapshot.mounts.clone(),
+            cache_key: key,
+            cache_status: if terminal_workspace_topology_cache_fresh(snapshot, now_ms) {
+                "hit"
+            } else {
+                "stale_cached"
+            },
+            cache_hit: true,
+            scanned_ms: snapshot.scanned_ms,
+            cache_age_ms: Some(age_ms),
+        };
+    }
+
+    TerminalWorkspaceTopologyScan {
+        mounts: Vec::new(),
+        cache_key: key,
+        cache_status: "missing",
+        cache_hit: false,
+        scanned_ms: now_ms,
+        cache_age_ms: None,
+    }
+}
+
 async fn terminal_workspace_topology_scan_for_launch_from_cache(
     cache: &Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
     workspace_root: &Path,
@@ -1603,6 +1636,54 @@ fn terminal_raw_scan_folder_trace(
     })
 }
 
+fn terminal_raw_scan_cached_folder_trace(
+    workspace_root: &Path,
+    mounts: &[WorkspaceProjectMount],
+) -> Value {
+    let workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let workspace_root_key = normalized_path_key(&workspace_root);
+    let mut entries = vec![terminal_raw_scan_folder_row(
+        &workspace_root,
+        &workspace_root,
+        0,
+        "cached_root",
+        true,
+        false,
+        mounts
+            .iter()
+            .find(|mount| normalized_path_key(&mount.root_path) == workspace_root_key),
+    )];
+
+    for mount in mounts {
+        let relative_path = child_relative_path(&workspace_root, &mount.root_path).unwrap_or_default();
+        if relative_path.is_empty() {
+            continue;
+        }
+        let depth = relative_path.split('/').filter(|part| !part.is_empty()).count();
+        entries.push(terminal_raw_scan_folder_row(
+            &workspace_root,
+            &mount.root_path,
+            depth,
+            "cached_mount",
+            false,
+            false,
+            Some(mount),
+        ));
+    }
+
+    let entry_count = entries.len();
+    json!({
+        "entries": entries,
+        "truncated": false,
+        "maxEntries": entry_count,
+        "unreadableEntries": 0,
+        "source": "cached_topology",
+        "live": false,
+    })
+}
+
 fn terminal_raw_scan_launch_targets(
     workspace_root: &Path,
     mounts: &[WorkspaceProjectMount],
@@ -1651,11 +1732,22 @@ async fn terminal_workspace_raw_scan(
     repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
+    include_folder_trace: Option<bool>,
 ) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace raw scan")?;
     let requested_repo_path = repo_path.clone();
     let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
-    let topology = terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
+    let live_folder_trace = include_folder_trace.unwrap_or(false);
+    let topology = if live_folder_trace {
+        terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
+    } else {
+        terminal_workspace_topology_cached_scan(
+            &state.workspace_topology_cache,
+            &workspace_root,
+            terminal_now_ms(),
+        )
+        .await
+    };
     let workspace_kind = workspace_kind_for_mounts(&workspace_root, &topology.mounts);
     let active_project_root = workspace_active_project_root_for_mounts(&topology.mounts);
     let workspace_mounts = workspace_mount_manifest_from_projects(&workspace_root, &topology.mounts);
@@ -1668,16 +1760,21 @@ async fn terminal_workspace_raw_scan(
     let launch_targets = terminal_raw_scan_launch_targets(&workspace_root, &topology.mounts);
     let folder_trace_root = workspace_root.clone();
     let folder_trace_mounts = topology.mounts.clone();
-    let folder_trace = tauri::async_runtime::spawn_blocking(move || {
-        terminal_raw_scan_folder_trace(&folder_trace_root, &folder_trace_mounts)
-    })
-    .await
-    .map_err(|error| format!("Unable to join workspace raw scan worker: {error}"))?;
+    let folder_trace = if live_folder_trace {
+        tauri::async_runtime::spawn_blocking(move || {
+            terminal_raw_scan_folder_trace(&folder_trace_root, &folder_trace_mounts)
+        })
+        .await
+        .map_err(|error| format!("Unable to join workspace raw scan worker: {error}"))?
+    } else {
+        terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts)
+    };
     let generated_at_ms = terminal_now_ms();
     let cache_age_ms = generated_at_ms.saturating_sub(topology.scanned_ms);
 
     Ok(json!({
         "generatedAtMs": generated_at_ms,
+        "scanMode": if live_folder_trace { "live_folder_trace" } else { "cached_topology" },
         "requestedRepoPath": requested_repo_path,
         "workspaceId": workspace_id.unwrap_or_default(),
         "workspaceName": workspace_name.unwrap_or_default(),
@@ -8725,6 +8822,60 @@ mod terminal_tests {
         assert_eq!(mount_paths.len(), 2);
         assert!(mount_paths.contains("frontend"));
         assert!(mount_paths.contains("backend"));
+    }
+
+    #[test]
+    fn terminal_workspace_raw_scan_cached_view_does_not_refresh_stale_topology() {
+        let container = terminal_test_directory("raw_scan_cached_topology");
+        let frontend = container.join("frontend");
+        fs::create_dir_all(&frontend).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&frontend)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let cache = Arc::new(RwLock::new(HashMap::new()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = runtime.block_on(terminal_workspace_topology_scan_for_launch_from_cache(
+            &cache,
+            &container,
+            1_000,
+            Some(1_000),
+        ));
+        assert_eq!(first.cache_status, "miss");
+        assert_eq!(first.mounts.len(), 1);
+
+        let backend = container.join("backend");
+        fs::create_dir_all(&backend).unwrap();
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&backend)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let cached = runtime.block_on(terminal_workspace_topology_cached_scan(
+            &cache,
+            &container,
+            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
+        ));
+        assert_eq!(cached.cache_status, "stale_cached");
+        assert_eq!(cached.cache_hit, true);
+        assert_eq!(cached.mounts.len(), 1);
+        assert_eq!(cached.mounts[0].workspace_relative_path, "frontend");
+
+        let trace = terminal_raw_scan_cached_folder_trace(&container, &cached.mounts);
+        assert_eq!(trace["source"].as_str(), Some("cached_topology"));
+        assert_eq!(trace["live"].as_bool(), Some(false));
+        let entries = trace["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["scanAction"].as_str(), Some("cached_mount"));
+        assert_eq!(entries[1]["relativePath"].as_str(), Some("frontend"));
     }
 
     #[test]

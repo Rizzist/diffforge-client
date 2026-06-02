@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  isCoreAppDirectoryNode,
+  isLocalOnlyNode,
+  mergeLocalIgnoredOverlay,
   nodeProjectContext,
   normalizeSnapshot,
 } from "./specGraphCore.js";
@@ -89,4 +92,89 @@ test("normalizeSnapshot promotes child routing metadata on mounted nodes", () =>
   assert.equal(context.sourceNodeId, "file-app");
   assert.equal(context.sourceNodeHash, "hash-app");
   assert.equal(context.sourceRepoId, "repo-child");
+});
+
+test("mergeLocalIgnoredOverlay attaches visible local-only nodes to the core workspace root", () => {
+  const graph = normalizeSnapshot({
+    specGraph: {
+      nodes: [{
+        id: "workspace-root",
+        node_type: "workspace",
+        title: "demo",
+        metadata: {
+          app_directory_location: true,
+          core_app_directory: true,
+          root: true,
+          source: "filetree",
+        },
+      }],
+      edges: [],
+    },
+  });
+
+  const merged = mergeLocalIgnoredOverlay(graph, {
+    cache_hit: true,
+    nodes: [{
+      id: "local-ignored-agents",
+      type: "folder",
+      title: ".agents",
+      path: ".agents",
+      metadata: {
+        ignored_overlay: true,
+        local_only: true,
+        source: "local_ignored",
+      },
+    }, {
+      id: "local-ignored-gitignore",
+      type: "file",
+      title: ".gitignore",
+      path: ".gitignore",
+      metadata: {
+        ignored_overlay: true,
+        local_only: true,
+        source: "local_ignored",
+      },
+    }],
+  }, true);
+
+  assert.equal(merged.nodes.length, 3);
+  assert.equal(merged.edges.length, 2);
+  assert.equal(merged.graphStats.localIgnoredOverlayCount, 2);
+  assert.equal(merged.graphStats.localIgnoredOverlayCacheHit, true);
+  assert.equal(isCoreAppDirectoryNode(merged.nodes[0]), true);
+  assert.equal(merged.nodes.slice(1).every(isLocalOnlyNode), true);
+  assert.deepEqual(
+    merged.edges.map((edge) => [edge.from, edge.to, edge.kind]),
+    [
+      ["workspace-root", "local-ignored-agents", "contains"],
+      ["workspace-root", "local-ignored-gitignore", "contains"],
+    ],
+  );
+});
+
+test("normalizeSnapshot synthesizes core app metadata for sparse workspace roots", () => {
+  const graph = normalizeSnapshot({
+    repoPath: "/Users/rizzist/Documents/CODING/testforge",
+    specGraph: {
+      nodes: [{
+        id: "workspace-root",
+        node_type: "workspace",
+        title: "testforge",
+        path: "",
+        file_source: "filetree",
+        file_origin: "main",
+      }],
+      edges: [],
+    },
+  });
+  const root = graph.nodes[0];
+
+  assert.equal(isCoreAppDirectoryNode(root), true);
+  assert.equal(root.app_directory_location, true);
+  assert.equal(root.core_app_directory, true);
+  assert.equal(root.metadata.app_directory_location, true);
+  assert.equal(root.metadata.core_app_directory, true);
+  assert.equal(root.metadata.directory_location, "/Users/rizzist/Documents/CODING/testforge");
+  assert.equal(root.file_source, "filetree");
+  assert.equal(root.file_origin, "main");
 });
