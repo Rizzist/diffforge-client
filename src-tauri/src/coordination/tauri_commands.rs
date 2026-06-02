@@ -439,6 +439,85 @@ pub fn coordination_get_snapshot(
 }
 
 #[tauri::command]
+pub fn coordination_terminal_task_plan_snapshot(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Option<Value>,
+) -> Result<Value, String> {
+    let input = input.unwrap_or_else(|| json!({}));
+    result(kernel(repo_path, db_path)?.terminal_task_plan_snapshot(
+        input["task_id"]
+            .as_str()
+            .or_else(|| input["taskId"].as_str()),
+        input["session_id"]
+            .as_str()
+            .or_else(|| input["sessionId"].as_str()),
+        input["agent_id"]
+            .as_str()
+            .or_else(|| input["agentId"].as_str()),
+    ))
+}
+
+#[tauri::command]
+pub fn coordination_terminal_task_plan_edit_step_title(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .or_else(|| input["taskId"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "task_id is required.".to_string())?;
+    let step_index = input["step_index"]
+        .as_i64()
+        .or_else(|| input["stepIndex"].as_i64())
+        .ok_or_else(|| "step_index is required.".to_string())?;
+    let title = input["title"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "title is required.".to_string())?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .or_else(|| input["agentId"].as_str());
+    let session_id = input["session_id"]
+        .as_str()
+        .or_else(|| input["sessionId"].as_str());
+    let mut response = kernel.edit_terminal_task_plan_step_title(task_id, step_index, title, agent_id)?;
+    let compact_plan = response["data"]["compact_plan"].clone();
+    let cloud = if response["ok"].as_bool() != Some(false) && !compact_plan.is_null() {
+        match crate::cloud_mcp_forward_terminal_task_plan_update(
+            Some(&kernel.paths.repo_path.display().to_string()),
+            Some(&kernel.paths.db_path),
+            input["workspace_id"]
+                .as_str()
+                .or_else(|| input["workspaceId"].as_str()),
+            agent_id,
+            session_id,
+            Some(task_id),
+            input["worktree_id"]
+                .as_str()
+                .or_else(|| input["worktreeId"].as_str()),
+            input["worktree_path"]
+                .as_str()
+                .or_else(|| input["worktreePath"].as_str()),
+            "user_edited_queued_step_title",
+            &compact_plan,
+        ) {
+            Ok(value) => json!({"ok": true, "response": value}),
+            Err(error) => json!({"ok": false, "error": error}),
+        }
+    } else {
+        json!({"ok": false, "skipped": true, "reason": "no_compact_plan"})
+    };
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
+}
+
+#[tauri::command]
 pub fn coordination_log_ui_surface_event(
     repo_path: Option<String>,
     db_path: Option<String>,

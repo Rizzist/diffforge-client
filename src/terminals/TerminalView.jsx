@@ -67,8 +67,8 @@ import {
   getThreadTerminalGroundTruth,
 } from "../threads/threadTerminalGroundTruth.js";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
-import FilesWorkspaceView from "../files/FilesWorkspaceView.jsx";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
+import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
@@ -997,7 +997,7 @@ const VOICE_PLAN_PARKED_STATUSES = new Set([
 ]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator" },
-  { id: "files", label: "Files" },
+  { id: "plans", label: "Plans" },
   { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics" },
 ];
@@ -5724,6 +5724,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onQueueItem,
   onRemoveItem,
   onReorderItem,
+  onResumePlan,
   onSubmitDraft,
   onToggleTerminalBreakout,
   onToggleFullscreenPane,
@@ -5733,6 +5734,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   paneMode = TODO_QUEUE_PANE_MODE_NORMAL,
   pendingItems = {},
   rootDirectory = "",
+  selectedTerminalPlanTarget = null,
   terminalBreakoutActive = false,
   workspace,
   workspaceError = "",
@@ -7285,15 +7287,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorTopButton>
         ))}
       </OrchestratorTopNav>
-      {activeWorkspaceTool === "files" ? (
-        <WorkspaceToolSurface data-tool="files">
-          <FilesWorkspaceView
-            defaultWorkingDirectory={defaultWorkingDirectory}
-            onBeginWorkspaceFileDrag={onBeginWorkspaceFileDrag}
-            onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+      {activeWorkspaceTool === "plans" ? (
+        <WorkspaceToolSurface data-tool="plans">
+          <PlansWorkspaceView
+            onResumePlan={onResumePlan}
             rootDirectory={rootDirectory}
+            selectedTerminal={selectedTerminalPlanTarget}
             workspace={workspace}
-            workspaceError={workspaceError}
           />
         </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "git" ? (
@@ -8399,18 +8399,39 @@ function TerminalView({
     const promptReadyAt = workspaceLiveTerminal?.promptReadyAt
       || runtimeTerminal?.promptReadyAt
       || inputReadyAt;
+    const coordination = workspaceLiveTerminal?.coordination || runtimeTerminal?.coordination || null;
+    const activeTask = workspaceLiveTerminal?.activeTask
+      || workspaceLiveTerminal?.active_task
+      || runtimeTerminal?.activeTask
+      || runtimeTerminal?.active_task
+      || null;
     const liveTerminal = {
       ...(runtimeTerminal || {}),
       ...(workspaceLiveTerminal || {}),
       agentId: workspaceLiveTerminal?.agentId || runtimeTerminal?.agentId || getTerminalRole(normalizedIndex),
       activityStatus: mergedActivityStatus,
       activity_status: mergedActivityStatus,
+      activeTask,
+      active_task: activeTask,
+      coordination,
       inputReady: Boolean(workspaceLiveTerminal?.inputReady || runtimeTerminal?.inputReady),
       inputReadyAt,
       instanceId: workspaceLiveTerminal?.instanceId || runtimeTerminal?.instanceId || "",
       paneId: workspaceLiveTerminal?.paneId || runtimeTerminal?.paneId || paneId,
       promptReadyAt,
+      sessionId: workspaceLiveTerminal?.sessionId
+        || runtimeTerminal?.sessionId
+        || coordination?.sessionId
+        || coordination?.session_id
+        || "",
       status: mergedStatus,
+      taskId: workspaceLiveTerminal?.taskId
+        || workspaceLiveTerminal?.task_id
+        || runtimeTerminal?.taskId
+        || runtimeTerminal?.task_id
+        || activeTask?.taskId
+        || activeTask?.task_id
+        || "",
       terminalIndex: normalizedIndex,
       threadId: workspaceLiveTerminal?.threadId || runtimeTerminal?.threadId || configuredThread?.id || "",
       workspaceId: workspaceLiveTerminal?.workspaceId || runtimeTerminal?.workspaceId || terminalWorkspace?.id || "",
@@ -8433,6 +8454,117 @@ function TerminalView({
     getTerminalThread,
     terminalWorkspace?.id,
     workspaceThreadEntry,
+  ]);
+  const selectedTerminalPlanTarget = useMemo(() => {
+    const terminalIndex = logicalTerminalIndexes.find((candidateIndex) => (
+      getTerminalPaneId(candidateIndex) === activePaneId
+    ));
+    const resolvedIndex = Number.isInteger(terminalIndex)
+      ? terminalIndex
+      : logicalTerminalIndexes[0];
+    if (!Number.isInteger(resolvedIndex)) {
+      return {
+        agentId: "",
+        paneId: activePaneId || "",
+        sessionId: "",
+        taskId: "",
+        terminalIndex: null,
+        workspaceId: terminalWorkspace?.id || "",
+      };
+    }
+    const paneId = getTerminalPaneId(resolvedIndex);
+    const { liveTerminal } = resolveTodoQueueLiveTerminal(resolvedIndex, paneId);
+    const coordination = liveTerminal?.coordination || {};
+    const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
+    return {
+      agentId: liveTerminal?.agentId
+        || coordination.agentId
+        || coordination.agent_id
+        || getTerminalRole(resolvedIndex)
+        || "",
+      paneId,
+      sessionId: liveTerminal?.sessionId
+        || liveTerminal?.session_id
+        || coordination.sessionId
+        || coordination.session_id
+        || "",
+      taskId: liveTerminal?.taskId
+        || liveTerminal?.task_id
+        || activeTask.taskId
+        || activeTask.task_id
+        || "",
+      terminalIndex: resolvedIndex,
+      workspaceId: terminalWorkspace?.id || liveTerminal?.workspaceId || "",
+    };
+  }, [
+    activePaneId,
+    getTerminalPaneId,
+    getTerminalRole,
+    logicalTerminalIndexes,
+    resolveTodoQueueLiveTerminal,
+    terminalWorkspace?.id,
+    todoQueueDispatchRevision,
+  ]);
+  const handleResumeTerminalPlan = useCallback((plan) => {
+    const targetSessionId = String(plan?.session_id || plan?.sessionId || "").trim();
+    const targetTaskId = String(plan?.task_id || plan?.taskId || "").trim();
+    const matchingIndex = logicalTerminalIndexes.find((terminalIndex) => {
+      const paneId = getTerminalPaneId(terminalIndex);
+      const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex, paneId);
+      const coordination = liveTerminal?.coordination || {};
+      const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
+      const sessionId = String(
+        liveTerminal?.sessionId
+          || liveTerminal?.session_id
+          || coordination.sessionId
+          || coordination.session_id
+          || "",
+      ).trim();
+      const taskId = String(
+        liveTerminal?.taskId
+          || liveTerminal?.task_id
+          || activeTask.taskId
+          || activeTask.task_id
+          || "",
+      ).trim();
+      return Boolean(
+        (targetSessionId && sessionId === targetSessionId)
+          || (targetTaskId && taskId === targetTaskId)
+      );
+    });
+    const focusTerminal = (terminalIndex, paneIdOverride = "") => {
+      const paneId = paneIdOverride || getTerminalPaneId(terminalIndex);
+      setActiveTerminalPaneId(paneId);
+      window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+        detail: {
+          paneId,
+          reason: "terminal_plan_resume",
+          terminalIndex,
+        },
+      }));
+    };
+    if (Number.isInteger(matchingIndex)) {
+      focusTerminal(matchingIndex);
+      return;
+    }
+    const added = addWorkspaceTerminal?.({
+      role: String(plan?.agent_id || plan?.agentId || "").trim(),
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    if (added && Number.isInteger(added.terminalIndex)) {
+      const paneId = getWorkspaceTerminalPaneId(
+        terminalWorkspace?.id,
+        added.terminalIndex,
+        added.terminalRole,
+      );
+      window.requestAnimationFrame(() => focusTerminal(added.terminalIndex, paneId));
+    }
+  }, [
+    addWorkspaceTerminal,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    resolveTodoQueueLiveTerminal,
+    terminalWorkspace?.id,
   ]);
   const recordTodoQueueTerminalLifecycle = useCallback((event = {}) => {
     const eventWorkspaceId = String(event.workspaceId || event.workspace_id || "").trim();
@@ -8516,9 +8648,12 @@ function TerminalView({
     const nowIso = new Date().toISOString();
     const status = String(event.status || existing.status || "active").trim().toLowerCase() || "active";
     const nextTerminal = {
+      activeTask: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
+      active_task: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
       agentId: event.agentId || existing.agentId || getTerminalRole(terminalIndex),
       activityStatus,
       activity_status: activityStatus,
+      coordination: event.coordination || existing.coordination || null,
       inputReady,
       inputReadyAt: inputReady
         ? event.inputReadyAt || event.promptReadyAt || existing.inputReadyAt || existing.promptReadyAt || nowIso
@@ -8537,6 +8672,8 @@ function TerminalView({
         || existing.promptReadyConfidence
         || "",
       status,
+      sessionId: event.sessionId || event.session_id || existing.sessionId || existing.session_id || "",
+      taskId: event.taskId || event.task_id || existing.taskId || existing.task_id || "",
       terminalIndex,
       threadId: event.threadId || existing.threadId || getTerminalThread(terminalIndex)?.id || "",
       updatedAt: nowIso,
@@ -8546,7 +8683,9 @@ function TerminalView({
       || String(existing.activityStatus || existing.activity_status || "") !== String(nextTerminal.activityStatus || "")
       || String(existing.instanceId || "") !== String(nextTerminal.instanceId || "")
       || String(existing.paneId || "") !== String(nextTerminal.paneId || "")
+      || String(existing.sessionId || existing.session_id || "") !== String(nextTerminal.sessionId || "")
       || String(existing.status || "") !== String(nextTerminal.status || "")
+      || String(existing.taskId || existing.task_id || "") !== String(nextTerminal.taskId || "")
       || String(existing.threadId || "") !== String(nextTerminal.threadId || "");
     todoQueueLiveTerminalsRef.current.set(terminalIndex, nextTerminal);
     if (changed || marksReady || marksBusy || eventType === "opened") {
@@ -14837,6 +14976,7 @@ function TerminalView({
                           onQueueItem={queueTodoQueueItem}
                           onRemoveItem={removeTodoQueueItem}
                           onReorderItem={reorderTodoQueueItem}
+                          onResumePlan={handleResumeTerminalPlan}
                           onSubmitDraft={submitTodoQueueDraft}
                           onToggleTerminalBreakout={toggleTerminalBreakout}
                           onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
@@ -14846,6 +14986,7 @@ function TerminalView({
                           paneMode={todoQueuePaneMode}
                           pendingItems={todoQueuePendingItems}
                           rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+                          selectedTerminalPlanTarget={selectedTerminalPlanTarget}
                           terminalBreakoutActive={terminalBreakoutVisible}
                           workspace={terminalWorkspace}
                           workspaceError={workspaceError}

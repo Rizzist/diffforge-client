@@ -11856,6 +11856,7 @@ mod cloud_mcp_tests {
             None,
             None,
             "Inspected files",
+            None,
         )
         .unwrap_err();
 
@@ -13180,6 +13181,7 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     worktree_path: Option<&str>,
     lane: Option<&str>,
     summary: &str,
+    terminal_task_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = local_task_id
         .map(str::trim)
@@ -13245,6 +13247,9 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    }
 
     let mut arguments = serde_json::Map::new();
     arguments.insert(
@@ -13257,6 +13262,9 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     arguments.insert("summary".to_string(), json!(summary));
     arguments.insert("agent_status".to_string(), json!("active"));
     arguments.insert("metadata".to_string(), Value::Object(metadata));
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
     }
@@ -13316,6 +13324,161 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
                 event_kind,
                 json!({
                     "activity": "agent checkpoint sync failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    local_task_id: Option<&str>,
+    worktree_id: Option<&str>,
+    worktree_path: Option<&str>,
+    update_reason: &str,
+    terminal_task_plan: &Value,
+) -> Result<Value, String> {
+    let active_task_id = local_task_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "terminal plan sync requires an active task_id.".to_string())?;
+    if terminal_task_plan.is_null() {
+        return Err("terminal plan sync requires a compact terminal_task_plan.".to_string());
+    }
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let worktree_path_text = worktree_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let scan_path_text = worktree_path_text
+        .as_ref()
+        .or(repo_path_text.as_ref())
+        .cloned();
+    let repo_id = repo_path_text
+        .as_deref()
+        .or(scan_path_text.as_deref())
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = cloud_mcp_base_url();
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: scan_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let event_kind = "terminal_task_plan_updated";
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "reported_by".to_string(),
+        json!("coordination-kernel.terminal_task_plan"),
+    );
+    metadata.insert(
+        "local_coordination_task_id".to_string(),
+        json!(active_task_id),
+    );
+    metadata.insert("coordination_task_id".to_string(), json!(active_task_id));
+    metadata.insert("terminal_task_plan".to_string(), terminal_task_plan.clone());
+    if let Some(worktree_id) = worktree_id {
+        metadata.insert("worktree_id".to_string(), json!(worktree_id));
+    }
+    if let Some(worktree_path) = worktree_path {
+        metadata.insert("worktree_path".to_string(), json!(worktree_path));
+    }
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "source".to_string(),
+        json!("rust-diffforge-terminal-task-plan"),
+    );
+    arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
+    arguments.insert("task_id".to_string(), json!(active_task_id));
+    arguments.insert("run_id".to_string(), json!(active_task_id));
+    arguments.insert("summary".to_string(), json!("Terminal task plan updated."));
+    arguments.insert("update_reason".to_string(), json!(update_reason));
+    arguments.insert("metadata".to_string(), Value::Object(metadata));
+    arguments.insert("terminal_task_plan".to_string(), terminal_task_plan.clone());
+    if let Some(repo_id) = identity.repo_id.as_deref() {
+        arguments.insert("repo_id".to_string(), json!(repo_id));
+    }
+    if let Some(repo_path) = repo_path_text.as_deref().or(scan_path_text.as_deref()) {
+        arguments.insert("repo_path".to_string(), json!(repo_path));
+        arguments.insert("workspace_root".to_string(), json!(repo_path));
+    }
+    if let Some(workspace_id) = identity.workspace_id.as_deref() {
+        arguments.insert("workspace_id".to_string(), json!(workspace_id));
+    }
+    if let Some(agent_id) = identity.cloud_agent_id() {
+        arguments.insert("agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("self_agent_id".to_string(), json!(agent_id.clone()));
+        arguments.insert("current_agent_id".to_string(), json!(agent_id));
+    }
+    if let Some(session_id) = identity.session_id.as_deref() {
+        arguments.insert("session_id".to_string(), json!(session_id));
+    }
+    cloud_mcp_proxy_insert_local_file_scope(&mut arguments, &identity, event_kind);
+
+    let request = json!({
+        "event_kind": event_kind,
+        "payload": Value::Object(arguments),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    identity.log(
+        "cloud_mcp.terminal_task_plan.start",
+        event_kind,
+        json!({
+            "activity": "terminal task plan sync",
+            "baseUrl": base_url,
+            "taskId": active_task_id,
+            "reason": clean_terminal_telemetry_text(update_reason),
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
+        Ok(response) => {
+            identity.log(
+                "cloud_mcp.terminal_task_plan.done",
+                event_kind,
+                json!({
+                    "activity": "terminal task plan synced",
+                    "baseUrl": base_url,
+                }),
+            );
+            let parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            Ok(parsed)
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.terminal_task_plan.error",
+                event_kind,
+                json!({
+                    "activity": "terminal task plan sync failed",
                     "baseUrl": base_url,
                     "error": clean_terminal_telemetry_text(&error),
                 }),
@@ -13823,6 +13986,7 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     enforcement_mode: Option<&str>,
     completion_mode: Option<&str>,
     complete_result: &Value,
+    terminal_task_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = task_id
         .map(str::trim)
@@ -13904,6 +14068,9 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     metadata.insert("enforcementMode".to_string(), json!(enforcement_mode_text));
     metadata.insert("completion_mode".to_string(), json!(completion_mode_text));
     metadata.insert("completionMode".to_string(), json!(completion_mode_text));
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    }
 
     let mut arguments = serde_json::Map::new();
     arguments.insert(
@@ -13923,6 +14090,9 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     arguments.insert("enforcement_mode".to_string(), json!(enforcement_mode_text));
     arguments.insert("completion_mode".to_string(), json!(completion_mode_text));
     arguments.insert("record_spec_activity".to_string(), json!(false));
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
     }

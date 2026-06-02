@@ -24,6 +24,7 @@ use super::{
 
 pub const TOOL_NAMES: &[&str] = &[
     "start_task",
+    "create_plan",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -2477,7 +2478,7 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
     apply_context_defaults(context, &mut input);
     if matches!(
         tool,
-        "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
+        "create_plan" | "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
     ) && !explicit_task_id
     {
         if let Some(object) = input.as_object_mut() {
@@ -2530,6 +2531,7 @@ fn dispatch_tool_result(
     reconnect_mcp_session_if_needed(&kernel, &input, tool)?;
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
+        "create_plan" => kernel_create_plan(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
@@ -2750,6 +2752,72 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     Ok(api_ok(data))
 }
 
+fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
+        return Ok(api_error(
+            "task_id_required_after_start_task",
+            "create_plan requires the task_id returned by start_task.",
+            json!({}),
+        ));
+    }
+    let task_id = req(input, "task_id")?;
+    let agent_id = req(input, "agent_id")?;
+    let session_id = req(input, "session_id")?;
+    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
+        return Ok(api_error(
+            "start_task_required_before_create_plan",
+            "Call start_task for this session and pass its returned task_id before creating a terminal plan.",
+            json!({"task_id": task_id, "session_id": session_id}),
+        ));
+    }
+    let steps = input.get("steps").unwrap_or(&Value::Null);
+    let current_step_index = input["current_step_index"]
+        .as_i64()
+        .or_else(|| input["currentStepIndex"].as_i64());
+    let current_step_detail = input["current_step_detail"]
+        .as_str()
+        .or_else(|| input["currentStepDetail"].as_str())
+        .or_else(|| input["detail"].as_str());
+    let title = input["title"].as_str().or_else(|| input["plan_title"].as_str());
+    let created = kernel.create_terminal_task_plan(
+        task_id,
+        Some(agent_id),
+        Some(session_id),
+        title,
+        steps,
+        current_step_index,
+        current_step_detail,
+    )?;
+    if created["ok"].as_bool() == Some(false) {
+        return Ok(created);
+    }
+    let compact_plan = created["data"]["compact_plan"].clone();
+    let cloud = if value_has_content(&compact_plan) {
+        match crate::cloud_mcp_forward_terminal_task_plan_update(
+            input["repo_path"].as_str(),
+            input["db_path"].as_str().map(PathBuf::from).as_deref(),
+            input["workspace_id"].as_str(),
+            Some(agent_id),
+            Some(session_id),
+            Some(task_id),
+            input["worktree_id"].as_str(),
+            input["worktree_path"].as_str(),
+            "created",
+            &compact_plan,
+        ) {
+            Ok(response) => json!({"ok": true, "response": response}),
+            Err(error) => json!({"ok": false, "error": error}),
+        }
+    } else {
+        json!({"ok": false, "reason": "empty_compact_plan"})
+    };
+    let mut response = created;
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
+}
+
 fn start_task_brief_for_agent(brief: &Value) -> Value {
     pick_fields(
         brief,
@@ -2825,6 +2893,7 @@ fn cloud_current_work_for_agent(current_work: &Value) -> Value {
             "suggested_lane",
             "summary",
             "claimed_paths",
+            "terminal_task_plan",
             "local_task_id",
             "prompt_summary",
         ],
@@ -2841,6 +2910,7 @@ fn cloud_peer_work_for_agent(peer: &Value) -> Value {
             "lane",
             "progress",
             "claimed_paths",
+            "terminal_task_plan",
             "local_task_id",
             "last_seen_at",
         ],
@@ -3304,6 +3374,15 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
             "source": "coordination-kernel.checkpoint",
         }),
     )?;
+    let terminal_plan_update =
+        kernel.checkpoint_terminal_task_plan(task_id, agent_id, session_id, input)?;
+    let terminal_plan_compact = terminal_plan_update
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("compact_plan")
+                .filter(|compact| value_has_content(compact))
+        });
 
     let cloud = match crate::cloud_mcp_forward_agent_checkpoint(
         input["repo_path"].as_str(),
@@ -3316,6 +3395,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         input["worktree_path"].as_str(),
         lane,
         summary,
+        terminal_plan_compact,
     ) {
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
@@ -3324,6 +3404,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     Ok(api_ok(json!({
         "event_id": event_id,
         "summary": summary,
+        "terminal_plan": terminal_plan_update,
         "cloud": cloud,
     })))
 }
@@ -3375,6 +3456,19 @@ fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         .as_str()
         .or(status)
         .or(Some("done"));
+    let terminal_plan_update = kernel.finish_terminal_task_plan(
+        task_id,
+        completed_status.unwrap_or("done"),
+        Some(agent_id),
+        Some(session_id),
+    )?;
+    let terminal_plan_compact = terminal_plan_update
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("compact_plan")
+                .filter(|compact| value_has_content(compact))
+        });
     let cloud = match crate::cloud_mcp_forward_agent_complete_task(
         input["repo_path"].as_str(),
         input["db_path"].as_str().map(PathBuf::from).as_deref(),
@@ -3390,12 +3484,14 @@ fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         input["enforcement_mode"].as_str(),
         input["completion_mode"].as_str(),
         &completed,
+        terminal_plan_compact,
     ) {
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
     let mut response = completed;
     if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("terminal_plan".to_string(), json!(terminal_plan_update));
         data.insert("cloud".to_string(), cloud);
     }
     Ok(response)
@@ -3879,8 +3975,9 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
+        "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; queued step titles are user-editable in the Plans tab.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
-        "checkpoint" => "Send one short summary only while an active started task exists. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance the terminal plan with current/next/completed step fields. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
@@ -3911,11 +4008,47 @@ fn tool_input_schema(name: &str) -> Value {
             "required": ["task_id", "resource_key"],
             "additionalProperties": true
         }),
+        "create_plan" => json!({
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Required task_id returned by start_task."},
+                "title": {"type": "string", "description": "Optional short plan title."},
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered plan steps. Step titles are capped to 96 characters.",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "detail": {"type": "string", "description": "Optional detail for the current or completed step only."}
+                                },
+                                "required": ["title"],
+                                "additionalProperties": true
+                            }
+                        ]
+                    },
+                    "minItems": 1,
+                    "maxItems": 24
+                },
+                "current_step_index": {"type": "integer", "description": "Optional zero-based current step index.", "default": 0},
+                "current_step_detail": {"type": "string", "description": "Optional detail for the current step."}
+            },
+            "required": ["task_id", "steps"],
+            "additionalProperties": true
+        }),
         "checkpoint" => json!({
             "type": "object",
             "properties": {
                 "task_id": {"type": "string", "description": "Required task_id returned by start_task. Do not rely on implicit session defaults."},
-                "summary": {"type": "string", "description": "One short public summary of active task progress. Do not call checkpoint before start_task."}
+                "summary": {"type": "string", "description": "One short public summary of active task progress. Do not call checkpoint before start_task."},
+                "completed_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark completed."},
+                "next_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark current/in progress."},
+                "current_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark current/in progress."},
+                "next_step_detail": {"type": "string", "description": "Optional detail to attach to the next/current step when it begins."},
+                "plan_status": {"type": "string", "description": "Optional terminal plan status: active, completed, interrupted, or blocked."}
             },
             "required": ["task_id", "summary"],
             "additionalProperties": true

@@ -48,6 +48,7 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
 ];
 const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "start_task",
+    "create_plan",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -57,6 +58,7 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
 const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
     "start_task",
+    "create_plan",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -73,6 +75,8 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
 const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
 const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
 const WORKTREE_DIFF_UNTRACKED_MAX_BYTES: u64 = 1_000_000;
+pub const TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS: usize = 96;
+const TERMINAL_TASK_PLAN_MAX_STEPS: usize = 24;
 
 #[derive(Clone)]
 struct SessionSlotOptions {
@@ -131,6 +135,102 @@ fn now_epoch_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis() as u64
+}
+
+fn compact_terminal_task_plan_text(value: &str, max_chars: usize) -> String {
+    let text = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string();
+    text.chars().take(max_chars).collect()
+}
+
+fn normalize_terminal_task_plan_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "done" | "complete" | "completed" | "finished" | "success" => "completed".to_string(),
+        "interrupt" | "interrupted" | "cancelled" | "canceled" | "stopped" => {
+            "interrupted".to_string()
+        }
+        "blocked" => "blocked".to_string(),
+        "active" | "running" | "in_progress" | "in-progress" | "working" | "" => {
+            "active".to_string()
+        }
+        _ => "active".to_string(),
+    }
+}
+
+fn normalize_terminal_task_plan_step_status(status: &str) -> String {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "done" | "complete" | "completed" | "finished" | "success" => "completed".to_string(),
+        "active" | "running" | "current" | "in_progress" | "in-progress" | "working" => {
+            "in_progress".to_string()
+        }
+        "blocked" => "blocked".to_string(),
+        "skip" | "skipped" => "skipped".to_string(),
+        "queued" | "pending" | "not_started" | "not-started" | "todo" | "" => {
+            "queued".to_string()
+        }
+        _ => "queued".to_string(),
+    }
+}
+
+fn terminal_task_plan_is_terminal_status(status: &str) -> bool {
+    matches!(
+        normalize_terminal_task_plan_status(status).as_str(),
+        "completed" | "interrupted"
+    )
+}
+
+fn terminal_task_plan_step_title_from_value(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .as_object()
+                .and_then(|object| {
+                    ["title", "name", "summary", "step"]
+                        .iter()
+                        .find_map(|key| object.get(*key).and_then(Value::as_str))
+                })
+                .map(str::to_string)
+        })
+        .map(|value| compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS))
+        .filter(|value| !value.is_empty())
+}
+
+fn terminal_task_plan_step_detail_from_value(value: &Value) -> Option<String> {
+    value.as_object().and_then(|object| {
+        ["detail", "details", "description", "current_step_detail", "currentStepDetail"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    })
+    .map(|value| compact_terminal_task_plan_text(value, 2000))
+    .filter(|value| !value.is_empty())
+}
+
+fn string_from_value_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn optional_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(|candidate| {
+                candidate.as_i64().or_else(|| {
+                    candidate
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<i64>().ok())
+                })
+            })
+    })
 }
 
 fn epoch_millis_from_now_text(value: &str) -> Option<u64> {
@@ -4475,6 +4575,703 @@ impl CoordinationKernel {
         )?;
 
         Ok(json!({"posted": true}))
+    }
+
+    pub fn create_terminal_task_plan(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        title: Option<&str>,
+        steps: &Value,
+        current_step_index: Option<i64>,
+        current_step_detail: Option<&str>,
+    ) -> Result<Value, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("Terminal task plan requires a task_id.".to_string());
+        }
+        let task = self.query_one(
+            "SELECT id, title, status, claimed_by_agent_id, claimed_session_id FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist for terminal task plan.",
+        )?;
+        let step_values = steps
+            .as_array()
+            .ok_or_else(|| "create_plan requires steps as an array.".to_string())?;
+        if step_values.is_empty() {
+            return Err("create_plan requires at least one step.".to_string());
+        }
+        if step_values.len() > TERMINAL_TASK_PLAN_MAX_STEPS {
+            return Err(format!(
+                "create_plan supports at most {TERMINAL_TASK_PLAN_MAX_STEPS} steps."
+            ));
+        }
+        let current_index = current_step_index
+            .unwrap_or(0)
+            .max(0)
+            .min((step_values.len().saturating_sub(1)) as i64);
+        let plan_id = self
+            .query_json(
+                "SELECT id FROM terminal_task_plans WHERE task_id=?1 LIMIT 1",
+                &[&task_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["id"].as_str().map(str::to_string))
+            .unwrap_or_else(uuid);
+        let now = now_rfc3339();
+        let plan_title = title
+            .map(|value| compact_terminal_task_plan_text(value, 140))
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                task["title"]
+                    .as_str()
+                    .map(|value| compact_terminal_task_plan_text(value, 140))
+                    .filter(|value| !value.is_empty())
+            });
+        let actor_id = agent_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(REPO_ID);
+        let result = (|| {
+            self.begin_immediate_transaction("create terminal task plan")?;
+            self.conn
+                .execute(
+                    "INSERT INTO terminal_task_plans(
+                        id, task_id, agent_id, session_id, title, status, current_step_index,
+                        revision, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, ?7, ?7)
+                     ON CONFLICT(task_id) DO UPDATE SET
+                        agent_id=COALESCE(excluded.agent_id, terminal_task_plans.agent_id),
+                        session_id=COALESCE(excluded.session_id, terminal_task_plans.session_id),
+                        title=COALESCE(excluded.title, terminal_task_plans.title),
+                        status='active',
+                        current_step_index=excluded.current_step_index,
+                        revision=terminal_task_plans.revision + 1,
+                        updated_at=excluded.updated_at,
+                        completed_at=NULL,
+                        interrupted_at=NULL",
+                    params![
+                        &plan_id,
+                        &task_id,
+                        agent_id,
+                        session_id,
+                        plan_title.as_deref(),
+                        current_index,
+                        &now,
+                    ],
+                )
+                .map_err(|error| format!("Unable to upsert terminal task plan: {error}"))?;
+            self.conn
+                .execute(
+                    "DELETE FROM terminal_task_plan_steps WHERE plan_id=?1",
+                    params![&plan_id],
+                )
+                .map_err(|error| format!("Unable to replace terminal task plan steps: {error}"))?;
+
+            let current_step_detail = current_step_detail
+                .map(|value| compact_terminal_task_plan_text(value, 2000))
+                .filter(|value| !value.is_empty());
+            for (index, step) in step_values.iter().enumerate() {
+                let title = terminal_task_plan_step_title_from_value(step)
+                    .ok_or_else(|| format!("Plan step {} requires a title.", index + 1))?;
+                let step_index = index as i64;
+                let status = if step_index < current_index {
+                    "completed"
+                } else if step_index == current_index {
+                    "in_progress"
+                } else {
+                    "queued"
+                };
+                let detail = if step_index == current_index {
+                    current_step_detail
+                        .clone()
+                        .or_else(|| terminal_task_plan_step_detail_from_value(step))
+                } else if step_index < current_index {
+                    terminal_task_plan_step_detail_from_value(step)
+                } else {
+                    None
+                };
+                self.conn
+                    .execute(
+                        "INSERT INTO terminal_task_plan_steps(
+                            id, plan_id, task_id, step_index, title, detail, status, source,
+                            revision, started_at, completed_at, created_at, updated_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'agent', 1, ?8, ?9, ?10, ?10)",
+                        params![
+                            uuid(),
+                            &plan_id,
+                            &task_id,
+                            step_index,
+                            &title,
+                            detail.as_deref(),
+                            status,
+                            if status == "in_progress" || status == "completed" {
+                                Some(now.as_str())
+                            } else {
+                                None
+                            },
+                            if status == "completed" {
+                                Some(now.as_str())
+                            } else {
+                                None
+                            },
+                            &now,
+                        ],
+                    )
+                    .map_err(|error| format!("Unable to insert terminal task plan step: {error}"))?;
+            }
+
+            let event_id = self.emit_event(
+                "terminal_task_plan_created",
+                "agent",
+                actor_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: agent_id.map(str::to_string),
+                    session_id: session_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "plan_id": plan_id,
+                    "step_count": step_values.len(),
+                    "current_step_index": current_index,
+                    "source": "coordination-kernel.create_plan",
+                }),
+            )?;
+            let plan = self.terminal_task_plan_view_by_task_id(task_id)?;
+            Ok(json!({
+                "event_id": event_id,
+                "plan": plan,
+                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+            }))
+        })();
+        self.finish_transaction(result, "create terminal task plan")
+    }
+
+    pub fn checkpoint_terminal_task_plan(
+        &self,
+        task_id: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        input: &Value,
+    ) -> Result<Option<Value>, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() || self.terminal_task_plan_id_for_task(task_id)?.is_none() {
+            return Ok(None);
+        }
+        let requested_current = optional_i64_field(
+            input,
+            &[
+                "current_step_index",
+                "currentStepIndex",
+                "plan_step_index",
+                "planStepIndex",
+                "next_step_index",
+                "nextStepIndex",
+            ],
+        );
+        let completed_index = optional_i64_field(
+            input,
+            &["completed_step_index", "completedStepIndex", "completed_index", "completedIndex"],
+        );
+        let next_detail = string_from_value_keys(
+            input,
+            &[
+                "next_step_detail",
+                "nextStepDetail",
+                "current_step_detail",
+                "currentStepDetail",
+                "plan_step_detail",
+                "planStepDetail",
+            ],
+        )
+        .map(|value| compact_terminal_task_plan_text(&value, 2000))
+        .filter(|value| !value.is_empty());
+        let step_status = string_from_value_keys(
+            input,
+            &["plan_step_status", "planStepStatus", "step_status", "stepStatus"],
+        )
+        .map(|value| normalize_terminal_task_plan_step_status(&value));
+        let plan_status = string_from_value_keys(
+            input,
+            &["plan_status", "planStatus", "terminal_plan_status", "terminalPlanStatus"],
+        )
+        .map(|value| normalize_terminal_task_plan_status(&value));
+
+        if requested_current.is_none()
+            && completed_index.is_none()
+            && next_detail.is_none()
+            && step_status.is_none()
+            && plan_status.is_none()
+        {
+            return Ok(None);
+        }
+
+        let plan = self.terminal_task_plan_view_by_task_id(task_id)?;
+        let steps_len = plan["steps"].as_array().map(Vec::len).unwrap_or(0);
+        if steps_len == 0 {
+            return Ok(None);
+        }
+        let max_index = steps_len.saturating_sub(1) as i64;
+        let current_before = plan["current_step_index"].as_i64().unwrap_or(0);
+        let next_index = requested_current
+            .or_else(|| completed_index.map(|index| (index + 1).min(max_index)))
+            .unwrap_or(current_before)
+            .max(0)
+            .min(max_index);
+        let now = now_rfc3339();
+        let actor_id = agent_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(REPO_ID);
+        let result = (|| {
+            self.begin_immediate_transaction("checkpoint terminal task plan")?;
+            if let Some(completed_index) = completed_index {
+                let completed_index = completed_index.max(0).min(max_index);
+                self.conn
+                    .execute(
+                        "UPDATE terminal_task_plan_steps
+                         SET status='completed', completed_at=COALESCE(completed_at, ?1), updated_at=?1,
+                             revision=revision + 1
+                         WHERE task_id=?2 AND step_index=?3",
+                        params![&now, &task_id, completed_index],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to mark terminal task plan step complete: {error}")
+                    })?;
+            }
+
+            let in_progress_status = step_status
+                .as_deref()
+                .filter(|status| *status != "completed")
+                .unwrap_or("in_progress");
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plan_steps
+                     SET status='completed', completed_at=COALESCE(completed_at, ?1),
+                         updated_at=?1, revision=revision + 1
+                     WHERE task_id=?2 AND step_index < ?3 AND status NOT IN ('completed', 'skipped')",
+                    params![&now, &task_id, next_index],
+                )
+                .map_err(|error| {
+                    format!("Unable to advance terminal task plan completed steps: {error}")
+                })?;
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plan_steps
+                     SET status=?1,
+                         detail=COALESCE(?2, detail),
+                         started_at=COALESCE(started_at, ?3),
+                         updated_at=?3,
+                         revision=revision + 1
+                     WHERE task_id=?4 AND step_index=?5",
+                    params![
+                        in_progress_status,
+                        next_detail.as_deref(),
+                        &now,
+                        &task_id,
+                        next_index,
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to update terminal task plan current step: {error}")
+                })?;
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plan_steps
+                     SET status='queued', completed_at=NULL, updated_at=?1, revision=revision + 1
+                     WHERE task_id=?2 AND step_index > ?3 AND status NOT IN ('queued', 'skipped')",
+                    params![&now, &task_id, next_index],
+                )
+                .map_err(|error| {
+                    format!("Unable to update terminal task plan queued steps: {error}")
+                })?;
+
+            let resolved_plan_status = plan_status.unwrap_or_else(|| {
+                if next_index == max_index && in_progress_status == "completed" {
+                    "completed".to_string()
+                } else {
+                    "active".to_string()
+                }
+            });
+            let completed_at = if resolved_plan_status == "completed" {
+                Some(now.as_str())
+            } else {
+                None
+            };
+            let interrupted_at = if resolved_plan_status == "interrupted" {
+                Some(now.as_str())
+            } else {
+                None
+            };
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plans
+                     SET status=?1, current_step_index=?2, updated_at=?3, revision=revision + 1,
+                         completed_at=COALESCE(?4, completed_at),
+                         interrupted_at=COALESCE(?5, interrupted_at)
+                     WHERE task_id=?6",
+                    params![
+                        &resolved_plan_status,
+                        next_index,
+                        &now,
+                        completed_at,
+                        interrupted_at,
+                        &task_id,
+                    ],
+                )
+                .map_err(|error| format!("Unable to update terminal task plan: {error}"))?;
+
+            let event_id = self.emit_event(
+                "terminal_task_plan_checkpoint",
+                "agent",
+                actor_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: agent_id.map(str::to_string),
+                    session_id: session_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "current_step_index": next_index,
+                    "completed_step_index": completed_index,
+                    "plan_status": resolved_plan_status,
+                    "source": "coordination-kernel.checkpoint",
+                }),
+            )?;
+            Ok(json!({
+                "event_id": event_id,
+                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+            }))
+        })();
+        self.finish_transaction(result, "checkpoint terminal task plan")
+            .map(Some)
+    }
+
+    pub fn edit_terminal_task_plan_step_title(
+        &self,
+        task_id: &str,
+        step_index: i64,
+        title: &str,
+        actor_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Err("Plan step edit requires task_id.".to_string());
+        }
+        let title = compact_terminal_task_plan_text(title, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS);
+        if title.is_empty() {
+            return Err("Plan step title cannot be empty.".to_string());
+        }
+        let step = self.query_one(
+            "SELECT id, status FROM terminal_task_plan_steps WHERE task_id=?1 AND step_index=?2",
+            &[&task_id, &step_index],
+            "Plan step does not exist.",
+        )?;
+        let status = step["status"].as_str().unwrap_or_default();
+        if normalize_terminal_task_plan_step_status(status) != "queued" {
+            return Ok(api_error(
+                "terminal_plan_step_not_editable",
+                "Only queued terminal plan step titles can be edited.",
+                json!({"task_id": task_id, "step_index": step_index, "status": status}),
+            ));
+        }
+        let now = now_rfc3339();
+        let actor_id = actor_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("user");
+        let result = (|| {
+            self.begin_immediate_transaction("edit terminal task plan step")?;
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plan_steps
+                     SET title=?1, source='user', updated_at=?2, revision=revision + 1
+                     WHERE task_id=?3 AND step_index=?4",
+                    params![&title, &now, &task_id, step_index],
+                )
+                .map_err(|error| format!("Unable to edit terminal task plan step: {error}"))?;
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plans
+                     SET updated_at=?1, revision=revision + 1
+                     WHERE task_id=?2",
+                    params![&now, &task_id],
+                )
+                .map_err(|error| format!("Unable to update terminal task plan revision: {error}"))?;
+            let event_id = self.emit_event(
+                "terminal_task_plan_step_title_edited",
+                "user",
+                actor_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "step_index": step_index,
+                    "title": title,
+                    "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+                    "source": "terminal-plans-ui",
+                }),
+            )?;
+            Ok(api_ok(json!({
+                "event_id": event_id,
+                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+            })))
+        })();
+        self.finish_transaction(result, "edit terminal task plan step")
+    }
+
+    pub fn finish_terminal_task_plan(
+        &self,
+        task_id: &str,
+        status: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        let task_id = task_id.trim();
+        let plan_status = normalize_terminal_task_plan_status(status);
+        if task_id.is_empty()
+            || !matches!(plan_status.as_str(), "completed" | "interrupted" | "blocked")
+            || self.terminal_task_plan_id_for_task(task_id)?.is_none()
+        {
+            return Ok(None);
+        }
+        let now = now_rfc3339();
+        let actor_id = agent_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(REPO_ID);
+        let result = (|| {
+            self.begin_immediate_transaction("finish terminal task plan")?;
+            if plan_status == "completed" {
+                self.conn
+                    .execute(
+                        "UPDATE terminal_task_plan_steps
+                         SET status='completed', completed_at=COALESCE(completed_at, ?1),
+                             updated_at=?1, revision=revision + 1
+                         WHERE task_id=?2 AND status NOT IN ('completed', 'skipped')",
+                        params![&now, &task_id],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to complete terminal task plan steps: {error}")
+                    })?;
+            }
+            self.conn
+                .execute(
+                    "UPDATE terminal_task_plans
+                     SET status=?1,
+                         current_step_index=COALESCE((
+                            SELECT MAX(step_index) FROM terminal_task_plan_steps WHERE task_id=?2
+                         ), current_step_index),
+                         updated_at=?3,
+                         revision=revision + 1,
+                         completed_at=CASE WHEN ?1='completed' THEN COALESCE(completed_at, ?3) ELSE completed_at END,
+                         interrupted_at=CASE WHEN ?1='interrupted' THEN COALESCE(interrupted_at, ?3) ELSE interrupted_at END
+                     WHERE task_id=?2",
+                    params![&plan_status, &task_id, &now],
+                )
+                .map_err(|error| format!("Unable to finish terminal task plan: {error}"))?;
+            let event_id = self.emit_event(
+                "terminal_task_plan_finished",
+                "agent",
+                actor_id,
+                EventRefs {
+                    task_id: Some(task_id.to_string()),
+                    agent_id: agent_id.map(str::to_string),
+                    session_id: session_id.map(str::to_string),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "plan_status": plan_status,
+                    "source": "coordination-kernel.task_lifecycle",
+                }),
+            )?;
+            Ok(json!({
+                "event_id": event_id,
+                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+            }))
+        })();
+        self.finish_transaction(result, "finish terminal task plan")
+            .map(Some)
+    }
+
+    pub fn terminal_task_plan_snapshot(
+        &self,
+        task_id: Option<&str>,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let selected_plan = if let Some(task_id) = task_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.terminal_task_plan_view_by_task_id(task_id).ok()
+        } else if let Some(session_id) = session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.query_json(
+                "SELECT task_id FROM terminal_task_plans
+                 WHERE session_id=?1
+                 ORDER BY updated_at DESC LIMIT 1",
+                &[&session_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["task_id"].as_str().map(str::to_string))
+            .and_then(|task_id| self.terminal_task_plan_view_by_task_id(&task_id).ok())
+        } else {
+            None
+        };
+        let history_rows = if let Some(agent_id) = agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
+                 FROM terminal_task_plans p
+                 LEFT JOIN tasks t ON t.id=p.task_id
+                 WHERE p.agent_id=?1 OR t.claimed_by_agent_id=?1
+                 ORDER BY p.updated_at DESC LIMIT 25",
+                &[&agent_id],
+            )?
+        } else {
+            self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
+                 FROM terminal_task_plans p
+                 LEFT JOIN tasks t ON t.id=p.task_id
+                 ORDER BY p.updated_at DESC LIMIT 25",
+                &[],
+            )?
+        };
+        let history = history_rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "plan_id": row["id"].clone(),
+                    "task_id": row["task_id"].clone(),
+                    "title": row["title"].clone(),
+                    "task_title": row["task_title"].clone(),
+                    "status": row["status"].clone(),
+                    "task_status": row["task_status"].clone(),
+                    "current_step_index": row["current_step_index"].clone(),
+                    "revision": row["revision"].clone(),
+                    "session_id": row["session_id"].clone(),
+                    "agent_id": row["agent_id"].clone(),
+                    "updated_at": row["updated_at"].clone(),
+                    "can_resume": !terminal_task_plan_is_terminal_status(row["status"].as_str().unwrap_or_default()),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(api_ok(json!({
+            "selected_plan": selected_plan,
+            "history": history,
+            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+        })))
+    }
+
+    pub fn terminal_task_plan_compact(&self, task_id: &str) -> Result<Option<Value>, String> {
+        let plan = match self.terminal_task_plan_view_by_task_id(task_id) {
+            Ok(plan) => plan,
+            Err(_) => return Ok(None),
+        };
+        let steps = plan["steps"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|step| {
+                json!({
+                    "index": step["index"].clone(),
+                    "title": step["title"].clone(),
+                    "status": step["status"].clone(),
+                    "revision": step["revision"].clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(json!({
+            "kind": "terminal_task_plan",
+            "version": 1,
+            "plan_id": plan["plan_id"].clone(),
+            "task_id": plan["task_id"].clone(),
+            "agent_id": plan["agent_id"].clone(),
+            "session_id": plan["session_id"].clone(),
+            "title": plan["title"].clone(),
+            "status": plan["status"].clone(),
+            "current_step_index": plan["current_step_index"].clone(),
+            "revision": plan["revision"].clone(),
+            "updated_at": plan["updated_at"].clone(),
+            "steps": steps,
+        })))
+    }
+
+    fn terminal_task_plan_id_for_task(&self, task_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .query_json(
+                "SELECT id FROM terminal_task_plans WHERE task_id=?1 LIMIT 1",
+                &[&task_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["id"].as_str().map(str::to_string)))
+    }
+
+    fn terminal_task_plan_view_by_task_id(&self, task_id: &str) -> Result<Value, String> {
+        let plan = self.query_one(
+            "SELECT p.*, t.title AS task_title, t.status AS task_status
+             FROM terminal_task_plans p
+             LEFT JOIN tasks t ON t.id=p.task_id
+             WHERE p.task_id=?1",
+            &[&task_id],
+            "Terminal task plan does not exist.",
+        )?;
+        let plan_id = plan["id"].as_str().unwrap_or_default().to_string();
+        let steps = self.query_json(
+            "SELECT id, step_index, title, detail, status, source, revision, started_at,
+                    completed_at, created_at, updated_at
+             FROM terminal_task_plan_steps
+             WHERE plan_id=?1
+             ORDER BY step_index ASC",
+            &[&plan_id],
+        )?
+        .into_iter()
+        .map(|step| {
+            json!({
+                "id": step["id"].clone(),
+                "index": step["step_index"].clone(),
+                "title": step["title"].clone(),
+                "detail": step["detail"].clone(),
+                "status": step["status"].clone(),
+                "source": step["source"].clone(),
+                "revision": step["revision"].clone(),
+                "started_at": step["started_at"].clone(),
+                "completed_at": step["completed_at"].clone(),
+                "created_at": step["created_at"].clone(),
+                "updated_at": step["updated_at"].clone(),
+                "editable": normalize_terminal_task_plan_step_status(step["status"].as_str().unwrap_or_default()) == "queued",
+            })
+        })
+        .collect::<Vec<_>>();
+        Ok(json!({
+            "plan_id": plan["id"].clone(),
+            "task_id": plan["task_id"].clone(),
+            "task_title": plan["task_title"].clone(),
+            "task_status": plan["task_status"].clone(),
+            "agent_id": plan["agent_id"].clone(),
+            "session_id": plan["session_id"].clone(),
+            "title": plan["title"].clone(),
+            "status": plan["status"].clone(),
+            "current_step_index": plan["current_step_index"].clone(),
+            "revision": plan["revision"].clone(),
+            "created_at": plan["created_at"].clone(),
+            "updated_at": plan["updated_at"].clone(),
+            "completed_at": plan["completed_at"].clone(),
+            "interrupted_at": plan["interrupted_at"].clone(),
+            "steps": steps,
+            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+        }))
     }
 
     pub fn create_session(
@@ -17715,9 +18512,10 @@ impl CoordinationKernel {
             "session_heartbeat_recorded": heartbeat,
             "brief": brief["data"].clone(),
             "workflow": {
-                "agent_visible_mcp_tools": ["start_task", "acquire_lease", "checkpoint", "complete_task", "submit_patch", "submit_patch_status"],
+                "agent_visible_mcp_tools": ["start_task", "create_plan", "acquire_lease", "checkpoint", "complete_task", "submit_patch", "submit_patch_status"],
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
+                    "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal plan.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
                     "Use normal shell and edit tools from the visible project root; Git-managed writes must target the assigned agent branch root explicitly.",
@@ -18181,6 +18979,7 @@ impl CoordinationKernel {
         let apply_merge_listed = mcp_tools.contains(&"apply_merge");
         let minimal_agent_tools = [
             "start_task",
+            "create_plan",
             "acquire_lease",
             "checkpoint",
             "complete_task",
@@ -18264,9 +19063,9 @@ impl CoordinationKernel {
             } else if !missing_minimal_agent_tools.is_empty()
                 || mcp_tools.len() != minimal_agent_tools.len()
             {
-                "Agent MCP should expose only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status."
+                "Agent MCP should expose only start_task, create_plan, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status."
             } else {
-                "Agent MCP exposes only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
+                "Agent MCP exposes only start_task, create_plan, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
@@ -25174,6 +25973,7 @@ mod tests {
         assert!(config.contains("[mcp_servers.workspace-mcp-gateway]\ncommand = "));
         for tool in [
             "start_task",
+            "create_plan",
             "acquire_lease",
             "checkpoint",
             "complete_task",
@@ -25740,6 +26540,7 @@ hooksPath = "{}"
             tools,
             &[
                 "start_task",
+                "create_plan",
                 "acquire_lease",
                 "checkpoint",
                 "complete_task",

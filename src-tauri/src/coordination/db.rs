@@ -17,6 +17,8 @@ use super::schema::{
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
     SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
+    TERMINAL_TASK_PLAN_MIGRATION_NAME, TERMINAL_TASK_PLAN_MIGRATION_VERSION,
+    TERMINAL_TASK_PLAN_SCHEMA_SQL,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
     WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
     WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
@@ -393,6 +395,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
         connection,
     )?);
     diagnostics.push(apply_worktree_task_binding_migration(connection)?);
+    diagnostics.push(apply_terminal_task_plan_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -845,6 +848,33 @@ fn apply_worktree_task_binding_migration(
             ),
             "idx_worktrees_task ensured".to_string(),
         ],
+    );
+    Ok(migration)
+}
+
+fn apply_terminal_task_plan_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    with_sqlite_lock_retry("Unable to initialize terminal task plan schema", || {
+        connection.execute_batch(TERMINAL_TASK_PLAN_SCHEMA_SQL)
+    })?;
+    let mut migration = if migration_applied(connection, TERMINAL_TASK_PLAN_MIGRATION_VERSION)? {
+        SchemaMigrationDiagnostics::new(
+            TERMINAL_TASK_PLAN_MIGRATION_VERSION,
+            TERMINAL_TASK_PLAN_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        )
+    } else {
+        record_migration_if_missing(
+            connection,
+            TERMINAL_TASK_PLAN_MIGRATION_VERSION,
+            TERMINAL_TASK_PLAN_MIGRATION_NAME,
+        )?
+    };
+    migration.details.splice(
+        0..0,
+        ["TERMINAL_TASK_PLAN_SCHEMA_SQL executed idempotently".to_string()],
     );
     Ok(migration)
 }

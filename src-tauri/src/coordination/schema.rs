@@ -33,6 +33,8 @@ pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_agent_config_access";
 pub const WORKTREE_TASK_BINDING_MIGRATION_VERSION: i64 = 15;
 pub const WORKTREE_TASK_BINDING_MIGRATION_NAME: &str = "coordination_kernel_worktree_task_binding";
+pub const TERMINAL_TASK_PLAN_MIGRATION_VERSION: i64 = 16;
+pub const TERMINAL_TASK_PLAN_MIGRATION_NAME: &str = "coordination_kernel_terminal_task_plans";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -127,6 +129,38 @@ CREATE TABLE IF NOT EXISTS task_dependencies(
   dependency_kind TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY(task_id, depends_on_task_id)
+);
+
+CREATE TABLE IF NOT EXISTS terminal_task_plans(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL UNIQUE,
+  agent_id TEXT,
+  session_id TEXT,
+  title TEXT,
+  status TEXT NOT NULL,
+  current_step_index INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  interrupted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  step_index INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'agent',
+  revision INTEGER NOT NULL DEFAULT 1,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(plan_id, step_index)
 );
 
 CREATE TABLE IF NOT EXISTS task_resource_intents(
@@ -730,6 +764,9 @@ ON agent_sessions(pty_id)
 WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
 CREATE INDEX IF NOT EXISTS idx_task_resource_intents_task ON task_resource_intents(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_resource_intents_resource ON task_resource_intents(resource_key, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_task ON terminal_task_plans(task_id);
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_session ON terminal_task_plans(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plan_steps_plan ON terminal_task_plan_steps(plan_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_task ON task_slice_dependencies(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_resource ON task_slice_dependencies(resource_key, status);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
@@ -796,6 +833,44 @@ CREATE TABLE IF NOT EXISTS dependency_edges(
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_prerequisite ON dependency_edges(prerequisite_kind, prerequisite_key, status);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_predicate ON dependency_edges(predicate_kind, status);
+"#;
+
+pub const TERMINAL_TASK_PLAN_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS terminal_task_plans(
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL UNIQUE,
+  agent_id TEXT,
+  session_id TEXT,
+  title TEXT,
+  status TEXT NOT NULL,
+  current_step_index INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  interrupted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
+  id TEXT PRIMARY KEY,
+  plan_id TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  step_index INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'agent',
+  revision INTEGER NOT NULL DEFAULT 1,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(plan_id, step_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_task ON terminal_task_plans(task_id);
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_session ON terminal_task_plans(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_task_plan_steps_plan ON terminal_task_plan_steps(plan_id, step_index);
 "#;
 
 pub const SLOT_SCHEMA_SQL: &str = r#"
