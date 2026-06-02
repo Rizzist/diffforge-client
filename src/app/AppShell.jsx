@@ -30,6 +30,7 @@ import {
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
 import {
+  terminalActivityStatusIsBusy,
   terminalPresenceStatusFromActivityStatus,
   terminalRailStateFromActivityStatus,
   terminalReadinessFromPresenceStatus,
@@ -859,6 +860,16 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
+const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
+  "provider-turn-completed",
+  "provider-turn-interrupted",
+  "terminal-input-ready",
+  "terminal-prompt-ready",
+]);
+
+function terminalStatusEventForcesIdle(eventType) {
+  return TERMINAL_IDLE_STATUS_EVENT_TYPES.has(String(eventType || "").trim().toLowerCase());
+}
 
 function getThreadDiagnosticTextLength(value) {
   return String(value ?? "").length;
@@ -1088,6 +1099,38 @@ function buildTerminalReadyProjectionEvents(thread, event = {}, groundTruth = nu
     id: `projection-terminal-ready-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
     messageId: latestTurn.messageId || "",
     source: eventType || "terminal-ready",
+    status: "completed",
+    turnId,
+    type: "thread.turn.completed",
+  }];
+}
+
+function buildTerminalCompletedProjectionEvents(thread, event = {}) {
+  const latestTurn = thread?.latestTurn || null;
+  const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+  const turnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  if (latestTurnState !== "running" || !turnId) {
+    return [];
+  }
+
+  const completedAt = String(
+    event.completedAt
+      || event.promptReadyAt
+      || event.inputReadyAt
+      || new Date().toISOString(),
+  ).trim();
+  const eventKey = workspaceThreadProjectionIdPart(
+    event.promptEventId || event.pendingPromptId || turnId,
+    "provider-turn-completed",
+  );
+  return [{
+    agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
+    assistantMessageId: latestTurn.assistantMessageId || "",
+    completedAt,
+    createdAt: completedAt,
+    id: `projection-provider-turn-completed-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
+    messageId: latestTurn.messageId || "",
+    source: event.source || event.type || "provider-turn-completed",
     status: "completed",
     turnId,
     type: "thread.turn.completed",
@@ -9088,7 +9131,6 @@ export default function App() {
             const liveTerminal = (
               liveTerminalCandidate
               && liveTerminalAgent === normalizedRole
-              && (!thread?.id || !liveTerminalCandidate.threadId || liveTerminalCandidate.threadId === thread.id)
             )
               ? liveTerminalCandidate
               : null;
@@ -9110,8 +9152,14 @@ export default function App() {
               : {};
             const liveStatus = String(liveTerminal?.status || "").trim().toLowerCase();
             const terminalLifecycle = liveTerminal || hasSession ? "open" : "closed";
+            const liveRailActivity = String(
+              liveTerminal?.activityStatus
+                || liveTerminal?.activity_status
+                || "",
+            ).trim().toLowerCase();
             const rawActivity = String(
-              terminalGroundTruth.effectiveActivityStatus
+              liveRailActivity
+                || terminalGroundTruth.effectiveActivityStatus
                 || thread?.activityStatus
                 || providerBinding?.activityStatus
                 || "",
@@ -9261,7 +9309,10 @@ export default function App() {
 
     const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
-    const eventActivityStatus = String(options.activityStatus || event.activityStatus || "").trim().toLowerCase();
+    const idleStatusEvent = terminalStatusEventForcesIdle(eventType);
+    const eventActivityStatus = idleStatusEvent
+      ? ""
+      : String(options.activityStatus || event.activityStatus || "").trim().toLowerCase();
     const statusLifecycleHint = (
       ["closed", "exited"].includes(eventType)
         ? "closed"
@@ -9269,7 +9320,7 @@ export default function App() {
           ? "closing"
           : "open"
     );
-    const statusActivity = eventActivityStatus
+    const statusActivity = (idleStatusEvent ? "idle" : eventActivityStatus)
       || (
         eventType === "terminal-prompt-ready"
         || eventType === "terminal-input-ready"
@@ -9385,19 +9436,28 @@ export default function App() {
         || event.native_rail_state
         || "",
     ).trim().toLowerCase();
-    const nativeRailState = explicitNativeRailState || (
+    const safeExplicitNativeRailState = idleStatusEvent && terminalActivityStatusIsBusy(explicitNativeRailState)
+      ? ""
+      : explicitNativeRailState;
+    const nativeRailState = safeExplicitNativeRailState || (
       ["closed", "closing", "exited", "offline"].includes(statusAfter)
         ? statusAfter
         : terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter)
     );
     const visibleActivityStatus = terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter);
-    const nativeRailFields = getTerminalNativeRailStateFields(
-      nativeRailState,
+    const explicitNativeRailLabel = String(
       options.nativeRailLabel
         || options.native_rail_label
         || event.nativeRailLabel
         || event.native_rail_label
         || "",
+    ).trim();
+    const safeExplicitNativeRailLabel = idleStatusEvent && terminalActivityStatusIsBusy(explicitNativeRailLabel)
+      ? ""
+      : explicitNativeRailLabel;
+    const nativeRailFields = getTerminalNativeRailStateFields(
+      nativeRailState,
+      safeExplicitNativeRailLabel,
     );
     const terminalPayload = {
       agentId,
@@ -12624,7 +12684,27 @@ export default function App() {
         operation = lifecycleEvent.type === "provider-turn-error"
           ? "provider_turn_error"
           : "provider_turn_completed";
-        nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+        if (lifecycleEvent.type === "provider-turn-completed") {
+          const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+          const existingProjectionEvents = Array.isArray(lifecycleEvent.projectionEvents)
+            ? lifecycleEvent.projectionEvents
+            : Array.isArray(lifecycleEvent.events)
+              ? lifecycleEvent.events
+              : [];
+          const projectionEvents = existingProjectionEvents.length
+            ? existingProjectionEvents
+            : buildTerminalCompletedProjectionEvents(existingThread, lifecycleEvent);
+          nextThreads = appendWorkspaceThreadProjectionEvents(threads, {
+            ...lifecycleEvent,
+            activityStatus: "idle",
+            clearPendingPrompt: true,
+            inputReady: true,
+            projectionEvents,
+            status: lifecycleEvent.status || "active",
+          });
+        } else {
+          nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+        }
       } else if (lifecycleEvent.type === "terminal-input-ready") {
         const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
         const projectionEvents = getReadinessProjectionEvents(existingThread, lifecycleEvent);

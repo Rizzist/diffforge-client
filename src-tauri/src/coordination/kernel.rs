@@ -2079,6 +2079,8 @@ impl CoordinationKernel {
         kernel.mark_duplicate_pty_sessions_interrupted()?;
         kernel.mark_unsafe_coordination_only_sessions_interrupted()?;
         kernel.mark_invalid_worktree_sessions_interrupted()?;
+        let recovered_shutdown_worktree_violations =
+            kernel.resolve_all_recovered_shutdown_worktree_violations()?;
         let startup_lease_reset = if emit_recovery_event {
             kernel.reset_active_leases_once_per_process_start()?
         } else {
@@ -2115,6 +2117,7 @@ impl CoordinationKernel {
                     "db_path": kernel.paths.db_path.display().to_string(),
                     "storage": storage_payload,
                     "startup_lease_reset": startup_lease_reset,
+                    "recovered_shutdown_worktree_violations": recovered_shutdown_worktree_violations,
                 }),
             )?;
             kernel.write_alignment_lifecycle_log(
@@ -13033,6 +13036,41 @@ impl CoordinationKernel {
                AND (session_id=?1 OR worktree_id=?2)",
             &[&session_id, &worktree_id],
         )?;
+        self.resolve_shutdown_git_skip_worktree_violations(
+            violations,
+            EventRefs {
+                session_id: Some(session_id.to_string()),
+                ..EventRefs::default()
+            },
+            json!({
+                "scope": "patch_validation",
+                "worktree_id": worktree_id,
+            }),
+        )
+    }
+
+    fn resolve_all_recovered_shutdown_worktree_violations(&self) -> Result<usize, String> {
+        let violations = self.query_json(
+            "SELECT * FROM workspace_violations
+             WHERE status='open'
+               AND violation_kind='invalid_worktree_isolation'",
+            &[],
+        )?;
+        self.resolve_shutdown_git_skip_worktree_violations(
+            violations,
+            EventRefs::default(),
+            json!({
+                "scope": "kernel_recovery",
+            }),
+        )
+    }
+
+    fn resolve_shutdown_git_skip_worktree_violations(
+        &self,
+        violations: Vec<Value>,
+        event_refs: EventRefs,
+        event_context: Value,
+    ) -> Result<usize, String> {
         let mut resolved_ids = Vec::new();
         let now = now_rfc3339();
 
@@ -13054,17 +13092,21 @@ impl CoordinationKernel {
             else {
                 continue;
             };
+            let violation_worktree_id = violation["worktree_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
             let expected_branch = workspace_violation_expected_branch(&violation)
                 .or_else(|| {
-                    self.get_worktree(worktree_id)
-                        .ok()
-                        .and_then(|worktree| {
+                    violation_worktree_id.and_then(|id| {
+                        self.get_worktree(id).ok().and_then(|worktree| {
                             worktree["branch_name"]
                                 .as_str()
                                 .map(str::trim)
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_string)
                         })
+                    })
                 })
                 .unwrap_or_default();
             if self
@@ -13102,14 +13144,11 @@ impl CoordinationKernel {
                 "workspace_violations_auto_resolved",
                 "kernel",
                 REPO_ID,
-                EventRefs {
-                    session_id: Some(session_id.to_string()),
-                    ..EventRefs::default()
-                },
+                event_refs,
                 json!({
                     "reason": "recovered_after_shutdown_git_skip",
                     "resolved_violation_ids": resolved_ids,
-                    "worktree_id": worktree_id,
+                    "context": event_context,
                 }),
             )?;
         }
@@ -21344,14 +21383,13 @@ fn workspace_violation_is_shutdown_git_skip_invalid_worktree(violation: &Value) 
 }
 
 fn workspace_violation_expected_branch(violation: &Value) -> Option<String> {
-    workspace_violation_details(violation)
-        .and_then(|details| {
-            details["details"]["expected_branch"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
+    workspace_violation_details(violation).and_then(|details| {
+        details["details"]["expected_branch"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 struct WorkspaceChangeInput<'a> {
@@ -28577,6 +28615,217 @@ hooksPath = "{}"
             violation["details_json"]["resolution_reason"].as_str(),
             Some("recovered_after_shutdown_git_skip")
         );
+    }
+
+    #[test]
+    fn stale_shutdown_git_skip_violation_from_previous_session_does_not_block_submit() {
+        let repo = init_git_repo("stale_shutdown_git_skip_violation");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let worktree = kernel
+            .query_one(
+                "SELECT * FROM worktrees WHERE id=?1",
+                &[&worktree_id],
+                "missing worktree",
+            )
+            .unwrap();
+        let branch_name = worktree["branch_name"].as_str().unwrap();
+
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:index.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+        fs::write(write_root.join("index.html"), "<h1>changed</h1>\n").unwrap();
+        let violation_id = kernel
+            .create_workspace_violation(
+                Some("old-task"),
+                Some(agent_id),
+                Some("old-session"),
+                Some(worktree_id),
+                "invalid_worktree_isolation",
+                Some(write_root.to_string_lossy().as_ref()),
+                None,
+                "error",
+                json!({
+                    "reason": "invalid_git_worktree",
+                    "details": {
+                        "error": "git skipped because Diff Forge is shutting down (closing_terminals)",
+                        "expected_branch": branch_name,
+                        "path": write_root.to_string_lossy(),
+                        "reason": "invalid_git_worktree",
+                        "session_id": "old-session",
+                        "worktree_id": worktree_id,
+                    },
+                    "recovery_action": "session_interrupted",
+                }),
+            )
+            .unwrap();
+
+        let response = kernel
+            .submit_patch(
+                task_id,
+                agent_id,
+                session_id,
+                Some(worktree_id),
+                Some("leased"),
+            )
+            .unwrap();
+        assert_eq!(
+            response["ok"].as_bool(),
+            Some(true),
+            "unexpected submit response: {response}"
+        );
+        assert_eq!(
+            response["data"]["validation_status"].as_str(),
+            Some("passed")
+        );
+        let violation = kernel
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            violation["details_json"]["resolution_reason"].as_str(),
+            Some("recovered_after_shutdown_git_skip")
+        );
+    }
+
+    #[test]
+    fn kernel_recovery_auto_resolves_recovered_shutdown_worktree_violations() {
+        let repo = init_git_repo("kernel_recovery_shutdown_git_skip");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let worktree = kernel
+            .query_one(
+                "SELECT * FROM worktrees WHERE id=?1",
+                &[&worktree_id],
+                "missing worktree",
+            )
+            .unwrap();
+        let branch_name = worktree["branch_name"].as_str().unwrap();
+        let violation_id = kernel
+            .create_workspace_violation(
+                None,
+                Some(agent_id),
+                Some(session_id),
+                Some(worktree_id),
+                "invalid_worktree_isolation",
+                Some(write_root.to_string_lossy().as_ref()),
+                None,
+                "error",
+                json!({
+                    "reason": "invalid_git_worktree",
+                    "details": {
+                        "error": "git skipped because Diff Forge is shutting down (quiescing)",
+                        "expected_branch": branch_name,
+                        "path": write_root.to_string_lossy(),
+                        "reason": "invalid_git_worktree",
+                        "session_id": session_id,
+                        "worktree_id": worktree_id,
+                    },
+                    "recovery_action": "session_interrupted",
+                }),
+            )
+            .unwrap();
+        drop(kernel);
+
+        let recovered = CoordinationKernel::open(&repo, None).unwrap();
+        let violation = recovered
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("resolved"));
+        assert_eq!(
+            violation["details_json"]["resolution_reason"].as_str(),
+            Some("recovered_after_shutdown_git_skip")
+        );
+    }
+
+    #[test]
+    fn kernel_recovery_preserves_real_invalid_worktree_violations() {
+        let repo = init_git_repo("kernel_recovery_real_invalid_worktree");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(agent_id, None, None, true, None, None)
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        let worktree_id = session["worktreeId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing worktreeId in session: {session}"));
+        let write_root = PathBuf::from(session["writeRoot"].as_str().unwrap());
+        let violation_id = kernel
+            .create_workspace_violation(
+                None,
+                Some(agent_id),
+                Some(session_id),
+                Some(worktree_id),
+                "invalid_worktree_isolation",
+                Some(write_root.to_string_lossy().as_ref()),
+                None,
+                "error",
+                json!({
+                    "reason": "invalid_git_worktree",
+                    "details": {
+                        "error": "fatal: not a git repository",
+                        "path": write_root.to_string_lossy(),
+                        "reason": "invalid_git_worktree",
+                        "session_id": session_id,
+                        "worktree_id": worktree_id,
+                    },
+                    "recovery_action": "session_interrupted",
+                }),
+            )
+            .unwrap();
+        drop(kernel);
+
+        let recovered = CoordinationKernel::open(&repo, None).unwrap();
+        let violation = recovered
+            .query_one(
+                "SELECT * FROM workspace_violations WHERE id=?1",
+                &[&violation_id],
+                "missing violation",
+            )
+            .unwrap();
+        assert_eq!(violation["status"].as_str(), Some("open"));
+        assert!(violation["details_json"]["resolution_reason"].is_null());
     }
 
     #[test]
