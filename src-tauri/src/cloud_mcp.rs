@@ -7989,6 +7989,12 @@ async fn cloud_mcp_sync_terminal_status_event(
         ],
     )
     .unwrap_or_else(|| "terminal.status".to_string());
+    let command_phase =
+        cloud_mcp_payload_text(&terminal, &["command_phase", "commandPhase"]);
+    let display_status =
+        cloud_mcp_payload_text(&terminal, &["display_status", "displayStatus"]);
+    let execution_phase =
+        cloud_mcp_payload_text(&terminal, &["execution_phase", "executionPhase"]);
     let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
     let terminal_id = cloud_mcp_payload_text(&terminal, &["terminal_id", "terminalId"])
         .or_else(|| pane_id.clone());
@@ -8014,6 +8020,9 @@ async fn cloud_mcp_sync_terminal_status_event(
         "agent_label": agent_label,
         "status": status,
         "status_after": status,
+        "command_phase": command_phase,
+        "display_status": display_status,
+        "execution_phase": execution_phase,
         "session_state": session_state,
         "terminal_index": terminal_index,
         "terminal_epoch": terminal_epoch,

@@ -10485,10 +10485,13 @@ function WorkspaceTerminal({
               onThreadTerminalLifecycle?.({
                 activityStatus: "idle",
                 agentId: terminalAgentKind,
+                commandPhase: "cancelled",
+                executionPhase: "interrupted",
                 inputReady: true,
                 inputReadyAt,
                 inputReadyConfidence: interruptSource,
                 instanceId: terminalInstanceId,
+                ...getTerminalNativeRailStateFields("idle"),
                 paneId,
                 promptReadyAt: inputReadyAt,
                 promptReadyConfidence: interruptSource,
@@ -10496,10 +10499,8 @@ function WorkspaceTerminal({
                 status: "active",
                 terminalIndex,
                 threadId: terminalThreadIdRef.current || "",
-                turnStatus: interruptedActiveTask || interruptedParkedPromptCount > 0 ? "interrupted" : "",
-                type: interruptedActiveTask || interruptedParkedPromptCount > 0
-                  ? "provider-turn-interrupted"
-                  : "terminal-input-ready",
+                turnStatus: "interrupted",
+                type: "provider-turn-interrupted",
                 workspaceId: workspace?.id || "",
               });
             }).catch((error) => {

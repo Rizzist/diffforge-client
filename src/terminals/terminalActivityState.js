@@ -47,6 +47,15 @@ const TERMINAL_ACTIVITY_ERROR_STATES = new Set([
   "failure",
 ]);
 
+const TERMINAL_TURN_FINISHED_STATES = new Set([
+  "cancelled",
+  "canceled",
+  "complete",
+  "completed",
+  "done",
+  "interrupted",
+]);
+
 const TERMINAL_ACTIVITY_CLOSED_STATES = new Set([
   "closed",
   "closing",
@@ -125,6 +134,87 @@ export function terminalTurnStatusFromActivityStatus(activityStatus, status = ""
   if (TERMINAL_ACTIVITY_PAUSED_STATES.has(activity)) return "pending";
   if (TERMINAL_ACTIVITY_CLOSED_STATES.has(activity)) return "interrupted";
   return "completed";
+}
+
+export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
+  const explicit = normalizeActivityText(fields.commandPhase || fields.command_phase, "");
+  if (explicit) return explicit;
+
+  const type = normalizeActivityText(eventType || fields.eventType || fields.type, "");
+  if (type === "remote_command_queued" || type === "remote-command-queued") return "queued";
+  if (type === "pending_prompt_sent" || type === "pending-prompt-sent") return "submitted";
+  if (type === "message_submitted" || type === "message-submitted") return "input_written";
+  if (type === "provider_turn_started" || type === "provider-turn-started") return "running";
+  if (type === "agent_output" || type === "agent-output") return "running";
+  if (type === "terminal_prompt_ready" || type === "terminal-prompt-ready") return "completed";
+  if (type === "terminal_input_ready" || type === "terminal-input-ready") return "completed";
+  if (type === "provider_turn_completed" || type === "provider-turn-completed") return "completed";
+  if (type === "provider_turn_interrupted" || type === "provider-turn-interrupted") return "cancelled";
+  if (type === "pending_prompt_error" || type === "pending-prompt-error") return "failed";
+  if (type === "provider_turn_error" || type === "provider-turn-error") return "failed";
+  if (type === "closed" || type === "closing" || type === "exited") return type;
+
+  return "";
+}
+
+export function terminalExecutionPhaseFromState(fields = {}) {
+  const eventType = normalizeActivityText(fields.eventType || fields.type, "");
+  const commandPhase = normalizeActivityText(fields.commandPhase || fields.command_phase, "");
+  const activity = normalizeActivityText(
+    fields.activityStatus
+      || fields.activity_status
+      || fields.nativeRailState
+      || fields.native_rail_state
+      || fields.status,
+    "",
+  );
+  const status = normalizeActivityText(fields.status || fields.statusAfter || fields.status_after, "");
+  const readiness = normalizeActivityText(fields.readiness || fields.readinessAfter || fields.readiness_after, "");
+  const turn = normalizeActivityText(fields.turnStatus || fields.turn_status, "");
+  const lifecycle = normalizeActivityText(fields.terminalLifecycle || fields.terminal_lifecycle, "");
+
+  if (lifecycle === "offline" || activity === "offline" || status === "offline") return "offline";
+  if (lifecycle === "exited" || activity === "exited" || status === "exited") return "exited";
+  if (["closed", "closing", "terminated"].includes(lifecycle) || ["closed", "closing", "terminated"].includes(status)) {
+    return lifecycle === "closing" || status === "closing" ? "closing" : "closed";
+  }
+  if (eventType === "provider_turn_interrupted" || turn === "interrupted") return "interrupted";
+  if (turn === "cancelled" || turn === "canceled" || commandPhase === "cancelled" || commandPhase === "canceled") return "cancelled";
+  if (eventType === "provider_turn_error" || eventType === "pending_prompt_error" || turn === "failed" || turn === "error") return "failed";
+  if (TERMINAL_ACTIVITY_ERROR_STATES.has(activity) || readiness === "error" || status === "error") return "failed";
+  if (TERMINAL_ACTIVITY_PAUSED_STATES.has(activity) || readiness === "needs_input" || readiness === "paused") return "needs_input";
+  if (commandPhase === "queued") return "queued";
+  if (
+    ["submitted", "input_written", "accepted", "running"].includes(commandPhase)
+      || ["message_submitted", "provider_turn_started", "agent_output", "pending_prompt_sent"].includes(eventType)
+      || TERMINAL_ACTIVITY_THINKING_STATES.has(activity)
+      || ["queued", "submitted", "pending", "running", "thinking", "reasoning", "working"].includes(turn)
+      || (readiness === "busy" && !TERMINAL_TURN_FINISHED_STATES.has(turn))
+  ) {
+    return "running";
+  }
+  if (
+    ["terminal_prompt_ready", "terminal_input_ready", "provider_turn_completed"].includes(eventType)
+      || ["completed", "complete", "done"].includes(commandPhase)
+      || TERMINAL_TURN_FINISHED_STATES.has(turn)
+      || TERMINAL_ACTIVITY_IDLE_STATES.has(activity)
+      || readiness === "ready"
+      || readiness === "input_ready"
+  ) {
+    return "idle";
+  }
+
+  return "idle";
+}
+
+export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "idle") {
+  const phase = normalizeActivityText(executionPhase, "");
+  if (["offline", "closed", "closing", "exited"].includes(phase)) return phase;
+  if (phase === "failed") return "error";
+  if (phase === "needs_input" || phase === "paused" || phase === "parked") return "paused";
+  if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
+  if (["cancelled", "canceled", "interrupted", "completed", "complete", "done", "idle"].includes(phase)) return "idle";
+  return terminalRailStateFromActivityStatus("", fallback);
 }
 
 export function shouldSuppressThreadPropThinking({

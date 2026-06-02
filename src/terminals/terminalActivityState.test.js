@@ -4,12 +4,15 @@ import test from "node:test";
 import {
   buildTerminalReadinessEpochKey,
   isReadyLifecycleEmittedForEpoch,
+  terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsSendable,
+  terminalExecutionPhaseFromState,
   shouldEmitPromptReadyLifecycle,
   shouldSuppressThreadPropThinking,
   terminalPresenceStatusFromActivityStatus,
   terminalRailStateFromActivityStatus,
+  terminalRailStateFromExecutionPhase,
   terminalReadinessFromPresenceStatus,
   terminalTurnStatusFromActivityStatus,
 } from "./terminalActivityState.js";
@@ -138,4 +141,33 @@ test("closed lifecycle wins over idle activity for terminal presence", () => {
   }), "closed");
   assert.equal(terminalReadinessFromPresenceStatus("closed"), "closed");
   assert.equal(terminalTurnStatusFromActivityStatus("closed"), "interrupted");
+});
+
+test("canonical execution phase maps queue and run events to thinking rail", () => {
+  const commandPhase = terminalCommandPhaseFromLifecycleEvent("remote-command-queued");
+  const executionPhase = terminalExecutionPhaseFromState({
+    commandPhase,
+    eventType: "remote-command-queued",
+    readiness: "busy",
+    turnStatus: "queued",
+  });
+
+  assert.equal(commandPhase, "queued");
+  assert.equal(executionPhase, "queued");
+  assert.equal(terminalRailStateFromExecutionPhase(executionPhase), "thinking");
+});
+
+test("canonical execution phase clears stale thinking after interruption", () => {
+  const commandPhase = terminalCommandPhaseFromLifecycleEvent("provider-turn-interrupted");
+  const executionPhase = terminalExecutionPhaseFromState({
+    activityStatus: "thinking",
+    commandPhase,
+    eventType: "provider-turn-interrupted",
+    readiness: "ready",
+    turnStatus: "interrupted",
+  });
+
+  assert.equal(commandPhase, "cancelled");
+  assert.equal(executionPhase, "interrupted");
+  assert.equal(terminalRailStateFromExecutionPhase(executionPhase), "idle");
 });

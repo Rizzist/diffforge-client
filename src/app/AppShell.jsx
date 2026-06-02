@@ -30,8 +30,11 @@ import {
 } from "../terminals/WorkspaceTerminal.jsx";
 import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
 import {
+  terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
+  terminalExecutionPhaseFromState,
   terminalPresenceStatusFromActivityStatus,
+  terminalRailStateFromExecutionPhase,
   terminalRailStateFromActivityStatus,
   terminalReadinessFromPresenceStatus,
   terminalTurnStatusFromActivityStatus,
@@ -7932,11 +7935,46 @@ export default function App() {
         targetRole: agentId,
         thread,
       });
-      const activityStatus = String(
-        groundTruth.effectiveActivityStatus
-          || thread?.activityStatus
-          || providerBinding?.activityStatus
+      const presenceRailState = String(
+        presenceTerminal?.nativeRailState
+          || presenceTerminal?.native_rail_state
+          || presenceTerminal?.activityStatus
+          || presenceTerminal?.activity_status
+          || presenceTerminal?.status
           || "",
+      ).trim().toLowerCase();
+      const presenceExecutionPhase = String(
+        presenceTerminal?.executionPhase
+          || presenceTerminal?.execution_phase
+          || "",
+      ).trim().toLowerCase();
+      const presenceTurnStatus = String(
+        presenceTerminal?.turnStatus
+          || presenceTerminal?.turn_status
+          || "",
+      ).trim().toLowerCase();
+      const presenceReadiness = String(
+        presenceTerminal?.readiness
+          || presenceTerminal?.terminalReadiness
+          || presenceTerminal?.terminal_readiness
+          || "",
+      ).trim().toLowerCase();
+      const presenceSaysIdle = Boolean(
+        presenceTerminal
+          && (
+            ["idle", "ready", "prompt_ready", "input_ready"].includes(presenceRailState)
+              || ["idle", "completed", "complete", "done", "interrupted", "cancelled", "canceled"].includes(presenceExecutionPhase)
+              || ["completed", "complete", "done", "interrupted", "cancelled", "canceled"].includes(presenceTurnStatus)
+              || ["ready", "input_ready"].includes(presenceReadiness)
+          )
+      );
+      const activityStatus = String(
+        presenceSaysIdle
+          ? "idle"
+          : groundTruth.effectiveActivityStatus
+            || thread?.activityStatus
+            || providerBinding?.activityStatus
+            || "",
       ).trim().toLowerCase();
       const terminalWorkState = String(groundTruth.terminalWorkState || "").trim().toLowerCase();
       const presenceStatus = String(presenceTerminal?.status || "").trim().toLowerCase();
@@ -7966,7 +8004,7 @@ export default function App() {
           || readiness === "ready"
           || ["idle", "ready"].includes(visibleStatus)
       );
-      const isWorking = Boolean(
+      const isWorking = !presenceSaysIdle && Boolean(
         ["thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
           || (
@@ -7975,7 +8013,7 @@ export default function App() {
             && Boolean(session.hasActiveTask || session.activeTask)
           )
       );
-      const needsInput = Boolean(
+      const needsInput = !presenceSaysIdle && Boolean(
         visibleStatus === "paused"
           || session.parked
           || session.parkedPrompt
@@ -9360,6 +9398,25 @@ export default function App() {
       if (eventType === "provider-turn-interrupted") return "interrupted";
       return terminalTurnStatusFromActivityStatus(statusActivity || statusAfter, statusAfter);
     })();
+    const commandPhase = terminalCommandPhaseFromLifecycleEvent(eventType, {
+      commandPhase: options.commandPhase || options.command_phase || event.commandPhase || event.command_phase,
+      readiness: readinessAfter,
+      status: statusAfter,
+      turnStatus,
+    });
+    const executionPhase = terminalExecutionPhaseFromState({
+      activityStatus: statusActivity,
+      commandPhase,
+      eventType,
+      readiness: readinessAfter,
+      status: statusAfter,
+      terminalLifecycle: statusLifecycleHint,
+      turnStatus,
+    });
+    const canonicalRailState = terminalRailStateFromExecutionPhase(
+      executionPhase,
+      statusActivity || statusAfter || "idle",
+    );
     const agentId = String(
       options.agentId
         || event.agentId
@@ -9442,9 +9499,9 @@ export default function App() {
     const nativeRailState = safeExplicitNativeRailState || (
       ["closed", "closing", "exited", "offline"].includes(statusAfter)
         ? statusAfter
-        : terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter)
+        : canonicalRailState || terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter)
     );
-    const visibleActivityStatus = terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter);
+    const visibleActivityStatus = canonicalRailState || terminalRailStateFromActivityStatus(statusActivity || statusAfter, statusAfter);
     const explicitNativeRailLabel = String(
       options.nativeRailLabel
         || options.native_rail_label
@@ -9471,6 +9528,12 @@ export default function App() {
       colorSlot: presenceTerminal?.colorSlot ?? presenceTerminal?.color_slot ?? getTerminalAgentColorSlot(safeTerminalIndex),
       eventId: `${terminalKey}:${statusSeq}`,
       eventType,
+      commandPhase,
+      command_phase: commandPhase,
+      displayStatus: visibleActivityStatus,
+      display_status: visibleActivityStatus,
+      executionPhase,
+      execution_phase: executionPhase,
       inputReady: readinessAfter === "ready",
       ...nativeRailFields,
       observedAtMs,
@@ -9495,6 +9558,8 @@ export default function App() {
     logTerminalStatus("frontend.terminal_status.event_sync.send", {
       agentId,
       eventType,
+      commandPhase,
+      executionPhase,
       paneId,
       readinessAfter,
       statusAfter,
@@ -10694,6 +10759,33 @@ export default function App() {
               workspaceName: targetWorkspace?.name || "",
             },
           }));
+          if (hasTerminalTarget) {
+            terminalStatusEventEmitterRef.current?.({
+              activityStatus: "queued",
+              agentId: agentId || "",
+              commandId,
+              commandPhase: "queued",
+              executionPhase: "queued",
+              inputReady: false,
+              messageSource: "next-remote-control",
+              paneId: targetTerminalId,
+              readiness: "busy",
+              source: "remote-command-queued",
+              status: "active",
+              terminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : 0,
+              threadId: targetThreadId,
+              turnId: commandId,
+              turnStatus: "queued",
+              type: "remote-command-queued",
+              workspaceId,
+              workspaceName: targetWorkspace?.name || "",
+            }, {
+              commandPhase: "queued",
+              executionPhase: "queued",
+              reason: "remote-command-queued",
+              status: "queued",
+            });
+          }
           await invoke("cloud_mcp_record_remote_command_status", {
             event,
             status: "queued",
