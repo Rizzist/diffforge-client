@@ -1147,6 +1147,7 @@ fn claude_write_authority_guard_settings(
         write_root
     };
     let guard_command = diff_forge_write_guard_hook_command(coordination, guard_root, "claude");
+    let activity_command = diff_forge_activity_hook_command(coordination, "claude");
     let mut deny_rules = vec![
         format!(
             "Edit({})",
@@ -1197,11 +1198,55 @@ fn claude_write_authority_guard_settings(
                     ]
                 },
                 {
+                    "matcher": "Agent|Task|Bash|PowerShell|Monitor",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                },
+                {
                     "matcher": "Bash|PowerShell|Monitor",
                     "hooks": [
                         {
                             "type": "command",
                             "command": guard_command
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "Agent|Task|Bash|PowerShell|Monitor",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
                         }
                     ]
                 }
@@ -1303,6 +1348,201 @@ fn diff_forge_write_guard_hook_command(
             quote_shell_literal(agent_kind),
         )
     }
+}
+
+fn diff_forge_activity_hook_command(
+    coordination: &TerminalCoordinationSession,
+    provider: &str,
+) -> String {
+    let command_path = coordination.mcp_command.as_str();
+
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-activity-hook --provider {}\"",
+            quote_powershell_literal(command_path),
+            quote_powershell_literal(provider),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{} --diff-forge-activity-hook --provider {}",
+            quote_shell_literal(command_path),
+            quote_shell_literal(provider),
+        )
+    }
+}
+
+fn terminal_activity_events_path(pane_id: &str, instance_id: u64) -> PathBuf {
+    let safe_pane_id = pane_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    env::temp_dir()
+        .join("diffforge-terminal-activity")
+        .join(format!("{safe_pane_id}-{instance_id}.jsonl"))
+}
+
+fn terminal_activity_env_vars(
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+    provider_id: &str,
+) -> Vec<(String, String)> {
+    let activity_path = terminal_activity_events_path(pane_id, instance_id);
+    vec![
+        ("DIFFFORGE_TERMINAL_PANE_ID".to_string(), pane_id.to_string()),
+        (
+            "DIFFFORGE_TERMINAL_INSTANCE_ID".to_string(),
+            instance_id.to_string(),
+        ),
+        (
+            "DIFFFORGE_TERMINAL_WORKSPACE_ID".to_string(),
+            workspace_id.unwrap_or_default().to_string(),
+        ),
+        (
+            "DIFFFORGE_TERMINAL_INDEX".to_string(),
+            terminal_index.map(|index| index.to_string()).unwrap_or_default(),
+        ),
+        (
+            "DIFFFORGE_TERMINAL_PROVIDER".to_string(),
+            provider_id.to_string(),
+        ),
+        (
+            "DIFFFORGE_ACTIVITY_EVENTS_PATH".to_string(),
+            activity_path.to_string_lossy().to_string(),
+        ),
+    ]
+}
+
+fn extend_terminal_activity_env_vars(
+    env_vars: &mut Vec<(String, String)>,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+    provider_id: &str,
+) {
+    let activity_env =
+        terminal_activity_env_vars(pane_id, instance_id, workspace_id, terminal_index, provider_id);
+    for (key, value) in activity_env {
+        env_vars.retain(|(existing_key, _)| existing_key != &key);
+        env_vars.push((key, value));
+    }
+}
+
+pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
+    let provider = terminal_cli_arg_or_env(
+        args,
+        "--provider",
+        &["DIFFFORGE_HOOK_PROVIDER", "DIFFFORGE_TERMINAL_PROVIDER"],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+    let pane_id = terminal_cli_arg_or_env(args, "--pane-id", &["DIFFFORGE_TERMINAL_PANE_ID"])
+        .unwrap_or_default();
+    let instance_id = terminal_cli_arg_or_env(
+        args,
+        "--instance-id",
+        &["DIFFFORGE_TERMINAL_INSTANCE_ID"],
+    )
+    .and_then(|value| value.parse::<u64>().ok())
+    .unwrap_or(0);
+    let workspace_id = terminal_cli_arg_or_env(
+        args,
+        "--workspace-id",
+        &["DIFFFORGE_TERMINAL_WORKSPACE_ID", "COORDINATION_WORKSPACE_ID"],
+    )
+    .unwrap_or_default();
+    let terminal_index =
+        terminal_cli_arg_or_env(args, "--terminal-index", &["DIFFFORGE_TERMINAL_INDEX"])
+            .unwrap_or_default();
+    let activity_path = terminal_cli_arg_or_env(
+        args,
+        "--events-path",
+        &["DIFFFORGE_ACTIVITY_EVENTS_PATH"],
+    )
+    .map(PathBuf::from)
+    .unwrap_or_else(|| terminal_activity_events_path(&pane_id, instance_id));
+
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return 0;
+    }
+    let Ok(hook_input) = serde_json::from_str::<Value>(&input) else {
+        return 0;
+    };
+    let record = diff_forge_activity_hook_record(
+        &provider,
+        &pane_id,
+        instance_id,
+        &workspace_id,
+        &terminal_index,
+        &hook_input,
+    );
+    if let Some(parent) = activity_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&activity_path)
+    {
+        let _ = writeln!(file, "{record}");
+    }
+
+    0
+}
+
+fn diff_forge_activity_hook_record(
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: &str,
+    terminal_index: &str,
+    hook_input: &Value,
+) -> Value {
+    let tool_input = &hook_input["tool_input"];
+    let agent_type = hook_input["agent_type"]
+        .as_str()
+        .or_else(|| tool_input["agent_type"].as_str())
+        .or_else(|| tool_input["subagent_type"].as_str())
+        .unwrap_or_default();
+    let description = tool_input["description"]
+        .as_str()
+        .or_else(|| tool_input["prompt"].as_str())
+        .unwrap_or_default();
+    json!({
+        "timestampMs": current_time_ms(),
+        "provider": provider,
+        "paneId": pane_id,
+        "instanceId": instance_id,
+        "workspaceId": workspace_id,
+        "terminalIndex": terminal_index,
+        "eventName": hook_input["hook_event_name"].as_str().unwrap_or_default(),
+        "hookEventName": hook_input["hook_event_name"].as_str().unwrap_or_default(),
+        "sessionId": hook_input["session_id"].as_str().unwrap_or_default(),
+        "turnId": hook_input["turn_id"].as_str().unwrap_or_default(),
+        "cwd": hook_input["cwd"].as_str().unwrap_or_default(),
+        "permissionMode": hook_input["permission_mode"].as_str().unwrap_or_default(),
+        "transcriptPath": hook_input["transcript_path"].as_str().unwrap_or_default(),
+        "agentId": hook_input["agent_id"].as_str().unwrap_or_default(),
+        "agentType": agent_type,
+        "agentTranscriptPath": hook_input["agent_transcript_path"].as_str().unwrap_or_default(),
+        "lastMessage": hook_input["last_assistant_message"].as_str().unwrap_or_default(),
+        "toolName": hook_input["tool_name"].as_str().unwrap_or_default(),
+        "toolUseId": hook_input["tool_use_id"].as_str().unwrap_or_default(),
+        "command": tool_input["command"].as_str().unwrap_or_default(),
+        "description": description,
+    })
 }
 
 pub fn run_claude_worktree_guard(args: &[String]) -> i32 {

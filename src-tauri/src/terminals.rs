@@ -4201,6 +4201,24 @@ async fn terminal_open(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        let activity_provider_id = provider_for_coordination
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(if plain_shell {
+                "generic"
+            } else if kind == "console" {
+                "codex"
+            } else {
+                kind.as_str()
+            });
+        extend_terminal_activity_env_vars(
+            &mut coordination_env_vars,
+            &pane_id,
+            instance_id,
+            workspace_id.as_deref(),
+            terminal_index,
+            activity_provider_id,
+        );
         if terminal_coordination.is_some() {
             coordination_env_vars
                 .extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
@@ -4244,6 +4262,14 @@ async fn terminal_open(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        extend_terminal_activity_env_vars(
+            &mut coordination_env_vars,
+            &pane_id,
+            instance_id,
+            workspace_id.as_deref(),
+            terminal_index,
+            launch_provider_id,
+        );
         coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
         let launch_env_vars =
             terminal_env_vars_with_opencode_tui_config(launch_provider_id, &coordination_env_vars)?;
@@ -4632,6 +4658,14 @@ async fn terminal_start_agent(
         .as_ref()
         .map(|coordination| coordination.env_vars.clone())
         .unwrap_or_default();
+    extend_terminal_activity_env_vars(
+        &mut coordination_env_vars,
+        &pane_id,
+        instance.id,
+        Some(instance.metadata.workspace_id.as_str()),
+        instance.metadata.terminal_index,
+        definition.id,
+    );
     coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
     let launch_env_vars =
         terminal_env_vars_with_opencode_tui_config(definition.id, &coordination_env_vars)?;
@@ -4829,6 +4863,14 @@ async fn start_terminal_agent_in_prepared_pty(
             .as_ref()
             .map(|coordination| coordination.env_vars.clone())
             .unwrap_or_default();
+        extend_terminal_activity_env_vars(
+            &mut coordination_env_vars,
+            &pane_id,
+            instance.id,
+            Some(instance.metadata.workspace_id.as_str()),
+            instance.metadata.terminal_index,
+            definition.id,
+        );
         let cloud_env_vars = match cloud_mcp_runtime_env_vars(&cloud_mcp_state).await {
             Ok(env_vars) => env_vars,
             Err(error) => {

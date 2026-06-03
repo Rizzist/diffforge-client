@@ -3293,6 +3293,7 @@ pub fn run() {
             install_agent,
             update_agent,
             list_developer_processes,
+            terminal_activity_snapshot,
             kill_developer_process,
             docker_developer_action,
             forge_working_directory,

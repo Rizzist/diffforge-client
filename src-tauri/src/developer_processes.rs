@@ -43,6 +43,49 @@ struct DeveloperProcessSnapshot {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct TerminalActivitySnapshot {
+    platform: &'static str,
+    sampled_at_ms: u64,
+    pane_id: String,
+    terminal_found: bool,
+    terminal_root_pid: Option<u32>,
+    terminal_instance_id: Option<u64>,
+    terminal_workspace_id: String,
+    terminal_workspace_name: String,
+    terminal_index: Option<u16>,
+    terminal_thread_id: String,
+    terminal_agent_id: String,
+    terminal_agent_kind: String,
+    activity_events_path: String,
+    processes: Vec<DeveloperProcessInfo>,
+    dev_servers: Vec<DeveloperProcessInfo>,
+    subagents: Vec<TerminalActivitySubagent>,
+    total_cpu_percent: f64,
+    total_memory_bytes: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivitySubagent {
+    id: String,
+    provider: String,
+    agent_id: String,
+    agent_type: String,
+    label: String,
+    description: String,
+    status: String,
+    started_at_ms: Option<u64>,
+    finished_at_ms: Option<u64>,
+    updated_at_ms: u64,
+    transcript_path: String,
+    agent_transcript_path: String,
+    last_message: String,
+    source: String,
+    confidence: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct DeveloperProcessInfo {
     pid: u32,
     parent_pid: Option<u32>,
@@ -235,6 +278,21 @@ struct DeveloperTerminalProcessRoot {
 async fn list_developer_processes(
     state: State<'_, DeveloperProcessMonitorState>,
     terminal_state: State<'_, TerminalState>,
+    active_workspace_root: Option<String>,
+    workspace_roots: Vec<String>,
+) -> Result<DeveloperProcessSnapshot, String> {
+    collect_developer_process_snapshot(
+        state.inner(),
+        terminal_state.inner(),
+        active_workspace_root,
+        workspace_roots,
+    )
+    .await
+}
+
+async fn collect_developer_process_snapshot(
+    state: &DeveloperProcessMonitorState,
+    terminal_state: &TerminalState,
     active_workspace_root: Option<String>,
     workspace_roots: Vec<String>,
 ) -> Result<DeveloperProcessSnapshot, String> {
@@ -431,6 +489,110 @@ async fn list_developer_processes(
     })
 }
 
+#[tauri::command]
+async fn terminal_activity_snapshot(
+    state: State<'_, DeveloperProcessMonitorState>,
+    terminal_state: State<'_, TerminalState>,
+    pane_id: String,
+) -> Result<TerminalActivitySnapshot, String> {
+    let pane_id = pane_id.trim().to_string();
+    validate_terminal_pane_id(&pane_id)?;
+
+    let terminal_roots = developer_terminal_process_roots(terminal_state.inner()).await;
+    let terminal_root = terminal_roots
+        .iter()
+        .find(|root| root.pane_id == pane_id)
+        .cloned();
+    let activity_events_path = terminal_root
+        .as_ref()
+        .map(|root| terminal_activity_events_path(&pane_id, root.instance_id))
+        .unwrap_or_else(|| terminal_activity_events_path(&pane_id, 0));
+    let activity_events_path_text = activity_events_path.to_string_lossy().to_string();
+    let process_snapshot = collect_developer_process_snapshot(
+        state.inner(),
+        terminal_state.inner(),
+        None,
+        Vec::new(),
+    )
+    .await?;
+
+    let mut processes = process_snapshot
+        .processes
+        .into_iter()
+        .filter(|process| {
+            process.terminal_owned
+                && process.terminal_pane_id == pane_id
+                && developer_terminal_activity_process_visible(process)
+        })
+        .collect::<Vec<_>>();
+    processes.sort_by(|left, right| {
+        developer_terminal_activity_process_rank(right)
+            .cmp(&developer_terminal_activity_process_rank(left))
+            .then_with(|| {
+                right
+                    .cpu_percent
+                    .partial_cmp(&left.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| right.memory_bytes.cmp(&left.memory_bytes))
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+
+    let dev_servers = processes
+        .iter()
+        .filter(|process| developer_terminal_process_is_dev_server(process))
+        .cloned()
+        .collect::<Vec<_>>();
+    let total_cpu_percent = processes.iter().map(|process| process.cpu_percent).sum();
+    let total_memory_bytes = processes
+        .iter()
+        .map(|process| process.memory_bytes)
+        .fold(0u64, u64::saturating_add);
+    let subagents = terminal_activity_subagents_from_events(
+        &activity_events_path,
+        terminal_root
+            .as_ref()
+            .map(|root| root.agent_kind.as_str())
+            .unwrap_or_default(),
+    );
+
+    Ok(TerminalActivitySnapshot {
+        platform: developer_process_platform(),
+        sampled_at_ms: current_time_ms(),
+        pane_id,
+        terminal_found: terminal_root.is_some(),
+        terminal_root_pid: terminal_root.as_ref().map(|root| root.root_pid),
+        terminal_instance_id: terminal_root.as_ref().map(|root| root.instance_id),
+        terminal_workspace_id: terminal_root
+            .as_ref()
+            .map(|root| root.workspace_id.clone())
+            .unwrap_or_default(),
+        terminal_workspace_name: terminal_root
+            .as_ref()
+            .map(|root| root.workspace_name.clone())
+            .unwrap_or_default(),
+        terminal_index: terminal_root.as_ref().and_then(|root| root.terminal_index),
+        terminal_thread_id: terminal_root
+            .as_ref()
+            .map(|root| root.thread_id.clone())
+            .unwrap_or_default(),
+        terminal_agent_id: terminal_root
+            .as_ref()
+            .map(|root| root.agent_id.clone())
+            .unwrap_or_default(),
+        terminal_agent_kind: terminal_root
+            .as_ref()
+            .map(|root| root.agent_kind.clone())
+            .unwrap_or_default(),
+        activity_events_path: activity_events_path_text,
+        processes,
+        dev_servers,
+        subagents,
+        total_cpu_percent,
+        total_memory_bytes,
+    })
+}
+
 async fn developer_terminal_process_roots(
     terminal_state: &TerminalState,
 ) -> Vec<DeveloperTerminalProcessRoot> {
@@ -492,6 +654,291 @@ fn developer_terminal_link_for_process<'a>(
             return None;
         };
         current = *parent;
+    }
+}
+
+fn developer_terminal_activity_process_visible(process: &DeveloperProcessInfo) -> bool {
+    if process
+        .terminal_root_pid
+        .is_some_and(|root_pid| process.pid == root_pid)
+    {
+        return false;
+    }
+    if developer_terminal_process_is_dev_server(process) {
+        return true;
+    }
+    if !process.bound_ports.is_empty() {
+        return true;
+    }
+
+    let text = developer_process_search_text(process);
+    if developer_process_text_is_shell_noise(&text) {
+        return false;
+    }
+    if developer_process_text_is_agent_root_noise(&text) && process.child_count > 0 {
+        return false;
+    }
+
+    true
+}
+
+fn developer_terminal_activity_process_rank(process: &DeveloperProcessInfo) -> u8 {
+    if developer_terminal_process_is_dev_server(process) {
+        return 4;
+    }
+    if !process.bound_ports.is_empty() {
+        return 3;
+    }
+    if process.cpu_percent >= DEVELOPER_PROCESS_CPU_WARNING_PERCENT
+        || process.memory_bytes >= DEVELOPER_PROCESS_MEMORY_WARNING_BYTES
+    {
+        return 2;
+    }
+    1
+}
+
+fn developer_terminal_process_is_dev_server(process: &DeveloperProcessInfo) -> bool {
+    let text = developer_process_search_text(process);
+    let has_port = !process.bound_ports.is_empty();
+    let dev_command = [
+        "npm run dev",
+        "npm start",
+        "pnpm dev",
+        "pnpm run dev",
+        "yarn dev",
+        "yarn start",
+        "bun dev",
+        "bun run dev",
+        "vite",
+        "next dev",
+        "astro dev",
+        "nuxt dev",
+        "svelte-kit",
+        "webpack serve",
+        "parcel",
+        "rails server",
+        "flask run",
+        "uvicorn",
+        "gunicorn",
+        "python -m http.server",
+        "python3 -m http.server",
+        "cargo run",
+        "trunk serve",
+        "tauri dev",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+
+    if dev_command {
+        return true;
+    }
+    has_port
+        && [
+            "node",
+            "npm",
+            "pnpm",
+            "yarn",
+            "bun",
+            "vite",
+            "next",
+            "python",
+            "ruby",
+            "rails",
+            "cargo",
+            "rust",
+            "go",
+            "java",
+            "deno",
+            "tsx",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn developer_process_search_text(process: &DeveloperProcessInfo) -> String {
+    [
+        process.name.as_str(),
+        process.display_name.as_str(),
+        process.group_id.as_str(),
+        process.group_label.as_str(),
+        process.command.as_str(),
+        process.executable.as_str(),
+        process.cwd.as_str(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn developer_process_text_is_shell_noise(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    [
+        " zsh ",
+        " bash ",
+        " sh ",
+        " fish ",
+        " powershell",
+        " pwsh",
+        " cmd.exe",
+        " login ",
+    ]
+    .iter()
+    .any(|needle| format!(" {trimmed} ").contains(needle))
+}
+
+fn developer_process_text_is_agent_root_noise(text: &str) -> bool {
+    ["codex", "claude", "opencode"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn terminal_activity_subagents_from_events(
+    activity_events_path: &Path,
+    fallback_provider: &str,
+) -> Vec<TerminalActivitySubagent> {
+    let Ok(body) = fs::read_to_string(activity_events_path) else {
+        return Vec::new();
+    };
+    let mut subagents = HashMap::<String, TerminalActivitySubagent>::new();
+
+    for line in body.lines().rev().take(500).collect::<Vec<_>>().into_iter().rev() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let event_name = event["eventName"]
+            .as_str()
+            .or_else(|| event["hookEventName"].as_str())
+            .unwrap_or_default();
+        let event_key = event_name.to_ascii_lowercase();
+        let provider = event["provider"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(fallback_provider)
+            .to_string();
+        let timestamp_ms = event["timestampMs"]
+            .as_u64()
+            .unwrap_or_else(current_time_ms);
+        let agent_id = event["agentId"].as_str().unwrap_or_default().trim();
+        let tool_use_id = event["toolUseId"].as_str().unwrap_or_default().trim();
+        let agent_type = event["agentType"]
+            .as_str()
+            .or_else(|| event["subagentType"].as_str())
+            .unwrap_or_default()
+            .trim();
+        let description = event["description"].as_str().unwrap_or_default().trim();
+        let is_agent_tool = event["toolName"]
+            .as_str()
+            .is_some_and(|tool| tool.eq_ignore_ascii_case("Agent") || tool.eq_ignore_ascii_case("Task"));
+        let is_subagent_event = event_key == "subagentstart" || event_key == "subagentstop";
+        if !is_subagent_event && !is_agent_tool {
+            continue;
+        }
+        let key = if !agent_id.is_empty() {
+            format!("agent:{agent_id}")
+        } else if !tool_use_id.is_empty() {
+            format!("tool:{tool_use_id}")
+        } else if !agent_type.is_empty() {
+            format!("type:{agent_type}:{timestamp_ms}")
+        } else {
+            continue;
+        };
+        let entry = subagents.entry(key.clone()).or_insert_with(|| {
+            let label = terminal_activity_subagent_label(agent_type, description);
+            TerminalActivitySubagent {
+                id: key.clone(),
+                provider: provider.clone(),
+                agent_id: agent_id.to_string(),
+                agent_type: agent_type.to_string(),
+                label,
+                description: description.to_string(),
+                status: "running".to_string(),
+                started_at_ms: Some(timestamp_ms),
+                finished_at_ms: None,
+                updated_at_ms: timestamp_ms,
+                transcript_path: event["transcriptPath"].as_str().unwrap_or_default().to_string(),
+                agent_transcript_path: event["agentTranscriptPath"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                last_message: String::new(),
+                source: "provider-hook".to_string(),
+                confidence: if is_subagent_event { "named" } else { "inferred" }.to_string(),
+            }
+        });
+
+        if !provider.trim().is_empty() {
+            entry.provider = provider;
+        }
+        if !agent_id.is_empty() {
+            entry.agent_id = agent_id.to_string();
+        }
+        if !agent_type.is_empty() {
+            entry.agent_type = agent_type.to_string();
+        }
+        if !description.is_empty() {
+            entry.description = description.to_string();
+        }
+        entry.label = terminal_activity_subagent_label(&entry.agent_type, &entry.description);
+        entry.updated_at_ms = timestamp_ms;
+        if event_key == "subagentstop" || event_key == "posttooluse" {
+            entry.status = "done".to_string();
+            entry.finished_at_ms = Some(timestamp_ms);
+        }
+        if event_key == "subagentstart" || event_key == "pretooluse" {
+            entry.status = "running".to_string();
+            entry.started_at_ms = entry.started_at_ms.or(Some(timestamp_ms));
+        }
+        if let Some(value) = event["transcriptPath"].as_str().filter(|value| !value.trim().is_empty()) {
+            entry.transcript_path = value.to_string();
+        }
+        if let Some(value) = event["agentTranscriptPath"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            entry.agent_transcript_path = value.to_string();
+        }
+        if let Some(value) = event["lastMessage"].as_str().filter(|value| !value.trim().is_empty()) {
+            entry.last_message = value.to_string();
+        }
+        if is_subagent_event {
+            entry.confidence = "named".to_string();
+        }
+    }
+
+    let mut values = subagents.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        terminal_activity_subagent_status_rank(&right.status)
+            .cmp(&terminal_activity_subagent_status_rank(&left.status))
+            .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    values
+}
+
+fn terminal_activity_subagent_label(agent_type: &str, description: &str) -> String {
+    let agent_type = agent_type.trim();
+    if !agent_type.is_empty() {
+        return agent_type.to_string();
+    }
+    let description = description.trim();
+    if !description.is_empty() {
+        return description
+            .split_whitespace()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    "Subagent".to_string()
+}
+
+fn terminal_activity_subagent_status_rank(status: &str) -> u8 {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "running" | "active" => 3,
+        "failed" | "blocked" => 2,
+        "done" | "completed" => 1,
+        _ => 0,
     }
 }
 

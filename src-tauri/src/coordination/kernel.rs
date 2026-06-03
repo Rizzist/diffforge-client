@@ -23297,6 +23297,7 @@ fn codex_managed_hooks_config(
     slot_key: &str,
     agent_kind: &str,
 ) -> Value {
+    let activity_hook_command = codex_activity_hook_command(mcp_command);
     json!({
         "hooks": {
             "PreToolUse": [
@@ -23316,6 +23317,50 @@ fn codex_managed_hooks_config(
                             ),
                             "timeout": 30,
                             "statusMessage": "Validating Diff Forge writes"
+                        }
+                    ]
+                },
+                {
+                    "matcher": "Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_hook_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_hook_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_hook_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_hook_command.clone(),
+                            "timeout": 5
                         }
                     ]
                 }
@@ -23755,6 +23800,14 @@ fn codex_write_guard_hook_command(
         quote_shell_literal_for_config(session_id),
         quote_shell_literal_for_config(slot_key),
         quote_shell_literal_for_config(agent_kind),
+    )
+}
+
+fn codex_activity_hook_command(command: &str) -> String {
+    format!(
+        "{} --diff-forge-activity-hook --provider {}",
+        quote_shell_literal_for_config(command),
+        quote_shell_literal_for_config("codex"),
     )
 }
 

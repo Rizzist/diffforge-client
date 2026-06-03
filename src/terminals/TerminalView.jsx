@@ -170,6 +170,7 @@ const TERMINAL_BREAKOUT_RESIZE_HANDLES = Object.freeze([
 const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
 const TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT = 80;
 const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
+const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 1100;
 const terminalBreakoutPlanCache = new Map();
 const terminalBreakoutPlanRequests = new Map();
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
@@ -1128,6 +1129,219 @@ const TerminalBreakoutPlanStepText = styled.span`
 
   html[data-forge-theme="light"] & {
     color: #334155;
+  }
+`;
+
+const TerminalBreakoutActivityPanel = styled.aside`
+  --terminal-breakout-activity-panel-width: clamp(300px, calc(var(--terminal-slot-width, 640px) * 0.56), 480px);
+
+  position: absolute;
+  top: 0;
+  left: calc(100% + calc(14px * var(--terminal-slot-inverse-scale, 1)));
+  z-index: 86;
+  display: flex;
+  width: var(--terminal-breakout-activity-panel-width);
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  padding: calc(14px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.24);
+  border-radius: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(241, 245, 249, 0.94);
+  background: rgba(3, 7, 18, 0.96);
+  box-shadow:
+    0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(44px * var(--terminal-slot-inverse-scale, 1)) rgba(0, 0, 0, 0.46),
+    inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.05);
+  font-size: calc(12px * var(--terminal-slot-inverse-scale, 1));
+  line-height: 1.35;
+  overflow: hidden;
+  pointer-events: auto;
+  backdrop-filter: blur(14px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(20, 184, 166, 0.28);
+    color: #111827;
+    background: rgba(255, 255, 255, 0.97);
+    box-shadow:
+      0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(38px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.14),
+      inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.85);
+  }
+`;
+
+const TerminalBreakoutActivityHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  align-items: start;
+`;
+
+const TerminalBreakoutActivitySummary = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: calc(5px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(148, 163, 184, 0.78);
+  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.74);
+  }
+`;
+
+const TerminalBreakoutActivityList = styled.div`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+`;
+
+const TerminalBreakoutActivitySection = styled.section`
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: calc(6px * var(--terminal-slot-inverse-scale, 1));
+`;
+
+const TerminalBreakoutActivitySectionTitle = styled.div`
+  color: rgba(148, 163, 184, 0.82);
+  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.78);
+  }
+`;
+
+const TerminalBreakoutActivityRow = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  align-items: center;
+  padding: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.18);
+  border-radius: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  background: rgba(15, 23, 42, 0.56);
+
+  &[data-kind="subagent"] {
+    border-color: rgba(96, 165, 250, 0.2);
+    background: rgba(15, 23, 42, 0.62);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(20, 184, 166, 0.24);
+    background: rgba(248, 250, 252, 0.74);
+  }
+
+  html[data-forge-theme="light"] &[data-kind="subagent"] {
+    border-color: rgba(37, 99, 235, 0.2);
+  }
+`;
+
+const TerminalBreakoutActivityRowMain = styled.div`
+  min-width: 0;
+`;
+
+const TerminalBreakoutActivityRowTitle = styled.div`
+  min-width: 0;
+  color: rgba(248, 250, 252, 0.98);
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+`;
+
+const TerminalBreakoutActivityRowMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: calc(5px * var(--terminal-slot-inverse-scale, 1));
+  margin-top: calc(4px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(148, 163, 184, 0.82);
+  font-size: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 800;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.78);
+  }
+`;
+
+const TerminalBreakoutActivityPill = styled.span`
+  display: inline-flex;
+  align-items: center;
+  min-height: calc(19px * var(--terminal-slot-inverse-scale, 1));
+  padding: 0 calc(7px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.32);
+  border-radius: 999px;
+  color: rgba(153, 246, 228, 0.96);
+  background: rgba(20, 184, 166, 0.1);
+  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  white-space: nowrap;
+
+  &[data-tone="blue"] {
+    border-color: rgba(96, 165, 250, 0.38);
+    color: rgba(191, 219, 254, 0.98);
+    background: rgba(37, 99, 235, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f766e;
+    background: rgba(20, 184, 166, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="blue"] {
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.08);
+  }
+`;
+
+const TerminalBreakoutActivityStopButton = styled.button`
+  display: inline-grid;
+  width: calc(28px * var(--terminal-slot-inverse-scale, 1));
+  height: calc(28px * var(--terminal-slot-inverse-scale, 1));
+  place-items: center;
+  padding: 0;
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(248, 113, 113, 0.34);
+  border-radius: calc(7px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(252, 165, 165, 0.95);
+  background: rgba(127, 29, 29, 0.16);
+  cursor: pointer;
+
+  svg {
+    width: calc(14px * var(--terminal-slot-inverse-scale, 1));
+    height: calc(14px * var(--terminal-slot-inverse-scale, 1));
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.56;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    color: #fecaca;
+    border-color: rgba(248, 113, 113, 0.58);
+    background: rgba(127, 29, 29, 0.28);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #b91c1c;
+    background: rgba(254, 226, 226, 0.76);
   }
 `;
 
@@ -3791,6 +4005,113 @@ function terminalBreakoutPlanTitle(plan) {
 
 function terminalBreakoutPlanSteps(plan) {
   return Array.isArray(plan?.steps) ? plan.steps : [];
+}
+
+function terminalActivityArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function terminalBreakoutActivityProcesses(snapshot) {
+  const seen = new Set();
+  return [
+    ...terminalActivityArray(snapshot?.devServers),
+    ...terminalActivityArray(snapshot?.processes),
+  ].filter((process) => {
+    const pid = Number(process?.pid || 0);
+    if (!Number.isInteger(pid) || pid <= 0 || seen.has(pid)) {
+      return false;
+    }
+    seen.add(pid);
+    return true;
+  });
+}
+
+function terminalBreakoutActivityHasContent(snapshot) {
+  return terminalActivityArray(snapshot?.subagents).length > 0
+    || terminalBreakoutActivityProcesses(snapshot).length > 0;
+}
+
+function formatTerminalActivityBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unitIndex = 0;
+  let amount = bytes;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  const precision = amount >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${amount.toFixed(precision)} ${units[unitIndex]}`;
+}
+
+function formatTerminalActivityCpu(value) {
+  const cpu = Number(value || 0);
+  if (!Number.isFinite(cpu) || cpu <= 0) {
+    return "";
+  }
+  return cpu >= 10 ? `${Math.round(cpu)}% CPU` : `${cpu.toFixed(1)}% CPU`;
+}
+
+function formatTerminalActivityDuration(seconds) {
+  const totalSeconds = Math.max(0, Math.floor(Number(seconds || 0)));
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) {
+    return "";
+  }
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`;
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+}
+
+function terminalActivityBoundPorts(process) {
+  return Array.isArray(process?.boundPorts) ? process.boundPorts : [];
+}
+
+function terminalActivityPortLabel(process) {
+  const ports = terminalActivityBoundPorts(process);
+  if (!ports.length) {
+    return "";
+  }
+  const first = ports[0];
+  const suffix = ports.length > 1 ? ` +${ports.length - 1}` : "";
+  return `:${first.port}${suffix}`;
+}
+
+function terminalActivityProcessLabel(process) {
+  const command = String(process?.command || "").trim();
+  const name = String(process?.name || process?.displayName || process?.groupLabel || "").trim();
+  if (command) {
+    const compact = command.replace(/\s+/g, " ");
+    return compact.length > 72 ? `${compact.slice(0, 69)}...` : compact;
+  }
+  return name || `PID ${process?.pid || ""}`;
+}
+
+function terminalActivityProcessMeta(process) {
+  return [
+    terminalActivityPortLabel(process),
+    formatTerminalActivityCpu(process?.cpuPercent),
+    formatTerminalActivityBytes(process?.memoryBytes),
+    formatTerminalActivityDuration(process?.runTimeSeconds),
+    process?.pid ? `PID ${process.pid}` : "",
+  ].filter(Boolean);
+}
+
+function terminalActivitySubagentMeta(subagent) {
+  return [
+    subagent?.provider || "",
+    subagent?.status || "",
+    subagent?.confidence === "named" ? "named" : "",
+  ].filter(Boolean);
 }
 
 function terminalBreakoutPlanEventText(payload, keys) {
@@ -8582,6 +8903,8 @@ function TerminalView({
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
+  const [terminalBreakoutActivitySnapshots, setTerminalBreakoutActivitySnapshots] = useState({});
+  const [terminalBreakoutActivityStopState, setTerminalBreakoutActivityStopState] = useState({});
   const [terminalBreakoutViewport, setTerminalBreakoutViewport] = useState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
@@ -9345,6 +9668,161 @@ function TerminalView({
     });
     return plansByIndex;
   }, [terminalBreakoutPlanSnapshots, terminalBreakoutPlanTargets]);
+  const terminalBreakoutActivityTargets = useMemo(() => {
+    if (!terminalBreakoutLayoutActive) {
+      return [];
+    }
+    return logicalTerminalIndexes.reduce((targets, terminalIndex) => {
+      if (!terminalBreakoutPlacements[terminalIndex]) {
+        return targets;
+      }
+      const paneId = getTerminalPaneId(terminalIndex);
+      if (paneId) {
+        targets.push({ paneId, terminalIndex });
+      }
+      return targets;
+    }, []);
+  }, [
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    terminalBreakoutLayoutActive,
+    terminalBreakoutPlacements,
+  ]);
+  const terminalBreakoutActivityTargetSignature = useMemo(() => (
+    terminalBreakoutActivityTargets
+      .map((target) => `${target.terminalIndex}:${target.paneId}`)
+      .join("\n")
+  ), [terminalBreakoutActivityTargets]);
+
+  const loadTerminalBreakoutActivitySnapshots = useCallback(async (targets, { silent = false } = {}) => {
+    if (!Array.isArray(targets) || !targets.length) {
+      if (!silent) {
+        setTerminalBreakoutActivitySnapshots({});
+      }
+      return;
+    }
+
+    const results = await Promise.all(targets.map(async (target) => {
+      try {
+        const snapshot = await invoke("terminal_activity_snapshot", { paneId: target.paneId });
+        return { signature: JSON.stringify(snapshot || null), snapshot, target };
+      } catch (error) {
+        const message = getErrorMessage(error);
+        return {
+          error: message,
+          signature: `error:${message}`,
+          snapshot: null,
+          target,
+        };
+      }
+    }));
+
+    setTerminalBreakoutActivitySnapshots((currentSnapshots) => {
+      const nextSnapshots = {};
+      results.forEach(({ error, signature, snapshot, target }) => {
+        nextSnapshots[target.paneId] = {
+          error: error || "",
+          signature: signature || "",
+          snapshot,
+          terminalIndex: target.terminalIndex,
+          updatedAt: Date.now(),
+        };
+      });
+
+      if (Object.keys(nextSnapshots).length === Object.keys(currentSnapshots).length) {
+        let unchanged = true;
+        for (const [paneId, entry] of Object.entries(nextSnapshots)) {
+          const currentEntry = currentSnapshots[paneId];
+          if (
+            !currentEntry
+            || currentEntry.error !== entry.error
+            || currentEntry.signature !== entry.signature
+            || currentEntry.terminalIndex !== entry.terminalIndex
+          ) {
+            unchanged = false;
+            break;
+          }
+        }
+        if (unchanged) {
+          return currentSnapshots;
+        }
+      }
+      return nextSnapshots;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!terminalBreakoutLayoutActive || !terminalBreakoutActivityTargets.length) {
+      setTerminalBreakoutActivitySnapshots({});
+      return undefined;
+    }
+
+    let cancelled = false;
+    const load = (silent = false) => {
+      if (cancelled || document.visibilityState === "hidden") {
+        return;
+      }
+      void loadTerminalBreakoutActivitySnapshots(terminalBreakoutActivityTargets, { silent });
+    };
+    load(false);
+    const intervalId = window.setInterval(() => load(true), TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    loadTerminalBreakoutActivitySnapshots,
+    terminalBreakoutActivityTargetSignature,
+    terminalBreakoutActivityTargets,
+    terminalBreakoutLayoutActive,
+  ]);
+
+  const stopTerminalBreakoutActivityProcess = useCallback(async (paneId, process) => {
+    const pid = Number(process?.pid || 0);
+    if (!paneId || !Number.isInteger(pid) || pid <= 0) {
+      return;
+    }
+    const stopKey = `${paneId}:${pid}`;
+    setTerminalBreakoutActivityStopState((currentState) => ({
+      ...currentState,
+      [stopKey]: "stopping",
+    }));
+    try {
+      await invoke("kill_developer_process", {
+        force: false,
+        includeTree: true,
+        pid,
+      });
+      const snapshot = await invoke("terminal_activity_snapshot", { paneId });
+      setTerminalBreakoutActivitySnapshots((currentSnapshots) => ({
+        ...currentSnapshots,
+        [paneId]: {
+          error: "",
+          signature: JSON.stringify(snapshot || null),
+          snapshot,
+          terminalIndex: currentSnapshots[paneId]?.terminalIndex,
+          updatedAt: Date.now(),
+        },
+      }));
+      setTerminalBreakoutActivityStopState((currentState) => ({
+        ...currentState,
+        [stopKey]: "done",
+      }));
+      window.setTimeout(() => {
+        setTerminalBreakoutActivityStopState((currentState) => {
+          const nextState = { ...currentState };
+          delete nextState[stopKey];
+          return nextState;
+        });
+      }, 1400);
+    } catch (error) {
+      setTerminalBreakoutActivityStopState((currentState) => ({
+        ...currentState,
+        [stopKey]: getErrorMessage(error),
+      }));
+    }
+  }, []);
 
   useEffect(() => {
     if (!terminalBreakoutLayoutActive || !terminalBreakoutPlanTargets.length) {
@@ -15797,6 +16275,11 @@ function TerminalView({
           const breakoutPlanStatus = normalizeTerminalBreakoutPlanStatus(terminalBreakoutPlan?.status);
           const breakoutPlanSteps = terminalBreakoutPlanSteps(terminalBreakoutPlan);
           const breakoutPlanTitle = terminalBreakoutPlanTitle(terminalBreakoutPlan);
+          const terminalBreakoutActivityEntry = terminalBreakoutActivitySnapshots[terminalPaneId] || null;
+          const terminalBreakoutActivitySnapshot = terminalBreakoutActivityEntry?.snapshot || null;
+          const terminalBreakoutSubagents = terminalActivityArray(terminalBreakoutActivitySnapshot?.subagents);
+          const terminalBreakoutProcesses = terminalBreakoutActivityProcesses(terminalBreakoutActivitySnapshot);
+          const terminalBreakoutActivityCount = terminalBreakoutSubagents.length + terminalBreakoutProcesses.length;
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
@@ -15852,6 +16335,97 @@ function TerminalView({
                     )}
                   </TerminalBreakoutPlanStepList>
                 </TerminalBreakoutPlanPanel>
+              )}
+              {terminalBreakoutLayoutActive
+                && !fullscreenThisTerminal
+                && terminalBreakoutActivitySnapshot
+                && terminalBreakoutActivityHasContent(terminalBreakoutActivitySnapshot) && (
+                <TerminalBreakoutActivityPanel
+                  aria-label="Terminal activity"
+                  data-terminal-control="true"
+                >
+                  <TerminalBreakoutActivityHeader>
+                    <div>
+                      <TerminalBreakoutPlanKicker>Activity</TerminalBreakoutPlanKicker>
+                      <TerminalBreakoutPlanTitle>
+                        {terminalBreakoutActivitySnapshot.terminalAgentId
+                          || terminalBreakoutActivitySnapshot.terminalAgentKind
+                          || "Terminal"}
+                      </TerminalBreakoutPlanTitle>
+                    </div>
+                    <TerminalBreakoutActivitySummary>
+                      {terminalBreakoutActivityCount}
+                    </TerminalBreakoutActivitySummary>
+                  </TerminalBreakoutActivityHeader>
+                  <TerminalBreakoutActivityList>
+                    {terminalBreakoutSubagents.length > 0 && (
+                      <TerminalBreakoutActivitySection>
+                        <TerminalBreakoutActivitySectionTitle>Subagents</TerminalBreakoutActivitySectionTitle>
+                        {terminalBreakoutSubagents.map((subagent) => {
+                          const meta = terminalActivitySubagentMeta(subagent);
+                          return (
+                            <TerminalBreakoutActivityRow
+                              data-kind="subagent"
+                              key={subagent.id || `${subagent.label}-${subagent.updatedAtMs}`}
+                            >
+                              <TerminalBreakoutActivityRowMain>
+                                <TerminalBreakoutActivityRowTitle title={subagent.description || subagent.label}>
+                                  {subagent.label || "Subagent"}
+                                </TerminalBreakoutActivityRowTitle>
+                                <TerminalBreakoutActivityRowMeta>
+                                  {meta.map((item) => (
+                                    <TerminalBreakoutActivityPill data-tone="blue" key={item}>
+                                      {item}
+                                    </TerminalBreakoutActivityPill>
+                                  ))}
+                                </TerminalBreakoutActivityRowMeta>
+                              </TerminalBreakoutActivityRowMain>
+                            </TerminalBreakoutActivityRow>
+                          );
+                        })}
+                      </TerminalBreakoutActivitySection>
+                    )}
+                    {terminalBreakoutProcesses.length > 0 && (
+                      <TerminalBreakoutActivitySection>
+                        <TerminalBreakoutActivitySectionTitle>Processes</TerminalBreakoutActivitySectionTitle>
+                        {terminalBreakoutProcesses.map((process) => {
+                          const stopKey = `${terminalPaneId}:${process.pid}`;
+                          const stopState = terminalBreakoutActivityStopState[stopKey] || "";
+                          const stopping = stopState === "stopping";
+                          const meta = terminalActivityProcessMeta(process);
+                          const label = terminalActivityProcessLabel(process);
+                          return (
+                            <TerminalBreakoutActivityRow key={process.pid}>
+                              <TerminalBreakoutActivityRowMain>
+                                <TerminalBreakoutActivityRowTitle title={process.command || process.executable || label}>
+                                  {label}
+                                </TerminalBreakoutActivityRowTitle>
+                                <TerminalBreakoutActivityRowMeta>
+                                  {meta.map((item) => (
+                                    <TerminalBreakoutActivityPill key={item}>
+                                      {item}
+                                    </TerminalBreakoutActivityPill>
+                                  ))}
+                                </TerminalBreakoutActivityRowMeta>
+                              </TerminalBreakoutActivityRowMain>
+                              {process.killable && (
+                                <TerminalBreakoutActivityStopButton
+                                  aria-label={`Stop ${label}`}
+                                  disabled={stopping}
+                                  onClick={() => stopTerminalBreakoutActivityProcess(terminalPaneId, process)}
+                                  title={stopping ? "Stopping..." : "Stop process tree"}
+                                  type="button"
+                                >
+                                  <Close aria-hidden="true" />
+                                </TerminalBreakoutActivityStopButton>
+                              )}
+                            </TerminalBreakoutActivityRow>
+                          );
+                        })}
+                      </TerminalBreakoutActivitySection>
+                    )}
+                  </TerminalBreakoutActivityList>
+                </TerminalBreakoutActivityPanel>
               )}
               <WorkspaceTerminal
                 key={`${terminalWorkspace.id}-${terminalIndex}`}

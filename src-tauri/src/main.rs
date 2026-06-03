@@ -48,6 +48,10 @@ fn main() {
         let guard_args = args.drain(2..).collect::<Vec<_>>();
         std::process::exit(rust_diffforge_lib::run_diff_forge_write_guard(&guard_args));
     }
+    if args.get(1).map(String::as_str) == Some("--diff-forge-activity-hook") {
+        let hook_args = args.drain(2..).collect::<Vec<_>>();
+        std::process::exit(rust_diffforge_lib::run_diff_forge_activity_hook(&hook_args));
+    }
 
     rust_diffforge_lib::run()
 }
