@@ -167,6 +167,11 @@ const TERMINAL_BREAKOUT_RESIZE_HANDLES = Object.freeze([
   { edgeX: -1, edgeY: 1, id: "sw", label: "Resize terminal from bottom left" },
   { edgeX: -1, edgeY: 0, id: "w", label: "Resize terminal from left" },
 ]);
+const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
+const TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT = 80;
+const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
+const terminalBreakoutPlanCache = new Map();
+const terminalBreakoutPlanRequests = new Map();
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
@@ -935,6 +940,194 @@ const TerminalBreakoutResizeHandle = styled.button`
     box-shadow:
       0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.95),
       0 0 calc(10px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.16);
+  }
+`;
+
+const TerminalBreakoutPlanPanel = styled.aside`
+  --terminal-breakout-plan-panel-width: clamp(320px, calc(var(--terminal-slot-width, 640px) * 0.62), 520px);
+
+  position: absolute;
+  top: 0;
+  right: calc(100% + calc(14px * var(--terminal-slot-inverse-scale, 1)));
+  z-index: 86;
+  display: flex;
+  width: var(--terminal-breakout-plan-panel-width);
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+  gap: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  padding: calc(14px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(96, 165, 250, 0.28);
+  border-radius: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(241, 245, 249, 0.94);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(3, 7, 18, 0.96)),
+    rgba(3, 7, 18, 0.96);
+  box-shadow:
+    0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(44px * var(--terminal-slot-inverse-scale, 1)) rgba(0, 0, 0, 0.48),
+    inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.05);
+  font-size: calc(12px * var(--terminal-slot-inverse-scale, 1));
+  line-height: 1.38;
+  overflow: hidden;
+  pointer-events: auto;
+  backdrop-filter: blur(14px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.24);
+    color: #111827;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 245, 249, 0.96)),
+      rgba(255, 255, 255, 0.96);
+    box-shadow:
+      0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(38px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.16),
+      inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.85);
+  }
+`;
+
+const TerminalBreakoutPlanHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  align-items: start;
+`;
+
+const TerminalBreakoutPlanKicker = styled.div`
+  margin-bottom: calc(4px * var(--terminal-slot-inverse-scale, 1));
+  color: rgba(148, 163, 184, 0.78);
+  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.76);
+  }
+`;
+
+const TerminalBreakoutPlanTitle = styled.div`
+  min-width: 0;
+  color: rgba(248, 250, 252, 0.98);
+  font-size: calc(15px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  letter-spacing: 0;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+`;
+
+const TerminalBreakoutPlanStatusPill = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(22px * var(--terminal-slot-inverse-scale, 1));
+  padding: 0 calc(9px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(96, 165, 250, 0.45);
+  border-radius: 999px;
+  color: rgba(191, 219, 254, 0.96);
+  background: rgba(37, 99, 235, 0.14);
+  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-status="blocked"] {
+    border-color: rgba(251, 191, 36, 0.5);
+    color: rgba(253, 230, 138, 0.98);
+    background: rgba(180, 83, 9, 0.16);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.36);
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-status="blocked"] {
+    border-color: rgba(217, 119, 6, 0.42);
+    color: #b45309;
+    background: rgba(245, 158, 11, 0.12);
+  }
+`;
+
+const TerminalBreakoutPlanStepList = styled.ol`
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: calc(7px * var(--terminal-slot-inverse-scale, 1));
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+`;
+
+const TerminalBreakoutPlanStep = styled.li`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  align-items: start;
+  padding: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(148, 163, 184, 0.18);
+  border-radius: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  background: rgba(15, 23, 42, 0.5);
+  list-style: none;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(148, 163, 184, 0.26);
+    background: rgba(248, 250, 252, 0.74);
+  }
+`;
+
+const TerminalBreakoutPlanStepDot = styled.span`
+  width: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  height: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  margin-top: calc(3px * var(--terminal-slot-inverse-scale, 1));
+  border: calc(2px * var(--terminal-slot-inverse-scale, 1)) solid rgba(100, 116, 139, 0.9);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.95);
+  box-shadow: 0 0 0 calc(2px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.9);
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.96);
+    background: rgba(96, 165, 250, 0.28);
+  }
+
+  &[data-status="completed"] {
+    border-color: rgba(52, 211, 153, 0.95);
+    background: rgba(52, 211, 153, 0.9);
+  }
+
+  &[data-status="blocked"] {
+    border-color: rgba(251, 191, 36, 0.96);
+    background: rgba(251, 191, 36, 0.42);
+  }
+
+  &[data-status="skipped"] {
+    border-color: rgba(148, 163, 184, 0.62);
+    background: rgba(100, 116, 139, 0.38);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow: 0 0 0 calc(2px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.95);
+  }
+`;
+
+const TerminalBreakoutPlanStepText = styled.span`
+  min-width: 0;
+  color: rgba(226, 232, 240, 0.9);
+  font-weight: 800;
+  overflow-wrap: anywhere;
+
+  html[data-forge-theme="light"] & {
+    color: #334155;
   }
 `;
 
@@ -3454,6 +3647,228 @@ function writeTerminalBreakoutLayout(storageKey, layout) {
   } catch {
     // Breakout layout is a visual preference; storage failures should not block terminals.
   }
+}
+
+function terminalBreakoutPlanData(response) {
+  return response?.data || response || {};
+}
+
+function cleanTerminalBreakoutPlanText(value) {
+  return String(value || "").trim();
+}
+
+function terminalBreakoutPlanPathIdentity(value) {
+  const cleaned = cleanTerminalBreakoutPlanText(value).replace(/\\/g, "/");
+  return cleaned === "/" ? cleaned : cleaned.replace(/\/+$/g, "").toLowerCase();
+}
+
+function terminalBreakoutPlanCacheKey({
+  agentId = "",
+  dbPath = "",
+  repoPath = "",
+  sessionId = "",
+  taskId = "",
+  workspaceId = "",
+} = {}) {
+  const repoIdentity = terminalBreakoutPlanPathIdentity(repoPath);
+  const planIdentity = cleanTerminalBreakoutPlanText(taskId)
+    || cleanTerminalBreakoutPlanText(sessionId);
+  if (!repoIdentity || !planIdentity) {
+    return "";
+  }
+
+  return [
+    cleanTerminalBreakoutPlanText(workspaceId),
+    repoIdentity,
+    terminalBreakoutPlanPathIdentity(dbPath),
+    cleanTerminalBreakoutPlanText(taskId),
+    cleanTerminalBreakoutPlanText(sessionId),
+    cleanTerminalBreakoutPlanText(agentId),
+  ].join("|");
+}
+
+function trimTerminalBreakoutPlanCache() {
+  while (terminalBreakoutPlanCache.size > TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT) {
+    const oldestKey = terminalBreakoutPlanCache.keys().next().value;
+    if (!oldestKey) {
+      return;
+    }
+    terminalBreakoutPlanCache.delete(oldestKey);
+  }
+}
+
+function cacheTerminalBreakoutPlanSnapshot(cacheKey, snapshot) {
+  if (!cacheKey || !snapshot || typeof snapshot !== "object") {
+    return;
+  }
+
+  terminalBreakoutPlanCache.delete(cacheKey);
+  terminalBreakoutPlanCache.set(cacheKey, {
+    snapshot,
+    updatedAt: Date.now(),
+  });
+  trimTerminalBreakoutPlanCache();
+}
+
+function cachedTerminalBreakoutPlanSnapshot(cacheKey, { freshOnly = false } = {}) {
+  if (!cacheKey) {
+    return null;
+  }
+
+  const entry = terminalBreakoutPlanCache.get(cacheKey);
+  if (!entry?.snapshot) {
+    return null;
+  }
+
+  if (
+    freshOnly
+    && Date.now() - Number(entry.updatedAt || 0) > TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS
+  ) {
+    return null;
+  }
+
+  return entry.snapshot;
+}
+
+function normalizeTerminalBreakoutPlanStatus(status) {
+  const normalized = cleanTerminalBreakoutPlanText(status).toLowerCase();
+  if (["done", "complete", "completed", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if (["interrupt", "interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) {
+    return "interrupted";
+  }
+  if (normalized === "blocked") {
+    return "blocked";
+  }
+  return "active";
+}
+
+function terminalBreakoutPlanIsLive(plan) {
+  const status = normalizeTerminalBreakoutPlanStatus(plan?.status);
+  return status === "active" || status === "blocked";
+}
+
+function terminalBreakoutPlanStatusLabel(status) {
+  return normalizeTerminalBreakoutPlanStatus(status) === "blocked" ? "Blocked" : "Active";
+}
+
+function getLiveTerminalBreakoutPlan(snapshot) {
+  const data = terminalBreakoutPlanData(snapshot);
+  const selectedPlan = data?.selected_plan || data?.selectedPlan || null;
+  return terminalBreakoutPlanIsLive(selectedPlan) ? selectedPlan : null;
+}
+
+function terminalBreakoutPlanStepStatusKind(status) {
+  const normalized = cleanTerminalBreakoutPlanText(status).toLowerCase();
+  if (["done", "complete", "completed", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if ([
+    "active",
+    "current",
+    "in_progress",
+    "in-progress",
+    "pending",
+    "running",
+    "working",
+  ].includes(normalized)) {
+    return "active";
+  }
+  if (normalized === "blocked" || normalized === "interrupted") {
+    return "blocked";
+  }
+  if (normalized === "skipped") {
+    return "skipped";
+  }
+  return "queued";
+}
+
+function terminalBreakoutPlanTitle(plan) {
+  return cleanTerminalBreakoutPlanText(plan?.title || plan?.task_title || plan?.taskTitle)
+    || "Live plan";
+}
+
+function terminalBreakoutPlanSteps(plan) {
+  return Array.isArray(plan?.steps) ? plan.steps : [];
+}
+
+function terminalBreakoutPlanEventText(payload, keys) {
+  const refs = payload?.refs || {};
+  const nestedPayload = payload?.payload || {};
+  for (const key of keys) {
+    const value = cleanTerminalBreakoutPlanText(refs[key] || payload?.[key] || nestedPayload?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function terminalBreakoutPlanEventMatchesTarget(payload, target) {
+  const eventRepoPath = cleanTerminalBreakoutPlanText(payload?.repoPath || payload?.repo_path);
+  const targetRepoPath = cleanTerminalBreakoutPlanText(target?.repoPath);
+  if (
+    eventRepoPath
+    && targetRepoPath
+    && terminalBreakoutPlanPathIdentity(eventRepoPath) !== terminalBreakoutPlanPathIdentity(targetRepoPath)
+  ) {
+    return false;
+  }
+
+  const eventTaskId = terminalBreakoutPlanEventText(payload, ["taskId", "task_id"]);
+  const eventSessionId = terminalBreakoutPlanEventText(payload, ["sessionId", "session_id"]);
+  const eventAgentId = terminalBreakoutPlanEventText(payload, ["agentId", "agent_id"]);
+  if (target?.taskId && eventTaskId) {
+    return eventTaskId === target.taskId;
+  }
+  if (target?.sessionId && eventSessionId) {
+    return eventSessionId === target.sessionId;
+  }
+  if (target?.agentId && eventAgentId) {
+    return eventAgentId === target.agentId;
+  }
+  return true;
+}
+
+function requestTerminalBreakoutPlanSnapshot(target) {
+  const cacheKey = target?.cacheKey || terminalBreakoutPlanCacheKey(target);
+  const repoPath = cleanTerminalBreakoutPlanText(target?.repoPath);
+  if (!cacheKey || !repoPath) {
+    return Promise.resolve(null);
+  }
+
+  const existingRequest = terminalBreakoutPlanRequests.get(cacheKey);
+  if (existingRequest) {
+    return existingRequest;
+  }
+
+  const command = {
+    repoPath,
+    input: {
+      agentId: cleanTerminalBreakoutPlanText(target?.agentId),
+      directRepoTarget: true,
+      sessionId: cleanTerminalBreakoutPlanText(target?.sessionId),
+      taskId: cleanTerminalBreakoutPlanText(target?.taskId),
+    },
+  };
+  const dbPath = cleanTerminalBreakoutPlanText(target?.dbPath);
+  if (dbPath) {
+    command.dbPath = dbPath;
+  }
+
+  const request = invoke("coordination_terminal_task_plan_snapshot", command)
+    .then(terminalBreakoutPlanData)
+    .then((snapshot) => {
+      cacheTerminalBreakoutPlanSnapshot(cacheKey, snapshot);
+      return snapshot;
+    })
+    .finally(() => {
+      terminalBreakoutPlanRequests.delete(cacheKey);
+    });
+
+  terminalBreakoutPlanRequests.set(cacheKey, request);
+  return request;
 }
 
 function getBreakoutBaseTerminalSize(panelRect, rects = {}) {
@@ -8165,6 +8580,8 @@ function TerminalView({
   const [terminalDragState, setTerminalDragState] = useState(null);
   const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
+  const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
+  const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
   const [terminalBreakoutViewport, setTerminalBreakoutViewport] = useState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
@@ -8212,12 +8629,20 @@ function TerminalView({
   const fullscreenTransitionTimerRef = useRef(0);
   const terminalBreakoutTransitionTimerRef = useRef(0);
   const terminalBreakoutPanStateRef = useRef(null);
+  const terminalBreakoutPanCleanupRef = useRef(null);
   const terminalBreakoutBackgroundCanvasRef = useRef(null);
+  const terminalBreakoutBackgroundDrawRef = useRef(null);
   const terminalBreakoutPlacementsRef = useRef({});
+  const terminalBreakoutPlacementFrameRef = useRef(0);
+  const terminalBreakoutPendingPlacementsRef = useRef(null);
   const terminalBreakoutPhaseRef = useRef(TERMINAL_BREAKOUT_PHASE_GRID);
   const terminalBreakoutTerminalScaleRef = useRef(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const terminalBreakoutViewportRef = useRef(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
+  const terminalBreakoutViewportFrameRef = useRef(0);
+  const terminalBreakoutPendingViewportRef = useRef(null);
+  const terminalBreakoutLayoutWriteTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
+  const terminalDragCleanupRef = useRef(null);
   const terminalDragStateRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
   const terminalPanelRectRef = useRef(null);
@@ -8324,16 +8749,32 @@ function TerminalView({
   }, [logicalTerminalIndexSignature]);
 
   useEffect(() => {
-    writeTerminalBreakoutLayout(terminalBreakoutStorageKey, {
-      placements: terminalBreakoutPlacements,
-      terminalScale: terminalBreakoutTerminalScale,
-      viewport: terminalBreakoutViewport,
-    });
+    if (terminalBreakoutLayoutWriteTimerRef.current) {
+      window.clearTimeout(terminalBreakoutLayoutWriteTimerRef.current);
+    }
+
+    terminalBreakoutLayoutWriteTimerRef.current = window.setTimeout(() => {
+      terminalBreakoutLayoutWriteTimerRef.current = 0;
+      writeTerminalBreakoutLayout(terminalBreakoutStorageKey, {
+        placements: terminalBreakoutPlacementsRef.current,
+        terminalScale: terminalBreakoutTerminalScaleRef.current,
+        viewport: terminalBreakoutViewportRef.current,
+      });
+    }, terminalBreakoutPanning || terminalDragActive ? 220 : 80);
+
+    return () => {
+      if (terminalBreakoutLayoutWriteTimerRef.current) {
+        window.clearTimeout(terminalBreakoutLayoutWriteTimerRef.current);
+        terminalBreakoutLayoutWriteTimerRef.current = 0;
+      }
+    };
   }, [
     terminalBreakoutPlacements,
+    terminalBreakoutPanning,
     terminalBreakoutStorageKey,
     terminalBreakoutTerminalScale,
     terminalBreakoutViewport,
+    terminalDragActive,
   ]);
 
   const recordTodoQueueRemoteCommandReceipt = useCallback((item, status, fields = {}) => {
@@ -8821,6 +9262,201 @@ function TerminalView({
 	    terminalWorkspace?.id,
 	    todoQueueDispatchRevision,
 	  ]);
+  const terminalBreakoutPlanTargets = useMemo(() => {
+    if (!terminalBreakoutLayoutActive) {
+      return [];
+    }
+
+    return logicalTerminalIndexes.reduce((targets, terminalIndex) => {
+      if (!terminalBreakoutPlacements[terminalIndex]) {
+        return targets;
+      }
+
+      const paneId = getTerminalPaneId(terminalIndex);
+      const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex, paneId);
+      const coordination = liveTerminal?.coordination || {};
+      const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
+      const projectTarget = getTerminalProjectTarget(terminalIndex);
+      const repoPath = projectTarget?.repoPath
+        || terminalWorkspaceWorkingDirectory
+        || defaultWorkingDirectory
+        || "";
+      const target = {
+        agentId: liveTerminal?.agentId
+          || coordination.agentId
+          || coordination.agent_id
+          || getTerminalRole(terminalIndex)
+          || "",
+        dbPath: projectTarget?.dbPath || "",
+        mountId: projectTarget?.mountId || "",
+        paneId,
+        repoPath,
+        sessionId: liveTerminal?.sessionId
+          || liveTerminal?.session_id
+          || coordination.sessionId
+          || coordination.session_id
+          || activeTask.sessionId
+          || activeTask.session_id
+          || "",
+        taskId: liveTerminal?.taskId
+          || liveTerminal?.task_id
+          || activeTask.taskId
+          || activeTask.task_id
+          || activeTask.id
+          || "",
+        terminalIndex,
+        workspaceId: terminalWorkspace?.id || liveTerminal?.workspaceId || "",
+      };
+      const cacheKey = terminalBreakoutPlanCacheKey(target);
+      if (!cacheKey) {
+        return targets;
+      }
+      targets.push({
+        ...target,
+        cacheKey,
+      });
+      return targets;
+    }, []);
+  }, [
+    defaultWorkingDirectory,
+    getTerminalPaneId,
+    getTerminalProjectTarget,
+    getTerminalRole,
+    logicalTerminalIndexes,
+    resolveTodoQueueLiveTerminal,
+    terminalBreakoutLayoutActive,
+    terminalBreakoutPlacements,
+    terminalWorkspace?.id,
+    terminalWorkspaceWorkingDirectory,
+    todoQueueDispatchRevision,
+  ]);
+  const terminalBreakoutPlanTargetSignature = useMemo(() => (
+    terminalBreakoutPlanTargets.map((target) => target.cacheKey).join("\n")
+  ), [terminalBreakoutPlanTargets]);
+  const terminalBreakoutLivePlansByIndex = useMemo(() => {
+    const plansByIndex = new Map();
+    terminalBreakoutPlanTargets.forEach((target) => {
+      const snapshot = terminalBreakoutPlanSnapshots[target.cacheKey]?.snapshot
+        || cachedTerminalBreakoutPlanSnapshot(target.cacheKey);
+      const plan = getLiveTerminalBreakoutPlan(snapshot);
+      if (plan) {
+        plansByIndex.set(target.terminalIndex, plan);
+      }
+    });
+    return plansByIndex;
+  }, [terminalBreakoutPlanSnapshots, terminalBreakoutPlanTargets]);
+
+  useEffect(() => {
+    if (!terminalBreakoutLayoutActive || !terminalBreakoutPlanTargets.length) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setTerminalBreakoutPlanSnapshots((currentSnapshots) => {
+      let nextSnapshots = currentSnapshots;
+      terminalBreakoutPlanTargets.forEach((target) => {
+        const cachedSnapshot = cachedTerminalBreakoutPlanSnapshot(target.cacheKey);
+        if (cachedSnapshot && currentSnapshots[target.cacheKey]?.snapshot !== cachedSnapshot) {
+          if (nextSnapshots === currentSnapshots) {
+            nextSnapshots = { ...currentSnapshots };
+          }
+          nextSnapshots[target.cacheKey] = {
+            snapshot: cachedSnapshot,
+            updatedAt: Date.now(),
+          };
+        }
+      });
+      return nextSnapshots;
+    });
+
+    terminalBreakoutPlanTargets.forEach((target) => {
+      const freshSnapshot = cachedTerminalBreakoutPlanSnapshot(target.cacheKey, { freshOnly: true });
+      if (freshSnapshot && terminalBreakoutPlanRefreshNonce === 0) {
+        return;
+      }
+
+      requestTerminalBreakoutPlanSnapshot(target)
+        .then((snapshot) => {
+          if (cancelled || !snapshot) {
+            return;
+          }
+          setTerminalBreakoutPlanSnapshots((currentSnapshots) => ({
+            ...currentSnapshots,
+            [target.cacheKey]: {
+              snapshot,
+              updatedAt: Date.now(),
+            },
+          }));
+        })
+        .catch(() => {});
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    terminalBreakoutLayoutActive,
+    terminalBreakoutPlanRefreshNonce,
+    terminalBreakoutPlanTargetSignature,
+    terminalBreakoutPlanTargets,
+  ]);
+
+  useEffect(() => {
+    if (!terminalBreakoutLayoutActive || !terminalBreakoutPlanTargets.length) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let unlisten = null;
+
+    listen(TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+
+      const payload = event?.payload || {};
+      const matchingTargets = terminalBreakoutPlanTargets.filter((target) => (
+        terminalBreakoutPlanEventMatchesTarget(payload, target)
+      ));
+      if (!matchingTargets.length) {
+        return;
+      }
+
+      matchingTargets.forEach((target) => {
+        terminalBreakoutPlanCache.delete(target.cacheKey);
+      });
+      setTerminalBreakoutPlanSnapshots((currentSnapshots) => {
+        let nextSnapshots = currentSnapshots;
+        matchingTargets.forEach((target) => {
+          if (target.cacheKey && currentSnapshots[target.cacheKey]) {
+            if (nextSnapshots === currentSnapshots) {
+              nextSnapshots = { ...currentSnapshots };
+            }
+            delete nextSnapshots[target.cacheKey];
+          }
+        });
+        return nextSnapshots;
+      });
+      setTerminalBreakoutPlanRefreshNonce((nonce) => nonce + 1);
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [
+    terminalBreakoutLayoutActive,
+    terminalBreakoutPlanTargetSignature,
+    terminalBreakoutPlanTargets,
+  ]);
   const handleResumeTerminalPlan = useCallback((plan) => {
     const targetSessionId = String(plan?.session_id || plan?.sessionId || "").trim();
     const targetTaskId = String(plan?.task_id || plan?.taskId || "").trim();
@@ -9843,6 +10479,22 @@ function TerminalView({
       window.cancelAnimationFrame(layoutMeasureFrameRef.current);
       layoutMeasureFrameRef.current = 0;
     }
+    if (terminalBreakoutPlacementFrameRef.current) {
+      window.cancelAnimationFrame(terminalBreakoutPlacementFrameRef.current);
+      terminalBreakoutPlacementFrameRef.current = 0;
+    }
+    if (terminalBreakoutViewportFrameRef.current) {
+      window.cancelAnimationFrame(terminalBreakoutViewportFrameRef.current);
+      terminalBreakoutViewportFrameRef.current = 0;
+    }
+    if (terminalBreakoutLayoutWriteTimerRef.current) {
+      window.clearTimeout(terminalBreakoutLayoutWriteTimerRef.current);
+      terminalBreakoutLayoutWriteTimerRef.current = 0;
+    }
+    terminalBreakoutPanCleanupRef.current?.();
+    terminalBreakoutPanCleanupRef.current = null;
+    terminalDragCleanupRef.current?.();
+    terminalDragCleanupRef.current = null;
   }, [clearFullscreenTransitionTimer, clearTerminalBreakoutTransitionTimer]);
 
   useEffect(() => {
@@ -10352,6 +11004,29 @@ function TerminalView({
     });
   }, [logicalTerminalIndexes]);
 
+  const scheduleTerminalBreakoutPlacementsFrame = useCallback((updater) => {
+    const nextPlacements = normalizeBreakoutPlacements(
+      typeof updater === "function" ? updater(terminalBreakoutPlacementsRef.current) : updater,
+      logicalTerminalIndexes,
+    );
+    terminalBreakoutPlacementsRef.current = nextPlacements;
+    terminalBreakoutPendingPlacementsRef.current = nextPlacements;
+
+    if (terminalBreakoutPlacementFrameRef.current) {
+      return;
+    }
+
+    terminalBreakoutPlacementFrameRef.current = window.requestAnimationFrame(() => {
+      terminalBreakoutPlacementFrameRef.current = 0;
+      const pendingPlacements = terminalBreakoutPendingPlacementsRef.current;
+      terminalBreakoutPendingPlacementsRef.current = null;
+      if (!pendingPlacements) {
+        return;
+      }
+      setTerminalBreakoutPlacements(pendingPlacements);
+    });
+  }, [logicalTerminalIndexes]);
+
   const setTerminalBreakoutViewportState = useCallback((updater) => {
     setTerminalBreakoutViewport((currentViewport) => {
       const nextViewport = normalizeBreakoutViewport(
@@ -10359,6 +11034,39 @@ function TerminalView({
       );
       terminalBreakoutViewportRef.current = nextViewport;
       return nextViewport;
+    });
+  }, []);
+
+  const scheduleTerminalBreakoutViewportFrame = useCallback((updater) => {
+    const currentViewport = terminalBreakoutViewportRef.current;
+    const nextViewport = normalizeBreakoutViewport(
+      typeof updater === "function" ? updater(currentViewport) : updater,
+    );
+    terminalBreakoutViewportRef.current = nextViewport;
+    terminalBreakoutPendingViewportRef.current = nextViewport;
+
+    if (terminalBreakoutViewportFrameRef.current) {
+      return;
+    }
+
+    terminalBreakoutViewportFrameRef.current = window.requestAnimationFrame(() => {
+      terminalBreakoutViewportFrameRef.current = 0;
+      const pendingViewport = terminalBreakoutPendingViewportRef.current;
+      terminalBreakoutPendingViewportRef.current = null;
+      if (!pendingViewport) {
+        return;
+      }
+      setTerminalBreakoutViewport((currentValue) => {
+        const currentNormalized = normalizeBreakoutViewport(currentValue);
+        if (
+          Math.abs(currentNormalized.x - pendingViewport.x) < 0.5
+          && Math.abs(currentNormalized.y - pendingViewport.y) < 0.5
+          && Math.abs(currentNormalized.zoom - pendingViewport.zoom) < 0.001
+        ) {
+          return currentValue;
+        }
+        return pendingViewport;
+      });
     });
   }, []);
 
@@ -10532,20 +11240,69 @@ function TerminalView({
     );
   }, [terminalBreakoutVisible, zoomTerminalBreakoutCanvas]);
 
+  const stopTerminalBreakoutPan = useCallback(() => {
+    terminalBreakoutPanCleanupRef.current?.();
+    terminalBreakoutPanCleanupRef.current = null;
+  }, []);
+
   const handleBreakoutPanPointerDown = useCallback((event) => {
     if (!terminalBreakoutVisible || event.button !== 0) {
       return;
     }
 
     event.preventDefault();
+    event.stopPropagation();
+    stopTerminalBreakoutPan();
     terminalBreakoutPanStateRef.current = {
       pointerId: event.pointerId,
       startClientX: event.clientX,
       startClientY: event.clientY,
       startViewport: normalizeBreakoutViewport(terminalBreakoutViewportRef.current),
     };
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handlePointerMove = (moveEvent) => {
+      const panState = terminalBreakoutPanStateRef.current;
+      if (!panState || moveEvent.pointerId !== panState.pointerId) {
+        return;
+      }
+
+      moveEvent.preventDefault();
+      scheduleTerminalBreakoutViewportFrame({
+        x: panState.startViewport.x + (moveEvent.clientX - panState.startClientX),
+        y: panState.startViewport.y + (moveEvent.clientY - panState.startClientY),
+        zoom: panState.startViewport.zoom,
+      });
+    };
+
+    const endPan = (endEvent) => {
+      const panState = terminalBreakoutPanStateRef.current;
+      if (!panState || endEvent.pointerId !== panState.pointerId) {
+        return;
+      }
+
+      terminalBreakoutPanStateRef.current = null;
+      setTerminalBreakoutPanning(false);
+      stopTerminalBreakoutPan();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", endPan);
+    window.addEventListener("pointercancel", endPan);
+    terminalBreakoutPanCleanupRef.current = () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", endPan);
+      window.removeEventListener("pointercancel", endPan);
+    };
+
     setTerminalBreakoutPanning(true);
-  }, [terminalBreakoutVisible]);
+  }, [scheduleTerminalBreakoutViewportFrame, stopTerminalBreakoutPan, terminalBreakoutVisible]);
 
   const handleAddTerminalToBreakout = useCallback(() => {
     if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
@@ -10611,51 +11368,14 @@ function TerminalView({
   ]);
 
   useEffect(() => {
-    if (!terminalBreakoutPanning) {
-      return undefined;
+    if (terminalBreakoutVisible) {
+      return;
     }
 
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = "grabbing";
-    document.body.style.userSelect = "none";
-
-    const handlePointerMove = (event) => {
-      const panState = terminalBreakoutPanStateRef.current;
-      if (!panState || event.pointerId !== panState.pointerId) {
-        return;
-      }
-
-      event.preventDefault();
-      setTerminalBreakoutViewportState({
-        x: panState.startViewport.x + (event.clientX - panState.startClientX),
-        y: panState.startViewport.y + (event.clientY - panState.startClientY),
-        zoom: panState.startViewport.zoom,
-      });
-    };
-
-    const endPan = (event) => {
-      const panState = terminalBreakoutPanStateRef.current;
-      if (!panState || event.pointerId !== panState.pointerId) {
-        return;
-      }
-
-      terminalBreakoutPanStateRef.current = null;
-      setTerminalBreakoutPanning(false);
-    };
-
-    window.addEventListener("pointermove", handlePointerMove, { passive: false });
-    window.addEventListener("pointerup", endPan);
-    window.addEventListener("pointercancel", endPan);
-
-    return () => {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", endPan);
-      window.removeEventListener("pointercancel", endPan);
-    };
-  }, [setTerminalBreakoutViewportState, terminalBreakoutPanning]);
+    terminalBreakoutPanStateRef.current = null;
+    setTerminalBreakoutPanning(false);
+    stopTerminalBreakoutPan();
+  }, [stopTerminalBreakoutPan, terminalBreakoutVisible]);
 
   useEffect(() => {
     if (!terminalBreakoutVisible) {
@@ -10735,6 +11455,7 @@ function TerminalView({
       });
     };
 
+    terminalBreakoutBackgroundDrawRef.current = scheduleDraw;
     scheduleDraw();
 
     const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scheduleDraw);
@@ -10750,10 +11471,21 @@ function TerminalView({
       if (frameId) {
         window.cancelAnimationFrame(frameId);
       }
+      if (terminalBreakoutBackgroundDrawRef.current === scheduleDraw) {
+        terminalBreakoutBackgroundDrawRef.current = null;
+      }
       observer?.disconnect();
       themeObserver?.disconnect();
       window.removeEventListener("resize", scheduleDraw);
     };
+  }, [terminalBreakoutVisible]);
+
+  useEffect(() => {
+    if (!terminalBreakoutVisible) {
+      return;
+    }
+
+    terminalBreakoutBackgroundDrawRef.current?.();
   }, [terminalBreakoutVisible, terminalBreakoutViewport, terminalPanelRect]);
 
   const updateTodoQueueItems = useCallback((updater) => {
@@ -13854,6 +14586,222 @@ function TerminalView({
     });
   }, []);
 
+  const stopTerminalDragListeners = useCallback(() => {
+    terminalDragCleanupRef.current?.();
+    terminalDragCleanupRef.current = null;
+  }, []);
+
+  const startTerminalDragListeners = useCallback((initialDragState = null) => {
+    stopTerminalDragListeners();
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = initialDragState?.resizeCursor || "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handlePointerMove = (event) => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
+        event.stopPropagation();
+      }
+
+      if (currentDrag.mode === "canvas") {
+        const containerRect = currentDrag.containerRect
+          || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
+        const currentPlacement = normalizeBreakoutPlacement(
+          terminalBreakoutPlacementsRef.current?.[currentDrag.terminalIndex],
+        );
+        if (!containerRect || !currentPlacement) {
+          return;
+        }
+
+        const viewport = terminalBreakoutViewportRef.current;
+        const normalizedViewport = normalizeBreakoutViewport(viewport);
+        const zoom = Math.max(0.001, normalizedViewport.zoom);
+        const terminalScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
+        const effectiveScale = Math.max(0.001, zoom * terminalScale);
+        const nextPlacement = {
+          ...currentPlacement,
+          x: (
+            event.clientX
+            - containerRect.left
+            - normalizedViewport.x
+            - (currentDrag.offsetX * effectiveScale)
+          ) / zoom,
+          y: (
+            event.clientY
+            - containerRect.top
+            - normalizedViewport.y
+            - (currentDrag.offsetY * effectiveScale)
+          ) / zoom,
+        };
+
+        scheduleTerminalBreakoutPlacementsFrame({
+          ...terminalBreakoutPlacementsRef.current,
+          [currentDrag.terminalIndex]: nextPlacement,
+        });
+        return;
+      }
+
+      if (currentDrag.mode === "canvas-resize") {
+        event.stopPropagation();
+        const startPlacement = normalizeBreakoutPlacement(currentDrag.startPlacement);
+        if (!startPlacement) {
+          return;
+        }
+
+        const viewport = normalizeBreakoutViewport(currentDrag.startViewport || terminalBreakoutViewportRef.current);
+        const zoom = Math.max(0.001, viewport.zoom);
+        const terminalScale = Math.max(
+          0.001,
+          clampBreakoutTerminalScale(currentDrag.startTerminalScale || terminalBreakoutTerminalScaleRef.current),
+        );
+        const effectiveScale = Math.max(0.001, zoom * terminalScale);
+        const edgeX = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeX || 0)));
+        const edgeY = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeY || 0)));
+        const deltaX = Number(event.clientX || 0) - Number(currentDrag.startClientX || 0);
+        const deltaY = Number(event.clientY || 0) - Number(currentDrag.startClientY || 0);
+        let nextWidth = startPlacement.width;
+        let nextHeight = startPlacement.height;
+        let nextX = startPlacement.x;
+        let nextY = startPlacement.y;
+
+        if (edgeX !== 0) {
+          nextWidth = Math.max(
+            TERMINAL_BREAKOUT_MIN_WIDTH,
+            startPlacement.width + ((edgeX * deltaX) / effectiveScale),
+          );
+          if (edgeX < 0) {
+            nextX = startPlacement.x + ((startPlacement.width - nextWidth) * terminalScale);
+          }
+        }
+
+        if (edgeY !== 0) {
+          nextHeight = Math.max(
+            TERMINAL_BREAKOUT_MIN_HEIGHT,
+            startPlacement.height + ((edgeY * deltaY) / effectiveScale),
+          );
+          if (edgeY < 0) {
+            nextY = startPlacement.y + ((startPlacement.height - nextHeight) * terminalScale);
+          }
+        }
+
+        scheduleTerminalBreakoutPlacementsFrame({
+          ...terminalBreakoutPlacementsRef.current,
+          [currentDrag.terminalIndex]: {
+            ...startPlacement,
+            height: nextHeight,
+            width: nextWidth,
+            x: nextX,
+            y: nextY,
+          },
+        });
+        return;
+      }
+
+      const containerRect = currentDrag.containerRect
+        || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
+      if (!containerRect) {
+        return;
+      }
+
+      const target = getDragTargetFromPoint({
+        clientX: event.clientX,
+        clientY: event.clientY,
+        containerRect,
+        draggedTerminalIndex: currentDrag.terminalIndex,
+        rects: terminalLayoutRectsRef.current,
+        rows: currentDrag.previewRows,
+      });
+      const nextPreviewRows = insertTerminalInRows(
+        currentDrag.previewRows,
+        currentDrag.terminalIndex,
+        target,
+      );
+
+      updateTerminalDragState({
+        ...currentDrag,
+        previewRows: areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows)
+          ? currentDrag.previewRows
+          : nextPreviewRows,
+        x: event.clientX - containerRect.left - currentDrag.offsetX,
+        y: event.clientY - containerRect.top - currentDrag.offsetY,
+      });
+    };
+
+    const commitDrag = () => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag) {
+        return;
+      }
+
+      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
+        updateTerminalDragState(null);
+        stopTerminalDragListeners();
+        return;
+      }
+
+      const nextRows = cloneTerminalRows(currentDrag.previewRows);
+      if (!areTerminalRowsEqual(currentDrag.sourceRows, nextRows)) {
+        reorderWorkspaceTerminalDisplayLayout?.({
+          displayRows: nextRows,
+          workspaceId: currentDrag.workspaceId,
+        });
+      }
+
+      updateTerminalDragState(null);
+      stopTerminalDragListeners();
+    };
+
+    const cancelDrag = () => {
+      updateTerminalDragState(null);
+      stopTerminalDragListeners();
+    };
+
+    const handlePointerUp = (event) => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      event.preventDefault();
+      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
+        event.stopPropagation();
+      }
+      commitDrag();
+    };
+
+    const handlePointerCancel = (event) => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+
+      cancelDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { capture: true, passive: false });
+    window.addEventListener("pointerup", handlePointerUp, { capture: true, passive: false });
+    window.addEventListener("pointercancel", handlePointerCancel, { capture: true });
+    terminalDragCleanupRef.current = () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerCancel, true);
+    };
+  }, [
+    reorderWorkspaceTerminalDisplayLayout,
+    scheduleTerminalBreakoutPlacementsFrame,
+    stopTerminalDragListeners,
+    updateTerminalDragState,
+  ]);
+
   const beginTerminalCanvasDrag = useCallback((event) => {
     if (
       fullscreenActive
@@ -13864,9 +14812,8 @@ function TerminalView({
       return false;
     }
 
-    measureTerminalLayout();
-
-    const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+    const containerRect = terminalPanelRectRef.current
+      || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
     const placement = normalizeBreakoutPlacement(
       terminalBreakoutPlacementsRef.current?.[event.terminalIndex],
     );
@@ -13900,7 +14847,8 @@ function TerminalView({
       [event.terminalIndex]: nextPlacement,
     });
     setActiveTerminalPaneId(event.paneId || "");
-    updateTerminalDragState({
+    const nextDragState = {
+      containerRect,
       height: nextPlacement.height,
       mode: "canvas",
       offsetX,
@@ -13910,12 +14858,14 @@ function TerminalView({
       terminalIndex: event.terminalIndex,
       width: nextPlacement.width,
       workspaceId: event.workspaceId || terminalWorkspace.id,
-    });
+    };
+    updateTerminalDragState(nextDragState);
+    startTerminalDragListeners(nextDragState);
 
     return true;
   }, [
     fullscreenActive,
-    measureTerminalLayout,
+    startTerminalDragListeners,
     terminalWorkspace?.id,
     todoDragActive,
     updateTerminalBreakoutPlacements,
@@ -13962,7 +14912,7 @@ function TerminalView({
       [terminalIndex]: nextPlacement,
     });
     setActiveTerminalPaneId(paneId);
-    updateTerminalDragState({
+    const nextDragState = {
       mode: "canvas-resize",
       paneId,
       pointerId: event.pointerId,
@@ -13976,10 +14926,13 @@ function TerminalView({
       startViewport: normalizeBreakoutViewport(terminalBreakoutViewportRef.current),
       terminalIndex,
       workspaceId: terminalWorkspace.id,
-    });
+    };
+    updateTerminalDragState(nextDragState);
+    startTerminalDragListeners(nextDragState);
   }, [
     fullscreenActive,
     getTerminalPaneId,
+    startTerminalDragListeners,
     terminalBreakoutLayoutActive,
     terminalDragActive,
     terminalWorkspace?.id,
@@ -14013,8 +14966,6 @@ function TerminalView({
       return;
     }
 
-    measureTerminalLayout();
-
     if (terminalBreakoutLayoutActive || terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_CANVAS) {
       beginTerminalCanvasDrag(event);
       return;
@@ -14024,9 +14975,11 @@ function TerminalView({
       return;
     }
 
+    measureTerminalLayout();
+
     const sourceRows = cloneTerminalRows(displayTerminalRows);
     const sourceRect = event.surfaceRect || event.panelRect;
-    const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
+    const containerRect = getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
 
     if (!sourceRows.length || !sourceRect || !containerRect) {
       return;
@@ -14035,6 +14988,7 @@ function TerminalView({
     const offsetX = Number(event.clientX || 0) - Number(sourceRect.left || 0);
     const offsetY = Number(event.clientY || 0) - Number(sourceRect.top || 0);
     const nextState = {
+      containerRect,
       height: Number(sourceRect.height || 0),
       offsetX,
       offsetY,
@@ -14051,12 +15005,14 @@ function TerminalView({
 
     setActiveTerminalPaneId(event.paneId || "");
     updateTerminalDragState(nextState);
+    startTerminalDragListeners(nextState);
   }, [
     beginTerminalCanvasDrag,
     displayTerminalRows,
     fullscreenActive,
     logicalTerminalIndexes.length,
     measureTerminalLayout,
+    startTerminalDragListeners,
     terminalBreakoutLayoutActive,
     terminalWorkspace?.id,
     todoDragActive,
@@ -14384,220 +15340,6 @@ function TerminalView({
     todoDragActive,
     updateTodoQueueItems,
     updateTodoDragState,
-  ]);
-
-  useEffect(() => {
-    if (!terminalDragActive) {
-      return undefined;
-    }
-
-    const initialDragState = terminalDragStateRef.current;
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = initialDragState?.resizeCursor || "grabbing";
-    document.body.style.userSelect = "none";
-
-    const handlePointerMove = (event) => {
-      const currentDrag = terminalDragStateRef.current;
-      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
-        return;
-      }
-
-      event.preventDefault();
-      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
-        event.stopPropagation();
-      }
-
-      const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
-      if (!containerRect) {
-        return;
-      }
-
-      if (currentDrag.mode === "canvas") {
-        const currentPlacement = normalizeBreakoutPlacement(
-          terminalBreakoutPlacementsRef.current?.[currentDrag.terminalIndex],
-        );
-        if (!currentPlacement) {
-          return;
-        }
-
-        const viewport = terminalBreakoutViewportRef.current;
-        const normalizedViewport = normalizeBreakoutViewport(viewport);
-        const zoom = Math.max(0.001, normalizedViewport.zoom);
-        const terminalScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
-        const effectiveScale = Math.max(0.001, zoom * terminalScale);
-        const nextPlacement = {
-          ...currentPlacement,
-          x: (
-            event.clientX
-            - containerRect.left
-            - normalizedViewport.x
-            - (currentDrag.offsetX * effectiveScale)
-          ) / zoom,
-          y: (
-            event.clientY
-            - containerRect.top
-            - normalizedViewport.y
-            - (currentDrag.offsetY * effectiveScale)
-          ) / zoom,
-        };
-
-        updateTerminalBreakoutPlacements({
-          ...terminalBreakoutPlacementsRef.current,
-          [currentDrag.terminalIndex]: nextPlacement,
-        });
-        return;
-      }
-
-      if (currentDrag.mode === "canvas-resize") {
-        event.stopPropagation();
-        const startPlacement = normalizeBreakoutPlacement(currentDrag.startPlacement);
-        if (!startPlacement) {
-          return;
-        }
-
-        const viewport = normalizeBreakoutViewport(currentDrag.startViewport || terminalBreakoutViewportRef.current);
-        const zoom = Math.max(0.001, viewport.zoom);
-        const terminalScale = Math.max(
-          0.001,
-          clampBreakoutTerminalScale(currentDrag.startTerminalScale || terminalBreakoutTerminalScaleRef.current),
-        );
-        const effectiveScale = Math.max(0.001, zoom * terminalScale);
-        const edgeX = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeX || 0)));
-        const edgeY = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeY || 0)));
-        const deltaX = Number(event.clientX || 0) - Number(currentDrag.startClientX || 0);
-        const deltaY = Number(event.clientY || 0) - Number(currentDrag.startClientY || 0);
-        let nextWidth = startPlacement.width;
-        let nextHeight = startPlacement.height;
-        let nextX = startPlacement.x;
-        let nextY = startPlacement.y;
-
-        if (edgeX !== 0) {
-          nextWidth = Math.max(
-            TERMINAL_BREAKOUT_MIN_WIDTH,
-            startPlacement.width + ((edgeX * deltaX) / effectiveScale),
-          );
-          if (edgeX < 0) {
-            nextX = startPlacement.x + ((startPlacement.width - nextWidth) * terminalScale);
-          }
-        }
-
-        if (edgeY !== 0) {
-          nextHeight = Math.max(
-            TERMINAL_BREAKOUT_MIN_HEIGHT,
-            startPlacement.height + ((edgeY * deltaY) / effectiveScale),
-          );
-          if (edgeY < 0) {
-            nextY = startPlacement.y + ((startPlacement.height - nextHeight) * terminalScale);
-          }
-        }
-
-        updateTerminalBreakoutPlacements({
-          ...terminalBreakoutPlacementsRef.current,
-          [currentDrag.terminalIndex]: {
-            ...startPlacement,
-            height: nextHeight,
-            width: nextWidth,
-            x: nextX,
-            y: nextY,
-          },
-        });
-        return;
-      }
-
-      const target = getDragTargetFromPoint({
-        clientX: event.clientX,
-        clientY: event.clientY,
-        containerRect,
-        draggedTerminalIndex: currentDrag.terminalIndex,
-        rects: terminalLayoutRectsRef.current,
-        rows: currentDrag.previewRows,
-      });
-      const nextPreviewRows = insertTerminalInRows(
-        currentDrag.previewRows,
-        currentDrag.terminalIndex,
-        target,
-      );
-
-      updateTerminalDragState({
-        ...currentDrag,
-        previewRows: areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows)
-          ? currentDrag.previewRows
-          : nextPreviewRows,
-        x: event.clientX - containerRect.left - currentDrag.offsetX,
-        y: event.clientY - containerRect.top - currentDrag.offsetY,
-      });
-    };
-
-    const commitDrag = () => {
-      const currentDrag = terminalDragStateRef.current;
-      if (!currentDrag) {
-        return;
-      }
-
-      if (currentDrag.mode === "canvas") {
-        updateTerminalDragState(null);
-        return;
-      }
-
-      if (currentDrag.mode === "canvas-resize") {
-        updateTerminalDragState(null);
-        return;
-      }
-
-      const nextRows = cloneTerminalRows(currentDrag.previewRows);
-      if (!areTerminalRowsEqual(currentDrag.sourceRows, nextRows)) {
-        reorderWorkspaceTerminalDisplayLayout?.({
-          displayRows: nextRows,
-          workspaceId: currentDrag.workspaceId,
-        });
-      }
-
-      updateTerminalDragState(null);
-    };
-
-    const cancelDrag = () => {
-      updateTerminalDragState(null);
-    };
-
-    const handlePointerUp = (event) => {
-      const currentDrag = terminalDragStateRef.current;
-      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
-        return;
-      }
-
-      event.preventDefault();
-      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
-        event.stopPropagation();
-      }
-      commitDrag();
-    };
-
-    const handlePointerCancel = (event) => {
-      const currentDrag = terminalDragStateRef.current;
-      if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
-        return;
-      }
-
-      cancelDrag();
-    };
-
-    window.addEventListener("pointermove", handlePointerMove, { capture: true, passive: false });
-    window.addEventListener("pointerup", handlePointerUp, { capture: true, passive: false });
-    window.addEventListener("pointercancel", handlePointerCancel);
-
-    return () => {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove, { capture: true });
-      window.removeEventListener("pointerup", handlePointerUp, { capture: true });
-      window.removeEventListener("pointercancel", handlePointerCancel);
-    };
-  }, [
-    reorderWorkspaceTerminalDisplayLayout,
-    terminalDragActive,
-    updateTerminalBreakoutPlacements,
-    updateTerminalDragState,
   ]);
 
   useEffect(() => {
@@ -15051,6 +15793,10 @@ function TerminalView({
           const terminalPaneId = getTerminalPaneId(terminalIndex);
           const terminalActive = activePaneId === terminalPaneId;
           const terminalProjectTarget = getTerminalProjectTarget(terminalIndex);
+          const terminalBreakoutPlan = terminalBreakoutLivePlansByIndex.get(terminalIndex) || null;
+          const breakoutPlanStatus = normalizeTerminalBreakoutPlanStatus(terminalBreakoutPlan?.status);
+          const breakoutPlanSteps = terminalBreakoutPlanSteps(terminalBreakoutPlan);
+          const breakoutPlanTitle = terminalBreakoutPlanTitle(terminalBreakoutPlan);
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
@@ -15067,6 +15813,46 @@ function TerminalView({
               onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
               style={getTerminalSlotStyle(terminalIndex)}
             >
+              {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalBreakoutPlan && (
+                <TerminalBreakoutPlanPanel
+                  aria-label={`Live terminal plan: ${breakoutPlanTitle}`}
+                  data-terminal-control="true"
+                >
+                  <TerminalBreakoutPlanHeader>
+                    <div>
+                      <TerminalBreakoutPlanKicker>Live plan</TerminalBreakoutPlanKicker>
+                      <TerminalBreakoutPlanTitle>{breakoutPlanTitle}</TerminalBreakoutPlanTitle>
+                    </div>
+                    <TerminalBreakoutPlanStatusPill data-status={breakoutPlanStatus}>
+                      {terminalBreakoutPlanStatusLabel(terminalBreakoutPlan.status)}
+                    </TerminalBreakoutPlanStatusPill>
+                  </TerminalBreakoutPlanHeader>
+                  <TerminalBreakoutPlanStepList>
+                    {breakoutPlanSteps.length ? breakoutPlanSteps.map((step, stepIndex) => {
+                      const stepStatus = terminalBreakoutPlanStepStatusKind(step?.status);
+                      const stepTitle = cleanTerminalBreakoutPlanText(step?.title || step?.detail)
+                        || `Step ${stepIndex + 1}`;
+                      return (
+                        <TerminalBreakoutPlanStep data-status={stepStatus} key={step?.id || step?.index || stepIndex}>
+                          <TerminalBreakoutPlanStepDot
+                            aria-hidden="true"
+                            data-status={stepStatus}
+                          />
+                          <TerminalBreakoutPlanStepText>{stepTitle}</TerminalBreakoutPlanStepText>
+                        </TerminalBreakoutPlanStep>
+                      );
+                    }) : (
+                      <TerminalBreakoutPlanStep data-status="queued">
+                        <TerminalBreakoutPlanStepDot
+                          aria-hidden="true"
+                          data-status="queued"
+                        />
+                        <TerminalBreakoutPlanStepText>No steps yet</TerminalBreakoutPlanStepText>
+                      </TerminalBreakoutPlanStep>
+                    )}
+                  </TerminalBreakoutPlanStepList>
+                </TerminalBreakoutPlanPanel>
+              )}
               <WorkspaceTerminal
                 key={`${terminalWorkspace.id}-${terminalIndex}`}
                 agent={getTerminalAgent(terminalIndex)}
