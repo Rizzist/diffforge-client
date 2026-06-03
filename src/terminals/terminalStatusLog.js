@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-const TERMINAL_STATUS_LOGGING_ENABLED = true;
+const TERMINAL_STATUS_LOGGING_ENABLED = false;
 const TERMINAL_STATUS_LOG_MAX_TEXT = 900;
 const TERMINAL_STATUS_LOG_MAX_ARRAY = 60;
 const TERMINAL_STATUS_LOG_MAX_OBJECT_KEYS = 120;

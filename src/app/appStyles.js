@@ -3802,10 +3802,29 @@ export const TerminalInlineUiView = styled.div`
   min-height: 0;
   overflow: hidden;
   background: #141414;
-  pointer-events: auto;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  contain: layout paint style;
+  transition:
+    opacity 120ms ease,
+    visibility 0s linear 120ms;
 
   html[data-forge-theme="light"] & {
     background: #f5f5f7;
+  }
+
+  &[data-active="true"] {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition:
+      opacity 120ms ease,
+      visibility 0s linear 0s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    transition: none;
   }
 
   > * {

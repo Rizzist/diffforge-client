@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED = true;
+export const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED = false;
 export const FILE_DRAG_DIAGNOSTIC_LOGGING_ENABLED = false;
 
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_MAX_TEXT = 512;

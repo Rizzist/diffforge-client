@@ -4810,7 +4810,7 @@ export default function App() {
 
   useEffect(() => {
     workspacesRef.current = workspaces;
-  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, workspaces]);
+  }, [workspaces]);
 
   useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
@@ -11976,7 +11976,7 @@ export default function App() {
         unlistenCreditWallet();
       }
     };
-  }, [workspaces]);
+  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, workspaces]);
 
   const submitSpecEditIntent = useCallback(async () => {
     throw new Error("Spec editing has been removed. Architecture keeps task history only.");

@@ -4682,6 +4682,7 @@ function WorkspaceThreadDetail({
   todoDropActive = false,
   todoDropTarget = false,
   todoDropUnsupportedMessage = "",
+  visible = true,
   workspace,
   workspaceRoot = "",
   workspaceThreadEntry,
@@ -4875,8 +4876,14 @@ function WorkspaceThreadDetail({
       return undefined;
     }
 
+    if (!visible) {
+      return undefined;
+    }
+
     let cancelled = false;
     let timeoutId = 0;
+    let firstFrameId = 0;
+    let secondFrameId = 0;
 
     const fetchSummary = async () => {
       try {
@@ -4902,8 +4909,6 @@ function WorkspaceThreadDetail({
       }
     };
 
-    fetchSummary();
-
     const poll = async () => {
       await fetchSummary();
       if (!cancelled && diffTurnLive) {
@@ -4911,12 +4916,40 @@ function WorkspaceThreadDetail({
       }
     };
 
-    if (diffTurnLive) {
-      timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
+    const startFetchAndPolling = () => {
+      if (cancelled) {
+        return;
+      }
+
+      timeoutId = window.setTimeout(async () => {
+        timeoutId = 0;
+        await fetchSummary();
+        if (!cancelled && diffTurnLive) {
+          timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
+        }
+      }, 0);
+    };
+
+    if (typeof window.requestAnimationFrame === "function") {
+      firstFrameId = window.requestAnimationFrame(() => {
+        firstFrameId = 0;
+        secondFrameId = window.requestAnimationFrame(() => {
+          secondFrameId = 0;
+          startFetchAndPolling();
+        });
+      });
+    } else {
+      startFetchAndPolling();
     }
 
     return () => {
       cancelled = true;
+      if (firstFrameId) {
+        window.cancelAnimationFrame(firstFrameId);
+      }
+      if (secondFrameId) {
+        window.cancelAnimationFrame(secondFrameId);
+      }
       if (timeoutId) {
         window.clearTimeout(timeoutId);
       }
@@ -4929,6 +4962,7 @@ function WorkspaceThreadDetail({
     diffWorktreePath,
     thread?.id,
     thread?.workspaceId,
+    visible,
     workspace?.id,
   ]);
 
@@ -5123,9 +5157,10 @@ function WorkspaceThreadDetail({
   useEffect(() => {
     const safeFocusToken = Number(composerFocusToken || 0);
     if (
-      !safeFocusToken
-      || safeFocusToken === lastComposerFocusTokenRef.current
+      !visible
       || !thread
+      || !safeFocusToken
+      || safeFocusToken === lastComposerFocusTokenRef.current
     ) {
       return undefined;
     }
@@ -5157,7 +5192,7 @@ function WorkspaceThreadDetail({
         window.cancelAnimationFrame(secondFrame);
       }
     };
-  }, [composerFocusToken, thread]);
+  }, [composerFocusToken, thread, visible]);
 
   useEffect(() => {
     logBigViewSyncDiagnosticEvent("bigview.model_state.thread_detail", {
@@ -5265,6 +5300,10 @@ function WorkspaceThreadDetail({
   ]);
 
   useLayoutEffect(() => {
+    if (!visible) {
+      return;
+    }
+
     const node = transcriptScrollRef.current;
     if (!node) {
       return;
@@ -5284,6 +5323,7 @@ function WorkspaceThreadDetail({
     thread?.latestTurn?.state,
     thread?.latestTurn?.turnId,
     thread?.status,
+    visible,
   ]);
 
   const addImageFiles = async (fileList) => {
