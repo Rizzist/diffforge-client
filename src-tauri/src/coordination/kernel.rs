@@ -56,15 +56,6 @@ const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "submit_patch_status",
 ];
 const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", "LS"];
-const COORDINATION_WORKSPACE_MCP_TOOLS: &[&str] = &[
-    "start_task",
-    "create_plan",
-    "acquire_lease",
-    "checkpoint",
-    "complete_task",
-    "submit_patch",
-    "submit_patch_status",
-];
 const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
@@ -506,7 +497,7 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
         "env_schema_json": [],
         "config_values_json": {},
         "missing_required_config": [],
-        "tools_json": COORDINATION_WORKSPACE_MCP_TOOLS,
+        "tools_json": crate::coordination::mcp::TOOL_NAMES,
         "install_state": "installed",
         "workspace_enabled": true,
         "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
@@ -8569,7 +8560,7 @@ impl CoordinationKernel {
                 "responded": Value::Null,
                 "status": if healthy { "cached" } else { "not_checked" },
                 "error": Value::Null,
-                "tool_count": COORDINATION_WORKSPACE_MCP_TOOLS.len(),
+                "tool_count": crate::coordination::mcp::TOOL_NAMES.len(),
                 "deferred": true,
             },
             "agent_client_mount": client_mount["status"].clone(),
@@ -18566,7 +18557,7 @@ impl CoordinationKernel {
             "session_heartbeat_recorded": heartbeat,
             "brief": brief["data"].clone(),
             "workflow": {
-                "agent_visible_mcp_tools": ["start_task", "create_plan", "acquire_lease", "checkpoint", "complete_task", "submit_patch", "submit_patch_status"],
+                "agent_visible_mcp_tools": crate::coordination::mcp::TOOL_NAMES,
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
                     "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal plan.",
@@ -24248,11 +24239,12 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 \n\
 ## Architecture graphs\n\n\
 - Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, normally `.agents/architectures` in the selected repo.\n\
-- Before creating a generic architecture doc, inspect `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, and existing `.agents/architectures/graphs/*.arch` files.\n\
-- For architecture, diagram, deployment, flow, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
+- For architecture, diagram, deployment, flow, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
+- Before creating a generic architecture doc, inspect the architecture MCP context and existing `.agents/architectures/graphs/*.arch` files.\n\
+- For architecture, diagram, deployment, flow, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
 - The DSL supports `title`, `folder`, `direction`, containers with `{{ ... }}`, node props such as `[icon: api, desc: Request handling]`, and edges such as `A > B: label`, `A -- B: dependency`, and `A <> B: bidirectional`.\n\
-- Name icons with simple aliases. Prefer semantic tokens like `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `auth`, `users`, `external`, and `settings`; use cloud/logo tokens like `aws:s3`, `aws:lambda`, `gcp:cloud-run`, `azure:functions`, `github`, `postgres`, `redis`, `mongodb`, `docker`, `kubernetes`, `stripe`, `supabase`, `cloudflare`, `auth0`, and `cockroachdb` when they fit.\n\
-- If an exact icon is unknown, choose a semantic alias; the renderer will fall back cleanly.\n\
+- Name icons with simple aliases. Prefer exact provider/product/framework slugs when the node/container title names a real technology, for example `appwrite`, `github`, `postgres`, `redis`, `mongodb`, `docker`, `kubernetes`, `stripe`, `supabase`, `cloudflare`, `auth0`, `cockroachdb`, `react`, or `vercel`. Use cloud tokens like `aws:s3`, `aws:lambda`, `gcp:cloud-run`, and `azure:functions` when they fit.\n\
+- Use semantic tokens like `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `auth`, `users`, `external`, and `settings` only when there is no exact product/provider icon. The renderer also tries to infer installed LikeC4/styled-icons logos from titles when a generic fallback is used.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }
@@ -26656,6 +26648,9 @@ hooksPath = "{}"
             &[
                 "start_task",
                 "create_plan",
+                "architecture_context",
+                "architecture_list",
+                "architecture_icon_reference",
                 "acquire_lease",
                 "checkpoint",
                 "complete_task",
@@ -26688,6 +26683,134 @@ hooksPath = "{}"
         assert!(!allowed
             .iter()
             .any(|tool| tool.as_str() == Some("resolve_workspace_violation")));
+    }
+
+    #[test]
+    fn architecture_mcp_tools_explain_direct_file_architecture_workflow() {
+        let repo = temp_repo("architecture_mcp_direct_file");
+        let _kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = crate::coordination::mcp::McpContext::default();
+        let repo_path = process_path_text(&repo);
+        let source = r#"title "Appwrite Auth Flow Architecture"
+direction right
+folder "flows / auth"
+
+Client [icon: users, desc: Signed-in user]
+Appwrite [icon: service, desc: Backend-as-a-service platform]
+Session Store [icon: database, desc: Stores sessions]
+
+Client > Appwrite: login
+Appwrite > Session Store: create session
+"#;
+
+        let contract = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "architecture_context",
+            json!({"repo_path": repo_path.clone()}),
+        );
+        assert_eq!(contract["ok"].as_bool(), Some(true));
+        assert_eq!(contract["data"]["sourceFormat"].as_str(), Some("eraserDsl"));
+        assert!(contract["data"]["contract"]["preferredMcpTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_context")));
+        assert!(!contract["data"]["contract"]["preferredMcpTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_read")));
+        assert!(!contract["data"]["contract"]["preferredMcpTools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_write")));
+        assert!(repo
+            .join(".agents")
+            .join("architectures")
+            .join("AGENTS.md")
+            .exists());
+        assert!(contract["data"]["contract"]["workflow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step
+                .as_str()
+                .unwrap_or_default()
+                .contains("normal file edits")));
+
+        let old_write = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "architecture_write",
+            json!({
+                "repo_path": repo_path.clone(),
+                "title": "Appwrite Auth Flow Architecture",
+                "folder": "flows / auth",
+                "source": source
+            }),
+        );
+        assert_eq!(old_write["ok"].as_bool(), Some(false));
+        assert_eq!(old_write["error"]["code"].as_str(), Some("unknown_tool"));
+
+        let old_read = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "architecture_read",
+            json!({
+                "repo_path": repo_path.clone(),
+                "graph_id": "appwrite-auth-flow-architecture"
+            }),
+        );
+        assert_eq!(old_read["ok"].as_bool(), Some(false));
+        assert_eq!(old_read["error"]["code"].as_str(), Some("unknown_tool"));
+
+        let graph_path = repo
+            .join(".agents")
+            .join("architectures")
+            .join("graphs")
+            .join("appwrite-auth-flow-architecture.arch");
+        fs::create_dir_all(graph_path.parent().unwrap()).unwrap();
+        fs::write(&graph_path, source).unwrap();
+        assert!(graph_path.exists());
+        assert!(fs::read_to_string(&graph_path)
+            .unwrap()
+            .contains("Appwrite [icon: service"));
+
+        let listed = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "architecture_list",
+            json!({"repo_path": repo_path.clone()}),
+        );
+        assert_eq!(listed["ok"].as_bool(), Some(true));
+        assert_eq!(
+            listed["data"]["graphs"][0]["id"].as_str(),
+            Some("appwrite-auth-flow-architecture")
+        );
+        assert_eq!(
+            listed["data"]["graphs"][0]["sourceFormat"].as_str(),
+            Some("eraserDsl")
+        );
+        assert_eq!(listed["data"]["graphs"][0]["nodeCount"].as_u64(), Some(3));
+
+        let icons = crate::coordination::mcp::dispatch_tool(
+            &context,
+            "architecture_icon_reference",
+            json!({"repo_path": repo_path}),
+        );
+        assert_eq!(icons["ok"].as_bool(), Some(true));
+        assert!(icons["data"]["techAndCompany"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|icon| icon.as_str() == Some("cockroachdb")));
+        assert!(icons["data"]["techAndCompany"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|icon| icon.as_str() == Some("appwrite")));
+        assert!(icons["data"]["packageResolution"]["titleInference"]
+            .as_str()
+            .unwrap()
+            .contains("missing or generic"));
     }
 
     #[test]

@@ -3,15 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   Background,
   BaseEdge,
-  Controls,
   EdgeLabelRenderer,
   Handle,
   MarkerType,
-  MiniMap,
   Position,
   ReactFlow,
   addEdge as addReactFlowEdge,
-  getBezierPath,
   useEdgesState,
   useNodesState,
 } from "@xyflow/react";
@@ -65,6 +62,13 @@ function text(value, fallback = "") {
 function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
+
+const ARCHITECTURE_GRAPH_LIST_REFRESH_MS = 700;
+const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
+const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
+const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
+const ARCHITECTURE_TODO_QUEUE_MAX_ITEMS = 120;
 
 function jsonObject(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -553,6 +557,83 @@ const ARCHITECTURE_KIND_ICON_FALLBACKS = {
   worker: "generic:worker",
 };
 
+const ARCHITECTURE_SEMANTIC_ICON_SLUGS = new Set([
+  "ai",
+  "api",
+  "auth",
+  "authentication",
+  "authorization",
+  "browser",
+  "box",
+  "boxes",
+  "cache",
+  "client",
+  "cloud",
+  "compute",
+  "config",
+  "database",
+  "datastore",
+  "db",
+  "document",
+  "external",
+  "external-service",
+  "file",
+  "flow",
+  "folder",
+  "gateway",
+  "group",
+  "monitor",
+  "persistence",
+  "queue",
+  "router",
+  "security",
+  "server",
+  "service",
+  "settings",
+  "storage",
+  "subscription",
+  "terminal",
+  "user",
+  "users",
+  "webhook",
+  "worker",
+]);
+
+const ARCHITECTURE_TITLE_ICON_SUFFIXES = new Set([
+  "account",
+  "accounts",
+  "api",
+  "apis",
+  "app",
+  "application",
+  "auth",
+  "authentication",
+  "bucket",
+  "buckets",
+  "cache",
+  "client",
+  "cloud",
+  "cluster",
+  "database",
+  "databases",
+  "db",
+  "gateway",
+  "integration",
+  "platform",
+  "provider",
+  "providers",
+  "queue",
+  "router",
+  "sdk",
+  "server",
+  "service",
+  "services",
+  "store",
+  "storage",
+  "system",
+  "worker",
+]);
+
 const architectureNodeTypes = {
   architectureGroup: ArchitectureCanvasGroup,
   architectureNode: ArchitectureCanvasNode,
@@ -682,6 +763,112 @@ function architectureIconAliasTarget(parts) {
   return ARCHITECTURE_ICON_ALIASES[parts.slug] || "";
 }
 
+function architectureIconTokenIsGeneric(value) {
+  const parts = architectureIconParts(value);
+  if (!parts.slug) return true;
+  if (parts.namespace === "generic") return true;
+  const aliasTarget = architectureIconAliasTarget(parts);
+  if (aliasTarget) {
+    const aliasParts = architectureIconParts(aliasTarget);
+    return aliasParts.namespace === "generic"
+      || ARCHITECTURE_SEMANTIC_ICON_SLUGS.has(aliasParts.slug);
+  }
+  return ARCHITECTURE_SEMANTIC_ICON_SLUGS.has(parts.slug);
+}
+
+function architectureLabelIconHintTokens(value) {
+  const slug = architectureIconSlug(value);
+  if (!slug) return [];
+  const tokens = [];
+  const seen = new Set();
+  const addToken = (token) => {
+    const clean = architectureIconSlug(token);
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    tokens.push(clean);
+  };
+  addToken(slug);
+
+  const parts = slug.split("-").filter(Boolean);
+  while (parts.length > 1 && ARCHITECTURE_TITLE_ICON_SUFFIXES.has(parts.at(-1))) {
+    parts.pop();
+    addToken(parts.join("-"));
+  }
+
+  if (slug.includes("-")) {
+    addToken(slug.replace(/-/gu, ""));
+  }
+
+  return tokens;
+}
+
+function architectureAddPackageIconHint(state, value, depth = 0) {
+  if (!state || depth > 4) return;
+  const parts = architectureIconParts(value);
+  if (!parts.slug) return;
+  const aliasTarget = architectureIconAliasTarget(parts);
+  if (aliasTarget) {
+    if (!architectureIconTokenIsGeneric(aliasTarget)) {
+      architectureAddIconToken(state, aliasTarget, depth + 1);
+    }
+    return;
+  }
+
+  if (parts.namespace === "generic") return;
+
+  if (parts.namespace === "styled") {
+    architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+    return;
+  }
+
+  if (parts.namespace === "aws") {
+    architectureAddLikeC4Candidate(state.candidates, "aws", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `aws-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `aws-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "gcp") {
+    architectureAddLikeC4Candidate(state.candidates, "gcp", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `google-cloud-${parts.slug}`);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `gcp-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `google-cloud-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "azure") {
+    architectureAddLikeC4Candidate(state.candidates, "azure", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `azure-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `azure-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "tech") {
+    architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+    return;
+  }
+
+  if (parts.namespace === "bootstrap") {
+    architectureAddLikeC4Candidate(state.candidates, "bootstrap", parts.slug);
+    return;
+  }
+
+  if (parts.namespace) return;
+
+  if (!parts.slug.endsWith("-icon")) {
+    architectureAddLikeC4Candidate(state.candidates, "tech", `${parts.slug}-icon`);
+  }
+  architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+  architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+}
+
+function architectureAddLabelIconHints(state, value) {
+  architectureLabelIconHintTokens(value).forEach((token) => {
+    architectureAddPackageIconHint(state, token);
+  });
+}
+
 function architectureAddIconToken(state, value, depth = 0) {
   if (!state || depth > 5) return;
   const parts = architectureIconParts(value);
@@ -776,7 +963,7 @@ function architectureIconInitials(value, fallback = "IC") {
     .toUpperCase() || fallback;
 }
 
-function architectureResolveIconDescriptor(icon, kind = "service") {
+function architectureResolveIconDescriptor(icon, kind = "service", labelHint = "") {
   const state = {
     candidates: [],
     seenTokens: new Set(),
@@ -785,6 +972,10 @@ function architectureResolveIconDescriptor(icon, kind = "service") {
   };
   const rawIcon = text(icon);
   const rawKind = text(kind, "service");
+  const rawLabelHint = text(labelHint);
+  if (!rawIcon || architectureIconTokenIsGeneric(rawIcon)) {
+    architectureAddLabelIconHints(state, rawLabelHint);
+  }
   architectureAddIconToken(state, rawIcon || rawKind);
   const kindFallback = ARCHITECTURE_KIND_ICON_FALLBACKS[architectureIconSlug(rawKind)];
   if (kindFallback) architectureAddIconToken(state, kindFallback);
@@ -803,8 +994,9 @@ function architectureResolveIconDescriptor(icon, kind = "service") {
       state.styledKey,
       ...state.candidates.map((candidate) => candidate.path),
       ...state.styledCandidates.map((candidate) => candidate.path),
+      rawLabelHint,
     ].join("|"),
-    label: architectureIconInitials(displayName),
+    label: architectureIconInitials(rawLabelHint || displayName),
     sourceLabel: displayName,
     styledCandidates: state.styledCandidates,
     styledKey: state.styledKey,
@@ -878,8 +1070,11 @@ function architectureLoadStyledSimpleIcon(candidates) {
   return promise;
 }
 
-function useArchitectureIcon(icon, kind = "service") {
-  const descriptor = useMemo(() => architectureResolveIconDescriptor(icon, kind), [icon, kind]);
+function useArchitectureIcon(icon, kind = "service", labelHint = "") {
+  const descriptor = useMemo(
+    () => architectureResolveIconDescriptor(icon, kind, labelHint),
+    [icon, kind, labelHint],
+  );
   const [state, setState] = useState(() => architectureIconFallbackState(descriptor));
 
   useEffect(() => {
@@ -1172,66 +1367,251 @@ function architectureLayoutGraph(graph) {
     childrenByParent.get(parentId).push(node);
   });
 
-  const direction = text(graph?.layout?.direction, "LR");
-  const topLevel = childrenByParent.get("") || [];
-  const topGroups = topLevel.filter((node) => node.type === "group");
-  const topNodes = topLevel.filter((node) => node.type !== "group");
-  const groupWidth = 360;
+  const rawDirection = text(graph?.layout?.direction, "LR").toUpperCase();
+  const direction = ["LR", "RL", "TB", "BT"].includes(rawDirection) ? rawDirection : "LR";
+  const horizontal = direction === "LR" || direction === "RL";
+  const reverseRanks = direction === "RL" || direction === "BT";
   const nodeWidth = 184;
   const nodeHeight = 76;
+  const groupMinWidth = 360;
+  const groupMinHeight = 190;
+  const groupPadX = 30;
+  const groupHeaderHeight = 70;
+  const groupPadBottom = 30;
+  const rootPadX = 80;
+  const rootPadY = 70;
+  const rankGap = 136;
+  const rowGap = 36;
+  const groupRankGap = 86;
+  const groupRowGap = 28;
+  const edges = jsonArray(graph.edges)
+    .map((edge) => ({
+      source: text(edge?.source || edge?.from),
+      target: text(edge?.target || edge?.to),
+    }))
+    .filter((edge) => edge.source && edge.target && byId.has(edge.source) && byId.has(edge.target));
+  const rankById = new Map(nodes.map((node) => [node.id, 0]));
+  const incomingById = new Map(nodes.map((node) => [node.id, new Set()]));
+  const outgoingById = new Map(nodes.map((node) => [node.id, new Set()]));
 
-  function layoutGroup(group, groupIndex = 0) {
-    const directChildren = childrenByParent.get(group.id) || [];
-    const childGroups = directChildren.filter((node) => node.type === "group");
-    const childNodes = directChildren.filter((node) => node.type !== "group");
-    const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(Math.max(1, childNodes.length)))));
-    const rows = Math.max(1, Math.ceil(childNodes.length / columns));
-    const nestedHeight = childGroups.length ? childGroups.length * 210 + 24 : 0;
-    const height = Math.max(190, 74 + rows * 102 + nestedHeight);
-    group.width = numberValue(group.width, Math.max(groupWidth, 48 + columns * (nodeWidth + 34)));
-    group.height = numberValue(group.height, height);
+  edges.forEach((edge) => {
+    if (edge.source === edge.target) return;
+    incomingById.get(edge.target)?.add(edge.source);
+    outgoingById.get(edge.source)?.add(edge.target);
+  });
 
-    childNodes.forEach((node, index) => {
-      node.position = node.position || {
-        x: 28 + (index % columns) * (nodeWidth + 24),
-        y: 72 + Math.floor(index / columns) * 102,
-      };
+  const sortedNodes = [...nodes].sort((left, right) => left.__order - right.__order);
+  const queue = sortedNodes
+    .filter((node) => !(incomingById.get(node.id)?.size))
+    .map((node) => node.id);
+  if (!queue.length) {
+    sortedNodes.forEach((node) => queue.push(node.id));
+  }
+  const indegree = new Map(nodes.map((node) => [node.id, incomingById.get(node.id)?.size || 0]));
+  const queued = new Set(queue);
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const sourceId = queue[cursor];
+    const sourceRank = rankById.get(sourceId) || 0;
+    [...(outgoingById.get(sourceId) || [])]
+      .sort((left, right) => (byId.get(left)?.__order || 0) - (byId.get(right)?.__order || 0))
+      .forEach((targetId) => {
+        rankById.set(targetId, Math.max(rankById.get(targetId) || 0, sourceRank + 1));
+        indegree.set(targetId, Math.max(0, (indegree.get(targetId) || 0) - 1));
+        if ((indegree.get(targetId) || 0) === 0 && !queued.has(targetId)) {
+          queued.add(targetId);
+          queue.push(targetId);
+        }
+      });
+  }
+  for (let iteration = 0; iteration < nodes.length; iteration += 1) {
+    let changed = false;
+    edges.forEach((edge) => {
+      const nextRank = Math.min(nodes.length, (rankById.get(edge.source) || 0) + 1);
+      if ((rankById.get(edge.target) || 0) < nextRank) {
+        rankById.set(edge.target, nextRank);
+        changed = true;
+      }
     });
+    if (!changed) break;
+  }
 
-    childGroups.forEach((childGroup, index) => {
-      layoutGroup(childGroup, index);
-      childGroup.position = childGroup.position || {
-        x: 28,
-        y: 72 + rows * 102 + index * 214,
-      };
-      childGroup.width = Math.max(numberValue(childGroup.width, groupWidth - 56), groupWidth - 56);
+  const descendantsByGroup = new Map();
+  function descendantNodeIds(groupId) {
+    if (descendantsByGroup.has(groupId)) return descendantsByGroup.get(groupId);
+    const directChildren = childrenByParent.get(groupId) || [];
+    const ids = [];
+    directChildren.forEach((child) => {
+      if (child.type === "group") {
+        ids.push(...descendantNodeIds(child.id));
+      } else {
+        ids.push(child.id);
+      }
     });
+    descendantsByGroup.set(groupId, ids);
+    return ids;
+  }
+
+  function rankForEntity(entity) {
+    if (!entity) return 0;
+    if (entity.type !== "group") return rankById.get(entity.id) || 0;
+    const childRanks = descendantNodeIds(entity.id)
+      .map((id) => rankById.get(id))
+      .filter((rank) => Number.isFinite(rank));
+    return childRanks.length ? Math.min(...childRanks) : rankById.get(entity.id) || 0;
+  }
+
+  function layoutRankedBoxes(boxes, options = {}) {
+    const safeBoxes = boxes.filter(Boolean);
+    const paddingLeft = numberValue(options.paddingLeft, 0);
+    const paddingTop = numberValue(options.paddingTop, 0);
+    const paddingRight = numberValue(options.paddingRight, paddingLeft);
+    const paddingBottom = numberValue(options.paddingBottom, paddingTop);
+    const localRankGap = numberValue(options.rankGap, rankGap);
+    const localRowGap = numberValue(options.rowGap, rowGap);
+    const minWidth = numberValue(options.minWidth, 0);
+    const minHeight = numberValue(options.minHeight, 0);
+    if (!safeBoxes.length) {
+      return {
+        boxes: [],
+        height: Math.max(minHeight, paddingTop + paddingBottom),
+        width: Math.max(minWidth, paddingLeft + paddingRight),
+      };
+    }
+
+    const rankKeys = [...new Set(safeBoxes.map((box) => numberValue(box.rank, 0)))]
+      .sort((left, right) => left - right);
+    if (reverseRanks) rankKeys.reverse();
+    const boxesByRank = new Map(rankKeys.map((rank) => [rank, []]));
+    safeBoxes
+      .sort((left, right) => (
+        numberValue(left.rank, 0) - numberValue(right.rank, 0)
+          || numberValue(left.order, 0) - numberValue(right.order, 0)
+          || text(left.id).localeCompare(text(right.id))
+      ))
+      .forEach((box) => {
+        const rank = numberValue(box.rank, 0);
+        if (!boxesByRank.has(rank)) boxesByRank.set(rank, []);
+        boxesByRank.get(rank).push(box);
+      });
+
+    const placed = [];
+    let width = paddingLeft + paddingRight;
+    let height = paddingTop + paddingBottom;
+    if (horizontal) {
+      let x = paddingLeft;
+      rankKeys.forEach((rank) => {
+        const rankBoxes = boxesByRank.get(rank) || [];
+        const columnWidth = Math.max(...rankBoxes.map((box) => numberValue(box.width, nodeWidth)), nodeWidth);
+        let y = paddingTop;
+        rankBoxes.forEach((box) => {
+          const boxWidth = numberValue(box.width, nodeWidth);
+          const boxHeight = numberValue(box.height, nodeHeight);
+          placed.push({
+            ...box,
+            x: Math.round(x + Math.max(0, (columnWidth - boxWidth) / 2)),
+            y: Math.round(y),
+          });
+          y += boxHeight + localRowGap;
+        });
+        width = Math.max(width, x + columnWidth + paddingRight);
+        height = Math.max(height, y - localRowGap + paddingBottom);
+        x += columnWidth + localRankGap;
+      });
+    } else {
+      let y = paddingTop;
+      rankKeys.forEach((rank) => {
+        const rankBoxes = boxesByRank.get(rank) || [];
+        const rowHeight = Math.max(...rankBoxes.map((box) => numberValue(box.height, nodeHeight)), nodeHeight);
+        let x = paddingLeft;
+        rankBoxes.forEach((box) => {
+          const boxWidth = numberValue(box.width, nodeWidth);
+          const boxHeight = numberValue(box.height, nodeHeight);
+          placed.push({
+            ...box,
+            x: Math.round(x),
+            y: Math.round(y + Math.max(0, (rowHeight - boxHeight) / 2)),
+          });
+          x += boxWidth + localRowGap;
+        });
+        width = Math.max(width, x - localRowGap + paddingRight);
+        height = Math.max(height, y + rowHeight + paddingBottom);
+        y += rowHeight + localRankGap;
+      });
+    }
 
     return {
-      height: group.height,
-      width: group.width,
-      x: direction === "TB" ? 80 : 80 + groupIndex * (group.width + 64),
-      y: direction === "TB" ? 80 + groupIndex * (group.height + 64) : 80,
+      boxes: placed,
+      height: Math.max(minHeight, Math.round(height)),
+      width: Math.max(minWidth, Math.round(width)),
     };
   }
 
-  topGroups.forEach((group, index) => {
-    const position = layoutGroup(group, index);
-    group.position = group.position || { x: position.x, y: position.y };
-  });
-
-  const topNodeOffsetX = topGroups.length
-    ? Math.max(...topGroups.map((group) => numberValue(group.position?.x, 0) + numberValue(group.width, groupWidth))) + 72
-    : 80;
-  topNodes.forEach((node, index) => {
-    node.position = node.position || {
-      x: direction === "TB" ? 80 + (index % 3) * 218 : topNodeOffsetX,
-      y: direction === "TB" ? 80 + topGroups.reduce((total, group) => total + numberValue(group.height, groupWidth) + 64, 0) + Math.floor(index / 3) * 108 : 110 + index * 108,
+  const laidOutGroups = new Map();
+  function boxForEntity(entity) {
+    if (!entity) return null;
+    if (entity.type === "group") return layoutGroup(entity);
+    return {
+      height: nodeHeight,
+      id: entity.id,
+      node: entity,
+      order: entity.__order,
+      rank: rankForEntity(entity),
+      width: nodeWidth,
     };
+  }
+
+  function layoutGroup(group) {
+    if (laidOutGroups.has(group.id)) return laidOutGroups.get(group.id);
+    const directChildren = childrenByParent.get(group.id) || [];
+    const childBoxes = directChildren.map(boxForEntity).filter(Boolean);
+    const layout = layoutRankedBoxes(childBoxes, {
+      minHeight: groupMinHeight,
+      minWidth: groupMinWidth,
+      paddingBottom: groupPadBottom,
+      paddingLeft: groupPadX,
+      paddingRight: groupPadX,
+      paddingTop: groupHeaderHeight,
+      rankGap: groupRankGap,
+      rowGap: groupRowGap,
+    });
+    layout.boxes.forEach((box) => {
+      box.node.position = { x: box.x, y: box.y };
+    });
+    group.width = Math.max(numberValue(group.width, 0), layout.width);
+    group.height = Math.max(numberValue(group.height, 0), layout.height);
+    const groupBox = {
+      height: group.height,
+      id: group.id,
+      node: group,
+      order: group.__order,
+      rank: rankForEntity(group),
+      width: group.width,
+    };
+    laidOutGroups.set(group.id, groupBox);
+    return groupBox;
+  }
+
+  const rootLayout = layoutRankedBoxes((childrenByParent.get("") || []).map(boxForEntity), {
+    minHeight: 360,
+    minWidth: 760,
+    paddingBottom: rootPadY,
+    paddingLeft: rootPadX,
+    paddingRight: rootPadX,
+    paddingTop: rootPadY,
+    rankGap,
+    rowGap,
+  });
+  rootLayout.boxes.forEach((box) => {
+    box.node.position = { x: box.x, y: box.y };
   });
 
   return {
     ...graph,
+    layout: {
+      ...(jsonObject(graph?.layout) || {}),
+      direction,
+      engine: "ranked",
+    },
     nodes: nodes
       .sort((left, right) => left.__order - right.__order)
       .map(({ __order, ...node }) => node),
@@ -1425,7 +1805,21 @@ function architectureStarterGraph({ groupPath = "", title = "" } = {}) {
   });
 }
 
-function architectureFlowNodeFromGraphNode(node, index = 0) {
+function architectureSourceHandlePosition(direction) {
+  if (direction === "TB") return Position.Bottom;
+  if (direction === "BT") return Position.Top;
+  if (direction === "RL") return Position.Left;
+  return Position.Right;
+}
+
+function architectureTargetHandlePosition(direction) {
+  if (direction === "TB") return Position.Top;
+  if (direction === "BT") return Position.Bottom;
+  if (direction === "RL") return Position.Right;
+  return Position.Left;
+}
+
+function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
   const rawKind = text(node?.kind || node?.type, "service");
   const isGroup = rawKind === "group" || text(node?.type) === "group";
   const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
@@ -1443,9 +1837,12 @@ function architectureFlowNodeFromGraphNode(node, index = 0) {
       x: numberValue(position.x, 80 + (index % 3) * 220),
       y: numberValue(position.y, 80 + Math.floor(index / 3) * 120),
     },
+    sourcePosition: architectureSourceHandlePosition(direction),
     style: isGroup ? { width, height } : undefined,
+    targetPosition: architectureTargetHandlePosition(direction),
     data: {
       color: text(node?.color),
+      flowDirection: direction,
       icon: text(node?.icon),
       kind: isGroup ? "group" : rawKind,
       subtitle: text(node?.subtitle || node?.description),
@@ -1478,7 +1875,10 @@ function architectureFlowEdgeFromGraphEdge(edge) {
 
 function architectureGraphToFlow(graph) {
   const compiledGraph = architectureParseDslGraph(graph) || graph;
-  const nodes = jsonArray(compiledGraph?.nodes).map(architectureFlowNodeFromGraphNode);
+  const direction = text(compiledGraph?.layout?.direction, "LR").toUpperCase();
+  const nodes = jsonArray(compiledGraph?.nodes).map((node, index) => (
+    architectureFlowNodeFromGraphNode(node, index, direction)
+  ));
   const edges = jsonArray(compiledGraph?.edges)
     .map(architectureFlowEdgeFromGraphEdge)
     .filter(Boolean);
@@ -1579,6 +1979,108 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       engine: "manual",
     },
   };
+}
+
+function architectureTodoQueueStorageKey(workspaceId) {
+  const safeWorkspaceId = text(workspaceId);
+  return safeWorkspaceId ? `${ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX}.${safeWorkspaceId}` : "";
+}
+
+function architectureReadStoredTodoQueueItems(storageKey) {
+  if (!storageKey || typeof window === "undefined" || !window.localStorage) return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function architectureWriteStoredTodoQueueItems(storageKey, items) {
+  if (!storageKey || typeof window === "undefined" || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify(items.slice(-ARCHITECTURE_TODO_QUEUE_MAX_ITEMS)),
+    );
+  } catch {
+    // Local queue persistence is best effort; the live event still covers mounted terminal views.
+  }
+}
+
+function architectureTodoCommandId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `architecture-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function architectureAgentTaskText({
+  graph,
+  prompt,
+  repoPath,
+}) {
+  const graphTitle = text(graph?.title, "Architecture graph");
+  const graphFilePath = text(graph?.filePath);
+  const graphId = text(graph?.id);
+  return [
+    `Architecture graph request: ${prompt}`,
+    "",
+    `Current graph: ${graphTitle}`,
+    graphFilePath ? `Graph file: ${graphFilePath}` : graphId ? `Graph id: ${graphId}` : "",
+    repoPath ? `Repo: ${repoPath}` : "",
+    "",
+    "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
+  ].filter(Boolean).join("\n");
+}
+
+function architectureQueueAgentTodo({
+  graph,
+  prompt,
+  repoPath,
+  workspaceId,
+  workspaceName,
+}) {
+  const safeWorkspaceId = text(workspaceId);
+  const commandId = architectureTodoCommandId();
+  const now = new Date().toISOString();
+  const item = {
+    createdAt: now,
+    id: commandId,
+    kind: "todo",
+    queueState: {
+      phase: "queued",
+      queuedAt: now,
+      source: ARCHITECTURE_TODO_QUEUE_SOURCE,
+      state: "queued",
+      updatedAt: now,
+    },
+    remoteCommand: {
+      commandId,
+      source: "architecture-tab",
+    },
+    source: ARCHITECTURE_TODO_QUEUE_SOURCE,
+    text: architectureAgentTaskText({ graph, prompt, repoPath }),
+    workspaceId: safeWorkspaceId,
+  };
+  const storageKey = architectureTodoQueueStorageKey(safeWorkspaceId);
+  if (storageKey) {
+    const currentItems = architectureReadStoredTodoQueueItems(storageKey)
+      .filter((candidate) => text(candidate?.id) !== commandId);
+    architectureWriteStoredTodoQueueItems(storageKey, currentItems.concat([item]));
+  }
+  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+    window.dispatchEvent(new CustomEvent(ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT, {
+      detail: {
+        commandId,
+        item,
+        source: "architecture-tab",
+        workspaceId: safeWorkspaceId,
+        workspaceName: text(workspaceName),
+      },
+    }));
+  }
+  return item;
 }
 
 function formatDurationMs(value) {
@@ -2376,7 +2878,7 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
     if (!selectedRepoPath) return undefined;
     const interval = window.setInterval(() => {
       void loadGraphList(selectedRepoPath, { silent: true });
-    }, 1800);
+    }, ARCHITECTURE_GRAPH_LIST_REFRESH_MS);
     return () => window.clearInterval(interval);
   }, [loadGraphList, selectedRepoPath]);
 
@@ -2433,7 +2935,7 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
           });
         })
         .catch(() => {});
-    }, 1200);
+    }, ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS);
     return () => window.clearInterval(interval);
   }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
 
@@ -2627,6 +3129,9 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
               graph={selectedGraph}
               onSave={saveGraph}
               saveState={saveState}
+              selectedRepo={selectedRepo}
+              workspaceId={workspaceId}
+              workspaceName={workspaceName}
             />
           )}
         </ArchitectureEditorContent>
@@ -2734,11 +3239,20 @@ function ArchitectureCreateSurface({
   );
 }
 
-function ArchitectureGraphEditor({ graph, onSave, saveState }) {
+function ArchitectureGraphEditor({
+  graph,
+  onSave,
+  saveState,
+  selectedRepo,
+  workspaceId = "",
+  workspaceName = "",
+}) {
   const initialFlow = useMemo(() => architectureGraphToFlow(graph), [graph]);
   const [nodes, setNodes, handleNodesChange] = useNodesState(initialFlow.nodes);
   const [edges, setEdges, handleEdgesChange] = useEdgesState(initialFlow.edges);
   const [draftGraph, setDraftGraph] = useState(() => jsonObject(graph) || {});
+  const [agentCommandDraft, setAgentCommandDraft] = useState("");
+  const [agentCommandNotice, setAgentCommandNotice] = useState("");
   const [dirty, setDirty] = useState(false);
   const [selectedNodes, setSelectedNodes] = useState([]);
   const [selectedEdges, setSelectedEdges] = useState([]);
@@ -2753,14 +3267,9 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
     setSelectedEdges([]);
     setDirty(false);
     setLocalError("");
+    setAgentCommandDraft("");
+    setAgentCommandNotice("");
   }, [graph, setEdges, setNodes]);
-
-  const selectedNode = selectedNodes[0]
-    ? nodes.find((node) => node.id === selectedNodes[0].id)
-    : null;
-  const selectedEdge = selectedEdges[0]
-    ? edges.find((edge) => edge.id === selectedEdges[0].id)
-    : null;
 
   const onNodesChange = useCallback((changes) => {
     if (changes.some((change) => change.type !== "select")) setDirty(true);
@@ -2822,7 +3331,7 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
 
   const addNode = useCallback(() => {
     const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
-      || (selectedNode?.type === "architectureGroup" ? selectedNode : null);
+      || null;
     const nodeCount = nodes.filter((node) => node.type !== "architectureGroup").length;
     setNodes((currentNodes) => [
       ...currentNodes,
@@ -2843,7 +3352,7 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
       },
     ]);
     setDirty(true);
-  }, [nodes, selectedNode, selectedNodes, setNodes]);
+  }, [nodes, selectedNodes, setNodes]);
 
   const connectSelectedNodes = useCallback(() => {
     const pair = selectedNodes.filter((node) => node.type !== "architectureGroup").slice(0, 2);
@@ -2889,37 +3398,6 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
     setDirty(true);
   }, [selectedEdges, selectedNodes, setEdges, setNodes]);
 
-  const updateSelectedNodeData = useCallback((patch) => {
-    if (!selectedNode) return;
-    setNodes((currentNodes) => currentNodes.map((node) => (
-      node.id === selectedNode.id
-        ? { ...node, data: { ...node.data, ...patch } }
-        : node
-    )));
-    setDirty(true);
-  }, [selectedNode, setNodes]);
-
-  const updateSelectedGroupSize = useCallback((field, value) => {
-    if (!selectedNode || selectedNode.type !== "architectureGroup") return;
-    const numeric = Math.max(field === "width" ? 220 : 150, numberValue(value, selectedNode.style?.[field] || 0));
-    setNodes((currentNodes) => currentNodes.map((node) => (
-      node.id === selectedNode.id
-        ? { ...node, style: { ...node.style, [field]: numeric } }
-        : node
-    )));
-    setDirty(true);
-  }, [selectedNode, setNodes]);
-
-  const updateSelectedEdgeData = useCallback((patch) => {
-    if (!selectedEdge) return;
-    setEdges((currentEdges) => currentEdges.map((edge) => (
-      edge.id === selectedEdge.id
-        ? { ...edge, data: { ...edge.data, ...patch } }
-        : edge
-    )));
-    setDirty(true);
-  }, [selectedEdge, setEdges]);
-
   const save = useCallback(() => {
     const nextGraph = architectureGraphFromFlow(draftGraph, nodes, edges);
     setLocalError("");
@@ -2929,6 +3407,26 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
         setLocalError(nextError?.message || String(nextError || "Unable to save graph."));
       });
   }, [draftGraph, edges, nodes, onSave]);
+
+  const queueArchitectureAgentCommand = useCallback((event) => {
+    event.preventDefault();
+    const prompt = text(agentCommandDraft);
+    if (!prompt) return;
+    if (!workspaceId) {
+      setLocalError("Open a workspace before queueing an architecture task.");
+      return;
+    }
+    const queuedItem = architectureQueueAgentTodo({
+      graph: draftGraph,
+      prompt,
+      repoPath: selectedRepo?.path || "",
+      workspaceId,
+      workspaceName,
+    });
+    setAgentCommandDraft("");
+    setAgentCommandNotice(queuedItem ? "Queued for coding agents" : "Queued locally");
+    setLocalError("");
+  }, [agentCommandDraft, draftGraph, selectedRepo?.path, workspaceId, workspaceName]);
 
   return (
     <ArchitectureEditorShell>
@@ -2976,11 +3474,13 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
         </ArchitectureEditorActions>
       </ArchitectureEditorToolbar>
 
-      {(localError || dirty) && (
-        <ArchitectureEditorNotice data-kind={localError ? "error" : "dirty"}>
-          {localError || "Unsaved architecture changes"}
-        </ArchitectureEditorNotice>
-      )}
+      <ArchitectureEditorNoticeSlot>
+        {(localError || dirty) && (
+          <ArchitectureEditorNotice data-kind={localError ? "error" : "dirty"}>
+            {localError || "Unsaved architecture changes"}
+          </ArchitectureEditorNotice>
+        )}
+      </ArchitectureEditorNoticeSlot>
 
       <ArchitectureEditorBody>
         <ArchitectureCanvasViewport>
@@ -3010,140 +3510,35 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
             proOptions={{ hideAttribution: true }}
           >
             <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
-            <MiniMap
-              nodeBorderRadius={8}
-              nodeColor={(node) => {
-                if (node.type === "architectureGroup") return "rgba(148, 163, 184, 0.24)";
-                if (node.data?.kind === "database") return "#34d399";
-                if (node.data?.kind === "client") return "#fbbf24";
-                if (node.data?.kind === "external") return "#f472b6";
-                if (node.data?.kind === "queue") return "#a78bfa";
-                return "#38bdf8";
-              }}
-              pannable
-              zoomable
-            />
-            <Controls showInteractive={false} />
           </ReactFlow>
         </ArchitectureCanvasViewport>
-
-        <ArchitectureInspector aria-label="Architecture selection inspector">
-          <ArchitectureInspectorHeader>
-            <span>Selection</span>
-            <strong>
-              {selectedNode
-                ? selectedNode.type === "architectureGroup" ? "Group" : "Node"
-                : selectedEdge ? "Edge" : "None"}
-            </strong>
-          </ArchitectureInspectorHeader>
-          {selectedNode ? (
-            <>
-              <ArchitectureField>
-                <span>Title</span>
-                <ArchitectureInput
-                  onChange={(event) => updateSelectedNodeData({ title: event.target.value })}
-                  value={text(selectedNode.data?.title)}
-                />
-              </ArchitectureField>
-              <ArchitectureField>
-                <span>Subtitle</span>
-                <ArchitectureInput
-                  onChange={(event) => updateSelectedNodeData({ subtitle: event.target.value })}
-                  value={text(selectedNode.data?.subtitle)}
-                />
-              </ArchitectureField>
-              <ArchitectureField>
-                <span>Icon</span>
-                <ArchitectureInput
-                  onChange={(event) => {
-                    const nextIcon = event.target.value;
-                    updateSelectedNodeData({
-                      icon: nextIcon,
-                      ...(selectedNode.type === "architectureGroup" ? {} : {
-                        kind: architectureIconKind(nextIcon, selectedNode.data?.kind || "service"),
-                      }),
-                    });
-                  }}
-                  placeholder="aws:s3, github, cockroachdb"
-                  value={text(selectedNode.data?.icon)}
-                />
-              </ArchitectureField>
-              {selectedNode.type === "architectureGroup" ? (
-                <>
-                  <ArchitectureField>
-                    <span>Width</span>
-                    <ArchitectureInput
-                      min="220"
-                      onChange={(event) => updateSelectedGroupSize("width", event.target.value)}
-                      type="number"
-                      value={Math.round(numberValue(selectedNode.style?.width, 360))}
-                    />
-                  </ArchitectureField>
-                  <ArchitectureField>
-                    <span>Height</span>
-                    <ArchitectureInput
-                      min="150"
-                      onChange={(event) => updateSelectedGroupSize("height", event.target.value)}
-                      type="number"
-                      value={Math.round(numberValue(selectedNode.style?.height, 220))}
-                    />
-                  </ArchitectureField>
-                </>
-              ) : (
-                <ArchitectureField>
-                  <span>Kind</span>
-                  <ArchitectureSelect
-                    onChange={(event) => updateSelectedNodeData({ kind: event.target.value })}
-                    value={text(selectedNode.data?.kind, "service")}
-                  >
-                    {ARCHITECTURE_NODE_KIND_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>{option.label}</option>
-                    ))}
-                  </ArchitectureSelect>
-                </ArchitectureField>
-              )}
-            </>
-          ) : selectedEdge ? (
-            <>
-              <ArchitectureField>
-                <span>Label</span>
-                <ArchitectureInput
-                  onChange={(event) => updateSelectedEdgeData({ label: event.target.value })}
-                  value={text(selectedEdge.data?.label)}
-                />
-              </ArchitectureField>
-              <ArchitectureField>
-                <span>Kind</span>
-                <ArchitectureSelect
-                  onChange={(event) => updateSelectedEdgeData({ kind: event.target.value })}
-                  value={text(selectedEdge.data?.kind, "calls")}
-                >
-                  {ARCHITECTURE_EDGE_KIND_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </ArchitectureSelect>
-              </ArchitectureField>
-              <ArchitectureInspectorMeta>
-                {selectedEdge.source} {"->"} {selectedEdge.target}
-              </ArchitectureInspectorMeta>
-            </>
-          ) : (
-            <ArchitectureInspectorMeta>
-              Select a node, group, or edge to edit it.
-            </ArchitectureInspectorMeta>
-          )}
-        </ArchitectureInspector>
       </ArchitectureEditorBody>
+
+      <ArchitectureAgentCommandForm onSubmit={queueArchitectureAgentCommand}>
+        <ArchitectureAgentCommandInput
+          aria-label="Queue architecture task"
+          onChange={(event) => {
+            setAgentCommandDraft(event.target.value);
+            if (agentCommandNotice) setAgentCommandNotice("");
+          }}
+          placeholder="Ask a coding agent to update this architecture graph..."
+          value={agentCommandDraft}
+        />
+        <ArchitectureAgentCommandMeta>
+          {agentCommandNotice || "Press Enter to queue"}
+        </ArchitectureAgentCommandMeta>
+      </ArchitectureAgentCommandForm>
     </ArchitectureEditorShell>
   );
 }
 
 function ArchitectureCanvasNode({ data, selected }) {
-  const icon = useArchitectureIcon(data?.icon, data?.kind);
+  const icon = useArchitectureIcon(data?.icon, data?.kind, data?.title);
   const IconComponent = icon.Icon;
+  const direction = text(data?.flowDirection, "LR").toUpperCase();
   return (
     <ArchitectureCanvasNodeShell data-kind={text(data?.kind, "service")} data-selected={selected ? "true" : "false"}>
-      <Handle position={Position.Left} type="target" />
+      <Handle position={architectureTargetHandlePosition(direction)} type="target" />
       <ArchitectureNodeIcon
         aria-hidden="true"
         data-kind={text(data?.kind, "service")}
@@ -3156,17 +3551,18 @@ function ArchitectureCanvasNode({ data, selected }) {
         <strong>{text(data?.title, "Node")}</strong>
         <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>
       </ArchitectureNodeText>
-      <Handle position={Position.Right} type="source" />
+      <Handle position={architectureSourceHandlePosition(direction)} type="source" />
     </ArchitectureCanvasNodeShell>
   );
 }
 
 function ArchitectureCanvasGroup({ data, selected }) {
-  const icon = useArchitectureIcon(data?.icon, "group");
+  const icon = useArchitectureIcon(data?.icon, "group", data?.title);
   const IconComponent = icon.Icon;
+  const direction = text(data?.flowDirection, "LR").toUpperCase();
   return (
     <ArchitectureCanvasGroupShell data-selected={selected ? "true" : "false"}>
-      <Handle position={Position.Left} type="target" />
+      <Handle position={architectureTargetHandlePosition(direction)} type="target" />
       <ArchitectureGroupHeader>
         <ArchitectureNodeIcon
           aria-hidden="true"
@@ -3181,9 +3577,101 @@ function ArchitectureCanvasGroup({ data, selected }) {
           <span>{text(data?.subtitle, "Architecture group")}</span>
         </ArchitectureGroupText>
       </ArchitectureGroupHeader>
-      <Handle position={Position.Right} type="source" />
+      <Handle position={architectureSourceHandlePosition(direction)} type="source" />
     </ArchitectureCanvasGroupShell>
   );
+}
+
+function architectureEdgeSide(position) {
+  const normalized = String(position || "").toLowerCase();
+  if (normalized.includes("left")) return "left";
+  if (normalized.includes("right")) return "right";
+  if (normalized.includes("top")) return "top";
+  if (normalized.includes("bottom")) return "bottom";
+  return "right";
+}
+
+function architectureEdgeOffsetPoint(x, y, side, distance) {
+  if (side === "left") return { x: x - distance, y };
+  if (side === "right") return { x: x + distance, y };
+  if (side === "top") return { x, y: y - distance };
+  if (side === "bottom") return { x, y: y + distance };
+  return { x, y };
+}
+
+function architectureDedupEdgePoints(points) {
+  return points.filter((point, index) => {
+    if (!index) return true;
+    const previous = points[index - 1];
+    return Math.round(previous.x) !== Math.round(point.x)
+      || Math.round(previous.y) !== Math.round(point.y);
+  });
+}
+
+function architectureEdgeHashOffset(id) {
+  const raw = text(id);
+  let hash = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    hash = (hash * 31 + raw.charCodeAt(index)) % 997;
+  }
+  return (hash % 5 - 2) * 6;
+}
+
+function architectureOrthogonalEdgePath({
+  id,
+  sourcePosition,
+  sourceX,
+  sourceY,
+  targetPosition,
+  targetX,
+  targetY,
+}) {
+  const sourceSide = architectureEdgeSide(sourcePosition);
+  const targetSide = architectureEdgeSide(targetPosition);
+  const horizontal = sourceSide === "left"
+    || sourceSide === "right"
+    || targetSide === "left"
+    || targetSide === "right";
+  const offset = 30;
+  const bendOffset = architectureEdgeHashOffset(id);
+  const sourceStub = architectureEdgeOffsetPoint(sourceX, sourceY, sourceSide, offset);
+  const targetStub = architectureEdgeOffsetPoint(targetX, targetY, targetSide, offset);
+  let points;
+
+  if (horizontal) {
+    const midX = Math.round((sourceStub.x + targetStub.x) / 2 + bendOffset);
+    points = [
+      { x: sourceX, y: sourceY },
+      sourceStub,
+      { x: midX, y: sourceStub.y },
+      { x: midX, y: targetStub.y },
+      targetStub,
+      { x: targetX, y: targetY },
+    ];
+  } else {
+    const midY = Math.round((sourceStub.y + targetStub.y) / 2 + bendOffset);
+    points = [
+      { x: sourceX, y: sourceY },
+      sourceStub,
+      { x: sourceStub.x, y: midY },
+      { x: targetStub.x, y: midY },
+      targetStub,
+      { x: targetX, y: targetY },
+    ];
+  }
+
+  const cleanPoints = architectureDedupEdgePoints(points);
+  const path = cleanPoints
+    .map((point, index) => `${index ? "L" : "M"} ${Math.round(point.x)} ${Math.round(point.y)}`)
+    .join(" ");
+  const labelSegmentIndex = Math.max(0, Math.min(cleanPoints.length - 2, Math.floor((cleanPoints.length - 1) / 2)));
+  const labelStart = cleanPoints[labelSegmentIndex];
+  const labelEnd = cleanPoints[labelSegmentIndex + 1] || labelStart;
+  return [
+    path,
+    Math.round((labelStart.x + labelEnd.x) / 2),
+    Math.round((labelStart.y + labelEnd.y) / 2),
+  ];
 }
 
 function ArchitectureCanvasEdge({
@@ -3198,7 +3686,8 @@ function ArchitectureCanvasEdge({
   targetX,
   targetY,
 }) {
-  const [edgePath, labelX, labelY] = getBezierPath({
+  const [edgePath, labelX, labelY] = architectureOrthogonalEdgePath({
+    id,
     sourcePosition,
     sourceX,
     sourceY,
@@ -4380,7 +4869,7 @@ const ArchitectureCreateActions = styled.div`
 
 const ArchitectureEditorShell = styled.div`
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 8px;
   min-width: 0;
   min-height: 0;
@@ -4419,6 +4908,11 @@ const ArchitectureEditorActions = styled.div`
   min-width: 0;
 `;
 
+const ArchitectureEditorNoticeSlot = styled.div`
+  min-width: 0;
+  min-height: 0;
+`;
+
 const ArchitectureEditorNotice = styled.div`
   min-width: 0;
   padding: 8px 10px;
@@ -4438,17 +4932,14 @@ const ArchitectureEditorNotice = styled.div`
 `;
 
 const ArchitectureEditorBody = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(190px, 230px);
-  gap: 10px;
+  display: block;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
 
   @media (max-width: 900px) {
-    grid-template-columns: 1fr;
-    overflow: auto;
+    overflow: hidden;
   }
 `;
 
@@ -4469,23 +4960,56 @@ const ArchitectureCanvasViewport = styled.div`
     min-height: 0;
   }
 
-  .react-flow__controls {
-    border: 1px solid rgba(148, 163, 184, 0.16);
-    border-radius: 8px;
-    overflow: hidden;
-    box-shadow: none;
+`;
+
+const ArchitectureAgentCommandForm = styled.form`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.42);
+
+  &:focus-within {
+    border-color: rgba(125, 211, 252, 0.34);
+    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.1);
   }
 
-  .react-flow__controls-button {
-    border-bottom-color: rgba(148, 163, 184, 0.12);
-    color: rgba(226, 232, 240, 0.86);
-    background: rgba(15, 23, 42, 0.82);
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+    gap: 5px;
   }
+`;
 
-  .react-flow__minimap {
-    border: 1px solid rgba(148, 163, 184, 0.14);
-    border-radius: 8px;
-    background: rgba(2, 6, 23, 0.72);
+const ArchitectureAgentCommandInput = styled.input`
+  min-width: 0;
+  height: 34px;
+  border: 0;
+  outline: none;
+  color: rgba(248, 250, 252, 0.94);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 780;
+
+  &::placeholder {
+    color: rgba(148, 163, 184, 0.62);
+  }
+`;
+
+const ArchitectureAgentCommandMeta = styled.span`
+  min-width: max-content;
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+
+  @media (max-width: 760px) {
+    min-width: 0;
   }
 `;
 

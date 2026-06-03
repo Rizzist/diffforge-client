@@ -1559,6 +1559,7 @@ export default function McpsWorkspaceView({
       "agent_env_file_write_enabled",
       true,
     );
+    const selectedTools = asArray(selectedServer.tools_json);
 
     return (
       <McpEditorPanel>
@@ -1788,20 +1789,24 @@ export default function McpsWorkspaceView({
           <McpAccessTopline>
             <span>
               <ButtonHubIcon aria-hidden="true" />
-              Tools
+              {selectedServer.built_in ? "Agent-exposed tools" : "Tools"}
             </span>
             <McpStatusBadge data-state="planned">
-              {asArray(selectedServer.tools_json).length}
+              {selectedTools.length}
             </McpStatusBadge>
           </McpAccessTopline>
-          {asArray(selectedServer.tools_json).length ? (
+          {selectedTools.length ? (
             <McpToolList>
-              {asArray(selectedServer.tools_json).map((tool) => (
+              {selectedTools.map((tool) => (
                 <McpToolChip key={tool}>{tool}</McpToolChip>
               ))}
             </McpToolList>
           ) : (
-            <McpEmptyAccess>Tool discovery will run through the workspace gateway later.</McpEmptyAccess>
+            <McpEmptyAccess>
+              {selectedServer.built_in
+                ? "No coordination tools are exposed to coding agents."
+                : "Tool discovery will run through the workspace gateway later."}
+            </McpEmptyAccess>
           )}
         </McpAccessPanel>
 

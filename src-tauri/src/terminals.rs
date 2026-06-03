@@ -10741,6 +10741,37 @@ mod terminal_tests {
     }
 
     #[test]
+    fn claude_worktree_guard_allows_architecture_root_graph_edit_without_task() {
+        let repo = terminal_test_repo_with_commit("claude_guard_architecture_root_edit");
+        let worktree = repo.join(".agents").join("worktrees").join("1");
+        fs::create_dir_all(&worktree).unwrap();
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": worktree.display().to_string(),
+            "tool_input": {
+                "file_path": repo
+                    .join(".agents")
+                    .join("architectures")
+                    .join("graphs")
+                    .join("auth-flow.arch")
+                    .display()
+                    .to_string()
+            }
+        });
+
+        let reason = claude_worktree_guard_denial_reason(
+            &hook_input,
+            &repo,
+            &worktree,
+            "1",
+            &DiffForgeWriteGuardIdentity::default(),
+        );
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
     fn claude_worktree_guard_denies_assigned_worktree_edit_without_task() {
         let repo = terminal_test_repo_with_commit("claude_guard_worktree_no_task");
         let worktree = repo.join(".agents").join("worktrees").join("1");
@@ -11018,6 +11049,62 @@ mod terminal_tests {
             &root,
             "slot1",
             "claude",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap();
+
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn diff_forge_write_guard_allows_architecture_graph_direct_root_edit_without_task() {
+        let repo = terminal_test_repo_with_commit("write_guard_architecture_root_edit");
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "file_path": repo
+                    .join(".agents")
+                    .join("architectures")
+                    .join("graphs")
+                    .join("deployment.arch")
+                    .display()
+                    .to_string()
+            }
+        });
+
+        let decision = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &DiffForgeWriteGuardIdentity::default(),
+        )
+        .unwrap();
+
+        assert!(decision.is_none());
+    }
+
+    #[test]
+    fn diff_forge_write_guard_allows_architecture_shell_direct_root_edit_without_task() {
+        let repo = terminal_test_repo_with_commit("write_guard_architecture_shell_edit");
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "command": "mkdir -p .agents/architectures/graphs && printf 'title \"Auth\"\\n' > .agents/architectures/graphs/auth.arch"
+            }
+        });
+
+        let decision = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
             &DiffForgeWriteGuardIdentity::default(),
         )
         .unwrap();

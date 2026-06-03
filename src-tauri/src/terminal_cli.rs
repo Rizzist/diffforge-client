@@ -1902,15 +1902,23 @@ fn diff_forge_shell_git_write_denial_reason(
         return Ok(None);
     }
 
+    let candidate_paths = diff_forge_shell_command_path_candidates(command, cwd);
+    let only_architecture_artifact_targets = !candidate_paths.is_empty()
+        && candidate_paths
+            .iter()
+            .all(|path| diff_forge_path_is_architecture_artifact(path));
+
     let mut cwd_is_slot_worktree_git_root = false;
     if let Some(repo_root) = diff_forge_nearest_git_root(cwd) {
         if !diff_forge_path_is_slot_worktree_root(&repo_root, slot_key) {
-            if let Some(reason) = diff_forge_git_write_denial_reason(
-                &repo_root, slot_key, agent_kind, identity, false,
-            )? {
-                return Ok(Some(format!(
-                    "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
-                )));
+            if !only_architecture_artifact_targets {
+                if let Some(reason) = diff_forge_git_write_denial_reason(
+                    &repo_root, slot_key, agent_kind, identity, false,
+                )? {
+                    return Ok(Some(format!(
+                        "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
+                    )));
+                }
             }
         } else {
             diff_forge_git_write_route(&repo_root, slot_key, agent_kind, identity, false)?;
@@ -1918,7 +1926,6 @@ fn diff_forge_shell_git_write_denial_reason(
         }
     }
 
-    let candidate_paths = diff_forge_shell_command_path_candidates(command, cwd);
     if candidate_paths.is_empty() && cwd_is_slot_worktree_git_root {
         return Ok(Some(
             "Diff Forge denied this mutating shell command because it did not expose an explicit file path to verify a write lease. Use Edit/Write/apply_patch or name the target file in the shell command after acquiring its lease."
@@ -2060,6 +2067,19 @@ fn diff_forge_shell_token_looks_like_path(token: &str, allow_plain_filename: boo
     allow_plain_filename
 }
 
+fn diff_forge_path_is_architecture_artifact(candidate_path: &Path) -> bool {
+    let candidate_path = claude_guard_existing_or_parent_canonical_path(candidate_path);
+    if diff_forge_slot_worktree_context(&candidate_path).is_some() {
+        return false;
+    }
+    let Some(repo_root) = diff_forge_nearest_git_root(&candidate_path) else {
+        return false;
+    };
+    let architecture_root =
+        claude_guard_clean_path(&repo_root.join(".agents").join("architectures"));
+    claude_guard_path_is_inside(&candidate_path, &architecture_root)
+}
+
 fn diff_forge_git_write_route(
     candidate_path: &Path,
     slot_key: &str,
@@ -2079,6 +2099,9 @@ fn diff_forge_git_write_route(
     let Some(repo_root) = diff_forge_nearest_git_root(&candidate_path) else {
         return Ok(None);
     };
+    if diff_forge_path_is_architecture_artifact(&candidate_path) {
+        return Ok(None);
+    }
     if let Some(worktree) = diff_forge_slot_worktree_context(&candidate_path) {
         if !worktree.slot_matches(slot_key) {
             return Err(format!(
@@ -2605,13 +2628,6 @@ fn claude_worktree_guard_denial_reason(
                 .to_string(),
         );
     }
-    let authority = match diff_forge_active_git_write_authority(repo_path, slot_key, identity) {
-        Ok(authority) => authority,
-        Err(error) => return Some(error),
-    };
-    if let Err(error) = diff_forge_validate_authority_worktree(&authority, &worktree) {
-        return Some(error);
-    }
 
     let cwd = hook_input["cwd"]
         .as_str()
@@ -2625,9 +2641,29 @@ fn claude_worktree_guard_denial_reason(
             "Diff Forge denied this {tool_name} call because Claude did not provide a target file path."
         ));
     }
+    let candidate_paths = candidate_paths
+        .into_iter()
+        .map(|candidate| claude_guard_resolved_path(&PathBuf::from(candidate), &cwd))
+        .collect::<Vec<_>>();
+    if candidate_paths
+        .iter()
+        .all(|candidate_path| diff_forge_path_is_architecture_artifact(candidate_path))
+    {
+        return None;
+    }
 
-    for candidate in candidate_paths {
-        let candidate_path = claude_guard_resolved_path(&PathBuf::from(candidate), &cwd);
+    let authority = match diff_forge_active_git_write_authority(repo_path, slot_key, identity) {
+        Ok(authority) => authority,
+        Err(error) => return Some(error),
+    };
+    if let Err(error) = diff_forge_validate_authority_worktree(&authority, &worktree) {
+        return Some(error);
+    }
+
+    for candidate_path in candidate_paths {
+        if diff_forge_path_is_architecture_artifact(&candidate_path) {
+            continue;
+        }
         if !claude_guard_path_is_inside(&candidate_path, &worktree) {
             return Some(format!(
                 "Diff Forge denied this edit because {} is outside terminal slot {slot_key}'s assigned worktree {}.",

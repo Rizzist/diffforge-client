@@ -25,6 +25,9 @@ use super::{
 pub const TOOL_NAMES: &[&str] = &[
     "start_task",
     "create_plan",
+    "architecture_context",
+    "architecture_list",
+    "architecture_icon_reference",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -2614,6 +2617,9 @@ fn dispatch_tool_result(
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
         "create_plan" => kernel_create_plan(&kernel, &input),
+        "architecture_context" => kernel_architecture_context(&kernel, &input),
+        "architecture_list" => kernel_architecture_list(&kernel, &input),
+        "architecture_icon_reference" => kernel_architecture_icon_reference(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
@@ -2655,6 +2661,39 @@ fn reconnect_mcp_session_if_needed(
         &reason,
     )?;
     Ok(())
+}
+
+fn architecture_tool_repo_path(kernel: &CoordinationKernel, input: &Value) -> String {
+    input["repo_path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| kernel.paths.repo_path.display().to_string())
+}
+
+fn kernel_architecture_context(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    Ok(api_ok(crate::architecture_context_value(
+        architecture_tool_repo_path(kernel, input),
+    )?))
+}
+
+fn kernel_architecture_list(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    Ok(api_ok(crate::architecture_graphs_list_value(
+        architecture_tool_repo_path(kernel, input),
+    )?))
+}
+
+fn kernel_architecture_icon_reference(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    Ok(api_ok(crate::architecture_icon_reference_value(
+        architecture_tool_repo_path(kernel, input),
+    )?))
 }
 
 fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -4071,6 +4110,9 @@ fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
         "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; queued step titles are user-editable in the Plans tab.".to_string(),
+        "architecture_context" => "Return the repo-scoped Diff Forge architecture contract, storage paths, DSL rules, existing graph summaries, and icon-reference path. Call this before architecture, diagram, deployment, flow, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
+        "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
+        "architecture_icon_reference" => "Return supported architecture icon aliases and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names for .arch DSL nodes and containers.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You may also advance the terminal plan with current/next/completed step fields. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
@@ -4132,6 +4174,27 @@ fn tool_input_schema(name: &str) -> Value {
                 "current_step_detail": {"type": "string", "description": "Optional detail for the current step."}
             },
             "required": ["task_id", "steps"],
+            "additionalProperties": true
+        }),
+        "architecture_context" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
+            },
+            "additionalProperties": true
+        }),
+        "architecture_list" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
+            },
+            "additionalProperties": true
+        }),
+        "architecture_icon_reference" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
+            },
             "additionalProperties": true
         }),
         "checkpoint" => json!({

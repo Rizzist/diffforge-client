@@ -17,11 +17,13 @@ When a user asks for an architecture, diagram, system map, deployment view, data
 
 ## Agent workflow
 
+Call `coordination-kernel.architecture_context` before architecture, diagram, deployment, flow, or subsystem visualization work. Use `coordination-kernel.architecture_list` to discover existing graphs and `coordination-kernel.architecture_icon_reference` when choosing icons. Create or modify `.agents/architectures/graphs/*.arch` with normal file edits so the Architecture tab reloads file changes live.
+
 1. Inspect `.agents/architectures/index.json` and existing `graphs/*.arch` files before creating a new graph.
 2. Prefer modifying the most relevant existing graph when the work changes a known subsystem.
-3. Create a new graph only when there is no relevant existing graph.
+3. Create a new graph file only when there is no relevant existing graph.
 4. Write nodes and containers first, then edges.
-5. Save incrementally. Diff Forge reloads valid graph source live in the Architecture tab.
+5. Save the `.arch` file incrementally after each valid block. Diff Forge reloads valid graph source live in the Architecture tab.
 6. Keep titles human-readable. The title, not a separate type field, should explain the graph's purpose.
 7. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
 
@@ -72,6 +74,8 @@ Supported basics:
 
 Use simple, stable icon aliases. The renderer resolves aliases through LikeC4 icons, styled-icons simple-icons, and semantic fallbacks.
 
+When a node or container title names a real provider, product, framework, database, cloud service, or company, prefer that exact lowercase slug as the icon alias. For example, use `Appwrite [icon: appwrite]`, `Vercel [icon: vercel]`, or `React App [icon: react]` instead of generic `service`, `cloud`, or `client` icons. The renderer can infer package icons from titles when a generic fallback is used, but explicit brand aliases are best.
+
 Preferred semantic aliases:
 
 - `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `cache`, `router`
@@ -87,7 +91,9 @@ Cloud service aliases:
 Tech and company aliases:
 
 - `github`, `github-actions`, `docker`, `kubernetes`, `nginx`, `postgres`, `redis`, `mongodb`, `cockroachdb`
-- `stripe`, `supabase`, `cloudflare`, `auth0`, `nodejs`, `nextjs`, `typescript`, `openai`, `anthropic`
+- `appwrite`, `stripe`, `supabase`, `cloudflare`, `auth0`, `nodejs`, `nextjs`, `typescript`, `react`, `vercel`, `openai`, `anthropic`
+
+The list above is not exhaustive. Any installed LikeC4 icon slug from `aws`, `azure`, `gcp`, `tech`, or `bootstrap`, and any installed styled-icons simple-icons brand slug, can be used directly when it matches the node/container name.
 
 If an exact icon is unknown, use the best semantic alias. The graph should still render with a clean fallback.
 
@@ -106,8 +112,14 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
   "preferredSyntax": "icon: alias or icon: namespace:name",
   "notes": [
     "Use simple aliases first. The renderer resolves LikeC4 icons, styled-icons simple-icons, and semantic fallbacks.",
-    "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service."
+    "When a node or container title names a real provider, product, framework, cloud service, database, or company, prefer that exact lowercase slug as the icon alias.",
+    "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service. The renderer also tries to infer installed package icons from titles when a generic fallback is used."
   ],
+  "packageResolution": {
+    "likec4": "Any installed @likec4/icons slug in aws, azure, gcp, tech, or bootstrap can be used, for example appwrite, appwrite-icon, aws:s3, gcp:cloud-run, or azure:functions.",
+    "styledSimpleIcons": "Any installed @styled-icons/simple-icons brand/component can be used by simple slug, for example appwrite, cockroachlabs, vercel, react, stripe, or supabase.",
+    "titleInference": "If icon is missing or generic, the renderer also checks the node/container title and strips common suffixes such as SDK, API, Service, App, Client, Server, Database, Queue, and Worker before falling back."
+  },
   "semantic": [
     "ai",
     "api",
@@ -178,6 +190,7 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
   ],
   "techAndCompany": [
     "anthropic",
+    "appwrite",
     "auth0",
     "cloudflare",
     "cockroachdb",
@@ -191,12 +204,15 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "nodejs",
     "openai",
     "postgres",
+    "react",
     "redis",
     "stripe",
     "supabase",
-    "typescript"
+    "typescript",
+    "vercel"
   ],
   "examples": [
+    "Appwrite [icon: appwrite, desc: Backend-as-a-service platform]",
     "API [icon: api, desc: Request handling]",
     "Object Store [icon: aws:s3, desc: Stores uploads]",
     "CockroachDB [icon: cockroachdb, desc: Durable SQL state]",
@@ -463,15 +479,19 @@ fn architecture_parse_group_path(source: &str) -> Vec<String> {
         else {
             continue;
         };
-        return architecture_unquote(rest)
-            .split(&['/', '>'][..])
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .take(12)
-            .map(ToString::to_string)
-            .collect();
+        return architecture_group_path_from_text(rest);
     }
     Vec::new()
+}
+
+fn architecture_group_path_from_text(value: &str) -> Vec<String> {
+    architecture_unquote(value)
+        .split(&['/', '>'][..])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .take(12)
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn architecture_source_counts(source: &str) -> (usize, usize) {
@@ -967,6 +987,88 @@ fn architecture_graph_save_blocking(
         file_path: workspace_path_display(&graph_path),
         graph,
     })
+}
+
+pub(crate) fn architecture_icon_reference_value(repo_path: String) -> Result<Value, String> {
+    let repo = resolve_workspace_root_directory(Some(repo_path.as_str()))?;
+    ensure_architecture_agent_guide(&repo)?;
+    let mut reference = serde_json::from_str::<Value>(ARCHITECTURE_ICON_REFERENCE)
+        .map_err(|error| format!("Unable to parse architecture icon reference: {error}"))?;
+    if let Some(object) = reference.as_object_mut() {
+        object.insert(
+            "repoPath".to_string(),
+            Value::String(workspace_path_display(&repo)),
+        );
+        object.insert(
+            "referencePath".to_string(),
+            Value::String(workspace_path_display(&architecture_icon_reference_path(&repo))),
+        );
+    }
+    Ok(reference)
+}
+
+pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, String> {
+    let repo = resolve_workspace_root_directory(Some(repo_path.as_str()))?;
+    ensure_architecture_agent_guide(&repo)?;
+    let graphs = architecture_graph_summaries(&repo)?;
+    let _ = architecture_write_index(&repo, &graphs);
+    let architecture_root = architecture_agents_root(&repo);
+    Ok(json!({
+        "kind": "architecture_context",
+        "version": 1,
+        "repoPath": workspace_path_display(&repo),
+        "architectureRoot": workspace_path_display(&architecture_root),
+        "graphsRoot": workspace_path_display(&architecture_root.join("graphs")),
+        "indexPath": workspace_path_display(&architecture_root.join("index.json")),
+        "agentGuidePath": workspace_path_display(&architecture_agent_guide_path(&repo)),
+        "iconReferencePath": workspace_path_display(&architecture_icon_reference_path(&repo)),
+        "sourceFormat": "eraserDsl",
+        "graphExtension": ".arch",
+        "graphs": graphs,
+        "contract": {
+            "purpose": "Architecture graphs are repo-scoped Diff Forge artifacts for humans and agents.",
+            "preferredMcpTools": [
+                "coordination-kernel.architecture_context",
+                "coordination-kernel.architecture_list",
+                "coordination-kernel.architecture_icon_reference"
+            ],
+            "workflow": [
+                "Call architecture_context or architecture_list before creating a new architecture.",
+                "Read the closest existing .agents/architectures/graphs/*.arch file directly before modifying a known subsystem.",
+                "Create or update .agents/architectures/graphs/*.arch with normal file edits using the eraser-like DSL.",
+                "Write containers and nodes first, then edges, and save the file incrementally so the Architecture tab updates live.",
+                "Use architecture_icon_reference when choosing cloud, tech, company, product, framework, or semantic icon aliases.",
+                "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks."
+            ],
+            "doNotCreateUnlessExplicitlyRequested": [
+                "ARCHITECTURE.md",
+                "docs/architecture.md",
+                "docs/architecture.mmd",
+                "Draw.io",
+                "PNG",
+                "SVG"
+            ]
+        },
+        "dsl": {
+            "title": "title \"Human-readable graph name\"",
+            "folder": "folder \"Area / Subarea\"",
+            "direction": "direction right | down | left | up",
+            "container": "Runtime Boundary [icon: cloud, color: blue] { ... }",
+            "node": "API [icon: api, desc: Request handling]",
+            "edges": [
+                "Client > API: request",
+                "API -- Database: dependency",
+                "API <> Worker: bidirectional"
+            ],
+            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nClient [icon: users]\nAPI [icon: api, desc: Handles requests]\nDatabase [icon: database]\n\nClient > API: request\nAPI > Database: read/write"
+        }
+    }))
+}
+
+pub(crate) fn architecture_graphs_list_value(repo_path: String) -> Result<Value, String> {
+    let list = architecture_graphs_list_blocking(repo_path)?;
+    serde_json::to_value(list)
+        .map_err(|error| format!("Unable to serialize architecture graph list: {error}"))
 }
 
 #[tauri::command]
