@@ -1251,6 +1251,7 @@ function WorkspaceTerminal({
   mountId = "",
   startupReady = true,
   terminalBreakoutActive = false,
+  terminalSelectionMode = "pointerdown",
   terminalIndex = 0,
   terminalCount = 1,
   terminalRole = "",
@@ -1281,6 +1282,7 @@ function WorkspaceTerminal({
   const terminalFirstVisibleOutputAtRef = useRef(0);
   const terminalRunningSinceRef = useRef(0);
   const terminalActiveRef = useRef(Boolean(isActive));
+  const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
   const blankStartupProbeCountRef = useRef(0);
@@ -1358,6 +1360,7 @@ function WorkspaceTerminal({
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const terminalSelectsOnPointerDown = terminalSelectionMode !== "pointerup";
   const terminalThreadId = thread?.id || "";
   const terminalThreadSlotKey = thread?.slotKey
     || String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
@@ -3488,18 +3491,45 @@ function WorkspaceTerminal({
       return;
     }
 
+    if (!terminalSelectsOnPointerDown && terminalPointerSelectionPendingRef.current) {
+      return;
+    }
+
     activateTerminalPane("terminal_focus");
     requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget, terminalSelectsOnPointerDown]);
 
   const handleTerminalSurfacePointerDownCapture = useCallback((event) => {
     if (isTerminalControlEventTarget(event.target)) {
       return;
     }
 
+    if (!terminalSelectsOnPointerDown) {
+      terminalPointerSelectionPendingRef.current = true;
+      return;
+    }
+
     activateTerminalPane("terminal_pointer");
     requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  }, [activateTerminalPane, requestTerminalAudioInputTarget, terminalSelectsOnPointerDown]);
+
+  useEffect(() => {
+    if (terminalSelectsOnPointerDown) {
+      terminalPointerSelectionPendingRef.current = false;
+      return undefined;
+    }
+
+    const clearPendingPointerSelection = () => {
+      terminalPointerSelectionPendingRef.current = false;
+    };
+
+    window.addEventListener("pointerup", clearPendingPointerSelection, true);
+    window.addEventListener("pointercancel", clearPendingPointerSelection, true);
+    return () => {
+      window.removeEventListener("pointerup", clearPendingPointerSelection, true);
+      window.removeEventListener("pointercancel", clearPendingPointerSelection, true);
+    };
+  }, [terminalSelectsOnPointerDown]);
   const handleTerminalUiViewFocusCapture = useCallback(() => {
     activateTerminalPane("terminal_ui_view_focus", { focusKeyboard: false });
     requestTerminalAudioInputTarget(true);

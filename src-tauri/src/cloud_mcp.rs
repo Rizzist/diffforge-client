@@ -7749,16 +7749,87 @@ async fn cloud_mcp_sync_agent_installations(
     let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
     let req =
         cloud_mcp_spec_graph_sync_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    let agent_count = agent_statuses
-        .as_array()
-        .map(Vec::len)
-        .ok_or_else(|| "Agent installation sync requires an agentStatuses array.".to_string())?;
     let snapshot_id = format!(
         "agent-installations-{}-{}",
         cloud_mcp_now_ms(),
         uuid::Uuid::new_v4()
     );
     let device_profile = cloud_mcp_desktop_device_profile();
+    let mut tagged_agent_statuses = agent_statuses;
+    let agent_items = tagged_agent_statuses
+        .as_array_mut()
+        .ok_or_else(|| "Agent installation sync requires an agentStatuses array.".to_string())?;
+    let agent_count = agent_items.len();
+    for agent in agent_items {
+        let Some(object) = agent.as_object_mut() else {
+            continue;
+        };
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "device_id",
+            device_profile["device_id"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "deviceId",
+            device_profile["device_id"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "machine_id",
+            device_profile["device_id"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "machineId",
+            device_profile["device_id"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "device_name",
+            device_profile["device_name"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "deviceName",
+            device_profile["device_name"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "machine_name",
+            device_profile["machine_name"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "machineName",
+            device_profile["machine_name"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "platform",
+            device_profile["platform"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "form_factor",
+            device_profile["form_factor"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "formFactor",
+            device_profile["form_factor"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "client_kind",
+            device_profile["client_kind"].clone(),
+        );
+        cloud_mcp_set_missing_agent_device_field(
+            object,
+            "clientKind",
+            device_profile["client_kind"].clone(),
+        );
+    }
     let payload = json!({
         "source": "rust-diffforge-agent-installation-sync",
         "event_kind": "agent_installation_snapshot",
@@ -7780,12 +7851,27 @@ async fn cloud_mcp_sync_agent_installations(
         "reason": reason,
         "snapshot_id": snapshot_id,
         "agent_count": agent_count,
-        "agents": agent_statuses,
+        "agents": tagged_agent_statuses,
         "summary": "Desktop installed agent inventory synced.",
         "ts_ms": cloud_mcp_now_ms(),
     });
 
     cloud_mcp_post_event_endpoint(state.inner(), "agent_installation_snapshot", &payload).await
+}
+
+fn cloud_mcp_set_missing_agent_device_field(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Value,
+) {
+    let has_value = object.get(key).is_some_and(|current| match current {
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Null => false,
+        _ => true,
+    });
+    if !has_value {
+        object.insert(key.to_string(), value);
+    }
 }
 
 #[tauri::command]

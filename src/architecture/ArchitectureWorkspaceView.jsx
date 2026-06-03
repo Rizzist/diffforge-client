@@ -76,6 +76,18 @@ function formatTime(value) {
   });
 }
 
+function formatFullTime(value) {
+  const ms = parseTimeMs(value);
+  if (!ms) return "";
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function formatClockTime(value) {
   const ms = parseTimeMs(value);
   if (!ms) return "";
@@ -167,17 +179,41 @@ function taskUpdatedMs(task) {
 
 function taskStatusKind(task) {
   const status = taskStatus(task).toLowerCase().replaceAll("_", "-");
-  if (["merged", "done", "completed", "complete", "success"].includes(status)) return "completed";
-  if (["active", "running", "started", "claimed", "in-progress", "working"].includes(status)) return "active";
-  if (["parked", "waiting", "resume-ready", "resume-requested", "blocked", "queued"].includes(status)) return "parked";
+  if (["merged", "applied", "done", "completed", "complete", "success", "idle", "ready", "prompt-ready"].includes(status)) return "done";
+  if (["active", "running", "started", "claimed", "in-progress", "working", "starting"].includes(status)) return "active";
+  if (["integrator-reviewing", "merge-queued", "patch-submitted", "resolved-patch-submitted", "review", "submitted"].includes(status)) return "active";
+  if (["queued", "dispatched"].includes(status)) return "queued";
+  if (["blocked"].includes(status)) return "blocked";
+  if (["parked", "waiting", "paused", "resume-ready", "resume-requested"].includes(status)) return "parked";
   if (["failed", "error"].includes(status)) return "failed";
-  if (["cancelled", "canceled", "interrupted", "rolled back", "rolled-back"].includes(status)) return "stopped";
+  if (["cancelled", "canceled"].includes(status)) return "cancelled";
+  if (["interrupted"].includes(status)) return "interrupted";
+  if (["rolled back", "rolled-back"].includes(status)) return "rolled-back";
+  if (["skipped"].includes(status)) return "skipped";
   return "unknown";
 }
+
+const TASK_TIMELINE_STATUS_LABELS = {
+  active: "Active",
+  blocked: "Blocked",
+  cancelled: "Cancelled",
+  done: "Done",
+  failed: "Failed",
+  interrupted: "Interrupted",
+  parked: "Parked",
+  queued: "Queued",
+  "rolled-back": "Rolled Back",
+  skipped: "Skipped",
+  unknown: "Unknown",
+};
 
 function taskStatusLabel(task) {
   const status = taskStatus(task).replaceAll("_", " ");
   return status || "unknown";
+}
+
+function taskTimelineStatusLabel(task) {
+  return TASK_TIMELINE_STATUS_LABELS[taskStatusKind(task)] || TASK_TIMELINE_STATUS_LABELS.unknown;
 }
 
 function taskIsActive(task) {
@@ -197,6 +233,28 @@ function taskDisplayTitle(task) {
   );
 }
 
+function taskBody(task) {
+  const terminalPlan = taskTerminalPlan(task);
+  return text(
+    task?.body
+      || task?.prompt
+      || task?.description
+      || task?.request
+      || terminalPlan?.description
+      || task?.start_task_plan,
+  );
+}
+
+function taskAgentLabel(task) {
+  return text(task?.coding_agent || task?.agent_kind || task?.agent || task?.agent_id);
+}
+
+function timelineTreeText(item) {
+  const depth = Math.max(0, Math.floor(numberValue(item?.lane, 0)));
+  const prefix = Array.from({ length: depth }, () => "|").join(" ");
+  return prefix ? `${prefix} *` : "*";
+}
+
 function buildTimelineItems(tasks) {
   const normalized = jsonArray(tasks)
     .map((task, index) => {
@@ -210,7 +268,8 @@ function buildTimelineItems(tasks) {
         label: taskDisplayTitle(task),
         startMs,
         statusKind: taskStatusKind(task),
-        statusLabel: taskStatusLabel(task),
+        statusLabel: taskTimelineStatusLabel(task),
+        rawStatusLabel: taskStatusLabel(task),
         task,
         taskId: text(task?.task_id || task?.id, `task-${index}`),
         updatedMs: taskUpdatedMs(task),
@@ -563,6 +622,21 @@ export default function ArchitectureWorkspaceView({
 
 function HistoryTimeline({ tasks, repoLabel }) {
   const timeline = useMemo(() => buildTimelineItems(tasks), [tasks]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+
+  useEffect(() => {
+    if (!timeline.rows.length) {
+      if (selectedTaskId) setSelectedTaskId("");
+      return;
+    }
+    if (!timeline.rows.some((item) => item.taskId === selectedTaskId)) {
+      setSelectedTaskId(timeline.rows[0].taskId);
+    }
+  }, [selectedTaskId, timeline.rows]);
+
+  const selectedItem = timeline.rows.find((item) => item.taskId === selectedTaskId)
+    || timeline.rows[0]
+    || null;
 
   if (!tasks.length) {
     return (
@@ -581,44 +655,144 @@ function HistoryTimeline({ tasks, repoLabel }) {
         </div>
         <TimelineSummary>{timeline.rows.length} task{timeline.rows.length === 1 ? "" : "s"} · newest first</TimelineSummary>
       </TimelineHeader>
-      <TimelineList style={{ "--timeline-lanes": timeline.laneCount }}>
-        {timeline.rows.map((item) => {
-          const startLabel = formatTime(item.startMs) || "unknown";
-          const finishLabel = item.endMs
-            ? formatTime(item.endMs)
-            : item.active ? "now" : "not finished";
-          const startClock = formatClockTime(item.startMs) || "unknown";
-          const finishClock = item.endMs
-            ? formatClockTime(item.endMs)
-            : item.active ? "now" : "open";
-          const duration = formatTimelineDuration(item.startMs, item.endMs, item.active);
-          const agent = text(item.task?.coding_agent || item.task?.agent_kind || item.task?.agent_id);
+      <HistorySplit>
+        <TimelineList aria-label="Task history timeline" style={{ "--timeline-lanes": timeline.laneCount }}>
+          {timeline.rows.map((item) => {
+            const startLabel = formatTime(item.startMs) || "unknown";
+            const finishLabel = item.endMs
+              ? formatTime(item.endMs)
+              : item.active ? "now" : "not finished";
+            const startClock = formatClockTime(item.startMs) || "unknown";
+            const finishClock = item.endMs
+              ? formatClockTime(item.endMs)
+              : item.active ? "now" : "open";
+            const duration = formatTimelineDuration(item.startMs, item.endMs, item.active);
+            const agent = taskAgentLabel(item.task);
 
-          return (
-            <TimelineRow data-status={item.statusKind} key={item.taskId} title={`${item.label}\n${startLabel} -> ${finishLabel}`}>
-              <TimelineTrack aria-hidden="true" style={{ "--timeline-lane": item.lane }}>
-                <span data-part="trunk" />
-                <span data-part="lane" />
-                <span data-part="connector" />
-                <span data-part="dot" />
-              </TimelineTrack>
-              <TimelineTask>
-                <TimelineTaskName>{item.label}</TimelineTaskName>
-                <TimelineTaskMeta>
-                  <StatusPill data-status={item.statusKind}>{item.statusLabel}</StatusPill>
-                  {agent && <span>{agent}</span>}
-                </TimelineTaskMeta>
-              </TimelineTask>
-              <TimelineTimes>
-                <strong>{startClock}</strong>
-                <span>{finishClock}</span>
-                {duration && <em>{duration}</em>}
-              </TimelineTimes>
-            </TimelineRow>
-          );
-        })}
-      </TimelineList>
+            return (
+              <TimelineRow
+                aria-pressed={selectedItem?.taskId === item.taskId}
+                data-selected={selectedItem?.taskId === item.taskId ? "true" : "false"}
+                data-status={item.statusKind}
+                key={item.taskId}
+                onClick={() => setSelectedTaskId(item.taskId)}
+                title={`${item.label}\n${startLabel} -> ${finishLabel}`}
+                type="button"
+              >
+                <TimelineTrack aria-hidden="true" style={{ "--timeline-lane": item.lane }}>
+                  <span data-part="trunk" />
+                  <span data-part="lane" />
+                  <span data-part="connector" />
+                  <span data-part="dot" />
+                </TimelineTrack>
+                <TimelineTask>
+                  <TimelineTaskLine>
+                    <TimelineTreeText aria-hidden="true">{timelineTreeText(item)}</TimelineTreeText>
+                    <TimelineTaskName>{item.label}</TimelineTaskName>
+                    <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
+                      {item.statusLabel}
+                    </StatusPill>
+                    {agent && <TimelineAgent>{agent}</TimelineAgent>}
+                  </TimelineTaskLine>
+                </TimelineTask>
+                <TimelineTimes>
+                  <strong>{startClock}</strong>
+                  <span>{finishClock}</span>
+                  {duration && <em>{duration}</em>}
+                </TimelineTimes>
+              </TimelineRow>
+            );
+          })}
+        </TimelineList>
+        <TaskDetailPanel item={selectedItem} repoLabel={repoLabel} />
+      </HistorySplit>
     </HistoryPane>
+  );
+}
+
+function TaskDetailPanel({ item, repoLabel }) {
+  if (!item) {
+    return (
+      <TaskDetails>
+        <EmptyState>Select a task to inspect it.</EmptyState>
+      </TaskDetails>
+    );
+  }
+
+  const task = item.task;
+  const terminalPlan = taskTerminalPlan(task);
+  const started = formatFullTime(item.startMs) || "unknown";
+  const finished = item.endMs
+    ? formatFullTime(item.endMs)
+    : item.active ? "now" : "open";
+  const duration = formatTimelineDuration(item.startMs, item.endMs, item.active) || "unknown";
+  const agent = taskAgentLabel(task) || "unknown";
+  const body = taskBody(task);
+  const title = item.label;
+  const taskId = text(task?.task_id || task?.id, item.taskId);
+  const planSteps = jsonArray(terminalPlan?.steps);
+
+  return (
+    <TaskDetails aria-label="Selected task details">
+      <TaskDetailsHeader>
+        <div>
+          <TimelineKicker>{repoLabel}</TimelineKicker>
+          <TaskDetailsTitle>{title}</TaskDetailsTitle>
+        </div>
+        <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
+          {item.statusLabel}
+        </StatusPill>
+      </TaskDetailsHeader>
+      <TaskFacts>
+        <TaskFact>
+          <span>Actual status</span>
+          <strong>{item.rawStatusLabel}</strong>
+        </TaskFact>
+        <TaskFact>
+          <span>Agent</span>
+          <strong>{agent}</strong>
+        </TaskFact>
+        <TaskFact>
+          <span>Started</span>
+          <strong>{started}</strong>
+        </TaskFact>
+        <TaskFact>
+          <span>Finished</span>
+          <strong>{finished}</strong>
+        </TaskFact>
+        <TaskFact>
+          <span>Duration</span>
+          <strong>{duration}</strong>
+        </TaskFact>
+      </TaskFacts>
+      {terminalPlan && (
+        <TaskPlanCard>
+          <TaskPlanHeader>
+            <span>Terminal plan</span>
+            <strong>{text(terminalPlan.title, title)}</strong>
+          </TaskPlanHeader>
+          {planSteps.length > 0 && (
+            <TaskPlanSteps>
+              {planSteps.slice(0, 5).map((step, index) => (
+                <li key={`${taskId}-step-${index}`}>
+                  {text(step?.step || step?.title || step, `Step ${index + 1}`)}
+                </li>
+              ))}
+            </TaskPlanSteps>
+          )}
+        </TaskPlanCard>
+      )}
+      {body && body !== title && (
+        <TaskBrief>
+          <span>Request</span>
+          <p>{body}</p>
+        </TaskBrief>
+      )}
+      <TaskDetailsFooter>
+        <span>Task id</span>
+        <code>{taskId}</code>
+      </TaskDetailsFooter>
+    </TaskDetails>
   );
 }
 
@@ -832,7 +1006,7 @@ const HistoryPane = styled.div`
   gap: 10px;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   padding: 16px;
 `;
 
@@ -875,29 +1049,90 @@ const TimelineSummary = styled.span`
   font-weight: 820;
 `;
 
+const HistorySplit = styled.div`
+  display: grid;
+  grid-template-columns: minmax(420px, 0.95fr) minmax(340px, 1.05fr);
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  @media (max-width: 920px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+`;
+
 const TimelineList = styled.div`
-  --timeline-track-width: calc(var(--timeline-lanes) * 18px + 20px);
+  --timeline-track-width: calc(var(--timeline-lanes) * 14px + 26px);
   display: grid;
   align-content: start;
   min-width: 0;
-  overflow: visible;
+  min-height: 0;
+  overflow: auto;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
 `;
 
-const TimelineRow = styled.div`
+const TimelineRow = styled.button`
   display: grid;
-  grid-template-columns: var(--timeline-track-width) minmax(0, 1fr) minmax(150px, 220px);
+  grid-template-columns: var(--timeline-track-width) minmax(0, 1fr) minmax(92px, 128px);
+  width: 100%;
   min-width: 0;
-  min-height: 58px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   color: var(--forge-text);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease, box-shadow 140ms ease;
+
+  &:hover {
+    background: rgba(148, 163, 184, 0.055);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.7);
+    outline-offset: -2px;
+  }
+
+  &[data-selected="true"] {
+    background: rgba(37, 99, 235, 0.13);
+    box-shadow: inset 2px 0 0 rgba(96, 165, 250, 0.75);
+  }
 
   &[data-status="active"] {
     background: rgba(37, 99, 235, 0.08);
   }
 
+  &[data-status="queued"] {
+    background: rgba(14, 165, 233, 0.055);
+  }
+
+  &[data-status="blocked"] {
+    background: rgba(217, 119, 6, 0.085);
+  }
+
   &[data-status="parked"] {
     background: rgba(217, 119, 6, 0.06);
+  }
+
+  &[data-selected="true"][data-status="active"] {
+    background: rgba(37, 99, 235, 0.16);
+  }
+
+  &[data-selected="true"][data-status="parked"] {
+    background: rgba(217, 119, 6, 0.12);
+  }
+
+  &[data-selected="true"][data-status="queued"] {
+    background: rgba(14, 165, 233, 0.12);
+  }
+
+  &[data-selected="true"][data-status="blocked"] {
+    background: rgba(217, 119, 6, 0.16);
   }
 
   @media (max-width: 700px) {
@@ -906,7 +1141,7 @@ const TimelineRow = styled.div`
 `;
 
 const TimelineTrack = styled.div`
-  --timeline-lane-x: calc(10px + var(--timeline-lane) * 18px);
+  --timeline-lane-x: calc(14px + var(--timeline-lane) * 14px);
   position: relative;
   min-width: 0;
 
@@ -918,34 +1153,35 @@ const TimelineTrack = styled.div`
 
   [data-part="trunk"],
   [data-part="lane"] {
-    top: 0;
-    bottom: 0;
+    top: -1px;
+    bottom: -1px;
     width: 2px;
     border-radius: 2px;
-    background: rgba(71, 85, 105, 0.72);
+    background: linear-gradient(180deg, rgba(71, 85, 105, 0.38), rgba(96, 165, 250, 0.5), rgba(71, 85, 105, 0.38));
   }
 
   [data-part="trunk"] {
-    left: 10px;
+    left: 14px;
   }
 
   [data-part="lane"] {
     left: var(--timeline-lane-x);
-    background: rgba(96, 165, 250, 0.5);
+    background: linear-gradient(180deg, rgba(96, 165, 250, 0.12), rgba(96, 165, 250, 0.56), rgba(96, 165, 250, 0.12));
   }
 
   [data-part="connector"] {
-    top: 28px;
-    left: 10px;
-    width: calc(var(--timeline-lane) * 18px);
-    height: 2px;
-    border-radius: 2px;
-    background: rgba(96, 165, 250, 0.5);
+    top: calc(50% - 11px);
+    left: 14px;
+    width: calc(var(--timeline-lane) * 14px);
+    height: 12px;
+    border-bottom: 2px solid rgba(96, 165, 250, 0.5);
+    border-left: 2px solid rgba(96, 165, 250, 0.24);
+    border-bottom-left-radius: 14px;
   }
 
   [data-part="dot"] {
-    top: 22px;
-    left: calc(var(--timeline-lane-x) - 5px);
+    top: calc(50% - 6px);
+    left: calc(var(--timeline-lane-x) - 6px);
     width: 12px;
     height: 12px;
     border: 2px solid rgba(15, 23, 42, 0.96);
@@ -954,7 +1190,7 @@ const TimelineTrack = styled.div`
     box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.5);
   }
 
-  ${TimelineRow}[data-status="completed"] & [data-part="dot"] {
+  ${TimelineRow}[data-status="done"] & [data-part="dot"] {
     background: #34d399;
     box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5);
   }
@@ -969,45 +1205,72 @@ const TimelineTrack = styled.div`
     box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.5);
   }
 
+  ${TimelineRow}[data-status="queued"] & [data-part="dot"] {
+    background: #38bdf8;
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.46);
+  }
+
+  ${TimelineRow}[data-status="blocked"] & [data-part="dot"] {
+    background: #f97316;
+    box-shadow: 0 0 0 1px rgba(249, 115, 22, 0.5);
+  }
+
   ${TimelineRow}[data-status="failed"] & [data-part="dot"],
-  ${TimelineRow}[data-status="stopped"] & [data-part="dot"] {
+  ${TimelineRow}[data-status="cancelled"] & [data-part="dot"],
+  ${TimelineRow}[data-status="interrupted"] & [data-part="dot"],
+  ${TimelineRow}[data-status="rolled-back"] & [data-part="dot"] {
     background: #fb7185;
     box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.5);
+  }
+
+  ${TimelineRow}[data-status="skipped"] & [data-part="dot"] {
+    background: #94a3b8;
+    box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.44);
   }
 `;
 
 const TimelineTask = styled.div`
   display: grid;
   align-content: center;
-  gap: 5px;
   min-width: 0;
-  padding: 9px 10px 9px 0;
+  padding: 7px 10px 7px 0;
+`;
+
+const TimelineTaskLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+`;
+
+const TimelineTreeText = styled.span`
+  flex: 0 0 auto;
+  min-width: 22px;
+  color: rgba(147, 197, 253, 0.68);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-weight: 820;
 `;
 
 const TimelineTaskName = styled.strong`
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.25;
 `;
 
-const TimelineTaskMeta = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 6px;
+const TimelineAgent = styled.span`
+  flex: 0 1 auto;
   min-width: 0;
-
-  > span:not([data-status]) {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--forge-text-muted);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 10px;
-    font-weight: 780;
-  }
+  overflow: hidden;
+  color: var(--forge-text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 780;
 `;
 
 const StatusPill = styled.span`
@@ -1020,7 +1283,7 @@ const StatusPill = styled.span`
   font-weight: 850;
   text-transform: uppercase;
 
-  &[data-status="completed"] {
+  &[data-status="done"] {
     border-color: rgba(52, 211, 153, 0.28);
     color: #a7f3d0;
     background: rgba(6, 78, 59, 0.2);
@@ -1032,6 +1295,18 @@ const StatusPill = styled.span`
     background: rgba(30, 64, 175, 0.2);
   }
 
+  &[data-status="queued"] {
+    border-color: rgba(56, 189, 248, 0.3);
+    color: #bae6fd;
+    background: rgba(8, 47, 73, 0.2);
+  }
+
+  &[data-status="blocked"] {
+    border-color: rgba(249, 115, 22, 0.32);
+    color: #fed7aa;
+    background: rgba(124, 45, 18, 0.2);
+  }
+
   &[data-status="parked"] {
     border-color: rgba(245, 158, 11, 0.3);
     color: #fde68a;
@@ -1039,28 +1314,37 @@ const StatusPill = styled.span`
   }
 
   &[data-status="failed"],
-  &[data-status="stopped"] {
+  &[data-status="interrupted"],
+  &[data-status="rolled-back"] {
     border-color: rgba(251, 113, 133, 0.3);
     color: #fecdd3;
     background: rgba(127, 29, 29, 0.18);
   }
+
+  &[data-status="cancelled"],
+  &[data-status="skipped"] {
+    border-color: rgba(148, 163, 184, 0.22);
+    color: #cbd5e1;
+    background: rgba(51, 65, 85, 0.18);
+  }
 `;
 
 const TimelineTimes = styled.div`
-  display: grid;
-  align-content: center;
-  justify-items: end;
-  gap: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   min-width: 0;
-  padding: 8px 0 8px 10px;
+  padding: 7px 0 7px 10px;
   color: var(--forge-text-muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 760;
+  white-space: nowrap;
 
   strong {
     min-width: 0;
     color: var(--forge-text);
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 850;
   }
 
@@ -1080,10 +1364,172 @@ const TimelineTimes = styled.div`
 
   @media (max-width: 700px) {
     grid-column: 2;
-    grid-template-columns: auto auto minmax(0, 1fr);
     justify-items: start;
     gap: 8px;
     padding: 0 0 10px;
+  }
+`;
+
+const TaskDetails = styled.aside`
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.28);
+`;
+
+const TaskDetailsHeader = styled.header`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+`;
+
+const TaskDetailsTitle = styled.strong`
+  display: block;
+  min-width: 0;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--forge-text);
+  font-size: 16px;
+  line-height: 1.25;
+`;
+
+const TaskFacts = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const TaskFact = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.34);
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 820;
+  }
+`;
+
+const TaskPlanCard = styled.div`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  border-radius: 8px;
+  background: rgba(30, 64, 175, 0.12);
+`;
+
+const TaskPlanHeader = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+    font-weight: 860;
+  }
+`;
+
+const TaskPlanSteps = styled.ol`
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: rgba(203, 213, 225, 0.82);
+  font-size: 11px;
+  font-weight: 720;
+  line-height: 1.35;
+
+  li {
+    padding-left: 2px;
+  }
+`;
+
+const TaskBrief = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  p {
+    max-height: 110px;
+    margin: 0;
+    overflow: auto;
+    color: rgba(203, 213, 225, 0.84);
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.45;
+  }
+`;
+
+const TaskDetailsFooter = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding-top: 2px;
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  code {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(191, 219, 254, 0.86);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 11px;
   }
 `;
 
