@@ -34,6 +34,7 @@ pub const REPO_ID: &str = "local";
 pub struct StorageEnsureDiagnostics {
     pub ensured_directories: Vec<String>,
     pub created_directories: Vec<String>,
+    pub migrated_private_state_paths: Vec<String>,
     pub removed_mcp_temp_files: Vec<String>,
 }
 
@@ -42,9 +43,11 @@ impl StorageEnsureDiagnostics {
         json!({
             "ensured_directories": self.ensured_directories,
             "created_directories": self.created_directories,
+            "migrated_private_state_paths": self.migrated_private_state_paths,
             "removed_mcp_temp_files": self.removed_mcp_temp_files,
             "ensured_directory_count": self.ensured_directories.len(),
             "created_directory_count": self.created_directories.len(),
+            "migrated_private_state_path_count": self.migrated_private_state_paths.len(),
             "removed_mcp_temp_file_count": self.removed_mcp_temp_files.len(),
         })
     }
@@ -123,8 +126,8 @@ pub struct StoragePaths {
 
 impl StoragePaths {
     pub fn new(repo_path: PathBuf, db_path: Option<PathBuf>) -> Self {
-        let agents_root = coordination_repo_state_root(&repo_path);
-        let worktrees_root = repo_path.join(".agents").join("worktrees");
+        let agents_root = repo_path.join(".agents");
+        let worktrees_root = agents_root.join("worktrees");
         Self {
             db_path: db_path.unwrap_or_else(|| agents_root.join("kernel.sqlite")),
             artifacts_root: agents_root.join("artifacts"),
@@ -139,6 +142,7 @@ impl StoragePaths {
 
     pub fn ensure(&self) -> Result<StorageEnsureDiagnostics, String> {
         let mut diagnostics = StorageEnsureDiagnostics::default();
+        diagnostics.migrated_private_state_paths = migrate_legacy_private_state(self)?;
         for path in [
             &self.agents_root,
             &self.artifacts_root,
@@ -183,6 +187,120 @@ impl StoragePaths {
 
         Ok(diagnostics)
     }
+}
+
+fn migrate_legacy_private_state(paths: &StoragePaths) -> Result<Vec<String>, String> {
+    let default_visible_db_path = paths.agents_root.join("kernel.sqlite");
+    if process_path_text(&paths.db_path) != process_path_text(&default_visible_db_path) {
+        return Ok(Vec::new());
+    }
+    if paths.db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let legacy_root = coordination_repo_state_root(&paths.repo_path);
+    if process_path_text(&legacy_root) == process_path_text(&paths.agents_root) {
+        return Ok(Vec::new());
+    }
+
+    let legacy_db_path = legacy_root.join("kernel.sqlite");
+    if !legacy_db_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    fs::create_dir_all(&paths.agents_root).map_err(|error| {
+        format!(
+            "Unable to create visible coordination root {}: {error}",
+            paths.agents_root.display()
+        )
+    })?;
+
+    let mut migrated = Vec::new();
+    for name in [
+        "kernel.sqlite",
+        "kernel.sqlite-wal",
+        "kernel.sqlite-shm",
+        "artifacts",
+        "memory",
+        "mcp",
+        "cloud",
+        "db",
+    ] {
+        let source = legacy_root.join(name);
+        if !source.exists() {
+            continue;
+        }
+        copy_legacy_private_state_path(&source, &paths.agents_root.join(name), &mut migrated)?;
+    }
+
+    Ok(migrated)
+}
+
+fn copy_legacy_private_state_path(
+    source: &Path,
+    destination: &Path,
+    migrated: &mut Vec<String>,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "Unable to inspect legacy coordination state {}: {error}",
+            source.display()
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        fs::create_dir_all(destination).map_err(|error| {
+            format!(
+                "Unable to create migrated coordination directory {}: {error}",
+                destination.display()
+            )
+        })?;
+        for entry in fs::read_dir(source).map_err(|error| {
+            format!(
+                "Unable to read legacy coordination directory {}: {error}",
+                source.display()
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "Unable to read legacy coordination directory entry {}: {error}",
+                    source.display()
+                )
+            })?;
+            copy_legacy_private_state_path(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                migrated,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !metadata.is_file() || destination.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create migrated coordination parent {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::copy(source, destination).map_err(|error| {
+        format!(
+            "Unable to migrate coordination state from {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    migrated.push(process_path_text(destination));
+    Ok(())
 }
 
 pub fn coordination_repo_state_root(repo_path: &Path) -> PathBuf {

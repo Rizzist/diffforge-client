@@ -555,14 +555,23 @@ function normalizeWorkspaceGitPullRepository(repository) {
   const path = String(repository?.path || "").trim();
   const name = String(repository?.name || "").trim() || getDirectoryName(path) || "repository";
   const relativePath = String(repository?.relativePath || "").trim();
+  const statusCounts = repository?.statusCounts && typeof repository.statusCounts === "object"
+    ? repository.statusCounts
+    : {};
   return {
     path,
     name,
     relativePath,
     branch: String(repository?.branch || "").trim(),
+    headSha: String(repository?.headSha || "").trim(),
     upstream: String(repository?.upstream || "").trim(),
     ahead: Number(repository?.ahead) || 0,
     behind: Number(repository?.behind) || 0,
+    dirty: Boolean(repository?.dirty),
+    statusCounts,
+    operationState: repository?.operationState || null,
+    fetchOk: Boolean(repository?.fetchOk),
+    fetchError: String(repository?.fetchError || "").trim(),
     reason: String(repository?.reason || "").trim(),
     pullable: Boolean(repository?.pullable),
   };
@@ -2772,7 +2781,6 @@ function normalizeTerminalLiveSessionsPayload(payload) {
 function appCloseTerminalRiskLabel(risk) {
   if (risk === "working") return "Working";
   if (risk === "needs_input") return "Needs input";
-  if (risk === "open_unknown") return "Open";
   if (risk === "error") return "Error";
   return "Idle";
 }
@@ -3123,6 +3131,32 @@ function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
       projectKind: "workspace_root",
     }),
   ].filter(Boolean);
+}
+
+function workspaceCoordinationTargetRepoLabel(target) {
+  const relativePath = String(target?.workspaceRelativePath || "").trim();
+  const projectName = String(target?.projectName || "").trim();
+  const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || "");
+  return relativePath || projectName || getDirectoryName(repoPath) || repoPath || "Repository";
+}
+
+function workspaceCoordinationTargetIsGitRepo(target) {
+  return Boolean(target?.hasGit || target?.projectKind === "git_repo");
+}
+
+function dedupeWorkspaceCoordinationTargets(targets) {
+  const seen = new Set();
+  return (Array.isArray(targets) ? targets : [])
+    .map((target) => normalizeWorkspaceCoordinationTarget(target))
+    .filter(Boolean)
+    .filter((target) => {
+      const key = getWorkspaceRootIdentity(target.repoPath);
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
 }
 
 function isWindowsSystemRootDirectory(value) {
@@ -4199,6 +4233,7 @@ export default function App() {
   const [workspaceSettingsModalId, setWorkspaceSettingsModalId] = useState("");
   const [workspaceDeleteConfirmId, setWorkspaceDeleteConfirmId] = useState("");
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
+  const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -4219,6 +4254,7 @@ export default function App() {
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
+  const [cloudSqliteResetSelectedRepoPath, setCloudSqliteResetSelectedRepoPath] = useState("");
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
   );
@@ -8412,8 +8448,19 @@ export default function App() {
           || presenceTerminal?.terminal_readiness
           || "",
       ).trim().toLowerCase();
+      const presenceHasNonIdleStatus = [
+        presenceRailState,
+        presenceExecutionPhase,
+        presenceTurnStatus,
+        presenceReadiness,
+      ].some((status) => (
+        terminalActivityStatusIsBusy(status)
+          || terminalActivityStatusIsPaused(status)
+          || ["error", "failed", "failure"].includes(status)
+      ));
       const presenceSaysIdle = Boolean(
         presenceTerminal
+          && !presenceHasNonIdleStatus
           && (
             ["idle", "ready", "prompt_ready", "input_ready"].includes(presenceRailState)
               || ["idle", "completed", "complete", "done", "interrupted", "cancelled", "canceled"].includes(presenceExecutionPhase)
@@ -8461,29 +8508,23 @@ export default function App() {
         ["thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
           || (
-            !activityStatus
-            && !presenceTerminal
-            && Boolean(session.hasActiveTask || session.activeTask)
+            Boolean(session.hasActiveTask || session.activeTask)
+            && (!presenceTerminal || !isReady)
           )
       );
-      const needsInput = !presenceSaysIdle && Boolean(
-        visibleStatus === "paused"
-          || session.parked
+      const needsInput = Boolean(
+        session.parked
           || session.parkedPrompt
           || groundTruth.terminalIsParked
           || groundTruth.terminalIsPromptingUser
-          || (!activityStatus && terminalWorkState === "parked")
-          || (!activityStatus && terminalWorkState === "prompting_user")
+          || terminalWorkState === "parked"
+          || terminalWorkState === "prompting_user"
+          || (!presenceSaysIdle && visibleStatus === "paused")
       );
       const hasError = Boolean(
         visibleStatus === "error"
-          || (!activityStatus && terminalWorkState === "error")
+          || terminalWorkState === "error"
           || readiness === "error"
-      );
-      const isUnknownOpen = Boolean(
-        !presenceTerminal
-          || (!isReady && agentId === WORKSPACE_TERMINAL_ROLE_GENERIC)
-          || (!isReady && !isWorking && !needsInput && !hasError)
       );
       const risk = needsInput
         ? "needs_input"
@@ -8491,9 +8532,7 @@ export default function App() {
           ? "working"
           : hasError
             ? "error"
-            : isUnknownOpen
-              ? "open_unknown"
-              : "idle";
+            : "idle";
 
       if (risk === "idle") {
         return;
@@ -10850,20 +10889,48 @@ export default function App() {
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
-  const cloudSqliteResetTarget = activatedWorkspace || selectedWorkspace || defaultWorkspace || null;
-  const cloudSqliteResetTargetId = String(cloudSqliteResetTarget?.id || "").trim();
-  const cloudSqliteResetTargetName = String(cloudSqliteResetTarget?.name || "").trim();
-  const cloudSqliteResetRepoPath = cloudSqliteResetTargetId
-    ? getWorkspaceRootDirectory(workspaceSettings, cloudSqliteResetTargetId) || defaultWorkingDirectory
+  const cloudSqliteResetWorkspace = activatedWorkspace || selectedWorkspace || defaultWorkspace || null;
+  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetWorkspace?.id || "").trim();
+  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetWorkspace?.name || "").trim();
+  const cloudSqliteResetWorkspaceRoot = cloudSqliteResetWorkspaceId
+    ? getWorkspaceRootDirectory(workspaceSettings, cloudSqliteResetWorkspaceId) || defaultWorkingDirectory
     : "";
+  const cloudSqliteResetRepoTargets = useMemo(() => {
+    const targets = dedupeWorkspaceCoordinationTargets(
+      getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        cloudSqliteResetWorkspaceRoot,
+      ),
+    );
+    const gitTargets = targets.filter(workspaceCoordinationTargetIsGitRepo);
+    return gitTargets.length ? gitTargets : targets;
+  }, [cloudSqliteResetWorkspaceRoot, workspaceCoordinationTargetsByRoot]);
+  const cloudSqliteResetRepoPath = useMemo(() => {
+    const selectedKey = getWorkspaceRootIdentity(cloudSqliteResetSelectedRepoPath);
+    const selectedTarget = selectedKey
+      ? cloudSqliteResetRepoTargets.find((target) => getWorkspaceRootIdentity(target.repoPath) === selectedKey)
+      : null;
+    return selectedTarget?.repoPath || cloudSqliteResetRepoTargets[0]?.repoPath || "";
+  }, [cloudSqliteResetRepoTargets, cloudSqliteResetSelectedRepoPath]);
+  const cloudSqliteResetRepoTarget = useMemo(() => {
+    const repoKey = getWorkspaceRootIdentity(cloudSqliteResetRepoPath);
+    return repoKey
+      ? cloudSqliteResetRepoTargets.find((target) => getWorkspaceRootIdentity(target.repoPath) === repoKey) || null
+      : null;
+  }, [cloudSqliteResetRepoPath, cloudSqliteResetRepoTargets]);
+  const cloudSqliteResetRepoLabel = workspaceCoordinationTargetRepoLabel(cloudSqliteResetRepoTarget);
   const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
     || cloudSqliteResetState === "resetting";
-  const isCloudSqliteClientResetting = cloudSqliteResetState === "client_resetting"
+  const isCloudSqliteRepoResetting = cloudSqliteResetState === "repo_resetting"
     || cloudSqliteResetState === "resetting";
-  const isCloudSqliteAccountResetting = cloudSqliteResetState === "account_resetting";
   const cloudSqliteResetDisabled = isCloudSqliteResetting
-    || !cloudSqliteResetTargetId
+    || !cloudSqliteResetWorkspaceId
     || !cloudSqliteResetRepoPath;
+  useEffect(() => {
+    if (cloudSqliteResetRepoPath !== cloudSqliteResetSelectedRepoPath) {
+      setCloudSqliteResetSelectedRepoPath(cloudSqliteResetRepoPath);
+    }
+  }, [cloudSqliteResetRepoPath, cloudSqliteResetSelectedRepoPath]);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const workspaceGitPullSelectedPaths = useMemo(
@@ -10900,6 +10967,87 @@ export default function App() {
     }
     setWorkspaceGitPullPrompt(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   }, [workspaceGitPullPrompt.checkKey]);
+  const refreshWorkspaceGitRepositoryPreload = useCallback(async ({
+    refresh = false,
+    rootDirectory = "",
+    workspaceId = "",
+    workspaceName = "",
+  } = {}) => {
+    const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
+
+    if (!checkKey) {
+      return {
+        allRepositories: [],
+        checkKey: "",
+        pullableRepositories: [],
+        response: null,
+      };
+    }
+
+    setWorkspaceGitRepositoryPreloads((current) => ({
+      ...current,
+      [checkKey]: {
+        ...(current[checkKey] || {}),
+        state: "loading",
+        workspaceId,
+        rootDirectory,
+        checkKey,
+        repositories: current[checkKey]?.repositories || [],
+        error: "",
+      },
+    }));
+
+    try {
+      const response = await invoke("workspace_git_pull_candidates", {
+        repoPath: rootDirectory,
+        workspaceId,
+        workspaceName,
+        refresh,
+      });
+      const allRepositories = Array.isArray(response?.repositories)
+        ? response.repositories
+          .map(normalizeWorkspaceGitPullRepository)
+          .filter((repository) => repository.path)
+        : [];
+      const pullableRepositories = allRepositories.filter((repository) => repository.pullable);
+
+      setWorkspaceGitRepositoryPreloads((current) => ({
+        ...current,
+        [checkKey]: {
+          state: "ready",
+          workspaceId,
+          rootDirectory,
+          checkKey,
+          repositories: allRepositories,
+          cache: response?.cache || null,
+          generatedAtMs: Number(response?.generatedAtMs) || Date.now(),
+          error: "",
+        },
+      }));
+
+      return {
+        allRepositories,
+        checkKey,
+        pullableRepositories,
+        response,
+      };
+    } catch (error) {
+      const errorMessage = getErrorMessage(error, "Unable to check Git repositories.");
+      setWorkspaceGitRepositoryPreloads((current) => ({
+        ...current,
+        [checkKey]: {
+          ...(current[checkKey] || {}),
+          state: "error",
+          workspaceId,
+          rootDirectory,
+          checkKey,
+          repositories: current[checkKey]?.repositories || [],
+          error: errorMessage,
+        },
+      }));
+      throw error;
+    }
+  }, []);
   const pullSelectedWorkspaceGitRepositories = useCallback(async () => {
     if (!workspaceGitPullSelectedPaths.length) {
       setWorkspaceGitPullPrompt((current) => ({
@@ -10947,6 +11095,12 @@ export default function App() {
           ? `Pulled ${pulledCount} repository${pulledCount === 1 ? "" : "ies"}.`
           : "Repositories were already current.",
       });
+      void refreshWorkspaceGitRepositoryPreload({
+        refresh: true,
+        rootDirectory: workspaceGitPullPrompt.rootDirectory,
+        workspaceId: workspaceGitPullPrompt.workspaceId,
+        workspaceName: selectedWorkspace?.name || "",
+      });
     } catch (error) {
       if (workspaceGitPullPromptCheckRef.current !== checkKey) {
         return;
@@ -10958,13 +11112,21 @@ export default function App() {
         message: "",
       }));
     }
-  }, [workspaceGitPullPrompt.checkKey, workspaceGitPullSelectedPaths]);
+  }, [
+    refreshWorkspaceGitRepositoryPreload,
+    selectedWorkspace?.name,
+    workspaceGitPullPrompt.checkKey,
+    workspaceGitPullPrompt.rootDirectory,
+    workspaceGitPullPrompt.workspaceId,
+    workspaceGitPullSelectedPaths,
+  ]);
 
   useEffect(() => {
     const workspaceId = selectedWorkspace?.id || "";
     const workspaceNameForCheck = selectedWorkspace?.name || "";
     const rootDirectory = selectedWorkspaceFileRoot || "";
     const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
+    const existingPreload = checkKey ? workspaceGitRepositoryPreloads[checkKey] : null;
 
     if (authState !== "authenticated" || shouldShowWorkspaceSetup || !workspaceId || !rootDirectory) {
       workspaceGitPullPromptCheckRef.current = "";
@@ -10974,8 +11136,9 @@ export default function App() {
 
     if (
       !checkKey
-        || workspaceGitPullPromptSkippedRef.current.has(checkKey)
         || workspaceGitPullPromptCheckRef.current === checkKey
+        || existingPreload?.state === "loading"
+        || existingPreload?.state === "ready"
     ) {
       return undefined;
     }
@@ -10990,22 +11153,17 @@ export default function App() {
       checkKey,
     });
 
-    invoke("workspace_git_pull_candidates", {
-      repoPath: rootDirectory,
+    refreshWorkspaceGitRepositoryPreload({
+      refresh: false,
+      rootDirectory,
       workspaceId,
       workspaceName: workspaceNameForCheck,
-      refresh: false,
     })
-      .then((response) => {
+      .then(({ response, pullableRepositories }) => {
         if (cancelled || workspaceGitPullPromptCheckRef.current !== checkKey) {
           return;
         }
-        const repositories = Array.isArray(response?.repositories)
-          ? response.repositories
-            .map(normalizeWorkspaceGitPullRepository)
-            .filter((repository) => repository.path && repository.pullable)
-          : [];
-        if (!repositories.length) {
+        if (workspaceGitPullPromptSkippedRef.current.has(checkKey) || !pullableRepositories.length) {
           setWorkspaceGitPullPrompt({
             ...WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE,
             workspaceId,
@@ -11020,8 +11178,8 @@ export default function App() {
           workspaceId,
           rootDirectory,
           checkKey,
-          repositories,
-          selected: Object.fromEntries(repositories.map((repository) => [repository.path, true])),
+          repositories: pullableRepositories,
+          selected: Object.fromEntries(pullableRepositories.map((repository) => [repository.path, true])),
           blockedCount: Number(response?.blockedCount) || 0,
         });
       })
@@ -11047,6 +11205,8 @@ export default function App() {
     selectedWorkspace?.name,
     selectedWorkspaceFileRoot,
     shouldShowWorkspaceSetup,
+    refreshWorkspaceGitRepositoryPreload,
+    workspaceGitRepositoryPreloads,
   ]);
   const isWorkspaceSettingsDeactivating = Boolean(
     workspaceDeactivationState.isActive
@@ -11063,44 +11223,34 @@ export default function App() {
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
 
-  const hardResetCloudSqlite = useCallback(async (resetScope = "client") => {
+  const hardResetCloudSqlite = useCallback(async () => {
     setCloudSqliteResetMessage("");
     setCloudSqliteResetError("");
 
-    if (!cloudSqliteResetTargetId || !cloudSqliteResetRepoPath) {
-      setCloudSqliteResetError("Choose or activate a workspace before resetting cloud SQLite.");
+    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetRepoPath) {
+      setCloudSqliteResetError("Choose a repository before resetting cloud SQLite.");
       return;
     }
 
-    const isAccountReset = resetScope === "account";
     const confirmed = window.confirm(
-      isAccountReset
-        ? "Hard reset cloud SQLite for this signed-in Appwrite account? This clears every cloud client store for the account, including duplicate device/client activations, task history, runtime state, logs, MCP state, terminal presence, and Architecture working state. Diff Forge AI credit usage is kept in the cloud credit ledger."
-        : "Hard reset cloud SQLite for the current cloud client? This deletes voice orchestrator history, task history, synced devices, cloud logs, MCP state, terminal presence, and Architecture task state for this client. The cloud checkpoint is refreshed.",
+      `Hard reset cloud SQLite for ${cloudSqliteResetRepoLabel}? This clears cloud runtime state, task history, logs, MCP state, terminal presence, and Architecture task state for the selected repository. The cloud checkpoint is refreshed.`,
     );
     if (!confirmed) {
       return;
     }
 
-    setCloudSqliteResetState(isAccountReset ? "account_resetting" : "client_resetting");
+    setCloudSqliteResetState("repo_resetting");
     try {
       const response = await invoke("cloud_mcp_hard_reset_cloud_sqlite", {
         repoPath: cloudSqliteResetRepoPath,
-        workspaceId: cloudSqliteResetTargetId,
-        workspaceName: cloudSqliteResetTargetName || null,
-        resetScope: isAccountReset ? "account" : "client",
+        workspaceId: cloudSqliteResetWorkspaceId,
+        workspaceName: cloudSqliteResetWorkspaceName || null,
+        resetScope: "repo",
       });
       const data = unwrapCloudCommandData(response, {});
-      const resetMode = data?.reset_mode || data?.resetMode || "";
-      const fullAccountWipe = isAccountReset && resetMode === "account_full_sqlite_wipe";
-      const preservedCreditRows = Object.entries(data?.preserved || {})
-        .filter(([key]) => key.startsWith("credit_"))
-        .reduce((total, [, value]) => total + Number(value || 0), 0);
       const backups = Array.isArray(data?.backups) ? data.backups : [];
       const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
       const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
-      const resetClientCount = Math.max(1, Number(data?.reset_client_count || 1));
-      const creditUsageLabel = preservedCreditRows === 1 ? "credit ledger row" : "credit ledger rows";
       let checkpointMessage = "cloud checkpoint refresh skipped";
       if (backgroundCheckpoint?.queued) {
         checkpointMessage = "queued cloud checkpoint refresh";
@@ -11109,16 +11259,13 @@ export default function App() {
       } else if (updatedBackupCount > 0) {
         checkpointMessage = "refreshed cloud checkpoint";
       }
-      const resetSummary = fullAccountWipe
-        ? `Cleared all account SQLite data across ${resetClientCount} ${resetClientCount === 1 ? "client" : "clients"}; preserved ${preservedCreditRows} ${creditUsageLabel} and ${checkpointMessage}.`
-        : `Cleared current client cloud SQLite state and ${checkpointMessage}.`;
       tokenomicsSyncCursorRef.current = "";
       const forceTokenomicsResync = tokenomicsForceResyncRef.current;
       if (typeof forceTokenomicsResync === "function") {
         await forceTokenomicsResync();
       }
       setCloudSqliteResetMessage(
-        `Cloud SQLite ${isAccountReset ? "account" : "client"} reset complete. ${resetSummary}`,
+        `Cloud SQLite repo reset complete for ${cloudSqliteResetRepoLabel}; ${checkpointMessage}.`,
       );
     } catch (error) {
       setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
@@ -11126,9 +11273,10 @@ export default function App() {
       setCloudSqliteResetState("idle");
     }
   }, [
+    cloudSqliteResetRepoLabel,
     cloudSqliteResetRepoPath,
-    cloudSqliteResetTargetId,
-    cloudSqliteResetTargetName,
+    cloudSqliteResetWorkspaceId,
+    cloudSqliteResetWorkspaceName,
   ]);
 
   useEffect(() => {
@@ -15320,9 +15468,13 @@ export default function App() {
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
-                            terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
-                            terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
-                            terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
+	                            terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
+	                            terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
+	                            terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
+	                              workspaceCoordinationTargetsByRoot,
+	                              runtimeDescriptor.workingDirectory,
+	                            )}
+	                            terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
                             agentStatusError={agentStatusError}
                             agentStatuses={agentStatuses}
@@ -15333,6 +15485,9 @@ export default function App() {
                             createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                             createFirstWorkspace={createFirstWorkspace}
                             chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
+                            gitRepositoriesPreload={workspaceGitRepositoryPreloads[
+                              workspaceGitPullPromptCheckKey(runtimeWorkspace.id, runtimeDescriptor.workingDirectory)
+                            ] || null}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
                             isWorkspaceRuntimeVisible={runtimeVisible}
@@ -15342,6 +15497,7 @@ export default function App() {
                             onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
                             onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
+                            onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
                             refreshAgentStatuses={refreshAgentStatuses}
@@ -15741,39 +15897,60 @@ export default function App() {
                       </div>
                     </PanelHeaderRow>
 
-                    <AccountCard data-tone="orange">
-                      <AccountCardHeader>
-                        <div>
-                          <SettingsLabel>Hard reset</SettingsLabel>
-                          <SettingsValue>Reset cloud SQLite</SettingsValue>
-                          <SettingsHint>
-                            Client reset clears this desktop client's cloud runtime state. Account reset clears every local cloud SQLite row for the signed-in account except local credit-ledger rows, if present.
-                          </SettingsHint>
-                        </div>
-                        <AgentReadyPill data-tone="orange">
+	                    <AccountCard data-tone="orange">
+	                      <AccountCardHeader>
+	                        <div>
+	                          <SettingsLabel>Hard reset</SettingsLabel>
+	                          <SettingsValue>Reset cloud SQLite</SettingsValue>
+	                          <SettingsHint>
+	                            Reset the selected repository's cloud runtime state and keep the workspace/account intact.
+	                          </SettingsHint>
+	                        </div>
+	                        <AgentReadyPill data-tone="orange">
                           {isCloudSqliteResetting ? (
                             <PendingIcon aria-hidden="true" />
                           ) : (
                             <ButtonRefreshIcon aria-hidden="true" />
                           )}
-                          <span>{isCloudSqliteResetting ? "Resetting" : "Checkpoint"}</span>
-                        </AgentReadyPill>
-                      </AccountCardHeader>
+	                          <span>{isCloudSqliteResetting ? "Resetting" : "Checkpoint"}</span>
+	                        </AgentReadyPill>
+	                      </AccountCardHeader>
 
-                      <SettingsIdentityGrid>
-                        <SettingsIdentityItem>
-                          <span>Target</span>
-                          <strong>{cloudSqliteResetTargetName || "No workspace"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Graph</span>
-                          <strong>Task history</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Remote</span>
-                          <strong>Cloud checkpoint</strong>
-                        </SettingsIdentityItem>
-                      </SettingsIdentityGrid>
+	                      <SetupField>
+	                        <SettingsLabel>Repository</SettingsLabel>
+	                        <WorkspaceSettingsSelectShell>
+	                          <WorkspaceSettingsSelect
+	                            disabled={isCloudSqliteResetting || cloudSqliteResetRepoTargets.length === 0}
+	                            onChange={(event) => setCloudSqliteResetSelectedRepoPath(event.target.value)}
+	                            value={cloudSqliteResetRepoPath}
+	                          >
+	                            {cloudSqliteResetRepoTargets.length === 0 ? (
+	                              <option value="">No git repositories found</option>
+	                            ) : cloudSqliteResetRepoTargets.map((target) => (
+	                              <option key={target.repoPath} value={target.repoPath}>
+	                                {workspaceCoordinationTargetRepoLabel(target)}
+	                              </option>
+	                            ))}
+	                          </WorkspaceSettingsSelect>
+	                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
+	                        </WorkspaceSettingsSelectShell>
+	                        <SettingsHint>{cloudSqliteResetRepoPath || "Select a workspace with a git repository."}</SettingsHint>
+	                      </SetupField>
+
+	                      <SettingsIdentityGrid>
+	                        <SettingsIdentityItem>
+	                          <span>Workspace</span>
+	                          <strong>{cloudSqliteResetWorkspaceName || "No workspace"}</strong>
+	                        </SettingsIdentityItem>
+	                        <SettingsIdentityItem>
+	                          <span>Repo</span>
+	                          <strong>{cloudSqliteResetRepoPath ? cloudSqliteResetRepoLabel : "None"}</strong>
+	                        </SettingsIdentityItem>
+	                        <SettingsIdentityItem>
+	                          <span>Local</span>
+	                          <strong>.agents</strong>
+	                        </SettingsIdentityItem>
+	                      </SettingsIdentityGrid>
 
                       {cloudSqliteResetError && <FormMessage $state="error">{cloudSqliteResetError}</FormMessage>}
                       {cloudSqliteResetMessage && (
@@ -15782,28 +15959,20 @@ export default function App() {
                         </AgentInstallMessage>
                       )}
 
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          Use client reset for this desktop client. Use account reset when old duplicate devices or pre-standardization client stores are still visible.
-                        </SettingsHint>
-                        <PrimaryDangerButton
-                          disabled={cloudSqliteResetDisabled}
-                          onClick={() => hardResetCloudSqlite("client")}
-                          type="button"
-                        >
-                          {isCloudSqliteClientResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteClientResetting ? "Resetting..." : "Reset current client"}</span>
-                        </PrimaryDangerButton>
-                        <PrimaryDangerButton
-                          disabled={cloudSqliteResetDisabled}
-                          onClick={() => hardResetCloudSqlite("account")}
-                          type="button"
-                        >
-                          {isCloudSqliteAccountResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteAccountResetting ? "Resetting..." : "Reset account state"}</span>
-                        </PrimaryDangerButton>
-                      </AccountCardFooter>
-                    </AccountCard>
+	                      <AccountCardFooter>
+	                        <SettingsHint>
+	                          Reset only the selected repo's cloud SQLite scope.
+	                        </SettingsHint>
+	                        <PrimaryDangerButton
+	                          disabled={cloudSqliteResetDisabled}
+	                          onClick={hardResetCloudSqlite}
+	                          type="button"
+	                        >
+	                          {isCloudSqliteRepoResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+	                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset selected repo"}</span>
+	                        </PrimaryDangerButton>
+	                      </AccountCardFooter>
+	                    </AccountCard>
                   </AccountSettingsPanel>
 
                   <AccountSettingsPanel>
@@ -16710,7 +16879,7 @@ export default function App() {
                         {workspace.workspaceName}
                       </CrashRecoveryItemTitle>
                       <CrashRecoveryItemBody>
-                        {workspace.terminals.length} active {workspace.terminals.length === 1 ? "terminal" : "terminals"}
+                        {workspace.terminals.length} non-idle {workspace.terminals.length === 1 ? "terminal" : "terminals"}
                       </CrashRecoveryItemBody>
                       {workspace.terminals.map((terminal) => (
                         <CrashRecoveryMeta key={`${terminal.paneId}:${terminal.instanceId}`}>

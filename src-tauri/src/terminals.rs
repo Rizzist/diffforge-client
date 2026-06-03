@@ -2210,26 +2210,6 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn workspace_git_repository_summary(root: &Path, workspace_root: &Path) -> Value {
-    let branch = workspace_git_current_branch(root);
-    let upstream = workspace_git_upstream(root);
-    let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
-    let files = workspace_git_status_files(root);
-    let counts = workspace_git_status_counts(&files);
-    json!({
-        "path": workspace_path_display(root),
-        "name": root.file_name().and_then(|value| value.to_str()).unwrap_or("repository"),
-        "relativePath": child_relative_path(workspace_root, root).unwrap_or_default(),
-        "branch": branch,
-        "headSha": workspace_git_head_sha(root),
-        "upstream": upstream,
-        "ahead": ahead,
-        "behind": behind,
-        "dirty": !files.is_empty(),
-        "statusCounts": counts,
-    })
-}
-
 fn workspace_git_discovered_repositories(
     workspace_root: &Path,
     mounts: &[WorkspaceProjectMount],
@@ -2598,50 +2578,6 @@ fn workspace_git_generated_commit_message(root: &Path) -> Value {
         "summary": title,
         "files": files,
     })
-}
-
-#[tauri::command]
-async fn workspace_git_repositories(
-    state: State<'_, TerminalState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-    refresh: Option<bool>,
-) -> Result<Value, String> {
-    ensure_app_not_shutting_down("workspace Git repositories")?;
-    let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
-    let force_refresh = refresh.unwrap_or(false);
-    let mut topology = if force_refresh {
-        terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
-    } else {
-        terminal_workspace_topology_cached_scan(
-            &state.workspace_topology_cache,
-            &workspace_root,
-            terminal_now_ms(),
-        )
-        .await
-    };
-    if !force_refresh && topology.cache_status == "missing" {
-        topology = terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
-    }
-    let repos = workspace_git_discovered_repositories(&workspace_root, &topology.mounts)
-        .into_iter()
-        .map(|repo| workspace_git_repository_summary(&repo, &workspace_root))
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "generatedAtMs": terminal_now_ms(),
-        "workspaceId": workspace_id.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
-        "root": workspace_path_display(&workspace_root),
-        "repositories": repos,
-        "cache": {
-            "key": topology.cache_key,
-            "status": topology.cache_status,
-            "hit": topology.cache_hit,
-            "scannedAtMs": topology.scanned_ms,
-            "ageMs": terminal_now_ms().saturating_sub(topology.scanned_ms),
-        },
-    }))
 }
 
 #[tauri::command]
@@ -6535,12 +6471,49 @@ fn register_terminal_coordination_event_bridge(app: &tauri::App) {
 }
 
 pub(crate) fn observe_terminal_coordination_event(
-    _repo_path: PathBuf,
-    _db_path: PathBuf,
+    repo_path: PathBuf,
+    db_path: PathBuf,
     event_type: String,
     refs: crate::coordination::kernel::EventRefs,
     payload: Value,
 ) {
+    if matches!(
+        event_type.as_str(),
+        "terminal_task_plan_created"
+            | "terminal_task_plan_checkpoint"
+            | "terminal_task_plan_step_title_edited"
+            | "terminal_task_plan_finished"
+    ) {
+        let Some(app) = TERMINAL_COORDINATION_EVENT_APP.get().cloned() else {
+            return;
+        };
+        let refs_payload = json!({
+            "taskId": refs.task_id,
+            "agentId": refs.agent_id,
+            "agentSlotId": refs.agent_slot_id,
+            "sessionId": refs.session_id,
+            "resourceId": refs.resource_id,
+            "artifactId": refs.artifact_id,
+            "contextRunId": refs.context_run_id,
+        });
+
+        tauri::async_runtime::spawn(async move {
+            sleep(Duration::from_millis(35)).await;
+            let _ = app.emit(
+                TERMINAL_TASK_PLAN_UPDATED_EVENT,
+                json!({
+                    "source": "coordination",
+                    "repoPath": repo_path.display().to_string(),
+                    "dbPath": db_path.display().to_string(),
+                    "eventType": event_type,
+                    "refs": refs_payload,
+                    "payload": payload,
+                }),
+            );
+        });
+        return;
+    }
+
     if !matches!(
         event_type.as_str(),
         "task_claimed"

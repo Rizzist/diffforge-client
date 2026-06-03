@@ -12288,6 +12288,22 @@ function WorkspaceTerminal({
 
   const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
   const canOpenTerminalUiView = !threadsViewActive && !terminalClosed && !terminalClosing && Boolean(thread);
+  const focusTerminalKeyboardInputAfterUiHide = useCallback(() => {
+    const focusAfterHide = () => {
+      if (terminalUiViewActiveRef.current) {
+        return;
+      }
+
+      focusTerminalKeyboardInput(true);
+    };
+
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(focusAfterHide);
+      return;
+    }
+
+    window.setTimeout(focusAfterHide, 0);
+  }, [focusTerminalKeyboardInput]);
   const toggleTerminalUiView = useCallback(() => {
     if (!canOpenTerminalUiView && !terminalUiViewActive) {
       return;
@@ -12300,8 +12316,18 @@ function WorkspaceTerminal({
 
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
     requestTerminalAudioInputTarget(true);
+    terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
-  }, [activateTerminalPane, canOpenTerminalUiView, requestTerminalAudioInputTarget, terminalUiViewActive]);
+    if (!nextUiViewActive) {
+      focusTerminalKeyboardInputAfterUiHide();
+    }
+  }, [
+    activateTerminalPane,
+    canOpenTerminalUiView,
+    focusTerminalKeyboardInputAfterUiHide,
+    requestTerminalAudioInputTarget,
+    terminalUiViewActive,
+  ]);
   const setTerminalUiViewFromArrowShortcut = useCallback((nextUiViewActive) => {
     if (nextUiViewActive) {
       if (!canOpenTerminalUiView || terminalUiViewActiveRef.current) {
@@ -12315,13 +12341,22 @@ function WorkspaceTerminal({
         return false;
       }
 
-      activateTerminalPane("terminal_tui_view_arrow_shortcut");
+      activateTerminalPane("terminal_tui_view_arrow_shortcut", { focusKeyboard: false });
     }
 
     requestTerminalAudioInputTarget(true);
+    terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
+    if (!nextUiViewActive) {
+      focusTerminalKeyboardInputAfterUiHide();
+    }
     return true;
-  }, [activateTerminalPane, canOpenTerminalUiView, requestTerminalAudioInputTarget]);
+  }, [
+    activateTerminalPane,
+    canOpenTerminalUiView,
+    focusTerminalKeyboardInputAfterUiHide,
+    requestTerminalAudioInputTarget,
+  ]);
   useEffect(() => {
     if (isActive && canOpenTerminalUiView && !terminalUiViewMounted) {
       setTerminalUiViewMounted(true);
@@ -12754,7 +12789,6 @@ function WorkspaceTerminal({
                   todoDropActive={todoDropActive}
                   todoDropTarget={todoDropTarget}
                   todoDropUnsupportedMessage={todoDropUnsupportedMessage}
-                  visible={terminalUiViewActive}
                   workspace={workspace}
                   workspaceRoot={workingDirectory}
                   workspaceThreadEntry={workspaceThreadEntry}

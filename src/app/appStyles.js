@@ -3807,8 +3807,8 @@ export const TerminalInlineUiView = styled.div`
   pointer-events: none;
   contain: layout paint style;
   transition:
-    opacity 120ms ease,
-    visibility 0s linear 120ms;
+    opacity 0ms linear,
+    visibility 0s linear 0s;
 
   html[data-forge-theme="light"] & {
     background: #f5f5f7;
@@ -8497,14 +8497,41 @@ export const McpLayout = styled.div`
     opacity: 0.82;
   }
 
+  &[data-editor-mode="manual"],
+  &[data-editor-mode="marketplace"] {
+    grid-template-columns: minmax(260px, 0.72fr) minmax(420px, 1.28fr);
+  }
+
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
     overflow: visible;
+
+    &[data-editor-mode="manual"] > :last-child,
+    &[data-editor-mode="marketplace"] > :last-child {
+      order: -1;
+    }
+
+    &[data-editor-mode="manual"] > :first-child,
+    &[data-editor-mode="marketplace"] > :first-child {
+      max-height: 260px;
+      overflow: auto;
+    }
   }
 
   @container (max-width: 920px) {
     grid-template-columns: minmax(0, 1fr);
     overflow: visible;
+
+    &[data-editor-mode="manual"] > :last-child,
+    &[data-editor-mode="marketplace"] > :last-child {
+      order: -1;
+    }
+
+    &[data-editor-mode="manual"] > :first-child,
+    &[data-editor-mode="marketplace"] > :first-child {
+      max-height: 260px;
+      overflow: auto;
+    }
   }
 `;
 

@@ -3721,10 +3721,64 @@ function normalizeThreadDiffSummary(value) {
     latestFile,
     partial: data.partial === true,
     summaryKey: String(data.summaryKey || data.summary_key || "").trim(),
+    turnId: String(data.turnId || data.turn_id || "").trim(),
     undoStatus: String(data.undoStatus || data.undo_status || "").trim(),
+    undoneAt: String(data.undoneAt || data.undone_at || "").trim(),
     worktreeId: String(data.worktreeId || data.worktree_id || "").trim(),
     worktreePath: String(data.worktreePath || data.worktree_path || "").trim(),
   };
+}
+
+function getAssistantBlockDiffTurnId(item) {
+  return String(item?.turnId || item?.id || "").trim();
+}
+
+function threadDiffSummaryEntriesEqual(left, right) {
+  if (!left && !right) {
+    return true;
+  }
+  if (!left || !right) {
+    return false;
+  }
+
+  return left.summaryKey === right.summaryKey
+    && left.undoStatus === right.undoStatus
+    && left.fileCount === right.fileCount
+    && left.turnId === right.turnId;
+}
+
+function threadDiffSummaryMapEqual(left, right) {
+  const leftKeys = Object.keys(left || {});
+  const rightKeys = Object.keys(right || {});
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  return leftKeys.every((key) => threadDiffSummaryEntriesEqual(left?.[key], right?.[key]));
+}
+
+function setThreadDiffSummaryInMap(current, turnId, summary) {
+  const safeTurnId = String(turnId || "").trim();
+  if (!safeTurnId) {
+    return current;
+  }
+
+  const nextSummary = summary?.fileCount ? {
+    ...summary,
+    turnId: summary.turnId || safeTurnId,
+  } : null;
+
+  if (threadDiffSummaryEntriesEqual(current?.[safeTurnId], nextSummary)) {
+    return current;
+  }
+
+  const next = { ...(current || {}) };
+  if (nextSummary) {
+    next[safeTurnId] = nextSummary;
+  } else {
+    delete next[safeTurnId];
+  }
+  return next;
 }
 
 function formatThreadDiffFileCount(count) {
@@ -4012,6 +4066,10 @@ function isActivityMessage(message) {
   return message?.role === "activity";
 }
 
+function getMessageTurnId(message) {
+  return String(message?.turnId || message?.turn_id || "").trim();
+}
+
 function buildTranscriptItems(messages) {
   const items = [];
   let assistantBlock = null;
@@ -4027,18 +4085,27 @@ function buildTranscriptItems(messages) {
     assistantBlock?.items.push({
       id: `activity-group-${firstMessage?.id || items.length}-${lastMessage?.id || activityGroup.length}`,
       messages: activityGroup,
+      turnId: getMessageTurnId(firstMessage) || getMessageTurnId(lastMessage),
       type: "activity-group",
     });
     activityGroup = [];
   };
 
   const ensureAssistantBlock = (message, fallbackIndex) => {
+    const turnId = getMessageTurnId(message);
+    if (assistantBlock?.turnId && turnId && assistantBlock.turnId !== turnId) {
+      flushAssistantBlock();
+    }
+
     if (!assistantBlock) {
       assistantBlock = {
         id: `assistant-block-${message?.id || fallbackIndex || items.length}`,
         items: [],
+        turnId,
         type: "assistant-block",
       };
+    } else if (!assistantBlock.turnId && turnId) {
+      assistantBlock.turnId = turnId;
     }
 
     return assistantBlock;
@@ -4069,6 +4136,7 @@ function buildTranscriptItems(messages) {
       block.items.push({
         id: message?.id || `message-${index}`,
         message,
+        turnId: getMessageTurnId(message),
         type: "message",
       });
       return;
@@ -4694,8 +4762,8 @@ function WorkspaceThreadDetail({
   const [error, setError] = useState("");
   const [copiedMessageId, setCopiedMessageId] = useState("");
   const [liveDiffSummary, setLiveDiffSummary] = useState(null);
-  const [finalDiffSummary, setFinalDiffSummary] = useState(null);
-  const [diffSummaryExpanded, setDiffSummaryExpanded] = useState(true);
+  const [diffSummariesByTurnId, setDiffSummariesByTurnId] = useState({});
+  const [diffSummaryExpandedByTurnId, setDiffSummaryExpandedByTurnId] = useState({});
   const [diffRefreshToken, setDiffRefreshToken] = useState(0);
   const [undoingDiffKey, setUndoingDiffKey] = useState("");
   const detailRootRef = useRef(null);
@@ -4710,16 +4778,18 @@ function WorkspaceThreadDetail({
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
-  const latestAssistantBlockId = useMemo(() => {
+  const latestAssistantBlock = useMemo(() => {
     for (let index = transcriptItems.length - 1; index >= 0; index -= 1) {
       const item = transcriptItems[index];
       if (item?.type === "assistant-block") {
-        return item.id;
+        return item;
       }
     }
 
-    return "";
+    return null;
   }, [transcriptItems]);
+  const latestAssistantBlockId = latestAssistantBlock?.id || "";
+  const latestAssistantBlockTurnId = getAssistantBlockDiffTurnId(latestAssistantBlock);
   const latestMessage = messages[messages.length - 1] || null;
   const activeAgentId = normalizeAgentId(thread?.currentAgent || "codex");
   const activeAgentStatus = useMemo(
@@ -4809,7 +4879,11 @@ function WorkspaceThreadDetail({
       || workspace?.workingDirectory
       || "",
   ).trim();
-  const diffTurnId = getThreadDiffTurnId(thread, latestMessage, latestAssistantBlockId);
+  const diffTurnId = getThreadDiffTurnId(
+    thread,
+    latestMessage,
+    latestAssistantBlockTurnId || latestAssistantBlockId,
+  );
   const diffStorageKey = getThreadDiffStorageKey(
     workspace?.id || thread?.workspaceId || "",
     thread?.id || "",
@@ -4817,10 +4891,35 @@ function WorkspaceThreadDetail({
   );
   const diffTurnLive = threadDiffTurnIsLive(thread, threadGroundTruth);
   const diffTurnTerminal = threadDiffTurnIsTerminal(thread, threadGroundTruth, Boolean(latestAssistantBlockId));
-  const visibleFinalDiffSummary = diffTurnTerminal ? finalDiffSummary : null;
+  const currentTurnFinalDiffSummary = diffTurnId ? diffSummariesByTurnId[diffTurnId] || null : null;
+  const visibleFinalDiffSummary = diffTurnTerminal ? currentTurnFinalDiffSummary : null;
   const visibleLiveDiffSummary = liveDiffSummary?.fileCount && !visibleFinalDiffSummary?.fileCount
     ? liveDiffSummary
     : null;
+  const assistantBlockDiffTurnIds = useMemo(() => {
+    const seen = new Set();
+    const turnIds = [];
+    transcriptItems.forEach((item) => {
+      if (item?.type !== "assistant-block") {
+        return;
+      }
+
+      const turnId = getAssistantBlockDiffTurnId(item);
+      if (!turnId || seen.has(turnId)) {
+        return;
+      }
+
+      seen.add(turnId);
+      turnIds.push(turnId);
+    });
+
+    if (diffTurnId && !seen.has(diffTurnId)) {
+      turnIds.push(diffTurnId);
+    }
+
+    return turnIds;
+  }, [diffTurnId, transcriptItems]);
+  const assistantBlockDiffTurnKey = assistantBlockDiffTurnIds.join("\n");
   useEffect(() => {
     const snapshot = getThreadDetailRenderDiagnosticSnapshot({
       activeAgentId,
@@ -4866,9 +4965,36 @@ function WorkspaceThreadDetail({
   ]);
 
   useEffect(() => {
-    setFinalDiffSummary(readStoredThreadDiffSummary(diffStorageKey));
-    setDiffSummaryExpanded(true);
-  }, [diffStorageKey]);
+    const workspaceId = workspace?.id || thread?.workspaceId || "";
+    const threadId = thread?.id || "";
+    if (!workspaceId || !threadId) {
+      setDiffSummariesByTurnId((current) => (
+        Object.keys(current || {}).length ? {} : current
+      ));
+      return;
+    }
+
+    const nextSummaries = {};
+    assistantBlockDiffTurnIds.forEach((turnId) => {
+      const storageKey = getThreadDiffStorageKey(workspaceId, threadId, turnId);
+      const storedSummary = readStoredThreadDiffSummary(storageKey);
+      if (storedSummary?.fileCount) {
+        nextSummaries[turnId] = {
+          ...storedSummary,
+          turnId: storedSummary.turnId || turnId,
+        };
+      }
+    });
+
+    setDiffSummariesByTurnId((current) => (
+      threadDiffSummaryMapEqual(current, nextSummaries) ? current : nextSummaries
+    ));
+  }, [
+    assistantBlockDiffTurnKey,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
 
   useEffect(() => {
     if (!thread?.id || !diffWorktreePath || !isThreadDiffWorktreePath(diffWorktreePath)) {
@@ -4975,15 +5101,9 @@ function WorkspaceThreadDetail({
       capturedAt: liveDiffSummary.capturedAt || new Date().toISOString(),
       turnId: diffTurnId,
     };
-    setFinalDiffSummary((currentSummary) => {
-      if (
-        currentSummary?.summaryKey === nextSummary.summaryKey
-        && currentSummary?.undoStatus === nextSummary.undoStatus
-      ) {
-        return currentSummary;
-      }
+    setDiffSummariesByTurnId((currentSummaries) => {
       writeStoredThreadDiffSummary(diffStorageKey, nextSummary);
-      return nextSummary;
+      return setThreadDiffSummaryInMap(currentSummaries, diffTurnId, nextSummary);
     });
   }, [
     diffStorageKey,
@@ -5098,6 +5218,12 @@ function WorkspaceThreadDetail({
     if (!summary?.summaryKey || !summary?.worktreePath) {
       return;
     }
+    const summaryTurnId = String(summary.turnId || diffTurnId || "").trim();
+    const summaryStorageKey = getThreadDiffStorageKey(
+      workspace?.id || thread?.workspaceId || "",
+      thread?.id || "",
+      summaryTurnId,
+    );
     if (
       typeof window !== "undefined"
       && !window.confirm(`Undo ${formatThreadDiffFileCount(summary.fileCount)} from this thread?`)
@@ -5114,7 +5240,7 @@ function WorkspaceThreadDetail({
           baseSha: summary.baseSha,
           expectedSummaryKey: summary.summaryKey,
           threadId: thread?.id || "",
-          turnId: diffTurnId,
+          turnId: summaryTurnId,
           worktreePath: summary.worktreePath,
           workspaceId: workspace?.id || thread?.workspaceId || "",
         },
@@ -5123,11 +5249,14 @@ function WorkspaceThreadDetail({
       unwrapThreadDiffApiResult(result);
       const undoneSummary = {
         ...summary,
+        turnId: summaryTurnId || summary.turnId || "",
         undoStatus: "undone",
         undoneAt: new Date().toISOString(),
       };
-      setFinalDiffSummary(undoneSummary);
-      writeStoredThreadDiffSummary(diffStorageKey, undoneSummary);
+      setDiffSummariesByTurnId((currentSummaries) => (
+        setThreadDiffSummaryInMap(currentSummaries, summaryTurnId, undoneSummary)
+      ));
+      writeStoredThreadDiffSummary(summaryStorageKey, undoneSummary);
       setDiffRefreshToken((token) => token + 1);
     } catch (undoError) {
       const message = undoError?.message || "Unable to undo these changes.";
@@ -6232,22 +6361,40 @@ function WorkspaceThreadDetail({
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
           {transcriptItems.map((item) => (
-            item.type === "assistant-block" ? (
-              <AssistantResponseBlock
-                copyAlwaysVisible={item.id === latestAssistantBlockId}
-                diffSummary={item.id === latestAssistantBlockId ? visibleFinalDiffSummary : null}
-                diffSummaryExpanded={diffSummaryExpanded}
-                isCopied={copiedMessageId === item.id}
-                item={item}
-                key={item.id}
-                onCopyMessage={handleCopyMessage}
-                onReviewDiffSummary={reviewDiffSummary}
-                onToggleDiffSummary={() => setDiffSummaryExpanded((expanded) => !expanded)}
-                onUndoDiffSummary={undoDiffSummary}
-                undoingDiff={Boolean(undoingDiffKey && undoingDiffKey === visibleFinalDiffSummary?.summaryKey)}
-                workspace={workspace}
-              />
-            ) : item.type === "activity-group" ? (
+            item.type === "assistant-block" ? (() => {
+              const blockTurnId = getAssistantBlockDiffTurnId(item);
+              const blockDiffSummary = blockTurnId
+                ? diffSummariesByTurnId[blockTurnId] || null
+                : null;
+              const diffSummaryExpanded = blockTurnId
+                ? diffSummaryExpandedByTurnId[blockTurnId] !== false
+                : true;
+
+              return (
+                <AssistantResponseBlock
+                  copyAlwaysVisible={item.id === latestAssistantBlockId}
+                  diffSummary={blockDiffSummary}
+                  diffSummaryExpanded={diffSummaryExpanded}
+                  isCopied={copiedMessageId === item.id}
+                  item={item}
+                  key={item.id}
+                  onCopyMessage={handleCopyMessage}
+                  onReviewDiffSummary={reviewDiffSummary}
+                  onToggleDiffSummary={() => {
+                    if (!blockTurnId) {
+                      return;
+                    }
+                    setDiffSummaryExpandedByTurnId((current) => ({
+                      ...current,
+                      [blockTurnId]: !(current[blockTurnId] !== false),
+                    }));
+                  }}
+                  onUndoDiffSummary={undoDiffSummary}
+                  undoingDiff={Boolean(undoingDiffKey && undoingDiffKey === blockDiffSummary?.summaryKey)}
+                  workspace={workspace}
+                />
+              );
+            })() : item.type === "activity-group" ? (
               <ActivityMessage
                 key={item.id}
                 messages={item.messages}

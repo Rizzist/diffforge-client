@@ -1,17 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
-import {
-  ButtonRefreshIcon,
-  FormMessage,
-} from "../app/appStyles";
+import { FormMessage } from "../app/appStyles";
+
+const TERMINAL_TASK_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
 
 const EMPTY_TARGET = Object.freeze({
   agentId: "",
+  dbPath: "",
+  mountId: "",
   paneId: "",
+  repoPath: "",
   sessionId: "",
   taskId: "",
   terminalIndex: null,
@@ -24,6 +27,49 @@ function dataOf(response) {
 
 function cleanText(value) {
   return String(value || "").trim();
+}
+
+function pathIdentity(value) {
+  const cleaned = cleanText(value).replace(/\\/g, "/");
+  return cleaned === "/" ? cleaned : cleaned.replace(/\/+$/g, "").toLowerCase();
+}
+
+function normalizeRepoTarget(value) {
+  const target = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  const repoPath = cleanText(target?.repoPath || target?.repo_path);
+  if (!repoPath) {
+    return null;
+  }
+  return {
+    repoPath,
+    dbPath: cleanText(target?.dbPath || target?.db_path),
+    mountId: cleanText(target?.mountId || target?.mount_id),
+    projectName: cleanText(target?.projectName || target?.project_name),
+    projectKind: cleanText(target?.projectKind || target?.project_kind),
+    workspaceRelativePath: cleanText(target?.workspaceRelativePath || target?.workspace_relative_path),
+  };
+}
+
+function repoTargetLabel(target) {
+  return cleanText(target?.workspaceRelativePath)
+    || cleanText(target?.projectName)
+    || cleanText(target?.repoPath).split(/[\\/]/).filter(Boolean).pop()
+    || "Repository";
+}
+
+function dedupeRepoTargets(targets) {
+  const seen = new Set();
+  return (Array.isArray(targets) ? targets : [])
+    .map(normalizeRepoTarget)
+    .filter(Boolean)
+    .filter((target) => {
+      const key = pathIdentity(target.repoPath);
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
 }
 
 function stepStatusLabel(status) {
@@ -47,7 +93,7 @@ function stepStatusLabel(status) {
 }
 
 function planStatusLabel(status) {
-  const normalized = cleanText(status).toLowerCase();
+  const normalized = normalizedPlanStatus(status);
   if (normalized === "completed") {
     return "Completed";
   }
@@ -58,6 +104,45 @@ function planStatusLabel(status) {
     return "Blocked";
   }
   return "Active";
+}
+
+function normalizedPlanStatus(status) {
+  const normalized = cleanText(status).toLowerCase();
+  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if (["interrupt", "interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) {
+    return "interrupted";
+  }
+  if (normalized === "blocked") {
+    return "blocked";
+  }
+  return "active";
+}
+
+function planIsTerminal(plan) {
+  const normalized = normalizedPlanStatus(plan?.status);
+  return normalized === "completed" || normalized === "interrupted";
+}
+
+function planCanContinue(plan) {
+  return normalizedPlanStatus(plan?.status) === "interrupted";
+}
+
+function planIdentity(plan) {
+  return cleanText(plan?.plan_id) || cleanText(plan?.task_id);
+}
+
+function planEventText(payload, keys) {
+  const refs = payload?.refs || {};
+  const nestedPayload = payload?.payload || {};
+  for (const key of keys) {
+    const value = cleanText(refs[key] || payload?.[key] || nestedPayload?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return "";
 }
 
 function stepStatusKind(status) {
@@ -120,74 +205,172 @@ function timestampLabel(value) {
 
 export default function PlansWorkspaceView({
   onResumePlan,
+  repoTargets = [],
   rootDirectory = "",
   selectedTerminal = EMPTY_TARGET,
   workspace,
 }) {
   const [snapshot, setSnapshot] = useState(null);
-  const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
   const [editingStepIndex, setEditingStepIndex] = useState(null);
   const [editingTitle, setEditingTitle] = useState("");
+  const [selectedRepoPath, setSelectedRepoPath] = useState("");
   const [savingStepIndex, setSavingStepIndex] = useState(null);
 
   const target = selectedTerminal || EMPTY_TARGET;
+  const normalizedRepoTargets = useMemo(() => {
+    const targets = dedupeRepoTargets(repoTargets);
+    if (targets.length) {
+      return targets;
+    }
+    return dedupeRepoTargets([{
+      repoPath: target.repoPath || rootDirectory,
+      dbPath: target.dbPath || "",
+      mountId: target.mountId || "",
+    }]);
+  }, [repoTargets, rootDirectory, target.dbPath, target.mountId, target.repoPath]);
+  const preferredRepoPath = target.repoPath || rootDirectory;
+  const activeRepoPath = useMemo(() => {
+    const selectedKey = pathIdentity(selectedRepoPath);
+    const selectedTarget = selectedKey
+      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === selectedKey)
+      : null;
+    const preferredKey = pathIdentity(preferredRepoPath);
+    const preferredTarget = preferredKey
+      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === preferredKey)
+      : null;
+    return selectedTarget?.repoPath || preferredTarget?.repoPath || normalizedRepoTargets[0]?.repoPath || "";
+  }, [normalizedRepoTargets, preferredRepoPath, selectedRepoPath]);
+  const activeRepoTarget = useMemo(() => {
+    const activeKey = pathIdentity(activeRepoPath);
+    return activeKey
+      ? normalizedRepoTargets.find((repoTarget) => pathIdentity(repoTarget.repoPath) === activeKey) || null
+      : null;
+  }, [activeRepoPath, normalizedRepoTargets]);
+  const activeDbPath = activeRepoTarget?.dbPath || "";
+  const targetMatchesActiveRepo = !target.repoPath
+    || !activeRepoPath
+    || pathIdentity(target.repoPath) === pathIdentity(activeRepoPath);
+  const snapshotAgentId = targetMatchesActiveRepo ? target.agentId || "" : "";
+  const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
+  const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
   const selectedPlan = snapshot?.selected_plan || null;
-  const history = Array.isArray(snapshot?.history) ? snapshot.history : [];
-  const titleMaxChars = Number(snapshot?.title_max_chars || selectedPlan?.title_max_chars || 96);
+  const planCandidates = Array.isArray(snapshot?.history) ? snapshot.history : [];
+  const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
+  const latestPlanCandidate = planCandidates[0] || null;
+  const displayedPlan = selectedPlan && !planIsTerminal(selectedPlan)
+    ? selectedPlan
+    : activePlanCandidate || selectedPlan || latestPlanCandidate || null;
+  const displayedPlanId = planIdentity(displayedPlan);
+  const displayedPlanCanContinue = planCanContinue(displayedPlan);
+  const titleMaxChars = Number(snapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
   const workspaceId = target.workspaceId || workspace?.id || "";
+
+  useEffect(() => {
+    if (activeRepoPath !== selectedRepoPath) {
+      setSelectedRepoPath(activeRepoPath);
+    }
+  }, [activeRepoPath, selectedRepoPath]);
+
+  useEffect(() => {
+    const preferredKey = pathIdentity(preferredRepoPath);
+    if (preferredKey && preferredKey !== pathIdentity(selectedRepoPath)) {
+      setSelectedRepoPath(preferredRepoPath);
+    }
+  }, [preferredRepoPath]);
 
   const loadSnapshot = useCallback(async (options = {}) => {
     const silent = options?.silent === true;
-    if (!rootDirectory) {
+    if (!activeRepoPath) {
       setSnapshot(null);
       return;
     }
     if (!silent) {
-      setStatus("loading");
       setError("");
     }
     try {
-      const response = await invoke("coordination_terminal_task_plan_snapshot", {
-        repoPath: rootDirectory,
+      const command = {
+        repoPath: activeRepoPath,
         input: {
-          agentId: target.agentId || "",
-          sessionId: target.sessionId || "",
-          taskId: target.taskId || "",
+          agentId: snapshotAgentId,
+          sessionId: snapshotSessionId,
+          taskId: snapshotTaskId,
         },
-      });
+      };
+      if (activeDbPath) {
+        command.dbPath = activeDbPath;
+      }
+      const response = await invoke("coordination_terminal_task_plan_snapshot", command);
       setSnapshot(dataOf(response));
-      setStatus("ready");
     } catch (nextError) {
       if (!silent) {
         setError(cleanText(nextError?.message || nextError) || "Unable to load terminal plans.");
-        setStatus("error");
       }
     }
-  }, [rootDirectory, target.agentId, target.sessionId, target.taskId]);
+  }, [activeDbPath, activeRepoPath, snapshotAgentId, snapshotSessionId, snapshotTaskId]);
 
   useEffect(() => {
     loadSnapshot();
   }, [loadSnapshot]);
 
   useEffect(() => {
-    if (!rootDirectory || editingStepIndex !== null) {
+    if (!activeRepoPath) {
       return undefined;
     }
 
-    const timerId = window.setInterval(() => {
+    let cancelled = false;
+    let unlisten = null;
+    const rootPath = pathIdentity(activeRepoPath);
+
+    listen(TERMINAL_TASK_PLAN_UPDATED_EVENT, (event) => {
+      if (cancelled || editingStepIndex !== null) {
+        return;
+      }
+
+      const payload = event?.payload || {};
+      const eventRepoPath = cleanText(payload.repoPath || payload.repo_path);
+      if (eventRepoPath && rootPath && pathIdentity(eventRepoPath) !== rootPath) {
+        return;
+      }
+
+      const eventTaskId = planEventText(payload, ["taskId", "task_id"]);
+      const eventSessionId = planEventText(payload, ["sessionId", "session_id"]);
+      const eventAgentId = planEventText(payload, ["agentId", "agent_id"]);
+      const targetTaskId = cleanText(snapshotTaskId);
+      const targetSessionId = cleanText(snapshotSessionId);
+      const targetAgentId = cleanText(snapshotAgentId);
+
+      if (targetTaskId && eventTaskId && eventTaskId !== targetTaskId) {
+        return;
+      }
+      if (!targetTaskId && targetSessionId && eventSessionId && eventSessionId !== targetSessionId) {
+        return;
+      }
+      if (!targetTaskId && !targetSessionId && targetAgentId && eventAgentId && eventAgentId !== targetAgentId) {
+        return;
+      }
+
       loadSnapshot({ silent: true });
-    }, 900);
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    }).catch(() => {});
 
     return () => {
-      window.clearInterval(timerId);
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
     };
-  }, [editingStepIndex, loadSnapshot, rootDirectory]);
+  }, [activeRepoPath, editingStepIndex, loadSnapshot, snapshotAgentId, snapshotSessionId, snapshotTaskId]);
 
   useEffect(() => {
     setEditingStepIndex(null);
     setEditingTitle("");
-  }, [selectedPlan?.plan_id]);
+  }, [displayedPlanId]);
 
   const startEditing = useCallback((step) => {
     setEditingStepIndex(Number(step?.index));
@@ -200,7 +383,7 @@ export default function PlansWorkspaceView({
   }, []);
 
   const saveEditing = useCallback(async () => {
-    const taskId = cleanText(selectedPlan?.task_id);
+    const taskId = cleanText(displayedPlan?.task_id);
     const stepIndex = Number(editingStepIndex);
     const title = cleanText(editingTitle);
     if (!taskId || !Number.isInteger(stepIndex) || !title || savingStepIndex !== null) {
@@ -210,10 +393,11 @@ export default function PlansWorkspaceView({
     setError("");
     try {
       const response = await invoke("coordination_terminal_task_plan_edit_step_title", {
-        repoPath: rootDirectory,
+        repoPath: activeRepoPath,
+        ...(activeDbPath ? { dbPath: activeDbPath } : {}),
         input: {
-          agentId: target.agentId || selectedPlan?.agent_id || "",
-          sessionId: target.sessionId || selectedPlan?.session_id || "",
+	          agentId: snapshotAgentId || displayedPlan?.agent_id || "",
+	          sessionId: snapshotSessionId || displayedPlan?.session_id || "",
           taskId,
           stepIndex,
           title,
@@ -238,24 +422,25 @@ export default function PlansWorkspaceView({
       setSavingStepIndex(null);
     }
   }, [
-    editingStepIndex,
-    editingTitle,
-    loadSnapshot,
-    rootDirectory,
-    savingStepIndex,
-    selectedPlan?.agent_id,
-    selectedPlan?.session_id,
-    selectedPlan?.task_id,
-    target.agentId,
-    target.sessionId,
+	    editingStepIndex,
+	    editingTitle,
+    activeDbPath,
+    activeRepoPath,
+	    displayedPlan?.agent_id,
+	    displayedPlan?.session_id,
+	    displayedPlan?.task_id,
+	    loadSnapshot,
+	    savingStepIndex,
+    snapshotAgentId,
+    snapshotSessionId,
     titleMaxChars,
     workspaceId,
   ]);
 
   const headerMeta = useMemo(() => {
-    if (!target.paneId && !target.sessionId && !target.taskId) {
-      return "";
-    }
+	    if (!target.paneId && !target.sessionId && !target.taskId && !activeRepoTarget) {
+	      return "";
+	    }
     const parts = [];
     if (Number.isInteger(Number(target.terminalIndex))) {
       parts.push(`Terminal ${Number(target.terminalIndex) + 1}`);
@@ -263,8 +448,11 @@ export default function PlansWorkspaceView({
     if (target.agentId) {
       parts.push(target.agentId);
     }
+    if (activeRepoTarget) {
+      parts.push(repoTargetLabel(activeRepoTarget));
+    }
     return parts.join(" / ");
-  }, [target.agentId, target.paneId, target.sessionId, target.taskId, target.terminalIndex]);
+  }, [activeRepoTarget, target.agentId, target.paneId, target.sessionId, target.taskId, target.terminalIndex]);
 
   return (
     <PlansSurface aria-label="Terminal plans">
@@ -273,35 +461,49 @@ export default function PlansWorkspaceView({
           <PlansEyebrow>{headerMeta || "Terminal plan"}</PlansEyebrow>
           <PlansTitle>Plans</PlansTitle>
         </div>
-        <IconButton
-          aria-label="Refresh plans"
-          disabled={status === "loading"}
-          onClick={loadSnapshot}
-          title="Refresh"
-          type="button"
-        >
-          <ButtonRefreshIcon aria-hidden="true" />
-        </IconButton>
+        {normalizedRepoTargets.length > 1 && (
+          <PlanRepoSelect
+            aria-label="Plan repository"
+            onChange={(event) => setSelectedRepoPath(event.target.value)}
+            value={activeRepoPath}
+          >
+            {normalizedRepoTargets.map((repoTarget) => (
+              <option key={repoTarget.repoPath} value={repoTarget.repoPath}>
+                {repoTargetLabel(repoTarget)}
+              </option>
+            ))}
+          </PlanRepoSelect>
+        )}
       </PlansHeader>
 
       {error && <FormMessage data-tone="danger">{error}</FormMessage>}
 
-      {selectedPlan ? (
+      {displayedPlan ? (
         <PlanPanel>
           <PlanPanelHeader>
             <div>
-              <PlanName>{selectedPlan.title || selectedPlan.task_title || "Terminal task"}</PlanName>
+              <PlanName>{displayedPlan.title || displayedPlan.task_title || "Terminal task"}</PlanName>
               <PlanSubline>
-                <span>{planStatusLabel(selectedPlan.status)}</span>
-                {timestampLabel(selectedPlan.updated_at) && <span>{timestampLabel(selectedPlan.updated_at)}</span>}
+                <span>{planStatusLabel(displayedPlan.status)}</span>
+                {timestampLabel(displayedPlan.updated_at) && <span>{timestampLabel(displayedPlan.updated_at)}</span>}
               </PlanSubline>
             </div>
-            <PlanBadge data-status={cleanText(selectedPlan.status).toLowerCase()}>
-              {planStatusLabel(selectedPlan.status)}
-            </PlanBadge>
+            <PlanPanelActions>
+              <PlanBadge data-status={normalizedPlanStatus(displayedPlan.status)}>
+                {planStatusLabel(displayedPlan.status)}
+              </PlanBadge>
+              {displayedPlanCanContinue && (
+                <ResumeButton
+                  onClick={() => onResumePlan?.(displayedPlan)}
+                  type="button"
+                >
+                  Continue
+                </ResumeButton>
+              )}
+            </PlanPanelActions>
           </PlanPanelHeader>
           <StepList>
-            {(selectedPlan.steps || []).map((step) => {
+            {(displayedPlan.steps || []).map((step) => {
               const index = Number(step.index);
               const editing = editingStepIndex === index;
               const editable = step.editable === true || cleanText(step.status).toLowerCase() === "queued";
@@ -376,51 +578,16 @@ export default function PlansWorkspaceView({
         </PlanPanel>
       ) : (
         <EmptyPanel>
-          <PlanName>No terminal plan</PlanName>
-          <PlanSubline>
-            <span>{status === "loading" ? "Loading" : "Waiting for create_plan"}</span>
-          </PlanSubline>
+          <PlanName>No plan</PlanName>
         </EmptyPanel>
       )}
-
-      <HistoryPanel>
-        <HistoryTitle>History</HistoryTitle>
-        {history.length ? (
-          <HistoryList>
-            {history.map((plan) => {
-              const canResume = plan.can_resume === true;
-              return (
-                <HistoryItem key={plan.plan_id || plan.task_id}>
-                  <div>
-                    <HistoryName>{plan.title || plan.task_title || "Terminal task"}</HistoryName>
-                    <HistoryMeta>
-                      <span>{planStatusLabel(plan.status)}</span>
-                      {timestampLabel(plan.updated_at) && <span>{timestampLabel(plan.updated_at)}</span>}
-                    </HistoryMeta>
-                  </div>
-                  {canResume && (
-                    <ResumeButton
-                      onClick={() => onResumePlan?.(plan)}
-                      type="button"
-                    >
-                      Resume
-                    </ResumeButton>
-                  )}
-                </HistoryItem>
-              );
-            })}
-          </HistoryList>
-        ) : (
-          <HistoryEmpty>No plan history</HistoryEmpty>
-        )}
-      </HistoryPanel>
     </PlansSurface>
   );
 }
 
 const PlansSurface = styled.section`
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   min-width: 0;
   min-height: 0;
@@ -451,6 +618,30 @@ const PlansTitle = styled.h2`
   line-height: 1.1;
 `;
 
+const PlanRepoSelect = styled.select`
+  min-width: 0;
+  width: min(150px, 42%);
+  height: 30px;
+  padding: 0 26px 0 10px;
+  border: 1px solid rgba(216, 226, 240, 0.16);
+  border-radius: 7px;
+  color: #dbe7f8;
+  background: rgba(255, 255, 255, 0.055);
+  color-scheme: dark;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  option {
+    color: #f4f7fa;
+    background: #0d1117;
+  }
+`;
+
 const IconButton = styled.button`
   display: inline-grid;
   place-items: center;
@@ -473,6 +664,9 @@ const IconButton = styled.button`
 `;
 
 const PlanPanel = styled.article`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -483,9 +677,9 @@ const PlanPanel = styled.article`
 
 const EmptyPanel = styled(PlanPanel)`
   display: grid;
+  grid-template-rows: auto;
   align-content: center;
   gap: 8px;
-  min-height: 150px;
   padding: 18px;
 `;
 
@@ -496,6 +690,13 @@ const PlanPanelHeader = styled.div`
   gap: 12px;
   padding: 12px;
   border-bottom: 1px solid rgba(216, 226, 240, 0.1);
+`;
+
+const PlanPanelActions = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
 `;
 
 const PlanName = styled.h3`
@@ -543,7 +744,6 @@ const StepList = styled.div`
   display: grid;
   gap: 0;
   min-height: 0;
-  max-height: 42vh;
   overflow: auto;
 `;
 
@@ -671,59 +871,6 @@ const StepInput = styled.input`
   font-size: 13px;
 `;
 
-const HistoryPanel = styled.aside`
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  border-top: 1px solid rgba(216, 226, 240, 0.1);
-  padding-top: 10px;
-`;
-
-const HistoryTitle = styled.h3`
-  margin: 0;
-  color: rgba(238, 245, 255, 0.86);
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0;
-`;
-
-const HistoryList = styled.div`
-  display: grid;
-  gap: 7px;
-  max-height: 170px;
-  overflow: auto;
-`;
-
-const HistoryItem = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 9px;
-  border: 1px solid rgba(216, 226, 240, 0.1);
-  border-radius: 7px;
-  background: rgba(255, 255, 255, 0.035);
-`;
-
-const HistoryName = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: #edf5ff;
-  font-size: 12px;
-  font-weight: 800;
-`;
-
-const HistoryMeta = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  margin-top: 3px;
-  color: rgba(216, 226, 240, 0.56);
-  font-size: 10px;
-`;
-
 const ResumeButton = styled.button`
   border: 1px solid rgba(116, 171, 255, 0.28);
   border-radius: 7px;
@@ -732,9 +879,5 @@ const ResumeButton = styled.button`
   background: rgba(50, 124, 245, 0.14);
   font-size: 11px;
   font-weight: 850;
-`;
-
-const HistoryEmpty = styled.div`
-  color: rgba(216, 226, 240, 0.54);
-  font-size: 12px;
+  white-space: nowrap;
 `;

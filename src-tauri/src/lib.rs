@@ -141,6 +141,7 @@ const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
+const TERMINAL_TASK_PLAN_UPDATED_EVENT: &str = "forge-terminal-task-plan-updated";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -3374,7 +3375,6 @@ pub fn run() {
             agent_thread_session_discover,
             agent_thread_transcript,
             terminal_workspace_raw_scan,
-            workspace_git_repositories,
             workspace_git_pull_candidates,
             workspace_git_pull_repositories,
             workspace_git_snapshot,

@@ -8827,11 +8827,23 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         workspace_name.clone(),
     );
     let device_profile = cloud_mcp_desktop_device_profile();
-    let reset_scope = reset_scope
+    let requested_reset_scope = reset_scope
         .as_deref()
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
-        .unwrap_or("client");
+        .unwrap_or("repo")
+        .to_ascii_lowercase();
+    if requested_reset_scope == "account" {
+        return Err(
+            "Account cloud SQLite reset has been removed; select a repository to reset."
+                .to_string(),
+        );
+    }
+    let reset_scope = match requested_reset_scope.as_str() {
+        "repo" | "repository" | "git_repo" | "git-repo" => "repo",
+        "client" | "current" | "workspace" => "repo",
+        _ => "repo",
+    };
     let payload = json!({
         "source": "rust-diffforge-cloud-sqlite-hard-reset",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,

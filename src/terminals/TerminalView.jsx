@@ -996,10 +996,10 @@ const VOICE_PLAN_PARKED_STATUSES = new Set([
   "resume_requested",
 ]);
 const WORKSPACE_TOOL_TABS = [
-  { id: "orchestrator", label: "Orchestrator" },
+  { id: "orchestrator", label: "Orchestrator", compactLabel: "Orch" },
   { id: "plans", label: "Plans" },
   { id: "git", label: "Git" },
-  { id: "tokenomics", label: "Tokenomics" },
+  { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
 ];
 const TODO_QUEUE_PANE_MODE_NORMAL = "normal";
 const TODO_QUEUE_PANE_MODE_MINIMIZED = "minimized";
@@ -1156,10 +1156,12 @@ const WorkspaceToolRailLabel = styled.div`
 
 const OrchestratorTopNav = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   min-height: 40px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background: rgba(2, 4, 8, 0.44);
+  container-type: inline-size;
+  overflow: hidden;
 
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(0, 0, 0, 0.08);
@@ -1173,6 +1175,7 @@ const OrchestratorTopButton = styled.button`
   min-width: 0;
   align-items: center;
   justify-content: center;
+  padding: 0 6px;
   border: 0;
   border-right: 1px solid rgba(230, 236, 245, 0.07);
   color: #9eabbc;
@@ -1186,6 +1189,18 @@ const OrchestratorTopButton = styled.button`
     background 140ms ease,
     color 140ms ease,
     opacity 140ms ease;
+  white-space: nowrap;
+
+  span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  [data-label="compact"] {
+    display: none;
+  }
 
   &:last-child {
     border-right: 0;
@@ -1215,6 +1230,16 @@ const OrchestratorTopButton = styled.button`
   html[data-forge-theme="light"] &:not(:disabled):hover {
     color: #0066cc;
     background: rgba(0, 102, 204, 0.08);
+  }
+
+  @container (max-width: 340px) {
+    [data-label="full"][data-has-compact="true"] {
+      display: none;
+    }
+
+    [data-label="compact"] {
+      display: block;
+    }
   }
 `;
 
@@ -3546,6 +3571,7 @@ function normalizeTerminalCoordinationTarget(value) {
   }
   return {
     repoPath,
+    dbPath: String(target.dbPath || target.db_path || "").trim(),
     mountId: String(target.mountId || target.mount_id || "").trim(),
     projectName: String(target.projectName || target.project_name || "").trim(),
     projectKind: String(target.projectKind || target.project_kind || "").trim(),
@@ -5684,6 +5710,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   agentStatuses = [],
   items,
   getItemAccentColor = null,
+  coordinationTargets = [],
+  gitRepositoriesPreload = null,
+  onRefreshGitRepositories = null,
   onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
   onCancelQueuedItem,
@@ -7247,27 +7276,39 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       <OrchestratorTopNav aria-label="Workspace tool">
         {WORKSPACE_TOOL_TABS.map((tool) => (
           <OrchestratorTopButton
+            aria-label={tool.label}
             data-active={activeWorkspaceTool === tool.id ? "true" : "false"}
             key={tool.id}
             onClick={() => setActiveWorkspaceTool(tool.id)}
+            title={tool.label}
             type="button"
           >
-            {tool.label}
+            <span data-has-compact={tool.compactLabel ? "true" : undefined} data-label="full">
+              {tool.label}
+            </span>
+            {tool.compactLabel && (
+              <span data-label="compact">
+                {tool.compactLabel}
+              </span>
+            )}
           </OrchestratorTopButton>
         ))}
       </OrchestratorTopNav>
       {activeWorkspaceTool === "plans" ? (
         <WorkspaceToolSurface data-tool="plans">
-          <PlansWorkspaceView
-            onResumePlan={onResumePlan}
-            rootDirectory={rootDirectory}
-            selectedTerminal={selectedTerminalPlanTarget}
-            workspace={workspace}
-          />
+	          <PlansWorkspaceView
+	            repoTargets={coordinationTargets}
+	            onResumePlan={onResumePlan}
+	            rootDirectory={selectedTerminalPlanTarget?.repoPath || rootDirectory}
+	            selectedTerminal={selectedTerminalPlanTarget}
+	            workspace={workspace}
+	          />
         </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "git" ? (
         <WorkspaceToolSurface data-tool="git">
           <GitWorkspaceView
+            onRefreshRepositories={onRefreshGitRepositories}
+            repositoriesPreload={gitRepositoriesPreload}
             rootDirectory={rootDirectory}
             workspace={workspace}
             workspaceError={workspaceError}
@@ -7770,6 +7811,8 @@ function TerminalView({
   createWorkspaceThreadTerminal,
   createFirstWorkspace,
   chooseNewWorkspaceRootDirectory = () => {},
+  gitRepositoriesPreload = null,
+  onRefreshGitRepositories = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -8431,29 +8474,37 @@ function TerminalView({
     const resolvedIndex = Number.isInteger(terminalIndex)
       ? terminalIndex
       : logicalTerminalIndexes[0];
-    if (!Number.isInteger(resolvedIndex)) {
-      return {
-        agentId: "",
-        paneId: activePaneId || "",
-        sessionId: "",
-        taskId: "",
-        terminalIndex: null,
-        workspaceId: terminalWorkspace?.id || "",
-      };
-    }
-    const paneId = getTerminalPaneId(resolvedIndex);
-    const { liveTerminal } = resolveTodoQueueLiveTerminal(resolvedIndex, paneId);
-    const coordination = liveTerminal?.coordination || {};
-    const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
-    return {
-      agentId: liveTerminal?.agentId
-        || coordination.agentId
-        || coordination.agent_id
-        || getTerminalRole(resolvedIndex)
-        || "",
-      paneId,
-      sessionId: liveTerminal?.sessionId
-        || liveTerminal?.session_id
+	    if (!Number.isInteger(resolvedIndex)) {
+	      const fallbackProjectTarget = getTerminalProjectTarget(null);
+	      return {
+	        agentId: "",
+	        dbPath: fallbackProjectTarget?.dbPath || "",
+	        mountId: fallbackProjectTarget?.mountId || "",
+	        paneId: activePaneId || "",
+	        repoPath: fallbackProjectTarget?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+	        sessionId: "",
+	        taskId: "",
+	        terminalIndex: null,
+	        workspaceId: terminalWorkspace?.id || "",
+	      };
+	    }
+	    const paneId = getTerminalPaneId(resolvedIndex);
+	    const { liveTerminal } = resolveTodoQueueLiveTerminal(resolvedIndex, paneId);
+	    const coordination = liveTerminal?.coordination || {};
+	    const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
+	    const projectTarget = getTerminalProjectTarget(resolvedIndex);
+	    return {
+	      agentId: liveTerminal?.agentId
+	        || coordination.agentId
+	        || coordination.agent_id
+	        || getTerminalRole(resolvedIndex)
+	        || "",
+	      dbPath: projectTarget?.dbPath || "",
+	      mountId: projectTarget?.mountId || "",
+	      paneId,
+	      repoPath: projectTarget?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+	      sessionId: liveTerminal?.sessionId
+	        || liveTerminal?.session_id
         || coordination.sessionId
         || coordination.session_id
         || "",
@@ -8466,14 +8517,17 @@ function TerminalView({
       workspaceId: terminalWorkspace?.id || liveTerminal?.workspaceId || "",
     };
   }, [
-    activePaneId,
-    getTerminalPaneId,
-    getTerminalRole,
-    logicalTerminalIndexes,
-    resolveTodoQueueLiveTerminal,
-    terminalWorkspace?.id,
-    todoQueueDispatchRevision,
-  ]);
+	    activePaneId,
+	    defaultWorkingDirectory,
+	    getTerminalProjectTarget,
+	    getTerminalPaneId,
+	    getTerminalRole,
+	    logicalTerminalIndexes,
+	    resolveTodoQueueLiveTerminal,
+	    terminalWorkspaceWorkingDirectory,
+	    terminalWorkspace?.id,
+	    todoQueueDispatchRevision,
+	  ]);
   const handleResumeTerminalPlan = useCallback((plan) => {
     const targetSessionId = String(plan?.session_id || plan?.sessionId || "").trim();
     const targetTaskId = String(plan?.task_id || plan?.taskId || "").trim();
@@ -14929,12 +14983,15 @@ function TerminalView({
                           accountKey={accountKey}
                           activeDragItemId={todoDragState?.itemId || ""}
                           agentStatuses={agentStatuses}
-                          billingStatus={billingStatus}
-                          defaultWorkingDirectory={defaultWorkingDirectory}
+	                          billingStatus={billingStatus}
+	                          coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
+	                          defaultWorkingDirectory={defaultWorkingDirectory}
                           draft={todoQueueDraft}
                           dropError={todoDropError}
                           getItemAccentColor={getTodoQueueItemAccentColor}
+                          gitRepositoriesPreload={gitRepositoriesPreload}
                           items={visibleTodoQueueItems}
+                          onRefreshGitRepositories={onRefreshGitRepositories}
                           onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
                           onBeginTodoDrag={handleBeginTodoDrag}
                           onCancelQueuedItem={cancelQueuedTodoQueueItem}

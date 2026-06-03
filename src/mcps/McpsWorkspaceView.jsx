@@ -1220,16 +1220,18 @@ export default function McpsWorkspaceView({
         </McpEmptyAccess>
       )}
       <McpInlineActions>
-        <button
-          disabled={actionState !== "idle"}
-          onClick={() => {
-            setEditorMode(EDITOR_MANUAL);
-            setView(VIEW_DISCOVER);
-          }}
-          type="button"
-        >
-          Manual MCP
-        </button>
+        {editorMode !== EDITOR_MANUAL && (
+          <button
+            disabled={actionState !== "idle"}
+            onClick={() => {
+              setEditorMode(EDITOR_MANUAL);
+              setView(VIEW_DISCOVER);
+            }}
+            type="button"
+          >
+            Manual MCP
+          </button>
+        )}
       </McpInlineActions>
     </McpServerList>
   );
@@ -1902,7 +1904,7 @@ export default function McpsWorkspaceView({
                 disabled={isBusy}
                 onClick={() => {
                   setView(VIEW_DISCOVER);
-                  setEditorMode(EDITOR_DETAILS);
+                  setEditorMode(EDITOR_MANUAL);
                 }}
                 type="button"
               >
@@ -1935,7 +1937,7 @@ export default function McpsWorkspaceView({
         )}
       </McpHeaderPanel>
 
-      <McpLayout data-busy={isBusy ? "true" : "false"}>
+      <McpLayout data-busy={isBusy ? "true" : "false"} data-editor-mode={editorMode}>
         <McpRegistryPanel>
           <McpPanelTopline>
             <span>Registry</span>
@@ -1944,21 +1946,30 @@ export default function McpsWorkspaceView({
           <McpTransportTabs aria-label="MCP registry sections">
             <McpTransportButton
               data-active={view === VIEW_INSTALLED}
-              onClick={() => setView(VIEW_INSTALLED)}
+              onClick={() => {
+                setView(VIEW_INSTALLED);
+                setEditorMode(EDITOR_DETAILS);
+              }}
               type="button"
             >
               Installed
             </McpTransportButton>
             <McpTransportButton
               data-active={view === VIEW_DISCOVER}
-              onClick={() => setView(VIEW_DISCOVER)}
+              onClick={() => {
+                setView(VIEW_DISCOVER);
+                setEditorMode(EDITOR_DETAILS);
+              }}
               type="button"
             >
               Discover
             </McpTransportButton>
             <McpTransportButton
               data-active={view === VIEW_MARKETPLACES}
-              onClick={() => setView(VIEW_MARKETPLACES)}
+              onClick={() => {
+                setView(VIEW_MARKETPLACES);
+                setEditorMode(EDITOR_DETAILS);
+              }}
               type="button"
             >
               Sources

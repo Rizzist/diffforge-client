@@ -181,6 +181,10 @@ fn terminal_task_plan_is_terminal_status(status: &str) -> bool {
     )
 }
 
+fn terminal_task_plan_can_resume(status: &str) -> bool {
+    normalize_terminal_task_plan_status(status) != "completed"
+}
+
 fn terminal_task_plan_step_title_from_value(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -5131,7 +5135,7 @@ impl CoordinationKernel {
         session_id: Option<&str>,
         agent_id: Option<&str>,
     ) -> Result<Value, String> {
-        let selected_plan = if let Some(task_id) =
+        let selected_plan_from_target = if let Some(task_id) =
             task_id.map(str::trim).filter(|value| !value.is_empty())
         {
             self.terminal_task_plan_view_by_task_id(task_id).ok()
@@ -5169,6 +5173,30 @@ impl CoordinationKernel {
                     &[],
                 )?
             };
+        let selected_plan_is_active = selected_plan_from_target
+            .as_ref()
+            .map(|plan| {
+                !terminal_task_plan_is_terminal_status(plan["status"].as_str().unwrap_or_default())
+            })
+            .unwrap_or(false);
+        let selected_plan = if selected_plan_is_active {
+            selected_plan_from_target
+        } else {
+            let fallback_task_id = history_rows
+                .iter()
+                .find(|row| {
+                    !terminal_task_plan_is_terminal_status(
+                        row["status"].as_str().unwrap_or_default(),
+                    )
+                })
+                .or_else(|| history_rows.first())
+                .and_then(|row| row["task_id"].as_str())
+                .map(str::to_string);
+            fallback_task_id
+                .as_deref()
+                .and_then(|task_id| self.terminal_task_plan_view_by_task_id(task_id).ok())
+                .or(selected_plan_from_target)
+        };
         let history = history_rows
             .into_iter()
             .map(|row| {
@@ -5184,7 +5212,7 @@ impl CoordinationKernel {
                     "session_id": row["session_id"].clone(),
                     "agent_id": row["agent_id"].clone(),
                     "updated_at": row["updated_at"].clone(),
-                    "can_resume": !terminal_task_plan_is_terminal_status(row["status"].as_str().unwrap_or_default()),
+                    "can_resume": terminal_task_plan_can_resume(row["status"].as_str().unwrap_or_default()),
                 })
             })
             .collect::<Vec<_>>();
