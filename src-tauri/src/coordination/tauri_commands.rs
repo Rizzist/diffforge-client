@@ -471,9 +471,7 @@ pub fn coordination_terminal_task_plan_snapshot(
         return result(kernel.terminal_task_plan_snapshot(task_id, session_id, agent_id));
     }
 
-    result(
-        kernel(repo_path, db_path)?.terminal_task_plan_snapshot(task_id, session_id, agent_id),
-    )
+    result(kernel(repo_path, db_path)?.terminal_task_plan_snapshot(task_id, session_id, agent_id))
 }
 
 #[tauri::command]

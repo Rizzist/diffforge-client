@@ -1457,7 +1457,6 @@ fn terminal_raw_scan_folder_row(
         "isExactGitRoot": selected_root && mount.map(|mount| mount.has_git).unwrap_or(false),
         "hasProjectMarker": mount.is_some(),
         "hasAgents": mount.map(|mount| mount.has_agents).unwrap_or(false),
-        "hasSpecGraphCache": mount.map(|mount| mount.has_spec_graph_cache).unwrap_or(false),
     })
 }
 

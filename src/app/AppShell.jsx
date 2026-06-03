@@ -921,9 +921,6 @@ const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 30 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS = 120;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
-const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
-const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
-const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
@@ -2185,351 +2182,6 @@ function getErrorMessage(error, fallback) {
   }
 
   return fallback;
-}
-
-function createSpecEditIntentId() {
-  const randomId = globalThis.crypto?.randomUUID?.()
-    || `${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
-  return `spec-edit-${randomId}`;
-}
-
-function cleanSpecEditPromptText(value, maxLength = 1800) {
-  const cleaned = String(value || "")
-    .replace(/\r/g, "")
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, " ")
-    .trim();
-  if (cleaned.length <= maxLength) {
-    return cleaned;
-  }
-  return `${cleaned.slice(0, maxLength - 12).trimEnd()}...`;
-}
-
-function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
-  const operation = String(payload.operation || "edit").toLowerCase();
-  const operationLabel = operation === "add"
-    ? "add"
-    : operation === "delete"
-      ? "delete"
-      : "edit";
-  const targetTitle = cleanSpecEditPromptText(payload.targetTitle || "Spec node", 240);
-  const targetPath = cleanSpecEditPromptText(payload.targetPath || "", 300);
-  const targetVisiblePath = cleanSpecEditPromptText(payload.targetVisiblePath || "", 300);
-  const targetProjectRoot = cleanSpecEditPromptText(payload.targetProjectRoot || "", 600);
-  const targetProjectRelativePath = cleanSpecEditPromptText(payload.targetProjectRelativePath || "", 300);
-  const targetWorkspaceRoot = cleanSpecEditPromptText(payload.targetWorkspaceRoot || "", 600);
-  const mountId = cleanSpecEditPromptText(payload.mountId || "", 160);
-  const currentStatement = cleanSpecEditPromptText(payload.currentStatement || "", 1800);
-  const desiredStatement = cleanSpecEditPromptText(payload.desiredStatement || "", 1800);
-  const userInstruction = cleanSpecEditPromptText(payload.userInstruction || "", 1800);
-  const lines = [
-    `Diff Forge Spec Edit Intent: ${intentId}`,
-    "",
-    `Operation: ${operationLabel}`,
-    `Workspace: ${workspace?.name || workspace?.id || "Workspace"}`,
-    `Repository path: ${repoPath || ""}`,
-    `Target node id: ${payload.targetNodeId || ""}`,
-    `Target node: ${targetTitle}`,
-  ];
-  if (targetPath) lines.push(`Target path: ${targetPath}`);
-  if (targetVisiblePath && targetVisiblePath !== targetPath) lines.push(`Container visible path: ${targetVisiblePath}`);
-  if (targetProjectRelativePath && targetProjectRelativePath !== targetPath) {
-    lines.push(`Project-relative path: ${targetProjectRelativePath}`);
-  }
-  if (targetProjectRoot) lines.push(`Project root: ${targetProjectRoot}`);
-  if (targetWorkspaceRoot && targetWorkspaceRoot !== targetProjectRoot) {
-    lines.push(`Container workspace root: ${targetWorkspaceRoot}`);
-  }
-  if (mountId) lines.push(`Project mount id: ${mountId}`);
-  if (payload.containerTargetNodeId && payload.containerTargetNodeId !== payload.targetNodeId) {
-    lines.push(`Container graph node id: ${payload.containerTargetNodeId}`);
-  }
-  if (payload.sourceRepoId) lines.push(`Source repo id: ${payload.sourceRepoId}`);
-  if (payload.targetSpecObjectId) lines.push(`Target spec object id: ${payload.targetSpecObjectId}`);
-  if (payload.baseGraphHash) lines.push(`Base graph cursor: ${payload.baseGraphHash}`);
-  if (payload.baseNodeHash) lines.push(`Base node hash: ${payload.baseNodeHash}`);
-  if (currentStatement) {
-    lines.push("", "Current spec:", currentStatement);
-  }
-  if (desiredStatement) {
-    lines.push("", operation === "add" ? "New spec:" : "Desired spec:", desiredStatement);
-  }
-  if (userInstruction) {
-    lines.push("", "User instruction:", userInstruction);
-  }
-  lines.push(
-    "",
-    "Use coordination-kernel.start_task before changing files or specs. Include this spec_edit_intent_id in the task metadata or plan if the tool schema allows it.",
-    "Acquire leases for affected paths before file edits. Checkpoint progress and submit_patch when complete.",
-    "For delete, retire or supersede the selected spec through the Task History workflow; do not hard-delete history.",
-  );
-  return lines.join("\n");
-}
-
-function specEditField(item, ...keys) {
-  for (const key of keys) {
-    const value = item?.[key];
-    if (value !== undefined && value !== null && value !== "") {
-      return value;
-    }
-  }
-  return "";
-}
-
-function normalizeSpecEditStatement(value) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-function specEditJsonArray(value) {
-  if (Array.isArray(value)) return value;
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function specEditSnapshotNodes(snapshot) {
-  const graph = snapshot?.specGraph || snapshot?.raw || {};
-  if (Array.isArray(snapshot?.specNodes)) return snapshot.specNodes;
-  if (Array.isArray(graph?.nodes)) return graph.nodes;
-  if (Array.isArray(snapshot?.nodes)) return snapshot.nodes;
-  return [];
-}
-
-function specEditNodeActiveSpecs(node) {
-  return specEditJsonArray(specEditField(node, "active_specs", "activeSpecs"));
-}
-
-function specEditSpecId(spec) {
-  return String(specEditField(spec, "id", "spec_id", "specId") || "").trim();
-}
-
-function specEditSpecStatement(spec) {
-  return String(specEditField(spec, "statement", "text", "title") || "");
-}
-
-function specEditSnapshotCursor(snapshot) {
-  const graph = snapshot?.specGraph || snapshot?.raw || {};
-  return String(specEditField(snapshot, "cursor") || specEditField(graph, "cursor") || "").trim();
-}
-
-function specEditSnapshotNodeHash(snapshot, nodeId) {
-  const safeNodeId = String(nodeId || "").trim();
-  if (!safeNodeId) return "";
-  const hashes = snapshot?.nodeHashes || snapshot?.node_hashes || {};
-  if (hashes && typeof hashes === "object" && !Array.isArray(hashes)) {
-    return String(hashes[safeNodeId] || "").trim();
-  }
-  return "";
-}
-
-function specEditSpecSignature(spec) {
-  return {
-    id: specEditSpecId(spec),
-    statement: normalizeSpecEditStatement(specEditSpecStatement(spec)),
-    status: String(specEditField(spec, "status", "freshness_state", "freshnessState") || "").trim().toLowerCase(),
-  };
-}
-
-function specEditNodeChangeSignature(node) {
-  if (!node) return "";
-  const activeSpecs = specEditNodeActiveSpecs(node).map(specEditSpecSignature);
-  const supersededSpecs = specEditJsonArray(
-    specEditField(node, "superseded_specs", "supersededSpecs"),
-  ).map(specEditSpecSignature);
-  return JSON.stringify({
-    activeAgentCount: Number(specEditField(node, "active_agent_count", "activeAgentCount")) || 0,
-    activeSpecs,
-    fileState: String(specEditField(node, "file_state", "fileState") || "").trim().toLowerCase(),
-    freshness: String(specEditField(node, "freshness_state", "freshnessState", "spec_state", "specState") || "").trim().toLowerCase(),
-    lastCodeTouchAt: String(specEditField(node, "last_code_touch_at", "lastCodeTouchAt") || "").trim(),
-    lastPatchEvidenceAt: String(specEditField(node, "last_patch_evidence_at", "lastPatchEvidenceAt") || "").trim(),
-    leaseState: String(specEditField(node, "lease_state", "leaseState") || "").trim().toLowerCase(),
-    markdownPath: String(specEditField(node, "markdown_path", "markdownPath") || "").trim(),
-    notificationCount: Number(specEditField(node, "notification_count", "notificationCount", "out_of_spec_count", "outOfSpecCount")) || 0,
-    supersededSpecs,
-    updatedAt: String(specEditField(node, "updated_at", "updatedAt") || "").trim(),
-  });
-}
-
-function specEditIntentResolvedByGraph(snapshot, intent) {
-  const targetNodeId = String(intent?.targetNodeId || "").trim();
-  if (!snapshot || !targetNodeId) return false;
-
-  const node = specEditSnapshotNodes(snapshot).find((candidate) => (
-    String(specEditField(candidate, "id", "node_id", "nodeId") || "").trim() === targetNodeId
-  ));
-  if (!node) return false;
-
-  const activeSpecs = specEditNodeActiveSpecs(node);
-  const operation = String(intent?.operation || "edit").toLowerCase();
-  const targetSpecObjectId = String(intent?.targetSpecObjectId || "").trim();
-  const currentStatement = normalizeSpecEditStatement(intent?.currentStatement);
-  const desiredStatement = normalizeSpecEditStatement(intent?.desiredStatement);
-  const activeIds = new Set(activeSpecs.map(specEditSpecId).filter(Boolean));
-  const activeStatements = activeSpecs.map((spec) => normalizeSpecEditStatement(specEditSpecStatement(spec)));
-  const targetActiveSpec = targetSpecObjectId
-    ? activeSpecs.find((spec) => specEditSpecId(spec) === targetSpecObjectId)
-    : null;
-
-  if (operation === "add") {
-    return Boolean(desiredStatement && activeStatements.includes(desiredStatement));
-  }
-
-  if (operation === "delete") {
-    if (targetSpecObjectId) return !activeIds.has(targetSpecObjectId);
-    return Boolean(currentStatement && !activeStatements.includes(currentStatement));
-  }
-
-  if (desiredStatement && activeStatements.includes(desiredStatement)) {
-    return true;
-  }
-  if (targetSpecObjectId && !activeIds.has(targetSpecObjectId)) {
-    return true;
-  }
-  if (targetActiveSpec && currentStatement) {
-    return normalizeSpecEditStatement(specEditSpecStatement(targetActiveSpec)) !== currentStatement;
-  }
-
-  const baseNodeHash = String(intent?.baseNodeHash || "").trim();
-  const nextNodeHash = specEditSnapshotNodeHash(snapshot, targetNodeId);
-  if (baseNodeHash && nextNodeHash && nextNodeHash !== baseNodeHash) {
-    return true;
-  }
-
-  const baseNodeSignature = String(intent?.targetNodeSignature || "").trim();
-  const nextNodeSignature = specEditNodeChangeSignature(node);
-  if ((!baseNodeHash || !nextNodeHash) && baseNodeSignature && nextNodeSignature && nextNodeSignature !== baseNodeSignature) {
-    return true;
-  }
-
-  const baseGraphHash = String(intent?.baseGraphHash || "").trim();
-  const nextGraphHash = specEditSnapshotCursor(snapshot);
-  if (!baseNodeHash && !baseNodeSignature && baseGraphHash && nextGraphHash && nextGraphHash !== baseGraphHash) {
-    return true;
-  }
-
-  return false;
-}
-
-function specEditProjectionEventCompletesIntent(event, intent) {
-  const eventType = String(event?.type || "").trim().toLowerCase();
-  if (!["thread.turn.completed", "thread.turn.error", "thread.turn.interrupted"].includes(eventType)) {
-    return false;
-  }
-  const intentId = String(intent?.intentId || "").trim();
-  const eventTurnId = String(event?.turnId || event?.turn_id || "").trim();
-  const eventMessageId = String(event?.messageId || event?.message_id || "").trim();
-  return Boolean(intentId && (eventTurnId === `turn-${intentId}` || eventMessageId === intentId));
-}
-
-function specEditIntentAgentFinished(workspaceThreads, intent) {
-  const workspaceId = String(intent?.workspaceId || "").trim();
-  const threadId = String(intent?.threadId || "").trim();
-  if (!workspaceId || !threadId) return false;
-
-  const thread = workspaceThreads?.[workspaceId]?.threads?.[threadId] || null;
-  if (!thread) return false;
-
-  const submittedAtMs = Number(intent?.submittedAtMs)
-    || Date.parse(intent?.submittedAt || intent?.createdAt || "")
-    || 0;
-  const projectionEvents = Array.isArray(thread.projectionEvents) ? thread.projectionEvents : [];
-  if (projectionEvents.some((event) => specEditProjectionEventCompletesIntent(event, intent))) {
-    return true;
-  }
-  if (transcriptHasTurnCompletionForPrompt(thread.messages, {
-    allowTimestampFallback: true,
-    expectedUserMessage: intent?.promptText || "",
-    messageCreatedAt: intent?.submittedAt || intent?.createdAt || "",
-    submittedAt: intent?.submittedAt || intent?.createdAt || "",
-  })) {
-    return true;
-  }
-
-  const latestTurn = thread.latestTurn || null;
-  const latestTurnState = String(latestTurn?.state || "").toLowerCase();
-  const intentId = String(intent?.intentId || "").trim();
-  const latestTurnMatchesIntent = Boolean(
-    intentId
-      && (
-        String(latestTurn?.turnId || "").trim() === `turn-${intentId}`
-        || String(latestTurn?.messageId || "").trim() === intentId
-      ),
-  );
-  if (latestTurnState === "running") {
-    const status = String(thread.status || "").toLowerCase();
-    return ["closed", "error", "exited"].includes(status);
-  }
-
-  const turnUpdatedAtMs = Date.parse(
-    latestTurn?.completedAt
-      || latestTurn?.updatedAt
-      || latestTurn?.startedAt
-      || latestTurn?.requestedAt
-      || "",
-  ) || 0;
-  if (["completed", "error", "interrupted"].includes(latestTurnState)) {
-    return latestTurnMatchesIntent || !submittedAtMs || !turnUpdatedAtMs || turnUpdatedAtMs >= submittedAtMs - 30000;
-  }
-
-  const status = String(thread.status || "").toLowerCase();
-  return ["closed", "error", "exited"].includes(status);
-}
-
-function specEditIntentResolvedByLifecycleEvent(intent, event = {}) {
-  const eventType = String(event?.type || "").trim().toLowerCase();
-  if (!["provider-turn-completed", "provider-turn-error", "closed", "exited", "error"].includes(eventType)) {
-    return false;
-  }
-
-  const workspaceId = String(intent?.workspaceId || "").trim();
-  const threadId = String(intent?.threadId || "").trim();
-  const eventWorkspaceId = String(event?.workspaceId || "").trim();
-  const eventThreadId = String(event?.threadId || "").trim();
-  if ((workspaceId && eventWorkspaceId && workspaceId !== eventWorkspaceId)
-    || (threadId && eventThreadId && threadId !== eventThreadId)) {
-    return false;
-  }
-
-  const intentId = String(intent?.intentId || "").trim();
-  const promptId = String(
-    event?.pendingPromptId
-      || event?.promptId
-      || event?.promptEventId
-      || event?.messageId
-      || "",
-  ).trim();
-  if (intentId && promptId && promptId === intentId) {
-    return true;
-  }
-
-  const projectionEvents = Array.isArray(event?.projectionEvents)
-    ? event.projectionEvents
-    : Array.isArray(event?.events)
-      ? event.events
-      : [];
-  if (projectionEvents.some((projectionEvent) => specEditProjectionEventCompletesIntent(projectionEvent, intent))) {
-    return true;
-  }
-
-  if (["closed", "exited", "error"].includes(eventType)) {
-    return Boolean(threadId && eventThreadId && threadId === eventThreadId);
-  }
-
-  const completedAtMs = Date.parse(
-    event?.completedAt || event?.messageCreatedAt || event?.createdAt || "",
-  ) || 0;
-  const submittedAtMs = Number(intent?.submittedAtMs)
-    || Date.parse(intent?.submittedAt || intent?.createdAt || "")
-    || 0;
-  return Boolean(threadId && eventThreadId && threadId === eventThreadId)
-    && (!completedAtMs || !submittedAtMs || completedAtMs >= submittedAtMs - 30000);
 }
 
 function isTerminalSessionMissingError(error) {
@@ -3811,7 +3463,7 @@ function normalizeGraphWorkspacePath(value) {
 }
 
 function graphSnapshotBody(snapshot) {
-  return snapshot?.specGraph || snapshot?.raw || {};
+  return snapshot?.raw || {};
 }
 
 function graphSnapshotWorkspaceId(snapshot) {
@@ -4258,7 +3910,6 @@ export default function App() {
   const [audioWidgetVisible, setAudioWidgetVisible] = useState(false);
   const [workspaces, setWorkspaces] = useState([]);
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
-  const [pendingSpecEditIntents, setPendingSpecEditIntents] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
@@ -5907,9 +5558,6 @@ export default function App() {
         workspaceTerminalDisplayLayoutsRef.current = next;
         return next;
       });
-      setPendingSpecEditIntents((current) => Object.fromEntries(
-        Object.entries(current || {}).filter(([, intent]) => intent?.workspaceId !== targetWorkspaceId),
-      ));
       setWorkspaceGraphState((current) => Object.fromEntries(
         Object.entries(current || {}).filter(([key]) => !key.startsWith(`${targetWorkspaceId}::`)),
       ));
@@ -11728,70 +11376,6 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    setPendingSpecEditIntents((current) => {
-      let changed = false;
-      const next = { ...current };
-      Object.entries(current).forEach(([intentId, intent]) => {
-        const graphKey = workspaceGraphStateKey(intent.repoPath || "", intent.workspaceId || "");
-        const graphSnapshot = graphKey ? workspaceGraphState[graphKey]?.architectureSnapshot : null;
-        const resolvedByGraph = specEditIntentResolvedByGraph(graphSnapshot, intent);
-        const resolvedByAgent = specEditIntentAgentFinished(workspaceThreads, intent);
-        if (resolvedByGraph || resolvedByAgent) {
-          delete next[intentId];
-          changed = true;
-        }
-      });
-      return changed ? next : current;
-    });
-  }, [pendingSpecEditIntents, workspaceGraphState, workspaceThreads]);
-  const selectedWorkspacePendingSpecEdits = useMemo(() => (
-    Object.values(pendingSpecEditIntents)
-      .filter((intent) => intent?.workspaceId && intent.workspaceId === (selectedWorkspace?.id || ""))
-  ), [pendingSpecEditIntents, selectedWorkspace?.id]);
-  useEffect(() => {
-    const handleSpecEditDispatched = (event) => {
-      const detail = event?.detail || {};
-      const intentId = String(detail.intentId || detail.intent_id || "").trim();
-      if (!intentId) return;
-      setPendingSpecEditIntents((current) => {
-        const intent = current[intentId];
-        if (!intent) return current;
-        return {
-          ...current,
-          [intentId]: {
-            ...intent,
-            agentId: detail.agentId || detail.agent_id || intent.agentId || "",
-            agentLabel: detail.agentLabel || detail.agent_label || detail.agentId || intent.agentLabel || "agent",
-            dispatchedAt: detail.dispatchedAt || detail.dispatched_at || new Date().toISOString(),
-            terminalId: detail.terminalId || detail.terminal_id || intent.terminalId || "",
-            terminalIndex: Number.isInteger(detail.terminalIndex) ? detail.terminalIndex : intent.terminalIndex,
-            terminalInstanceId: detail.terminalInstanceId || detail.terminal_instance_id || intent.terminalInstanceId || "",
-            threadId: detail.threadId || detail.thread_id || intent.threadId || "",
-          },
-        };
-      });
-    };
-    const handleSpecEditCancelled = (event) => {
-      const detail = event?.detail || {};
-      const intentId = String(detail.intentId || detail.intent_id || "").trim();
-      if (!intentId) return;
-      setPendingSpecEditIntents((current) => {
-        if (!current[intentId]) return current;
-        const next = { ...current };
-        delete next[intentId];
-        return next;
-      });
-    };
-
-    window.addEventListener(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, handleSpecEditDispatched);
-    window.addEventListener(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, handleSpecEditCancelled);
-    return () => {
-      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, handleSpecEditDispatched);
-      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, handleSpecEditCancelled);
-    };
-  }, []);
-
-  useEffect(() => {
     let disposed = false;
     let unlistenRemoteCommand = null;
     let unlistenCreditWallet = null;
@@ -12462,10 +12046,6 @@ export default function App() {
       }
     };
   }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, workspaces]);
-
-  const submitSpecEditIntent = useCallback(async () => {
-    throw new Error("Spec editing has been removed. Architecture keeps task history only.");
-  }, []);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
@@ -14018,17 +13598,6 @@ export default function App() {
         workspaceId: lifecycleWorkspaceId,
       });
     }
-    setPendingSpecEditIntents((current) => {
-      let changed = false;
-      const next = { ...current };
-      Object.entries(current).forEach(([intentId, intent]) => {
-        if (specEditIntentResolvedByLifecycleEvent(intent, lifecycleEvent)) {
-          delete next[intentId];
-          changed = true;
-        }
-      });
-      return changed ? next : current;
-    });
     logWorkspaceThreadDiagnosticEvent("frontend.thread_lifecycle.event", {
       activityStatus: lifecycleEvent.activityStatus || "",
       agentId: lifecycleAgentId,

@@ -1315,7 +1315,6 @@ struct WorkspaceDirectoryEntry {
     mount_id: Option<String>,
     is_project_mount: bool,
     has_agents: bool,
-    has_spec_graph_cache: bool,
 }
 
 #[derive(Serialize)]
@@ -1796,6 +1795,7 @@ include!("platform.rs");
 include!("process.rs");
 include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
+include!("architectures.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("terminal_cli.rs");
@@ -2640,7 +2640,6 @@ async fn deactivate_workspace_runtime(
 
 fn workspace_delete_known_metadata_paths(agents_root: &Path) -> Vec<PathBuf> {
     [
-        "spec-graph",
         "worktrees",
         "cloud-mcp",
         "artifacts",
@@ -3020,10 +3019,10 @@ mod workspace_delete_local_metadata_tests {
             resolve_workspace_root_directory(Some(&root.display().to_string())).unwrap();
         let agents = root.join(".agents");
         let private_state_root = coordination::db::coordination_repo_state_root(&resolved_root);
-        fs::create_dir_all(agents.join("spec-graph")).unwrap();
+        fs::create_dir_all(agents.join("cloud-mcp")).unwrap();
         fs::create_dir_all(agents.join("worktrees").join("slot-1")).unwrap();
         fs::create_dir_all(&private_state_root).unwrap();
-        fs::write(agents.join("spec-graph").join("cache.json"), "{}").unwrap();
+        fs::write(agents.join("cloud-mcp").join("cloud-mcp.jsonl"), "{}").unwrap();
         fs::write(
             agents.join("worktrees").join("slot-1").join("note.txt"),
             "draft",
@@ -3303,6 +3302,10 @@ pub fn run() {
             read_workspace_file_diff,
             workspace_threads_read,
             workspace_threads_persist,
+            architecture_repositories,
+            architecture_graphs_list,
+            architecture_graph_read,
+            architecture_graph_save,
             workspace_web_normalize_url,
             workspace_web_navigate,
             workspace_web_reload,

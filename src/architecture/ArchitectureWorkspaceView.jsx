@@ -1,5 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  Background,
+  BaseEdge,
+  Controls,
+  EdgeLabelRenderer,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Position,
+  ReactFlow,
+  addEdge as addReactFlowEdge,
+  getBezierPath,
+  useEdgesState,
+  useNodesState,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import styled, { keyframes } from "styled-components";
 
 function text(value, fallback = "") {
@@ -157,6 +173,235 @@ function shortLabel(value, maxLength = 30) {
   if (raw.length <= maxLength) return raw;
   if (maxLength <= 3) return raw.slice(0, maxLength);
   return `${raw.slice(0, maxLength - 3)}...`;
+}
+
+const ARCHITECTURE_KIND_OPTIONS = [
+  { label: "Deployment", value: "deployment" },
+  { label: "Flow", value: "flow" },
+  { label: "Subsystem", value: "subsystem" },
+  { label: "Data", value: "data" },
+];
+
+const ARCHITECTURE_NODE_KIND_OPTIONS = [
+  { label: "Service", value: "service" },
+  { label: "Client", value: "client" },
+  { label: "API", value: "api" },
+  { label: "Worker", value: "worker" },
+  { label: "Database", value: "database" },
+  { label: "External", value: "external" },
+  { label: "Queue", value: "queue" },
+];
+
+const ARCHITECTURE_EDGE_KIND_OPTIONS = [
+  { label: "Calls", value: "calls" },
+  { label: "Reads", value: "reads" },
+  { label: "Writes", value: "writes" },
+  { label: "Publishes", value: "publishes" },
+  { label: "Subscribes", value: "subscribes" },
+  { label: "Depends on", value: "depends" },
+];
+
+const architectureNodeTypes = {
+  architectureGroup: ArchitectureCanvasGroup,
+  architectureNode: ArchitectureCanvasNode,
+};
+
+const architectureEdgeTypes = {
+  architectureEdge: ArchitectureCanvasEdge,
+};
+
+function architectureSlug(value, fallback = "architecture") {
+  const raw = text(value, fallback).toLowerCase();
+  const slug = raw
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 96);
+  return slug || fallback;
+}
+
+function architectureEntityId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function architectureKindLabel(value) {
+  const raw = text(value, "architecture");
+  return ARCHITECTURE_KIND_OPTIONS.find((option) => option.value === raw)?.label
+    || raw.replace(/[-_]+/gu, " ");
+}
+
+function architectureGroupPathLabel(value) {
+  const parts = jsonArray(value).map((item) => text(item)).filter(Boolean);
+  return parts.length ? parts.join(" / ") : "General";
+}
+
+function architectureStarterGraph({ groupPath = "", kind = "deployment", title = "" } = {}) {
+  const cleanTitle = text(title, `${architectureKindLabel(kind)} Architecture`);
+  const createdAt = String(Date.now());
+  const id = `${architectureSlug(cleanTitle)}-${createdAt.slice(-5)}`;
+  const groupParts = text(groupPath)
+    .split(/[/>]/u)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, 8);
+  const graphKind = text(kind, "deployment");
+
+  return {
+    id,
+    title: cleanTitle,
+    kind: graphKind,
+    groupPath: groupParts,
+    layout: {
+      direction: "LR",
+      engine: "manual",
+    },
+    version: 1,
+    createdAt,
+    updatedAt: createdAt,
+    nodes: [
+      {
+        id: "boundary",
+        title: `${architectureKindLabel(graphKind)} boundary`,
+        kind: "group",
+        type: "group",
+        position: { x: 80, y: 70 },
+        width: 680,
+        height: 330,
+      },
+      {
+        id: "client",
+        parentId: "boundary",
+        title: graphKind === "flow" ? "Actor" : "Client",
+        subtitle: graphKind === "flow" ? "Starts the flow" : "Browser, mobile, or CLI",
+        kind: "client",
+        position: { x: 48, y: 96 },
+      },
+      {
+        id: "api",
+        parentId: "boundary",
+        title: graphKind === "subsystem" ? "Facade" : "API",
+        subtitle: "Request handling and validation",
+        kind: "api",
+        position: { x: 280, y: 96 },
+      },
+      {
+        id: "store",
+        parentId: "boundary",
+        title: graphKind === "data" ? "Primary dataset" : "Store",
+        subtitle: "State, cache, or persistence",
+        kind: "database",
+        position: { x: 512, y: 96 },
+      },
+    ],
+    edges: [
+      {
+        id: "client-api",
+        source: "client",
+        target: "api",
+        label: "request",
+        kind: "calls",
+      },
+      {
+        id: "api-store",
+        source: "api",
+        target: "store",
+        label: "read/write",
+        kind: "writes",
+      },
+    ],
+  };
+}
+
+function architectureFlowNodeFromGraphNode(node, index = 0) {
+  const rawKind = text(node?.kind || node?.type, "service");
+  const isGroup = rawKind === "group" || text(node?.type) === "group";
+  const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
+  const parentId = text(node?.parentId || node?.parent_id);
+  const position = jsonObject(node?.position) || {};
+  const width = numberValue(node?.width || node?.style?.width, isGroup ? 360 : 184);
+  const height = numberValue(node?.height || node?.style?.height, isGroup ? 220 : 76);
+
+  return {
+    id,
+    type: isGroup ? "architectureGroup" : "architectureNode",
+    parentId: parentId || undefined,
+    extent: parentId && !isGroup ? "parent" : undefined,
+    position: {
+      x: numberValue(position.x, 80 + (index % 3) * 220),
+      y: numberValue(position.y, 80 + Math.floor(index / 3) * 120),
+    },
+    style: isGroup ? { width, height } : undefined,
+    data: {
+      kind: isGroup ? "group" : rawKind,
+      subtitle: text(node?.subtitle || node?.description),
+      title: text(node?.title || node?.label, isGroup ? "Group" : "Node"),
+    },
+  };
+}
+
+function architectureFlowEdgeFromGraphEdge(edge) {
+  const source = text(edge?.source || edge?.from);
+  const target = text(edge?.target || edge?.to);
+  if (!source || !target) return null;
+  return {
+    id: text(edge?.id, `${source}-${target}`),
+    source,
+    target,
+    type: "architectureEdge",
+    markerEnd: {
+      color: "rgba(125, 211, 252, 0.88)",
+      height: 18,
+      type: MarkerType.ArrowClosed,
+      width: 18,
+    },
+    data: {
+      kind: text(edge?.kind, "calls"),
+      label: text(edge?.label || edge?.title),
+    },
+  };
+}
+
+function architectureGraphToFlow(graph) {
+  const nodes = jsonArray(graph?.nodes).map(architectureFlowNodeFromGraphNode);
+  const edges = jsonArray(graph?.edges)
+    .map(architectureFlowEdgeFromGraphEdge)
+    .filter(Boolean);
+  return { edges, nodes };
+}
+
+function architectureGraphFromFlow(graph, nodes, edges) {
+  return {
+    ...(jsonObject(graph) || {}),
+    nodes: nodes.map((node) => {
+      const isGroup = node.type === "architectureGroup";
+      return {
+        id: node.id,
+        title: text(node.data?.title, isGroup ? "Group" : "Node"),
+        subtitle: text(node.data?.subtitle),
+        kind: isGroup ? "group" : text(node.data?.kind, "service"),
+        type: isGroup ? "group" : "node",
+        position: {
+          x: Math.round(numberValue(node.position?.x, 0)),
+          y: Math.round(numberValue(node.position?.y, 0)),
+        },
+        ...(node.parentId ? { parentId: node.parentId } : {}),
+        ...(isGroup ? {
+          height: Math.round(numberValue(node.style?.height, 220)),
+          width: Math.round(numberValue(node.style?.width, 360)),
+        } : {}),
+      };
+    }),
+    edges: edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      label: text(edge.data?.label),
+      kind: text(edge.data?.kind, "calls"),
+    })),
+    layout: {
+      ...(jsonObject(graph?.layout) || {}),
+      engine: "manual",
+    },
+  };
 }
 
 function formatDurationMs(value) {
@@ -711,7 +956,7 @@ export default function ArchitectureWorkspaceView({
   const workspaceId = workspace?.id || "";
   const workspaceName = workspace?.name || "";
   const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
-  const [viewMode, setViewMode] = useState("taskHistory");
+  const [viewMode, setViewMode] = useState("architectures");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
   const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
   const [finishedPlanTaskIds, setFinishedPlanTaskIds] = useState(() => new Set());
@@ -726,6 +971,11 @@ export default function ArchitectureWorkspaceView({
     });
   }, [finishedPlanTaskIds, tasks]);
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
+  const toolbarMeta = viewMode === "architectures"
+    ? `Architectures · repo scoped · ${repoLabel}`
+    : viewMode === "rawScan"
+      ? `Raw Scan · startup cache · ${repoLabel}`
+      : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
 
   useEffect(() => {
     setLocalArchitectureSnapshot(architectureSnapshot);
@@ -805,6 +1055,13 @@ export default function ArchitectureWorkspaceView({
       <ArchitectureToolbar>
         <ViewToggleGroup aria-label="Architecture view mode">
           <ViewToggleButton
+            data-active={viewMode === "architectures" ? "true" : "false"}
+            onClick={() => setViewMode("architectures")}
+            type="button"
+          >
+            Architectures
+          </ViewToggleButton>
+          <ViewToggleButton
             data-active={viewMode === "taskHistory" ? "true" : "false"}
             onClick={() => setViewMode("taskHistory")}
             type="button"
@@ -819,10 +1076,15 @@ export default function ArchitectureWorkspaceView({
             Raw Scan
           </ViewToggleButton>
         </ViewToggleGroup>
-        <ToolbarMeta>Task History · {tasks.length} task{tasks.length === 1 ? "" : "s"} · repo: {repoLabel} · live</ToolbarMeta>
+        <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
       </ArchitectureToolbar>
 
-      {viewMode === "rawScan" ? (
+      {viewMode === "architectures" ? (
+        <ArchitecturesPanel
+          repoLabel={repoLabel}
+          repoPath={repoPath}
+        />
+      ) : viewMode === "rawScan" ? (
         <RawScanPanel
           error={rawScanError}
           scan={rawScanSnapshot}
@@ -844,6 +1106,771 @@ export default function ArchitectureWorkspaceView({
         </ArchitectureErrorToast>
       )}
     </ArchitectureSurface>
+  );
+}
+
+function ArchitecturesPanel({ repoLabel, repoPath }) {
+  const [repositories, setRepositories] = useState([]);
+  const [selectedRepoPath, setSelectedRepoPath] = useState("");
+  const [repoState, setRepoState] = useState("loading");
+  const [graphs, setGraphs] = useState([]);
+  const [graphState, setGraphState] = useState("idle");
+  const [selectedGraphId, setSelectedGraphId] = useState("");
+  const [selectedGraph, setSelectedGraph] = useState(null);
+  const [error, setError] = useState("");
+  const [draftTitle, setDraftTitle] = useState("Deployment architecture");
+  const [draftKind, setDraftKind] = useState("deployment");
+  const [draftGroupPath, setDraftGroupPath] = useState("");
+  const [saveState, setSaveState] = useState("idle");
+
+  useEffect(() => {
+    let cancelled = false;
+    setRepoState("loading");
+    setError("");
+    invoke("architecture_repositories", { rootDirectory: repoPath || null })
+      .then((result) => {
+        if (cancelled) return;
+        const nextRepositories = jsonArray(result?.repositories);
+        setRepositories(nextRepositories);
+        setSelectedRepoPath((current) => {
+          if (current && nextRepositories.some((repo) => repo.path === current)) return current;
+          return nextRepositories[0]?.path || "";
+        });
+        setRepoState("ready");
+      })
+      .catch((nextError) => {
+        if (cancelled) return;
+        setRepositories([]);
+        setSelectedRepoPath("");
+        setRepoState("error");
+        setError(nextError?.message || String(nextError || "Unable to load architecture repositories."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath]);
+
+  const loadGraphList = useCallback((repo = selectedRepoPath) => {
+    if (!repo) {
+      setGraphs([]);
+      setSelectedGraphId("");
+      setSelectedGraph(null);
+      return Promise.resolve([]);
+    }
+    setGraphState("loading");
+    setError("");
+    return invoke("architecture_graphs_list", { repoPath: repo })
+      .then((result) => {
+        const nextGraphs = jsonArray(result?.graphs);
+        setGraphs(nextGraphs);
+        setSelectedGraphId((current) => {
+          if (current && nextGraphs.some((graph) => graph.id === current)) return current;
+          return nextGraphs[0]?.id || "";
+        });
+        if (!nextGraphs.length) {
+          setSelectedGraph(null);
+        }
+        setGraphState("ready");
+        return nextGraphs;
+      })
+      .catch((nextError) => {
+        setGraphs([]);
+        setSelectedGraphId("");
+        setSelectedGraph(null);
+        setGraphState("error");
+        setError(nextError?.message || String(nextError || "Unable to load architecture graphs."));
+        return [];
+      });
+  }, [selectedRepoPath]);
+
+  useEffect(() => {
+    void loadGraphList(selectedRepoPath);
+  }, [loadGraphList, selectedRepoPath]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedRepoPath || !selectedGraphId) {
+      setSelectedGraph(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setGraphState("loading");
+    invoke("architecture_graph_read", {
+      graphId: selectedGraphId,
+      repoPath: selectedRepoPath,
+    })
+      .then((graph) => {
+        if (cancelled) return;
+        setSelectedGraph(graph);
+        setGraphState("ready");
+      })
+      .catch((nextError) => {
+        if (cancelled) return;
+        setSelectedGraph(null);
+        setGraphState("error");
+        setError(nextError?.message || String(nextError || "Unable to read architecture graph."));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedGraphId, selectedRepoPath]);
+
+  const selectedRepo = repositories.find((repo) => repo.path === selectedRepoPath) || null;
+  const isLoading = repoState === "loading" || graphState === "loading";
+
+  const createGraph = useCallback(() => {
+    if (!selectedRepoPath) return;
+    const graph = architectureStarterGraph({
+      groupPath: draftGroupPath,
+      kind: draftKind,
+      title: draftTitle,
+    });
+    setSaveState("saving");
+    setError("");
+    invoke("architecture_graph_save", {
+      graph,
+      repoPath: selectedRepoPath,
+    })
+      .then((result) => {
+        setSelectedGraph(result?.graph || graph);
+        setSelectedGraphId(result?.graphId || graph.id);
+        setDraftTitle(`${architectureKindLabel(draftKind)} architecture`);
+        setSaveState("idle");
+        void loadGraphList(selectedRepoPath);
+      })
+      .catch((nextError) => {
+        setSaveState("idle");
+        setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
+      });
+  }, [draftGroupPath, draftKind, draftTitle, loadGraphList, selectedRepoPath]);
+
+  const saveGraph = useCallback((graph) => {
+    if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
+    setSaveState("saving");
+    setError("");
+    return invoke("architecture_graph_save", {
+      graph,
+      repoPath: selectedRepoPath,
+    })
+      .then((result) => {
+        const nextGraph = result?.graph || graph;
+        setSelectedGraph(nextGraph);
+        setSelectedGraphId(result?.graphId || nextGraph.id);
+        setSaveState("idle");
+        void loadGraphList(selectedRepoPath);
+        return nextGraph;
+      })
+      .catch((nextError) => {
+        setSaveState("idle");
+        setError(nextError?.message || String(nextError || "Unable to save architecture graph."));
+        throw nextError;
+      });
+  }, [loadGraphList, selectedRepoPath]);
+
+  return (
+    <ArchitecturesShell>
+      <ArchitectureRepoRail aria-label="Architecture repositories">
+        <ArchitectureRailHeader>
+          <span>Repositories</span>
+          <strong>{repositories.length}</strong>
+        </ArchitectureRailHeader>
+        <ArchitectureRepoList>
+          {repositories.map((repo) => (
+            <ArchitectureRepoButton
+              data-active={repo.path === selectedRepoPath ? "true" : "false"}
+              key={repo.id}
+              onClick={() => {
+                setSelectedRepoPath(repo.path);
+                setSelectedGraphId("");
+                setSelectedGraph(null);
+              }}
+              title={repo.path}
+              type="button"
+            >
+              <strong>{repo.name}</strong>
+              <span>{repo.relativePath}</span>
+              <em>{repo.graphCount} graph{repo.graphCount === 1 ? "" : "s"}</em>
+            </ArchitectureRepoButton>
+          ))}
+          {repoState === "ready" && !repositories.length && (
+            <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
+          )}
+        </ArchitectureRepoList>
+        <ArchitectureCreatePanel>
+          <ArchitectureRailHeader>
+            <span>New Graph</span>
+            <strong>{architectureKindLabel(draftKind)}</strong>
+          </ArchitectureRailHeader>
+          <ArchitectureField>
+            <span>Title</span>
+            <ArchitectureInput
+              onChange={(event) => setDraftTitle(event.target.value)}
+              value={draftTitle}
+            />
+          </ArchitectureField>
+          <ArchitectureField>
+            <span>Type</span>
+            <ArchitectureSelect
+              onChange={(event) => setDraftKind(event.target.value)}
+              value={draftKind}
+            >
+              {ARCHITECTURE_KIND_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </ArchitectureSelect>
+          </ArchitectureField>
+          <ArchitectureField>
+            <span>Nested path</span>
+            <ArchitectureInput
+              onChange={(event) => setDraftGroupPath(event.target.value)}
+              placeholder="auth / api"
+              value={draftGroupPath}
+            />
+          </ArchitectureField>
+          <ArchitecturePrimaryButton
+            disabled={!selectedRepoPath || saveState === "saving"}
+            onClick={createGraph}
+            type="button"
+          >
+            Create Graph
+          </ArchitecturePrimaryButton>
+        </ArchitectureCreatePanel>
+      </ArchitectureRepoRail>
+
+      <ArchitectureGraphLibrary aria-label="Architecture graphs">
+        <ArchitectureGraphHeader>
+          <div>
+            <TimelineKicker>{selectedRepo?.name || repoLabel}</TimelineKicker>
+            <ArchitectureGraphTitle>{selectedRepo?.relativePath || "Architectures"}</ArchitectureGraphTitle>
+          </div>
+          <ArchitectureGraphHeaderActions>
+            <ArchitectureSmallButton
+              disabled={!selectedRepoPath || isLoading}
+              onClick={() => void loadGraphList(selectedRepoPath)}
+              type="button"
+            >
+              Refresh
+            </ArchitectureSmallButton>
+          </ArchitectureGraphHeaderActions>
+        </ArchitectureGraphHeader>
+        {selectedRepo && (
+          <ArchitectureStoragePath title={selectedRepo.architectureRoot}>
+            .agents/architectures
+          </ArchitectureStoragePath>
+        )}
+        <ArchitectureGraphList>
+          {graphs.map((graph) => (
+            <ArchitectureGraphButton
+              data-active={graph.id === selectedGraphId ? "true" : "false"}
+              key={graph.id}
+              onClick={() => setSelectedGraphId(graph.id)}
+              title={graph.filePath}
+              type="button"
+            >
+              <strong>{graph.title}</strong>
+              <span>{architectureKindLabel(graph.kind)} · {architectureGroupPathLabel(graph.groupPath)}</span>
+              <em>{graph.nodeCount} nodes · {graph.edgeCount} edges · {formatRelativeTimeMs(graph.updatedAt)}</em>
+            </ArchitectureGraphButton>
+          ))}
+          {graphState === "ready" && !graphs.length && (
+            <ArchitectureEmptyNote>Create a graph to start mapping this repo.</ArchitectureEmptyNote>
+          )}
+        </ArchitectureGraphList>
+      </ArchitectureGraphLibrary>
+
+      <ArchitectureEditorRegion>
+        {error && <ArchitectureError>{error}</ArchitectureError>}
+        {selectedGraph ? (
+          <ArchitectureGraphEditor
+            graph={selectedGraph}
+            onSave={saveGraph}
+            saveState={saveState}
+          />
+        ) : (
+          <ArchitectureEditorEmpty>
+            <strong>{isLoading ? "Loading architectures..." : "No graph selected"}</strong>
+            <span>Manual graphs live in the selected repo under .agents/architectures.</span>
+          </ArchitectureEditorEmpty>
+        )}
+      </ArchitectureEditorRegion>
+    </ArchitecturesShell>
+  );
+}
+
+function ArchitectureGraphEditor({ graph, onSave, saveState }) {
+  const initialFlow = useMemo(() => architectureGraphToFlow(graph), [graph]);
+  const [nodes, setNodes, handleNodesChange] = useNodesState(initialFlow.nodes);
+  const [edges, setEdges, handleEdgesChange] = useEdgesState(initialFlow.edges);
+  const [draftGraph, setDraftGraph] = useState(() => jsonObject(graph) || {});
+  const [dirty, setDirty] = useState(false);
+  const [selectedNodes, setSelectedNodes] = useState([]);
+  const [selectedEdges, setSelectedEdges] = useState([]);
+  const [localError, setLocalError] = useState("");
+
+  useEffect(() => {
+    const nextFlow = architectureGraphToFlow(graph);
+    setNodes(nextFlow.nodes);
+    setEdges(nextFlow.edges);
+    setDraftGraph(jsonObject(graph) || {});
+    setSelectedNodes([]);
+    setSelectedEdges([]);
+    setDirty(false);
+    setLocalError("");
+  }, [graph, setEdges, setNodes]);
+
+  const selectedNode = selectedNodes[0]
+    ? nodes.find((node) => node.id === selectedNodes[0].id)
+    : null;
+  const selectedEdge = selectedEdges[0]
+    ? edges.find((edge) => edge.id === selectedEdges[0].id)
+    : null;
+
+  const onNodesChange = useCallback((changes) => {
+    if (changes.some((change) => change.type !== "select")) setDirty(true);
+    handleNodesChange(changes);
+  }, [handleNodesChange]);
+
+  const onEdgesChange = useCallback((changes) => {
+    if (changes.some((change) => change.type !== "select")) setDirty(true);
+    handleEdgesChange(changes);
+  }, [handleEdgesChange]);
+
+  const onConnect = useCallback((connection) => {
+    const id = architectureEntityId("edge");
+    setDirty(true);
+    setEdges((currentEdges) => addReactFlowEdge({
+      ...connection,
+      id,
+      markerEnd: {
+        color: "rgba(125, 211, 252, 0.88)",
+        height: 18,
+        type: MarkerType.ArrowClosed,
+        width: 18,
+      },
+      type: "architectureEdge",
+      data: {
+        kind: "calls",
+        label: "",
+      },
+    }, currentEdges));
+  }, [setEdges]);
+
+  const updateDraftGraph = useCallback((patch) => {
+    setDraftGraph((current) => ({
+      ...current,
+      ...patch,
+    }));
+    setDirty(true);
+  }, []);
+
+  const addGroup = useCallback(() => {
+    const count = nodes.filter((node) => node.type === "architectureGroup").length;
+    setNodes((currentNodes) => [
+      ...currentNodes,
+      {
+        id: architectureEntityId("group"),
+        type: "architectureGroup",
+        position: { x: 120 + count * 34, y: 90 + count * 28 },
+        style: { height: 240, width: 380 },
+        data: {
+          kind: "group",
+          subtitle: "Drag nodes into this area",
+          title: `Group ${count + 1}`,
+        },
+      },
+    ]);
+    setDirty(true);
+  }, [nodes, setNodes]);
+
+  const addNode = useCallback(() => {
+    const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
+      || (selectedNode?.type === "architectureGroup" ? selectedNode : null);
+    const nodeCount = nodes.filter((node) => node.type !== "architectureGroup").length;
+    setNodes((currentNodes) => [
+      ...currentNodes,
+      {
+        id: architectureEntityId("node"),
+        type: "architectureNode",
+        parentId: selectedGroup?.id,
+        extent: selectedGroup?.id ? "parent" : undefined,
+        position: selectedGroup?.id
+          ? { x: 44 + (nodeCount % 2) * 190, y: 72 + Math.floor(nodeCount / 2) * 96 }
+          : { x: 140 + (nodeCount % 3) * 220, y: 130 + Math.floor(nodeCount / 3) * 128 },
+        data: {
+          kind: "service",
+          subtitle: "",
+          title: `Node ${nodeCount + 1}`,
+        },
+      },
+    ]);
+    setDirty(true);
+  }, [nodes, selectedNode, selectedNodes, setNodes]);
+
+  const connectSelectedNodes = useCallback(() => {
+    const pair = selectedNodes.filter((node) => node.type !== "architectureGroup").slice(0, 2);
+    if (pair.length < 2) {
+      setLocalError("Select two non-group nodes to connect.");
+      return;
+    }
+    setLocalError("");
+    setEdges((currentEdges) => [
+      ...currentEdges,
+      {
+        id: architectureEntityId("edge"),
+        source: pair[0].id,
+        target: pair[1].id,
+        type: "architectureEdge",
+        markerEnd: {
+          color: "rgba(125, 211, 252, 0.88)",
+          height: 18,
+          type: MarkerType.ArrowClosed,
+          width: 18,
+        },
+        data: {
+          kind: "calls",
+          label: "",
+        },
+      },
+    ]);
+    setDirty(true);
+  }, [selectedNodes, setEdges]);
+
+  const deleteSelected = useCallback(() => {
+    const nodeIds = new Set(selectedNodes.map((node) => node.id));
+    const edgeIds = new Set(selectedEdges.map((edge) => edge.id));
+    if (!nodeIds.size && !edgeIds.size) return;
+    setNodes((currentNodes) => currentNodes.filter((node) => !nodeIds.has(node.id) && !nodeIds.has(node.parentId)));
+    setEdges((currentEdges) => currentEdges.filter((edge) => (
+      !edgeIds.has(edge.id)
+      && !nodeIds.has(edge.source)
+      && !nodeIds.has(edge.target)
+    )));
+    setSelectedNodes([]);
+    setSelectedEdges([]);
+    setDirty(true);
+  }, [selectedEdges, selectedNodes, setEdges, setNodes]);
+
+  const updateSelectedNodeData = useCallback((patch) => {
+    if (!selectedNode) return;
+    setNodes((currentNodes) => currentNodes.map((node) => (
+      node.id === selectedNode.id
+        ? { ...node, data: { ...node.data, ...patch } }
+        : node
+    )));
+    setDirty(true);
+  }, [selectedNode, setNodes]);
+
+  const updateSelectedGroupSize = useCallback((field, value) => {
+    if (!selectedNode || selectedNode.type !== "architectureGroup") return;
+    const numeric = Math.max(field === "width" ? 220 : 150, numberValue(value, selectedNode.style?.[field] || 0));
+    setNodes((currentNodes) => currentNodes.map((node) => (
+      node.id === selectedNode.id
+        ? { ...node, style: { ...node.style, [field]: numeric } }
+        : node
+    )));
+    setDirty(true);
+  }, [selectedNode, setNodes]);
+
+  const updateSelectedEdgeData = useCallback((patch) => {
+    if (!selectedEdge) return;
+    setEdges((currentEdges) => currentEdges.map((edge) => (
+      edge.id === selectedEdge.id
+        ? { ...edge, data: { ...edge.data, ...patch } }
+        : edge
+    )));
+    setDirty(true);
+  }, [selectedEdge, setEdges]);
+
+  const save = useCallback(() => {
+    const nextGraph = architectureGraphFromFlow(draftGraph, nodes, edges);
+    setLocalError("");
+    onSave(nextGraph)
+      .then(() => setDirty(false))
+      .catch((nextError) => {
+        setLocalError(nextError?.message || String(nextError || "Unable to save graph."));
+      });
+  }, [draftGraph, edges, nodes, onSave]);
+
+  return (
+    <ArchitectureEditorShell>
+      <ArchitectureEditorToolbar>
+        <ArchitectureEditorMeta>
+          <ArchitectureField>
+            <span>Graph title</span>
+            <ArchitectureInput
+              onChange={(event) => updateDraftGraph({ title: event.target.value })}
+              value={text(draftGraph.title)}
+            />
+          </ArchitectureField>
+          <ArchitectureField>
+            <span>Type</span>
+            <ArchitectureSelect
+              onChange={(event) => updateDraftGraph({ kind: event.target.value })}
+              value={text(draftGraph.kind, "deployment")}
+            >
+              {ARCHITECTURE_KIND_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </ArchitectureSelect>
+          </ArchitectureField>
+          <ArchitectureField>
+            <span>Nested path</span>
+            <ArchitectureInput
+              onChange={(event) => updateDraftGraph({
+                groupPath: event.target.value
+                  .split(/[/>]/u)
+                  .map((part) => part.trim())
+                  .filter(Boolean),
+              })}
+              placeholder="auth / api"
+              value={jsonArray(draftGraph.groupPath).join(" / ")}
+            />
+          </ArchitectureField>
+        </ArchitectureEditorMeta>
+        <ArchitectureEditorActions>
+          <ArchitectureSmallButton onClick={addNode} type="button">Add Node</ArchitectureSmallButton>
+          <ArchitectureSmallButton onClick={addGroup} type="button">Add Group</ArchitectureSmallButton>
+          <ArchitectureSmallButton onClick={connectSelectedNodes} type="button">Connect</ArchitectureSmallButton>
+          <ArchitectureDangerButton
+            disabled={!selectedNodes.length && !selectedEdges.length}
+            onClick={deleteSelected}
+            type="button"
+          >
+            Delete
+          </ArchitectureDangerButton>
+          <ArchitecturePrimaryButton
+            disabled={!dirty || saveState === "saving"}
+            onClick={save}
+            type="button"
+          >
+            {saveState === "saving" ? "Saving..." : dirty ? "Save" : "Saved"}
+          </ArchitecturePrimaryButton>
+        </ArchitectureEditorActions>
+      </ArchitectureEditorToolbar>
+
+      {(localError || dirty) && (
+        <ArchitectureEditorNotice data-kind={localError ? "error" : "dirty"}>
+          {localError || "Unsaved architecture changes"}
+        </ArchitectureEditorNotice>
+      )}
+
+      <ArchitectureEditorBody>
+        <ArchitectureCanvasViewport>
+          <ReactFlow
+            colorMode="dark"
+            defaultEdgeOptions={{
+              markerEnd: {
+                color: "rgba(125, 211, 252, 0.88)",
+                type: MarkerType.ArrowClosed,
+              },
+              type: "architectureEdge",
+            }}
+            edgeTypes={architectureEdgeTypes}
+            edges={edges}
+            fitView
+            maxZoom={1.7}
+            minZoom={0.18}
+            nodeTypes={architectureNodeTypes}
+            nodes={nodes}
+            onConnect={onConnect}
+            onEdgesChange={onEdgesChange}
+            onNodesChange={onNodesChange}
+            onSelectionChange={({ nodes: nextNodes, edges: nextEdges }) => {
+              setSelectedNodes(nextNodes);
+              setSelectedEdges(nextEdges);
+            }}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
+            <MiniMap
+              nodeBorderRadius={8}
+              nodeColor={(node) => {
+                if (node.type === "architectureGroup") return "rgba(148, 163, 184, 0.24)";
+                if (node.data?.kind === "database") return "#34d399";
+                if (node.data?.kind === "client") return "#fbbf24";
+                if (node.data?.kind === "external") return "#f472b6";
+                if (node.data?.kind === "queue") return "#a78bfa";
+                return "#38bdf8";
+              }}
+              pannable
+              zoomable
+            />
+            <Controls showInteractive={false} />
+          </ReactFlow>
+        </ArchitectureCanvasViewport>
+
+        <ArchitectureInspector aria-label="Architecture selection inspector">
+          <ArchitectureInspectorHeader>
+            <span>Selection</span>
+            <strong>
+              {selectedNode
+                ? selectedNode.type === "architectureGroup" ? "Group" : "Node"
+                : selectedEdge ? "Edge" : "None"}
+            </strong>
+          </ArchitectureInspectorHeader>
+          {selectedNode ? (
+            <>
+              <ArchitectureField>
+                <span>Title</span>
+                <ArchitectureInput
+                  onChange={(event) => updateSelectedNodeData({ title: event.target.value })}
+                  value={text(selectedNode.data?.title)}
+                />
+              </ArchitectureField>
+              <ArchitectureField>
+                <span>Subtitle</span>
+                <ArchitectureInput
+                  onChange={(event) => updateSelectedNodeData({ subtitle: event.target.value })}
+                  value={text(selectedNode.data?.subtitle)}
+                />
+              </ArchitectureField>
+              {selectedNode.type === "architectureGroup" ? (
+                <>
+                  <ArchitectureField>
+                    <span>Width</span>
+                    <ArchitectureInput
+                      min="220"
+                      onChange={(event) => updateSelectedGroupSize("width", event.target.value)}
+                      type="number"
+                      value={Math.round(numberValue(selectedNode.style?.width, 360))}
+                    />
+                  </ArchitectureField>
+                  <ArchitectureField>
+                    <span>Height</span>
+                    <ArchitectureInput
+                      min="150"
+                      onChange={(event) => updateSelectedGroupSize("height", event.target.value)}
+                      type="number"
+                      value={Math.round(numberValue(selectedNode.style?.height, 220))}
+                    />
+                  </ArchitectureField>
+                </>
+              ) : (
+                <ArchitectureField>
+                  <span>Kind</span>
+                  <ArchitectureSelect
+                    onChange={(event) => updateSelectedNodeData({ kind: event.target.value })}
+                    value={text(selectedNode.data?.kind, "service")}
+                  >
+                    {ARCHITECTURE_NODE_KIND_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </ArchitectureSelect>
+                </ArchitectureField>
+              )}
+            </>
+          ) : selectedEdge ? (
+            <>
+              <ArchitectureField>
+                <span>Label</span>
+                <ArchitectureInput
+                  onChange={(event) => updateSelectedEdgeData({ label: event.target.value })}
+                  value={text(selectedEdge.data?.label)}
+                />
+              </ArchitectureField>
+              <ArchitectureField>
+                <span>Kind</span>
+                <ArchitectureSelect
+                  onChange={(event) => updateSelectedEdgeData({ kind: event.target.value })}
+                  value={text(selectedEdge.data?.kind, "calls")}
+                >
+                  {ARCHITECTURE_EDGE_KIND_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </ArchitectureSelect>
+              </ArchitectureField>
+              <ArchitectureInspectorMeta>
+                {selectedEdge.source} {"->"} {selectedEdge.target}
+              </ArchitectureInspectorMeta>
+            </>
+          ) : (
+            <ArchitectureInspectorMeta>
+              Select a node, group, or edge to edit it.
+            </ArchitectureInspectorMeta>
+          )}
+        </ArchitectureInspector>
+      </ArchitectureEditorBody>
+    </ArchitectureEditorShell>
+  );
+}
+
+function ArchitectureCanvasNode({ data, selected }) {
+  return (
+    <ArchitectureCanvasNodeShell data-kind={text(data?.kind, "service")} data-selected={selected ? "true" : "false"}>
+      <Handle position={Position.Left} type="target" />
+      <ArchitectureNodeIcon aria-hidden="true" data-kind={text(data?.kind, "service")} />
+      <ArchitectureNodeText>
+        <strong>{text(data?.title, "Node")}</strong>
+        <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>
+      </ArchitectureNodeText>
+      <Handle position={Position.Right} type="source" />
+    </ArchitectureCanvasNodeShell>
+  );
+}
+
+function ArchitectureCanvasGroup({ data, selected }) {
+  return (
+    <ArchitectureCanvasGroupShell data-selected={selected ? "true" : "false"}>
+      <Handle position={Position.Left} type="target" />
+      <strong>{text(data?.title, "Group")}</strong>
+      <span>{text(data?.subtitle, "Architecture group")}</span>
+      <Handle position={Position.Right} type="source" />
+    </ArchitectureCanvasGroupShell>
+  );
+}
+
+function ArchitectureCanvasEdge({
+  data,
+  id,
+  markerEnd,
+  selected,
+  sourcePosition,
+  sourceX,
+  sourceY,
+  targetPosition,
+  targetX,
+  targetY,
+}) {
+  const [edgePath, labelX, labelY] = getBezierPath({
+    sourcePosition,
+    sourceX,
+    sourceY,
+    targetPosition,
+    targetX,
+    targetY,
+  });
+  const kind = text(data?.kind, "calls");
+  const label = text(data?.label);
+
+  return (
+    <>
+      <BaseEdge
+        id={id}
+        markerEnd={markerEnd}
+        path={edgePath}
+        style={{
+          stroke: selected ? "rgba(251, 191, 36, 0.95)" : "rgba(125, 211, 252, 0.8)",
+          strokeDasharray: kind === "depends" ? "7 5" : kind === "subscribes" ? "2 6" : "0",
+          strokeLinecap: "round",
+          strokeWidth: selected ? 3 : 2.2,
+        }}
+      />
+      {label && (
+        <EdgeLabelRenderer>
+          <ArchitectureEdgeLabel
+            data-kind={kind}
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+            }}
+          >
+            {label}
+          </ArchitectureEdgeLabel>
+        </EdgeLabelRenderer>
+      )}
+    </>
   );
 }
 
@@ -1264,6 +2291,732 @@ const ArchitectureErrorToast = styled.div`
   span {
     color: rgba(254, 202, 202, 0.9);
     font-weight: 720;
+  }
+`;
+
+const ArchitecturesShell = styled.div`
+  display: grid;
+  grid-template-columns: minmax(190px, 230px) minmax(220px, 280px) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  @media (max-width: 1100px) {
+    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  }
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+`;
+
+const ArchitectureRepoRail = styled.aside`
+  display: grid;
+  align-content: start;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
+  overflow: hidden;
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(2, 6, 23, 0.34);
+
+  @media (max-width: 760px) {
+    border-right: 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  }
+`;
+
+const ArchitectureRailHeader = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  color: var(--forge-text-muted);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+
+  strong {
+    color: rgba(226, 232, 240, 0.82);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: none;
+  }
+`;
+
+const ArchitectureRepoList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+`;
+
+const ArchitectureRepoButton = styled.button`
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(15, 23, 42, 0.28);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  strong,
+  span,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 880;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.78);
+    font-size: 10px;
+    font-weight: 720;
+  }
+
+  em {
+    color: rgba(125, 211, 252, 0.78);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 820;
+  }
+
+  &:hover,
+  &[data-active="true"] {
+    border-color: rgba(125, 211, 252, 0.24);
+    background: rgba(14, 165, 233, 0.12);
+  }
+
+  &[data-active="true"] {
+    box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.72);
+  }
+`;
+
+const ArchitectureCreatePanel = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const ArchitectureField = styled.label`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+
+  span {
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+`;
+
+const ArchitectureInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: var(--forge-text);
+  background: rgba(2, 6, 23, 0.42);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 760;
+  outline: none;
+
+  &:focus {
+    border-color: rgba(125, 211, 252, 0.52);
+    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.14);
+  }
+`;
+
+const ArchitectureSelect = styled.select`
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: var(--forge-text);
+  background: rgba(2, 6, 23, 0.42);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 760;
+  outline: none;
+
+  &:focus {
+    border-color: rgba(125, 211, 252, 0.52);
+    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.14);
+  }
+`;
+
+const ArchitecturePrimaryButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  padding: 0 11px;
+  border: 1px solid rgba(45, 212, 191, 0.32);
+  border-radius: 7px;
+  color: rgba(204, 251, 241, 0.95);
+  background: rgba(13, 148, 136, 0.22);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(94, 234, 212, 0.48);
+    background: rgba(20, 184, 166, 0.28);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.52;
+  }
+`;
+
+const ArchitectureSmallButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.86);
+  background: rgba(15, 23, 42, 0.48);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 850;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    background: rgba(14, 165, 233, 0.13);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.48;
+  }
+`;
+
+const ArchitectureDangerButton = styled(ArchitectureSmallButton)`
+  border-color: rgba(251, 113, 133, 0.18);
+  color: rgba(254, 205, 211, 0.86);
+  background: rgba(127, 29, 29, 0.16);
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(251, 113, 133, 0.32);
+    background: rgba(190, 18, 60, 0.18);
+  }
+`;
+
+const ArchitectureGraphLibrary = styled.aside`
+  display: grid;
+  align-content: start;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
+  overflow: hidden;
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(15, 23, 42, 0.18);
+
+  @media (max-width: 1100px) {
+    display: none;
+  }
+`;
+
+const ArchitectureGraphHeader = styled.header`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const ArchitectureGraphTitle = styled.strong`
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--forge-text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 1.2;
+`;
+
+const ArchitectureGraphHeaderActions = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 6px;
+`;
+
+const ArchitectureStoragePath = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(167, 243, 208, 0.74);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 820;
+`;
+
+const ArchitectureGraphList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+`;
+
+const ArchitectureGraphButton = styled.button`
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(2, 6, 23, 0.24);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  strong,
+  span,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 880;
+  }
+
+  span {
+    color: rgba(226, 232, 240, 0.72);
+    font-size: 10px;
+    font-weight: 740;
+    text-transform: capitalize;
+  }
+
+  em {
+    color: rgba(148, 163, 184, 0.72);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 780;
+  }
+
+  &:hover,
+  &[data-active="true"] {
+    border-color: rgba(251, 191, 36, 0.26);
+    background: rgba(120, 53, 15, 0.14);
+  }
+
+  &[data-active="true"] {
+    box-shadow: inset 2px 0 0 rgba(251, 191, 36, 0.68);
+  }
+`;
+
+const ArchitectureEmptyNote = styled.div`
+  padding: 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: rgba(148, 163, 184, 0.76);
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.4;
+`;
+
+const ArchitectureEditorRegion = styled.main`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
+  overflow: hidden;
+`;
+
+const ArchitectureEditorEmpty = styled.div`
+  display: grid;
+  place-content: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  border: 1px dashed rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: rgba(148, 163, 184, 0.78);
+  text-align: center;
+
+  strong {
+    color: var(--forge-text);
+    font-size: 15px;
+    font-weight: 900;
+  }
+
+  span {
+    font-size: 12px;
+    font-weight: 760;
+  }
+`;
+
+const ArchitectureEditorShell = styled.div`
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const ArchitectureEditorToolbar = styled.header`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+  min-width: 0;
+
+  @media (max-width: 980px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const ArchitectureEditorMeta = styled.div`
+  display: grid;
+  grid-template-columns: minmax(160px, 1.2fr) minmax(110px, 0.55fr) minmax(120px, 0.8fr);
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const ArchitectureEditorActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const ArchitectureEditorNotice = styled.div`
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(251, 191, 36, 0.2);
+  border-radius: 8px;
+  color: rgba(254, 240, 138, 0.82);
+  background: rgba(120, 53, 15, 0.12);
+  font-size: 11px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+
+  &[data-kind="error"] {
+    border-color: rgba(251, 113, 133, 0.26);
+    color: #fecaca;
+    background: rgba(127, 29, 29, 0.16);
+  }
+`;
+
+const ArchitectureEditorBody = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(190px, 230px);
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+`;
+
+const ArchitectureCanvasViewport = styled.div`
+  min-width: 0;
+  min-height: 420px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.16), rgba(2, 6, 23, 0.18)),
+    rgba(2, 6, 23, 0.36);
+
+  .react-flow {
+    min-height: 420px;
+  }
+
+  .react-flow__controls {
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: none;
+  }
+
+  .react-flow__controls-button {
+    border-bottom-color: rgba(148, 163, 184, 0.12);
+    color: rgba(226, 232, 240, 0.86);
+    background: rgba(15, 23, 42, 0.82);
+  }
+
+  .react-flow__minimap {
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 8px;
+    background: rgba(2, 6, 23, 0.72);
+  }
+`;
+
+const ArchitectureInspector = styled.aside`
+  display: grid;
+  align-content: start;
+  gap: 9px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 11px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.3);
+`;
+
+const ArchitectureInspectorHeader = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: rgba(148, 163, 184, 0.82);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+
+  strong {
+    color: rgba(226, 232, 240, 0.88);
+    text-transform: none;
+  }
+`;
+
+const ArchitectureInspectorMeta = styled.div`
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 7px;
+  color: rgba(148, 163, 184, 0.78);
+  background: rgba(2, 6, 23, 0.24);
+  font-size: 11px;
+  font-weight: 760;
+  overflow-wrap: anywhere;
+`;
+
+const ArchitectureCanvasNodeShell = styled.div`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  width: 184px;
+  min-height: 76px;
+  padding: 10px;
+  border: 1px solid rgba(125, 211, 252, 0.28);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background:
+    linear-gradient(180deg, rgba(14, 165, 233, 0.18), rgba(15, 23, 42, 0.86)),
+    rgba(2, 6, 23, 0.9);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+
+  &[data-kind="client"] {
+    border-color: rgba(251, 191, 36, 0.36);
+    background: linear-gradient(180deg, rgba(217, 119, 6, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-kind="database"] {
+    border-color: rgba(52, 211, 153, 0.34);
+    background: linear-gradient(180deg, rgba(5, 150, 105, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-kind="external"] {
+    border-color: rgba(244, 114, 182, 0.36);
+    background: linear-gradient(180deg, rgba(190, 24, 93, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-kind="queue"] {
+    border-color: rgba(167, 139, 250, 0.36);
+    background: linear-gradient(180deg, rgba(109, 40, 217, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(251, 191, 36, 0.68);
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18), 0 12px 30px rgba(0, 0, 0, 0.24);
+  }
+
+  .react-flow__handle {
+    width: 9px;
+    height: 9px;
+    border: 1px solid rgba(2, 6, 23, 0.9);
+    background: rgba(125, 211, 252, 0.95);
+  }
+`;
+
+const ArchitectureNodeIcon = styled.span`
+  width: 18px;
+  height: 18px;
+  border: 1px solid rgba(125, 211, 252, 0.36);
+  border-radius: 6px;
+  background: rgba(14, 165, 233, 0.2);
+
+  &[data-kind="client"] {
+    border-color: rgba(251, 191, 36, 0.42);
+    background: rgba(217, 119, 6, 0.22);
+  }
+
+  &[data-kind="database"] {
+    border-color: rgba(52, 211, 153, 0.44);
+    border-radius: 50%;
+    background: rgba(5, 150, 105, 0.22);
+  }
+
+  &[data-kind="external"] {
+    border-color: rgba(244, 114, 182, 0.42);
+    background: rgba(190, 24, 93, 0.22);
+  }
+
+  &[data-kind="queue"] {
+    border-color: rgba(167, 139, 250, 0.42);
+    background: rgba(109, 40, 217, 0.22);
+  }
+`;
+
+const ArchitectureNodeText = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(248, 250, 252, 0.95);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.74);
+    font-size: 10px;
+    font-weight: 760;
+  }
+`;
+
+const ArchitectureCanvasGroupShell = styled.div`
+  width: 100%;
+  height: 100%;
+  padding: 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.34);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.88);
+  background: rgba(15, 23, 42, 0.18);
+
+  strong,
+  span {
+    display: block;
+    max-width: calc(100% - 14px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  span {
+    margin-top: 3px;
+    color: rgba(148, 163, 184, 0.75);
+    font-size: 10px;
+    font-weight: 760;
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(251, 191, 36, 0.68);
+    background: rgba(120, 53, 15, 0.12);
+  }
+
+  .react-flow__handle {
+    width: 9px;
+    height: 9px;
+    border: 1px solid rgba(2, 6, 23, 0.9);
+    background: rgba(251, 191, 36, 0.95);
+  }
+`;
+
+const ArchitectureEdgeLabel = styled.div`
+  position: absolute;
+  z-index: 3;
+  padding: 3px 7px;
+  border: 1px solid rgba(125, 211, 252, 0.22);
+  border-radius: 999px;
+  color: rgba(224, 242, 254, 0.92);
+  background: rgba(2, 6, 23, 0.82);
+  font-size: 9px;
+  font-weight: 850;
+  line-height: 1.15;
+  pointer-events: all;
+  text-transform: lowercase;
+
+  &[data-kind="writes"],
+  &[data-kind="publishes"] {
+    border-color: rgba(52, 211, 153, 0.24);
+    color: rgba(209, 250, 229, 0.92);
+  }
+
+  &[data-kind="reads"],
+  &[data-kind="subscribes"] {
+    border-color: rgba(251, 191, 36, 0.24);
+    color: rgba(254, 243, 199, 0.92);
   }
 `;
 

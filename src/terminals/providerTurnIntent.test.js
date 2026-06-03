@@ -40,5 +40,4 @@ test("provider turn completion reconciliation requires a terminal pane", () => {
 test("provider turn intent defaults to casual message", () => {
   assert.equal(getProviderTurnCompletionIntent({}), "casual_message");
   assert.equal(getProviderTurnCompletionIntent({ providerTurnIntent: "  " }), "casual_message");
-  assert.equal(getProviderTurnCompletionIntent({ providerTurnIntent: "spec_edit" }), "spec_edit");
 });

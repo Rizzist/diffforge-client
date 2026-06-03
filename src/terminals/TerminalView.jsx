@@ -88,7 +88,6 @@ import {
 import { selectTodoQueueDispatchCandidate } from "./todoQueueScheduler.js";
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
-  TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
   TODO_QUEUE_SOURCE_TODO_AUTO,
   TODO_QUEUE_SOURCE_VOICE_AGENT,
   TODO_QUEUE_SOURCE_VOICE_PLAN,
@@ -207,15 +206,11 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   phase: "idle",
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
-const SPEC_EDIT_TODO_QUEUE_EVENT = "diffforge:spec-edit-todo-queue";
-const SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT = "diffforge:spec-edit-todo-queue-dispatched";
-const SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT = "diffforge:spec-edit-todo-queue-cancelled";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
 const VOICE_AGENT_OPEN_CODING_AGENTS_RESULT_EVENT = "diffforge:voice-agent-open-coding-agents-result";
-const TODO_QUEUE_KIND_SPEC_EDIT = "spec-edit";
 const ORCHESTRATOR_VOICE_OWNER = "orchestrator-voice-agent";
 const ORCHESTRATOR_VOICE_TURN_TIMEOUT_MS = 60000;
 const ORCHESTRATOR_VOICE_WAVEFORM_POINT_COUNT = 256;
@@ -4473,101 +4468,11 @@ function normalizeTodoQueueNote(value) {
 }
 
 function normalizeTodoQueueKind(value) {
-  const kind = String(value || "").trim().toLowerCase();
-  return kind === TODO_QUEUE_KIND_SPEC_EDIT ? TODO_QUEUE_KIND_SPEC_EDIT : "todo";
+  return "todo";
 }
 
 function normalizeTodoQueueSource(value) {
   return String(value || "").trim().slice(0, 80);
-}
-
-function normalizeTodoQueueSpecEdit(value) {
-  const specEdit = value && typeof value === "object" ? value : null;
-  if (!specEdit) {
-    return null;
-  }
-
-  const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object" && !Array.isArray(specEdit.intentPayload)
-    ? { ...specEdit.intentPayload }
-    : null;
-  const intentId = String(
-    specEdit.intentId
-      || specEdit.intent_id
-      || intentPayload?.intent_id
-      || "",
-  ).trim();
-  const promptText = normalizeTodoQueueMultilineText(
-    specEdit.promptText
-      || specEdit.prompt
-      || specEdit.terminalText
-      || "",
-  );
-
-  if (!intentId && !promptText) {
-    return null;
-  }
-
-  return {
-    ...(intentPayload ? { intentPayload } : {}),
-    baseGraphHash: String(specEdit.baseGraphHash || specEdit.base_graph_hash || intentPayload?.base_graph_hash || "").trim(),
-    baseNodeHash: String(specEdit.baseNodeHash || specEdit.base_node_hash || intentPayload?.base_node_hash || "").trim(),
-    containerTargetNodeId: String(
-      specEdit.containerTargetNodeId
-        || specEdit.container_target_node_id
-        || intentPayload?.container_target_node_id
-        || "",
-    ).trim(),
-    intentId,
-    mountId: String(specEdit.mountId || specEdit.mount_id || intentPayload?.mount_id || "").trim(),
-    operation: String(specEdit.operation || intentPayload?.operation || "edit").trim().slice(0, 40),
-    promptText,
-    repoPath: String(specEdit.repoPath || specEdit.repo_path || "").trim().slice(0, 4096),
-    sourceRepoId: String(specEdit.sourceRepoId || specEdit.source_repo_id || intentPayload?.source_repo_id || "").trim(),
-    targetNodeId: String(specEdit.targetNodeId || specEdit.target_node_id || intentPayload?.target_node_id || "").trim(),
-    targetNodeSignature: String(specEdit.targetNodeSignature || specEdit.target_node_signature || "").trim(),
-    targetPath: String(specEdit.targetPath || specEdit.target_path || intentPayload?.target_path || "").trim(),
-    targetProjectRelativePath: String(
-      specEdit.targetProjectRelativePath
-        || specEdit.target_project_relative_path
-        || intentPayload?.target_project_relative_path
-        || "",
-    ).trim(),
-    targetProjectRoot: String(
-      specEdit.targetProjectRoot
-        || specEdit.target_project_root
-        || intentPayload?.target_project_root
-        || "",
-    ).trim().slice(0, 4096),
-    targetSpecObjectId: String(
-      specEdit.targetSpecObjectId
-        || specEdit.target_spec_object_id
-        || intentPayload?.target_spec_object_id
-        || "",
-    ).trim(),
-    targetTitle: String(specEdit.targetTitle || specEdit.target_title || intentPayload?.target_title || "").trim(),
-    targetVisiblePath: String(specEdit.targetVisiblePath || specEdit.target_visible_path || intentPayload?.target_visible_path || "").trim(),
-    targetWorkspaceRoot: String(
-      specEdit.targetWorkspaceRoot
-        || specEdit.target_workspace_root
-        || intentPayload?.target_workspace_root
-        || "",
-    ).trim().slice(0, 4096),
-    workspaceId: String(specEdit.workspaceId || specEdit.workspace_id || "").trim(),
-    workspaceName: String(specEdit.workspaceName || specEdit.workspace_name || "").trim(),
-  };
-}
-
-function normalizeTerminalCoordinationPath(value) {
-  return String(value || "")
-    .replace(/\\/g, "/")
-    .replace(/\/+$/g, "")
-    .toLowerCase();
-}
-
-function terminalCoordinationPathsEqual(left, right) {
-  const leftPath = normalizeTerminalCoordinationPath(left);
-  const rightPath = normalizeTerminalCoordinationPath(right);
-  return Boolean(leftPath && rightPath && leftPath === rightPath);
 }
 
 function normalizeTerminalCoordinationTarget(value) {
@@ -4613,10 +4518,6 @@ function terminalCoordinationTargetForIndex(targets, terminalIndexes, terminalIn
   const position = (Array.isArray(terminalIndexes) ? terminalIndexes : []).indexOf(terminalIndex);
   const targetIndex = position >= 0 ? position % normalizedTargets.length : 0;
   return normalizedTargets[targetIndex];
-}
-
-function specEditTargetRepoPath(specEdit) {
-  return String(specEdit?.repoPath || specEdit?.targetProjectRoot || "").trim();
 }
 
 function normalizeVoiceAgentQueueArguments(value) {
@@ -5131,11 +5032,6 @@ function getTodoQueueItemNote(item) {
   return normalizeTodoQueueNote(item?.note || item?.noteText || item?.longText);
 }
 
-function getTodoQueueItemSpecEdit(item) {
-  const specEdit = normalizeTodoQueueSpecEdit(item?.specEdit || item?.spec_edit);
-  return specEdit?.intentId || specEdit?.promptText ? specEdit : null;
-}
-
 function normalizeTodoQueuePlanTask(value) {
   if (!value || typeof value !== "object") {
     return null;
@@ -5435,11 +5331,6 @@ function getVoicePlanReleasedTasksFromSnapshot(snapshot) {
     .filter(Boolean);
 }
 
-function isSpecEditTodoQueueItem(item) {
-  return normalizeTodoQueueKind(item?.kind || item?.type) === TODO_QUEUE_KIND_SPEC_EDIT
-    || Boolean(getTodoQueueItemSpecEdit(item));
-}
-
 function getTodoQueueNoteFromPastedText(value) {
   return getTodoQueueLineCount(value) > TODO_QUEUE_NOTE_LINE_THRESHOLD
     ? normalizeTodoQueueNote(value)
@@ -5494,11 +5385,6 @@ function dedupeTodoQueueImages(images) {
 }
 
 function getTodoQueueItemTerminalText(item) {
-  const specEdit = getTodoQueueItemSpecEdit(item);
-  if (specEdit?.promptText) {
-    return specEdit.promptText;
-  }
-
   const text = normalizeTodoQueueText(item?.text);
   const note = getTodoQueueItemNote(item);
 
@@ -5516,14 +5402,10 @@ function getTodoQueueItemThreadMessageText(item, fallback = "") {
 function getTodoQueueItemAutoQueueSource(item) {
   return getTodoQueueAutoQueueSourceForSource({
     source: item?.source,
-    specEdit: isSpecEditTodoQueueItem(item),
   });
 }
 
 function getTodoQueueAttachmentSource(source) {
-  if (source === TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO) {
-    return "tui_spec_edit_auto_queue";
-  }
   if (source === TODO_QUEUE_SOURCE_VOICE_AGENT) {
     return "tui_voice_agent_queue";
   }
@@ -5533,17 +5415,15 @@ function getTodoQueueAttachmentSource(source) {
   return source === TODO_QUEUE_SOURCE_TODO_AUTO ? "tui_todo_auto_queue" : "tui_todo_drop";
 }
 
-function getTodoQueuePromptEventSource(source, item) {
+function getTodoQueuePromptEventSource(source) {
   return getTodoQueuePromptEventSourceForSource({
     source,
-    specEdit: isSpecEditTodoQueueItem(item),
   });
 }
 
-function getTodoQueueLifecycleSource(source, item) {
+function getTodoQueueLifecycleSource(source) {
   return getTodoQueueLifecycleSourceForSource({
     source,
-    specEdit: isSpecEditTodoQueueItem(item),
   });
 }
 
@@ -6026,17 +5906,14 @@ function getTodoQueueItemLogSummary(items) {
     .map((item) => {
       const image = getTodoQueueItemImage(item);
       const note = getTodoQueueItemNote(item);
-      const specEdit = getTodoQueueItemSpecEdit(item);
       return {
         hasImage: Boolean(image),
         hasNote: Boolean(note),
-        hasSpecEdit: Boolean(specEdit),
         id: String(item?.id || ""),
         image: image ? getTodoImageLogSummary([image])[0] || null : null,
         kind: normalizeTodoQueueKind(item?.kind || item?.type),
         noteLength: note ? normalizeTodoQueueMultilineText(note.text).length : 0,
         source: normalizeTodoQueueSource(item?.source),
-        specEditIntentId: specEdit?.intentId || "",
         textLength: normalizeTodoQueueText(item?.text).length,
       };
     });
@@ -6114,11 +5991,6 @@ async function saveTodoQueueTextAttachment(note) {
 }
 
 async function prepareTodoTerminalText(item) {
-  const specEdit = getTodoQueueItemSpecEdit(item);
-  if (specEdit?.promptText) {
-    return specEdit.promptText;
-  }
-
   const text = normalizeTodoQueueText(item?.text);
   const note = getTodoQueueItemNote(item);
   const parts = [];
@@ -6253,9 +6125,8 @@ function createTodoQueueItem(text, options = {}) {
   const note = normalizeTodoQueueNote(options.note);
   const kind = normalizeTodoQueueKind(options.kind);
   const source = normalizeTodoQueueSource(options.source);
-  const specEdit = normalizeTodoQueueSpecEdit(options.specEdit);
   const planTask = normalizeTodoQueuePlanTask(options.planTask);
-  const workspaceId = String(options.workspaceId || specEdit?.workspaceId || "").trim();
+  const workspaceId = String(options.workspaceId || "").trim();
   const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
@@ -6280,7 +6151,6 @@ function createTodoQueueItem(text, options = {}) {
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
     ...(source ? { source } : {}),
-    ...(specEdit ? { specEdit } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
@@ -6305,9 +6175,8 @@ function normalizeTodoQueueItem(item) {
   const note = getTodoQueueItemNote(item);
   const kind = normalizeTodoQueueKind(item.kind || item.type);
   const source = normalizeTodoQueueSource(item.source);
-  const specEdit = getTodoQueueItemSpecEdit(item);
   const planTask = getTodoQueueItemPlanTask(item);
-  const workspaceId = String(item.workspaceId || item.workspace_id || specEdit?.workspaceId || "").trim();
+  const workspaceId = String(item.workspaceId || item.workspace_id || "").trim();
   const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
@@ -6325,7 +6194,7 @@ function normalizeTodoQueueItem(item) {
       ? { ...item.remote_command }
       : null;
   const queueState = normalizeTodoQueuePersistedQueueState(item);
-  if (!text && !image && !note && !specEdit?.promptText) {
+  if (!text && !image && !note) {
     return null;
   }
 
@@ -6335,11 +6204,10 @@ function normalizeTodoQueueItem(item) {
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     ...(image ? { image } : {}),
-    kind: specEdit ? TODO_QUEUE_KIND_SPEC_EDIT : kind,
+    kind,
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
     ...(source ? { source } : {}),
-    ...(specEdit ? { specEdit } : {}),
     ...(remoteCommand ? { remoteCommand } : {}),
     ...(queueState ? { queueState } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
@@ -7835,7 +7703,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     const image = getTodoQueueItemImage(item);
     const note = getTodoQueueItemNote(item);
     const planTask = getTodoQueueItemPlanTask(item);
-    const specEdit = getTodoQueueItemSpecEdit(item);
     if (!terminalText && !image && !note) {
       event.preventDefault();
       return;
@@ -7861,7 +7728,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         ...(image ? { image } : {}),
         ...(note ? { note } : {}),
         ...(planTask ? { planTask } : {}),
-        ...(specEdit ? { kind: TODO_QUEUE_KIND_SPEC_EDIT, specEdit } : {}),
         ...(item.source ? { source: item.source } : {}),
         text,
       },
@@ -10487,8 +10353,6 @@ function TerminalView({
     const targetRole = String(getTerminalRole(targetTerminalIndex) || "").trim().toLowerCase();
     const targetProject = getTerminalProjectTarget(targetTerminalIndex);
       const terminalAgent = getTerminalAgent(targetTerminalIndex);
-      const specEdit = getTodoQueueItemSpecEdit(item);
-      const specEditRepoPath = specEditTargetRepoPath(specEdit);
       const {
         liveTerminal,
         liveTerminalSource,
@@ -10596,18 +10460,6 @@ function TerminalView({
       turnStartedAt,
       workspaceId,
     };
-
-    if (
-      specEditRepoPath
-      && targetProject?.repoPath
-      && !targetProject?.isWorkspaceRoot
-      && !terminalCoordinationPathsEqual(specEditRepoPath, targetProject.repoPath)
-    ) {
-      return unavailable("project_mismatch", "Choose a terminal for this project.", {
-        ...targetFields,
-        specEditRepoPath,
-      });
-    }
 
     if (!paneId) {
       return unavailable("missing_pane", "Choose an agent terminal for this todo.", targetFields);
@@ -12659,69 +12511,6 @@ function TerminalView({
     todoQueuePendingItemsRef.current = {};
   }, []);
 
-  const recordTodoQueueSpecEditDispatch = useCallback(async ({
-    item,
-    paneId,
-    target,
-    targetBinding,
-    targetRole,
-    targetThread,
-    workspaceId,
-  } = {}) => {
-    const specEdit = getTodoQueueItemSpecEdit(item);
-    if (!specEdit?.intentId) {
-      return;
-    }
-
-    const intentPayload = specEdit.intentPayload && typeof specEdit.intentPayload === "object"
-      ? specEdit.intentPayload
-      : {};
-    const targetTerminalIndex = Number.isInteger(target?.targetTerminalIndex)
-      ? target.targetTerminalIndex
-      : null;
-    const terminalInstanceId = String(targetBinding?.instanceId || "");
-    const threadId = String(targetThread?.id || "");
-    const agentId = String(targetRole || intentPayload.agent_id || "").trim();
-    const nextWorkspaceId = specEdit.workspaceId || workspaceId || terminalWorkspace?.id || "";
-    const dispatchedAt = new Date().toISOString();
-
-    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_DISPATCH_EVENT, {
-      detail: {
-        agentId,
-        agentLabel: target?.terminalAgent?.label || agentId || "agent",
-        dispatchedAt,
-        intentId: specEdit.intentId,
-        terminalId: paneId || "",
-        terminalIndex: targetTerminalIndex,
-        terminalInstanceId,
-        threadId,
-        workspaceId: nextWorkspaceId,
-      },
-    }));
-  }, [
-    terminalWorkspace?.id,
-    terminalWorkspace?.name,
-  ]);
-
-  const recordTodoQueueSpecEditCancelled = useCallback((item, reason = "cancelled", message = "") => {
-    const specEdit = getTodoQueueItemSpecEdit(item);
-    if (!specEdit?.intentId) {
-      return;
-    }
-
-    const workspaceId = specEdit.workspaceId || terminalWorkspace?.id || "";
-
-    window.dispatchEvent(new CustomEvent(SPEC_EDIT_TODO_QUEUE_CANCEL_EVENT, {
-      detail: {
-        intentId: specEdit.intentId,
-        reason,
-        workspaceId,
-      },
-    }));
-  }, [
-    terminalWorkspace?.id,
-  ]);
-
   const sendTodoQueueItemToTerminal = useCallback(async ({
     allowGeneric = true,
     focusReason = "todo_dropdown_drop",
@@ -13068,7 +12857,6 @@ function TerminalView({
       }
       const promptId = shouldConfirmAutoSubmit
         ? getTodoQueueItemPlanTask(currentItem)?.taskId
-          || getTodoQueueItemSpecEdit(currentItem)?.intentId
           || createThreadProjectionToken("todo-drop-prompt")
         : "";
       draftTransactionId = promptId
@@ -13923,17 +13711,6 @@ function TerminalView({
         threadId: targetThread?.id || "",
       });
     }
-    if (dropResult?.confirmedSubmit && isSpecEditTodoQueueItem(currentItem)) {
-      await recordTodoQueueSpecEditDispatch({
-        item: currentItem,
-        paneId,
-        target,
-        targetBinding,
-        targetRole,
-        targetThread,
-        workspaceId,
-      });
-    }
       if (dropResult?.confirmedSubmit && planTask) {
         await recordVoicePlanTaskStatus(planTask, "dispatched", {
           agentId: targetRole,
@@ -13983,7 +13760,6 @@ function TerminalView({
       getTodoQueueTerminalSendTarget,
       handleWorkspaceTerminalLifecycle,
       onThreadTerminalLifecycle,
-    recordTodoQueueSpecEditDispatch,
     recordVoicePlanTaskStatus,
     terminalWorkspace?.id,
     terminalWorkspace?.name,
@@ -14027,9 +13803,6 @@ function TerminalView({
 
   const removeTodoQueueItem = useCallback((itemId) => {
     const item = todoQueueItemsRef.current.find((candidate) => candidate.id === itemId) || null;
-    if (item && isSpecEditTodoQueueItem(item)) {
-      recordTodoQueueSpecEditCancelled(item, "removed", "User removed the queued spec edit.");
-    }
     const planTask = getTodoQueueItemPlanTask(item);
     if (planTask) {
       void recordVoicePlanTaskStatus(planTask, "cancelled", {
@@ -14043,7 +13816,6 @@ function TerminalView({
     ));
   }, [
     clearTodoQueueItemPending,
-    recordTodoQueueSpecEditCancelled,
     recordVoicePlanTaskStatus,
     updateTodoQueueItems,
   ]);
@@ -14292,56 +14064,6 @@ function TerminalView({
   ]);
 
   useEffect(() => {
-    const handleSpecEditQueueEvent = (event) => {
-      const detail = event?.detail || {};
-      const eventWorkspaceId = String(detail.workspaceId || detail.item?.workspaceId || "").trim();
-      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
-        return;
-      }
-
-      const item = normalizeTodoQueueItem({
-        ...(detail.item || {}),
-        kind: TODO_QUEUE_KIND_SPEC_EDIT,
-        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-        workspaceId: eventWorkspaceId,
-      });
-      if (!item || !isSpecEditTodoQueueItem(item)) {
-        return;
-      }
-
-      updateTodoQueueItems((currentItems) => (
-        currentItems
-          .filter((candidate) => candidate.id !== item.id)
-          .concat([item])
-      ));
-      setTodoDropError("");
-      setTodoQueueItemPending(item.id, {
-        item: getTodoQueueItemLogSummary([item])[0] || null,
-        phase: "queued",
-        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-        workspaceId: terminalWorkspace.id,
-      });
-      setTodoQueueDispatchRevision((revision) => revision + 1);
-      logBigViewSyncDiagnosticEvent("spec_edit.queue_added", {
-        intentId: getTodoQueueItemSpecEdit(item)?.intentId || item.id,
-        item: getTodoQueueItemLogSummary([item])[0] || null,
-        source: TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-        surface: "tui_todo_queue",
-        workspaceId: terminalWorkspace.id,
-      });
-    };
-
-    window.addEventListener(SPEC_EDIT_TODO_QUEUE_EVENT, handleSpecEditQueueEvent);
-    return () => {
-      window.removeEventListener(SPEC_EDIT_TODO_QUEUE_EVENT, handleSpecEditQueueEvent);
-    };
-  }, [
-    setTodoQueueItemPending,
-    terminalWorkspace?.id,
-    updateTodoQueueItems,
-  ]);
-
-  useEffect(() => {
     const handleRemoteTodoQueueEvent = (event) => {
       const detail = event?.detail || {};
       const eventWorkspaceId = String(detail.workspaceId || detail.item?.workspaceId || "").trim();
@@ -14478,27 +14200,19 @@ function TerminalView({
     clearTodoQueueItemPending(safeItemId, "cancelled", {
       source,
     });
-    if (item && isSpecEditTodoQueueItem(item)) {
-      recordTodoQueueSpecEditCancelled(item, "cancelled", "User cancelled the queued spec edit.");
+    const planTask = getTodoQueueItemPlanTask(item);
+    if (planTask) {
+      void recordVoicePlanTaskStatus(planTask, "cancelled", {
+        clientTodoId: item.id || "",
+        reason: "cancelled",
+      });
       updateTodoQueueItems((currentItems) => (
         currentItems.filter((candidate) => candidate.id !== safeItemId)
       ));
-    } else {
-      const planTask = getTodoQueueItemPlanTask(item);
-      if (planTask) {
-        void recordVoicePlanTaskStatus(planTask, "cancelled", {
-          clientTodoId: item.id || "",
-          reason: "cancelled",
-        });
-        updateTodoQueueItems((currentItems) => (
-          currentItems.filter((candidate) => candidate.id !== safeItemId)
-        ));
-      }
     }
     setTodoQueueDispatchRevision((revision) => revision + 1);
   }, [
     clearTodoQueueItemPending,
-    recordTodoQueueSpecEditCancelled,
     recordVoicePlanTaskStatus,
     updateTodoQueueItems,
   ]);
@@ -14923,13 +14637,6 @@ function TerminalView({
           targetRole: target.targetRole,
           targetTerminalIndex,
         });
-        if (isSpecEditTodoQueueItem(queuedItem)) {
-          recordTodoQueueSpecEditCancelled(
-            queuedItem,
-            "dispatch_error",
-            error?.message || String(error || ""),
-          );
-        }
         const planTask = getTodoQueueItemPlanTask(queuedItem);
         if (planTask) {
           void recordVoicePlanTaskStatus(planTask, "failed", {
@@ -14965,7 +14672,6 @@ function TerminalView({
     isAppClosing,
     isWorkspaceRuntimeDeactivating,
     logicalTerminalIndexes,
-    recordTodoQueueSpecEditCancelled,
     recordTodoQueueRemoteCommandReceipt,
     recordVoicePlanTaskStatus,
     sendTodoQueueItemToTerminal,
@@ -14997,7 +14703,6 @@ function TerminalView({
     const terminalText = getTodoQueueItemTerminalText(event?.item);
     const image = getTodoQueueItemImage(event?.item);
     const note = getTodoQueueItemNote(event?.item);
-    const specEdit = getTodoQueueItemSpecEdit(event?.item);
     const sourceRect = event?.sourceRect;
 
     if (
@@ -15035,11 +14740,10 @@ function TerminalView({
       pointerId: event.pointerId,
       targetTerminalIndex,
       text,
-      kind: specEdit ? TODO_QUEUE_KIND_SPEC_EDIT : normalizeTodoQueueKind(event.item?.kind),
+      kind: normalizeTodoQueueKind(event.item?.kind),
       source: normalizeTodoQueueSource(event.item?.source),
       ...(image ? { image } : {}),
       ...(note ? { note } : {}),
-      ...(specEdit ? { specEdit } : {}),
       width: dragWidth,
       workspaceId: event.workspaceId || terminalWorkspace.id,
       x: Number(event.clientX || 0) - offsetX,
@@ -15524,9 +15228,7 @@ function TerminalView({
       }
 
       {
-        const source = isSpecEditTodoQueueItem(currentDrag)
-          ? TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO
-          : getTodoQueueItemPlanTask(currentDrag)
+        const source = getTodoQueueItemPlanTask(currentDrag)
             ? TODO_QUEUE_SOURCE_VOICE_PLAN
             : "tui-todo-drop";
         const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentDrag, {

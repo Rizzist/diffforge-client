@@ -3,7 +3,6 @@ import test from "node:test";
 
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
-  TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
   TODO_QUEUE_SOURCE_TODO_AUTO,
   TODO_QUEUE_SOURCE_VOICE_AGENT,
   TODO_QUEUE_SOURCE_VOICE_PLAN,
@@ -49,29 +48,5 @@ test("known todo queue sources keep their existing mappings", () => {
   assert.equal(
     getTodoQueueLifecycleSourceForSource({ source: "manual-drop" }),
     "tui-todo-drop",
-  );
-});
-
-test("spec edit source wins over item source", () => {
-  assert.equal(
-    getTodoQueueAutoQueueSourceForSource({
-      source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
-      specEdit: true,
-    }),
-    TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-  );
-  assert.equal(
-    getTodoQueueLifecycleSourceForSource({
-      source: TODO_QUEUE_SOURCE_TODO_AUTO,
-      specEdit: true,
-    }),
-    TODO_QUEUE_SOURCE_SPEC_EDIT_AUTO,
-  );
-  assert.equal(
-    getTodoQueuePromptEventSourceForSource({
-      source: TODO_QUEUE_SOURCE_TODO_AUTO,
-      specEdit: true,
-    }),
-    "spec-edit",
   );
 });

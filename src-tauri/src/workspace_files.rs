@@ -244,7 +244,6 @@ struct WorkspaceProjectMount {
     mount_depth: usize,
     has_git: bool,
     has_agents: bool,
-    has_spec_graph_cache: bool,
     #[serde(skip_serializing)]
     root_path: PathBuf,
 }
@@ -449,7 +448,6 @@ fn workspace_has_explicit_workspace_marker(root: &Path) -> bool {
 
 fn workspace_has_project_file_marker(root: &Path) -> bool {
     workspace_has_explicit_workspace_marker(root)
-        || root.join(".agents").join("spec-graph").is_dir()
         || workspace_has_any_file(
             root,
             &[
@@ -542,7 +540,6 @@ fn workspace_project_mount_from_root(
         .map(str::to_string)
         .unwrap_or_else(|| workspace_path_display(&project_root));
     let has_agents = project_root.join(".agents").is_dir();
-    let has_spec_graph_cache = project_root.join(".agents").join("spec-graph").is_dir();
     let parent_mount_id = workspace_mount_parent_id(&workspace_relative_path);
     let mount_depth = workspace_mount_depth(&workspace_relative_path);
 
@@ -561,7 +558,6 @@ fn workspace_project_mount_from_root(
         mount_depth,
         has_git: matches!(project_kind, WorkspaceProjectKind::Git),
         has_agents,
-        has_spec_graph_cache,
         root_path: project_root,
     })
 }
@@ -2268,10 +2264,6 @@ fn directory_entry_from_path(
             .as_ref()
             .map(|context| context.mount.has_agents)
             .unwrap_or(false),
-        has_spec_graph_cache: project_context
-            .as_ref()
-            .map(|context| context.mount.has_spec_graph_cache)
-            .unwrap_or(false),
         relative_path,
         kind: kind.to_string(),
         size: metadata.is_file().then_some(metadata.len()),
@@ -2674,7 +2666,7 @@ mod workspace_files_tests {
         let root = test_workspace_root("diffforge-container-mounts");
         let project = root.join("rust-diffforge");
         init_test_git_repo(&project);
-        fs::create_dir_all(project.join(".agents").join("spec-graph")).unwrap();
+        fs::create_dir_all(project.join(".agents")).unwrap();
 
         let bootstrap = workspace_git_bootstrap_for_selected_root(&root, false).unwrap();
         let response = workspace_root_response(&root);
@@ -2690,7 +2682,6 @@ mod workspace_files_tests {
             "rust-diffforge"
         );
         assert!(response.project_mounts[0].has_agents);
-        assert!(response.project_mounts[0].has_spec_graph_cache);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2735,7 +2726,7 @@ mod workspace_files_tests {
     #[test]
     fn selected_root_bootstrap_allows_reopened_metadata_only_folder_without_empty_selection() {
         let root = test_workspace_root("diffforge-reopened-empty-bootstrap");
-        fs::create_dir_all(root.join(".agents").join("spec-graph")).unwrap();
+        fs::create_dir_all(root.join(".agents").join("cloud-mcp")).unwrap();
         fs::write(root.join(".gitignore"), ".agents/\n/logs/\n").unwrap();
         fs::create_dir_all(root.join("logs")).unwrap();
         fs::write(root.join("logs").join("coordination-alignment.jsonl"), "{}\n").unwrap();
@@ -2784,7 +2775,7 @@ mod workspace_files_tests {
         let root = test_workspace_root("diffforge-marker-mounts");
         create_package_project(&root.join("frontend"), "{\"scripts\":{\"dev\":\"vite\"}}\n");
         init_test_git_repo(&root.join("backend"));
-        fs::create_dir_all(root.join("client").join(".agents").join("spec-graph")).unwrap();
+        create_package_project(&root.join("client"), "{\"scripts\":{\"dev\":\"vite\"}}\n");
 
         let response = workspace_root_response(&root);
         let mount_ids = response
