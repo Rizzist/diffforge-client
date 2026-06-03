@@ -484,6 +484,8 @@ function buildRawScanGraph(scan) {
       nodes: [],
       stats: {
         cacheLabel: "No scan data",
+        cacheReason: "Raw Scan reads the cached startup topology. No cached response has been loaded yet.",
+        cacheStatus: "waiting",
         projectCount: 0,
         sourceLabel: "Waiting",
         workspaceKind: "workspace",
@@ -608,12 +610,22 @@ function buildRawScanGraph(scan) {
   const edges = Array.from(edgeMap.values()).filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
   const cacheStatus = text(object.cache?.status, "missing");
   const cacheAge = formatDurationMs(object.cache?.ageMs);
+  const cacheReason = text(
+    object.cache?.reason
+      || object.diagnostic?.reason
+      || object.folderTrace?.reason
+      || (cacheStatus === "missing"
+        ? "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan."
+        : ""),
+  );
 
   return {
     edges,
     nodes,
     stats: {
       cacheLabel: cacheAge ? `${cacheStatus} · ${cacheAge}` : cacheStatus,
+      cacheReason,
+      cacheStatus,
       projectCount: jsonArray(object.projectMounts).length,
       sourceLabel: text(object.scanMode, "cached_topology").replaceAll("_", " "),
       workspaceKind: text(object.workspaceKind, "workspace"),
@@ -1050,6 +1062,16 @@ function RawScanPanel({ error, scan, state }) {
   const graph = useMemo(() => buildRawScanGraph(scan), [scan]);
   const hasGraph = graph.nodes.length > 0;
   const isLoading = state === "loading";
+  const cacheReason = graph.stats.cacheReason || "";
+  const cacheStatus = graph.stats.cacheStatus || "";
+  const emptyMessage = isLoading
+    ? "Loading startup workspace graph..."
+    : cacheReason || "No startup workspace graph cached yet.";
+  const shouldShowCacheNotice = Boolean(
+    cacheReason
+      && !isLoading
+      && (!hasGraph || ["error", "missing", "stale_cached", "unavailable"].includes(cacheStatus)),
+  );
 
   return (
     <RawShell>
@@ -1066,10 +1088,13 @@ function RawScanPanel({ error, scan, state }) {
         <span>{graph.stats.workspaceKind}</span>
         <span>{graph.stats.projectCount} project{graph.stats.projectCount === 1 ? "" : "s"}</span>
       </RawGraphStats>
+      {shouldShowCacheNotice && (
+        <RawCacheNotice data-cache-status={cacheStatus}>{cacheReason}</RawCacheNotice>
+      )}
       {hasGraph ? (
         <RawScanGraph graph={graph} />
       ) : (
-        <EmptyState>{isLoading ? "Loading startup workspace graph..." : "No startup workspace graph cached yet."}</EmptyState>
+        <EmptyState>{emptyMessage}</EmptyState>
       )}
       <RawDetails>
         <summary>Raw payload</summary>
@@ -1982,7 +2007,7 @@ const TaskActionError = styled.div`
 
 const RawShell = styled.div`
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   gap: 12px;
   min-width: 0;
   min-height: 0;
@@ -2023,6 +2048,32 @@ const RawGraphStats = styled.div`
     background: rgba(15, 23, 42, 0.42);
     font-size: 11px;
     font-weight: 820;
+  }
+`;
+
+const RawCacheNotice = styled.div`
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  color: rgba(203, 213, 225, 0.82);
+  background: rgba(15, 23, 42, 0.38);
+  font-size: 11px;
+  font-weight: 740;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+
+  &[data-cache-status="missing"],
+  &[data-cache-status="stale_cached"],
+  &[data-cache-status="unavailable"] {
+    border-color: rgba(251, 191, 36, 0.22);
+    color: rgba(254, 240, 138, 0.88);
+    background: rgba(113, 63, 18, 0.12);
+  }
+
+  &[data-cache-status="error"] {
+    border-color: rgba(248, 113, 113, 0.24);
+    color: rgba(254, 202, 202, 0.9);
+    background: rgba(127, 29, 29, 0.13);
   }
 `;
 

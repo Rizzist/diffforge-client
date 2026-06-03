@@ -515,6 +515,7 @@ const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const PLAN_REFRESH_TIMEOUT_MS = 5000;
+const RAW_SCAN_CACHE_LOAD_TIMEOUT_MS = 2500;
 const BILLING_STATUS_REFRESH_MS = 60000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
@@ -3843,6 +3844,58 @@ function workspaceGraphStateKey(repoPath, workspaceId) {
     return "";
   }
   return `${normalizedWorkspaceId}::${normalizedRepoPath}`;
+}
+
+function buildUnavailableRawScanSnapshot({
+  reason,
+  repoPath,
+  status = "unavailable",
+  workspaceId,
+  workspaceName,
+}) {
+  const generatedAtMs = Date.now();
+  return {
+    generatedAtMs,
+    scanMode: "cached_topology",
+    requestedRepoPath: graphText(repoPath),
+    workspaceId: graphText(workspaceId),
+    workspaceName: graphText(workspaceName),
+    root: graphText(repoPath),
+    workspaceKind: "workspace",
+    activeProjectRoot: "",
+    selectedRoot: {
+      projectKind: "none",
+      exactGitRoot: false,
+      gitTopLevel: "",
+      broadArea: false,
+      emptyDirectory: false,
+      emptyForGitBootstrap: false,
+      mount: null,
+    },
+    cache: {
+      key: normalizeGraphWorkspacePath(repoPath),
+      status,
+      hit: false,
+      fresh: false,
+      scannedAtMs: generatedAtMs,
+      ageMs: 0,
+      previousAgeMs: null,
+      ttlMs: null,
+      reason: graphText(reason, "No cached startup scan is available."),
+      source: "workspace_topology_cache",
+    },
+    limits: {},
+    projectMounts: [],
+    workspaceMounts: [],
+    launchTargets: [],
+    folderTrace: {
+      entries: [],
+      reason: graphText(reason, "No cached startup scan is available."),
+    },
+    diagnostic: {
+      reason: graphText(reason, "No cached startup scan is available."),
+    },
+  };
 }
 
 function workspaceGraphSnapshotKey(snapshot) {
@@ -11530,48 +11583,39 @@ export default function App() {
       return undefined;
     }
 
-    const workspaceTerminalRecords = selectedWorkspace?.id
-      ? Object.values(workspaceThreads?.[selectedWorkspace.id]?.terminals || {})
-      : [];
-    const selectedWorkspaceAgentTerminalOpened = activatedWorkspaceAgentTerminalEntries.some(({ terminalIndex }) => (
-      workspaceTerminalRecords.some((terminal) => {
-        const status = String(terminal?.status || "").trim().toLowerCase();
-        return Number(terminal?.terminalIndex) === Number(terminalIndex)
-          && !["closed", "exited", "error"].includes(status);
-      })
-    ));
-    const waitingForPrewarmTerminalBatch = Boolean(
-      shouldPrewarmWorkspaceTerminals
-      && (!workspaceAgentLaunchKey || workspaceAgentBatchSentKey !== workspaceAgentLaunchKey)
-    );
-    const waitingForDirectTerminalOpen = Boolean(
-      !shouldPrewarmWorkspaceTerminals
-      && !selectedWorkspaceAgentTerminalOpened
-    );
-    const shouldWaitForTerminalStartupScan = Boolean(
-      selectedWorkspace?.id
-      && activatedWorkspace?.id
-      && selectedWorkspace.id === activatedWorkspace.id
-      && activatedWorkspaceAgentTerminalEntries.length > 0
-      && (waitingForPrewarmTerminalBatch || waitingForDirectTerminalOpen),
-    );
-    if (shouldWaitForTerminalStartupScan) {
-      return undefined;
-    }
-
     const rawScanState = selectedWorkspaceGraphState.rawScanState || "";
+    const loadingStartedAt = Number(selectedWorkspaceGraphState.rawScanRequestedAt) || 0;
+    const loadingIsFresh = rawScanState === "loading"
+      && loadingStartedAt > 0
+      && Date.now() - loadingStartedAt < RAW_SCAN_CACHE_LOAD_TIMEOUT_MS;
     if (
       selectedWorkspaceGraphState.rawScanSnapshot
-      || rawScanState === "loading"
-      || rawScanState === "ready"
-      || rawScanState === "error"
+      || loadingIsFresh
     ) {
       return undefined;
     }
 
     let cancelled = false;
+    const requestedAt = Date.now();
+    const timeoutId = window.setTimeout(() => {
+      if (cancelled) return;
+      setWorkspaceGraphStatus(repoPath, workspaceId, {
+        rawScanError: "",
+        rawScanRequestedAt: requestedAt,
+        rawScanSnapshot: buildUnavailableRawScanSnapshot({
+          reason: "The cached startup scan command did not return. Raw Scan only displays the initial startup topology cache, so this usually means no cached scan has been populated yet or the backend is still busy.",
+          repoPath,
+          status: "unavailable",
+          workspaceId,
+          workspaceName,
+        }),
+        rawScanState: "ready",
+      });
+    }, RAW_SCAN_CACHE_LOAD_TIMEOUT_MS);
+
     setWorkspaceGraphStatus(repoPath, workspaceId, {
       rawScanError: "",
+      rawScanRequestedAt: requestedAt,
       rawScanState: "loading",
     });
 
@@ -11582,38 +11626,55 @@ export default function App() {
     })
       .then((scan) => {
         if (cancelled) return;
+        window.clearTimeout(timeoutId);
+        const rawScanSnapshot = scan && typeof scan === "object"
+          ? scan
+          : buildUnavailableRawScanSnapshot({
+            reason: "The cached startup scan command returned no payload. Raw Scan only displays the initial startup topology cache.",
+            repoPath,
+            status: "unavailable",
+            workspaceId,
+            workspaceName,
+          });
         setWorkspaceGraphStatus(repoPath, workspaceId, {
           rawScanError: "",
-          rawScanSnapshot: scan,
+          rawScanRequestedAt: requestedAt,
+          rawScanSnapshot,
           rawScanState: "ready",
         });
       })
       .catch((error) => {
         if (cancelled) return;
+        window.clearTimeout(timeoutId);
+        const message = getErrorMessage(error, "Unable to load cached startup scan.");
         setWorkspaceGraphStatus(repoPath, workspaceId, {
-          rawScanError: getErrorMessage(error, "Unable to load cached startup scan."),
+          rawScanError: message,
+          rawScanRequestedAt: requestedAt,
+          rawScanSnapshot: buildUnavailableRawScanSnapshot({
+            reason: message,
+            repoPath,
+            status: "error",
+            workspaceId,
+            workspaceName,
+          }),
           rawScanState: "error",
         });
       });
 
     return () => {
       cancelled = true;
+      window.clearTimeout(timeoutId);
     };
   }, [
     activatedWorkspaceTerminalWorkingDirectory,
-    activatedWorkspace?.id,
-    activatedWorkspaceAgentTerminalEntries,
     selectedWorkspace?.id,
     selectedWorkspace?.name,
     selectedWorkspaceFileRoot,
+    selectedWorkspaceGraphState.rawScanRequestedAt,
     selectedWorkspaceGraphState.rawScanSnapshot,
     selectedWorkspaceGraphState.rawScanState,
     setWorkspaceGraphStatus,
-    shouldPrewarmWorkspaceTerminals,
-    workspaceAgentBatchSentKey,
-    workspaceAgentLaunchKey,
     workspaceHydrationReady,
-    workspaceThreads,
   ]);
 
   useEffect(() => {

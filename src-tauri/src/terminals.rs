@@ -1592,6 +1592,12 @@ async fn terminal_workspace_raw_scan(
     let folder_trace = terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts);
     let generated_at_ms = terminal_now_ms();
     let cache_age_ms = generated_at_ms.saturating_sub(topology.scanned_ms);
+    let cache_reason = match topology.cache_status {
+        "missing" => "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan; it only displays the cached topology captured during terminal launch.",
+        "stale_cached" => "The cached startup topology is older than the freshness window. Raw Scan is showing that stale cached topology without rescanning.",
+        "hit" => "Fresh startup topology cache captured during terminal launch.",
+        _ => "Raw Scan is showing the current workspace topology cache without rescanning.",
+    };
 
     Ok(json!({
         "generatedAtMs": generated_at_ms,
@@ -1620,6 +1626,8 @@ async fn terminal_workspace_raw_scan(
             "ageMs": cache_age_ms,
             "previousAgeMs": topology.cache_age_ms,
             "ttlMs": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
+            "reason": cache_reason,
+            "source": "workspace_topology_cache",
         },
         "limits": {
             "projectMounts": MAX_WORKSPACE_PROJECT_MOUNTS,

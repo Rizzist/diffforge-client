@@ -9,7 +9,9 @@ import { FormMessage } from "../app/appStyles";
 
 const TERMINAL_TASK_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
 const PLAN_SNAPSHOT_CACHE_LIMIT = 80;
+const PLAN_SNAPSHOT_CACHE_FRESH_MS = 5000;
 const planSnapshotCache = new Map();
+const planSnapshotRequests = new Map();
 
 const EMPTY_TARGET = Object.freeze({
   agentId: "",
@@ -78,18 +80,22 @@ function cachePlanSnapshot(keys, snapshot) {
   if (!snapshot || typeof snapshot !== "object") {
     return;
   }
+  const entry = {
+    snapshot,
+    updatedAt: Date.now(),
+  };
   if (keys?.exact) {
     planSnapshotCache.delete(keys.exact);
-    planSnapshotCache.set(keys.exact, snapshot);
+    planSnapshotCache.set(keys.exact, entry);
   }
   if (keys?.repo) {
     planSnapshotCache.delete(keys.repo);
-    planSnapshotCache.set(keys.repo, snapshot);
+    planSnapshotCache.set(keys.repo, entry);
   }
   trimPlanSnapshotCache();
 }
 
-function cachedPlanSnapshot(keys) {
+function cachedPlanSnapshotEntry(keys) {
   if (!keys) return null;
   if (keys.exact && planSnapshotCache.has(keys.exact)) {
     return planSnapshotCache.get(keys.exact);
@@ -98,6 +104,24 @@ function cachedPlanSnapshot(keys) {
     return planSnapshotCache.get(keys.repo);
   }
   return null;
+}
+
+function cachedPlanSnapshot(keys) {
+  const entry = cachedPlanSnapshotEntry(keys);
+  if (!entry) return null;
+  return entry.snapshot || entry;
+}
+
+function cachedPlanSnapshotIsFresh(keys) {
+  const entry = cachedPlanSnapshotEntry(keys);
+  if (!entry?.snapshot || !Number.isFinite(Number(entry.updatedAt))) {
+    return false;
+  }
+  return Date.now() - Number(entry.updatedAt) <= PLAN_SNAPSHOT_CACHE_FRESH_MS;
+}
+
+function planSnapshotRequestKey(keys) {
+  return keys?.exact || keys?.repo || "";
 }
 
 function normalizeRepoTarget(value) {
@@ -405,11 +429,24 @@ export default function PlansWorkspaceView({
       if (activeDbPath) {
         command.dbPath = activeDbPath;
       }
-      const response = await invoke("coordination_terminal_task_plan_snapshot", command);
+      const requestKey = planSnapshotRequestKey(snapshotCacheKeys);
+      let request = requestKey ? planSnapshotRequests.get(requestKey) : null;
+      if (!request) {
+        request = invoke("coordination_terminal_task_plan_snapshot", command)
+          .then(dataOf)
+          .finally(() => {
+            if (requestKey) {
+              planSnapshotRequests.delete(requestKey);
+            }
+          });
+        if (requestKey) {
+          planSnapshotRequests.set(requestKey, request);
+        }
+      }
+      const nextSnapshot = await request;
       if (snapshotRequestKeyRef.current !== activeSnapshotRequestKey) {
         return;
       }
-      const nextSnapshot = dataOf(response);
       cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
       setSnapshot(nextSnapshot);
     } catch (nextError) {
@@ -428,7 +465,11 @@ export default function PlansWorkspaceView({
   ]);
 
   useEffect(() => {
-    loadSnapshot({ silent: Boolean(cachedPlanSnapshot(snapshotCacheKeys)) });
+    const cachedSnapshot = cachedPlanSnapshot(snapshotCacheKeys);
+    if (cachedSnapshot && cachedPlanSnapshotIsFresh(snapshotCacheKeys)) {
+      return;
+    }
+    loadSnapshot({ silent: Boolean(cachedSnapshot) });
   }, [activeSnapshotRequestKey, loadSnapshot, snapshotCacheKeys]);
 
   useEffect(() => {

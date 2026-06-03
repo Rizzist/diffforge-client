@@ -142,7 +142,7 @@ const TERMINAL_BREAKOUT_PHASE_BREAKING_OUT = "breaking-out";
 const TERMINAL_BREAKOUT_PHASE_CANVAS = "canvas";
 const TERMINAL_BREAKOUT_PHASE_RETURNING = "returning";
 const TERMINAL_BREAKOUT_DEFAULT_ZOOM = 0.33;
-const TERMINAL_BREAKOUT_MIN_ZOOM = 0.18;
+const TERMINAL_BREAKOUT_MIN_ZOOM = 0.05;
 const TERMINAL_BREAKOUT_MAX_ZOOM = 1.4;
 const TERMINAL_BREAKOUT_ZOOM_STEP = 1.22;
 const TERMINAL_BREAKOUT_WHEEL_ZOOM_INTENSITY = 0.0022;
@@ -153,7 +153,6 @@ const TERMINAL_BREAKOUT_DEFAULT_VIEWPORT = { x: 0, y: 0, zoom: TERMINAL_BREAKOUT
 const TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE = 1.18;
 const TERMINAL_BREAKOUT_MIN_TERMINAL_SCALE = 0.65;
 const TERMINAL_BREAKOUT_MAX_TERMINAL_SCALE = 2.5;
-const TERMINAL_BREAKOUT_TERMINAL_SCALE_STEP = 1.14;
 const TERMINAL_BREAKOUT_MIN_WIDTH = 420;
 const TERMINAL_BREAKOUT_MIN_HEIGHT = 260;
 const TERMINAL_BREAKOUT_MAX_WIDTH = 840;
@@ -2427,6 +2426,10 @@ const WorkspaceToolSurface = styled.div`
   html[data-forge-theme="light"] & {
     background: #ffffff;
   }
+
+  &[hidden] {
+    display: none;
+  }
 `;
 
 const TodoQueueComposer = styled.form`
@@ -3512,38 +3515,6 @@ function getBreakoutPlacementBounds(placements = {}, terminalScale = TERMINAL_BR
   };
 }
 
-function breakoutPlacementsRespectGap(
-  placements = {},
-  terminalIndexes = [],
-  terminalScale = TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE,
-) {
-  const scale = clampBreakoutTerminalScale(terminalScale);
-  const rects = (terminalIndexes || [])
-    .map((terminalIndex) => normalizeBreakoutPlacement(placements?.[terminalIndex]))
-    .filter(Boolean);
-
-  if (rects.length !== (terminalIndexes || []).length) {
-    return false;
-  }
-
-  for (let index = 0; index < rects.length; index += 1) {
-    const left = rects[index];
-    for (let nextIndex = index + 1; nextIndex < rects.length; nextIndex += 1) {
-      const right = rects[nextIndex];
-      const separated = (left.x + (left.width * scale) + TERMINAL_BREAKOUT_MIN_GAP_X <= right.x)
-        || (right.x + (right.width * scale) + TERMINAL_BREAKOUT_MIN_GAP_X <= left.x)
-        || (left.y + (left.height * scale) + TERMINAL_BREAKOUT_MIN_GAP_Y <= right.y)
-        || (right.y + (right.height * scale) + TERMINAL_BREAKOUT_MIN_GAP_Y <= left.y);
-
-      if (!separated) {
-        return false;
-      }
-    }
-  }
-
-  return true;
-}
-
 function buildSpreadBreakoutPlacements({
   existingPlacements = {},
   panelRect,
@@ -3558,34 +3529,34 @@ function buildSpreadBreakoutPlacements({
     terminalIndex,
     ...getBreakoutTerminalSize(terminalIndex, baseSize, rects),
   }));
-  const terminalSizeByIndex = new Map(
-    terminalSizes.map(({ height, terminalIndex, width }) => [terminalIndex, { height, width }]),
-  );
   const normalizedExistingPlacements = normalizeBreakoutPlacements(existingPlacements, terminalIndexes);
-  const sizedExistingPlacements = Object.fromEntries(
-    Object.entries(normalizedExistingPlacements).map(([terminalIndexKey, placement]) => {
-      const terminalIndex = Number.parseInt(terminalIndexKey, 10);
-      const size = terminalSizeByIndex.get(terminalIndex);
-      return [
-        terminalIndexKey,
-        size
-          ? {
-            ...placement,
-            height: size.height,
-            width: size.width,
-          }
-          : placement,
-      ];
-    }),
-  );
-  const shouldPreserveExisting = preserveExisting
-    && breakoutPlacementsRespectGap(sizedExistingPlacements, terminalIndexes, scale);
+  const existingPlacementCount = Object.keys(normalizedExistingPlacements).length;
+  const shouldPreserveExisting = preserveExisting && existingPlacementCount > 0;
 
   if (shouldPreserveExisting) {
+    const placements = { ...normalizedExistingPlacements };
+    const missingSizes = terminalSizes.filter(({ terminalIndex }) => !placements[terminalIndex]);
+    const bounds = getBreakoutPlacementBounds(placements, scale);
+    let maxZ = Math.max(0, ...Object.values(placements)
+      .map((placement) => Number.parseInt(placement?.z, 10) || 0));
+    let cursorX = bounds ? bounds.maxX + TERMINAL_BREAKOUT_MIN_GAP_X : 0;
+    const cursorY = bounds ? bounds.minY : 0;
+
+    missingSizes.forEach(({ height, terminalIndex, width }) => {
+      placements[terminalIndex] = {
+        height,
+        width,
+        x: cursorX,
+        y: cursorY,
+        z: maxZ + 1,
+      };
+      maxZ += 1;
+      cursorX += (width * scale) + TERMINAL_BREAKOUT_MIN_GAP_X;
+    });
+
     return {
-      maxZ: Math.max(0, ...Object.values(sizedExistingPlacements)
-        .map((placement) => Number.parseInt(placement?.z, 10) || 0)),
-      placements: sizedExistingPlacements,
+      maxZ,
+      placements,
     };
   }
 
@@ -7599,17 +7570,16 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorTopButton>
         ))}
       </OrchestratorTopNav>
-      {activeWorkspaceTool === "plans" ? (
-        <WorkspaceToolSurface data-tool="plans">
-	          <PlansWorkspaceView
-	            repoTargets={coordinationTargets}
-	            onResumePlan={onResumePlan}
-	            rootDirectory={selectedTerminalPlanTarget?.repoPath || rootDirectory}
-	            selectedTerminal={selectedTerminalPlanTarget}
-	            workspace={workspace}
-	          />
-        </WorkspaceToolSurface>
-      ) : activeWorkspaceTool === "git" ? (
+      <WorkspaceToolSurface data-tool="plans" hidden={activeWorkspaceTool !== "plans"}>
+        <PlansWorkspaceView
+          repoTargets={coordinationTargets}
+          onResumePlan={onResumePlan}
+          rootDirectory={selectedTerminalPlanTarget?.repoPath || rootDirectory}
+          selectedTerminal={selectedTerminalPlanTarget}
+          workspace={workspace}
+        />
+      </WorkspaceToolSurface>
+      {activeWorkspaceTool === "git" ? (
         <WorkspaceToolSurface data-tool="git">
           <GitWorkspaceView
             onRefreshRepositories={onRefreshGitRepositories}
@@ -7628,7 +7598,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             billingStatus={billingStatus}
           />
         </WorkspaceToolSurface>
-      ) : (
+      ) : activeWorkspaceTool === "orchestrator" ? (
         <OrchestratorView>
           <OrchestratorVoiceArea>
             <OrchestratorVoicePaneControls aria-label="Orchestrator pane controls">
@@ -8092,7 +8062,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
             )}
           </OrchestratorContent>
         </OrchestratorView>
-      )}
+      ) : null}
     </TodoQueueSurface>
   );
 });
@@ -8206,6 +8176,7 @@ function TerminalView({
   const terminalBreakoutVisible = terminalBreakoutPhase !== TERMINAL_BREAKOUT_PHASE_GRID;
   const terminalBreakoutLayoutActive = terminalBreakoutPhase === TERMINAL_BREAKOUT_PHASE_BREAKING_OUT
     || terminalBreakoutPhase === TERMINAL_BREAKOUT_PHASE_CANVAS;
+  const terminalBreakoutControlsVisible = terminalBreakoutVisible && !fullscreenActive;
   const [todoDragState, setTodoDragState] = useState(null);
   const [todoDropError, setTodoDropError] = useState("");
   const todoDragActive = Boolean(todoDragState);
@@ -10391,16 +10362,6 @@ function TerminalView({
     });
   }, []);
 
-  const setTerminalBreakoutTerminalScaleState = useCallback((updater) => {
-    setTerminalBreakoutTerminalScale((currentScale) => {
-      const nextScale = clampBreakoutTerminalScale(
-        typeof updater === "function" ? updater(currentScale) : updater,
-      );
-      terminalBreakoutTerminalScaleRef.current = nextScale;
-      return nextScale;
-    });
-  }, []);
-
   const buildCurrentBreakoutPlacements = useCallback((options = {}) => (
     buildSpreadBreakoutPlacements({
       existingPlacements: terminalBreakoutPlacementsRef.current,
@@ -10505,50 +10466,6 @@ function TerminalView({
       terminalBreakoutTerminalScaleRef.current,
     ));
   }, [setTerminalBreakoutViewportState]);
-
-  const changeTerminalBreakoutTerminalScale = useCallback((factor) => {
-    if (!terminalBreakoutVisible) {
-      return;
-    }
-
-    const currentScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
-    const nextScale = clampBreakoutTerminalScale(currentScale * factor);
-
-    if (Math.abs(nextScale - currentScale) < 0.001) {
-      return;
-    }
-
-    setTerminalBreakoutTerminalScaleState(nextScale);
-    const { placements } = buildSpreadBreakoutPlacements({
-      existingPlacements: terminalBreakoutPlacementsRef.current,
-      panelRect: terminalPanelRectRef.current,
-      preserveExisting: true,
-      rects: terminalLayoutRectsRef.current,
-      terminalScale: nextScale,
-      terminalIndexes: logicalTerminalIndexes,
-    });
-    updateTerminalBreakoutPlacements(placements);
-    setTerminalBreakoutViewportState(getBreakoutFitViewport(
-      terminalPanelRectRef.current,
-      placements,
-      normalizeBreakoutViewport(terminalBreakoutViewportRef.current).zoom,
-      nextScale,
-    ));
-  }, [
-    logicalTerminalIndexes,
-    setTerminalBreakoutTerminalScaleState,
-    setTerminalBreakoutViewportState,
-    terminalBreakoutVisible,
-    updateTerminalBreakoutPlacements,
-  ]);
-
-  const shrinkTerminalBreakoutTerminals = useCallback(() => {
-    changeTerminalBreakoutTerminalScale(1 / TERMINAL_BREAKOUT_TERMINAL_SCALE_STEP);
-  }, [changeTerminalBreakoutTerminalScale]);
-
-  const growTerminalBreakoutTerminals = useCallback(() => {
-    changeTerminalBreakoutTerminalScale(TERMINAL_BREAKOUT_TERMINAL_SCALE_STEP);
-  }, [changeTerminalBreakoutTerminalScale]);
 
   const zoomTerminalBreakoutCanvas = useCallback((factor, anchor = {}) => {
     const panelRect = terminalPanelRectRef.current;
@@ -10655,21 +10572,32 @@ function TerminalView({
     const nextTerminalIndexes = logicalTerminalIndexes.includes(terminalIndex)
       ? logicalTerminalIndexes
       : [...logicalTerminalIndexes, terminalIndex];
-    const { placements } = buildSpreadBreakoutPlacements({
-      existingPlacements: terminalBreakoutPlacementsRef.current,
-      panelRect: terminalPanelRectRef.current,
-      preserveExisting: false,
-      rects: terminalLayoutRectsRef.current,
-      terminalScale: terminalBreakoutTerminalScaleRef.current,
-      terminalIndexes: nextTerminalIndexes,
-    });
+    const existingPlacements = normalizeBreakoutPlacements(
+      terminalBreakoutPlacementsRef.current,
+      logicalTerminalIndexes,
+    );
+    const panelRect = terminalPanelRectRef.current;
+    const viewport = normalizeBreakoutViewport(terminalBreakoutViewportRef.current);
+    const terminalScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
+    const zoom = Math.max(0.001, viewport.zoom);
+    const baseSize = getBreakoutBaseTerminalSize(panelRect, terminalLayoutRectsRef.current);
+    const nextSize = getBreakoutTerminalSize(terminalIndex, baseSize, terminalLayoutRectsRef.current);
+    const centerWorldX = ((Number(panelRect?.width || 0) / 2) - viewport.x) / zoom;
+    const centerWorldY = ((Number(panelRect?.height || 0) / 2) - viewport.y) / zoom;
+    const maxZ = Math.max(0, ...Object.values(existingPlacements)
+      .map((placement) => Number.parseInt(placement?.z, 10) || 0));
+    const placements = {
+      ...existingPlacements,
+      [terminalIndex]: existingPlacements[terminalIndex] || {
+        height: nextSize.height,
+        width: nextSize.width,
+        x: centerWorldX - ((nextSize.width * terminalScale) / 2),
+        y: centerWorldY - ((nextSize.height * terminalScale) / 2),
+        z: maxZ + 1,
+      },
+    };
+
     updateTerminalBreakoutPlacements(placements, nextTerminalIndexes);
-    setTerminalBreakoutViewportState(getBreakoutFitViewport(
-      terminalPanelRectRef.current,
-      placements,
-      normalizeBreakoutViewport(terminalBreakoutViewportRef.current).zoom,
-      terminalBreakoutTerminalScaleRef.current,
-    ));
     setActiveTerminalPaneId(getWorkspaceTerminalPaneId(terminalWorkspace.id, terminalIndex, result?.terminalRole || getTerminalRole(sourceTerminalIndex)));
   }, [
     activeTerminalPaneId,
@@ -10678,7 +10606,6 @@ function TerminalView({
     getTerminalRole,
     logicalTerminalIndexes,
     measureTerminalLayout,
-    setTerminalBreakoutViewportState,
     terminalWorkspace?.id,
     updateTerminalBreakoutPlacements,
   ]);
@@ -15174,7 +15101,7 @@ function TerminalView({
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
                 terminalRole={getTerminalRole(terminalIndex)}
-                terminalSelectionMode={terminalBreakoutLayoutActive ? "pointerup" : "pointerdown"}
+                terminalSelectionMode="pointerdown"
                 thread={getTerminalThread(terminalIndex)}
                 threadsViewActive={fullscreenThisTerminal}
                 todoDropActive={todoDragActive || workspaceFileDragActive}
@@ -15213,7 +15140,7 @@ function TerminalView({
           );
         })}
       </TerminalSurfaceLayer>
-      {terminalBreakoutVisible && (
+      {terminalBreakoutControlsVisible && (
         <TerminalBreakoutTopBar data-terminal-control="true">
           <TerminalBreakoutButton
             aria-label="Add terminal to canvas"
@@ -15231,7 +15158,7 @@ function TerminalView({
           <TerminalBreakoutTopBarDivider aria-hidden="true" />
           <TerminalBreakoutButton
             aria-label="Zoom out terminal canvas"
-            disabled={(terminalBreakoutViewport.zoom || TERMINAL_BREAKOUT_DEFAULT_ZOOM) <= TERMINAL_BREAKOUT_MIN_ZOOM + 0.01}
+            disabled={(terminalBreakoutViewport.zoom || TERMINAL_BREAKOUT_DEFAULT_ZOOM) <= TERMINAL_BREAKOUT_MIN_ZOOM + 0.001}
             onClick={zoomOutTerminalBreakoutCanvas}
             title="Zoom out"
             type="button"
@@ -15240,31 +15167,12 @@ function TerminalView({
           </TerminalBreakoutButton>
           <TerminalBreakoutButton
             aria-label="Zoom in terminal canvas"
-            disabled={(terminalBreakoutViewport.zoom || TERMINAL_BREAKOUT_DEFAULT_ZOOM) >= TERMINAL_BREAKOUT_MAX_ZOOM - 0.01}
+            disabled={(terminalBreakoutViewport.zoom || TERMINAL_BREAKOUT_DEFAULT_ZOOM) >= TERMINAL_BREAKOUT_MAX_ZOOM - 0.001}
             onClick={zoomInTerminalBreakoutCanvas}
             title="Zoom in"
             type="button"
           >
             <ZoomIn aria-hidden="true" />
-          </TerminalBreakoutButton>
-          <TerminalBreakoutTopBarDivider aria-hidden="true" />
-          <TerminalBreakoutButton
-            aria-label="Shrink breakout terminals"
-            disabled={terminalBreakoutTerminalScale <= TERMINAL_BREAKOUT_MIN_TERMINAL_SCALE + 0.01}
-            onClick={shrinkTerminalBreakoutTerminals}
-            title="Smaller terminals"
-            type="button"
-          >
-            <TitleMinimizeIcon aria-hidden="true" />
-          </TerminalBreakoutButton>
-          <TerminalBreakoutButton
-            aria-label="Grow breakout terminals"
-            disabled={terminalBreakoutTerminalScale >= TERMINAL_BREAKOUT_MAX_TERMINAL_SCALE - 0.01}
-            onClick={growTerminalBreakoutTerminals}
-            title="Larger terminals"
-            type="button"
-          >
-            <TitleRestoreIcon aria-hidden="true" />
           </TerminalBreakoutButton>
           <TerminalBreakoutTopBarDivider aria-hidden="true" />
           <TerminalBreakoutButton

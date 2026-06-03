@@ -467,10 +467,8 @@ pub fn coordination_terminal_task_plan_snapshot(
     {
         let repo_path = coordination_input_root(repo_path)?;
         let db_path = clean_optional_path(db_path);
-        return result(
-            CoordinationKernel::open(repo_path, db_path)?
-                .terminal_task_plan_snapshot(task_id, session_id, agent_id),
-        );
+        let (kernel, _) = CoordinationKernel::open_for_terminal_launch(repo_path, db_path)?;
+        return result(kernel.terminal_task_plan_snapshot(task_id, session_id, agent_id));
     }
 
     result(

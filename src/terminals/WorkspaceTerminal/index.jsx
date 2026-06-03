@@ -1277,7 +1277,6 @@ function WorkspaceTerminal({
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
-  const breakoutSurfaceDragPendingRef = useRef(null);
   const submittedPendingPromptIdsRef = useRef(new Set());
   const pendingPromptSendTimersRef = useRef(new Map());
   const terminalFirstVisibleOutputAtRef = useRef(0);
@@ -3536,18 +3535,6 @@ function WorkspaceTerminal({
     workspace?.id,
   ]);
 
-  const clearBreakoutSurfaceDragPending = useCallback(() => {
-    const pending = breakoutSurfaceDragPendingRef.current;
-    if (!pending) {
-      return;
-    }
-
-    window.removeEventListener("pointermove", pending.handlePointerMove, true);
-    window.removeEventListener("pointerup", pending.handlePointerEnd, true);
-    window.removeEventListener("pointercancel", pending.handlePointerEnd, true);
-    breakoutSurfaceDragPendingRef.current = null;
-  }, []);
-
   const beginBreakoutSurfaceDragGesture = useCallback((event) => {
     if (
       !terminalBreakoutActive
@@ -3559,67 +3546,14 @@ function WorkspaceTerminal({
       return false;
     }
 
-    event.preventDefault();
-    event.stopPropagation();
-    clearBreakoutSurfaceDragPending();
-
-    const pending = {
-      handlePointerEnd: null,
-      handlePointerMove: null,
-      pointerId: event.pointerId,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-    };
-
-    pending.handlePointerMove = (pointerEvent) => {
-      if (pointerEvent.pointerId !== pending.pointerId) {
-        return;
-      }
-
-      pointerEvent.preventDefault();
-      pointerEvent.stopPropagation();
-
-      const dragDistance = Math.hypot(
-        pointerEvent.clientX - pending.startClientX,
-        pointerEvent.clientY - pending.startClientY,
-      );
-      if (dragDistance < 4) {
-        return;
-      }
-
-      clearBreakoutSurfaceDragPending();
-      requestTerminalDragFromEvent(pointerEvent, { breakoutSurfaceDrag: true });
-    };
-
-    pending.handlePointerEnd = (pointerEvent) => {
-      if (pointerEvent.pointerId !== pending.pointerId) {
-        return;
-      }
-
-      pointerEvent.preventDefault();
-      pointerEvent.stopPropagation();
-      clearBreakoutSurfaceDragPending();
-      activateTerminalPane("terminal_breakout_pointerup");
-      requestTerminalAudioInputTarget(true);
-    };
-
-    breakoutSurfaceDragPendingRef.current = pending;
-    window.addEventListener("pointermove", pending.handlePointerMove, { capture: true, passive: false });
-    window.addEventListener("pointerup", pending.handlePointerEnd, { capture: true, passive: false });
-    window.addEventListener("pointercancel", pending.handlePointerEnd, { capture: true, passive: false });
-    return true;
+    return requestTerminalDragFromEvent(event, { breakoutSurfaceDrag: true });
   }, [
-    activateTerminalPane,
-    clearBreakoutSurfaceDragPending,
     isFullscreen,
-    requestTerminalAudioInputTarget,
     requestTerminalDragFromEvent,
     terminalBreakoutActive,
     terminalClosed,
     terminalClosing,
   ]);
-
-  useEffect(() => clearBreakoutSurfaceDragPending, [clearBreakoutSurfaceDragPending]);
 
   const handleTerminalSurfaceFocusCapture = useCallback((event) => {
     if (isTerminalControlEventTarget(event.target)) {
