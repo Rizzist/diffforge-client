@@ -57,17 +57,6 @@ function taskStatus(task) {
   return text(task?.status, "unknown");
 }
 
-function taskPrompt(task) {
-  return text(
-    task?.original_prompt
-      || task?.prompt
-      || task?.start_task_plan
-      || task?.body
-      || task?.title,
-    "No task prompt captured.",
-  );
-}
-
 function taskTerminalPlan(task) {
   const metadata = jsonObject(task?.metadata_json || task?.metadata);
   return jsonObject(task?.terminal_task_plan)
@@ -76,38 +65,43 @@ function taskTerminalPlan(task) {
     || jsonObject(metadata?.terminalTaskPlan);
 }
 
-function planStepStatusKind(status) {
-  const normalized = text(status).toLowerCase();
-  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
-    return "completed";
-  }
-  if (["active", "current", "in_progress", "in-progress", "pending", "running", "working"].includes(normalized)) {
-    return "active";
-  }
-  if (["blocked", "interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) {
-    return "blocked";
-  }
-  if (normalized === "skipped") {
-    return "skipped";
-  }
-  return "queued";
-}
-
-function planStatusLabel(status) {
-  const kind = planStepStatusKind(status);
-  if (kind === "completed") return "Completed";
-  if (kind === "active") return "In progress";
-  if (kind === "blocked") return "Blocked";
-  if (kind === "skipped") return "Skipped";
-  return "Queued";
-}
-
 function formatTime(value) {
+  const ms = parseTimeMs(value);
+  if (!ms) return "";
+  return new Date(ms).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatClockTime(value) {
+  const ms = parseTimeMs(value);
+  if (!ms) return "";
+  return new Date(ms).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function parseTimeMs(value) {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 10_000_000_000 ? value * 1000 : value;
+  }
   const raw = text(value);
-  if (!raw) return "";
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) return raw;
-  return date.toLocaleString();
+  if (!raw) return 0;
+  const numeric = raw.match(/^-?\d+(?:\.\d+)?Z?$/u);
+  if (numeric) {
+    const number = Number(raw.replace(/Z$/u, ""));
+    if (Number.isFinite(number)) return number < 10_000_000_000 ? number * 1000 : number;
+  }
+  const ms = new Date(raw).getTime();
+  return Number.isNaN(ms) ? 0 : ms;
 }
 
 function numberValue(value, fallback = 0) {
@@ -137,6 +131,114 @@ function formatDurationMs(value) {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
   return `${Math.round(minutes / 60)}h`;
+}
+
+function formatTimelineDuration(startMs, endMs, active) {
+  if (!startMs) return "";
+  const durationMs = (endMs || Date.now()) - startMs;
+  const formatted = formatDurationMs(Math.max(0, durationMs));
+  if (!formatted) return "";
+  return active ? `${formatted} live` : formatted;
+}
+
+function taskStartMs(task) {
+  return parseTimeMs(task?.started_at)
+    || parseTimeMs(task?.task_started_at)
+    || parseTimeMs(task?.created_at)
+    || parseTimeMs(task?.task_created_at)
+    || parseTimeMs(task?.first_mutation_at)
+    || parseTimeMs(task?.updated_at)
+    || parseTimeMs(task?.last_mutation_at);
+}
+
+function taskEndMs(task) {
+  return parseTimeMs(task?.finished_at)
+    || parseTimeMs(task?.completed_at)
+    || parseTimeMs(task?.merged_at);
+}
+
+function taskUpdatedMs(task) {
+  return parseTimeMs(task?.updated_at)
+    || parseTimeMs(task?.task_updated_at)
+    || parseTimeMs(task?.last_mutation_at)
+    || taskEndMs(task)
+    || taskStartMs(task);
+}
+
+function taskStatusKind(task) {
+  const status = taskStatus(task).toLowerCase().replaceAll("_", "-");
+  if (["merged", "done", "completed", "complete", "success"].includes(status)) return "completed";
+  if (["active", "running", "started", "claimed", "in-progress", "working"].includes(status)) return "active";
+  if (["parked", "waiting", "resume-ready", "resume-requested", "blocked", "queued"].includes(status)) return "parked";
+  if (["failed", "error"].includes(status)) return "failed";
+  if (["cancelled", "canceled", "interrupted", "rolled back", "rolled-back"].includes(status)) return "stopped";
+  return "unknown";
+}
+
+function taskStatusLabel(task) {
+  const status = taskStatus(task).replaceAll("_", " ");
+  return status || "unknown";
+}
+
+function taskIsActive(task) {
+  return ["active", "parked"].includes(taskStatusKind(task)) && !taskEndMs(task);
+}
+
+function taskDisplayTitle(task) {
+  const terminalPlan = taskTerminalPlan(task);
+  return text(
+    terminalPlan?.title
+      || task?.plan_title
+      || task?.planTitle
+      || task?.title
+      || task?.start_task_plan
+      || task?.body,
+    "Untitled task",
+  );
+}
+
+function buildTimelineItems(tasks) {
+  const normalized = jsonArray(tasks)
+    .map((task, index) => {
+      const startMs = taskStartMs(task);
+      const endMs = taskEndMs(task);
+      const active = taskIsActive(task);
+      return {
+        active,
+        endMs,
+        index,
+        label: taskDisplayTitle(task),
+        startMs,
+        statusKind: taskStatusKind(task),
+        statusLabel: taskStatusLabel(task),
+        task,
+        taskId: text(task?.task_id || task?.id, `task-${index}`),
+        updatedMs: taskUpdatedMs(task),
+      };
+    })
+    .filter((item) => item.taskId);
+
+  const ascending = [...normalized].sort((left, right) => (
+    (left.startMs || left.updatedMs || 0) - (right.startMs || right.updatedMs || 0)
+      || left.index - right.index
+  ));
+  const laneEnds = [];
+  ascending.forEach((item) => {
+    const startMs = item.startMs || item.updatedMs || 0;
+    const endMs = item.endMs || (item.active ? Date.now() : item.updatedMs || startMs);
+    let lane = laneEnds.findIndex((laneEnd) => startMs >= laneEnd);
+    if (lane === -1) lane = laneEnds.length;
+    laneEnds[lane] = Math.max(laneEnds[lane] || 0, endMs || startMs);
+    item.lane = lane;
+  });
+
+  return {
+    laneCount: Math.max(1, laneEnds.length),
+    rows: normalized.sort((left, right) => (
+      (right.startMs || right.updatedMs || 0) - (left.startMs || left.updatedMs || 0)
+        || right.index - left.index
+    )),
+  };
 }
 
 function mountField(mount, camelKey, snakeKey, fallback = "") {
@@ -378,23 +480,12 @@ export default function ArchitectureWorkspaceView({
   const workspaceName = workspace?.name || "";
   const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
   const [viewMode, setViewMode] = useState("taskHistory");
-  const [selectedTaskId, setSelectedTaskId] = useState("");
   const [rawScan, setRawScan] = useState(null);
   const [rawScanState, setRawScanState] = useState("idle");
   const [rawScanError, setRawScanError] = useState("");
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(architectureSnapshot), [architectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
-  const selectedTask = tasks.find((task) => text(task?.task_id) === selectedTaskId) || tasks[0] || null;
-
-  useEffect(() => {
-    if (!tasks.length) {
-      setSelectedTaskId("");
-      return;
-    }
-    if (!tasks.some((task) => text(task?.task_id) === selectedTaskId)) {
-      setSelectedTaskId(text(tasks[0]?.task_id));
-    }
-  }, [selectedTaskId, tasks]);
+  const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
 
   const loadRawScan = useCallback((options = {}) => {
     if (!repoPath || !workspaceId) {
@@ -447,7 +538,7 @@ export default function ArchitectureWorkspaceView({
             Raw Scan
           </ViewToggleButton>
         </ViewToggleGroup>
-        <ToolbarMeta>{tasks.length} task{tasks.length === 1 ? "" : "s"}</ToolbarMeta>
+        <ToolbarMeta>Task History · {tasks.length} task{tasks.length === 1 ? "" : "s"} · repo: {repoLabel} · live</ToolbarMeta>
       </ArchitectureToolbar>
 
       {viewMode === "rawScan" ? (
@@ -458,10 +549,7 @@ export default function ArchitectureWorkspaceView({
           state={rawScanState}
         />
       ) : (
-        <HistoryShell>
-          <HistoryList tasks={tasks} selectedTaskId={text(selectedTask?.task_id)} onSelectTask={setSelectedTaskId} />
-          <HistoryInspector task={selectedTask} />
-        </HistoryShell>
+        <HistoryTimeline tasks={tasks} repoLabel={repoLabel} />
       )}
       {architectureError && (
         <ArchitectureErrorToast aria-live="polite" role="status" title={architectureError}>
@@ -473,7 +561,9 @@ export default function ArchitectureWorkspaceView({
   );
 }
 
-function HistoryList({ tasks, selectedTaskId, onSelectTask }) {
+function HistoryTimeline({ tasks, repoLabel }) {
+  const timeline = useMemo(() => buildTimelineItems(tasks), [tasks]);
+
   if (!tasks.length) {
     return (
       <HistoryPane>
@@ -484,125 +574,51 @@ function HistoryList({ tasks, selectedTaskId, onSelectTask }) {
 
   return (
     <HistoryPane>
-      {tasks.map((task) => {
-        const taskId = text(task?.task_id);
-        const selected = taskId === selectedTaskId;
-        const nodeCount = jsonArray(task?.nodes).length;
-        const decisionCount = jsonArray(task?.arbiter_decisions).length;
-        const terminalPlan = taskTerminalPlan(task);
-        const terminalPlanStepCount = jsonArray(terminalPlan?.steps).length;
+      <TimelineHeader>
+        <div>
+          <TimelineKicker>Repo timeline</TimelineKicker>
+          <TimelineTitle>{repoLabel}</TimelineTitle>
+        </div>
+        <TimelineSummary>{timeline.rows.length} task{timeline.rows.length === 1 ? "" : "s"} · newest first</TimelineSummary>
+      </TimelineHeader>
+      <TimelineList style={{ "--timeline-lanes": timeline.laneCount }}>
+        {timeline.rows.map((item) => {
+          const startLabel = formatTime(item.startMs) || "unknown";
+          const finishLabel = item.endMs
+            ? formatTime(item.endMs)
+            : item.active ? "now" : "not finished";
+          const startClock = formatClockTime(item.startMs) || "unknown";
+          const finishClock = item.endMs
+            ? formatClockTime(item.endMs)
+            : item.active ? "now" : "open";
+          const duration = formatTimelineDuration(item.startMs, item.endMs, item.active);
+          const agent = text(item.task?.coding_agent || item.task?.agent_kind || item.task?.agent_id);
 
-        return (
-          <TaskButton
-            data-selected={selected ? "true" : undefined}
-            key={taskId || taskPrompt(task)}
-            onClick={() => onSelectTask(taskId)}
-            type="button"
-          >
-            <TaskHeader>
-              <strong>{text(task?.title, taskPrompt(task))}</strong>
-              <StatusPill>{taskStatus(task)}</StatusPill>
-            </TaskHeader>
-            <TaskPrompt>{taskPrompt(task)}</TaskPrompt>
-            <TaskMeta>
-              <span>{text(task?.coding_agent || task?.agent_kind, "agent")}</span>
-              {terminalPlanStepCount > 0 && (
-                <span>{terminalPlanStepCount} plan step{terminalPlanStepCount === 1 ? "" : "s"}</span>
-              )}
-              <span>{nodeCount} node delta{nodeCount === 1 ? "" : "s"}</span>
-              <span>{decisionCount} decision{decisionCount === 1 ? "" : "s"}</span>
-            </TaskMeta>
-          </TaskButton>
-        );
-      })}
+          return (
+            <TimelineRow data-status={item.statusKind} key={item.taskId} title={`${item.label}\n${startLabel} -> ${finishLabel}`}>
+              <TimelineTrack aria-hidden="true" style={{ "--timeline-lane": item.lane }}>
+                <span data-part="trunk" />
+                <span data-part="lane" />
+                <span data-part="connector" />
+                <span data-part="dot" />
+              </TimelineTrack>
+              <TimelineTask>
+                <TimelineTaskName>{item.label}</TimelineTaskName>
+                <TimelineTaskMeta>
+                  <StatusPill data-status={item.statusKind}>{item.statusLabel}</StatusPill>
+                  {agent && <span>{agent}</span>}
+                </TimelineTaskMeta>
+              </TimelineTask>
+              <TimelineTimes>
+                <strong>{startClock}</strong>
+                <span>{finishClock}</span>
+                {duration && <em>{duration}</em>}
+              </TimelineTimes>
+            </TimelineRow>
+          );
+        })}
+      </TimelineList>
     </HistoryPane>
-  );
-}
-
-function HistoryInspector({ task }) {
-  if (!task) {
-    return (
-      <InspectorPane>
-        <EmptyState>No task selected.</EmptyState>
-      </InspectorPane>
-    );
-  }
-
-  const nodes = jsonArray(task.nodes);
-  const decisions = jsonArray(task.arbiter_decisions);
-  const mutations = jsonArray(task.mutations);
-  const terminalPlan = taskTerminalPlan(task);
-  const terminalPlanSteps = jsonArray(terminalPlan?.steps);
-
-  return (
-    <InspectorPane>
-      <InspectorHeader>
-        <span>{taskStatus(task)}</span>
-        <strong>{text(task.title, "Task")}</strong>
-      </InspectorHeader>
-      <InspectorPrompt>{taskPrompt(task)}</InspectorPrompt>
-      <InspectorGrid>
-        <InfoCell>
-          <span>Agent</span>
-          <strong>{text(task.coding_agent || task.agent_kind || task.agent_id, "unknown")}</strong>
-        </InfoCell>
-        <InfoCell>
-          <span>Started</span>
-          <strong>{formatTime(task.started_at || task.created_at) || "unknown"}</strong>
-        </InfoCell>
-        <InfoCell>
-          <span>Finished</span>
-          <strong>{formatTime(task.finished_at) || "not finished"}</strong>
-        </InfoCell>
-      </InspectorGrid>
-
-      {terminalPlan && (
-        <>
-          <SectionTitle>Terminal Plan</SectionTitle>
-          <PlanPanel>
-            <PlanPanelHeader>
-              <strong>{text(terminalPlan.title, "Terminal task plan")}</strong>
-              <StatusPill>{planStatusLabel(terminalPlan.status)}</StatusPill>
-            </PlanPanelHeader>
-            {terminalPlanSteps.length ? (
-              <PlanStepList>
-                {terminalPlanSteps.map((step, index) => {
-                  const statusKind = planStepStatusKind(step?.status);
-                  return (
-                    <PlanStepItem data-status={statusKind} key={`${text(step?.title, "step")}-${index}`}>
-                      <PlanStepMarker aria-hidden="true" data-status={statusKind} />
-                      <div>
-                        <strong>{text(step?.title, "Untitled step")}</strong>
-                        <span>{planStatusLabel(step?.status)}</span>
-                      </div>
-                    </PlanStepItem>
-                  );
-                })}
-              </PlanStepList>
-            ) : (
-              <EmptyState>No plan steps captured for this task.</EmptyState>
-            )}
-          </PlanPanel>
-        </>
-      )}
-
-      <SectionTitle>Task Deltas</SectionTitle>
-      <DeltaList>
-        {nodes.length ? nodes.map((node) => (
-          <DeltaItem key={text(node.node_id) || text(node.title)}>
-            <strong>{text(node.title || node.display_title || node.node_id, "Architecture item")}</strong>
-            <span>
-              {Number(node.mutation_count) || 0} change{Number(node.mutation_count) === 1 ? "" : "s"}
-            </span>
-          </DeltaItem>
-        )) : (
-          <EmptyState>No graph node deltas for this task.</EmptyState>
-        )}
-      </DeltaList>
-
-      <SectionTitle>Raw Task Record</SectionTitle>
-      <JsonBlock>{JSON.stringify({ task, decisions, mutations }, null, 2)}</JsonBlock>
-    </InspectorPane>
   );
 }
 
@@ -809,69 +825,188 @@ const ArchitectureErrorToast = styled.div`
   }
 `;
 
-const HistoryShell = styled.div`
-  display: grid;
-  grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.35fr);
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-
-  @media (max-width: 920px) {
-    grid-template-columns: 1fr;
-  }
-`;
-
 const HistoryPane = styled.div`
   display: grid;
   align-content: start;
-  gap: 8px;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px;
-  border-right: 1px solid var(--forge-border);
-`;
-
-const InspectorPane = styled.aside`
-  display: grid;
-  align-content: start;
-  gap: 12px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
   min-width: 0;
   min-height: 0;
   overflow: auto;
   padding: 16px;
 `;
 
-const TaskButton = styled.button`
-  display: grid;
-  gap: 8px;
-  width: 100%;
+const TimelineHeader = styled.header`
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
   min-width: 0;
-  padding: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 8px;
-  color: inherit;
-  background: rgba(15, 23, 42, 0.5);
-  text-align: left;
-  cursor: pointer;
 
-  &[data-selected="true"] {
-    border-color: rgba(96, 165, 250, 0.46);
-    background: rgba(30, 64, 175, 0.22);
+  @media (max-width: 700px) {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
   }
 `;
 
-const TaskHeader = styled.div`
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
+const TimelineKicker = styled.div`
+  color: var(--forge-text-muted);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+`;
 
-  strong {
+const TimelineTitle = styled.strong`
+  display: block;
+  min-width: 0;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  line-height: 1.2;
+`;
+
+const TimelineSummary = styled.span`
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 820;
+`;
+
+const TimelineList = styled.div`
+  --timeline-track-width: calc(var(--timeline-lanes) * 18px + 20px);
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  overflow: visible;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const TimelineRow = styled.div`
+  display: grid;
+  grid-template-columns: var(--timeline-track-width) minmax(0, 1fr) minmax(150px, 220px);
+  min-width: 0;
+  min-height: 58px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: var(--forge-text);
+
+  &[data-status="active"] {
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  &[data-status="parked"] {
+    background: rgba(217, 119, 6, 0.06);
+  }
+
+  @media (max-width: 700px) {
+    grid-template-columns: var(--timeline-track-width) minmax(0, 1fr);
+  }
+`;
+
+const TimelineTrack = styled.div`
+  --timeline-lane-x: calc(10px + var(--timeline-lane) * 18px);
+  position: relative;
+  min-width: 0;
+
+  span {
+    position: absolute;
+    display: block;
+    pointer-events: none;
+  }
+
+  [data-part="trunk"],
+  [data-part="lane"] {
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    border-radius: 2px;
+    background: rgba(71, 85, 105, 0.72);
+  }
+
+  [data-part="trunk"] {
+    left: 10px;
+  }
+
+  [data-part="lane"] {
+    left: var(--timeline-lane-x);
+    background: rgba(96, 165, 250, 0.5);
+  }
+
+  [data-part="connector"] {
+    top: 28px;
+    left: 10px;
+    width: calc(var(--timeline-lane) * 18px);
+    height: 2px;
+    border-radius: 2px;
+    background: rgba(96, 165, 250, 0.5);
+  }
+
+  [data-part="dot"] {
+    top: 22px;
+    left: calc(var(--timeline-lane-x) - 5px);
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(15, 23, 42, 0.96);
+    border-radius: 50%;
+    background: #93c5fd;
+    box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.5);
+  }
+
+  ${TimelineRow}[data-status="completed"] & [data-part="dot"] {
+    background: #34d399;
+    box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5);
+  }
+
+  ${TimelineRow}[data-status="active"] & [data-part="dot"] {
+    background: #60a5fa;
+    box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.62), 0 0 18px rgba(96, 165, 250, 0.3);
+  }
+
+  ${TimelineRow}[data-status="parked"] & [data-part="dot"] {
+    background: #f59e0b;
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.5);
+  }
+
+  ${TimelineRow}[data-status="failed"] & [data-part="dot"],
+  ${TimelineRow}[data-status="stopped"] & [data-part="dot"] {
+    background: #fb7185;
+    box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.5);
+  }
+`;
+
+const TimelineTask = styled.div`
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 10px 9px 0;
+`;
+
+const TimelineTaskName = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.25;
+`;
+
+const TimelineTaskMeta = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+
+  > span:not([data-status]) {
     min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: 13px;
-    line-height: 1.3;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: 780;
   }
 `;
 
@@ -879,246 +1014,76 @@ const StatusPill = styled.span`
   flex: 0 0 auto;
   padding: 3px 7px;
   border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 8px;
+  border-radius: 7px;
   color: var(--forge-text-muted);
   font-size: 10px;
   font-weight: 850;
   text-transform: uppercase;
-`;
-
-const TaskPrompt = styled.p`
-  margin: 0;
-  color: var(--forge-text-soft);
-  font-size: 12px;
-  font-weight: 690;
-  line-height: 1.45;
-`;
-
-const TaskMeta = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-
-  span {
-    padding: 3px 6px;
-    border: 1px solid rgba(148, 163, 184, 0.14);
-    border-radius: 7px;
-    color: var(--forge-text-muted);
-    font-size: 10px;
-    font-weight: 820;
-  }
-`;
-
-const InspectorHeader = styled.header`
-  display: grid;
-  gap: 5px;
-
-  span {
-    color: var(--forge-text-muted);
-    font-size: 11px;
-    font-weight: 850;
-    text-transform: uppercase;
-  }
-
-  strong {
-    overflow-wrap: anywhere;
-    font-size: 20px;
-    line-height: 1.2;
-  }
-`;
-
-const InspectorPrompt = styled.p`
-  margin: 0;
-  color: var(--forge-text-soft);
-  font-size: 13px;
-  line-height: 1.55;
-`;
-
-const InspectorGrid = styled.div`
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-
-  @media (max-width: 720px) {
-    grid-template-columns: 1fr;
-  }
-`;
-
-const InfoCell = styled.div`
-  display: grid;
-  gap: 4px;
-  padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.38);
-
-  span {
-    color: var(--forge-text-muted);
-    font-size: 10px;
-    font-weight: 850;
-    text-transform: uppercase;
-  }
-
-  strong {
-    min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: 12px;
-  }
-`;
-
-const PlanPanel = styled.div`
-  display: grid;
-  gap: 0;
-  overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.34);
-`;
-
-const PlanPanelHeader = styled.div`
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-
-  strong {
-    min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: 13px;
-  }
-`;
-
-const PlanStepList = styled.div`
-  display: grid;
-`;
-
-const PlanStepItem = styled.div`
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
-  gap: 9px;
-  padding: 10px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
-
-  &:last-child {
-    border-bottom: 0;
-  }
-
-  strong {
-    display: block;
-    min-width: 0;
-    overflow-wrap: anywhere;
-    color: var(--forge-text);
-    font-size: 12px;
-    line-height: 1.3;
-  }
-
-  span {
-    display: block;
-    margin-top: 3px;
-    color: var(--forge-text-muted);
-    font-size: 11px;
-    font-weight: 760;
-  }
-`;
-
-const PlanStepMarker = styled.span`
-  display: grid;
-  place-items: center;
-  width: 18px;
-  height: 18px;
-  margin-top: 1px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 50%;
-
-  &::after {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: rgba(148, 163, 184, 0.7);
-    content: "";
-  }
 
   &[data-status="completed"] {
-    border-color: rgba(74, 222, 128, 0.36);
-    background: rgba(34, 197, 94, 0.12);
-
-    &::after {
-      width: 8px;
-      height: 4px;
-      border: 0 solid #a7f3d0;
-      border-width: 0 0 2px 2px;
-      border-radius: 0;
-      background: transparent;
-      transform: rotate(-45deg) translate(1px, -1px);
-    }
+    border-color: rgba(52, 211, 153, 0.28);
+    color: #a7f3d0;
+    background: rgba(6, 78, 59, 0.2);
   }
 
   &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.42);
-
-    &::after {
-      width: 10px;
-      height: 10px;
-      border: 2px solid rgba(147, 197, 253, 0.24);
-      border-top-color: #93c5fd;
-      background: transparent;
-      animation: architecture-plan-spin 0.8s linear infinite;
-    }
+    border-color: rgba(96, 165, 250, 0.32);
+    color: #bfdbfe;
+    background: rgba(30, 64, 175, 0.2);
   }
 
-  &[data-status="blocked"] {
-    border-color: rgba(251, 146, 60, 0.38);
-    background: rgba(194, 65, 12, 0.12);
-
-    &::after {
-      background: #fed7aa;
-    }
+  &[data-status="parked"] {
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #fde68a;
+    background: rgba(120, 53, 15, 0.18);
   }
 
-  @keyframes architecture-plan-spin {
-    to {
-      transform: rotate(360deg);
-    }
+  &[data-status="failed"],
+  &[data-status="stopped"] {
+    border-color: rgba(251, 113, 133, 0.3);
+    color: #fecdd3;
+    background: rgba(127, 29, 29, 0.18);
   }
 `;
 
-const SectionTitle = styled.h3`
-  margin: 4px 0 0;
-  color: var(--forge-text-muted);
-  font-size: 12px;
-  font-weight: 900;
-  letter-spacing: 0;
-  text-transform: uppercase;
-`;
-
-const DeltaList = styled.div`
+const TimelineTimes = styled.div`
   display: grid;
-  gap: 7px;
-`;
-
-const DeltaItem = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.32);
+  align-content: center;
+  justify-items: end;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 0 8px 10px;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 760;
 
   strong {
     min-width: 0;
-    overflow-wrap: anywhere;
-    font-size: 12px;
+    color: var(--forge-text);
+    font-size: 11px;
+    font-weight: 850;
   }
 
-  span {
-    flex: 0 0 auto;
-    color: var(--forge-text-muted);
-    font-size: 11px;
-    font-weight: 820;
+  span,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    max-width: 100%;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  em {
+    color: rgba(148, 163, 184, 0.78);
+    font-style: normal;
+  }
+
+  @media (max-width: 700px) {
+    grid-column: 2;
+    grid-template-columns: auto auto minmax(0, 1fr);
+    justify-items: start;
+    gap: 8px;
+    padding: 0 0 10px;
   }
 `;
 

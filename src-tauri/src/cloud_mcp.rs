@@ -9839,7 +9839,7 @@ fn cloud_mcp_container_spec_graph_snapshot(
             "project_mounts": mount_values.clone(),
         },
         "task_history": {
-            "kind": "spec_task_history",
+            "kind": "task_history",
             "version": 1,
             "tasks": task_history_tasks,
         },
@@ -10407,7 +10407,7 @@ fn cloud_mcp_spec_graph_empty_raw(req: &CloudMcpSpecGraphSyncRequest) -> Value {
         "hidden_edges": [],
         "agent_work": {},
         "graph_stats": {},
-        "task_history": {"kind": "spec_task_history", "version": 1, "tasks": []},
+        "task_history": {"kind": "task_history", "version": 1, "tasks": []},
     })
 }
 
@@ -10454,7 +10454,7 @@ fn cloud_mcp_spec_graph_snapshot_from_data(
         .get("task_history")
         .or_else(|| data.get("taskHistory"))
         .cloned()
-        .unwrap_or_else(|| json!({"kind": "spec_task_history", "version": 1, "tasks": []}));
+        .unwrap_or_else(|| json!({"kind": "task_history", "version": 1, "tasks": []}));
     let task_history_cursor = task_history
         .get("cursor")
         .and_then(Value::as_str)
@@ -10500,7 +10500,7 @@ fn cloud_mcp_spec_graph_snapshot_from_data(
     })
 }
 
-fn cloud_mcp_attach_spec_task_history(mut snapshot: Value, task_history: Value) -> Value {
+fn cloud_mcp_attach_task_history(mut snapshot: Value, task_history: Value) -> Value {
     let task_history_cursor = task_history
         .get("cursor")
         .and_then(Value::as_str)
@@ -10565,8 +10565,6 @@ fn cloud_mcp_task_history_snapshot(
             "repo_id": req.repo_id.clone(),
             "workspace_id": req.workspace_id.clone(),
             "task_history": task_history,
-            "nodes": [],
-            "edges": [],
         },
     })
 }
@@ -10632,7 +10630,7 @@ fn cloud_mcp_stamp_spec_graph_snapshot(
                     .and_then(|raw| raw.get("task_history"))
                     .cloned()
             })
-            .unwrap_or_else(|| json!({"kind": "spec_task_history", "version": 1, "tasks": []}));
+            .unwrap_or_else(|| json!({"kind": "task_history", "version": 1, "tasks": []}));
         let task_history_cursor = task_history
             .get("cursor")
             .and_then(Value::as_str)
@@ -10738,228 +10736,6 @@ fn cloud_mcp_spec_graph_array(snapshot: &Value, camel_key: &str, raw_key: &str) 
         .unwrap_or_default()
 }
 
-fn cloud_mcp_apply_spec_graph_items(
-    existing_items: Vec<Value>,
-    changed_items: Vec<Value>,
-    removed_ids: Vec<String>,
-) -> Vec<Value> {
-    let removed = removed_ids.into_iter().collect::<HashSet<_>>();
-    let mut changed_by_id = changed_items
-        .into_iter()
-        .filter_map(|item| cloud_mcp_spec_graph_item_id(&item).map(|id| (id, item)))
-        .collect::<HashMap<_, _>>();
-    let mut next_items = Vec::new();
-
-    for item in existing_items {
-        let Some(id) = cloud_mcp_spec_graph_item_id(&item) else {
-            next_items.push(item);
-            continue;
-        };
-        if removed.contains(&id) {
-            continue;
-        }
-        if let Some(changed) = changed_by_id.remove(&id) {
-            next_items.push(changed);
-        } else {
-            next_items.push(item);
-        }
-    }
-
-    let mut appended = changed_by_id.into_iter().collect::<Vec<_>>();
-    appended.sort_by(|left, right| left.0.cmp(&right.0));
-    next_items.extend(appended.into_iter().map(|(_, item)| item));
-    next_items
-}
-
-fn cloud_mcp_spec_graph_delta_array(delta: &Value, key: &str) -> Vec<Value> {
-    delta
-        .get(key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn cloud_mcp_spec_graph_delta_string_array(delta: &Value, key: &str) -> Vec<String> {
-    delta
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn cloud_mcp_spec_graph_hash_ids(value: Option<&Value>) -> HashSet<String> {
-    value
-        .and_then(Value::as_object)
-        .map(|hashes| {
-            hashes
-                .iter()
-                .filter(|(_, hash)| hash.as_str().map(str::trim).is_some_and(|value| !value.is_empty()))
-                .map(|(id, _)| id.clone())
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn cloud_mcp_spec_graph_delta_changed_ids(delta: &Value, key: &str) -> HashSet<String> {
-    cloud_mcp_spec_graph_delta_array(delta, key)
-        .into_iter()
-        .filter_map(|item| cloud_mcp_spec_graph_item_id(&item))
-        .collect()
-}
-
-fn cloud_mcp_spec_graph_delta_missing_cached_items(
-    cache: &Value,
-    delta: &Value,
-    camel_items_key: &str,
-    raw_items_key: &str,
-    delta_hash_key: &str,
-    changed_key: &str,
-    removed_key: &str,
-) -> bool {
-    let current_ids = cloud_mcp_spec_graph_array(cache, camel_items_key, raw_items_key)
-        .iter()
-        .filter_map(cloud_mcp_spec_graph_item_id)
-        .collect::<HashSet<_>>();
-    let next_hash_ids = cloud_mcp_spec_graph_hash_ids(delta.get(delta_hash_key));
-    if next_hash_ids.is_empty() {
-        return false;
-    }
-    let changed_ids = cloud_mcp_spec_graph_delta_changed_ids(delta, changed_key);
-    let removed_ids = cloud_mcp_spec_graph_delta_string_array(delta, removed_key)
-        .into_iter()
-        .collect::<HashSet<_>>();
-
-    next_hash_ids
-        .iter()
-        .any(|id| !current_ids.contains(id) && !changed_ids.contains(id) && !removed_ids.contains(id))
-}
-
-fn cloud_mcp_spec_graph_delta_needs_full_resync(cache: &Value, delta: &Value) -> bool {
-    cloud_mcp_spec_graph_delta_missing_cached_items(
-        cache,
-        delta,
-        "specNodes",
-        "nodes",
-        "node_hashes",
-        "changed_nodes",
-        "removed_node_ids",
-    ) || cloud_mcp_spec_graph_delta_missing_cached_items(
-        cache,
-        delta,
-        "specEdges",
-        "edges",
-        "edge_hashes",
-        "changed_edges",
-        "removed_edge_ids",
-    )
-}
-
-fn cloud_mcp_apply_spec_graph_delta(
-    req: &CloudMcpSpecGraphSyncRequest,
-    cache: Value,
-    delta: Value,
-    cache_path: &Path,
-) -> Value {
-    let nodes = cloud_mcp_apply_spec_graph_items(
-        cloud_mcp_spec_graph_array(&cache, "specNodes", "nodes"),
-        cloud_mcp_spec_graph_delta_array(&delta, "changed_nodes"),
-        cloud_mcp_spec_graph_delta_string_array(&delta, "removed_node_ids"),
-    );
-    let edges = cloud_mcp_apply_spec_graph_items(
-        cloud_mcp_spec_graph_array(&cache, "specEdges", "edges"),
-        cloud_mcp_spec_graph_delta_array(&delta, "changed_edges"),
-        cloud_mcp_spec_graph_delta_string_array(&delta, "removed_edge_ids"),
-    );
-    let agent_work = if delta
-        .get("agent_work")
-        .is_some_and(|value| !value.is_null())
-    {
-        delta["agent_work"].clone()
-    } else {
-        cache
-            .get("agentWork")
-            .cloned()
-            .or_else(|| {
-                cache
-                    .get("raw")
-                    .and_then(|raw| raw.get("agent_work"))
-                    .cloned()
-            })
-            .unwrap_or_else(|| json!({}))
-    };
-    let graph_stats = if delta
-        .get("graph_stats")
-        .is_some_and(|value| !value.is_null())
-    {
-        delta["graph_stats"].clone()
-    } else {
-        cache
-            .get("graphStats")
-            .cloned()
-            .or_else(|| {
-                cache
-                    .get("raw")
-                    .and_then(|raw| raw.get("graph_stats"))
-                    .cloned()
-            })
-            .unwrap_or_else(|| json!({}))
-    };
-    let raw = json!({
-        "kind": "project_spec_graph",
-        "version": 3,
-        "repo_id": req.repo_id.clone(),
-        "workspace_id": req.workspace_id.clone(),
-        "nodes": nodes,
-        "edges": edges,
-        "hidden_edges": cache.get("raw").and_then(|raw| raw.get("hidden_edges")).cloned().unwrap_or_else(|| json!([])),
-        "agent_work": agent_work,
-        "graph_stats": graph_stats,
-        "task_history": cache.get("taskHistory").cloned().or_else(|| cache.get("raw").and_then(|raw| raw.get("task_history")).cloned()).unwrap_or_else(|| json!({"kind": "spec_task_history", "version": 1, "tasks": []})),
-    });
-    let mut snapshot = cloud_mcp_spec_graph_snapshot_from_data(req, raw, cache_path, "ready", "");
-    if let Some(object) = snapshot.as_object_mut() {
-        object.insert(
-            "cursor".to_string(),
-            delta.get("cursor").cloned().unwrap_or_else(|| json!("")),
-        );
-        object.insert(
-            "nodeHashes".to_string(),
-            delta
-                .get("node_hashes")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        );
-        object.insert(
-            "edgeHashes".to_string(),
-            delta
-                .get("edge_hashes")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-        );
-        object.insert(
-            "agentWorkHash".to_string(),
-            delta
-                .get("agent_work_hash")
-                .cloned()
-                .unwrap_or_else(|| json!("")),
-        );
-        object.insert(
-            "graphStatsHash".to_string(),
-            delta
-                .get("graph_stats_hash")
-                .cloned()
-                .unwrap_or_else(|| json!("")),
-        );
-    }
-    snapshot
-}
-
 fn cloud_mcp_spec_graph_sync_payload(req: &CloudMcpSpecGraphSyncRequest, cache: &Value) -> Value {
     let repo_name = cloud_mcp_repo_display_name(&req.root);
     let display_root = cloud_mcp_repo_display_root(&req.root);
@@ -11016,7 +10792,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
     Ok(cloud_mcp_response_data(&response))
 }
 
-async fn cloud_mcp_fetch_spec_task_history_data(
+async fn cloud_mcp_fetch_task_history_data(
     state: &CloudMcpState,
     req: &CloudMcpSpecGraphSyncRequest,
 ) -> Result<Value, String> {
@@ -11040,17 +10816,17 @@ async fn cloud_mcp_fetch_spec_task_history_data(
     Ok(cloud_mcp_response_data(&response))
 }
 
-async fn cloud_mcp_fetch_spec_task_history_or_empty(
+async fn cloud_mcp_fetch_task_history_or_empty(
     state: &CloudMcpState,
     req: &CloudMcpSpecGraphSyncRequest,
 ) -> Value {
-    match cloud_mcp_fetch_spec_task_history_data(state, req).await {
+    match cloud_mcp_fetch_task_history_data(state, req).await {
         Ok(history) => history,
         Err(error) if error.contains("HTTP 404") => {
-            json!({"kind": "spec_task_history", "version": 1, "tasks": []})
+            json!({"kind": "task_history", "version": 1, "tasks": []})
         }
         Err(error) => json!({
-            "kind": "spec_task_history",
+            "kind": "task_history",
             "version": 1,
             "tasks": [],
             "sync_error": clean_terminal_telemetry_text(&error),
@@ -11067,8 +10843,8 @@ async fn cloud_mcp_sync_spec_graph_once(
     cloud_mcp_connected_or_connect(state).await?;
     let data = cloud_mcp_fetch_full_spec_graph_data(state, req).await?;
     let mut next_snapshot = cloud_mcp_spec_graph_snapshot_from_data(req, data, &cache_path, "ready", "");
-    let task_history = cloud_mcp_fetch_spec_task_history_or_empty(state, req).await;
-    next_snapshot = cloud_mcp_attach_spec_task_history(next_snapshot, task_history);
+    let task_history = cloud_mcp_fetch_task_history_or_empty(state, req).await;
+    next_snapshot = cloud_mcp_attach_task_history(next_snapshot, task_history);
     let changed = current_cache.get("cursor").and_then(Value::as_str)
         != next_snapshot.get("cursor").and_then(Value::as_str)
         || current_cache
@@ -11498,7 +11274,7 @@ async fn cloud_mcp_get_task_history(
     workspace_name: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_spec_graph_sync_request(repo_path, workspace_id, workspace_name);
-    let task_history = cloud_mcp_fetch_spec_task_history_or_empty(state.inner(), &req).await;
+    let task_history = cloud_mcp_fetch_task_history_or_empty(state.inner(), &req).await;
     let sync_error = task_history
         .get("sync_error")
         .and_then(Value::as_str)
@@ -11927,49 +11703,6 @@ mod cloud_mcp_tests {
         });
 
         assert!(!cloud_mcp_graph_ws_event_matches(&req, &event));
-    }
-
-    #[test]
-    fn spec_graph_delta_requires_full_resync_when_cached_items_are_missing() {
-        let cache = json!({
-            "specNodes": [],
-            "specEdges": [],
-            "nodeHashes": {"workspace-root": "hash-root"},
-            "edgeHashes": {},
-            "raw": {
-                "nodes": [],
-                "edges": []
-            }
-        });
-        let delta = json!({
-            "changed_nodes": [],
-            "removed_node_ids": [],
-            "changed_edges": [],
-            "removed_edge_ids": [],
-            "node_hashes": {"workspace-root": "hash-root"},
-            "edge_hashes": {}
-        });
-
-        assert!(cloud_mcp_spec_graph_delta_needs_full_resync(&cache, &delta));
-
-        let recoverable_delta = json!({
-            "changed_nodes": [{
-                "id": "workspace-root",
-                "node_type": "workspace",
-                "title": "testforge",
-                "path": ""
-            }],
-            "removed_node_ids": [],
-            "changed_edges": [],
-            "removed_edge_ids": [],
-            "node_hashes": {"workspace-root": "hash-root"},
-            "edge_hashes": {}
-        });
-
-        assert!(!cloud_mcp_spec_graph_delta_needs_full_resync(
-            &cache,
-            &recoverable_delta
-        ));
     }
 
     #[test]
