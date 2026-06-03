@@ -79,6 +79,20 @@ const ARCHITECTURE_ROUTE_NODE_CLEARANCE = 44;
 const ARCHITECTURE_ROUTE_EDGE_CLEARANCE = 20;
 const ARCHITECTURE_ROUTE_ENDPOINT_STUB = ARCHITECTURE_ROUTE_NODE_CLEARANCE + 24;
 const ARCHITECTURE_ROUTE_INTERACTIVE_STUB = 28;
+const ARCHITECTURE_ROUTE_CROSSING_EPSILON = 2;
+const ARCHITECTURE_EDGE_LABEL_HEIGHT = 21;
+const ARCHITECTURE_EDGE_LABEL_MIN_WIDTH = 54;
+const ARCHITECTURE_EDGE_LABEL_MAX_WIDTH = 156;
+const ARCHITECTURE_EDGE_LABEL_ENDPOINT_GAP = 44;
+const ARCHITECTURE_EDGE_LABEL_OFFSET = 12;
+const ARCHITECTURE_EDGE_LABEL_NODE_PADDING = 12;
+const ARCHITECTURE_EDGE_LABEL_NODE_REJECT_PADDING = 2;
+const ARCHITECTURE_EDGE_LABEL_ROUTE_PADDING = 6;
+const ARCHITECTURE_EDGE_LABEL_OWN_ROUTE_PADDING = 1;
+const ARCHITECTURE_NODE_CARD_WIDTH = 184;
+const ARCHITECTURE_NODE_CARD_HEIGHT = 76;
+const ARCHITECTURE_NODE_COMPACT_WIDTH = 88;
+const ARCHITECTURE_NODE_COMPACT_HEIGHT = 70;
 
 function jsonObject(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -213,6 +227,10 @@ function parseTimeMs(value) {
 function numberValue(value, fallback = 0) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function pathName(value, fallback = "workspace") {
@@ -1360,6 +1378,36 @@ function architectureIconKind(icon, fallback = "service") {
   return fallback;
 }
 
+function architectureNormalizeNodeDisplay(value) {
+  const raw = architectureIconSlug(value);
+  if (/(^|-)(compact|actor|person|people|human|icon|avatar)(-|$)/u.test(raw)) return "compact";
+  if (/(^|-)(card|full|node|component)(-|$)/u.test(raw)) return "card";
+  return "";
+}
+
+function architectureNodeDisplayMode(node, isGroup = false) {
+  if (isGroup) return "group";
+  const explicit = architectureNormalizeNodeDisplay(
+    node?.display || node?.variant || node?.shape || node?.mode || node?.presentation,
+  );
+  if (explicit) return explicit;
+
+  const titleSlug = architectureIconSlug(node?.title || node?.label || node?.name);
+  const iconSlug = architectureIconSlug(node?.icon);
+  const kindSlug = architectureIconSlug(node?.kind || node?.type);
+  const actorPattern = /(^|-)(user|users|customer|customers|visitor|visitors|admin|admins|operator|operators|person|people|human|humans|actor|actors|agent|agents|bot|bots|client|clients|browser|browsers|cli|terminal)(-|$)/u;
+  const systemTitlePattern = /(^|-)(api|service|server|database|db|store|storage|queue|worker|sdk|context|component|router|gateway|controller|manager|provider|page|pages|route|routes)(-|$)/u;
+  const actorByIconOrKind = actorPattern.test(iconSlug) || actorPattern.test(kindSlug);
+  const actorByTitle = actorPattern.test(titleSlug) && !systemTitlePattern.test(titleSlug);
+  return (actorByIconOrKind || actorByTitle)
+    ? "compact"
+    : "card";
+}
+
+function architectureIsCompactNode(node, isGroup = false) {
+  return architectureNodeDisplayMode(node, isGroup) === "compact";
+}
+
 function architectureDslPropsText(props = {}) {
   const entries = Object.entries(props)
     .filter(([, value]) => text(value))
@@ -1381,8 +1429,8 @@ function architectureLayoutGraph(graph) {
   const direction = ["LR", "RL", "TB", "BT"].includes(rawDirection) ? rawDirection : "LR";
   const horizontal = direction === "LR" || direction === "RL";
   const reverseRanks = direction === "RL" || direction === "BT";
-  const nodeWidth = 184;
-  const nodeHeight = 76;
+  const nodeWidth = ARCHITECTURE_NODE_CARD_WIDTH;
+  const nodeHeight = ARCHITECTURE_NODE_CARD_HEIGHT;
   const groupMinWidth = 460;
   const groupMinHeight = 280;
   const groupPadX = 52;
@@ -1560,13 +1608,14 @@ function architectureLayoutGraph(graph) {
   function boxForEntity(entity) {
     if (!entity) return null;
     if (entity.type === "group") return layoutGroup(entity);
+    const compact = architectureIsCompactNode(entity);
     return {
-      height: nodeHeight,
+      height: compact ? ARCHITECTURE_NODE_COMPACT_HEIGHT : nodeHeight,
       id: entity.id,
       node: entity,
       order: entity.__order,
       rank: rankForEntity(entity),
-      width: nodeWidth,
+      width: compact ? ARCHITECTURE_NODE_COMPACT_WIDTH : nodeWidth,
     };
   }
 
@@ -1665,14 +1714,18 @@ function architectureParseDslGraph(graph) {
     const id = uniqueId(cleanName, isGroup ? "group" : "node");
     const parentId = explicitParentId || stack.at(-1)?.id || "";
     const icon = text(props.icon);
+    const title = text(props.label, cleanName);
+    const kind = isGroup ? "group" : architectureIconKind(icon, "service");
+    const display = architectureNodeDisplayMode({ ...props, icon, kind, title }, isGroup);
     const node = {
       id,
-      title: text(props.label, cleanName),
-      subtitle: text(props.desc || props.description),
-      kind: isGroup ? "group" : architectureIconKind(icon, "service"),
+      title,
+      subtitle: display === "compact" ? "" : text(props.desc || props.description),
+      kind,
       type: isGroup ? "group" : "node",
       icon,
       color: text(props.color),
+      ...(!isGroup ? { display } : {}),
       ...(parentId ? { parentId } : {}),
     };
     parsed.nodes.push(node);
@@ -1835,8 +1888,17 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
   const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
   const parentId = text(node?.parentId || node?.parent_id);
   const position = jsonObject(node?.position) || {};
-  const width = numberValue(node?.width || node?.style?.width, isGroup ? 460 : 184);
-  const height = numberValue(node?.height || node?.style?.height, isGroup ? 280 : 76);
+  const title = text(node?.title || node?.label, isGroup ? "Group" : "Node");
+  const display = architectureNodeDisplayMode({ ...node, kind: rawKind, title }, isGroup);
+  const compact = display === "compact";
+  const width = numberValue(
+    node?.width || node?.style?.width,
+    isGroup ? 460 : compact ? ARCHITECTURE_NODE_COMPACT_WIDTH : ARCHITECTURE_NODE_CARD_WIDTH,
+  );
+  const height = numberValue(
+    node?.height || node?.style?.height,
+    isGroup ? 280 : compact ? ARCHITECTURE_NODE_COMPACT_HEIGHT : ARCHITECTURE_NODE_CARD_HEIGHT,
+  );
 
   return {
     id,
@@ -1848,15 +1910,16 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
       y: numberValue(position.y, 80 + Math.floor(index / 3) * 120),
     },
     sourcePosition: architectureSourceHandlePosition(direction),
-    style: isGroup ? { width, height } : undefined,
+    style: isGroup || compact ? { width, height } : undefined,
     targetPosition: architectureTargetHandlePosition(direction),
     data: {
       color: text(node?.color),
+      display,
       flowDirection: direction,
       icon: text(node?.icon),
       kind: isGroup ? "group" : rawKind,
-      subtitle: text(node?.subtitle || node?.description),
-      title: text(node?.title || node?.label, isGroup ? "Group" : "Node"),
+      subtitle: compact ? "" : text(node?.subtitle || node?.description),
+      title,
     },
   };
 }
@@ -1909,9 +1972,12 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     childrenByParent.get(parentId).push(node);
   });
   const lineForNode = (node, depth) => {
+    const display = architectureNodeDisplayMode(node.data || {}, false);
+    const compact = display === "compact";
     const props = {
       icon: node.data?.icon || node.data?.kind,
-      desc: node.data?.subtitle,
+      ...(compact ? { display: "compact" } : {}),
+      ...(!compact ? { desc: node.data?.subtitle } : {}),
     };
     return `${"  ".repeat(depth)}${architectureDslName(node.data?.title || node.id)}${architectureDslPropsText(props)}`;
   };
@@ -1959,22 +2025,31 @@ function architectureGraphFromFlow(graph, nodes, edges) {
     sourceFormat: "eraserDsl",
     nodes: nodes.map((node) => {
       const isGroup = node.type === "architectureGroup";
+      const display = architectureNodeDisplayMode(node.data || {}, isGroup);
+      const compact = display === "compact";
       return {
         id: node.id,
         title: text(node.data?.title, isGroup ? "Group" : "Node"),
-        subtitle: text(node.data?.subtitle),
+        subtitle: compact ? "" : text(node.data?.subtitle),
         icon: text(node.data?.icon),
         color: text(node.data?.color),
         kind: isGroup ? "group" : text(node.data?.kind, "service"),
         type: isGroup ? "group" : "node",
+        ...(!isGroup ? { display } : {}),
         position: {
           x: Math.round(numberValue(node.position?.x, 0)),
           y: Math.round(numberValue(node.position?.y, 0)),
         },
         ...(node.parentId ? { parentId: node.parentId } : {}),
-        ...(isGroup ? {
-          height: Math.round(numberValue(node.style?.height, 220)),
-          width: Math.round(numberValue(node.style?.width, 360)),
+        ...(isGroup || compact ? {
+          height: Math.round(numberValue(
+            node.style?.height,
+            isGroup ? 220 : ARCHITECTURE_NODE_COMPACT_HEIGHT,
+          )),
+          width: Math.round(numberValue(
+            node.style?.width,
+            isGroup ? 360 : ARCHITECTURE_NODE_COMPACT_WIDTH,
+          )),
         } : {}),
       };
     }),
@@ -2078,6 +2153,7 @@ function architectureAgentTaskText({
     repoPath ? `Repo: ${repoPath}` : "",
     "",
     "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
+    "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar graph entrypoints: write `User [icon: users, display: compact]` or `AI Agent [icon: ai, display: compact]` and omit `desc` for those compact nodes. Use full cards with `desc` for services, APIs, databases, workers, queues, and important system components.",
   ].filter(Boolean).join("\n");
 }
 
@@ -3657,8 +3733,14 @@ function ArchitectureCanvasNode({ data, selected }) {
   const icon = useArchitectureIcon(data?.icon, data?.kind, data?.title);
   const IconComponent = icon.Icon;
   const direction = text(data?.flowDirection, "LR").toUpperCase();
+  const display = architectureNodeDisplayMode(data || {});
+  const compact = display === "compact";
   return (
-    <ArchitectureCanvasNodeShell data-kind={text(data?.kind, "service")} data-selected={selected ? "true" : "false"}>
+    <ArchitectureCanvasNodeShell
+      data-display={display}
+      data-kind={text(data?.kind, "service")}
+      data-selected={selected ? "true" : "false"}
+    >
       <Handle position={architectureTargetHandlePosition(direction)} type="target" />
       <ArchitectureNodeIcon
         aria-hidden="true"
@@ -3670,7 +3752,7 @@ function ArchitectureCanvasNode({ data, selected }) {
       </ArchitectureNodeIcon>
       <ArchitectureNodeText>
         <strong>{text(data?.title, "Node")}</strong>
-        <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>
+        {!compact && <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>}
       </ArchitectureNodeText>
       <Handle position={architectureSourceHandlePosition(direction)} type="source" />
     </ArchitectureCanvasNodeShell>
@@ -3743,9 +3825,16 @@ function architectureOrderFlowNodes(nodes) {
 
 function architectureNodeSize(node) {
   const isGroup = node?.type === "architectureGroup";
+  const compact = !isGroup && architectureIsCompactNode(node?.data || {});
   return {
-    height: numberValue(node?.style?.height, isGroup ? 280 : 76),
-    width: numberValue(node?.style?.width, isGroup ? 460 : 184),
+    height: numberValue(
+      node?.style?.height,
+      isGroup ? 280 : compact ? ARCHITECTURE_NODE_COMPACT_HEIGHT : ARCHITECTURE_NODE_CARD_HEIGHT,
+    ),
+    width: numberValue(
+      node?.style?.width,
+      isGroup ? 460 : compact ? ARCHITECTURE_NODE_COMPACT_WIDTH : ARCHITECTURE_NODE_CARD_WIDTH,
+    ),
   };
 }
 
@@ -3916,7 +4005,7 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
   const reservedSegments = [];
   let reservedHash = 2166136261;
 
-  return edges.map((edge, index) => {
+  const routedEdges = edges.map((edge, index) => {
     const sourceNode = nodeById.get(edge.source);
     const targetNode = nodeById.get(edge.target);
     const edgeKey = architectureEdgeRenderKey(edge, index);
@@ -3992,6 +4081,46 @@ function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
       data: {
         ...data,
         routePoints,
+      },
+    };
+  });
+  const allRouteSegments = routedEdges.flatMap((edge, index) => (
+    architectureRouteSegments(jsonArray(edge.data?.routePoints)).map((segment) => ({
+      ...segment,
+      edgeId: architectureEdgeRenderKey(edge, index),
+    }))
+  ));
+  const labelRects = [];
+  return routedEdges.map((edge, index) => {
+    const edgeKey = architectureEdgeRenderKey(edge, index);
+    const label = text(edge.data?.label);
+    const ownRouteSegments = allRouteSegments.filter((segment) => segment.edgeId === edgeKey);
+    const otherRouteSegments = allRouteSegments.filter((segment) => segment.edgeId !== edgeKey);
+    const labelPlacement = label
+      ? architectureEdgeLabelPlacement(jsonArray(edge.data?.routePoints), {
+        avoidanceRects: [...obstacleRects, ...labelRects],
+        label,
+        nodeAvoidanceRects: obstacleRects,
+        ownRouteSegments,
+        routeSegments: otherRouteSegments,
+      })
+      : null;
+    if (labelPlacement) {
+      labelRects.push({
+        ...architectureLabelRect(
+          labelPlacement,
+          labelPlacement.width,
+          ARCHITECTURE_EDGE_LABEL_HEIGHT,
+        ),
+        id: `${edgeKey}:label`,
+      });
+    }
+    return {
+      ...edge,
+      data: {
+        ...(edge.data || {}),
+        labelAvoidanceSegments: allRouteSegments,
+        labelPlacement,
       },
     };
   });
@@ -4232,14 +4361,14 @@ function architectureSegmentOverlapLength(left, right) {
   return Math.max(0, Math.min(left.x2, right.x2) - Math.max(left.x1, right.x1));
 }
 
-function architectureSegmentsCross(left, right) {
+function architectureSegmentsCross(left, right, epsilon = ARCHITECTURE_ROUTE_CROSSING_EPSILON) {
   if (!left || !right || left.orientation === right.orientation) return false;
   const vertical = left.orientation === "vertical" ? left : right;
   const horizontal = left.orientation === "horizontal" ? left : right;
-  return vertical.x >= horizontal.x1
-    && vertical.x <= horizontal.x2
-    && horizontal.y >= vertical.y1
-    && horizontal.y <= vertical.y2;
+  return vertical.x > horizontal.x1 + epsilon
+    && vertical.x < horizontal.x2 - epsilon
+    && horizontal.y > vertical.y1 + epsilon
+    && horizontal.y < vertical.y2 - epsilon;
 }
 
 function architectureSegmentCloseOverlap(left, right, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
@@ -4272,6 +4401,7 @@ function architectureRouteSegmentClearOfReserved(start, end, reservedSegments, s
   if (!segment) return true;
   return !jsonArray(reservedSegments).some((reservedSegment) => (
     architectureRouteSegmentTooCloseToReserved(segment, reservedSegment, spacing)
+    || architectureSegmentsCross(segment, reservedSegment)
   ));
 }
 
@@ -4292,7 +4422,7 @@ function architectureRouteConflictPenalty(points, reservedSegments) {
         }
       }
       if (architectureSegmentsCross(segment, reservedSegment)) {
-        penalty += nearEndpoint ? 450 : 1400;
+        penalty += nearEndpoint ? 4500 : 32000;
       }
     });
   });
@@ -4896,7 +5026,105 @@ function architectureEdgePathFromPoints(points) {
   return commands.join(" ");
 }
 
-function architectureEdgeLabelPoint(points) {
+function architectureLabelRect(center, width, height) {
+  return {
+    height,
+    width,
+    x: Math.round(numberValue(center?.x, 0) - width / 2),
+    y: Math.round(numberValue(center?.y, 0) - height / 2),
+  };
+}
+
+function architectureRectsOverlap(left, right, padding = 0) {
+  if (!left || !right) return false;
+  return left.x - padding < right.x + right.width
+    && left.x + left.width + padding > right.x
+    && left.y - padding < right.y + right.height
+    && left.y + left.height + padding > right.y;
+}
+
+function architectureSegmentIntersectsLabelRect(segment, rect, padding = 0) {
+  if (!segment || !rect) return false;
+  const left = rect.x - padding;
+  const right = rect.x + rect.width + padding;
+  const top = rect.y - padding;
+  const bottom = rect.y + rect.height + padding;
+  if (segment.orientation === "vertical") {
+    return segment.x >= left
+      && segment.x <= right
+      && segment.y2 >= top
+      && segment.y1 <= bottom;
+  }
+  if (segment.orientation === "horizontal") {
+    return segment.y >= top
+      && segment.y <= bottom
+      && segment.x2 >= left
+      && segment.x1 <= right;
+  }
+  return false;
+}
+
+function architectureEdgeLabelSize(label) {
+  const raw = text(label);
+  return {
+    height: ARCHITECTURE_EDGE_LABEL_HEIGHT,
+    width: Math.round(clampNumber(
+      raw.length * 6.2 + 24,
+      ARCHITECTURE_EDGE_LABEL_MIN_WIDTH,
+      ARCHITECTURE_EDGE_LABEL_MAX_WIDTH,
+    )),
+  };
+}
+
+function architecturePointAlongAxisSegment(start, end, distance) {
+  const length = Math.abs(end.x - start.x) + Math.abs(end.y - start.y);
+  if (!length) return { x: Math.round(start.x), y: Math.round(start.y) };
+  const ratio = clampNumber(distance / length, 0, 1);
+  return {
+    x: Math.round(start.x + (end.x - start.x) * ratio),
+    y: Math.round(start.y + (end.y - start.y) * ratio),
+  };
+}
+
+function architectureEdgeLabelCollisionScore(
+  rect,
+  routeSegments,
+  avoidanceRects,
+  ownRouteSegments = [],
+  nodeAvoidanceRects = [],
+) {
+  if (jsonArray(nodeAvoidanceRects).some((obstacle) => (
+    architectureRectsOverlap(rect, obstacle, ARCHITECTURE_EDGE_LABEL_NODE_REJECT_PADDING)
+  ))) {
+    return Infinity;
+  }
+
+  let score = 0;
+  jsonArray(avoidanceRects).forEach((obstacle) => {
+    if (architectureRectsOverlap(rect, obstacle, ARCHITECTURE_EDGE_LABEL_NODE_PADDING)) {
+      score += 260000;
+    } else if (architectureRectsOverlap(rect, obstacle, ARCHITECTURE_EDGE_LABEL_NODE_PADDING + 16)) {
+      score += 12000;
+    }
+  });
+  jsonArray(routeSegments).forEach((segment) => {
+    if (architectureSegmentIntersectsLabelRect(segment, rect, ARCHITECTURE_EDGE_LABEL_ROUTE_PADDING)) {
+      score += 90000;
+    } else if (architectureSegmentIntersectsLabelRect(segment, rect, ARCHITECTURE_EDGE_LABEL_ROUTE_PADDING + 12)) {
+      score += 9000;
+    }
+  });
+  jsonArray(ownRouteSegments).forEach((segment) => {
+    if (architectureSegmentIntersectsLabelRect(segment, rect, ARCHITECTURE_EDGE_LABEL_OWN_ROUTE_PADDING)) {
+      score += 14000;
+    } else if (architectureSegmentIntersectsLabelRect(segment, rect, ARCHITECTURE_EDGE_LABEL_OWN_ROUTE_PADDING + 4)) {
+      score += 700;
+    }
+  });
+  return score;
+}
+
+function architectureEdgeLabelFallbackPoint(points) {
   const cleanPoints = architectureSimplifyEdgePoints(points);
   let bestStart = cleanPoints[0] || { x: 0, y: 0 };
   let bestEnd = cleanPoints[1] || bestStart;
@@ -4923,9 +5151,125 @@ function architectureEdgeLabelPoint(points) {
   };
 }
 
+function architectureEdgeLabelPlacement(points, options = {}) {
+  const cleanPoints = architectureSimplifyEdgePoints(points);
+  const labelSize = architectureEdgeLabelSize(options.label);
+  const nodeAvoidanceRects = jsonArray(options.nodeAvoidanceRects);
+  const ownRouteSegments = jsonArray(options.ownRouteSegments);
+  const routeSegments = jsonArray(options.routeSegments);
+  const avoidanceRects = jsonArray(options.avoidanceRects);
+  let bestCandidate = null;
+  let routeLength = 0;
+  const segmentEntries = [];
+
+  for (let index = 1; index < cleanPoints.length; index += 1) {
+    const start = cleanPoints[index - 1];
+    const end = cleanPoints[index];
+    const horizontal = start.y === end.y;
+    const vertical = start.x === end.x;
+    if (!horizontal && !vertical) continue;
+    const length = Math.abs(end.x - start.x) + Math.abs(end.y - start.y);
+    if (length <= 0) continue;
+
+    segmentEntries.push({
+      end,
+      horizontal,
+      index,
+      length,
+      pathStart: routeLength,
+      start,
+      vertical,
+    });
+    routeLength += length;
+  }
+
+  segmentEntries.forEach((entry) => {
+    const { end, horizontal, index, length, pathStart, start } = entry;
+
+    const nearEndpoint = index <= 2 || index >= cleanPoints.length - 2;
+    const inset = Math.min(
+      ARCHITECTURE_EDGE_LABEL_ENDPOINT_GAP,
+      Math.max(0, Math.floor(length / 2) - 1),
+    );
+    const distances = [...new Set([0.5, 0.36, 0.64, 0.24, 0.76].map((ratio) => (
+      Math.round(clampNumber(length * ratio, inset, Math.max(inset, length - inset)))
+    )))];
+    const offsetDistances = [
+      ARCHITECTURE_EDGE_LABEL_OFFSET,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 4,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 9,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 18,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 30,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 44,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 64,
+      ARCHITECTURE_EDGE_LABEL_OFFSET + 88,
+    ];
+    const sideOrder = index % 2 ? [-1, 1] : [1, -1];
+
+    distances.forEach((distance) => {
+      const basePoint = architecturePointAlongAxisSegment(start, end, distance);
+      offsetDistances.forEach((offsetDistance) => {
+        sideOrder.forEach((side) => {
+          const center = horizontal
+            ? { x: basePoint.x, y: basePoint.y + side * offsetDistance }
+            : { x: basePoint.x + side * offsetDistance, y: basePoint.y };
+          const rect = architectureLabelRect(center, labelSize.width, labelSize.height);
+          const endpointGap = Math.min(distance, length - distance);
+          const pathDistance = pathStart + distance;
+          const score = architectureEdgeLabelCollisionScore(
+            rect,
+            routeSegments,
+            avoidanceRects,
+            ownRouteSegments,
+            nodeAvoidanceRects,
+          )
+            + (horizontal ? 0 : 18000)
+            + (nearEndpoint ? 3200 : 0)
+            + Math.max(0, ARCHITECTURE_EDGE_LABEL_ENDPOINT_GAP - endpointGap) * 70
+            + Math.max(0, labelSize.width + 28 - length) * 120
+            + Math.abs(distance - length / 2) * 5
+            + Math.abs(pathDistance - routeLength / 2) * 4
+            + Math.abs(index - cleanPoints.length / 2) * 120
+            + (offsetDistance - ARCHITECTURE_EDGE_LABEL_OFFSET) * 180
+            - Math.min(length, 220) * 2;
+          if (Number.isFinite(score) && (!bestCandidate || score < bestCandidate.score)) {
+            bestCandidate = {
+              center,
+              orientation: horizontal ? "horizontal" : "vertical",
+              score,
+            };
+          }
+        });
+      });
+    });
+  });
+  const fallback = architectureEdgeLabelFallbackPoint(cleanPoints);
+  const fallbackBlocked = Boolean(
+    !bestCandidate
+    && nodeAvoidanceRects.length
+    && jsonArray(nodeAvoidanceRects).some((obstacle) => (
+      architectureRectsOverlap(
+        architectureLabelRect(fallback, labelSize.width, labelSize.height),
+        obstacle,
+        ARCHITECTURE_EDGE_LABEL_NODE_REJECT_PADDING,
+      )
+    )),
+  );
+  return {
+    hidden: fallbackBlocked,
+    orientation: bestCandidate?.orientation || "horizontal",
+    width: labelSize.width,
+    x: Math.round(bestCandidate?.center?.x ?? fallback.x),
+    y: Math.round(bestCandidate?.center?.y ?? fallback.y),
+  };
+}
+
 function architectureOrthogonalEdgePath({
   avoidanceRects = [],
   id,
+  label = "",
+  labelAvoidanceSegments = [],
+  labelPlacement: providedLabelPlacement = null,
   routePoints = [],
   sourcePosition,
   sourceX,
@@ -4946,11 +5290,16 @@ function architectureOrthogonalEdgePath({
       targetX,
       targetY,
     });
-  const labelPoint = architectureEdgeLabelPoint(cleanPoints);
+  const labelPlacement = providedLabelPlacement || architectureEdgeLabelPlacement(cleanPoints, {
+    avoidanceRects,
+    label,
+    routeSegments: labelAvoidanceSegments,
+  });
   return [
     architectureEdgePathFromPoints(cleanPoints),
-    labelPoint.x,
-    labelPoint.y,
+    labelPlacement.x,
+    labelPlacement.y,
+    labelPlacement,
   ];
 }
 
@@ -4966,9 +5315,14 @@ function ArchitectureCanvasEdge({
   targetX,
   targetY,
 }) {
-  const [edgePath, labelX, labelY] = architectureOrthogonalEdgePath({
+  const kind = text(data?.kind, "calls");
+  const label = text(data?.label);
+  const [edgePath, labelX, labelY, labelPlacement] = architectureOrthogonalEdgePath({
     avoidanceRects: data?.avoidanceRects,
     id,
+    label,
+    labelAvoidanceSegments: data?.labelAvoidanceSegments,
+    labelPlacement: data?.labelPlacement,
     routePoints: data?.routePoints,
     sourcePosition,
     sourceX,
@@ -4977,8 +5331,6 @@ function ArchitectureCanvasEdge({
     targetX,
     targetY,
   });
-  const kind = text(data?.kind, "calls");
-  const label = text(data?.label);
 
   return (
     <>
@@ -4994,12 +5346,14 @@ function ArchitectureCanvasEdge({
           strokeWidth: selected ? 3 : 2.2,
         }}
       />
-      {label && (
+      {label && !labelPlacement?.hidden && (
         <EdgeLabelRenderer>
           <ArchitectureEdgeLabel
             data-kind={kind}
+            data-orientation={labelPlacement?.orientation || "horizontal"}
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
+              "--edge-label-max-width": `${labelPlacement?.width || ARCHITECTURE_EDGE_LABEL_MAX_WIDTH}px`,
             }}
           >
             {label}
@@ -6515,12 +6869,13 @@ const ArchitectureInspectorMeta = styled.div`
 `;
 
 const ArchitectureCanvasNodeShell = styled.div`
+  box-sizing: border-box;
   display: grid;
   grid-template-columns: 26px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  width: 184px;
-  min-height: 76px;
+  width: ${ARCHITECTURE_NODE_CARD_WIDTH}px;
+  min-height: ${ARCHITECTURE_NODE_CARD_HEIGHT}px;
   padding: 10px;
   border: 1px solid rgba(125, 211, 252, 0.28);
   border-radius: 8px;
@@ -6550,9 +6905,32 @@ const ArchitectureCanvasNodeShell = styled.div`
     background: linear-gradient(180deg, rgba(109, 40, 217, 0.18), rgba(15, 23, 42, 0.86));
   }
 
+  &[data-display="compact"],
+  &[data-display="compact"][data-kind="client"],
+  &[data-display="compact"][data-kind="database"],
+  &[data-display="compact"][data-kind="external"],
+  &[data-display="compact"][data-kind="queue"] {
+    grid-template-columns: 1fr;
+    align-content: center;
+    justify-items: center;
+    gap: 6px;
+    width: ${ARCHITECTURE_NODE_COMPACT_WIDTH}px;
+    min-height: ${ARCHITECTURE_NODE_COMPACT_HEIGHT}px;
+    padding: 4px;
+    border-color: transparent;
+    background: transparent;
+    box-shadow: none;
+  }
+
   &[data-selected="true"] {
     border-color: rgba(251, 191, 36, 0.68);
     box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18), 0 12px 30px rgba(0, 0, 0, 0.24);
+  }
+
+  &[data-display="compact"][data-selected="true"] {
+    border-color: rgba(251, 191, 36, 0.42);
+    background: rgba(15, 23, 42, 0.28);
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.12);
   }
 
   .react-flow__handle {
@@ -6560,6 +6938,11 @@ const ArchitectureCanvasNodeShell = styled.div`
     height: 9px;
     border: 1px solid rgba(2, 6, 23, 0.9);
     background: rgba(125, 211, 252, 0.95);
+  }
+
+  &[data-display="compact"] .react-flow__handle {
+    width: 7px;
+    height: 7px;
   }
 `;
 
@@ -6651,6 +7034,24 @@ const ArchitectureNodeIcon = styled.span`
   &[data-kind="group"] {
     border-radius: 7px;
   }
+
+  ${ArchitectureCanvasNodeShell}[data-display="compact"] & {
+    width: 34px;
+    height: 34px;
+    border-radius: 11px;
+    font-size: 8px;
+  }
+
+  ${ArchitectureCanvasNodeShell}[data-display="compact"] &[data-kind="database"] {
+    border-radius: 50%;
+  }
+
+  ${ArchitectureCanvasNodeShell}[data-display="compact"] & svg {
+    width: 21px;
+    height: 21px;
+    max-width: 23px;
+    max-height: 23px;
+  }
 `;
 
 const ArchitectureNodeText = styled.div`
@@ -6676,6 +7077,19 @@ const ArchitectureNodeText = styled.div`
     color: rgba(203, 213, 225, 0.74);
     font-size: 10px;
     font-weight: 760;
+  }
+
+  ${ArchitectureCanvasNodeShell}[data-display="compact"] & {
+    justify-items: center;
+    width: 100%;
+    text-align: center;
+  }
+
+  ${ArchitectureCanvasNodeShell}[data-display="compact"] & strong {
+    max-width: ${ARCHITECTURE_NODE_COMPACT_WIDTH - 4}px;
+    color: rgba(248, 250, 252, 0.94);
+    font-size: 10px;
+    font-weight: 860;
   }
 `;
 
@@ -6744,16 +7158,21 @@ const ArchitectureGroupText = styled.div`
 const ArchitectureEdgeLabel = styled.div`
   position: absolute;
   z-index: 3;
-  padding: 3px 7px;
+  max-width: var(--edge-label-max-width, 156px);
+  padding: 3px 8px;
+  overflow: hidden;
   border: 1px solid rgba(125, 211, 252, 0.22);
   border-radius: 999px;
   color: rgba(224, 242, 254, 0.92);
-  background: rgba(2, 6, 23, 0.82);
-  font-size: 9px;
+  background: rgba(2, 6, 23, 0.76);
+  box-shadow: 0 0 0 1px rgba(2, 6, 23, 0.38);
+  font-size: 8.5px;
   font-weight: 850;
   line-height: 1.15;
-  pointer-events: all;
+  pointer-events: none;
+  text-overflow: ellipsis;
   text-transform: lowercase;
+  white-space: nowrap;
 
   &[data-kind="writes"],
   &[data-kind="publishes"] {

@@ -25,7 +25,8 @@ Call `coordination-kernel.architecture_context` before architecture, diagram, de
 4. Write nodes and containers first, then edges.
 5. Save the `.arch` file incrementally after each valid block. Diff Forge reloads valid graph source live in the Architecture tab.
 6. Keep titles human-readable. The title, not a separate type field, should explain the graph's purpose.
-7. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
+7. Use compact actor nodes for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints. Write `User [icon: users, display: compact]` or `AI Agent [icon: ai, display: compact]` and omit `desc` for those compact nodes.
+8. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
 
 ## DSL syntax
 
@@ -37,8 +38,8 @@ direction right
 folder "workspace mcp / hot reload"
 
 Client Layer [icon: users, color: blue] {
-  AI Agent [icon: ai, desc: Requests tools]
-  User API [icon: api, desc: Opens config and triggers reloads]
+  AI Agent [icon: ai, display: compact]
+  User API [icon: users, display: compact]
 }
 
 Workspace MCP [icon: settings, color: amber] {
@@ -66,6 +67,7 @@ Supported basics:
 - `direction right`, `direction down`, `direction left`, or `direction up` controls layout.
 - `Container [icon: box, color: amber] { ... }` creates a group/container.
 - `Node [icon: api, desc: Short description]` creates a node.
+- `Actor [icon: users, display: compact]` creates an icon + label actor/client node. Omit `desc` on compact nodes.
 - `A > B: label` creates a directional edge.
 - `A -- B: label` creates a dependency edge.
 - `A <> B: label` creates bidirectional call edges.
@@ -100,6 +102,7 @@ If an exact icon is unknown, use the best semantic alias. The graph should still
 ## Good graph style
 
 - Keep node names short and descriptions useful.
+- Use compact nodes without descriptions for actors/entrypoints such as User, Customer, Admin, AI Agent, Browser, CLI, or Bot.
 - Use containers for ownership or runtime boundaries, not decoration.
 - Prefer readable labels on important edges.
 - Avoid overloading one graph. Split deployment, auth flow, billing flow, and subsystem internals into separate graphs when needed.
@@ -212,6 +215,8 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "vercel"
   ],
   "examples": [
+    "User [icon: users, display: compact]",
+    "AI Agent [icon: ai, display: compact]",
     "Appwrite [icon: appwrite, desc: Backend-as-a-service platform]",
     "API [icon: api, desc: Request handling]",
     "Object Store [icon: aws:s3, desc: Stores uploads]",
@@ -1038,7 +1043,8 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
                 "Create or update .agents/architectures/graphs/*.arch with normal file edits using the eraser-like DSL.",
                 "Write containers and nodes first, then edges, and save the file incrementally so the Architecture tab updates live.",
                 "Use architecture_icon_reference when choosing cloud, tech, company, product, framework, or semantic icon aliases.",
-                "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks."
+                "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks.",
+                "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints: `User [icon: users, display: compact]`; omit desc on compact nodes."
             ],
             "doNotCreateUnlessExplicitlyRequested": [
                 "ARCHITECTURE.md",
@@ -1055,12 +1061,13 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "direction": "direction right | down | left | up",
             "container": "Runtime Boundary [icon: cloud, color: blue] { ... }",
             "node": "API [icon: api, desc: Request handling]",
+            "compactNode": "User [icon: users, display: compact]",
             "edges": [
                 "Client > API: request",
                 "API -- Database: dependency",
                 "API <> Worker: bidirectional"
             ],
-            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nClient [icon: users]\nAPI [icon: api, desc: Handles requests]\nDatabase [icon: database]\n\nClient > API: request\nAPI > Database: read/write"
+            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nClient [icon: users, display: compact]\nAPI [icon: api, desc: Handles requests]\nDatabase [icon: database]\n\nClient > API: request\nAPI > Database: read/write"
         }
     }))
 }

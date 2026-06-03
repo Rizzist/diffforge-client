@@ -24242,7 +24242,8 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - For architecture, diagram, deployment, flow, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
 - Before creating a generic architecture doc, inspect the architecture MCP context and existing `.agents/architectures/graphs/*.arch` files.\n\
 - For architecture, diagram, deployment, flow, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
-- The DSL supports `title`, `folder`, `direction`, containers with `{{ ... }}`, node props such as `[icon: api, desc: Request handling]`, and edges such as `A > B: label`, `A -- B: dependency`, and `A <> B: bidirectional`.\n\
+- The DSL supports `title`, `folder`, `direction`, containers with `{{ ... }}`, node props such as `[icon: api, desc: Request handling]`, compact actor props such as `[icon: users, display: compact]`, and edges such as `A > B: label`, `A -- B: dependency`, and `A <> B: bidirectional`.\n\
+- Use compact actor nodes without descriptions for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints, for example `User [icon: users, display: compact]` or `AI Agent [icon: ai, display: compact]`.\n\
 - Name icons with simple aliases. Prefer exact provider/product/framework slugs when the node/container title names a real technology, for example `appwrite`, `github`, `postgres`, `redis`, `mongodb`, `docker`, `kubernetes`, `stripe`, `supabase`, `cloudflare`, `auth0`, `cockroachdb`, `react`, or `vercel`. Use cloud tokens like `aws:s3`, `aws:lambda`, `gcp:cloud-run`, and `azure:functions` when they fit.\n\
 - Use semantic tokens like `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `auth`, `users`, `external`, and `settings` only when there is no exact product/provider icon. The renderer also tries to infer installed LikeC4/styled-icons logos from titles when a generic fallback is used.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
@@ -26695,7 +26696,7 @@ hooksPath = "{}"
 direction right
 folder "flows / auth"
 
-Client [icon: users, desc: Signed-in user]
+Client [icon: users, display: compact]
 Appwrite [icon: service, desc: Backend-as-a-service platform]
 Session Store [icon: database, desc: Stores sessions]
 
@@ -26710,6 +26711,10 @@ Appwrite > Session Store: create session
         );
         assert_eq!(contract["ok"].as_bool(), Some(true));
         assert_eq!(contract["data"]["sourceFormat"].as_str(), Some("eraserDsl"));
+        assert!(contract["data"]["dsl"]["compactNode"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("display: compact"));
         assert!(contract["data"]["contract"]["preferredMcpTools"]
             .as_array()
             .unwrap()
