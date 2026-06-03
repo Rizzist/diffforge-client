@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Background,
@@ -15,6 +15,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import styled, { keyframes } from "styled-components";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { Add } from "@styled-icons/material-rounded/Add";
 import { AllInbox } from "@styled-icons/material-rounded/AllInbox";
 import { Api } from "@styled-icons/material-rounded/Api";
 import { Cached } from "@styled-icons/material-rounded/Cached";
@@ -28,6 +29,7 @@ import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile"
 import { Hub } from "@styled-icons/material-rounded/Hub";
 import { Lock } from "@styled-icons/material-rounded/Lock";
 import { Memory } from "@styled-icons/material-rounded/Memory";
+import { North } from "@styled-icons/material-rounded/North";
 import { Person } from "@styled-icons/material-rounded/Person";
 import { Public } from "@styled-icons/material-rounded/Public";
 import { Route } from "@styled-icons/material-rounded/Route";
@@ -69,6 +71,14 @@ const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
 const ARCHITECTURE_TODO_QUEUE_MAX_ITEMS = 120;
+const ARCHITECTURE_ROUTE_GRID_CELL = 48;
+const ARCHITECTURE_ROUTE_GRID_MAX_POINTS = 1600;
+const ARCHITECTURE_ROUTE_CACHE_MAX = 700;
+const ARCHITECTURE_ROUTE_SETTLE_DELAY_MS = 120;
+const ARCHITECTURE_ROUTE_NODE_CLEARANCE = 44;
+const ARCHITECTURE_ROUTE_EDGE_CLEARANCE = 20;
+const ARCHITECTURE_ROUTE_ENDPOINT_STUB = ARCHITECTURE_ROUTE_NODE_CLEARANCE + 24;
+const ARCHITECTURE_ROUTE_INTERACTIVE_STUB = 28;
 
 function jsonObject(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -1373,17 +1383,17 @@ function architectureLayoutGraph(graph) {
   const reverseRanks = direction === "RL" || direction === "BT";
   const nodeWidth = 184;
   const nodeHeight = 76;
-  const groupMinWidth = 360;
-  const groupMinHeight = 190;
-  const groupPadX = 30;
-  const groupHeaderHeight = 70;
-  const groupPadBottom = 30;
+  const groupMinWidth = 460;
+  const groupMinHeight = 280;
+  const groupPadX = 52;
+  const groupHeaderHeight = 88;
+  const groupPadBottom = 48;
   const rootPadX = 80;
   const rootPadY = 70;
-  const rankGap = 136;
-  const rowGap = 36;
-  const groupRankGap = 86;
-  const groupRowGap = 28;
+  const rankGap = 176;
+  const rowGap = 54;
+  const groupRankGap = 116;
+  const groupRowGap = 46;
   const edges = jsonArray(graph.edges)
     .map((edge) => ({
       source: text(edge?.source || edge?.from),
@@ -1825,14 +1835,14 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
   const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
   const parentId = text(node?.parentId || node?.parent_id);
   const position = jsonObject(node?.position) || {};
-  const width = numberValue(node?.width || node?.style?.width, isGroup ? 360 : 184);
-  const height = numberValue(node?.height || node?.style?.height, isGroup ? 220 : 76);
+  const width = numberValue(node?.width || node?.style?.width, isGroup ? 460 : 184);
+  const height = numberValue(node?.height || node?.style?.height, isGroup ? 280 : 76);
 
   return {
     id,
     type: isGroup ? "architectureGroup" : "architectureNode",
     parentId: parentId || undefined,
-    extent: parentId && !isGroup ? "parent" : undefined,
+    extent: parentId ? "parent" : undefined,
     position: {
       x: numberValue(position.x, 80 + (index % 3) * 220),
       y: numberValue(position.y, 80 + Math.floor(index / 3) * 120),
@@ -1860,6 +1870,7 @@ function architectureFlowEdgeFromGraphEdge(edge) {
     source,
     target,
     type: "architectureEdge",
+    zIndex: 0,
     markerEnd: {
       color: "rgba(125, 211, 252, 0.88)",
       height: 18,
@@ -1979,6 +1990,42 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       engine: "manual",
     },
   };
+}
+
+function architectureExpandParentNodesForChild(nodes, parentId, childPosition, childSize, padding = 58) {
+  let nextNodes = nodes;
+  let currentParentId = text(parentId);
+  let requiredWidth = numberValue(childPosition?.x, 0) + numberValue(childSize?.width, 0) + padding;
+  let requiredHeight = numberValue(childPosition?.y, 0) + numberValue(childSize?.height, 0) + padding;
+
+  while (currentParentId) {
+    const parentNode = nextNodes.find((node) => node.id === currentParentId);
+    if (!parentNode) break;
+    const currentWidth = numberValue(parentNode.style?.width, 460);
+    const currentHeight = numberValue(parentNode.style?.height, 280);
+    const nextWidth = Math.max(currentWidth, requiredWidth);
+    const nextHeight = Math.max(currentHeight, requiredHeight);
+    if (nextWidth !== currentWidth || nextHeight !== currentHeight) {
+      nextNodes = nextNodes.map((node) => (
+        node.id === currentParentId
+          ? {
+            ...node,
+            style: {
+              ...(node.style || {}),
+              height: nextHeight,
+              width: nextWidth,
+            },
+          }
+          : node
+      ));
+    }
+
+    requiredWidth = numberValue(parentNode.position?.x, 0) + nextWidth + padding;
+    requiredHeight = numberValue(parentNode.position?.y, 0) + nextHeight + padding;
+    currentParentId = text(parentNode.parentId);
+  }
+
+  return nextNodes;
 }
 
 function architectureTodoQueueStorageKey(workspaceId) {
@@ -2632,9 +2679,9 @@ export default function ArchitectureWorkspaceView({
   rawScanState = "idle",
   workspace,
 }) {
-  const workspaceId = workspace?.id || "";
-  const workspaceName = workspace?.name || "";
-  const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
+  const activeWorkspaceId = workspace?.id || "";
+  const activeWorkspaceName = workspace?.name || "";
+  const repoPath = activeWorkspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
   const [viewMode, setViewMode] = useState("architectures");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
   const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
@@ -2664,21 +2711,21 @@ export default function ArchitectureWorkspaceView({
   useEffect(() => {
     setFinishedPlanTaskIds(new Set());
     setFinishPlanState({ error: "", taskId: "" });
-  }, [repoPath, workspaceId]);
+  }, [repoPath, activeWorkspaceId]);
 
   const refreshTaskHistorySnapshot = useCallback(() => {
-    if (!repoPath || !workspaceId) {
+    if (!repoPath || !activeWorkspaceId) {
       return Promise.resolve(null);
     }
     return invoke("cloud_mcp_get_task_history", {
       repoPath,
-      workspaceId,
-      workspaceName,
+      workspaceId: activeWorkspaceId,
+      workspaceName: activeWorkspaceName,
     }).then((result) => {
       setLocalArchitectureSnapshot(result);
       return result;
     });
-  }, [repoPath, workspaceId, workspaceName]);
+  }, [repoPath, activeWorkspaceId, activeWorkspaceName]);
 
   const finishTerminalTaskPlan = useCallback((item) => {
     const task = item?.task || null;
@@ -2700,7 +2747,7 @@ export default function ArchitectureWorkspaceView({
         direct_repo_target: true,
         session_id: terminalPlan?.session_id || terminalPlan?.sessionId || task?.session_id || task?.sessionId,
         task_id: taskId,
-        workspace_id: workspaceId,
+        workspace_id: activeWorkspaceId,
       },
     })
       .then((response) => {
@@ -2728,7 +2775,7 @@ export default function ArchitectureWorkspaceView({
           taskId: "",
         });
       });
-  }, [refreshTaskHistorySnapshot, repoPath, workspaceId]);
+  }, [refreshTaskHistorySnapshot, repoPath, activeWorkspaceId]);
 
   return (
     <ArchitectureSurface aria-label={`${workspace?.name || "Workspace"} Architecture`} data-state={architectureState}>
@@ -2761,6 +2808,8 @@ export default function ArchitectureWorkspaceView({
 
       {viewMode === "architectures" ? (
         <ArchitecturesPanel
+          queueWorkspaceId={activeWorkspaceId}
+          queueWorkspaceName={activeWorkspaceName}
           repoLabel={repoLabel}
           repoPath={repoPath}
         />
@@ -2789,7 +2838,12 @@ export default function ArchitectureWorkspaceView({
   );
 }
 
-function ArchitecturesPanel({ repoLabel, repoPath }) {
+function ArchitecturesPanel({
+  queueWorkspaceId = "",
+  queueWorkspaceName = "",
+  repoLabel,
+  repoPath,
+}) {
   const [repositories, setRepositories] = useState([]);
   const [selectedRepoPath, setSelectedRepoPath] = useState("");
   const [repoState, setRepoState] = useState("loading");
@@ -2802,6 +2856,7 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
   const [draftTitle, setDraftTitle] = useState("Architecture graph");
   const [draftLocationMode, setDraftLocationMode] = useState("root");
   const [draftFolderPath, setDraftFolderPath] = useState("");
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("idle");
 
   useEffect(() => {
@@ -3051,61 +3106,83 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
   ), [beginCreateGraph, creatingGraph, graphState, graphs.length, selectedGraphId, treeRows]);
 
   return (
-    <ArchitecturesShell>
-      <ArchitectureNavRail aria-label="Architecture repositories">
-        <ArchitectureNavHeader>
-          <strong>Architectures</strong>
-          <ArchitectureIconButton
-            aria-label="Create architecture graph"
-            disabled={!selectedRepoPath || saveState === "saving"}
-            onClick={() => beginCreateGraph()}
-            title="Create architecture graph"
-            type="button"
-          >
-            +
-          </ArchitectureIconButton>
-        </ArchitectureNavHeader>
-        <ArchitectureTree>
-          {singleRepository ? renderTreeRows(0) : repositories.map((repo) => (
-            <ArchitectureTreeRepoGroup key={repo.id}>
-              <ArchitectureTreeRow
-                data-active={repo.path === selectedRepoPath ? "true" : "false"}
-                data-kind="repo"
-                onClick={() => {
-                  setSelectedRepoPath(repo.path);
-                  setSelectedGraphId("");
-                  setSelectedGraph(null);
-                  setCreatingGraph(false);
-                }}
-                style={{ "--tree-depth": 0 }}
-                title={repo.path}
+    <ArchitecturesShell data-nav-collapsed={navCollapsed ? "true" : "false"}>
+      {!navCollapsed && (
+        <ArchitectureNavRail aria-label="Architecture repositories">
+          <ArchitectureNavHeader>
+            <strong>Architectures</strong>
+            <ArchitectureNavHeaderActions>
+              <ArchitectureCreateGraphButton
+                aria-label="Create architecture graph"
+                disabled={!selectedRepoPath || saveState === "saving"}
+                onClick={() => beginCreateGraph()}
+                title="Create architecture graph"
                 type="button"
               >
-                <ArchitectureTreeGlyph data-kind="repo" aria-hidden="true" />
-                <span>{repo.name}</span>
-                <em>{repo.graphCount}</em>
-              </ArchitectureTreeRow>
-              {repo.path === selectedRepoPath && (
-                <ArchitectureTreeBranch>
-                  {renderTreeRows(1)}
-                </ArchitectureTreeBranch>
-              )}
-            </ArchitectureTreeRepoGroup>
-          ))}
-          {repoState === "ready" && !repositories.length && (
-            <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
+                <Add aria-hidden="true" />
+              </ArchitectureCreateGraphButton>
+              <ArchitectureNavToggleButton
+                aria-label="Hide architecture navigation"
+                onClick={() => setNavCollapsed(true)}
+                title="Hide architecture navigation"
+                type="button"
+              >
+                &lt;&lt;
+              </ArchitectureNavToggleButton>
+            </ArchitectureNavHeaderActions>
+          </ArchitectureNavHeader>
+          <ArchitectureTree>
+            {singleRepository ? renderTreeRows(0) : repositories.map((repo) => (
+              <ArchitectureTreeRepoGroup key={repo.id}>
+                <ArchitectureTreeRow
+                  data-active={repo.path === selectedRepoPath ? "true" : "false"}
+                  data-kind="repo"
+                  onClick={() => {
+                    setSelectedRepoPath(repo.path);
+                    setSelectedGraphId("");
+                    setSelectedGraph(null);
+                    setCreatingGraph(false);
+                  }}
+                  style={{ "--tree-depth": 0 }}
+                  title={repo.path}
+                  type="button"
+                >
+                  <ArchitectureTreeGlyph data-kind="repo" aria-hidden="true" />
+                  <span>{repo.name}</span>
+                  <em>{repo.graphCount}</em>
+                </ArchitectureTreeRow>
+                {repo.path === selectedRepoPath && (
+                  <ArchitectureTreeBranch>
+                    {renderTreeRows(1)}
+                  </ArchitectureTreeBranch>
+                )}
+              </ArchitectureTreeRepoGroup>
+            ))}
+            {repoState === "ready" && !repositories.length && (
+              <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
+            )}
+          </ArchitectureTree>
+          {selectedRepo && (
+            <ArchitectureNavStoragePath title={selectedRepo.architectureRoot}>
+              .agents/architectures
+            </ArchitectureNavStoragePath>
           )}
-        </ArchitectureTree>
-        {selectedRepo && (
-          <ArchitectureNavStoragePath title={selectedRepo.architectureRoot}>
-            .agents/architectures
-          </ArchitectureNavStoragePath>
-        )}
-      </ArchitectureNavRail>
+        </ArchitectureNavRail>
+      )}
 
       <ArchitectureEditorRegion>
         {error && <ArchitectureError>{error}</ArchitectureError>}
         <ArchitectureEditorContent>
+          {navCollapsed && (
+            <ArchitectureRestoreNavButton
+              aria-label="Show architecture navigation"
+              onClick={() => setNavCollapsed(false)}
+              title="Show architecture navigation"
+              type="button"
+            >
+              &gt;&gt;
+            </ArchitectureRestoreNavButton>
+          )}
           {creatingGraph || !selectedGraph ? (
             <ArchitectureCreateSurface
               canCancel={creatingGraph && Boolean(selectedGraph)}
@@ -3128,10 +3205,10 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
             <ArchitectureGraphEditor
               graph={selectedGraph}
               onSave={saveGraph}
+              queueWorkspaceId={queueWorkspaceId}
+              queueWorkspaceName={queueWorkspaceName}
               saveState={saveState}
               selectedRepo={selectedRepo}
-              workspaceId={workspaceId}
-              workspaceName={workspaceName}
             />
           )}
         </ArchitectureEditorContent>
@@ -3242,10 +3319,10 @@ function ArchitectureCreateSurface({
 function ArchitectureGraphEditor({
   graph,
   onSave,
+  queueWorkspaceId = "",
+  queueWorkspaceName = "",
   saveState,
   selectedRepo,
-  workspaceId = "",
-  workspaceName = "",
 }) {
   const initialFlow = useMemo(() => architectureGraphToFlow(graph), [graph]);
   const [nodes, setNodes, handleNodesChange] = useNodesState(initialFlow.nodes);
@@ -3257,9 +3334,23 @@ function ArchitectureGraphEditor({
   const [selectedNodes, setSelectedNodes] = useState([]);
   const [selectedEdges, setSelectedEdges] = useState([]);
   const [localError, setLocalError] = useState("");
+  const [routingMode, setRoutingMode] = useState("settled");
+  const routeCacheRef = useRef(new Map());
+  const routeSettleTimerRef = useRef(null);
+  const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes), [nodes]);
+  const renderEdges = useMemo(() => architectureEdgesWithRoutingData(edges, renderNodes, {
+    interactive: routingMode === "interactive",
+    routeCache: routeCacheRef.current,
+  }), [edges, renderNodes, routingMode]);
 
   useEffect(() => {
     const nextFlow = architectureGraphToFlow(graph);
+    routeCacheRef.current.clear();
+    if (routeSettleTimerRef.current) {
+      clearTimeout(routeSettleTimerRef.current);
+      routeSettleTimerRef.current = null;
+    }
+    setRoutingMode("settled");
     setNodes(nextFlow.nodes);
     setEdges(nextFlow.edges);
     setDraftGraph(jsonObject(graph) || {});
@@ -3271,6 +3362,10 @@ function ArchitectureGraphEditor({
     setAgentCommandNotice("");
   }, [graph, setEdges, setNodes]);
 
+  useEffect(() => () => {
+    if (routeSettleTimerRef.current) clearTimeout(routeSettleTimerRef.current);
+  }, []);
+
   const onNodesChange = useCallback((changes) => {
     if (changes.some((change) => change.type !== "select")) setDirty(true);
     handleNodesChange(changes);
@@ -3281,12 +3376,29 @@ function ArchitectureGraphEditor({
     handleEdgesChange(changes);
   }, [handleEdgesChange]);
 
+  const beginInteractiveRouting = useCallback(() => {
+    if (routeSettleTimerRef.current) {
+      clearTimeout(routeSettleTimerRef.current);
+      routeSettleTimerRef.current = null;
+    }
+    setRoutingMode("interactive");
+  }, []);
+
+  const settleFullRouting = useCallback(() => {
+    if (routeSettleTimerRef.current) clearTimeout(routeSettleTimerRef.current);
+    routeSettleTimerRef.current = setTimeout(() => {
+      routeSettleTimerRef.current = null;
+      setRoutingMode("settled");
+    }, ARCHITECTURE_ROUTE_SETTLE_DELAY_MS);
+  }, []);
+
   const onConnect = useCallback((connection) => {
     const id = architectureEntityId("edge");
     setDirty(true);
     setEdges((currentEdges) => addReactFlowEdge({
       ...connection,
       id,
+      zIndex: 0,
       markerEnd: {
         color: "rgba(125, 211, 252, 0.88)",
         height: 18,
@@ -3310,47 +3422,67 @@ function ArchitectureGraphEditor({
   }, []);
 
   const addGroup = useCallback(() => {
+    const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
+      || null;
     const count = nodes.filter((node) => node.type === "architectureGroup").length;
-    setNodes((currentNodes) => [
-      ...currentNodes,
-      {
-        id: architectureEntityId("group"),
-        type: "architectureGroup",
-        position: { x: 120 + count * 34, y: 90 + count * 28 },
-        style: { height: 240, width: 380 },
-        data: {
-          icon: "box",
-          kind: "group",
-          subtitle: "Drag nodes into this area",
-          title: `Group ${count + 1}`,
+    const childSize = { height: 300, width: 460 };
+    const childPosition = selectedGroup?.id
+      ? { x: 58 + (count % 2) * 58, y: 98 + Math.floor(count / 2) * 48 }
+      : { x: 120 + count * 34, y: 90 + count * 28 };
+    setNodes((currentNodes) => {
+      const expandedNodes = selectedGroup?.id
+        ? architectureExpandParentNodesForChild(currentNodes, selectedGroup.id, childPosition, childSize)
+        : currentNodes;
+      return [
+        ...expandedNodes,
+        {
+          id: architectureEntityId("group"),
+          type: "architectureGroup",
+          parentId: selectedGroup?.id,
+          extent: selectedGroup?.id ? "parent" : undefined,
+          position: childPosition,
+          style: childSize,
+          data: {
+            icon: "box",
+            kind: "group",
+            subtitle: "Drag nodes into this area",
+            title: `Group ${count + 1}`,
+          },
         },
-      },
-    ]);
+      ];
+    });
     setDirty(true);
-  }, [nodes, setNodes]);
+  }, [nodes, selectedNodes, setNodes]);
 
   const addNode = useCallback(() => {
     const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
       || null;
     const nodeCount = nodes.filter((node) => node.type !== "architectureGroup").length;
-    setNodes((currentNodes) => [
-      ...currentNodes,
-      {
-        id: architectureEntityId("node"),
-        type: "architectureNode",
-        parentId: selectedGroup?.id,
-        extent: selectedGroup?.id ? "parent" : undefined,
-        position: selectedGroup?.id
-          ? { x: 44 + (nodeCount % 2) * 190, y: 72 + Math.floor(nodeCount / 2) * 96 }
-          : { x: 140 + (nodeCount % 3) * 220, y: 130 + Math.floor(nodeCount / 3) * 128 },
-        data: {
-          icon: "server",
-          kind: "service",
-          subtitle: "",
-          title: `Node ${nodeCount + 1}`,
+    const childSize = { height: 76, width: 184 };
+    const childPosition = selectedGroup?.id
+      ? { x: 58 + (nodeCount % 2) * 220, y: 98 + Math.floor(nodeCount / 2) * 116 }
+      : { x: 140 + (nodeCount % 3) * 220, y: 130 + Math.floor(nodeCount / 3) * 128 };
+    setNodes((currentNodes) => {
+      const expandedNodes = selectedGroup?.id
+        ? architectureExpandParentNodesForChild(currentNodes, selectedGroup.id, childPosition, childSize)
+        : currentNodes;
+      return [
+        ...expandedNodes,
+        {
+          id: architectureEntityId("node"),
+          type: "architectureNode",
+          parentId: selectedGroup?.id,
+          extent: selectedGroup?.id ? "parent" : undefined,
+          position: childPosition,
+          data: {
+            icon: "server",
+            kind: "service",
+            subtitle: "",
+            title: `Node ${nodeCount + 1}`,
+          },
         },
-      },
-    ]);
+      ];
+    });
     setDirty(true);
   }, [nodes, selectedNodes, setNodes]);
 
@@ -3368,6 +3500,7 @@ function ArchitectureGraphEditor({
         source: pair[0].id,
         target: pair[1].id,
         type: "architectureEdge",
+        zIndex: 0,
         markerEnd: {
           color: "rgba(125, 211, 252, 0.88)",
           height: 18,
@@ -3387,7 +3520,17 @@ function ArchitectureGraphEditor({
     const nodeIds = new Set(selectedNodes.map((node) => node.id));
     const edgeIds = new Set(selectedEdges.map((edge) => edge.id));
     if (!nodeIds.size && !edgeIds.size) return;
-    setNodes((currentNodes) => currentNodes.filter((node) => !nodeIds.has(node.id) && !nodeIds.has(node.parentId)));
+    let expanded = true;
+    while (expanded) {
+      expanded = false;
+      nodes.forEach((node) => {
+        if (!nodeIds.has(node.id) && nodeIds.has(node.parentId)) {
+          nodeIds.add(node.id);
+          expanded = true;
+        }
+      });
+    }
+    setNodes((currentNodes) => currentNodes.filter((node) => !nodeIds.has(node.id)));
     setEdges((currentEdges) => currentEdges.filter((edge) => (
       !edgeIds.has(edge.id)
       && !nodeIds.has(edge.source)
@@ -3396,7 +3539,7 @@ function ArchitectureGraphEditor({
     setSelectedNodes([]);
     setSelectedEdges([]);
     setDirty(true);
-  }, [selectedEdges, selectedNodes, setEdges, setNodes]);
+  }, [nodes, selectedEdges, selectedNodes, setEdges, setNodes]);
 
   const save = useCallback(() => {
     const nextGraph = architectureGraphFromFlow(draftGraph, nodes, edges);
@@ -3412,7 +3555,7 @@ function ArchitectureGraphEditor({
     event.preventDefault();
     const prompt = text(agentCommandDraft);
     if (!prompt) return;
-    if (!workspaceId) {
+    if (!queueWorkspaceId) {
       setLocalError("Open a workspace before queueing an architecture task.");
       return;
     }
@@ -3420,68 +3563,18 @@ function ArchitectureGraphEditor({
       graph: draftGraph,
       prompt,
       repoPath: selectedRepo?.path || "",
-      workspaceId,
-      workspaceName,
+      workspaceId: queueWorkspaceId,
+      workspaceName: queueWorkspaceName,
     });
     setAgentCommandDraft("");
     setAgentCommandNotice(queuedItem ? "Queued for coding agents" : "Queued locally");
     setLocalError("");
-  }, [agentCommandDraft, draftGraph, selectedRepo?.path, workspaceId, workspaceName]);
+  }, [agentCommandDraft, draftGraph, selectedRepo?.path, queueWorkspaceId, queueWorkspaceName]);
+  const agentCommandReady = Boolean(text(agentCommandDraft));
+  const agentCommandStatus = localError || agentCommandNotice || (dirty ? "Unsaved changes" : "Press Enter to queue");
 
   return (
     <ArchitectureEditorShell>
-      <ArchitectureEditorToolbar>
-        <ArchitectureEditorMeta>
-          <ArchitectureField>
-            <span>Graph title</span>
-            <ArchitectureInput
-              onChange={(event) => updateDraftGraph({ title: event.target.value })}
-              value={text(draftGraph.title)}
-            />
-          </ArchitectureField>
-          <ArchitectureField>
-            <span>Folder</span>
-            <ArchitectureInput
-              onChange={(event) => updateDraftGraph({
-                groupPath: event.target.value
-                  .split(/[/>]/u)
-                  .map((part) => part.trim())
-                  .filter(Boolean),
-              })}
-              placeholder="auth / api"
-              value={jsonArray(draftGraph.groupPath).join(" / ")}
-            />
-          </ArchitectureField>
-        </ArchitectureEditorMeta>
-        <ArchitectureEditorActions>
-          <ArchitectureSmallButton onClick={addNode} type="button">Add Node</ArchitectureSmallButton>
-          <ArchitectureSmallButton onClick={addGroup} type="button">Add Group</ArchitectureSmallButton>
-          <ArchitectureSmallButton onClick={connectSelectedNodes} type="button">Connect</ArchitectureSmallButton>
-          <ArchitectureDangerButton
-            disabled={!selectedNodes.length && !selectedEdges.length}
-            onClick={deleteSelected}
-            type="button"
-          >
-            Delete
-          </ArchitectureDangerButton>
-          <ArchitecturePrimaryButton
-            disabled={!dirty || saveState === "saving"}
-            onClick={save}
-            type="button"
-          >
-            {saveState === "saving" ? "Saving..." : dirty ? "Save" : "Saved"}
-          </ArchitecturePrimaryButton>
-        </ArchitectureEditorActions>
-      </ArchitectureEditorToolbar>
-
-      <ArchitectureEditorNoticeSlot>
-        {(localError || dirty) && (
-          <ArchitectureEditorNotice data-kind={localError ? "error" : "dirty"}>
-            {localError || "Unsaved architecture changes"}
-          </ArchitectureEditorNotice>
-        )}
-      </ArchitectureEditorNoticeSlot>
-
       <ArchitectureEditorBody>
         <ArchitectureCanvasViewport>
           <ReactFlow
@@ -3492,16 +3585,19 @@ function ArchitectureGraphEditor({
                 type: MarkerType.ArrowClosed,
               },
               type: "architectureEdge",
+              zIndex: 0,
             }}
             edgeTypes={architectureEdgeTypes}
-            edges={edges}
+            edges={renderEdges}
             fitView
             maxZoom={1.7}
             minZoom={0.18}
             nodeTypes={architectureNodeTypes}
-            nodes={nodes}
+            nodes={renderNodes}
             onConnect={onConnect}
             onEdgesChange={onEdgesChange}
+            onNodeDragStart={beginInteractiveRouting}
+            onNodeDragStop={settleFullRouting}
             onNodesChange={onNodesChange}
             onSelectionChange={({ nodes: nextNodes, edges: nextEdges }) => {
               setSelectedNodes(nextNodes);
@@ -3511,23 +3607,48 @@ function ArchitectureGraphEditor({
           >
             <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
           </ReactFlow>
+          <ArchitectureFloatingActions>
+            <ArchitectureFloatingDangerButton
+              disabled={!selectedNodes.length && !selectedEdges.length}
+              onClick={deleteSelected}
+              type="button"
+            >
+              Delete
+            </ArchitectureFloatingDangerButton>
+            <ArchitectureFloatingPrimaryButton
+              disabled={!dirty || saveState === "saving"}
+              onClick={save}
+              type="button"
+            >
+              {saveState === "saving" ? "Saving..." : dirty ? "Save" : "Saved"}
+            </ArchitectureFloatingPrimaryButton>
+          </ArchitectureFloatingActions>
+          <ArchitectureAgentCommandForm
+            aria-label={agentCommandStatus}
+            data-state={localError ? "error" : agentCommandNotice ? "notice" : dirty ? "dirty" : "idle"}
+            onSubmit={queueArchitectureAgentCommand}
+            title={agentCommandStatus}
+          >
+            <ArchitectureAgentCommandInput
+              aria-label="Queue architecture task"
+              onChange={(event) => {
+                setAgentCommandDraft(event.target.value);
+                if (agentCommandNotice) setAgentCommandNotice("");
+              }}
+              placeholder="Ask a coding agent to update this architecture graph..."
+              value={agentCommandDraft}
+            />
+            <ArchitectureAgentCommandSubmitButton
+              aria-label="Queue architecture task"
+              data-ready={agentCommandReady ? "true" : undefined}
+              disabled={!agentCommandReady}
+              type="submit"
+            >
+              <ArchitectureAgentCommandSubmitIcon aria-hidden="true" />
+            </ArchitectureAgentCommandSubmitButton>
+          </ArchitectureAgentCommandForm>
         </ArchitectureCanvasViewport>
       </ArchitectureEditorBody>
-
-      <ArchitectureAgentCommandForm onSubmit={queueArchitectureAgentCommand}>
-        <ArchitectureAgentCommandInput
-          aria-label="Queue architecture task"
-          onChange={(event) => {
-            setAgentCommandDraft(event.target.value);
-            if (agentCommandNotice) setAgentCommandNotice("");
-          }}
-          placeholder="Ask a coding agent to update this architecture graph..."
-          value={agentCommandDraft}
-        />
-        <ArchitectureAgentCommandMeta>
-          {agentCommandNotice || "Press Enter to queue"}
-        </ArchitectureAgentCommandMeta>
-      </ArchitectureAgentCommandForm>
     </ArchitectureEditorShell>
   );
 }
@@ -3582,6 +3703,300 @@ function ArchitectureCanvasGroup({ data, selected }) {
   );
 }
 
+function architectureOrderFlowNodes(nodes) {
+  const nodeList = jsonArray(nodes);
+  const byId = new Map(nodeList.map((node) => [node.id, node]));
+  const orderById = new Map(nodeList.map((node, index) => [node.id, index]));
+  const childrenByParent = new Map();
+  nodeList.forEach((node) => {
+    const parentId = text(node?.parentId);
+    const safeParentId = parentId && byId.has(parentId) ? parentId : "";
+    if (!childrenByParent.has(safeParentId)) childrenByParent.set(safeParentId, []);
+    childrenByParent.get(safeParentId).push(node);
+  });
+
+  const ordered = [];
+  const seen = new Set();
+  const visitChildren = (parentId) => {
+    const children = [...(childrenByParent.get(parentId) || [])].sort((left, right) => {
+      const leftGroup = left.type === "architectureGroup" ? 0 : 1;
+      const rightGroup = right.type === "architectureGroup" ? 0 : 1;
+      return leftGroup - rightGroup
+        || (orderById.get(left.id) || 0) - (orderById.get(right.id) || 0);
+    });
+    children.forEach((child) => {
+      if (seen.has(child.id)) return;
+      seen.add(child.id);
+      ordered.push(child);
+      visitChildren(child.id);
+    });
+  };
+
+  visitChildren("");
+  nodeList.forEach((node) => {
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+    ordered.push(node);
+  });
+  return ordered;
+}
+
+function architectureNodeSize(node) {
+  const isGroup = node?.type === "architectureGroup";
+  return {
+    height: numberValue(node?.style?.height, isGroup ? 280 : 76),
+    width: numberValue(node?.style?.width, isGroup ? 460 : 184),
+  };
+}
+
+function architectureAbsoluteNodePosition(node, nodeById, cache) {
+  const nodeId = text(node?.id);
+  if (!nodeId) return { x: 0, y: 0 };
+  if (cache.has(nodeId)) return cache.get(nodeId);
+  const parentId = text(node?.parentId);
+  const parentPosition = parentId && nodeById.has(parentId)
+    ? architectureAbsoluteNodePosition(nodeById.get(parentId), nodeById, cache)
+    : { x: 0, y: 0 };
+  const position = {
+    x: parentPosition.x + numberValue(node?.position?.x, 0),
+    y: parentPosition.y + numberValue(node?.position?.y, 0),
+  };
+  cache.set(nodeId, position);
+  return position;
+}
+
+function architectureNodeRect(node, nodeById, positionCache) {
+  const position = architectureAbsoluteNodePosition(node, nodeById, positionCache);
+  const size = architectureNodeSize(node);
+  return {
+    height: size.height,
+    id: node.id,
+    width: size.width,
+    x: position.x,
+    y: position.y,
+  };
+}
+
+function architectureRectBelongsToNode(rect, nodeId) {
+  const cleanRectId = text(rect?.id);
+  const cleanNodeId = text(nodeId);
+  return cleanRectId === cleanNodeId || cleanRectId.startsWith(`${cleanNodeId}:`);
+}
+
+function architectureNodeHandlePoint(node, side, nodeById, positionCache) {
+  const rect = architectureNodeRect(node, nodeById, positionCache);
+  if (side === "left") return { x: rect.x, y: rect.y + rect.height / 2 };
+  if (side === "right") return { x: rect.x + rect.width, y: rect.y + rect.height / 2 };
+  if (side === "top") return { x: rect.x + rect.width / 2, y: rect.y };
+  if (side === "bottom") return { x: rect.x + rect.width / 2, y: rect.y + rect.height };
+  return { x: rect.x + rect.width, y: rect.y + rect.height / 2 };
+}
+
+function architectureEdgeRenderKey(edge, index = 0) {
+  return text(edge?.id, `edge-${index}`);
+}
+
+function architectureEndpointFanOffset(index, count) {
+  if (count <= 1) return 0;
+  const offset = Math.round((index - (count - 1) / 2) * 18);
+  return Math.max(-90, Math.min(90, offset));
+}
+
+function architectureEndpointFanOffsets(edges) {
+  const bySource = new Map();
+  const byTarget = new Map();
+  const offsets = new Map();
+  const addToGroup = (groupMap, key, entry) => {
+    if (!key) return;
+    if (!groupMap.has(key)) groupMap.set(key, []);
+    groupMap.get(key).push(entry);
+  };
+
+  edges.forEach((edge, index) => {
+    const key = architectureEdgeRenderKey(edge, index);
+    offsets.set(key, { source: 0, target: 0 });
+    addToGroup(bySource, text(edge.source), { edge, index, key, sortKey: text(edge.target) });
+    addToGroup(byTarget, text(edge.target), { edge, index, key, sortKey: text(edge.source) });
+  });
+
+  const assign = (groupMap, offsetKey) => {
+    groupMap.forEach((items) => {
+      const sorted = [...items].sort((left, right) => (
+        left.sortKey.localeCompare(right.sortKey)
+          || left.index - right.index
+      ));
+      sorted.forEach((item, index) => {
+        const current = offsets.get(item.key) || { source: 0, target: 0 };
+        current[offsetKey] = architectureEndpointFanOffset(index, sorted.length);
+        offsets.set(item.key, current);
+      });
+    });
+  };
+
+  assign(bySource, "source");
+  assign(byTarget, "target");
+  return offsets;
+}
+
+function architectureRouteHashString(seed, value) {
+  let hash = seed >>> 0;
+  const raw = String(value ?? "");
+  for (let index = 0; index < raw.length; index += 1) {
+    hash ^= raw.charCodeAt(index);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function architectureRouteHashNumber(seed, value) {
+  return architectureRouteHashString(seed, Math.round(numberValue(value, 0)));
+}
+
+function architectureRectsRoutingHash(rects) {
+  return jsonArray(rects).reduce((hash, rect) => {
+    let nextHash = architectureRouteHashString(hash, rect?.id || "");
+    nextHash = architectureRouteHashNumber(nextHash, rect?.x);
+    nextHash = architectureRouteHashNumber(nextHash, rect?.y);
+    nextHash = architectureRouteHashNumber(nextHash, rect?.width);
+    nextHash = architectureRouteHashNumber(nextHash, rect?.height);
+    return nextHash;
+  }, 2166136261);
+}
+
+function architectureRouteSegmentsRoutingHash(seed, segments) {
+  return jsonArray(segments).reduce((hash, segment) => {
+    let nextHash = architectureRouteHashString(hash, segment?.orientation || "");
+    nextHash = architectureRouteHashNumber(nextHash, segment?.x ?? segment?.x1);
+    nextHash = architectureRouteHashNumber(nextHash, segment?.y ?? segment?.y1);
+    nextHash = architectureRouteHashNumber(nextHash, segment?.x2);
+    nextHash = architectureRouteHashNumber(nextHash, segment?.y2);
+    return nextHash;
+  }, seed >>> 0);
+}
+
+function architectureRouteCacheGet(routeCache, key) {
+  if (!routeCache?.has?.(key)) return null;
+  const routePoints = routeCache.get(key);
+  routeCache.delete(key);
+  routeCache.set(key, routePoints);
+  return routePoints;
+}
+
+function architectureRouteCacheSet(routeCache, key, routePoints) {
+  if (!routeCache?.set) return;
+  routeCache.set(key, routePoints);
+  while (routeCache.size > ARCHITECTURE_ROUTE_CACHE_MAX) {
+    const firstKey = routeCache.keys().next().value;
+    if (!firstKey) break;
+    routeCache.delete(firstKey);
+  }
+}
+
+function architectureEdgesWithRoutingData(edges, nodes, options = {}) {
+  const interactive = Boolean(options.interactive);
+  const routeCache = options.routeCache || null;
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const positionCache = new Map();
+  const nodeRects = nodes
+    .filter((node) => node.type !== "architectureGroup")
+    .map((node) => architectureNodeRect(node, nodeById, positionCache));
+  const groupHeaderRects = nodes
+    .filter((node) => node.type === "architectureGroup")
+    .map((node) => {
+      const rect = architectureNodeRect(node, nodeById, positionCache);
+      return {
+        ...rect,
+        height: 74,
+        id: `${node.id}:header`,
+      };
+    });
+  const obstacleRects = [...nodeRects, ...groupHeaderRects];
+  const obstacleHash = architectureRectsRoutingHash(obstacleRects);
+  const endpointFanOffsets = architectureEndpointFanOffsets(edges);
+  const reservedSegments = [];
+  let reservedHash = 2166136261;
+
+  return edges.map((edge, index) => {
+    const sourceNode = nodeById.get(edge.source);
+    const targetNode = nodeById.get(edge.target);
+    const edgeKey = architectureEdgeRenderKey(edge, index);
+    const data = {
+      ...(edge.data || {}),
+      avoidanceRects: obstacleRects,
+    };
+    if (!sourceNode || !targetNode) {
+      return {
+        ...edge,
+        data,
+      };
+    }
+
+    const sourceSide = architectureEdgeSide(sourceNode.sourcePosition);
+    const targetSide = architectureEdgeSide(targetNode.targetPosition);
+    const sourcePoint = architectureNodeHandlePoint(sourceNode, sourceSide, nodeById, positionCache);
+    const targetPoint = architectureNodeHandlePoint(targetNode, targetSide, nodeById, positionCache);
+    const edgeFan = endpointFanOffsets.get(edgeKey) || { source: 0, target: 0 };
+    const routeKey = [
+      interactive ? "interactive" : "settled",
+      edgeKey,
+      edge.source,
+      edge.target,
+      sourceSide,
+      targetSide,
+      Math.round(sourcePoint.x),
+      Math.round(sourcePoint.y),
+      Math.round(targetPoint.x),
+      Math.round(targetPoint.y),
+      Math.round(edgeFan.source),
+      Math.round(edgeFan.target),
+      obstacleHash.toString(36),
+      reservedHash.toString(36),
+    ].join("|");
+    let routePoints = architectureRouteCacheGet(routeCache, routeKey);
+    if (!routePoints) {
+      routePoints = interactive
+        ? architecturePreviewEdgePoints({
+          sourceFanOffset: edgeFan.source,
+          sourcePosition: sourceNode.sourcePosition,
+          sourceX: sourcePoint.x,
+          sourceY: sourcePoint.y,
+          targetFanOffset: edgeFan.target,
+          targetPosition: targetNode.targetPosition,
+          targetX: targetPoint.x,
+          targetY: targetPoint.y,
+        })
+        : architectureOrthogonalEdgePoints({
+          avoidanceRects: obstacleRects,
+          edgeIndex: index,
+          id: edge.id,
+          reservedSegments,
+          sourceFanOffset: edgeFan.source,
+          sourcePosition: sourceNode.sourcePosition,
+          sourceX: sourcePoint.x,
+          sourceY: sourcePoint.y,
+          targetFanOffset: edgeFan.target,
+          targetPosition: targetNode.targetPosition,
+          targetX: targetPoint.x,
+          targetY: targetPoint.y,
+        });
+      architectureRouteCacheSet(routeCache, routeKey, routePoints);
+    }
+    const routeSegments = architectureRouteSegments(routePoints);
+    routeSegments.forEach((segment) => {
+      reservedSegments.push({ ...segment, edgeId: edgeKey });
+    });
+    reservedHash = architectureRouteSegmentsRoutingHash(reservedHash, routeSegments);
+
+    return {
+      ...edge,
+      data: {
+        ...data,
+        routePoints,
+      },
+    };
+  });
+}
+
 function architectureEdgeSide(position) {
   const normalized = String(position || "").toLowerCase();
   if (normalized.includes("left")) return "left";
@@ -3600,11 +4015,13 @@ function architectureEdgeOffsetPoint(x, y, side, distance) {
 }
 
 function architectureDedupEdgePoints(points) {
-  return points.filter((point, index) => {
+  return jsonArray(points).map((point) => ({
+    x: Math.round(numberValue(point?.x, 0)),
+    y: Math.round(numberValue(point?.y, 0)),
+  })).filter((point, index, cleanPoints) => {
     if (!index) return true;
-    const previous = points[index - 1];
-    return Math.round(previous.x) !== Math.round(point.x)
-      || Math.round(previous.y) !== Math.round(point.y);
+    const previous = cleanPoints[index - 1];
+    return previous.x !== point.x || previous.y !== point.y;
   });
 }
 
@@ -3617,11 +4034,702 @@ function architectureEdgeHashOffset(id) {
   return (hash % 5 - 2) * 6;
 }
 
-function architectureOrthogonalEdgePath({
-  id,
+function architectureEdgeLaneOffsets(edgeIndex = 0, hashOffset = 0) {
+  const nudge = ((edgeIndex % 3) - 1) * 4 + hashOffset;
+  return [0, 28, -28, 56, -56, 84, -84, 112, -112, 140, -140]
+    .map((offset) => offset + nudge);
+}
+
+function architectureSegmentIntersectsRect(start, end, rect, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
+  const left = rect.x - padding;
+  const right = rect.x + rect.width + padding;
+  const top = rect.y - padding;
+  const bottom = rect.y + rect.height + padding;
+  if (Math.round(start.x) === Math.round(end.x)) {
+    const x = start.x;
+    if (x < left || x > right) return false;
+    return Math.max(start.y, end.y) >= top && Math.min(start.y, end.y) <= bottom;
+  }
+  if (Math.round(start.y) === Math.round(end.y)) {
+    const y = start.y;
+    if (y < top || y > bottom) return false;
+    return Math.max(start.x, end.x) >= left && Math.min(start.x, end.x) <= right;
+  }
+  return false;
+}
+
+function architectureRouteSegment(start, end) {
+  const x1 = Math.round(start.x);
+  const y1 = Math.round(start.y);
+  const x2 = Math.round(end.x);
+  const y2 = Math.round(end.y);
+  if (x1 === x2 && y1 !== y2) {
+    return {
+      orientation: "vertical",
+      x: x1,
+      y1: Math.min(y1, y2),
+      y2: Math.max(y1, y2),
+    };
+  }
+  if (y1 === y2 && x1 !== x2) {
+    return {
+      orientation: "horizontal",
+      y: y1,
+      x1: Math.min(x1, x2),
+      x2: Math.max(x1, x2),
+    };
+  }
+  return null;
+}
+
+function architectureRouteSegments(points) {
+  const segments = [];
+  for (let index = 1; index < points.length; index += 1) {
+    const segment = architectureRouteSegment(points[index - 1], points[index]);
+    if (segment) segments.push(segment);
+  }
+  return segments;
+}
+
+function architecturePointInsideRect(point, rect, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
+  const x = Math.round(numberValue(point?.x, 0));
+  const y = Math.round(numberValue(point?.y, 0));
+  return x >= rect.x - padding
+    && x <= rect.x + rect.width + padding
+    && y >= rect.y - padding
+    && y <= rect.y + rect.height + padding;
+}
+
+function architecturePointClearOfRects(point, rects, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
+  return !jsonArray(rects).some((rect) => architecturePointInsideRect(point, rect, padding));
+}
+
+function architectureSegmentClearOfRects(start, end, rects, padding = ARCHITECTURE_ROUTE_NODE_CLEARANCE) {
+  return !jsonArray(rects).some((rect) => architectureSegmentIntersectsRect(start, end, rect, padding));
+}
+
+function architecturePointOnRouteSegment(point, segment) {
+  if (!point || !segment) return false;
+  const x = Math.round(numberValue(point.x, 0));
+  const y = Math.round(numberValue(point.y, 0));
+  if (segment.orientation === "vertical") {
+    return x === segment.x && y >= segment.y1 && y <= segment.y2;
+  }
+  if (segment.orientation === "horizontal") {
+    return y === segment.y && x >= segment.x1 && x <= segment.x2;
+  }
+  return false;
+}
+
+function architectureRouteSegmentIntersectionPoint(leftStart, leftEnd, rightStart, rightEnd) {
+  const left = architectureRouteSegment(leftStart, leftEnd);
+  const right = architectureRouteSegment(rightStart, rightEnd);
+  if (!left || !right) return null;
+  if (left.orientation !== right.orientation) {
+    const vertical = left.orientation === "vertical" ? left : right;
+    const horizontal = left.orientation === "horizontal" ? left : right;
+    const point = { x: vertical.x, y: horizontal.y };
+    return architecturePointOnRouteSegment(point, left) && architecturePointOnRouteSegment(point, right)
+      ? point
+      : null;
+  }
+  if (left.orientation === "vertical") {
+    if (left.x !== right.x) return null;
+    const overlapStart = Math.max(left.y1, right.y1);
+    const overlapEnd = Math.min(left.y2, right.y2);
+    if (overlapEnd <= overlapStart) return null;
+    const candidates = [
+      { x: left.x, y: overlapStart },
+      { x: left.x, y: overlapEnd },
+      leftStart,
+      leftEnd,
+      rightStart,
+      rightEnd,
+    ].filter((point) => architecturePointOnRouteSegment(point, left) && architecturePointOnRouteSegment(point, right));
+    return candidates.sort((first, second) => (
+      Math.abs(first.y - leftStart.y) - Math.abs(second.y - leftStart.y)
+    ))[0] || null;
+  }
+  if (left.y !== right.y) return null;
+  const overlapStart = Math.max(left.x1, right.x1);
+  const overlapEnd = Math.min(left.x2, right.x2);
+  if (overlapEnd <= overlapStart) return null;
+  const candidates = [
+    { x: overlapStart, y: left.y },
+    { x: overlapEnd, y: left.y },
+    leftStart,
+    leftEnd,
+    rightStart,
+    rightEnd,
+  ].filter((point) => architecturePointOnRouteSegment(point, left) && architecturePointOnRouteSegment(point, right));
+  return candidates.sort((first, second) => (
+    Math.abs(first.x - leftStart.x) - Math.abs(second.x - leftStart.x)
+  ))[0] || null;
+}
+
+function architectureRemoveCollinearEdgePoints(points) {
+  const deduped = architectureDedupEdgePoints(points);
+  return deduped.filter((point, index) => {
+    if (!index || index === deduped.length - 1) return true;
+    const previous = deduped[index - 1];
+    const next = deduped[index + 1];
+    const vertical = previous.x === point.x && point.x === next.x;
+    const horizontal = previous.y === point.y && point.y === next.y;
+    return !vertical && !horizontal;
+  });
+}
+
+function architecturePruneSelfIntersectingEdgePoints(points) {
+  const cleanPoints = architectureRemoveCollinearEdgePoints(points);
+  for (let leftIndex = 0; leftIndex < cleanPoints.length - 3; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 2; rightIndex < cleanPoints.length - 1; rightIndex += 1) {
+      const intersection = architectureRouteSegmentIntersectionPoint(
+        cleanPoints[leftIndex],
+        cleanPoints[leftIndex + 1],
+        cleanPoints[rightIndex],
+        cleanPoints[rightIndex + 1],
+      );
+      if (!intersection) continue;
+      const leftEndKey = architecturePointKey(cleanPoints[leftIndex + 1]);
+      const rightStartKey = architecturePointKey(cleanPoints[rightIndex]);
+      const intersectionKey = architecturePointKey(intersection);
+      if (rightIndex === leftIndex + 1 && intersectionKey === leftEndKey) continue;
+      if (intersectionKey === leftEndKey && intersectionKey === rightStartKey) continue;
+      return architectureDedupEdgePoints([
+        ...cleanPoints.slice(0, leftIndex + 1),
+        intersection,
+        ...cleanPoints.slice(rightIndex + 1),
+      ]);
+    }
+  }
+  return cleanPoints;
+}
+
+function architecturePointsSignature(points) {
+  return architectureDedupEdgePoints(points)
+    .map((point) => `${point.x},${point.y}`)
+    .join("|");
+}
+
+function architectureSimplifyEdgePoints(points) {
+  let cleanPoints = architectureDedupEdgePoints(points);
+  for (let pass = 0; pass < 6; pass += 1) {
+    const previousSignature = architecturePointsSignature(cleanPoints);
+    cleanPoints = architecturePruneSelfIntersectingEdgePoints(cleanPoints);
+    cleanPoints = architectureRemoveCollinearEdgePoints(cleanPoints);
+    if (architecturePointsSignature(cleanPoints) === previousSignature) break;
+  }
+  return cleanPoints;
+}
+
+function architectureSegmentOverlapLength(left, right) {
+  if (!left || !right || left.orientation !== right.orientation) return 0;
+  if (left.orientation === "vertical") {
+    if (Math.abs(left.x - right.x) > 1) return 0;
+    return Math.max(0, Math.min(left.y2, right.y2) - Math.max(left.y1, right.y1));
+  }
+  if (Math.abs(left.y - right.y) > 1) return 0;
+  return Math.max(0, Math.min(left.x2, right.x2) - Math.max(left.x1, right.x1));
+}
+
+function architectureSegmentsCross(left, right) {
+  if (!left || !right || left.orientation === right.orientation) return false;
+  const vertical = left.orientation === "vertical" ? left : right;
+  const horizontal = left.orientation === "horizontal" ? left : right;
+  return vertical.x >= horizontal.x1
+    && vertical.x <= horizontal.x2
+    && horizontal.y >= vertical.y1
+    && horizontal.y <= vertical.y2;
+}
+
+function architectureSegmentCloseOverlap(left, right, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
+  if (!left || !right || left.orientation !== right.orientation) {
+    return { distance: Infinity, overlap: 0 };
+  }
+  if (left.orientation === "vertical") {
+    const distance = Math.abs(left.x - right.x);
+    if (distance > spacing) return { distance, overlap: 0 };
+    return {
+      distance,
+      overlap: Math.max(0, Math.min(left.y2, right.y2) - Math.max(left.y1, right.y1)),
+    };
+  }
+  const distance = Math.abs(left.y - right.y);
+  if (distance > spacing) return { distance, overlap: 0 };
+  return {
+    distance,
+    overlap: Math.max(0, Math.min(left.x2, right.x2) - Math.max(left.x1, right.x1)),
+  };
+}
+
+function architectureRouteSegmentTooCloseToReserved(segment, reservedSegment, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
+  const closeOverlap = architectureSegmentCloseOverlap(segment, reservedSegment, spacing);
+  return closeOverlap.overlap > 0;
+}
+
+function architectureRouteSegmentClearOfReserved(start, end, reservedSegments, spacing = ARCHITECTURE_ROUTE_EDGE_CLEARANCE) {
+  const segment = architectureRouteSegment(start, end);
+  if (!segment) return true;
+  return !jsonArray(reservedSegments).some((reservedSegment) => (
+    architectureRouteSegmentTooCloseToReserved(segment, reservedSegment, spacing)
+  ));
+}
+
+function architectureRouteConflictPenalty(points, reservedSegments) {
+  const segments = architectureRouteSegments(points);
+  let penalty = 0;
+  segments.forEach((segment, index) => {
+    const nearEndpoint = index < 2 || index > segments.length - 3;
+    reservedSegments.forEach((reservedSegment) => {
+      const overlap = architectureSegmentOverlapLength(segment, reservedSegment);
+      if (overlap > 0) {
+        penalty += (nearEndpoint ? 4500 : 18000) + overlap * 180;
+      } else {
+        const closeOverlap = architectureSegmentCloseOverlap(segment, reservedSegment);
+        if (closeOverlap.overlap > 0) {
+          const closeness = Math.max(1, ARCHITECTURE_ROUTE_EDGE_CLEARANCE - closeOverlap.distance + 1);
+          penalty += (nearEndpoint ? 1800 : 9000) + closeOverlap.overlap * closeness * 18;
+        }
+      }
+      if (architectureSegmentsCross(segment, reservedSegment)) {
+        penalty += nearEndpoint ? 450 : 1400;
+      }
+    });
+  });
+  return penalty;
+}
+
+function architectureEdgePathLength(points) {
+  let length = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    length += Math.abs(points[index].x - points[index - 1].x)
+      + Math.abs(points[index].y - points[index - 1].y);
+  }
+  return length;
+}
+
+function architectureEndpointBacktrackPenalty(points, sourceSide, targetSide, sourceX, targetX, sourceY, targetY) {
+  const second = points[2] || points[1] || points[0];
+  const beforeTarget = points.at(-3) || points.at(-2) || points.at(-1);
+  let penalty = 0;
+  if (sourceSide === "right" && second.x < sourceX) penalty += 2400;
+  if (sourceSide === "left" && second.x > sourceX) penalty += 2400;
+  if (sourceSide === "bottom" && second.y < sourceY) penalty += 2400;
+  if (sourceSide === "top" && second.y > sourceY) penalty += 2400;
+  if (targetSide === "left" && beforeTarget.x > targetX) penalty += 1600;
+  if (targetSide === "right" && beforeTarget.x < targetX) penalty += 1600;
+  if (targetSide === "top" && beforeTarget.y > targetY) penalty += 1600;
+  if (targetSide === "bottom" && beforeTarget.y < targetY) penalty += 1600;
+  return penalty;
+}
+
+function architectureScoreEdgePoints(
+  points,
+  rects,
+  sourceSide,
+  targetSide,
+  sourceX,
+  targetX,
+  sourceY,
+  targetY,
+  reservedSegments = [],
+) {
+  let collisions = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    rects.forEach((rect) => {
+      if (architectureSegmentIntersectsRect(points[index - 1], points[index], rect)) {
+        collisions += 1;
+      }
+    });
+  }
+  return collisions * 10000
+    + architectureRouteConflictPenalty(points, reservedSegments)
+    + architectureEndpointBacktrackPenalty(points, sourceSide, targetSide, sourceX, targetX, sourceY, targetY)
+    + architectureEdgePathLength(points);
+}
+
+function architectureEdgeBounds(sourceX, sourceY, targetX, targetY, rects) {
+  const xs = [sourceX, targetX];
+  const ys = [sourceY, targetY];
+  rects.forEach((rect) => {
+    xs.push(rect.x, rect.x + rect.width);
+    ys.push(rect.y, rect.y + rect.height);
+  });
+  return {
+    bottom: Math.max(...ys),
+    left: Math.min(...xs),
+    right: Math.max(...xs),
+    top: Math.min(...ys),
+  };
+}
+
+function architectureEdgeFanPoint(point, side, fanOffset) {
+  if (side === "left" || side === "right") {
+    return { x: point.x, y: point.y + fanOffset };
+  }
+  if (side === "top" || side === "bottom") {
+    return { x: point.x + fanOffset, y: point.y };
+  }
+  return point;
+}
+
+function architectureSourceRoutePoints(x, y, side, fanOffset, stubDistance) {
+  const start = { x, y };
+  const portStub = architectureEdgeOffsetPoint(x, y, side, 12);
+  const fanPoint = architectureEdgeFanPoint(portStub, side, fanOffset);
+  const stub = architectureEdgeOffsetPoint(fanPoint.x, fanPoint.y, side, stubDistance);
+  return {
+    points: [start, portStub, fanPoint, stub],
+    stub,
+  };
+}
+
+function architectureTargetRoutePoints(x, y, side, fanOffset, stubDistance) {
+  const end = { x, y };
+  const portStub = architectureEdgeOffsetPoint(x, y, side, 12);
+  const fanPoint = architectureEdgeFanPoint(portStub, side, fanOffset);
+  const stub = architectureEdgeOffsetPoint(fanPoint.x, fanPoint.y, side, stubDistance);
+  return {
+    points: [stub, fanPoint, portStub, end],
+    stub,
+  };
+}
+
+function architecturePreviewEdgePoints({
+  sourceFanOffset = 0,
   sourcePosition,
   sourceX,
   sourceY,
+  targetFanOffset = 0,
+  targetPosition,
+  targetX,
+  targetY,
+}) {
+  const sourceSide = architectureEdgeSide(sourcePosition);
+  const targetSide = architectureEdgeSide(targetPosition);
+  const sourceRoute = architectureSourceRoutePoints(
+    sourceX,
+    sourceY,
+    sourceSide,
+    sourceFanOffset,
+    ARCHITECTURE_ROUTE_INTERACTIVE_STUB,
+  );
+  const targetRoute = architectureTargetRoutePoints(
+    targetX,
+    targetY,
+    targetSide,
+    targetFanOffset,
+    ARCHITECTURE_ROUTE_INTERACTIVE_STUB,
+  );
+  const sourceStub = sourceRoute.stub;
+  const targetStub = targetRoute.stub;
+  const horizontal = sourceSide === "left"
+    || sourceSide === "right"
+    || targetSide === "left"
+    || targetSide === "right";
+  const middlePoints = horizontal
+    ? [
+      { x: Math.round((sourceStub.x + targetStub.x) / 2), y: sourceStub.y },
+      { x: Math.round((sourceStub.x + targetStub.x) / 2), y: targetStub.y },
+    ]
+    : [
+      { x: sourceStub.x, y: Math.round((sourceStub.y + targetStub.y) / 2) },
+      { x: targetStub.x, y: Math.round((sourceStub.y + targetStub.y) / 2) },
+    ];
+
+  return architectureSimplifyEdgePoints([
+    ...sourceRoute.points,
+    ...middlePoints,
+    ...targetRoute.points,
+  ]);
+}
+
+function architectureLaneValues(values) {
+  return [...new Set(values.map((value) => Math.round(numberValue(value, 0))))]
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right);
+}
+
+function architecturePointKey(point) {
+  return `${Math.round(numberValue(point?.x, 0))},${Math.round(numberValue(point?.y, 0))}`;
+}
+
+function architectureGridRouteBounds(sourceStub, targetStub, rects, bendOffset = 0) {
+  const bounds = architectureEdgeBounds(sourceStub.x, sourceStub.y, targetStub.x, targetStub.y, rects);
+  const outside = 154 + Math.abs(bendOffset);
+  return {
+    bottom: bounds.bottom + outside,
+    left: bounds.left - outside,
+    right: bounds.right + outside,
+    top: bounds.top - outside,
+  };
+}
+
+function architectureGridSpacingForBounds(bounds) {
+  let spacing = ARCHITECTURE_ROUTE_GRID_CELL;
+  const width = Math.max(1, bounds.right - bounds.left);
+  const height = Math.max(1, bounds.bottom - bounds.top);
+  while (
+    Math.ceil(width / spacing) * Math.ceil(height / spacing) > ARCHITECTURE_ROUTE_GRID_MAX_POINTS
+    && spacing < 96
+  ) {
+    spacing += 8;
+  }
+  return spacing;
+}
+
+function architectureRegularAxisValues(min, max, spacing) {
+  const values = [];
+  const start = Math.floor(min / spacing) * spacing;
+  for (let value = start; value <= max + spacing; value += spacing) {
+    if (value >= min && value <= max) values.push(value);
+  }
+  return values;
+}
+
+function architectureGridRouteLanes(sourceStub, targetStub, rects, edgeIndex = 0, bendOffset = 0) {
+  const bounds = architectureGridRouteBounds(sourceStub, targetStub, rects, bendOffset);
+  const spacing = architectureGridSpacingForBounds(bounds);
+  const lanePads = [
+    ARCHITECTURE_ROUTE_NODE_CLEARANCE + 8,
+    ARCHITECTURE_ROUTE_NODE_CLEARANCE + spacing + 8,
+    ARCHITECTURE_ROUTE_NODE_CLEARANCE + spacing * 2 + 8,
+  ];
+  const xValues = [
+    sourceStub.x,
+    targetStub.x,
+    bounds.left,
+    bounds.right,
+    (sourceStub.x + targetStub.x) / 2,
+    ...architectureRegularAxisValues(bounds.left, bounds.right, spacing),
+  ];
+  const yValues = [
+    sourceStub.y,
+    targetStub.y,
+    bounds.top,
+    bounds.bottom,
+    (sourceStub.y + targetStub.y) / 2,
+    ...architectureRegularAxisValues(bounds.top, bounds.bottom, spacing),
+  ];
+  const nudges = architectureEdgeLaneOffsets(edgeIndex, bendOffset).slice(0, 5);
+  rects.forEach((rect) => {
+    lanePads.forEach((lanePad) => {
+      xValues.push(rect.x - lanePad, rect.x + rect.width + lanePad);
+      yValues.push(rect.y - lanePad, rect.y + rect.height + lanePad);
+    });
+  });
+  nudges.forEach((nudge) => {
+    xValues.push(sourceStub.x + nudge, targetStub.x + nudge);
+    yValues.push(sourceStub.y + nudge, targetStub.y + nudge);
+  });
+  return {
+    xValues: architectureLaneValues(xValues),
+    yValues: architectureLaneValues(yValues),
+  };
+}
+
+function architectureSegmentDirection(segment) {
+  if (!segment) return "";
+  return segment.orientation;
+}
+
+function architectureNeighborRouteCost(current, neighbor, currentDirection, reservedSegments) {
+  const segment = architectureRouteSegment(current, neighbor);
+  const length = Math.abs(neighbor.x - current.x) + Math.abs(neighbor.y - current.y);
+  const nextDirection = architectureSegmentDirection(segment);
+  let cost = length || 1;
+  if (currentDirection && nextDirection && currentDirection !== nextDirection) {
+    cost += 34;
+  }
+  cost += architectureRouteConflictPenalty([current, neighbor], reservedSegments);
+  return cost;
+}
+
+function architectureRouteHeuristic(point, target) {
+  return Math.abs(target.x - point.x) + Math.abs(target.y - point.y);
+}
+
+function architectureRouteStateKey(pointKey, direction = "") {
+  return `${pointKey}|${direction || "start"}`;
+}
+
+function architecturePointKeyFromRouteStateKey(stateKey) {
+  return String(stateKey || "").split("|")[0] || "";
+}
+
+function architectureDirectionFromRouteStateKey(stateKey) {
+  const direction = String(stateKey || "").split("|")[1] || "";
+  return direction === "start" ? "" : direction;
+}
+
+function architectureRouteHeapPush(heap, item) {
+  heap.push(item);
+  let index = heap.length - 1;
+  while (index > 0) {
+    const parentIndex = Math.floor((index - 1) / 2);
+    if (heap[parentIndex].priority <= item.priority) break;
+    heap[index] = heap[parentIndex];
+    index = parentIndex;
+  }
+  heap[index] = item;
+}
+
+function architectureRouteHeapPop(heap) {
+  if (!heap.length) return null;
+  const first = heap[0];
+  const last = heap.pop();
+  if (heap.length && last) {
+    let index = 0;
+    while (true) {
+      const leftIndex = index * 2 + 1;
+      const rightIndex = leftIndex + 1;
+      if (leftIndex >= heap.length) break;
+      const childIndex = rightIndex < heap.length && heap[rightIndex].priority < heap[leftIndex].priority
+        ? rightIndex
+        : leftIndex;
+      if (heap[childIndex].priority >= last.priority) break;
+      heap[index] = heap[childIndex];
+      index = childIndex;
+    }
+    heap[index] = last;
+  }
+  return first;
+}
+
+function architectureGridRoutePoints({
+  avoidReservedSegments = true,
+  bendOffset = 0,
+  edgeIndex = 0,
+  rects = [],
+  reservedSegments = [],
+  sourceStub,
+  targetStub,
+}) {
+  const cleanRects = jsonArray(rects);
+  const start = { x: Math.round(sourceStub.x), y: Math.round(sourceStub.y) };
+  const target = { x: Math.round(targetStub.x), y: Math.round(targetStub.y) };
+  const lanes = architectureGridRouteLanes(start, target, cleanRects, edgeIndex, bendOffset);
+  const points = [];
+  const pointByKey = new Map();
+  const addPoint = (point, force = false) => {
+    const candidate = { x: Math.round(point.x), y: Math.round(point.y) };
+    if (!force && !architecturePointClearOfRects(candidate, cleanRects)) return;
+    const key = architecturePointKey(candidate);
+    if (pointByKey.has(key)) return;
+    pointByKey.set(key, candidate);
+    points.push(candidate);
+  };
+
+  lanes.xValues.forEach((x) => {
+    lanes.yValues.forEach((y) => addPoint({ x, y }));
+  });
+  addPoint(start, true);
+  addPoint(target, true);
+
+  const startKey = architecturePointKey(start);
+  const targetKey = architecturePointKey(target);
+  const rowMap = new Map();
+  const columnMap = new Map();
+  points.forEach((point) => {
+    const rowKey = String(Math.round(point.y));
+    const columnKey = String(Math.round(point.x));
+    if (!rowMap.has(rowKey)) rowMap.set(rowKey, []);
+    if (!columnMap.has(columnKey)) columnMap.set(columnKey, []);
+    rowMap.get(rowKey).push(point);
+    columnMap.get(columnKey).push(point);
+  });
+  rowMap.forEach((rowPoints) => rowPoints.sort((left, right) => left.x - right.x));
+  columnMap.forEach((columnPoints) => columnPoints.sort((left, right) => left.y - right.y));
+
+  const neighborsByKey = new Map();
+  const connect = (left, right) => {
+    if (!architectureSegmentClearOfRects(left, right, cleanRects)) return;
+    if (
+      avoidReservedSegments
+      && !architectureRouteSegmentClearOfReserved(left, right, reservedSegments)
+    ) {
+      return;
+    }
+    const leftKey = architecturePointKey(left);
+    const rightKey = architecturePointKey(right);
+    if (!neighborsByKey.has(leftKey)) neighborsByKey.set(leftKey, []);
+    if (!neighborsByKey.has(rightKey)) neighborsByKey.set(rightKey, []);
+    neighborsByKey.get(leftKey).push(right);
+    neighborsByKey.get(rightKey).push(left);
+  };
+  const connectAdjacent = (linePoints) => {
+    for (let index = 1; index < linePoints.length; index += 1) {
+      connect(linePoints[index - 1], linePoints[index]);
+    }
+  };
+  rowMap.forEach(connectAdjacent);
+  columnMap.forEach(connectAdjacent);
+
+  const startStateKey = architectureRouteStateKey(startKey);
+  const distances = new Map([[startStateKey, 0]]);
+  const previousByStateKey = new Map();
+  const visited = new Set();
+  const heap = [];
+  architectureRouteHeapPush(heap, {
+    key: startStateKey,
+    priority: architectureRouteHeuristic(start, target),
+  });
+  let bestTargetStateKey = "";
+  while (heap.length) {
+    const item = architectureRouteHeapPop(heap);
+    if (!item || visited.has(item.key)) continue;
+    visited.add(item.key);
+    const currentPointKey = architecturePointKeyFromRouteStateKey(item.key);
+    if (currentPointKey === targetKey) {
+      bestTargetStateKey = item.key;
+      break;
+    }
+    const current = pointByKey.get(currentPointKey);
+    if (!current) continue;
+    const currentDirection = architectureDirectionFromRouteStateKey(item.key);
+    const currentDistance = distances.get(item.key) ?? Infinity;
+    (neighborsByKey.get(currentPointKey) || []).forEach((neighbor) => {
+      const neighborSegment = architectureRouteSegment(current, neighbor);
+      const neighborDirection = architectureSegmentDirection(neighborSegment);
+      const neighborPointKey = architecturePointKey(neighbor);
+      const neighborStateKey = architectureRouteStateKey(neighborPointKey, neighborDirection);
+      if (visited.has(neighborStateKey)) return;
+      const nextDistance = currentDistance
+        + architectureNeighborRouteCost(current, neighbor, currentDirection, reservedSegments);
+      if (nextDistance < (distances.get(neighborStateKey) ?? Infinity)) {
+        distances.set(neighborStateKey, nextDistance);
+        previousByStateKey.set(neighborStateKey, item.key);
+        architectureRouteHeapPush(heap, {
+          key: neighborStateKey,
+          priority: nextDistance + architectureRouteHeuristic(neighbor, target),
+        });
+      }
+    });
+  }
+
+  if (!bestTargetStateKey) return [];
+  const route = [];
+  let cursor = bestTargetStateKey;
+  while (cursor) {
+    const point = pointByKey.get(architecturePointKeyFromRouteStateKey(cursor));
+    if (point) route.push(point);
+    if (cursor === startStateKey) break;
+    cursor = previousByStateKey.get(cursor);
+  }
+  if (architecturePointKey(route.at(-1)) !== startKey) return [];
+  return architectureSimplifyEdgePoints(route.reverse());
+}
+
+function architectureOrthogonalEdgePoints({
+  avoidanceRects = [],
+  edgeIndex = 0,
+  id,
+  reservedSegments = [],
+  sourceFanOffset = 0,
+  sourcePosition,
+  sourceX,
+  sourceY,
+  targetFanOffset = 0,
   targetPosition,
   targetX,
   targetY,
@@ -3632,45 +4740,217 @@ function architectureOrthogonalEdgePath({
     || sourceSide === "right"
     || targetSide === "left"
     || targetSide === "right";
-  const offset = 30;
+  const offset = ARCHITECTURE_ROUTE_ENDPOINT_STUB;
   const bendOffset = architectureEdgeHashOffset(id);
-  const sourceStub = architectureEdgeOffsetPoint(sourceX, sourceY, sourceSide, offset);
-  const targetStub = architectureEdgeOffsetPoint(targetX, targetY, targetSide, offset);
-  let points;
+  const sourceRoute = architectureSourceRoutePoints(sourceX, sourceY, sourceSide, sourceFanOffset, offset);
+  const targetRoute = architectureTargetRoutePoints(targetX, targetY, targetSide, targetFanOffset, offset);
+  const sourceStub = sourceRoute.stub;
+  const targetStub = targetRoute.stub;
+  const rects = jsonArray(avoidanceRects).filter((rect) => text(rect?.id) !== text(id));
+  let gridRoute = architectureGridRoutePoints({
+    bendOffset,
+    edgeIndex,
+    rects,
+    reservedSegments,
+    sourceStub,
+    targetStub,
+  });
+  if (gridRoute.length < 2) {
+    gridRoute = architectureGridRoutePoints({
+      avoidReservedSegments: false,
+      bendOffset,
+      edgeIndex,
+      rects,
+      reservedSegments,
+      sourceStub,
+      targetStub,
+    });
+  }
+  if (gridRoute.length >= 2) {
+    return architectureSimplifyEdgePoints([
+      ...sourceRoute.points,
+      ...gridRoute,
+      ...targetRoute.points,
+    ]);
+  }
+  const bounds = architectureEdgeBounds(sourceX, sourceY, targetX, targetY, rects);
+  const outsideOffset = 76 + Math.abs(bendOffset);
+  const leftLane = bounds.left - outsideOffset;
+  const rightLane = bounds.right + outsideOffset;
+  const topLane = bounds.top - outsideOffset;
+  const bottomLane = bounds.bottom + outsideOffset;
+  const laneOffsets = architectureEdgeLaneOffsets(edgeIndex, bendOffset);
+  const candidates = [];
+  const pushCandidate = (middlePoints) => {
+    candidates.push(architectureDedupEdgePoints([
+      ...sourceRoute.points,
+      ...middlePoints,
+      ...targetRoute.points,
+    ]));
+  };
 
   if (horizontal) {
-    const midX = Math.round((sourceStub.x + targetStub.x) / 2 + bendOffset);
-    points = [
-      { x: sourceX, y: sourceY },
-      sourceStub,
-      { x: midX, y: sourceStub.y },
-      { x: midX, y: targetStub.y },
-      targetStub,
-      { x: targetX, y: targetY },
-    ];
+    laneOffsets.forEach((laneOffset) => {
+      const midX = Math.round((sourceStub.x + targetStub.x) / 2 + laneOffset);
+      pushCandidate([
+        { x: midX, y: sourceStub.y },
+        { x: midX, y: targetStub.y },
+      ]);
+    });
+    laneOffsets.forEach((laneOffset) => {
+      [leftLane - Math.abs(laneOffset), rightLane + Math.abs(laneOffset)].forEach((laneX) => {
+        pushCandidate([
+          { x: laneX, y: sourceStub.y },
+          { x: laneX, y: targetStub.y },
+        ]);
+      });
+      [topLane - Math.abs(laneOffset), bottomLane + Math.abs(laneOffset)].forEach((laneY) => {
+        pushCandidate([
+          { x: sourceStub.x, y: laneY },
+          { x: targetStub.x, y: laneY },
+        ]);
+      });
+    });
   } else {
-    const midY = Math.round((sourceStub.y + targetStub.y) / 2 + bendOffset);
-    points = [
-      { x: sourceX, y: sourceY },
-      sourceStub,
-      { x: sourceStub.x, y: midY },
-      { x: targetStub.x, y: midY },
-      targetStub,
-      { x: targetX, y: targetY },
-    ];
+    laneOffsets.forEach((laneOffset) => {
+      const midY = Math.round((sourceStub.y + targetStub.y) / 2 + laneOffset);
+      pushCandidate([
+        { x: sourceStub.x, y: midY },
+        { x: targetStub.x, y: midY },
+      ]);
+    });
+    laneOffsets.forEach((laneOffset) => {
+      [topLane - Math.abs(laneOffset), bottomLane + Math.abs(laneOffset)].forEach((laneY) => {
+        pushCandidate([
+          { x: sourceStub.x, y: laneY },
+          { x: targetStub.x, y: laneY },
+        ]);
+      });
+      [leftLane - Math.abs(laneOffset), rightLane + Math.abs(laneOffset)].forEach((laneX) => {
+        pushCandidate([
+          { x: laneX, y: sourceStub.y },
+          { x: laneX, y: targetStub.y },
+        ]);
+      });
+    });
   }
 
-  const cleanPoints = architectureDedupEdgePoints(points);
-  const path = cleanPoints
-    .map((point, index) => `${index ? "L" : "M"} ${Math.round(point.x)} ${Math.round(point.y)}`)
-    .join(" ");
-  const labelSegmentIndex = Math.max(0, Math.min(cleanPoints.length - 2, Math.floor((cleanPoints.length - 1) / 2)));
-  const labelStart = cleanPoints[labelSegmentIndex];
-  const labelEnd = cleanPoints[labelSegmentIndex + 1] || labelStart;
+  return candidates
+    .sort((left, right) => (
+      architectureScoreEdgePoints(left, rects, sourceSide, targetSide, sourceX, targetX, sourceY, targetY, reservedSegments)
+        - architectureScoreEdgePoints(right, rects, sourceSide, targetSide, sourceX, targetX, sourceY, targetY, reservedSegments)
+    ))[0] || [
+    { x: sourceX, y: sourceY },
+    { x: targetX, y: targetY },
+  ];
+}
+
+function architecturePointTowardPoint(from, to, distance) {
+  const xDelta = Math.round(numberValue(to?.x, 0)) - Math.round(numberValue(from?.x, 0));
+  const yDelta = Math.round(numberValue(to?.y, 0)) - Math.round(numberValue(from?.y, 0));
+  if (xDelta !== 0) {
+    return {
+      x: Math.round(numberValue(from?.x, 0)) + Math.sign(xDelta) * distance,
+      y: Math.round(numberValue(from?.y, 0)),
+    };
+  }
+  if (yDelta !== 0) {
+    return {
+      x: Math.round(numberValue(from?.x, 0)),
+      y: Math.round(numberValue(from?.y, 0)) + Math.sign(yDelta) * distance,
+    };
+  }
+  return {
+    x: Math.round(numberValue(from?.x, 0)),
+    y: Math.round(numberValue(from?.y, 0)),
+  };
+}
+
+function architectureEdgePathFromPoints(points) {
+  const cleanPoints = architectureSimplifyEdgePoints(points);
+  if (!cleanPoints.length) return "";
+  if (cleanPoints.length === 1) return `M ${cleanPoints[0].x} ${cleanPoints[0].y}`;
+  const commands = [`M ${cleanPoints[0].x} ${cleanPoints[0].y}`];
+  const cornerRadius = 14;
+  for (let index = 1; index < cleanPoints.length - 1; index += 1) {
+    const previous = cleanPoints[index - 1];
+    const point = cleanPoints[index];
+    const next = cleanPoints[index + 1];
+    const previousLength = Math.abs(point.x - previous.x) + Math.abs(point.y - previous.y);
+    const nextLength = Math.abs(next.x - point.x) + Math.abs(next.y - point.y);
+    const isCorner = (previous.x === point.x || previous.y === point.y)
+      && (point.x === next.x || point.y === next.y)
+      && !((previous.x === point.x && point.x === next.x) || (previous.y === point.y && point.y === next.y));
+    const radius = Math.min(cornerRadius, Math.floor(previousLength / 2), Math.floor(nextLength / 2));
+    if (!isCorner || radius < 3) {
+      commands.push(`L ${point.x} ${point.y}`);
+      continue;
+    }
+    const beforeCorner = architecturePointTowardPoint(point, previous, radius);
+    const afterCorner = architecturePointTowardPoint(point, next, radius);
+    commands.push(`L ${beforeCorner.x} ${beforeCorner.y}`);
+    commands.push(`Q ${point.x} ${point.y} ${afterCorner.x} ${afterCorner.y}`);
+  }
+  const lastPoint = cleanPoints.at(-1);
+  commands.push(`L ${lastPoint.x} ${lastPoint.y}`);
+  return commands.join(" ");
+}
+
+function architectureEdgeLabelPoint(points) {
+  const cleanPoints = architectureSimplifyEdgePoints(points);
+  let bestStart = cleanPoints[0] || { x: 0, y: 0 };
+  let bestEnd = cleanPoints[1] || bestStart;
+  let bestLength = -1;
+  for (let index = 1; index < cleanPoints.length; index += 1) {
+    const nearEndpoint = index <= 2 || index >= cleanPoints.length - 2;
+    const start = cleanPoints[index - 1];
+    const end = cleanPoints[index];
+    const length = Math.abs(end.x - start.x) + Math.abs(end.y - start.y);
+    if (!nearEndpoint && length > bestLength) {
+      bestStart = start;
+      bestEnd = end;
+      bestLength = length;
+    }
+  }
+  if (bestLength < 0) {
+    const labelSegmentIndex = Math.max(0, Math.min(cleanPoints.length - 2, Math.floor((cleanPoints.length - 1) / 2)));
+    bestStart = cleanPoints[labelSegmentIndex] || bestStart;
+    bestEnd = cleanPoints[labelSegmentIndex + 1] || bestStart;
+  }
+  return {
+    x: Math.round((bestStart.x + bestEnd.x) / 2),
+    y: Math.round((bestStart.y + bestEnd.y) / 2),
+  };
+}
+
+function architectureOrthogonalEdgePath({
+  avoidanceRects = [],
+  id,
+  routePoints = [],
+  sourcePosition,
+  sourceX,
+  sourceY,
+  targetPosition,
+  targetX,
+  targetY,
+}) {
+  const cleanPoints = jsonArray(routePoints).length >= 2
+    ? architectureDedupEdgePoints(routePoints)
+    : architectureOrthogonalEdgePoints({
+      avoidanceRects,
+      id,
+      sourcePosition,
+      sourceX,
+      sourceY,
+      targetPosition,
+      targetX,
+      targetY,
+    });
+  const labelPoint = architectureEdgeLabelPoint(cleanPoints);
   return [
-    path,
-    Math.round((labelStart.x + labelEnd.x) / 2),
-    Math.round((labelStart.y + labelEnd.y) / 2),
+    architectureEdgePathFromPoints(cleanPoints),
+    labelPoint.x,
+    labelPoint.y,
   ];
 }
 
@@ -3687,7 +4967,9 @@ function ArchitectureCanvasEdge({
   targetY,
 }) {
   const [edgePath, labelX, labelY] = architectureOrthogonalEdgePath({
+    avoidanceRects: data?.avoidanceRects,
     id,
+    routePoints: data?.routePoints,
     sourcePosition,
     sourceX,
     sourceY,
@@ -3708,6 +4990,7 @@ function ArchitectureCanvasEdge({
           stroke: selected ? "rgba(251, 191, 36, 0.95)" : "rgba(125, 211, 252, 0.8)",
           strokeDasharray: kind === "depends" ? "7 5" : kind === "subscribes" ? "2 6" : "0",
           strokeLinecap: "round",
+          strokeLinejoin: "round",
           strokeWidth: selected ? 3 : 2.2,
         }}
       />
@@ -4057,31 +5340,32 @@ const ArchitectureSurface = styled.section`
 const ArchitectureToolbar = styled.div`
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 9px;
   min-width: 0;
-  padding: 12px 16px;
+  min-height: 38px;
+  padding: 4px 10px;
   border-bottom: 1px solid var(--forge-border);
-  background: rgba(15, 23, 42, 0.42);
+  background: rgba(15, 23, 42, 0.34);
 `;
 
 const ViewToggleGroup = styled.div`
   display: inline-flex;
-  gap: 4px;
-  padding: 4px;
+  gap: 2px;
+  padding: 2px;
   border: 1px solid var(--forge-border);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.48);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.42);
 `;
 
 const ViewToggleButton = styled.button`
-  min-height: 34px;
-  padding: 0 14px;
+  min-height: 24px;
+  padding: 0 10px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 5px;
   color: var(--forge-text-muted);
   background: transparent;
   font: inherit;
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 850;
   cursor: pointer;
 
@@ -4092,9 +5376,13 @@ const ViewToggleButton = styled.button`
 `;
 
 const ToolbarMeta = styled.span`
+  min-width: 0;
+  overflow: hidden;
   color: var(--forge-text-muted);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const ArchitectureError = styled.div`
@@ -4154,6 +5442,10 @@ const ArchitecturesShell = styled.div`
   min-height: 0;
   overflow: hidden;
 
+  &[data-nav-collapsed="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   @media (max-width: 760px) {
     grid-template-columns: 1fr;
     overflow: auto;
@@ -4199,6 +5491,13 @@ const ArchitectureNavHeader = styled.header`
   }
 `;
 
+const ArchitectureNavHeaderActions = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+`;
+
 const ArchitectureIconButton = styled.button`
   display: inline-grid;
   flex: 0 0 auto;
@@ -4225,6 +5524,32 @@ const ArchitectureIconButton = styled.button`
   &:disabled {
     cursor: default;
     opacity: 0.45;
+  }
+`;
+
+const ArchitectureCreateGraphButton = styled(ArchitectureIconButton)`
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+
+  svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+  }
+`;
+
+const ArchitectureNavToggleButton = styled(ArchitectureIconButton)`
+  border-color: rgba(148, 163, 184, 0.18);
+  color: rgba(203, 213, 225, 0.8);
+  background: rgba(15, 23, 42, 0.42);
+  font-size: 10px;
+  font-weight: 900;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    background: rgba(14, 165, 233, 0.14);
   }
 `;
 
@@ -4717,20 +6042,50 @@ const ArchitectureEmptyNote = styled.div`
 const ArchitectureEditorRegion = styled.main`
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 8px;
+  gap: 0;
   min-width: 0;
   min-height: 0;
-  padding: 12px;
+  padding: 0;
   overflow: hidden;
 `;
 
 const ArchitectureEditorContent = styled.div`
+  position: relative;
   display: grid;
   grid-row: 2;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
+`;
+
+const ArchitectureRestoreNavButton = styled.button`
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 9;
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid rgba(125, 211, 252, 0.28);
+  border-radius: 8px;
+  color: rgba(224, 242, 254, 0.9);
+  background: rgba(15, 23, 42, 0.72);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0;
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.46);
+    background: rgba(14, 165, 233, 0.18);
+  }
 `;
 
 const ArchitectureEditorEmpty = styled.div`
@@ -4869,8 +6224,8 @@ const ArchitectureCreateActions = styled.div`
 
 const ArchitectureEditorShell = styled.div`
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -4944,12 +6299,13 @@ const ArchitectureEditorBody = styled.div`
 `;
 
 const ArchitectureCanvasViewport = styled.div`
+  position: relative;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 8px;
+  border: 0;
+  border-radius: 0;
   background:
     linear-gradient(180deg, rgba(15, 23, 42, 0.16), rgba(2, 6, 23, 0.18)),
     rgba(2, 6, 23, 0.36);
@@ -4960,57 +6316,159 @@ const ArchitectureCanvasViewport = styled.div`
     min-height: 0;
   }
 
+  .react-flow__edge-path {
+    shape-rendering: crispEdges;
+  }
+
+`;
+
+const ArchitectureFloatingActions = styled.div`
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 8;
+  display: flex;
+  gap: 7px;
+  pointer-events: auto;
+  opacity: 0.72;
+  transition: opacity 120ms ease, transform 120ms ease;
+
+  ${ArchitectureCanvasViewport}:hover &,
+  &:focus-within {
+    opacity: 1;
+    transform: translateY(0);
+  }
+`;
+
+const ArchitectureFloatingButton = styled.button`
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.88);
+  background: rgba(15, 23, 42, 0.78);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0;
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+`;
+
+const ArchitectureFloatingDangerButton = styled(ArchitectureFloatingButton)`
+  border-color: rgba(251, 113, 133, 0.28);
+  color: #fecdd3;
+  background: rgba(69, 10, 10, 0.64);
+`;
+
+const ArchitectureFloatingPrimaryButton = styled(ArchitectureFloatingButton)`
+  border-color: rgba(45, 212, 191, 0.3);
+  color: #ccfbf1;
+  background: rgba(13, 69, 63, 0.66);
 `;
 
 const ArchitectureAgentCommandForm = styled.form`
-  display: grid;
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  z-index: 8;
+  display: flex;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 10px;
+  gap: 6px;
+  width: min(520px, calc(100% - 28px));
   min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.42);
+  min-height: 40px;
+  padding: 5px 6px 5px 14px;
+  border: 1px solid rgba(230, 236, 245, 0.11);
+  border-radius: 999px;
+  background: rgba(8, 12, 18, 0.82);
+  box-shadow: 0 14px 32px rgba(0, 0, 0, 0.26);
+  backdrop-filter: blur(12px);
+  transform: translateX(-50%);
 
   &:focus-within {
-    border-color: rgba(125, 211, 252, 0.34);
-    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.1);
+    border-color: rgba(125, 176, 255, 0.45);
+    background: rgba(8, 12, 18, 0.92);
   }
 
-  @media (max-width: 760px) {
-    grid-template-columns: 1fr;
-    gap: 5px;
+  &[data-state="error"] {
+    border-color: rgba(251, 113, 133, 0.36);
+  }
+
+  &[data-state="notice"] {
+    border-color: rgba(45, 212, 191, 0.32);
   }
 `;
 
 const ArchitectureAgentCommandInput = styled.input`
+  flex: 1 1 auto;
   min-width: 0;
-  height: 34px;
+  height: 30px;
   border: 0;
   outline: none;
-  color: rgba(248, 250, 252, 0.94);
+  color: #eef4ff;
   background: transparent;
   font: inherit;
-  font-size: 12px;
-  font-weight: 780;
+  font-size: 11px;
+  font-weight: 680;
+  line-height: 1.25;
 
   &::placeholder {
-    color: rgba(148, 163, 184, 0.62);
+    color: #657386;
   }
 `;
 
-const ArchitectureAgentCommandMeta = styled.span`
-  min-width: max-content;
-  color: rgba(148, 163, 184, 0.72);
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0;
-  text-transform: uppercase;
+const ArchitectureAgentCommandSubmitButton = styled.button`
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  color: #8d9aac;
+  background: rgba(21, 27, 36, 0.94);
+  line-height: 1;
+  outline: none;
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
 
-  @media (max-width: 760px) {
-    min-width: 0;
+  &:not(:disabled):hover {
+    border-color: rgba(255, 255, 255, 0.42);
+    color: #05070a;
+    background: #ffffff;
   }
+
+  &[data-ready="true"] {
+    border-color: rgba(255, 255, 255, 0.5);
+    color: #05070a;
+    background: #ffffff;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.68;
+  }
+`;
+
+const ArchitectureAgentCommandSubmitIcon = styled(North)`
+  display: block;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
 `;
 
 const ArchitectureInspector = styled.aside`
@@ -5112,8 +6570,8 @@ const ArchitectureNodeIcon = styled.span`
   height: 24px;
   border: 1px solid rgba(125, 211, 252, 0.36);
   border-radius: 7px;
-  color: rgba(226, 232, 240, 0.76);
-  background: rgba(14, 165, 233, 0.2);
+  color: rgba(248, 250, 252, 0.92);
+  background: rgba(14, 165, 233, 0.18);
   font-size: 6px;
   font-weight: 900;
   line-height: 1;
@@ -5130,10 +6588,14 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-source="likec4"],
   &[data-source="styled"] {
-    border-color: rgba(226, 232, 240, 0.74);
-    color: rgba(15, 23, 42, 0.92);
-    background: rgba(248, 250, 252, 0.92);
-    box-shadow: 0 5px 14px rgba(0, 0, 0, 0.14);
+    border-color: rgba(226, 232, 240, 0.2);
+    color: rgba(248, 250, 252, 0.96);
+    background: rgba(248, 250, 252, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.04), 0 5px 14px rgba(0, 0, 0, 0.14);
+  }
+
+  &[data-source="likec4"] svg {
+    filter: brightness(0) invert(1);
   }
 
   &[data-source="label"] {
@@ -5148,8 +6610,8 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-kind="client"][data-source="likec4"],
   &[data-kind="client"][data-source="styled"] {
-    border-color: rgba(254, 240, 138, 0.78);
-    background: rgba(255, 251, 235, 0.94);
+    border-color: rgba(254, 240, 138, 0.26);
+    background: rgba(217, 119, 6, 0.16);
   }
 
   &[data-kind="database"] {
@@ -5160,8 +6622,8 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-kind="database"][data-source="likec4"],
   &[data-kind="database"][data-source="styled"] {
-    border-color: rgba(167, 243, 208, 0.82);
-    background: rgba(240, 253, 244, 0.94);
+    border-color: rgba(167, 243, 208, 0.28);
+    background: rgba(5, 150, 105, 0.16);
   }
 
   &[data-kind="external"] {
@@ -5171,8 +6633,8 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-kind="external"][data-source="likec4"],
   &[data-kind="external"][data-source="styled"] {
-    border-color: rgba(251, 207, 232, 0.82);
-    background: rgba(253, 242, 248, 0.94);
+    border-color: rgba(251, 207, 232, 0.28);
+    background: rgba(190, 24, 93, 0.16);
   }
 
   &[data-kind="queue"] {
@@ -5182,8 +6644,8 @@ const ArchitectureNodeIcon = styled.span`
 
   &[data-kind="queue"][data-source="likec4"],
   &[data-kind="queue"][data-source="styled"] {
-    border-color: rgba(221, 214, 254, 0.82);
-    background: rgba(245, 243, 255, 0.94);
+    border-color: rgba(221, 214, 254, 0.28);
+    background: rgba(109, 40, 217, 0.16);
   }
 
   &[data-kind="group"] {
@@ -5220,15 +6682,20 @@ const ArchitectureNodeText = styled.div`
 const ArchitectureCanvasGroupShell = styled.div`
   width: 100%;
   height: 100%;
-  padding: 12px;
-  border: 1px dashed rgba(148, 163, 184, 0.34);
+  padding: 16px;
+  border: 1px dashed rgba(148, 163, 184, 0.38);
   border-radius: 8px;
   color: rgba(226, 232, 240, 0.88);
-  background: rgba(15, 23, 42, 0.18);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.28), rgba(2, 6, 23, 0.16)),
+    rgba(15, 23, 42, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.025);
 
   &[data-selected="true"] {
     border-color: rgba(251, 191, 36, 0.68);
-    background: rgba(120, 53, 15, 0.12);
+    background:
+      linear-gradient(180deg, rgba(120, 53, 15, 0.16), rgba(2, 6, 23, 0.18)),
+      rgba(15, 23, 42, 0.18);
   }
 
   .react-flow__handle {
@@ -5245,6 +6712,7 @@ const ArchitectureGroupHeader = styled.div`
   align-items: center;
   gap: 8px;
   max-width: calc(100% - 14px);
+  padding: 1px 0 0;
 `;
 
 const ArchitectureGroupText = styled.div`
