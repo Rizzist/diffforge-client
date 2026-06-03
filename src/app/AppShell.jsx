@@ -57,6 +57,7 @@ import {
   getLiveTerminalForThread,
   getThreadTerminalGroundTruth,
   recordThreadTerminalReadiness,
+  terminalPromptingUserBlocksShutdown,
 } from "../threads/threadTerminalGroundTruth.js";
 import {
   transcriptHasTurnCompletionForPrompt as transcriptHasTurnCompletionForPromptEvidence,
@@ -8512,13 +8513,14 @@ export default function App() {
             && (!presenceTerminal || !isReady)
           )
       );
+      const promptingUserBlocksShutdown = terminalPromptingUserBlocksShutdown(groundTruth);
       const needsInput = Boolean(
         session.parked
           || session.parkedPrompt
           || groundTruth.terminalIsParked
-          || groundTruth.terminalIsPromptingUser
+          || promptingUserBlocksShutdown
           || terminalWorkState === "parked"
-          || terminalWorkState === "prompting_user"
+          || (terminalWorkState === "prompting_user" && promptingUserBlocksShutdown)
           || (!presenceSaysIdle && visibleStatus === "paused")
       );
       const hasError = Boolean(
@@ -9164,6 +9166,7 @@ export default function App() {
       || workspaceState !== "initializing"
       || isLaunchScreenVisible
       || !workspaceListHydrated
+      || (isPaidUser(user) && startupAgentGateState !== "complete")
     ) {
       return undefined;
     }
@@ -9172,7 +9175,7 @@ export default function App() {
     authStore.setMessage("Workspace ready.");
 
     return undefined;
-  }, [authState, isLaunchScreenVisible, workspaceListHydrated, workspaceState]);
+  }, [authState, isLaunchScreenVisible, startupAgentGateState, user, workspaceListHydrated, workspaceState]);
 
   useEffect(() => {
     if (authState !== "authenticated" || !isPaidUser(user) || workspaceState !== "initializing") {
@@ -9336,7 +9339,7 @@ export default function App() {
         ? "Checking terminal CLIs..."
         : "Terminal readiness checked";
   const startupAgentStatusDetail = startupAgentGateState === "choice"
-    ? getAgentUpdateSummary(startupAgentUpdates)
+    ? `${getAgentUpdateSummary(startupAgentUpdates)} Choose whether to update now or enter the workspace without updating.`
     : startupAgentGateState === "updating"
       ? "The workspace will open when the selected updates finish."
       : startupAgentGateState === "checking"
@@ -11339,6 +11342,80 @@ export default function App() {
   const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
     ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
     : {};
+
+  useEffect(() => {
+    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = selectedWorkspace?.id || "";
+    const workspaceName = selectedWorkspace?.name || null;
+    if (!workspaceHydrationReady || !repoPath || !workspaceId) {
+      return undefined;
+    }
+
+    const shouldWaitForTerminalStartupScan = Boolean(
+      selectedWorkspace?.id
+      && activatedWorkspace?.id
+      && selectedWorkspace.id === activatedWorkspace.id
+      && activatedWorkspaceAgentTerminalEntries.length > 0
+      && (!workspaceAgentLaunchKey || workspaceAgentBatchSentKey !== workspaceAgentLaunchKey),
+    );
+    if (shouldWaitForTerminalStartupScan) {
+      return undefined;
+    }
+
+    const rawScanState = selectedWorkspaceGraphState.rawScanState || "";
+    if (
+      selectedWorkspaceGraphState.rawScanSnapshot
+      || rawScanState === "loading"
+      || rawScanState === "ready"
+      || rawScanState === "error"
+    ) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    setWorkspaceGraphStatus(repoPath, workspaceId, {
+      rawScanError: "",
+      rawScanState: "loading",
+    });
+
+    invoke("terminal_workspace_raw_scan", {
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then((scan) => {
+        if (cancelled) return;
+        setWorkspaceGraphStatus(repoPath, workspaceId, {
+          rawScanError: "",
+          rawScanSnapshot: scan,
+          rawScanState: "ready",
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setWorkspaceGraphStatus(repoPath, workspaceId, {
+          rawScanError: getErrorMessage(error, "Unable to load cached startup scan."),
+          rawScanState: "error",
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activatedWorkspaceTerminalWorkingDirectory,
+    activatedWorkspace?.id,
+    activatedWorkspaceAgentTerminalEntries.length,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceFileRoot,
+    selectedWorkspaceGraphState.rawScanSnapshot,
+    selectedWorkspaceGraphState.rawScanState,
+    setWorkspaceGraphStatus,
+    workspaceAgentBatchSentKey,
+    workspaceAgentLaunchKey,
+    workspaceHydrationReady,
+  ]);
 
   useEffect(() => {
     const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
@@ -16123,6 +16200,9 @@ export default function App() {
                       architectureError={selectedWorkspaceGraphState.architectureError || ""}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
                       architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
+                      rawScanError={selectedWorkspaceGraphState.rawScanError || ""}
+                      rawScanSnapshot={selectedWorkspaceGraphState.rawScanSnapshot || null}
+                      rawScanState={selectedWorkspaceGraphState.rawScanState || "idle"}
                       workspace={selectedWorkspace}
                     />
                   ) : (

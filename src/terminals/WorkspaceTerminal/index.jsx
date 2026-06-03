@@ -1277,6 +1277,7 @@ function WorkspaceTerminal({
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
   const agentLaunchReadyRef = useRef(agentLaunchReady);
+  const breakoutSurfaceDragPendingRef = useRef(null);
   const submittedPendingPromptIdsRef = useRef(new Set());
   const pendingPromptSendTimersRef = useRef(new Map());
   const terminalFirstVisibleOutputAtRef = useRef(0);
@@ -3486,6 +3487,140 @@ function WorkspaceTerminal({
       });
   }, [paneId]);
 
+  const requestTerminalDragFromEvent = useCallback((event, options = {}) => {
+    const breakoutSurfaceDrag = options?.breakoutSurfaceDrag === true;
+
+    if (
+      terminalClosed
+      || terminalClosing
+      || isFullscreen
+      || event.button !== 0
+      || (breakoutSurfaceDrag && !terminalBreakoutActive)
+      || (!terminalBreakoutActive && terminalCount <= 1)
+    ) {
+      return false;
+    }
+
+    const surfaceElement = surfaceRef.current;
+    const panelElement = surfaceElement?.parentElement || null;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    activateTerminalPane(breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag");
+    requestTerminalAudioInputTarget(true);
+
+    onBeginTerminalDrag?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      paneId,
+      panelRect: getPlainDomRect(panelElement?.getBoundingClientRect?.()),
+      pointerId: event.pointerId,
+      surfaceRect: getPlainDomRect(surfaceElement?.getBoundingClientRect?.()),
+      terminalIndex,
+      workspaceId: workspace?.id || "",
+    });
+
+    return true;
+  }, [
+    activateTerminalPane,
+    isFullscreen,
+    onBeginTerminalDrag,
+    paneId,
+    requestTerminalAudioInputTarget,
+    terminalBreakoutActive,
+    terminalClosed,
+    terminalClosing,
+    terminalCount,
+    terminalIndex,
+    workspace?.id,
+  ]);
+
+  const clearBreakoutSurfaceDragPending = useCallback(() => {
+    const pending = breakoutSurfaceDragPendingRef.current;
+    if (!pending) {
+      return;
+    }
+
+    window.removeEventListener("pointermove", pending.handlePointerMove, true);
+    window.removeEventListener("pointerup", pending.handlePointerEnd, true);
+    window.removeEventListener("pointercancel", pending.handlePointerEnd, true);
+    breakoutSurfaceDragPendingRef.current = null;
+  }, []);
+
+  const beginBreakoutSurfaceDragGesture = useCallback((event) => {
+    if (
+      !terminalBreakoutActive
+      || terminalClosed
+      || terminalClosing
+      || isFullscreen
+      || event.button !== 0
+    ) {
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    clearBreakoutSurfaceDragPending();
+
+    const pending = {
+      handlePointerEnd: null,
+      handlePointerMove: null,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+    };
+
+    pending.handlePointerMove = (pointerEvent) => {
+      if (pointerEvent.pointerId !== pending.pointerId) {
+        return;
+      }
+
+      pointerEvent.preventDefault();
+      pointerEvent.stopPropagation();
+
+      const dragDistance = Math.hypot(
+        pointerEvent.clientX - pending.startClientX,
+        pointerEvent.clientY - pending.startClientY,
+      );
+      if (dragDistance < 4) {
+        return;
+      }
+
+      clearBreakoutSurfaceDragPending();
+      requestTerminalDragFromEvent(pointerEvent, { breakoutSurfaceDrag: true });
+    };
+
+    pending.handlePointerEnd = (pointerEvent) => {
+      if (pointerEvent.pointerId !== pending.pointerId) {
+        return;
+      }
+
+      pointerEvent.preventDefault();
+      pointerEvent.stopPropagation();
+      clearBreakoutSurfaceDragPending();
+      activateTerminalPane("terminal_breakout_pointerup");
+      requestTerminalAudioInputTarget(true);
+    };
+
+    breakoutSurfaceDragPendingRef.current = pending;
+    window.addEventListener("pointermove", pending.handlePointerMove, { capture: true, passive: false });
+    window.addEventListener("pointerup", pending.handlePointerEnd, { capture: true, passive: false });
+    window.addEventListener("pointercancel", pending.handlePointerEnd, { capture: true, passive: false });
+    return true;
+  }, [
+    activateTerminalPane,
+    clearBreakoutSurfaceDragPending,
+    isFullscreen,
+    requestTerminalAudioInputTarget,
+    requestTerminalDragFromEvent,
+    terminalBreakoutActive,
+    terminalClosed,
+    terminalClosing,
+  ]);
+
+  useEffect(() => clearBreakoutSurfaceDragPending, [clearBreakoutSurfaceDragPending]);
+
   const handleTerminalSurfaceFocusCapture = useCallback((event) => {
     if (isTerminalControlEventTarget(event.target)) {
       return;
@@ -3504,6 +3639,14 @@ function WorkspaceTerminal({
       return;
     }
 
+    if (
+      terminalBreakoutActive
+      && beginBreakoutSurfaceDragGesture(event)
+    ) {
+      terminalPointerSelectionPendingRef.current = false;
+      return;
+    }
+
     if (!terminalSelectsOnPointerDown) {
       terminalPointerSelectionPendingRef.current = true;
       return;
@@ -3511,7 +3654,13 @@ function WorkspaceTerminal({
 
     activateTerminalPane("terminal_pointer");
     requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget, terminalSelectsOnPointerDown]);
+  }, [
+    activateTerminalPane,
+    beginBreakoutSurfaceDragGesture,
+    requestTerminalAudioInputTarget,
+    terminalBreakoutActive,
+    terminalSelectsOnPointerDown,
+  ]);
 
   useEffect(() => {
     if (terminalSelectsOnPointerDown) {
@@ -3546,13 +3695,15 @@ function WorkspaceTerminal({
 
     if (isActive) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
+      requestTerminalAudioInputTarget(true);
+      focusTerminalKeyboardInput(true);
       return undefined;
     }
 
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
     requestTerminalAudioInputTarget(false);
     return undefined;
-  }, [isActive, paneId, requestTerminalAudioInputTarget, updateTerminalInteractiveState]);
+  }, [focusTerminalKeyboardInput, isActive, paneId, requestTerminalAudioInputTarget, updateTerminalInteractiveState]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -12501,43 +12652,8 @@ function WorkspaceTerminal({
   ]);
   const handleTerminalCloseButtonClick = threadsViewActive ? toggleTerminalFullscreen : closeTerminal;
   const beginTerminalDrag = useCallback((event) => {
-    if (
-      terminalClosed
-      || terminalClosing
-      || isFullscreen
-      || (!terminalBreakoutActive && terminalCount <= 1)
-      || event.button !== 0
-    ) {
-      return;
-    }
-
-    const surfaceElement = surfaceRef.current;
-    const panelElement = surfaceElement?.parentElement || null;
-
-    event.preventDefault();
-    event.stopPropagation();
-
-    onBeginTerminalDrag?.({
-      clientX: event.clientX,
-      clientY: event.clientY,
-      paneId,
-      panelRect: getPlainDomRect(panelElement?.getBoundingClientRect?.()),
-      pointerId: event.pointerId,
-      surfaceRect: getPlainDomRect(surfaceElement?.getBoundingClientRect?.()),
-      terminalIndex,
-      workspaceId: workspace?.id || "",
-    });
-  }, [
-    isFullscreen,
-    onBeginTerminalDrag,
-    paneId,
-    terminalClosed,
-    terminalClosing,
-    terminalBreakoutActive,
-    terminalCount,
-    terminalIndex,
-    workspace?.id,
-  ]);
+    requestTerminalDragFromEvent(event);
+  }, [requestTerminalDragFromEvent]);
 
   const terminalStatusErrorDetails = [
     workspaceError,
@@ -12620,6 +12736,7 @@ function WorkspaceTerminal({
   const xtermSurface = (
     <XtermSurface
       data-active={terminalFocused ? "true" : "false"}
+      data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
       data-parked={parkedPrompt ? "true" : "false"}
       onDragEnterCapture={handleTerminalRawDragEnterCapture}
@@ -12650,6 +12767,7 @@ function WorkspaceTerminal({
       data-pane-id={paneId}
       data-terminal-fullscreen={isFullscreen ? "true" : undefined}
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}
+      data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-terminal-index={terminalIndex}
       data-threads-view={threadsViewActive ? "true" : undefined}
       data-ui-view={terminalUiViewActive ? "true" : undefined}
@@ -12782,6 +12900,7 @@ function WorkspaceTerminal({
 
       <TerminalFrame
         aria-busy={terminalClosing ? "true" : "false"}
+        data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
         data-state={terminalState}
         data-drop-active={todoDropOverlayTarget ? "true" : "false"}
         onDragEnter={handleTerminalTodoDragEnter}

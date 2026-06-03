@@ -76,27 +76,6 @@ function formatTime(value) {
   });
 }
 
-function formatFullTime(value) {
-  const ms = parseTimeMs(value);
-  if (!ms) return "";
-  return new Date(ms).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
-function formatClockTime(value) {
-  const ms = parseTimeMs(value);
-  if (!ms) return "";
-  return new Date(ms).toLocaleTimeString(undefined, {
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
-
 function parseTimeMs(value) {
   if (value instanceof Date) {
     const ms = value.getTime();
@@ -143,6 +122,22 @@ function formatDurationMs(value) {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
   return `${Math.round(minutes / 60)}h`;
+}
+
+function formatRelativeTimeMs(value, nowMs = Date.now()) {
+  const ms = parseTimeMs(value);
+  if (!ms) return "";
+  const deltaMs = Math.max(0, nowMs - ms);
+  if (deltaMs < 45_000) return "now";
+  const minutes = Math.round(deltaMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(deltaMs / 3_600_000);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.round(deltaMs / 86_400_000);
+  if (days < 14) return `${days}d ago`;
+  const weeks = Math.round(days / 7);
+  if (weeks < 8) return `${weeks}w ago`;
+  return formatTime(ms);
 }
 
 function formatTimelineDuration(startMs, endMs, active) {
@@ -212,6 +207,14 @@ function taskStatusLabel(task) {
   return status || "unknown";
 }
 
+function terminalPlanStatusKind(plan) {
+  const status = text(plan?.status).toLowerCase().replaceAll("_", "-");
+  if (["complete", "completed", "done", "finished", "success"].includes(status)) return "completed";
+  if (["interrupted", "cancelled", "canceled", "stopped"].includes(status)) return "interrupted";
+  if (["blocked"].includes(status)) return "blocked";
+  return status ? "active" : "unknown";
+}
+
 function taskTimelineStatusLabel(task) {
   return TASK_TIMELINE_STATUS_LABELS[taskStatusKind(task)] || TASK_TIMELINE_STATUS_LABELS.unknown;
 }
@@ -221,26 +224,43 @@ function taskIsActive(task) {
 }
 
 function taskDisplayTitle(task) {
+  const metadata = jsonObject(task?.metadata_json || task?.metadata);
   const terminalPlan = taskTerminalPlan(task);
   return text(
     terminalPlan?.title
+      || terminalPlan?.name
       || task?.plan_title
       || task?.planTitle
+      || metadata?.plan_title
+      || metadata?.planTitle
       || task?.title
-      || task?.start_task_plan
-      || task?.body,
-    "Untitled task",
+      || task?.name
+      || metadata?.title
+      || metadata?.name,
+    "Untitled plan",
   );
 }
 
 function taskBody(task) {
   const terminalPlan = taskTerminalPlan(task);
+  const metadata = jsonObject(task?.metadata_json || task?.metadata);
   return text(
     task?.body
       || task?.prompt
+      || task?.input
+      || task?.user_input
+      || task?.userInput
       || task?.description
+      || task?.details
+      || task?.summary
       || task?.request
+      || metadata?.body
+      || metadata?.prompt
+      || metadata?.input
+      || metadata?.user_input
+      || metadata?.userInput
       || terminalPlan?.description
+      || terminalPlan?.detail
       || task?.start_task_plan,
   );
 }
@@ -249,10 +269,102 @@ function taskAgentLabel(task) {
   return text(task?.coding_agent || task?.agent_kind || task?.agent || task?.agent_id);
 }
 
-function timelineTreeText(item) {
-  const depth = Math.max(0, Math.floor(numberValue(item?.lane, 0)));
-  const prefix = Array.from({ length: depth }, () => "|").join(" ");
-  return prefix ? `${prefix} *` : "*";
+function taskRelativeStamp(item) {
+  if (!item) return "";
+  if (item.active) return "live now";
+  const referenceMs = item.endMs || item.updatedMs || item.startMs;
+  return formatRelativeTimeMs(referenceMs) || "unknown";
+}
+
+function addUniqueInputBlock(blocks, label, value) {
+  const content = text(value);
+  if (!content || blocks.some((block) => block.content === content)) return;
+  blocks.push({ content, label });
+}
+
+function taskInputBlocks(task) {
+  const metadata = jsonObject(task?.metadata_json || task?.metadata);
+  const terminalPlan = taskTerminalPlan(task);
+  const blocks = [];
+
+  addUniqueInputBlock(blocks, "Input", task?.input);
+  addUniqueInputBlock(blocks, "Input", task?.user_input);
+  addUniqueInputBlock(blocks, "Input", task?.userInput);
+  addUniqueInputBlock(blocks, "Input", task?.prompt);
+  addUniqueInputBlock(blocks, "Input", task?.body);
+  addUniqueInputBlock(blocks, "Input", task?.request);
+  addUniqueInputBlock(blocks, "Input", task?.description);
+  addUniqueInputBlock(blocks, "Input", metadata?.input);
+  addUniqueInputBlock(blocks, "Input", metadata?.user_input);
+  addUniqueInputBlock(blocks, "Input", metadata?.userInput);
+  addUniqueInputBlock(blocks, "Input", metadata?.prompt);
+  addUniqueInputBlock(blocks, "Input", metadata?.body);
+  addUniqueInputBlock(blocks, "Input", metadata?.request);
+  addUniqueInputBlock(blocks, "Input", terminalPlan?.description);
+
+  addUniqueInputBlock(blocks, "Park resume", task?.parked_prompt);
+  addUniqueInputBlock(blocks, "Park resume", task?.parkedPrompt);
+  addUniqueInputBlock(blocks, "Park resume", task?.parked_resume_input);
+  addUniqueInputBlock(blocks, "Park resume", task?.parkedResumeInput);
+  addUniqueInputBlock(blocks, "Park resume", task?.resume_prompt);
+  addUniqueInputBlock(blocks, "Park resume", task?.resumePrompt);
+  addUniqueInputBlock(blocks, "Park resume", task?.resume_input);
+  addUniqueInputBlock(blocks, "Park resume", task?.resumeInput);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.parked_prompt);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.parkedPrompt);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.parked_resume_input);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.parkedResumeInput);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resume_prompt);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resumePrompt);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resume_input);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resumeInput);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resume_instruction);
+  addUniqueInputBlock(blocks, "Park resume", metadata?.resumeInstruction);
+
+  return blocks;
+}
+
+function planStepStatusKind(step) {
+  const status = text(step?.status || step?.state || step?.phase).toLowerCase().replaceAll("_", "-");
+  if (["complete", "completed", "done", "finished", "success"].includes(status)) return "completed";
+  if (["active", "current", "in-progress", "running", "working", "pending"].includes(status)) return "active";
+  if (["blocked", "interrupted"].includes(status)) return "blocked";
+  if (["skipped"].includes(status)) return "skipped";
+  if (["cancelled", "canceled", "failed", "error"].includes(status)) return "failed";
+  return "queued";
+}
+
+function planStepStatusLabel(step) {
+  const kind = planStepStatusKind(step);
+  if (kind === "completed") return "Done";
+  if (kind === "active") return "Active";
+  if (kind === "blocked") return "Blocked";
+  if (kind === "skipped") return "Skipped";
+  if (kind === "failed") return "Failed";
+  return "Queued";
+}
+
+function planStepTitle(step, index) {
+  return text(
+    step?.title
+      || step?.step
+      || step?.task
+      || step?.objective
+      || (typeof step === "string" ? step : ""),
+    `Step ${index + 1}`,
+  );
+}
+
+function planStepDetail(step) {
+  return text(
+    step?.detail
+      || step?.details
+      || step?.description
+      || step?.done_when
+      || step?.doneWhen
+      || step?.summary
+      || step?.result,
+  );
 }
 
 function buildTimelineItems(tasks) {
@@ -533,50 +645,75 @@ export default function ArchitectureWorkspaceView({
   architectureError = "",
   architectureSnapshot = null,
   architectureState = "idle",
+  rawScanError = "",
+  rawScanSnapshot = null,
+  rawScanState = "idle",
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
   const workspaceName = workspace?.name || "";
   const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
   const [viewMode, setViewMode] = useState("taskHistory");
-  const [rawScan, setRawScan] = useState(null);
-  const [rawScanState, setRawScanState] = useState("idle");
-  const [rawScanError, setRawScanError] = useState("");
-  const taskHistory = useMemo(() => taskHistoryFromSnapshot(architectureSnapshot), [architectureSnapshot]);
+  const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
+  const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
+  const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
+  const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
 
-  const loadRawScan = useCallback((options = {}) => {
+  useEffect(() => {
+    setLocalArchitectureSnapshot(architectureSnapshot);
+  }, [architectureSnapshot]);
+
+  const refreshTaskHistorySnapshot = useCallback(() => {
     if (!repoPath || !workspaceId) {
-      setRawScan(null);
-      setRawScanError("");
-      setRawScanState("idle");
-      return;
+      return Promise.resolve(null);
     }
-    const includeFolderTrace = options?.includeFolderTrace === true;
-    setRawScanState((current) => (includeFolderTrace && current !== "idle" ? "refreshing" : "loading"));
-    setRawScanError("");
-    invoke("terminal_workspace_raw_scan", {
-      includeFolderTrace,
+    return invoke("cloud_mcp_get_task_history", {
       repoPath,
       workspaceId,
       workspaceName,
-    })
-      .then((scan) => {
-        setRawScan(scan);
-        setRawScanState("ready");
-      })
-      .catch((error) => {
-        setRawScanError(error?.message || String(error || "Unable to scan workspace."));
-        setRawScanState("error");
-      });
+    }).then((result) => {
+      setLocalArchitectureSnapshot(result);
+      return result;
+    });
   }, [repoPath, workspaceId, workspaceName]);
 
-  useEffect(() => {
-    if (viewMode === "rawScan") {
-      loadRawScan();
-    }
-  }, [loadRawScan, viewMode]);
+  const finishTerminalTaskPlan = useCallback((item) => {
+    const task = item?.task || null;
+    const terminalPlan = taskTerminalPlan(task);
+    const taskId = text(
+      terminalPlan?.task_id
+        || terminalPlan?.taskId
+        || task?.task_id
+        || task?.id
+        || item?.taskId,
+    );
+    if (!taskId || !repoPath) return;
+
+    setFinishPlanState({ error: "", taskId });
+    invoke("coordination_terminal_task_plan_finish", {
+      repoPath,
+      input: {
+        agent_id: terminalPlan?.agent_id || terminalPlan?.agentId || task?.agent_id || task?.agentId || taskAgentLabel(task),
+        session_id: terminalPlan?.session_id || terminalPlan?.sessionId || task?.session_id || task?.sessionId,
+        task_id: taskId,
+        workspace_id: workspaceId,
+      },
+    })
+      .then(() => refreshTaskHistorySnapshot())
+      .catch((error) => {
+        setFinishPlanState({
+          error: error?.message || String(error || "Unable to finish terminal plan."),
+          taskId: "",
+        });
+      })
+      .finally(() => {
+        setFinishPlanState((current) => (
+          current.taskId === taskId ? { ...current, taskId: "" } : current
+        ));
+      });
+  }, [refreshTaskHistorySnapshot, repoPath, workspaceId]);
 
   return (
     <ArchitectureSurface aria-label={`${workspace?.name || "Workspace"} Architecture`} data-state={architectureState}>
@@ -603,12 +740,17 @@ export default function ArchitectureWorkspaceView({
       {viewMode === "rawScan" ? (
         <RawScanPanel
           error={rawScanError}
-          onRefresh={loadRawScan}
-          scan={rawScan}
+          scan={rawScanSnapshot}
           state={rawScanState}
         />
       ) : (
-        <HistoryTimeline tasks={tasks} repoLabel={repoLabel} />
+        <HistoryTimeline
+          finishPlanError={finishPlanState.error}
+          finishingPlanTaskId={finishPlanState.taskId}
+          onFinishPlan={finishTerminalTaskPlan}
+          tasks={tasks}
+          repoLabel={repoLabel}
+        />
       )}
       {architectureError && (
         <ArchitectureErrorToast aria-live="polite" role="status" title={architectureError}>
@@ -620,7 +762,13 @@ export default function ArchitectureWorkspaceView({
   );
 }
 
-function HistoryTimeline({ tasks, repoLabel }) {
+function HistoryTimeline({
+  finishPlanError = "",
+  finishingPlanTaskId = "",
+  onFinishPlan,
+  repoLabel,
+  tasks,
+}) {
   const timeline = useMemo(() => buildTimelineItems(tasks), [tasks]);
   const [selectedTaskId, setSelectedTaskId] = useState("");
 
@@ -662,12 +810,8 @@ function HistoryTimeline({ tasks, repoLabel }) {
             const finishLabel = item.endMs
               ? formatTime(item.endMs)
               : item.active ? "now" : "not finished";
-            const startClock = formatClockTime(item.startMs) || "unknown";
-            const finishClock = item.endMs
-              ? formatClockTime(item.endMs)
-              : item.active ? "now" : "open";
             const duration = formatTimelineDuration(item.startMs, item.endMs, item.active);
-            const agent = taskAgentLabel(item.task);
+            const relativeStamp = taskRelativeStamp(item);
 
             return (
               <TimelineRow
@@ -687,30 +831,39 @@ function HistoryTimeline({ tasks, repoLabel }) {
                 </TimelineTrack>
                 <TimelineTask>
                   <TimelineTaskLine>
-                    <TimelineTreeText aria-hidden="true">{timelineTreeText(item)}</TimelineTreeText>
                     <TimelineTaskName>{item.label}</TimelineTaskName>
                     <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
                       {item.statusLabel}
                     </StatusPill>
-                    {agent && <TimelineAgent>{agent}</TimelineAgent>}
                   </TimelineTaskLine>
                 </TimelineTask>
                 <TimelineTimes>
-                  <strong>{startClock}</strong>
-                  <span>{finishClock}</span>
+                  <strong>{relativeStamp}</strong>
                   {duration && <em>{duration}</em>}
                 </TimelineTimes>
               </TimelineRow>
             );
           })}
         </TimelineList>
-        <TaskDetailPanel item={selectedItem} repoLabel={repoLabel} />
+        <TaskDetailPanel
+          finishPlanError={finishPlanError}
+          finishingPlanTaskId={finishingPlanTaskId}
+          item={selectedItem}
+          onFinishPlan={onFinishPlan}
+          repoLabel={repoLabel}
+        />
       </HistorySplit>
     </HistoryPane>
   );
 }
 
-function TaskDetailPanel({ item, repoLabel }) {
+function TaskDetailPanel({
+  finishPlanError = "",
+  finishingPlanTaskId = "",
+  item,
+  onFinishPlan,
+  repoLabel,
+}) {
   if (!item) {
     return (
       <TaskDetails>
@@ -721,16 +874,24 @@ function TaskDetailPanel({ item, repoLabel }) {
 
   const task = item.task;
   const terminalPlan = taskTerminalPlan(task);
-  const started = formatFullTime(item.startMs) || "unknown";
-  const finished = item.endMs
-    ? formatFullTime(item.endMs)
-    : item.active ? "now" : "open";
   const duration = formatTimelineDuration(item.startMs, item.endMs, item.active) || "unknown";
   const agent = taskAgentLabel(task) || "unknown";
   const body = taskBody(task);
   const title = item.label;
-  const taskId = text(task?.task_id || task?.id, item.taskId);
+  const relativeStamp = taskRelativeStamp(item);
+  const updatedRelative = formatRelativeTimeMs(item.updatedMs || item.endMs || item.startMs) || relativeStamp;
+  const taskId = text(terminalPlan?.task_id || terminalPlan?.taskId || task?.task_id || task?.id || item.taskId);
+  const planKey = text(terminalPlan?.plan_id || terminalPlan?.planId, taskId);
   const planSteps = jsonArray(terminalPlan?.steps);
+  const planDetail = text(terminalPlan?.description || terminalPlan?.detail || terminalPlan?.summary);
+  const inputBlocks = taskInputBlocks(task);
+  const canFinishPlan = Boolean(
+    terminalPlan
+      && taskId
+      && terminalPlanStatusKind(terminalPlan) !== "completed"
+      && typeof onFinishPlan === "function",
+  );
+  const finishingPlan = finishingPlanTaskId === taskId;
 
   return (
     <TaskDetails aria-label="Selected task details">
@@ -739,82 +900,89 @@ function TaskDetailPanel({ item, repoLabel }) {
           <TimelineKicker>{repoLabel}</TimelineKicker>
           <TaskDetailsTitle>{title}</TaskDetailsTitle>
         </div>
-        <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
-          {item.statusLabel}
-        </StatusPill>
+        <TaskDetailsHeaderActions>
+          <TaskDetailsUpdated>Updated {updatedRelative}</TaskDetailsUpdated>
+          <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
+            {item.statusLabel}
+          </StatusPill>
+          {canFinishPlan && (
+            <FinishPlanButton
+              disabled={finishingPlan}
+              onClick={() => onFinishPlan(item)}
+              type="button"
+            >
+              {finishingPlan ? "Finishing..." : "Finish plan"}
+            </FinishPlanButton>
+          )}
+        </TaskDetailsHeaderActions>
       </TaskDetailsHeader>
-      <TaskFacts>
-        <TaskFact>
-          <span>Actual status</span>
-          <strong>{item.rawStatusLabel}</strong>
-        </TaskFact>
-        <TaskFact>
+      <TaskMetaStrip>
+        <TaskMetaChip>
           <span>Agent</span>
           <strong>{agent}</strong>
-        </TaskFact>
-        <TaskFact>
-          <span>Started</span>
-          <strong>{started}</strong>
-        </TaskFact>
-        <TaskFact>
-          <span>Finished</span>
-          <strong>{finished}</strong>
-        </TaskFact>
-        <TaskFact>
+        </TaskMetaChip>
+        <TaskMetaChip>
           <span>Duration</span>
           <strong>{duration}</strong>
-        </TaskFact>
-      </TaskFacts>
+        </TaskMetaChip>
+      </TaskMetaStrip>
+      <TaskInputPanel>
+        {(inputBlocks.length ? inputBlocks : [{ content: body || "No agent input recorded.", label: "Input" }])
+          .map((block, index) => (
+            <TaskInputBlock key={`${block.label}-${index}-${block.content.slice(0, 24)}`}>
+              <span>{block.label}</span>
+              <p>{block.content}</p>
+            </TaskInputBlock>
+          ))}
+      </TaskInputPanel>
       {terminalPlan && (
         <TaskPlanCard>
           <TaskPlanHeader>
             <span>Terminal plan</span>
             <strong>{text(terminalPlan.title, title)}</strong>
           </TaskPlanHeader>
+          {planDetail && <TaskPlanDescription>{planDetail}</TaskPlanDescription>}
           {planSteps.length > 0 && (
             <TaskPlanSteps>
-              {planSteps.slice(0, 5).map((step, index) => (
-                <li key={`${taskId}-step-${index}`}>
-                  {text(step?.step || step?.title || step, `Step ${index + 1}`)}
-                </li>
-              ))}
+              {planSteps.map((step, index) => {
+                const stepStatus = planStepStatusKind(step);
+                const stepDetail = planStepDetail(step);
+                return (
+                  <TaskPlanStep data-status={stepStatus} key={`${planKey}-step-${text(step?.id || step?.index, index)}`}>
+                    <TaskPlanStepMarker aria-hidden="true" data-status={stepStatus}>
+                      <span />
+                    </TaskPlanStepMarker>
+                    <TaskPlanStepContent>
+                      <TaskPlanStepTitleRow>
+                        <strong>{planStepTitle(step, index)}</strong>
+                        <TaskPlanStepBadge data-status={stepStatus}>{planStepStatusLabel(step)}</TaskPlanStepBadge>
+                      </TaskPlanStepTitleRow>
+                      {stepDetail && <p>{stepDetail}</p>}
+                    </TaskPlanStepContent>
+                  </TaskPlanStep>
+                );
+              })}
             </TaskPlanSteps>
           )}
         </TaskPlanCard>
       )}
-      {body && body !== title && (
-        <TaskBrief>
-          <span>Request</span>
-          <p>{body}</p>
-        </TaskBrief>
-      )}
-      <TaskDetailsFooter>
-        <span>Task id</span>
-        <code>{taskId}</code>
-      </TaskDetailsFooter>
+      {finishPlanError && <TaskActionError>{finishPlanError}</TaskActionError>}
     </TaskDetails>
   );
 }
 
-function RawScanPanel({ error, onRefresh, scan, state }) {
+function RawScanPanel({ error, scan, state }) {
   const graph = useMemo(() => buildRawScanGraph(scan), [scan]);
   const hasGraph = graph.nodes.length > 0;
+  const isLoading = state === "loading";
 
   return (
     <RawShell>
       <RawHeader>
         <div>
-          <RawKicker>Local scan</RawKicker>
-          <RawTitle>{state === "loading" ? "Scanning..." : "Cached workspace graph"}</RawTitle>
+          <RawKicker>Startup cache</RawKicker>
+          <RawTitle>{isLoading ? "Loading cached workspace graph..." : "Cached workspace graph"}</RawTitle>
         </div>
-        <RawActions>
-          <button disabled={state === "loading" || state === "refreshing"} onClick={() => onRefresh()} type="button">
-            Refresh
-          </button>
-          <button disabled={state === "loading" || state === "refreshing"} onClick={() => onRefresh({ includeFolderTrace: true })} type="button">
-            Trace
-          </button>
-        </RawActions>
       </RawHeader>
       {error && <ArchitectureError>{error}</ArchitectureError>}
       <RawGraphStats>
@@ -826,7 +994,7 @@ function RawScanPanel({ error, onRefresh, scan, state }) {
       {hasGraph ? (
         <RawScanGraph graph={graph} />
       ) : (
-        <EmptyState>{state === "loading" ? "Loading workspace graph..." : "No cached workspace graph yet."}</EmptyState>
+        <EmptyState>{isLoading ? "Loading startup workspace graph..." : "No startup workspace graph cached yet."}</EmptyState>
       )}
       <RawDetails>
         <summary>Raw payload</summary>
@@ -1064,21 +1232,38 @@ const HistorySplit = styled.div`
 `;
 
 const TimelineList = styled.div`
-  --timeline-track-width: calc(var(--timeline-lanes) * 14px + 26px);
+  --timeline-lane-gap: 14px;
+  --timeline-line-center: 15px;
+  --timeline-track-width: calc(var(--timeline-lanes) * var(--timeline-lane-gap) + 26px);
   display: grid;
   align-content: start;
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: auto;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
+
+  &::before {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 14px;
+    z-index: 1;
+    width: 2px;
+    border-radius: 2px;
+    background: linear-gradient(180deg, rgba(71, 85, 105, 0.3), rgba(96, 165, 250, 0.58), rgba(71, 85, 105, 0.3));
+    content: "";
+    pointer-events: none;
+  }
 `;
 
 const TimelineRow = styled.button`
   display: grid;
-  grid-template-columns: var(--timeline-track-width) minmax(0, 1fr) minmax(92px, 128px);
+  grid-template-columns: var(--timeline-track-width) minmax(0, 1fr) minmax(78px, 104px);
+  position: relative;
   width: 100%;
   min-width: 0;
-  min-height: 44px;
+  min-height: 36px;
   padding: 0;
   border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
@@ -1141,12 +1326,16 @@ const TimelineRow = styled.button`
 `;
 
 const TimelineTrack = styled.div`
-  --timeline-lane-x: calc(14px + var(--timeline-lane) * 14px);
+  --timeline-lane-x: calc(var(--timeline-line-center) + var(--timeline-lane) * var(--timeline-lane-gap));
+  align-self: stretch;
   position: relative;
+  height: 100%;
   min-width: 0;
+  min-height: 36px;
 
   span {
     position: absolute;
+    z-index: 2;
     display: block;
     pointer-events: none;
   }
@@ -1161,33 +1350,38 @@ const TimelineTrack = styled.div`
   }
 
   [data-part="trunk"] {
-    left: 14px;
+    left: calc(var(--timeline-line-center) - 1px);
+    background: transparent;
   }
 
   [data-part="lane"] {
-    left: var(--timeline-lane-x);
+    left: calc(var(--timeline-lane-x) - 1px);
     background: linear-gradient(180deg, rgba(96, 165, 250, 0.12), rgba(96, 165, 250, 0.56), rgba(96, 165, 250, 0.12));
   }
 
   [data-part="connector"] {
-    top: calc(50% - 11px);
-    left: 14px;
-    width: calc(var(--timeline-lane) * 14px);
-    height: 12px;
+    top: 50%;
+    left: var(--timeline-line-center);
+    width: calc(var(--timeline-lane) * var(--timeline-lane-gap));
+    height: 0;
     border-bottom: 2px solid rgba(96, 165, 250, 0.5);
     border-left: 2px solid rgba(96, 165, 250, 0.24);
     border-bottom-left-radius: 14px;
+    transform: translateY(-1px);
   }
 
   [data-part="dot"] {
-    top: calc(50% - 6px);
-    left: calc(var(--timeline-lane-x) - 6px);
+    top: 50%;
+    left: var(--timeline-lane-x);
+    z-index: 3;
     width: 12px;
     height: 12px;
     border: 2px solid rgba(15, 23, 42, 0.96);
     border-radius: 50%;
+    box-sizing: border-box;
     background: #93c5fd;
     box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.5);
+    transform: translate(-50%, -50%);
   }
 
   ${TimelineRow}[data-status="done"] & [data-part="dot"] {
@@ -1233,7 +1427,7 @@ const TimelineTask = styled.div`
   display: grid;
   align-content: center;
   min-width: 0;
-  padding: 7px 10px 7px 0;
+  padding: 5px 10px 5px 0;
 `;
 
 const TimelineTaskLine = styled.div`
@@ -1241,15 +1435,6 @@ const TimelineTaskLine = styled.div`
   align-items: center;
   gap: 7px;
   min-width: 0;
-`;
-
-const TimelineTreeText = styled.span`
-  flex: 0 0 auto;
-  min-width: 22px;
-  color: rgba(147, 197, 253, 0.68);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 10px;
-  font-weight: 820;
 `;
 
 const TimelineTaskName = styled.strong`
@@ -1262,80 +1447,71 @@ const TimelineTaskName = styled.strong`
   line-height: 1.25;
 `;
 
-const TimelineAgent = styled.span`
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--forge-text-muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 10px;
-  font-weight: 780;
-`;
-
 const StatusPill = styled.span`
   flex: 0 0 auto;
-  padding: 3px 7px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 7px;
-  color: var(--forge-text-muted);
-  font-size: 10px;
-  font-weight: 850;
+  padding: 2px 5px;
+  border: 1px solid rgba(148, 163, 184, 0.11);
+  border-radius: 6px;
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 8px;
+  font-weight: 820;
+  line-height: 1.05;
   text-transform: uppercase;
 
   &[data-status="done"] {
-    border-color: rgba(52, 211, 153, 0.28);
-    color: #a7f3d0;
-    background: rgba(6, 78, 59, 0.2);
+    border-color: rgba(52, 211, 153, 0.16);
+    color: rgba(167, 243, 208, 0.72);
+    background: rgba(6, 78, 59, 0.11);
   }
 
   &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.32);
-    color: #bfdbfe;
-    background: rgba(30, 64, 175, 0.2);
+    border-color: rgba(96, 165, 250, 0.18);
+    color: rgba(191, 219, 254, 0.74);
+    background: rgba(30, 64, 175, 0.12);
   }
 
   &[data-status="queued"] {
-    border-color: rgba(56, 189, 248, 0.3);
-    color: #bae6fd;
-    background: rgba(8, 47, 73, 0.2);
+    border-color: rgba(56, 189, 248, 0.16);
+    color: rgba(186, 230, 253, 0.72);
+    background: rgba(8, 47, 73, 0.11);
   }
 
   &[data-status="blocked"] {
-    border-color: rgba(249, 115, 22, 0.32);
-    color: #fed7aa;
-    background: rgba(124, 45, 18, 0.2);
+    border-color: rgba(249, 115, 22, 0.18);
+    color: rgba(254, 215, 170, 0.74);
+    background: rgba(124, 45, 18, 0.12);
   }
 
   &[data-status="parked"] {
-    border-color: rgba(245, 158, 11, 0.3);
-    color: #fde68a;
-    background: rgba(120, 53, 15, 0.18);
+    border-color: rgba(245, 158, 11, 0.17);
+    color: rgba(253, 230, 138, 0.72);
+    background: rgba(120, 53, 15, 0.11);
   }
 
   &[data-status="failed"],
   &[data-status="interrupted"],
   &[data-status="rolled-back"] {
-    border-color: rgba(251, 113, 133, 0.3);
-    color: #fecdd3;
-    background: rgba(127, 29, 29, 0.18);
+    border-color: rgba(251, 113, 133, 0.18);
+    color: rgba(254, 205, 211, 0.72);
+    background: rgba(127, 29, 29, 0.11);
   }
 
   &[data-status="cancelled"],
   &[data-status="skipped"] {
-    border-color: rgba(148, 163, 184, 0.22);
-    color: #cbd5e1;
-    background: rgba(51, 65, 85, 0.18);
+    border-color: rgba(148, 163, 184, 0.14);
+    color: rgba(203, 213, 225, 0.66);
+    background: rgba(51, 65, 85, 0.1);
   }
 `;
 
 const TimelineTimes = styled.div`
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
+  gap: 1px;
   min-width: 0;
-  padding: 7px 0 7px 10px;
+  padding: 5px 0 5px 8px;
   color: var(--forge-text-muted);
   font-size: 10px;
   font-weight: 760;
@@ -1346,6 +1522,7 @@ const TimelineTimes = styled.div`
     color: var(--forge-text);
     font-size: 10px;
     font-weight: 850;
+    line-height: 1.15;
   }
 
   span,
@@ -1359,6 +1536,7 @@ const TimelineTimes = styled.div`
 
   em {
     color: rgba(148, 163, 184, 0.78);
+    font-size: 9px;
     font-style: normal;
   }
 
@@ -1373,7 +1551,7 @@ const TimelineTimes = styled.div`
 const TaskDetails = styled.aside`
   display: grid;
   align-content: start;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -1391,6 +1569,48 @@ const TaskDetailsHeader = styled.header`
   min-width: 0;
 `;
 
+const TaskDetailsHeaderActions = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+`;
+
+const TaskDetailsUpdated = styled.span`
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 10px;
+  font-weight: 760;
+  white-space: nowrap;
+`;
+
+const FinishPlanButton = styled.button`
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  border-radius: 7px;
+  color: rgba(191, 219, 254, 0.84);
+  background: rgba(30, 64, 175, 0.14);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 850;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(96, 165, 250, 0.3);
+    color: rgba(219, 234, 254, 0.94);
+    background: rgba(37, 99, 235, 0.2);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
+`;
+
 const TaskDetailsTitle = styled.strong`
   display: block;
   min-width: 0;
@@ -1401,28 +1621,27 @@ const TaskDetailsTitle = styled.strong`
   line-height: 1.25;
 `;
 
-const TaskFacts = styled.div`
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-
-  @media (max-width: 560px) {
-    grid-template-columns: 1fr;
-  }
+const TaskMetaStrip = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
 `;
 
-const TaskFact = styled.div`
-  display: grid;
-  gap: 4px;
+const TaskMetaChip = styled.div`
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   min-width: 0;
-  padding: 9px 10px;
+  max-width: 100%;
+  padding: 5px 8px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 8px;
-  background: rgba(2, 6, 23, 0.34);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.24);
 
   span {
     color: var(--forge-text-muted);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 900;
     text-transform: uppercase;
   }
@@ -1433,16 +1652,16 @@ const TaskFact = styled.div`
     color: var(--forge-text);
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 11px;
+    font-size: 10px;
     font-weight: 820;
   }
 `;
 
 const TaskPlanCard = styled.div`
   display: grid;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
-  padding: 11px;
+  padding: 10px;
   border: 1px solid rgba(96, 165, 250, 0.18);
   border-radius: 8px;
   background: rgba(30, 64, 175, 0.12);
@@ -1471,25 +1690,165 @@ const TaskPlanHeader = styled.div`
   }
 `;
 
+const TaskPlanDescription = styled.p`
+  margin: -2px 0 0;
+  color: rgba(203, 213, 225, 0.78);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.38;
+`;
+
 const TaskPlanSteps = styled.ol`
   display: grid;
-  gap: 6px;
+  gap: 5px;
   margin: 0;
-  padding-left: 18px;
-  color: rgba(203, 213, 225, 0.82);
-  font-size: 11px;
-  font-weight: 720;
-  line-height: 1.35;
+  padding: 0;
+  list-style: none;
+`;
 
-  li {
-    padding-left: 2px;
+const TaskPlanStep = styled.li`
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.2);
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.18);
+    background: rgba(37, 99, 235, 0.11);
+  }
+
+  &[data-status="completed"] {
+    border-color: rgba(52, 211, 153, 0.16);
+    background: rgba(6, 78, 59, 0.11);
+  }
+
+  &[data-status="blocked"],
+  &[data-status="failed"] {
+    border-color: rgba(251, 113, 133, 0.18);
+    background: rgba(127, 29, 29, 0.12);
   }
 `;
 
-const TaskBrief = styled.div`
+const TaskPlanStepMarker = styled.span`
   display: grid;
-  gap: 6px;
+  position: relative;
+  place-items: center;
+  min-height: 20px;
+
+  span {
+    display: block;
+    width: 9px;
+    height: 9px;
+    border: 2px solid rgba(15, 23, 42, 0.96);
+    border-radius: 50%;
+    background: #94a3b8;
+    box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.36);
+  }
+
+  &[data-status="completed"] span {
+    background: #34d399;
+    box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.42);
+  }
+
+  &[data-status="active"] span {
+    background: #60a5fa;
+    box-shadow:
+      0 0 0 1px rgba(96, 165, 250, 0.5),
+      0 0 14px rgba(96, 165, 250, 0.28);
+  }
+
+  &[data-status="blocked"] span,
+  &[data-status="failed"] span {
+    background: #fb7185;
+    box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.45);
+  }
+
+  &[data-status="skipped"] span {
+    background: #64748b;
+  }
+`;
+
+const TaskPlanStepContent = styled.div`
+  display: grid;
+  gap: 3px;
   min-width: 0;
+
+  p {
+    margin: 0;
+    color: rgba(203, 213, 225, 0.72);
+    font-size: 10px;
+    font-weight: 690;
+    line-height: 1.34;
+    overflow-wrap: anywhere;
+  }
+`;
+
+const TaskPlanStepTitleRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+
+  strong {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(241, 245, 249, 0.94);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 800;
+  }
+`;
+
+const TaskPlanStepBadge = styled.span`
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.72);
+  font-size: 8px;
+  font-weight: 900;
+  text-transform: uppercase;
+
+  &[data-status="completed"] {
+    border-color: rgba(52, 211, 153, 0.24);
+    color: #a7f3d0;
+    background: rgba(6, 78, 59, 0.18);
+  }
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.28);
+    color: #bfdbfe;
+    background: rgba(30, 64, 175, 0.2);
+  }
+
+  &[data-status="blocked"],
+  &[data-status="failed"] {
+    border-color: rgba(251, 113, 133, 0.24);
+    color: #fecdd3;
+    background: rgba(127, 29, 29, 0.18);
+  }
+`;
+
+const TaskInputPanel = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+`;
+
+const TaskInputBlock = styled.div`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.22);
 
   span {
     color: var(--forge-text-muted);
@@ -1499,38 +1858,27 @@ const TaskBrief = styled.div`
   }
 
   p {
-    max-height: 110px;
+    max-height: 116px;
     margin: 0;
     overflow: auto;
     color: rgba(203, 213, 225, 0.84);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 700;
-    line-height: 1.45;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
   }
 `;
 
-const TaskDetailsFooter = styled.div`
-  display: grid;
-  gap: 5px;
-  min-width: 0;
-  padding-top: 2px;
-
-  span {
-    color: var(--forge-text-muted);
-    font-size: 10px;
-    font-weight: 900;
-    text-transform: uppercase;
-  }
-
-  code {
-    min-width: 0;
-    overflow: hidden;
-    color: rgba(191, 219, 254, 0.86);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    font-size: 11px;
-  }
+const TaskActionError = styled.div`
+  padding: 8px 10px;
+  border: 1px solid rgba(248, 113, 113, 0.22);
+  border-radius: 8px;
+  color: rgba(254, 202, 202, 0.92);
+  background: rgba(127, 29, 29, 0.12);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 `;
 
 const RawShell = styled.div`
@@ -1561,29 +1909,6 @@ const RawTitle = styled.strong`
   display: block;
   margin-top: 3px;
   font-size: 16px;
-`;
-
-const RawActions = styled.div`
-  display: flex;
-  gap: 8px;
-
-  button {
-    min-height: 32px;
-    padding: 0 10px;
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    border-radius: 8px;
-    color: var(--forge-text);
-    background: rgba(15, 23, 42, 0.54);
-    font: inherit;
-    font-size: 12px;
-    font-weight: 850;
-    cursor: pointer;
-  }
-
-  button:disabled {
-    cursor: wait;
-    opacity: 0.62;
-  }
 `;
 
 const RawGraphStats = styled.div`

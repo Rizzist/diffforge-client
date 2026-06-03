@@ -1428,17 +1428,6 @@ async fn terminal_workspace_topology_scan_for_launch(
     .await
 }
 
-fn terminal_raw_scan_project_kind_for_root(
-    path: &Path,
-    selected_root: bool,
-) -> Option<&'static str> {
-    if selected_root {
-        workspace_project_kind_for_selected_root(path).map(WorkspaceProjectKind::as_str)
-    } else {
-        workspace_project_kind_for_root(path).map(WorkspaceProjectKind::as_str)
-    }
-}
-
 fn terminal_raw_scan_folder_row(
     workspace_root: &Path,
     path: &Path,
@@ -1449,11 +1438,9 @@ fn terminal_raw_scan_folder_row(
     mount: Option<&WorkspaceProjectMount>,
 ) -> Value {
     let relative_path = child_relative_path(workspace_root, path).unwrap_or_default();
-    let project_kind = if skipped {
-        None
-    } else {
-        terminal_raw_scan_project_kind_for_root(path, selected_root)
-    };
+    let project_kind = mount
+        .map(|mount| mount.project_kind.as_str())
+        .unwrap_or("none");
     json!({
         "relativePath": relative_path,
         "path": workspace_path_display(path),
@@ -1462,177 +1449,15 @@ fn terminal_raw_scan_folder_row(
         "scanAction": scan_action,
         "selectedRoot": selected_root,
         "skipped": skipped,
-        "projectKind": project_kind.unwrap_or("none"),
+        "projectKind": if skipped { "none" } else { project_kind },
         "mountId": mount.map(|mount| mount.mount_id.clone()).unwrap_or_default(),
         "mountKind": mount.map(|mount| mount.mount_kind.clone()).unwrap_or_default(),
         "projectName": mount.map(|mount| mount.project_name.clone()).unwrap_or_default(),
-        "hasGitMarker": workspace_has_git_marker(path),
-        "isExactGitRoot": workspace_is_exact_git_root(path),
-        "hasProjectMarker": workspace_has_project_marker(path),
-        "hasAgents": path.join(".agents").is_dir(),
-        "hasSpecGraphCache": path.join(".agents").join("spec-graph").is_dir(),
-    })
-}
-
-fn terminal_raw_scan_folder_trace(
-    workspace_root: &Path,
-    mounts: &[WorkspaceProjectMount],
-) -> Value {
-    const TERMINAL_RAW_SCAN_MAX_FOLDERS: usize = 512;
-
-    let workspace_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let workspace_root_key = normalized_path_key(&workspace_root);
-    let mount_by_key = mounts
-        .iter()
-        .map(|mount| (normalized_path_key(&mount.root_path), mount))
-        .collect::<HashMap<_, _>>();
-    let mut entries = Vec::new();
-    let mut queue = VecDeque::new();
-    let mut seen = HashSet::new();
-    let mut truncated = false;
-    let mut unreadable_entries = 0usize;
-
-    entries.push(terminal_raw_scan_folder_row(
-        &workspace_root,
-        &workspace_root,
-        0,
-        "selected_root",
-        true,
-        false,
-        mount_by_key.get(&workspace_root_key).copied(),
-    ));
-    queue.push_back((workspace_root.clone(), 0usize));
-    seen.insert(workspace_root_key);
-
-    while let Some((directory, depth)) = queue.pop_front() {
-        let read_dir = match fs::read_dir(&directory) {
-            Ok(read_dir) => read_dir,
-            Err(_) => {
-                unreadable_entries += 1;
-                continue;
-            }
-        };
-
-        for entry in read_dir {
-            if entries.len() >= TERMINAL_RAW_SCAN_MAX_FOLDERS {
-                truncated = true;
-                break;
-            }
-
-            let Ok(entry) = entry else {
-                unreadable_entries += 1;
-                continue;
-            };
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default();
-            let Ok(metadata) = fs::symlink_metadata(&path) else {
-                unreadable_entries += 1;
-                continue;
-            };
-            if metadata.file_type().is_symlink() {
-                entries.push(json!({
-                    "relativePath": child_relative_path(&workspace_root, &path).unwrap_or_default(),
-                    "path": workspace_path_display(&path),
-                    "depth": depth + 1,
-                    "entryKind": "symlink",
-                    "scanAction": "ignored_symlink",
-                    "selectedRoot": false,
-                    "skipped": true,
-                    "projectKind": "none",
-                    "mountId": "",
-                    "mountKind": "",
-                    "projectName": "",
-                    "hasGitMarker": false,
-                    "isExactGitRoot": false,
-                    "hasProjectMarker": false,
-                    "hasAgents": false,
-                    "hasSpecGraphCache": false,
-                }));
-                continue;
-            }
-            if !metadata.is_dir() {
-                continue;
-            }
-
-            let skipped = workspace_project_mount_skip_name(name);
-            let Ok(canonical) = path.canonicalize() else {
-                unreadable_entries += 1;
-                continue;
-            };
-            if !canonical.starts_with(&workspace_root) {
-                entries.push(json!({
-                    "relativePath": child_relative_path(&workspace_root, &canonical).unwrap_or_default(),
-                    "path": workspace_path_display(&canonical),
-                    "depth": depth + 1,
-                    "entryKind": "directory",
-                    "scanAction": "ignored_outside_workspace",
-                    "selectedRoot": false,
-                    "skipped": true,
-                    "projectKind": "none",
-                    "mountId": "",
-                    "mountKind": "",
-                    "projectName": "",
-                    "hasGitMarker": workspace_has_git_marker(&canonical),
-                    "isExactGitRoot": false,
-                    "hasProjectMarker": false,
-                    "hasAgents": false,
-                    "hasSpecGraphCache": false,
-                }));
-                continue;
-            }
-
-            let key = normalized_path_key(&canonical);
-            let mount = mount_by_key.get(&key).copied();
-            let project_kind = if skipped {
-                None
-            } else {
-                workspace_project_kind_for_root(&canonical)
-            };
-            let scan_action = if skipped {
-                "skipped_by_mount_scan"
-            } else if mount.is_some() || project_kind.is_some() {
-                "detected_mount"
-            } else if depth + 1 < WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH {
-                "queued"
-            } else {
-                "max_depth"
-            };
-
-            entries.push(terminal_raw_scan_folder_row(
-                &workspace_root,
-                &canonical,
-                depth + 1,
-                scan_action,
-                false,
-                skipped,
-                mount,
-            ));
-
-            if !skipped
-                && mount.is_none()
-                && project_kind.is_none()
-                && depth + 1 < WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH
-                && seen.insert(key)
-            {
-                queue.push_back((canonical, depth + 1));
-            }
-        }
-
-        if truncated {
-            break;
-        }
-    }
-
-    json!({
-        "entries": entries,
-        "truncated": truncated,
-        "maxEntries": TERMINAL_RAW_SCAN_MAX_FOLDERS,
-        "unreadableEntries": unreadable_entries,
+        "hasGitMarker": mount.map(|mount| mount.has_git).unwrap_or(false),
+        "isExactGitRoot": selected_root && mount.map(|mount| mount.has_git).unwrap_or(false),
+        "hasProjectMarker": mount.is_some(),
+        "hasAgents": mount.map(|mount| mount.has_agents).unwrap_or(false),
+        "hasSpecGraphCache": mount.map(|mount| mount.has_spec_graph_cache).unwrap_or(false),
     })
 }
 
@@ -1687,6 +1512,7 @@ fn terminal_raw_scan_cached_folder_trace(
 fn terminal_raw_scan_launch_targets(
     workspace_root: &Path,
     mounts: &[WorkspaceProjectMount],
+    selected_root_empty_for_git_bootstrap: bool,
 ) -> Vec<Value> {
     [
         TerminalSessionMode::General,
@@ -1701,11 +1527,11 @@ fn terminal_raw_scan_launch_targets(
         match terminal_coordination_launch_target_with_mounts(
             workspace_root,
             Some(mounts),
-            None,
-            None,
-            workspace_directory_is_empty_for_git_bootstrap(workspace_root),
-            mode,
-        ) {
+                None,
+                None,
+                selected_root_empty_for_git_bootstrap,
+                mode,
+            ) {
             Ok(target) => json!({
                 "sessionMode": mode.as_str(),
                 "fileAuthority": mode.file_authority(),
@@ -1732,49 +1558,44 @@ async fn terminal_workspace_raw_scan(
     repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
-    include_folder_trace: Option<bool>,
+    _include_folder_trace: Option<bool>,
 ) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace raw scan")?;
     let requested_repo_path = repo_path.clone();
     let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
-    let live_folder_trace = include_folder_trace.unwrap_or(false);
-    let topology = if live_folder_trace {
-        terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
-    } else {
-        terminal_workspace_topology_cached_scan(
-            &state.workspace_topology_cache,
-            &workspace_root,
-            terminal_now_ms(),
-        )
-        .await
-    };
+    let topology = terminal_workspace_topology_cached_scan(
+        &state.workspace_topology_cache,
+        &workspace_root,
+        terminal_now_ms(),
+    )
+    .await;
     let workspace_kind = workspace_kind_for_mounts(&workspace_root, &topology.mounts);
     let active_project_root = workspace_active_project_root_for_mounts(&topology.mounts);
     let workspace_mounts = workspace_mount_manifest_from_projects(&workspace_root, &topology.mounts);
     let selected_root_mount = workspace_selected_root_mount(&workspace_root, &topology.mounts).cloned();
-    let selected_project_kind =
-        terminal_raw_scan_project_kind_for_root(&workspace_root, true).unwrap_or("none");
-    let git_top_level = workspace_git_top_level(&workspace_root)
-        .map(|path| workspace_path_display(&path))
+    let selected_project_kind = selected_root_mount
+        .as_ref()
+        .map(|mount| mount.project_kind.as_str())
+        .unwrap_or("none");
+    let selected_root_has_git = selected_root_mount
+        .as_ref()
+        .map(|mount| mount.has_git)
+        .unwrap_or(false);
+    let git_top_level = selected_root_mount
+        .as_ref()
+        .filter(|mount| mount.has_git)
+        .map(|mount| mount.project_root.clone())
         .unwrap_or_default();
-    let launch_targets = terminal_raw_scan_launch_targets(&workspace_root, &topology.mounts);
+    let launch_targets = terminal_raw_scan_launch_targets(&workspace_root, &topology.mounts, false);
     let folder_trace_root = workspace_root.clone();
     let folder_trace_mounts = topology.mounts.clone();
-    let folder_trace = if live_folder_trace {
-        tauri::async_runtime::spawn_blocking(move || {
-            terminal_raw_scan_folder_trace(&folder_trace_root, &folder_trace_mounts)
-        })
-        .await
-        .map_err(|error| format!("Unable to join workspace raw scan worker: {error}"))?
-    } else {
-        terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts)
-    };
+    let folder_trace = terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts);
     let generated_at_ms = terminal_now_ms();
     let cache_age_ms = generated_at_ms.saturating_sub(topology.scanned_ms);
 
     Ok(json!({
         "generatedAtMs": generated_at_ms,
-        "scanMode": if live_folder_trace { "live_folder_trace" } else { "cached_topology" },
+        "scanMode": "cached_topology",
         "requestedRepoPath": requested_repo_path,
         "workspaceId": workspace_id.unwrap_or_default(),
         "workspaceName": workspace_name.unwrap_or_default(),
@@ -1783,11 +1604,11 @@ async fn terminal_workspace_raw_scan(
         "activeProjectRoot": active_project_root.unwrap_or_default(),
         "selectedRoot": {
             "projectKind": selected_project_kind,
-            "exactGitRoot": workspace_is_exact_git_root(&workspace_root),
+            "exactGitRoot": selected_root_has_git,
             "gitTopLevel": git_top_level,
             "broadArea": workspace_root_is_broad_area(&workspace_root, &topology.mounts),
-            "emptyDirectory": workspace_directory_is_empty(&workspace_root),
-            "emptyForGitBootstrap": workspace_directory_is_empty_for_git_bootstrap(&workspace_root),
+            "emptyDirectory": false,
+            "emptyForGitBootstrap": false,
             "mount": selected_root_mount,
         },
         "cache": {

@@ -3410,6 +3410,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_get_snapshot,
             coordination::tauri_commands::coordination_terminal_task_plan_snapshot,
             coordination::tauri_commands::coordination_terminal_task_plan_edit_step_title,
+            coordination::tauri_commands::coordination_terminal_task_plan_finish,
             coordination::tauri_commands::coordination_log_ui_surface_event,
             coordination::tauri_commands::coordination_cleanup_bloat_dry_run,
             coordination::tauri_commands::coordination_start_file_watcher,

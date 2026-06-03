@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
+import styled from "styled-components";
 
 import {
   ButtonHubIcon,
@@ -1219,20 +1220,6 @@ export default function McpsWorkspaceView({
             : "Add a global source to discover MCPs."}
         </McpEmptyAccess>
       )}
-      <McpInlineActions>
-        {editorMode !== EDITOR_MANUAL && (
-          <button
-            disabled={actionState !== "idle"}
-            onClick={() => {
-              setEditorMode(EDITOR_MANUAL);
-              setView(VIEW_DISCOVER);
-            }}
-            type="button"
-          >
-            Manual MCP
-          </button>
-        )}
-      </McpInlineActions>
     </McpServerList>
   );
 
@@ -1975,6 +1962,20 @@ export default function McpsWorkspaceView({
               Sources
             </McpTransportButton>
           </McpTransportTabs>
+          {view === VIEW_DISCOVER && editorMode !== EDITOR_MANUAL && (
+            <McpRegistryActionBar>
+              <button
+                disabled={isBusy}
+                onClick={() => {
+                  setEditorMode(EDITOR_MANUAL);
+                  setView(VIEW_DISCOVER);
+                }}
+                type="button"
+              >
+                Manual MCP
+              </button>
+            </McpRegistryActionBar>
+          )}
           {view === VIEW_INSTALLED && renderInstalledList()}
           {view === VIEW_DISCOVER && renderDiscoverList()}
           {view === VIEW_MARKETPLACES && renderMarketplaceList()}
@@ -1995,3 +1996,38 @@ export default function McpsWorkspaceView({
     </McpWorkspaceSurface>
   );
 }
+
+const McpRegistryActionBar = styled.div`
+  display: flex;
+  min-width: 0;
+  justify-content: flex-start;
+
+  button {
+    display: inline-flex;
+    min-height: 32px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 10px;
+    border: 1px solid var(--forge-border);
+    border-radius: 7px;
+    color: var(--forge-text-soft);
+    background: rgba(21, 27, 35, 0.72);
+    font-size: 10px;
+    font-weight: 900;
+    white-space: nowrap;
+  }
+
+  button:hover:not(:disabled) {
+    border-color: rgba(125, 160, 205, 0.34);
+    color: var(--forge-text);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+
+  html[data-forge-theme="light"] & button {
+    background: var(--forge-surface);
+  }
+`;

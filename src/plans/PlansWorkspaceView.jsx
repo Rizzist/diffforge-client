@@ -2,12 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import { FormMessage } from "../app/appStyles";
 
 const TERMINAL_TASK_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
+const PLAN_SNAPSHOT_CACHE_LIMIT = 80;
+const planSnapshotCache = new Map();
 
 const EMPTY_TARGET = Object.freeze({
   agentId: "",
@@ -32,6 +34,70 @@ function cleanText(value) {
 function pathIdentity(value) {
   const cleaned = cleanText(value).replace(/\\/g, "/");
   return cleaned === "/" ? cleaned : cleaned.replace(/\/+$/g, "").toLowerCase();
+}
+
+function planSnapshotCacheKey({
+  agentId = "",
+  dbPath = "",
+  repoPath = "",
+  sessionId = "",
+  taskId = "",
+  workspaceId = "",
+}) {
+  const scope = [
+    cleanText(workspaceId),
+    pathIdentity(repoPath),
+    pathIdentity(dbPath),
+  ].join("|");
+  const target = [
+    cleanText(taskId),
+    cleanText(sessionId),
+    cleanText(agentId),
+  ].join("|");
+  return `${scope}|${target}`;
+}
+
+function planSnapshotRepoCacheKey({ dbPath = "", repoPath = "", workspaceId = "" }) {
+  return [
+    cleanText(workspaceId),
+    pathIdentity(repoPath),
+    pathIdentity(dbPath),
+    "repo",
+  ].join("|");
+}
+
+function trimPlanSnapshotCache() {
+  while (planSnapshotCache.size > PLAN_SNAPSHOT_CACHE_LIMIT) {
+    const oldestKey = planSnapshotCache.keys().next().value;
+    if (!oldestKey) return;
+    planSnapshotCache.delete(oldestKey);
+  }
+}
+
+function cachePlanSnapshot(keys, snapshot) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return;
+  }
+  if (keys?.exact) {
+    planSnapshotCache.delete(keys.exact);
+    planSnapshotCache.set(keys.exact, snapshot);
+  }
+  if (keys?.repo) {
+    planSnapshotCache.delete(keys.repo);
+    planSnapshotCache.set(keys.repo, snapshot);
+  }
+  trimPlanSnapshotCache();
+}
+
+function cachedPlanSnapshot(keys) {
+  if (!keys) return null;
+  if (keys.exact && planSnapshotCache.has(keys.exact)) {
+    return planSnapshotCache.get(keys.exact);
+  }
+  if (keys.repo && planSnapshotCache.has(keys.repo)) {
+    return planSnapshotCache.get(keys.repo);
+  }
+  return null;
 }
 
 function normalizeRepoTarget(value) {
@@ -70,6 +136,12 @@ function dedupeRepoTargets(targets) {
       seen.add(key);
       return true;
     });
+}
+
+function initialSelectedRepoPath(repoTargets, rootDirectory, target) {
+  const preferred = cleanText(target?.repoPath || rootDirectory);
+  if (preferred) return preferred;
+  return dedupeRepoTargets(repoTargets)[0]?.repoPath || "";
 }
 
 function stepStatusLabel(status) {
@@ -210,14 +282,17 @@ export default function PlansWorkspaceView({
   selectedTerminal = EMPTY_TARGET,
   workspace,
 }) {
+  const target = selectedTerminal || EMPTY_TARGET;
+  const [selectedRepoPath, setSelectedRepoPath] = useState(() => (
+    initialSelectedRepoPath(repoTargets, rootDirectory, target)
+  ));
   const [snapshot, setSnapshot] = useState(null);
   const [error, setError] = useState("");
   const [editingStepIndex, setEditingStepIndex] = useState(null);
   const [editingTitle, setEditingTitle] = useState("");
-  const [selectedRepoPath, setSelectedRepoPath] = useState("");
   const [savingStepIndex, setSavingStepIndex] = useState(null);
+  const snapshotRequestKeyRef = useRef("");
 
-  const target = selectedTerminal || EMPTY_TARGET;
   const normalizedRepoTargets = useMemo(() => {
     const targets = dedupeRepoTargets(repoTargets);
     if (targets.length) {
@@ -254,6 +329,30 @@ export default function PlansWorkspaceView({
   const snapshotAgentId = targetMatchesActiveRepo ? target.agentId || "" : "";
   const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
   const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
+  const workspaceId = target.workspaceId || workspace?.id || "";
+  const snapshotCacheKeys = useMemo(() => ({
+    exact: planSnapshotCacheKey({
+      agentId: snapshotAgentId,
+      dbPath: activeDbPath,
+      repoPath: activeRepoPath,
+      sessionId: snapshotSessionId,
+      taskId: snapshotTaskId,
+      workspaceId,
+    }),
+    repo: planSnapshotRepoCacheKey({
+      dbPath: activeDbPath,
+      repoPath: activeRepoPath,
+      workspaceId,
+    }),
+  }), [
+    activeDbPath,
+    activeRepoPath,
+    snapshotAgentId,
+    snapshotSessionId,
+    snapshotTaskId,
+    workspaceId,
+  ]);
+  const activeSnapshotRequestKey = snapshotCacheKeys.exact || snapshotCacheKeys.repo || "";
   const selectedPlan = snapshot?.selected_plan || null;
   const planCandidates = Array.isArray(snapshot?.history) ? snapshot.history : [];
   const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
@@ -264,7 +363,12 @@ export default function PlansWorkspaceView({
   const displayedPlanId = planIdentity(displayedPlan);
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
   const titleMaxChars = Number(snapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
-  const workspaceId = target.workspaceId || workspace?.id || "";
+
+  useEffect(() => {
+    snapshotRequestKeyRef.current = activeSnapshotRequestKey;
+    setSnapshot(cachedPlanSnapshot(snapshotCacheKeys));
+    setError("");
+  }, [activeSnapshotRequestKey, snapshotCacheKeys]);
 
   useEffect(() => {
     if (activeRepoPath !== selectedRepoPath) {
@@ -277,7 +381,7 @@ export default function PlansWorkspaceView({
     if (preferredKey && preferredKey !== pathIdentity(selectedRepoPath)) {
       setSelectedRepoPath(preferredRepoPath);
     }
-  }, [preferredRepoPath]);
+  }, [preferredRepoPath, selectedRepoPath]);
 
   const loadSnapshot = useCallback(async (options = {}) => {
     const silent = options?.silent === true;
@@ -293,6 +397,7 @@ export default function PlansWorkspaceView({
         repoPath: activeRepoPath,
         input: {
           agentId: snapshotAgentId,
+          directRepoTarget: Boolean(activeRepoPath),
           sessionId: snapshotSessionId,
           taskId: snapshotTaskId,
         },
@@ -301,17 +406,30 @@ export default function PlansWorkspaceView({
         command.dbPath = activeDbPath;
       }
       const response = await invoke("coordination_terminal_task_plan_snapshot", command);
-      setSnapshot(dataOf(response));
+      if (snapshotRequestKeyRef.current !== activeSnapshotRequestKey) {
+        return;
+      }
+      const nextSnapshot = dataOf(response);
+      cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
+      setSnapshot(nextSnapshot);
     } catch (nextError) {
       if (!silent) {
         setError(cleanText(nextError?.message || nextError) || "Unable to load terminal plans.");
       }
     }
-  }, [activeDbPath, activeRepoPath, snapshotAgentId, snapshotSessionId, snapshotTaskId]);
+  }, [
+    activeDbPath,
+    activeRepoPath,
+    activeSnapshotRequestKey,
+    snapshotAgentId,
+    snapshotCacheKeys,
+    snapshotSessionId,
+    snapshotTaskId,
+  ]);
 
   useEffect(() => {
-    loadSnapshot();
-  }, [loadSnapshot]);
+    loadSnapshot({ silent: Boolean(cachedPlanSnapshot(snapshotCacheKeys)) });
+  }, [activeSnapshotRequestKey, loadSnapshot, snapshotCacheKeys]);
 
   useEffect(() => {
     if (!activeRepoPath) {
@@ -406,12 +524,16 @@ export default function PlansWorkspaceView({
       });
       const data = dataOf(response);
       if (data?.plan) {
-        setSnapshot((current) => ({
-          ...(current || {}),
-          selected_plan: data.plan,
-          history: current?.history || [],
-          title_max_chars: current?.title_max_chars || titleMaxChars,
-        }));
+        setSnapshot((current) => {
+          const nextSnapshot = {
+            ...(current || {}),
+            selected_plan: data.plan,
+            history: current?.history || [],
+            title_max_chars: current?.title_max_chars || titleMaxChars,
+          };
+          cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
+          return nextSnapshot;
+        });
       }
       setEditingStepIndex(null);
       setEditingTitle("");
@@ -432,6 +554,7 @@ export default function PlansWorkspaceView({
 	    loadSnapshot,
 	    savingStepIndex,
     snapshotAgentId,
+    snapshotCacheKeys,
     snapshotSessionId,
     titleMaxChars,
     workspaceId,
@@ -589,6 +712,7 @@ const PlansSurface = styled.section`
   display: flex;
   flex-direction: column;
   gap: 10px;
+  box-sizing: border-box;
   min-width: 0;
   min-height: 0;
   height: 100%;
@@ -666,7 +790,7 @@ const IconButton = styled.button`
 const PlanPanel = styled.article`
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -678,7 +802,9 @@ const PlanPanel = styled.article`
 const EmptyPanel = styled(PlanPanel)`
   display: grid;
   grid-template-rows: auto;
+  flex: 0 0 auto;
   align-content: center;
+  min-height: 0;
   gap: 8px;
   padding: 18px;
 `;

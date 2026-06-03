@@ -643,6 +643,21 @@ export function getThreadTerminalGroundTruth({
   };
 }
 
+export function terminalPromptingUserBlocksShutdown(groundTruth = {}) {
+  const promptingUser = Boolean(
+    groundTruth?.terminalIsPromptingUser === true
+      || cleanText(groundTruth?.terminalWorkState).toLowerCase() === "prompting_user",
+  );
+  if (!promptingUser) {
+    return false;
+  }
+
+  const source = cleanText(groundTruth?.promptingUserSource)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+  return source !== "latest-assistant-message";
+}
+
 export function threadLooksEffectivelyThinking(groundTruth = {}) {
   if (groundTruth.terminalIsPromptingUser || groundTruth.terminalWorkState === "prompting_user") {
     return false;

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
 import { FormMessage } from "../app/appStyles";
@@ -45,22 +45,6 @@ function repoChangeSummary(repo) {
   if (untracked) parts.push(`${untracked} untracked`);
   if (conflicted) parts.push(`${conflicted} conflicted`);
   return parts.length ? parts.join(" · ") : `${total} changed`;
-}
-
-function statusSummary(snapshot) {
-  const counts = snapshot?.status?.counts || {};
-  const total = numberValue(counts.total);
-  if (!total) return "Clean working tree";
-  const parts = [];
-  const staged = numberValue(counts.staged);
-  const unstaged = numberValue(counts.unstaged);
-  const untracked = numberValue(counts.untracked);
-  const conflicted = numberValue(counts.conflicted);
-  if (staged) parts.push(`${staged} staged`);
-  if (unstaged) parts.push(`${unstaged} unstaged`);
-  if (untracked) parts.push(`${untracked} untracked`);
-  if (conflicted) parts.push(`${conflicted} conflicted`);
-  return parts.length ? `${total} changed · ${parts.join(" · ")}` : `${total} changed`;
 }
 
 function historyFileCode(file) {
@@ -175,6 +159,7 @@ function historyGitStatus(file) {
 }
 
 export default function GitWorkspaceView({
+  onRefreshRepositories = null,
   repositoriesPreload = null,
   rootDirectory = "",
   workspace = null,
@@ -187,7 +172,21 @@ export default function GitWorkspaceView({
   const [snapshotState, setSnapshotState] = useState("idle");
   const [snapshotError, setSnapshotError] = useState("");
   const [snapshot, setSnapshot] = useState(null);
-  const [selectedCommitSha, setSelectedCommitSha] = useState("");
+  const [expandedHistoryKeys, setExpandedHistoryKeys] = useState(() => new Set());
+  const [commitMessage, setCommitMessage] = useState("");
+  const [commitState, setCommitState] = useState("idle");
+  const [commitError, setCommitError] = useState("");
+  const [commitNotice, setCommitNotice] = useState("");
+  const repoRailRef = useRef(null);
+  const repoRailDragRef = useRef({
+    active: false,
+    consumeClick: false,
+    moved: false,
+    pointerId: null,
+    startScrollLeft: 0,
+    startX: 0,
+  });
+  const [repoRailDragging, setRepoRailDragging] = useState(false);
   const workspaceId = workspace?.id || "";
   const preloadMatches = Boolean(
     repositoriesPreload
@@ -217,6 +216,8 @@ export default function GitWorkspaceView({
   );
   const operationBlocked = snapshot?.operationState && snapshot.operationState.clean === false;
   const hasChanges = changedFiles.length > 0;
+  const commitBusy = commitState === "generating" || commitState === "committing";
+  const canCommit = Boolean(hasChanges && !operationBlocked && commitMessage.trim() && !commitBusy);
 
   const loadSnapshot = useCallback(async (repoPath) => {
     if (!repoPath) {
@@ -236,6 +237,18 @@ export default function GitWorkspaceView({
       setSnapshotState("error");
     }
   }, []);
+
+  const refreshRepositories = useCallback(() => {
+    if (typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
+      return Promise.resolve(null);
+    }
+    return onRefreshRepositories({
+      refresh: true,
+      rootDirectory,
+      workspaceId,
+      workspaceName: workspace?.name || "",
+    });
+  }, [onRefreshRepositories, rootDirectory, workspace?.name, workspaceId]);
 
   useEffect(() => {
     if (!preloadMatches) {
@@ -269,17 +282,172 @@ export default function GitWorkspaceView({
 
   useEffect(() => {
     setSnapshot(null);
-    setSelectedCommitSha("");
+    setExpandedHistoryKeys(new Set());
+    setCommitMessage("");
+    setCommitState("idle");
+    setCommitError("");
+    setCommitNotice("");
     void loadSnapshot(selectedRepoPath);
   }, [loadSnapshot, selectedRepoPath]);
 
   useEffect(() => {
-    setSelectedCommitSha((current) => {
-      if (current === WORKING_TREE_HISTORY_KEY && hasChanges) return current;
-      if (current && history.some((commit) => commit.sha === current)) return current;
-      return "";
+    setExpandedHistoryKeys((current) => {
+      const next = new Set();
+      current.forEach((key) => {
+        if (key === WORKING_TREE_HISTORY_KEY && hasChanges) {
+          next.add(key);
+        } else if (history.some((commit) => commit.sha === key)) {
+          next.add(key);
+        }
+      });
+      if (hasChanges) next.add(WORKING_TREE_HISTORY_KEY);
+      return next;
     });
   }, [hasChanges, history]);
+
+  useEffect(() => {
+    if (!hasChanges) {
+      setCommitMessage("");
+      setCommitError("");
+      return;
+    }
+    if (!selectedRepoPath || commitMessage.trim() || commitBusy) {
+      return;
+    }
+    let cancelled = false;
+    setCommitState("generating");
+    setCommitError("");
+    invoke("workspace_git_generate_commit_message", { repoPath: selectedRepoPath })
+      .then((result) => {
+        if (cancelled) return;
+        const generated = text(result?.summary || result?.message);
+        if (generated) setCommitMessage(generated);
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setCommitError(error?.message || String(error || "Unable to generate commit message."));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCommitState("idle");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [commitMessage, hasChanges, selectedRepoPath]);
+
+  const toggleHistoryKey = useCallback((key) => {
+    setExpandedHistoryKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  }, []);
+
+  const commitAndPush = useCallback(async () => {
+    if (!selectedRepoPath || !canCommit) return;
+    setCommitState("committing");
+    setCommitError("");
+    setCommitNotice("");
+    try {
+      const result = await invoke("workspace_git_commit_and_push", {
+        message: commitMessage,
+        push: true,
+        repoPath: selectedRepoPath,
+      });
+      if (result?.snapshot) {
+        setSnapshot(result.snapshot);
+      } else {
+        await loadSnapshot(selectedRepoPath);
+      }
+      setCommitMessage("");
+      setCommitNotice(result?.pushed
+        ? `Committed and pushed ${shortSha(result?.commitSha)}.`
+        : `Committed ${shortSha(result?.commitSha)}.${result?.pushError ? ` Push failed: ${result.pushError}` : ""}`);
+      await refreshRepositories();
+    } catch (error) {
+      setCommitError(error?.message || String(error || "Unable to commit and push."));
+    } finally {
+      setCommitState("idle");
+    }
+  }, [canCommit, commitMessage, loadSnapshot, refreshRepositories, selectedRepoPath]);
+
+  const selectRepository = useCallback((repoPath) => {
+    if (repoRailDragRef.current.consumeClick) {
+      repoRailDragRef.current.consumeClick = false;
+      return;
+    }
+    setSelectedRepoPath(repoPath);
+  }, []);
+
+  const handleRepoRailWheel = useCallback((event) => {
+    const rail = repoRailRef.current;
+    if (!rail || rail.scrollWidth <= rail.clientWidth + 1) return;
+
+    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      ? event.deltaX
+      : event.deltaY;
+    if (!delta) return;
+
+    const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+    const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, rail.scrollLeft + delta));
+    if (nextScrollLeft === rail.scrollLeft) return;
+
+    event.preventDefault();
+    rail.scrollLeft = nextScrollLeft;
+  }, []);
+
+  const handleRepoRailPointerDown = useCallback((event) => {
+    const rail = repoRailRef.current;
+    if (!rail || rail.scrollWidth <= rail.clientWidth + 1) return;
+
+    repoRailDragRef.current = {
+      active: true,
+      consumeClick: false,
+      moved: false,
+      pointerId: event.pointerId,
+      startScrollLeft: rail.scrollLeft,
+      startX: event.clientX,
+    };
+    setRepoRailDragging(true);
+    rail.setPointerCapture?.(event.pointerId);
+  }, []);
+
+  const handleRepoRailPointerMove = useCallback((event) => {
+    const rail = repoRailRef.current;
+    const drag = repoRailDragRef.current;
+    if (!rail || !drag.active || drag.pointerId !== event.pointerId) return;
+
+    const deltaX = event.clientX - drag.startX;
+    if (Math.abs(deltaX) > 3) {
+      drag.moved = true;
+      drag.consumeClick = true;
+    }
+    rail.scrollLeft = drag.startScrollLeft - deltaX;
+  }, []);
+
+  const endRepoRailDrag = useCallback((event) => {
+    const rail = repoRailRef.current;
+    const drag = repoRailDragRef.current;
+    if (!drag.active || drag.pointerId !== event.pointerId) return;
+
+    repoRailDragRef.current = {
+      ...drag,
+      active: false,
+      pointerId: null,
+    };
+    if (drag.moved) {
+      window.setTimeout(() => {
+        repoRailDragRef.current.consumeClick = false;
+      }, 180);
+    }
+    setRepoRailDragging(false);
+    rail?.releasePointerCapture?.(event.pointerId);
+  }, []);
 
   if (!rootDirectory || !workspace) {
     return (
@@ -296,7 +464,17 @@ export default function GitWorkspaceView({
       {snapshotError && <FormMessage $state="error">{snapshotError}</FormMessage>}
 
       {repositories.length ? (
-        <RepoRail aria-label="Git repositories" role="list">
+        <RepoRail
+          aria-label="Git repositories"
+          data-dragging={repoRailDragging ? "true" : undefined}
+          onPointerCancel={endRepoRailDrag}
+          onPointerDown={handleRepoRailPointerDown}
+          onPointerMove={handleRepoRailPointerMove}
+          onPointerUp={endRepoRailDrag}
+          onWheel={handleRepoRailWheel}
+          ref={repoRailRef}
+          role="list"
+        >
           {repositories.map((repo) => {
             const active = repo.path === selectedRepoPath;
             const changeSummary = repoChangeSummary(repo);
@@ -305,14 +483,11 @@ export default function GitWorkspaceView({
                 data-active={active ? "true" : undefined}
                 data-dirty={repo.dirty ? "true" : undefined}
                 key={repo.path}
-                onClick={() => setSelectedRepoPath(repo.path)}
+                onClick={() => selectRepository(repo.path)}
                 title={repo.path}
                 type="button"
               >
-                <RepoCardTop>
-                  <strong>{repoLabel(repo)}</strong>
-                  <RepoDirtyDot data-dirty={repo.dirty ? "true" : undefined} />
-                </RepoCardTop>
+                <strong>{repoLabel(repo)}</strong>
                 <span>{repoMeta(repo)}</span>
                 <em>{changeSummary}</em>
               </RepoButton>
@@ -329,51 +504,56 @@ export default function GitWorkspaceView({
 
       {selectedRepo ? (
         <GitBody>
-          <RepoSummary>
-            <RepoSummaryMain>
-              <strong>{repoLabel(selectedRepo)}</strong>
-              <span title={selectedRepo.path}>{selectedRepo.path}</span>
-            </RepoSummaryMain>
-            <RepoFacts>
-              <span>{text(snapshot?.repo?.branch, selectedRepo.branch) || "no branch"}</span>
-              <span>{shortSha(snapshot?.repo?.headSha || selectedRepo.headSha)}</span>
-              <span>{statusSummary(snapshot)}</span>
-            </RepoFacts>
-          </RepoSummary>
-
           {operationBlocked && (
             <GitNotice data-state="warning">
               Repository is in {snapshot.operationState.state} state. Resolve it before committing from Diff Forge.
             </GitNotice>
           )}
 
+          <CommitBar aria-label="Commit and push changes">
+            <CommitInput
+              disabled={!hasChanges || operationBlocked || commitBusy}
+              onChange={(event) => setCommitMessage(event.target.value)}
+              onKeyDown={(event) => {
+                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  void commitAndPush();
+                }
+              }}
+              placeholder={hasChanges ? "Commit message" : "Clean working tree"}
+              value={commitMessage}
+            />
+            <CommitButton
+              disabled={!canCommit}
+              onClick={commitAndPush}
+              title={hasChanges ? "Commit all changes and push" : "No changes to commit"}
+              type="button"
+            >
+              {commitState === "committing" ? "Committing..." : "Commit & Push"}
+            </CommitButton>
+          </CommitBar>
+          {commitError && <GitNotice data-state="error">{commitError}</GitNotice>}
+          {commitNotice && <GitNotice>{commitNotice}</GitNotice>}
+
           <HistoryPane>
             <HistoryList>
-              <HistoryEntry data-empty="true">
-                <HistoryButton
-                  data-empty="true"
-                  onClick={() => setSelectedCommitSha("")}
-                  title="Clear selected history item"
-                  type="button"
-                >
-                  <HistoryGraph aria-hidden="true" />
-                  <HistoryCommitLine aria-hidden="true" />
-                </HistoryButton>
-              </HistoryEntry>
               {hasChanges && (() => {
-                const active = selectedCommitSha === WORKING_TREE_HISTORY_KEY;
+                const active = expandedHistoryKeys.has(WORKING_TREE_HISTORY_KEY);
                 return (
                   <HistoryEntry data-active={active ? "true" : undefined} key={WORKING_TREE_HISTORY_KEY}>
                     <HistoryButton
                       data-active={active ? "true" : undefined}
-                      onClick={() => setSelectedCommitSha(WORKING_TREE_HISTORY_KEY)}
+                      aria-expanded={active}
+                      onClick={() => toggleHistoryKey(WORKING_TREE_HISTORY_KEY)}
                       title="Uncommitted working tree changes"
                       type="button"
                     >
                       <HistoryGraph aria-hidden="true" />
                       <HistoryCommitLine>
                         <strong>Changes</strong>
+                        <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"}</span>
                       </HistoryCommitLine>
+                      <HistoryToggleIcon aria-hidden="true" data-open={active ? "true" : undefined}>›</HistoryToggleIcon>
                     </HistoryButton>
                     {active && (
                       <HistoryFileList>
@@ -407,20 +587,24 @@ export default function GitWorkspaceView({
                 );
               })()}
               {history.length ? history.map((commit) => {
-                const active = commit.sha === selectedCommitSha;
+                const active = expandedHistoryKeys.has(commit.sha);
                 const files = Array.isArray(commit.files) ? commit.files : [];
                 return (
                   <HistoryEntry data-active={active ? "true" : undefined} key={commit.sha}>
                     <HistoryButton
                       data-active={active ? "true" : undefined}
-                      onClick={() => setSelectedCommitSha(commit.sha)}
+                      aria-expanded={active}
+                      onClick={() => toggleHistoryKey(commit.sha)}
                       title={commit.subject}
                       type="button"
                     >
                       <HistoryGraph aria-hidden="true" />
                       <HistoryCommitLine>
                         <strong>{commit.subject}</strong>
+                        <span>{commit.shortSha || shortSha(commit.sha)}</span>
+                        <span>{files.length} file{files.length === 1 ? "" : "s"}</span>
                       </HistoryCommitLine>
+                      <HistoryToggleIcon aria-hidden="true" data-open={active ? "true" : undefined}>›</HistoryToggleIcon>
                     </HistoryButton>
                     {active && (
                       <HistoryFileList>
@@ -513,30 +697,67 @@ const GitSurface = styled.section`
 `;
 
 const RepoRail = styled.div`
-  display: grid;
+  display: flex;
   flex: 0 0 auto;
+  align-items: flex-start;
+  flex-wrap: nowrap;
   min-width: 0;
-  max-height: 124px;
-  grid-template-columns: repeat(auto-fill, minmax(188px, 1fr));
-  gap: 8px;
-  overflow: auto;
-  padding: 10px 10px 8px;
+  gap: 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 8px 10px;
   border-bottom: 1px solid var(--git-vscode-border-subtle);
+  cursor: grab;
+  overscroll-behavior-x: contain;
+  scroll-padding-inline: 10px;
+  scroll-snap-type: x proximity;
+  scrollbar-color: color-mix(in srgb, var(--git-vscode-blue) 46%, transparent) transparent;
+  scrollbar-width: thin;
+  touch-action: pan-x;
+  user-select: none;
+  -webkit-overflow-scrolling: touch;
+
+  &[data-dragging="true"] {
+    cursor: grabbing;
+  }
+
+  &::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--git-vscode-blue) 42%, rgba(148, 163, 184, 0.28));
+    background-clip: padding-box;
+  }
 `;
 
 const RepoButton = styled.button`
   display: grid;
+  flex: 0 0 auto;
+  width: min(184px, 100%);
   min-width: 0;
-  min-height: 76px;
+  min-height: 58px;
   align-content: start;
-  gap: 5px;
-  padding: 9px 10px;
-  border: 1px solid var(--git-vscode-border);
+  gap: 4px;
+  padding: 8px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 8px;
   color: var(--git-vscode-text);
   background: var(--git-card-bg);
+  box-shadow: none;
   cursor: pointer;
+  scroll-snap-align: start;
   text-align: left;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    box-shadow 140ms ease;
 
   strong,
   span,
@@ -549,7 +770,7 @@ const RepoButton = styled.button`
 
   strong {
     color: var(--git-vscode-selection-text);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 850;
   }
 
@@ -576,28 +797,21 @@ const RepoButton = styled.button`
   }
 
   &[data-active="true"] {
-    border-color: color-mix(in srgb, var(--git-vscode-blue) 72%, var(--git-vscode-border));
+    border-color: rgba(125, 176, 255, 0.54);
+    color: var(--git-vscode-selection-text);
     background: var(--git-card-bg-active);
+    box-shadow:
+      0 0 0 1px rgba(79, 163, 255, 0.22),
+      inset 0 0 0 1px rgba(125, 176, 255, 0.08);
   }
-`;
 
-const RepoCardTop = styled.div`
-  display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-`;
+  &[data-active="true"] strong {
+    color: var(--git-vscode-selection-text);
+  }
 
-const RepoDirtyDot = styled.i`
-  width: 7px;
-  height: 7px;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.46);
-
-  &[data-dirty="true"] {
-    background: #f59e0b;
-    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.12);
+  &[data-active="true"] span,
+  &[data-active="true"] em {
+    color: rgba(203, 213, 225, 0.82);
   }
 `;
 
@@ -611,65 +825,68 @@ const GitBody = styled.div`
   overflow: hidden;
 `;
 
-const RepoSummary = styled.section`
-  display: flex;
+const CommitBar = styled.div`
+  display: grid;
   flex: 0 0 auto;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
   padding: 8px 10px;
   border-bottom: 1px solid var(--git-vscode-border-subtle);
-  background: color-mix(in srgb, var(--git-card-bg) 68%, transparent);
+  background: rgba(2, 6, 23, 0.12);
 `;
 
-const RepoSummaryMain = styled.div`
-  display: grid;
+const CommitInput = styled.input`
+  width: 100%;
   min-width: 0;
-  gap: 2px;
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--git-vscode-border);
+  border-radius: 8px;
+  color: var(--git-vscode-text);
+  background: rgba(2, 6, 23, 0.38);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  outline: none;
 
-  strong,
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  &::placeholder {
+    color: color-mix(in srgb, var(--git-vscode-text-muted) 78%, transparent);
   }
 
-  strong {
-    color: var(--git-vscode-selection-text);
-    font-size: 13px;
-    font-weight: 850;
+  &:focus {
+    border-color: color-mix(in srgb, var(--git-vscode-blue) 72%, var(--git-vscode-border));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--git-vscode-blue) 14%, transparent);
   }
 
-  span {
-    color: var(--git-vscode-text-muted);
-    font-size: 10px;
-    font-weight: 720;
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.58;
   }
 `;
 
-const RepoFacts = styled.div`
-  display: flex;
-  flex: 0 1 auto;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-  min-width: 0;
+const CommitButton = styled.button`
+  flex: 0 0 auto;
+  min-width: 112px;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--git-vscode-blue) 56%, var(--git-vscode-border));
+  border-radius: 8px;
+  color: var(--git-vscode-selection-text);
+  background: color-mix(in srgb, var(--git-vscode-blue) 28%, rgba(15, 23, 42, 0.64));
+  font: inherit;
+  font-size: 11px;
+  font-weight: 850;
+  cursor: pointer;
+  white-space: nowrap;
 
-  span {
-    min-width: 0;
-    max-width: 180px;
-    overflow: hidden;
-    padding: 3px 7px;
-    border: 1px solid var(--git-vscode-border);
-    border-radius: 999px;
-    color: var(--git-vscode-text-muted);
-    background: rgba(15, 23, 42, 0.22);
-    font-size: 10px;
-    font-weight: 760;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  &:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--git-vscode-blue) 38%, rgba(15, 23, 42, 0.64));
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
   }
 `;
 
@@ -838,6 +1055,8 @@ const HistoryEntry = styled.article`
 `;
 
 const HistoryGraph = styled.span`
+  --git-history-line-x: 20px;
+
   position: relative;
   display: block;
   width: 40px;
@@ -847,31 +1066,34 @@ const HistoryGraph = styled.span`
     position: absolute;
     top: 0;
     bottom: 0;
-    left: 20px;
+    left: var(--git-history-line-x);
     width: 1px;
     background: color-mix(in srgb, var(--git-vscode-blue) 58%, transparent);
     content: "";
+    transform: translateX(-50%);
   }
 
   &::after {
+    box-sizing: border-box;
     position: absolute;
-    top: 7px;
-    left: 15px;
-    width: 10px;
-    height: 10px;
+    top: 50%;
+    left: var(--git-history-line-x);
+    width: 12px;
+    height: 12px;
     border: 2px solid var(--git-vscode-blue);
     border-radius: 999px;
     background: var(--git-vscode-sidebar);
     content: "";
+    transform: translate(-50%, -50%);
   }
 `;
 
 const HistoryButton = styled.button`
   display: grid;
   width: 100%;
-  height: 24px;
+  min-height: 28px;
   min-width: 0;
-  grid-template-columns: 40px minmax(0, 1fr);
+  grid-template-columns: 40px minmax(0, 1fr) 22px;
   align-items: center;
   padding: 0 8px 0 0;
   border: 0;
@@ -894,23 +1116,6 @@ const HistoryButton = styled.button`
     background: var(--git-vscode-blue);
   }
 
-  &[data-empty="true"] {
-    height: 36px;
-    padding-right: 8px;
-  }
-
-  &[data-empty="true"] ${HistoryGraph} {
-    height: 36px;
-  }
-
-  &[data-empty="true"] ${HistoryGraph}::after {
-    top: 13px;
-  }
-
-  &[data-empty="true"]:hover {
-    background: transparent;
-  }
-
   &:focus-visible {
     outline: 1px solid var(--git-vscode-focus);
     outline-offset: -1px;
@@ -922,7 +1127,7 @@ const HistoryCommitLine = styled.div`
   height: 100%;
   min-width: 0;
   align-items: center;
-  gap: 0;
+  gap: 8px;
 
   strong,
   span {
@@ -936,7 +1141,7 @@ const HistoryCommitLine = styled.div`
     color: inherit;
     font-size: 13px;
     font-weight: 400;
-    line-height: 24px;
+    line-height: 28px;
   }
 
   span {
@@ -944,22 +1149,29 @@ const HistoryCommitLine = styled.div`
     color: var(--git-vscode-text-muted);
     font-size: 13px;
     font-weight: 400;
-    line-height: 24px;
+    line-height: 28px;
   }
 
   ${HistoryButton}[data-active="true"] & span {
     color: color-mix(in srgb, var(--git-vscode-selection-text) 72%, transparent);
   }
 
-  ${HistoryButton}[data-empty="true"] & {
-    height: 24px;
-    border: 1px dotted var(--git-vscode-dotted);
-    border-radius: 2px;
-  }
+`;
 
-  ${HistoryButton}[data-empty="true"]:hover & {
-    border-color: var(--git-vscode-blue);
-    background: color-mix(in srgb, var(--git-vscode-blue) 7%, transparent);
+const HistoryToggleIcon = styled.span`
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  color: var(--git-vscode-text-muted);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 140ms ease;
+
+  &[data-open="true"] {
+    transform: rotate(90deg);
   }
 `;
 
@@ -978,6 +1190,7 @@ const HistoryFileList = styled.div`
     width: 1px;
     background: color-mix(in srgb, var(--git-vscode-blue) 58%, transparent);
     content: "";
+    transform: translateX(-50%);
   }
 
   ${GitFileItem} {

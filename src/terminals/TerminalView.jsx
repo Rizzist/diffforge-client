@@ -154,12 +154,20 @@ const TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE = 1.18;
 const TERMINAL_BREAKOUT_MIN_TERMINAL_SCALE = 0.65;
 const TERMINAL_BREAKOUT_MAX_TERMINAL_SCALE = 2.5;
 const TERMINAL_BREAKOUT_TERMINAL_SCALE_STEP = 1.14;
-const TERMINAL_BREAKOUT_HOLD_DRAG_DELAY_MS = 180;
-const TERMINAL_BREAKOUT_HOLD_DRAG_CANCEL_PX = 6;
 const TERMINAL_BREAKOUT_MIN_WIDTH = 420;
 const TERMINAL_BREAKOUT_MIN_HEIGHT = 260;
 const TERMINAL_BREAKOUT_MAX_WIDTH = 840;
 const TERMINAL_BREAKOUT_MAX_HEIGHT = 560;
+const TERMINAL_BREAKOUT_RESIZE_HANDLES = Object.freeze([
+  { edgeX: -1, edgeY: -1, id: "nw", label: "Resize terminal from top left" },
+  { edgeX: 0, edgeY: -1, id: "n", label: "Resize terminal from top" },
+  { edgeX: 1, edgeY: -1, id: "ne", label: "Resize terminal from top right" },
+  { edgeX: 1, edgeY: 0, id: "e", label: "Resize terminal from right" },
+  { edgeX: 1, edgeY: 1, id: "se", label: "Resize terminal from bottom right" },
+  { edgeX: 0, edgeY: 1, id: "s", label: "Resize terminal from bottom" },
+  { edgeX: -1, edgeY: 1, id: "sw", label: "Resize terminal from bottom left" },
+  { edgeX: -1, edgeY: 0, id: "w", label: "Resize terminal from left" },
+]);
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
@@ -784,7 +792,7 @@ const TerminalSurfaceSlot = styled.div`
   }
 
   &[data-terminal-breakout="true"] {
-    border-radius: calc(7px * var(--terminal-slot-inverse-scale, 1));
+    border-radius: 0;
     background: rgba(3, 6, 11, 0.98);
     box-shadow:
       0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(148, 163, 184, 0.34),
@@ -793,16 +801,8 @@ const TerminalSurfaceSlot = styled.div`
   }
 
   &[data-terminal-breakout="true"]::before {
-    position: absolute;
-    inset: calc(-8px * var(--terminal-slot-inverse-scale, 1));
-    z-index: 2;
-    border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(148, 163, 184, 0.16);
-    border-radius: calc(12px * var(--terminal-slot-inverse-scale, 1));
-    box-shadow:
-      inset 0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.028),
-      0 0 calc(22px * var(--terminal-slot-inverse-scale, 1)) rgba(66, 153, 225, 0.08);
+    display: none;
     content: "";
-    pointer-events: none;
   }
 
   &[data-terminal-breakout="true"][data-terminal-active="true"] {
@@ -812,25 +812,11 @@ const TerminalSurfaceSlot = styled.div`
       0 0 calc(28px * var(--terminal-slot-inverse-scale, 1)) rgba(59, 130, 246, 0.2);
   }
 
-  &[data-terminal-breakout="true"][data-terminal-active="true"]::before {
-    border-color: rgba(96, 165, 250, 0.48);
-    box-shadow:
-      inset 0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.04),
-      0 0 calc(30px * var(--terminal-slot-inverse-scale, 1)) rgba(59, 130, 246, 0.22);
-  }
-
   html[data-forge-theme="light"] &[data-terminal-breakout="true"] {
     background: rgba(255, 255, 255, 0.98);
     box-shadow:
       0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(71, 85, 105, 0.28),
       0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(44px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.18);
-  }
-
-  html[data-forge-theme="light"] &[data-terminal-breakout="true"]::before {
-    border-color: rgba(71, 85, 105, 0.14);
-    box-shadow:
-      inset 0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.58),
-      0 0 calc(20px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.08);
   }
 
   html[data-forge-theme="light"] &[data-terminal-breakout="true"][data-terminal-active="true"] {
@@ -859,6 +845,97 @@ const TerminalSurfaceSlot = styled.div`
 
   &[data-terminal-fullscreen="true"] {
     z-index: 240;
+  }
+`;
+
+const TerminalBreakoutResizeHandles = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 92;
+  pointer-events: none;
+`;
+
+const TerminalBreakoutResizeHandle = styled.button`
+  position: absolute;
+  display: block;
+  width: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  height: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  padding: 0;
+  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(191, 219, 254, 0.8);
+  border-radius: calc(1px * var(--terminal-slot-inverse-scale, 1));
+  color: transparent;
+  background: rgba(15, 23, 42, 0.92);
+  box-shadow:
+    0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.9),
+    0 0 calc(12px * var(--terminal-slot-inverse-scale, 1)) rgba(96, 165, 250, 0.18);
+  opacity: 0.76;
+  pointer-events: auto;
+  touch-action: none;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(219, 234, 254, 0.98);
+    background: rgba(30, 64, 175, 0.96);
+    opacity: 1;
+    outline: none;
+  }
+
+  &[data-handle="nw"] {
+    top: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    left: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: nw-resize;
+  }
+
+  &[data-handle="n"] {
+    top: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    left: calc(50% - (5px * var(--terminal-slot-inverse-scale, 1)));
+    cursor: n-resize;
+  }
+
+  &[data-handle="ne"] {
+    top: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    right: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: ne-resize;
+  }
+
+  &[data-handle="e"] {
+    top: calc(50% - (5px * var(--terminal-slot-inverse-scale, 1)));
+    right: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: e-resize;
+  }
+
+  &[data-handle="se"] {
+    right: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    bottom: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: se-resize;
+  }
+
+  &[data-handle="s"] {
+    bottom: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    left: calc(50% - (5px * var(--terminal-slot-inverse-scale, 1)));
+    cursor: s-resize;
+  }
+
+  &[data-handle="sw"] {
+    bottom: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    left: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: sw-resize;
+  }
+
+  &[data-handle="w"] {
+    top: calc(50% - (5px * var(--terminal-slot-inverse-scale, 1)));
+    left: calc(-5px * var(--terminal-slot-inverse-scale, 1));
+    cursor: w-resize;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.7);
+    background: rgba(255, 255, 255, 0.94);
+    box-shadow:
+      0 0 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) rgba(255, 255, 255, 0.95),
+      0 0 calc(10px * var(--terminal-slot-inverse-scale, 1)) rgba(37, 99, 235, 0.16);
   }
 `;
 
@@ -1077,7 +1154,7 @@ const TodoQueueSurface = styled.aside`
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   padding: 0;
   border-left: 1px solid rgba(230, 236, 245, 0.08);
   color: #e8eef8;
@@ -1096,12 +1173,10 @@ const TodoQueueSurface = styled.aside`
     border-left: 0;
   }
 
-  &[data-active-tool="orchestrator"] {
-    grid-template-rows: auto minmax(0, 1fr);
-  }
 `;
 
 const WorkspaceToolControlButton = styled.button`
+  box-sizing: border-box;
   display: inline-grid;
   width: 24px;
   height: 24px;
@@ -1109,9 +1184,11 @@ const WorkspaceToolControlButton = styled.button`
   flex: 0 0 auto;
   border: 0;
   border-radius: 999px;
+  padding: 0;
   color: rgba(232, 238, 248, 0.74);
   background: transparent;
   cursor: pointer;
+  line-height: 0;
   outline: none;
   transition:
     background 140ms ease,
@@ -1120,8 +1197,10 @@ const WorkspaceToolControlButton = styled.button`
     transform 140ms ease;
 
   svg {
+    display: block;
     width: 14px;
     height: 14px;
+    margin: 0;
   }
 
   &:hover,
@@ -1335,6 +1414,7 @@ const OrchestratorVoiceArea = styled.div`
 `;
 
 const OrchestratorVoicePaneControls = styled.div`
+  --orchestrator-pane-control-size: 21px;
   position: absolute;
   top: 3px;
   left: 50%;
@@ -1343,7 +1423,7 @@ const OrchestratorVoicePaneControls = styled.div`
   align-items: center;
   justify-content: center;
   gap: 1px;
-  padding: 1px 2px;
+  padding: 2px 3px;
   border: 1px solid rgba(226, 232, 240, 0.08);
   border-radius: 999px;
   transform: translateX(-50%);
@@ -1356,14 +1436,22 @@ const OrchestratorVoicePaneControls = styled.div`
   backdrop-filter: blur(18px) saturate(135%);
 
   ${WorkspaceToolControlButton} {
-    width: 19px;
-    height: 19px;
+    width: var(--orchestrator-pane-control-size);
+    height: var(--orchestrator-pane-control-size);
+    min-width: var(--orchestrator-pane-control-size);
+    min-height: var(--orchestrator-pane-control-size);
     color: rgba(232, 238, 248, 0.68);
+    place-items: center;
 
     svg {
-      width: 10px;
-      height: 10px;
+      width: 11px;
+      height: 11px;
     }
+  }
+
+  ${WorkspaceToolControlButton}[data-control="breakout"] svg {
+    width: 12px;
+    height: 12px;
   }
 
   html[data-forge-theme="light"] & {
@@ -3272,7 +3360,7 @@ function normalizeBreakoutViewport(value) {
 
 function isTerminalBreakoutHoldDragExcludedTarget(target) {
   return Boolean(target?.closest?.(
-    "[data-terminal-control='true'], [data-terminal-drag-handle='true'], button, input, textarea, select, a, [contenteditable='true']",
+    "[data-terminal-control='true'], [data-terminal-drag-handle='true'], [data-terminal-resize-handle='true'], button, input, textarea, select, a, [contenteditable='true']",
   ));
 }
 
@@ -7552,6 +7640,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 aria-label={terminalBreakoutActive ? "Exit terminal breakout canvas" : "Open terminal breakout canvas"}
                 aria-pressed={terminalBreakoutActive ? "true" : "false"}
                 data-active={terminalBreakoutActive ? "true" : undefined}
+                data-control="breakout"
                 onClick={onToggleTerminalBreakout}
                 title={terminalBreakoutActive ? "Exit breakout" : "Breakout"}
                 type="button"
@@ -8147,7 +8236,6 @@ function TerminalView({
   const terminalBreakoutTransitionTimerRef = useRef(0);
   const terminalBreakoutPanStateRef = useRef(null);
   const terminalBreakoutBackgroundCanvasRef = useRef(null);
-  const terminalBreakoutHoldDragRef = useRef(null);
   const terminalBreakoutPlacementsRef = useRef({});
   const terminalBreakoutPhaseRef = useRef(TERMINAL_BREAKOUT_PHASE_GRID);
   const terminalBreakoutTerminalScaleRef = useRef(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
@@ -13901,23 +13989,7 @@ function TerminalView({
     updateTerminalDragState,
   ]);
 
-  const clearTerminalBreakoutHoldDrag = useCallback(() => {
-    const holdState = terminalBreakoutHoldDragRef.current;
-    if (!holdState) {
-      return;
-    }
-
-    if (holdState.timerId) {
-      window.clearTimeout(holdState.timerId);
-    }
-
-    window.removeEventListener("pointermove", holdState.handlePointerMove, { capture: true });
-    window.removeEventListener("pointerup", holdState.handlePointerEnd, { capture: true });
-    window.removeEventListener("pointercancel", holdState.handlePointerEnd, { capture: true });
-    terminalBreakoutHoldDragRef.current = null;
-  }, []);
-
-  const handleTerminalBreakoutSlotPointerDownCapture = useCallback((event, terminalIndex) => {
+  const beginTerminalBreakoutResize = useCallback((event, terminalIndex, handle) => {
     if (
       !terminalBreakoutLayoutActive
       || fullscreenActive
@@ -13926,7 +13998,7 @@ function TerminalView({
       || event.button !== 0
       || !terminalWorkspace?.id
       || !Number.isInteger(terminalIndex)
-      || isTerminalBreakoutHoldDragExcludedTarget(event.target)
+      || !handle
     ) {
       return;
     }
@@ -13936,112 +14008,67 @@ function TerminalView({
       return;
     }
 
-    clearTerminalBreakoutHoldDrag();
+    const placement = normalizeBreakoutPlacement(terminalBreakoutPlacementsRef.current?.[terminalIndex]);
+    if (!placement) {
+      return;
+    }
 
-    const holdState = {
-      handlePointerEnd: null,
-      handlePointerMove: null,
-      latestClientX: event.clientX,
-      latestClientY: event.clientY,
+    event.preventDefault();
+    event.stopPropagation();
+
+    const maxZ = Object.values(terminalBreakoutPlacementsRef.current)
+      .map((currentPlacement) => Number.parseInt(currentPlacement?.z, 10) || 0)
+      .reduce((maxValue, z) => Math.max(maxValue, z), 0);
+    const nextPlacement = {
+      ...placement,
+      z: maxZ + 1,
+    };
+
+    updateTerminalBreakoutPlacements({
+      ...terminalBreakoutPlacementsRef.current,
+      [terminalIndex]: nextPlacement,
+    });
+    setActiveTerminalPaneId(paneId);
+    updateTerminalDragState({
+      mode: "canvas-resize",
       paneId,
       pointerId: event.pointerId,
+      resizeCursor: `${handle.id}-resize`,
+      resizeEdgeX: Number(handle.edgeX || 0),
+      resizeEdgeY: Number(handle.edgeY || 0),
       startClientX: event.clientX,
       startClientY: event.clientY,
-      started: false,
+      startPlacement: nextPlacement,
+      startTerminalScale: clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current),
+      startViewport: normalizeBreakoutViewport(terminalBreakoutViewportRef.current),
       terminalIndex,
-      timerId: 0,
       workspaceId: terminalWorkspace.id,
-    };
-
-    holdState.handlePointerMove = (pointerEvent) => {
-      const currentHoldState = terminalBreakoutHoldDragRef.current;
-      if (!currentHoldState || pointerEvent.pointerId !== currentHoldState.pointerId) {
-        return;
-      }
-
-      currentHoldState.latestClientX = pointerEvent.clientX;
-      currentHoldState.latestClientY = pointerEvent.clientY;
-
-      if (currentHoldState.started) {
-        pointerEvent.preventDefault();
-        pointerEvent.stopPropagation();
-        return;
-      }
-
-      const dragDistance = Math.hypot(
-        pointerEvent.clientX - currentHoldState.startClientX,
-        pointerEvent.clientY - currentHoldState.startClientY,
-      );
-
-      if (dragDistance > TERMINAL_BREAKOUT_HOLD_DRAG_CANCEL_PX) {
-        clearTerminalBreakoutHoldDrag();
-      }
-    };
-
-    holdState.handlePointerEnd = (pointerEvent) => {
-      const currentHoldState = terminalBreakoutHoldDragRef.current;
-      if (!currentHoldState || pointerEvent.pointerId !== currentHoldState.pointerId) {
-        return;
-      }
-
-      if (!currentHoldState.started) {
-        setActiveTerminalPaneId(currentHoldState.paneId || "");
-      }
-
-      if (currentHoldState.started) {
-        pointerEvent.preventDefault();
-        pointerEvent.stopPropagation();
-        const currentDragState = terminalDragStateRef.current;
-        if (
-          currentDragState?.mode === "canvas"
-          && currentDragState.pointerId === currentHoldState.pointerId
-        ) {
-          updateTerminalDragState(null);
-        }
-      }
-
-      clearTerminalBreakoutHoldDrag();
-    };
-
-    holdState.timerId = window.setTimeout(() => {
-      const currentHoldState = terminalBreakoutHoldDragRef.current;
-      if (!currentHoldState || currentHoldState.pointerId !== holdState.pointerId) {
-        return;
-      }
-
-      currentHoldState.timerId = 0;
-      currentHoldState.started = true;
-      const dragStarted = beginTerminalCanvasDrag({
-        clientX: currentHoldState.latestClientX,
-        clientY: currentHoldState.latestClientY,
-        paneId: currentHoldState.paneId,
-        pointerId: currentHoldState.pointerId,
-        terminalIndex: currentHoldState.terminalIndex,
-        workspaceId: currentHoldState.workspaceId,
-      });
-
-      if (!dragStarted) {
-        clearTerminalBreakoutHoldDrag();
-      }
-    }, TERMINAL_BREAKOUT_HOLD_DRAG_DELAY_MS);
-
-    terminalBreakoutHoldDragRef.current = holdState;
-    window.addEventListener("pointermove", holdState.handlePointerMove, { capture: true, passive: false });
-    window.addEventListener("pointerup", holdState.handlePointerEnd, { capture: true, passive: false });
-    window.addEventListener("pointercancel", holdState.handlePointerEnd, { capture: true, passive: false });
+    });
   }, [
-    beginTerminalCanvasDrag,
-    clearTerminalBreakoutHoldDrag,
     fullscreenActive,
     getTerminalPaneId,
     terminalBreakoutLayoutActive,
     terminalDragActive,
     terminalWorkspace?.id,
     todoDragActive,
+    updateTerminalBreakoutPlacements,
     updateTerminalDragState,
   ]);
 
-  useEffect(() => clearTerminalBreakoutHoldDrag, [clearTerminalBreakoutHoldDrag]);
+  const handleTerminalBreakoutSlotClickCapture = useCallback((event, terminalIndex) => {
+    if (
+      !terminalBreakoutLayoutActive
+      || !Number.isInteger(terminalIndex)
+      || isTerminalBreakoutHoldDragExcludedTarget(event.target)
+    ) {
+      return;
+    }
+
+    const paneId = getTerminalPaneId(terminalIndex);
+    if (paneId) {
+      setActiveTerminalPaneId(paneId);
+    }
+  }, [getTerminalPaneId, terminalBreakoutLayoutActive]);
 
   const handleBeginTerminalDrag = useCallback((event) => {
     if (
@@ -14431,9 +14458,10 @@ function TerminalView({
       return undefined;
     }
 
+    const initialDragState = terminalDragStateRef.current;
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = "grabbing";
+    document.body.style.cursor = initialDragState?.resizeCursor || "grabbing";
     document.body.style.userSelect = "none";
 
     const handlePointerMove = (event) => {
@@ -14443,7 +14471,7 @@ function TerminalView({
       }
 
       event.preventDefault();
-      if (currentDrag.mode === "canvas") {
+      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
         event.stopPropagation();
       }
 
@@ -14488,6 +14516,62 @@ function TerminalView({
         return;
       }
 
+      if (currentDrag.mode === "canvas-resize") {
+        event.stopPropagation();
+        const startPlacement = normalizeBreakoutPlacement(currentDrag.startPlacement);
+        if (!startPlacement) {
+          return;
+        }
+
+        const viewport = normalizeBreakoutViewport(currentDrag.startViewport || terminalBreakoutViewportRef.current);
+        const zoom = Math.max(0.001, viewport.zoom);
+        const terminalScale = Math.max(
+          0.001,
+          clampBreakoutTerminalScale(currentDrag.startTerminalScale || terminalBreakoutTerminalScaleRef.current),
+        );
+        const effectiveScale = Math.max(0.001, zoom * terminalScale);
+        const edgeX = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeX || 0)));
+        const edgeY = Math.max(-1, Math.min(1, Number(currentDrag.resizeEdgeY || 0)));
+        const deltaX = Number(event.clientX || 0) - Number(currentDrag.startClientX || 0);
+        const deltaY = Number(event.clientY || 0) - Number(currentDrag.startClientY || 0);
+        let nextWidth = startPlacement.width;
+        let nextHeight = startPlacement.height;
+        let nextX = startPlacement.x;
+        let nextY = startPlacement.y;
+
+        if (edgeX !== 0) {
+          nextWidth = Math.max(
+            TERMINAL_BREAKOUT_MIN_WIDTH,
+            startPlacement.width + ((edgeX * deltaX) / effectiveScale),
+          );
+          if (edgeX < 0) {
+            nextX = startPlacement.x + ((startPlacement.width - nextWidth) * terminalScale);
+          }
+        }
+
+        if (edgeY !== 0) {
+          nextHeight = Math.max(
+            TERMINAL_BREAKOUT_MIN_HEIGHT,
+            startPlacement.height + ((edgeY * deltaY) / effectiveScale),
+          );
+          if (edgeY < 0) {
+            nextY = startPlacement.y + ((startPlacement.height - nextHeight) * terminalScale);
+          }
+        }
+
+        updateTerminalBreakoutPlacements({
+          ...terminalBreakoutPlacementsRef.current,
+          [currentDrag.terminalIndex]: {
+            ...startPlacement,
+            height: nextHeight,
+            width: nextWidth,
+            x: nextX,
+            y: nextY,
+          },
+        });
+        return;
+      }
+
       const target = getDragTargetFromPoint({
         clientX: event.clientX,
         clientY: event.clientY,
@@ -14523,6 +14607,11 @@ function TerminalView({
         return;
       }
 
+      if (currentDrag.mode === "canvas-resize") {
+        updateTerminalDragState(null);
+        return;
+      }
+
       const nextRows = cloneTerminalRows(currentDrag.previewRows);
       if (!areTerminalRowsEqual(currentDrag.sourceRows, nextRows)) {
         reorderWorkspaceTerminalDisplayLayout?.({
@@ -14545,7 +14634,7 @@ function TerminalView({
       }
 
       event.preventDefault();
-      if (currentDrag.mode === "canvas") {
+      if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
         event.stopPropagation();
       }
       commitDrag();
@@ -14852,7 +14941,11 @@ function TerminalView({
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
     const fullscreenThisTerminal = fullscreenActive && fullscreenTerminalIndex === terminalIndex;
 
-    if (draggingThisTerminal && terminalDragState?.mode !== "canvas") {
+    if (
+      draggingThisTerminal
+      && terminalDragState?.mode !== "canvas"
+      && terminalDragState?.mode !== "canvas-resize"
+    ) {
       return {
         "--terminal-slot-height": `${Math.max(0, terminalDragState.height || 0)}px`,
         "--terminal-slot-inverse-scale": "1",
@@ -15022,6 +15115,8 @@ function TerminalView({
         {logicalTerminalIndexes.map((terminalIndex) => {
           const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
+          const terminalPaneId = getTerminalPaneId(terminalIndex);
+          const terminalActive = activePaneId === terminalPaneId;
           const terminalProjectTarget = getTerminalProjectTarget(terminalIndex);
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
@@ -15030,13 +15125,13 @@ function TerminalView({
 
           return (
             <TerminalSurfaceSlot
-              data-terminal-active={activePaneId === getTerminalPaneId(terminalIndex) ? "true" : "false"}
+              data-terminal-active={terminalActive ? "true" : "false"}
               data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
               data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
               data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
               data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
               key={`${terminalWorkspace.id}-${terminalIndex}`}
-              onPointerDownCapture={(event) => handleTerminalBreakoutSlotPointerDownCapture(event, terminalIndex)}
+              onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
               style={getTerminalSlotStyle(terminalIndex)}
             >
               <WorkspaceTerminal
@@ -15048,7 +15143,7 @@ function TerminalView({
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
                 fullscreenState={fullscreenState}
-                isActive={activePaneId === getTerminalPaneId(terminalIndex)}
+                isActive={terminalActive}
                 isFullscreen={fullscreenThisTerminal}
                 onActivateTerminal={handleActivateTerminalPane}
                 onBeginTerminalDrag={handleBeginTerminalDrag}
@@ -15092,6 +15187,22 @@ function TerminalView({
                 workspaces={workspaces}
                 selectedWorkspaceThreadId={selectedWorkspaceThreadId}
               />
+              {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalActive && (
+                <TerminalBreakoutResizeHandles data-terminal-control="true">
+                  {TERMINAL_BREAKOUT_RESIZE_HANDLES.map((handle) => (
+                    <TerminalBreakoutResizeHandle
+                      aria-label={handle.label}
+                      data-handle={handle.id}
+                      data-terminal-control="true"
+                      data-terminal-resize-handle="true"
+                      key={handle.id}
+                      onPointerDown={(event) => beginTerminalBreakoutResize(event, terminalIndex, handle)}
+                      title={handle.label}
+                      type="button"
+                    />
+                  ))}
+                </TerminalBreakoutResizeHandles>
+              )}
             </TerminalSurfaceSlot>
           );
         })}

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   getThreadTerminalGroundTruth,
+  terminalPromptingUserBlocksShutdown,
   terminalOutputLooksActive,
   terminalOutputLooksPromptReady,
 } from "./threadTerminalGroundTruth.js";
@@ -167,6 +168,83 @@ test("live idle activity is sendable even when explicit inputReady was not persi
   assert.equal(groundTruth.activityStatusLooksInputReady, true);
   assert.equal(groundTruth.completedTurnLooksSendable, true);
   assert.equal(groundTruth.agentInputReady, true);
+});
+
+test("idle assistant follow-up questions do not block shutdown", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: true,
+      status: "idle",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: true,
+      status: "idle",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        state: "completed",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "hi" },
+        { role: "assistant", text: "Hi. What would you like me to work on next?" },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.terminalIsPromptingUser, true);
+  assert.equal(groundTruth.promptingUserSource, "latest-assistant-message");
+  assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), false);
+});
+
+test("live terminal permission prompts still block shutdown", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    lifecycleEvent: {
+      promptingUserKind: "permission",
+      promptingUserSource: "terminal-output",
+      promptingUserText: "Allow command to run?",
+      terminalIsPromptingUser: true,
+      type: "terminal-output",
+    },
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: true,
+      status: "idle",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: true,
+      status: "idle",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        state: "completed",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "run the risky command" },
+        { role: "assistant", text: "I need permission." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.terminalIsPromptingUser, true);
+  assert.equal(groundTruth.promptingUserSource, "terminal-output");
+  assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), true);
 });
 
 test("fresh prompt readiness settles a restored running turn", () => {

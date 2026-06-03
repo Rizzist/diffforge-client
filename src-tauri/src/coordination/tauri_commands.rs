@@ -445,18 +445,36 @@ pub fn coordination_terminal_task_plan_snapshot(
     input: Option<Value>,
 ) -> Result<Value, String> {
     let input = input.unwrap_or_else(|| json!({}));
+    let task_id = input["task_id"]
+        .as_str()
+        .or_else(|| input["taskId"].as_str());
+    let session_id = input["session_id"]
+        .as_str()
+        .or_else(|| input["sessionId"].as_str());
+    let agent_id = input["agent_id"]
+        .as_str()
+        .or_else(|| input["agentId"].as_str());
+    let direct_repo_target = input["direct_repo_target"]
+        .as_bool()
+        .or_else(|| input["directRepoTarget"].as_bool())
+        .unwrap_or(false);
+
+    if direct_repo_target
+        && repo_path
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        let repo_path = coordination_input_root(repo_path)?;
+        let db_path = clean_optional_path(db_path);
+        return result(
+            CoordinationKernel::open(repo_path, db_path)?
+                .terminal_task_plan_snapshot(task_id, session_id, agent_id),
+        );
+    }
+
     result(
-        kernel(repo_path, db_path)?.terminal_task_plan_snapshot(
-            input["task_id"]
-                .as_str()
-                .or_else(|| input["taskId"].as_str()),
-            input["session_id"]
-                .as_str()
-                .or_else(|| input["sessionId"].as_str()),
-            input["agent_id"]
-                .as_str()
-                .or_else(|| input["agentId"].as_str()),
-        ),
+        kernel(repo_path, db_path)?.terminal_task_plan_snapshot(task_id, session_id, agent_id),
     )
 }
 
@@ -506,6 +524,61 @@ pub fn coordination_terminal_task_plan_edit_step_title(
                 .as_str()
                 .or_else(|| input["worktreePath"].as_str()),
             "user_edited_queued_step_title",
+            &compact_plan,
+        ) {
+            Ok(value) => json!({"ok": true, "response": value}),
+            Err(error) => json!({"ok": false, "error": error}),
+        }
+    } else {
+        json!({"ok": false, "skipped": true, "reason": "no_compact_plan"})
+    };
+    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("cloud".to_string(), cloud);
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub fn coordination_terminal_task_plan_finish(
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    input: Value,
+) -> Result<Value, String> {
+    let kernel = kernel(repo_path, db_path)?;
+    let task_id = input["task_id"]
+        .as_str()
+        .or_else(|| input["taskId"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "task_id is required.".to_string())?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .or_else(|| input["agentId"].as_str());
+    let session_id = input["session_id"]
+        .as_str()
+        .or_else(|| input["sessionId"].as_str());
+    let finished = kernel.finish_terminal_task_plan(task_id, "completed", agent_id, session_id)?;
+    let mut response = api_ok(json!({
+        "plan_finished": finished.is_some(),
+        "result": finished,
+    }));
+    let compact_plan = response["data"]["result"]["compact_plan"].clone();
+    let cloud = if !compact_plan.is_null() {
+        match crate::cloud_mcp_forward_terminal_task_plan_update(
+            Some(&kernel.paths.repo_path.display().to_string()),
+            Some(&kernel.paths.db_path),
+            input["workspace_id"]
+                .as_str()
+                .or_else(|| input["workspaceId"].as_str()),
+            agent_id,
+            session_id,
+            Some(task_id),
+            input["worktree_id"]
+                .as_str()
+                .or_else(|| input["worktreeId"].as_str()),
+            input["worktree_path"]
+                .as_str()
+                .or_else(|| input["worktreePath"].as_str()),
+            "user_finished_terminal_task_plan",
             &compact_plan,
         ) {
             Ok(value) => json!({"ok": true, "response": value}),

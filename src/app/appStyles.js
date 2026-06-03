@@ -3481,6 +3481,11 @@ export const TerminalWorkspaceSurface = styled.section`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
+  &[data-terminal-breakout="true"] {
+    border-radius: 0;
+    overflow: hidden;
+  }
+
   &[data-terminal-fullscreen="true"] {
     --terminal-focus-outline-inset: 1px;
 
@@ -3788,6 +3793,10 @@ export const TerminalFrame = styled.section`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
+  &[data-terminal-breakout="true"] {
+    border-radius: 0;
+  }
+
   &[data-state="error"] {
     border-color: rgba(255, 107, 107, 0.36);
   }
@@ -4092,6 +4101,12 @@ export const XtermSurface = styled.div`
   --terminal-native-scrollbar-glass-edge: rgba(255, 255, 255, 0.14);
   --terminal-native-scrollbar-glass-shade: rgba(7, 11, 18, 0.18);
 
+  &[data-terminal-breakout="true"] {
+    --terminal-xterm-painted-bottom: 100% !important;
+
+    contain: layout paint;
+  }
+
   html[data-forge-theme="light"] & {
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
     --terminal-native-scrollbar-thumb: rgba(0, 102, 204, 0.22);
@@ -4117,6 +4132,10 @@ export const XtermSurface = styled.div`
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT};
   }
 
+  &[data-terminal-breakout="true"]::after {
+    display: none;
+  }
+
   .xterm {
     position: relative;
     z-index: 1;
@@ -4128,6 +4147,15 @@ export const XtermSurface = styled.div`
 
   html[data-forge-theme="light"] & .xterm {
     background: ${TERMINAL_THEME_BACKGROUND_LIGHT} !important;
+  }
+
+  &[data-terminal-breakout="true"] .xterm,
+  &[data-terminal-breakout="true"] .xterm-viewport,
+  &[data-terminal-breakout="true"] .xterm-scroll-area,
+  &[data-terminal-breakout="true"] .xterm-scrollable-element,
+  &[data-terminal-breakout="true"] .xterm-screen {
+    height: 100% !important;
+    min-height: 100% !important;
   }
 
   .xterm-viewport,
