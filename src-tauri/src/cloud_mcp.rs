@@ -1573,6 +1573,13 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             Some("websocket_ready"),
         )
         .await;
+        let _ = cloud_mcp_send_device_workspace_snapshot_event_with_auth(
+            state,
+            &connection_id,
+            &message_token,
+            "websocket_ready",
+        )
+        .await;
         cloud_mcp_replay_runtime_snapshots(state, &connection_id, &message_token).await;
         return;
     }
@@ -1830,16 +1837,17 @@ async fn cloud_mcp_send_remote_command_status_event(
     event: &Value,
     status: &str,
     message: &str,
+    details: Option<&Value>,
 ) -> Result<Value, String> {
     let now = cloud_mcp_now_ms();
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
-    let status_kind = if matches!(status, "completed" | "failed") {
+    let status_kind = if matches!(status, "blocked" | "completed" | "failed" | "rejected") {
         "remote_command_result"
     } else {
         "remote_command_ack"
     };
-    let payload = json!({
+    let mut payload = json!({
         "source": "rust-diffforge-remote-control",
         "event_kind": status_kind,
         "command_id": cloud_mcp_payload_text(event, &["command_id"])
@@ -1921,6 +1929,12 @@ async fn cloud_mcp_send_remote_command_status_event(
         "rust_received_ms": now,
         "ts_ms": now,
     });
+    if let Some(details) = details {
+        if !details.is_null() {
+            payload["details"] = details.clone();
+            payload["result"] = details.clone();
+        }
+    }
     let request = cloud_mcp_event_envelope(status_kind, &payload);
     let envelope = json!({
         "kind": "event",
@@ -1998,6 +2012,7 @@ async fn cloud_mcp_start_remote_command_listener(
                     &event,
                     "duplicate_ignored",
                     "Duplicate remote command ignored by desktop.",
+                    None,
                 )
                 .await;
                 continue;
@@ -2012,7 +2027,7 @@ async fn cloud_mcp_start_remote_command_listener(
                 )
             };
             let _ =
-                cloud_mcp_send_remote_command_status_event(&state_clone, &event, status, message)
+                cloud_mcp_send_remote_command_status_event(&state_clone, &event, status, message, None)
                     .await;
         }
     });
@@ -2029,14 +2044,33 @@ async fn cloud_mcp_record_remote_command_status(
     event: Value,
     status: String,
     message: Option<String>,
+    details: Option<Value>,
 ) -> Result<Value, String> {
     cloud_mcp_send_remote_command_status_event(
         state.inner(),
         &event,
         status.trim(),
         message.as_deref().unwrap_or(""),
+        details.as_ref(),
     )
     .await
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_device_workspace_snapshot(
+    state: State<'_, CloudMcpState>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "manual_device_workspace_snapshot".to_string());
+    cloud_mcp_send_device_workspace_snapshot_event(state.inner(), &reason).await?;
+    Ok(json!({
+        "ok": true,
+        "sent": true,
+        "reason": reason,
+    }))
 }
 
 fn cloud_mcp_desktop_device_profile() -> Value {
@@ -2198,6 +2232,27 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                     "workspace_id": workspace_id,
                     "repo_id": repo_id,
                     "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
+                    "workspace_root": cloud_mcp_payload_text(workspace, &["workspace_root", "workspaceRoot", "repo_path", "repoPath"]),
+                    "workspace_location_fingerprint": cloud_mcp_payload_text(
+                        workspace,
+                        &[
+                            "workspace_location_fingerprint",
+                            "workspaceLocationFingerprint",
+                            "root_fingerprint",
+                            "rootFingerprint",
+                        ],
+                    ),
+                    "workspace_status": cloud_mcp_payload_text(workspace, &["workspace_status", "workspaceStatus", "status"]),
+                    "terminal_count": workspace.get("terminal_count")
+                        .or_else(|| workspace.get("terminalCount"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(0)),
+                    "mcp_server_count": workspace.get("mcp_server_count")
+                        .or_else(|| workspace.get("mcpServerCount"))
+                        .or_else(|| workspace.get("server_count"))
+                        .or_else(|| workspace.get("serverCount"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(0)),
                     "workspace_active": workspace.get("workspace_active")
                         .or_else(|| workspace.get("workspaceActive"))
                         .cloned()
@@ -2222,13 +2277,108 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             "workspace_id": workspace.workspace_id,
             "repo_id": repo_id,
             "workspace_name": workspace.workspace_name,
+            "workspace_root": workspace.root,
+            "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(Path::new(&workspace.root)),
             "workspace_active": false,
             "workspace_reported_active": false,
             "workspace_status": "registered",
+            "terminal_count": 0,
+            "mcp_server_count": 0,
         }));
     }
 
     workspaces
+}
+
+async fn cloud_mcp_device_workspace_snapshot_payload(
+    state: &CloudMcpState,
+    reason: &str,
+) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let workspaces = cloud_mcp_lifecycle_workspaces(state).await;
+    json!({
+        "source": "rust-diffforge-device-workspace-catalog",
+        "event_kind": "device_workspace_snapshot",
+        "reason": reason,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "snapshot_id": format!("device-workspaces-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+        "snapshot_full": true,
+        "authoritative": true,
+        "workspace_count": workspaces.len(),
+        "workspaces": workspaces,
+        "ts_ms": cloud_mcp_now_ms(),
+    })
+}
+
+async fn cloud_mcp_send_device_workspace_snapshot_event_with_auth(
+    state: &CloudMcpState,
+    connection_id: &str,
+    message_token: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return Err("Cloud MCP app websocket is not accepting messages.".to_string());
+    };
+    let auth = json!({
+        "connection_id": connection_id,
+        "message_token": message_token,
+    });
+    cloud_mcp_queue_device_workspace_snapshot_event(state, tx, auth, reason).await
+}
+
+async fn cloud_mcp_send_device_workspace_snapshot_event(
+    state: &CloudMcpState,
+    reason: &str,
+) -> Result<(), String> {
+    cloud_mcp_start_global_ws(state).await;
+    let tx = cloud_mcp_wait_for_ws_sender(state).await?;
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    cloud_mcp_queue_device_workspace_snapshot_event(state, tx, auth, reason).await
+}
+
+async fn cloud_mcp_queue_device_workspace_snapshot_event(
+    state: &CloudMcpState,
+    tx: mpsc::UnboundedSender<Value>,
+    auth: Value,
+    reason: &str,
+) -> Result<(), String> {
+    let payload = cloud_mcp_device_workspace_snapshot_payload(state, reason).await;
+    let request = cloud_mcp_event_envelope("device_workspace_snapshot", &payload);
+    let workspace_count = payload["workspace_count"].as_u64().unwrap_or(0);
+    let envelope = json!({
+        "kind": "event",
+        "id": format!("device-workspace-snapshot-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": cloud_mcp_payload_text(&request, &["repo_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "repo_id"])),
+        "workspace_id": cloud_mcp_payload_text(&request, &["workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(&request, &["payload", "workspace_id"])),
+        "request": request,
+    });
+    tx.send(envelope)
+        .map_err(|_| "Cloud MCP app websocket is not accepting messages.".to_string())?;
+    cloud_mcp_record_connection_diagnostic(
+        state,
+        "rust.cloud_mcp.device_workspace_snapshot.sent",
+        "ok",
+        "Rust sent the authoritative device workspace catalog snapshot.",
+        json!({
+            "reason": reason,
+            "workspaceCount": workspace_count,
+        }),
+    )
+    .await;
+    Ok(())
 }
 
 fn cloud_mcp_app_ws_url(base_url: &str) -> String {
@@ -4361,7 +4511,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/sync/push" => Some("sync_push"),
         "/v1/sync/pull" => Some("sync_pull"),
         "/v1/context/pack" => Some("context_pack"),
-        "/v1/architecture/history" => Some("architecture_history"),
+        "/v1/task/history" => Some("task_history"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -4487,7 +4637,7 @@ fn cloud_mcp_post_log_context(
         .cloned();
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
-        "/v1/architecture/history" => "cloud_get_architecture_history",
+        "/v1/task/history" => "cloud_get_task_history",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -4837,6 +4987,7 @@ async fn cloud_mcp_register_prepared_workspace(
     }
     let registration_response =
         cloud_mcp_ws_send_workspace_registration(state, &repo_id, &workspace_status).await?;
+    let _ = cloud_mcp_send_device_workspace_snapshot_event(state, "workspace_registered").await;
     let status = cloud_mcp_status_snapshot(state).await;
     Ok(CloudMcpWorkspaceRegistrationResult {
         status,
@@ -6989,7 +7140,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "starting",
         Some(payload["prompt"].as_str().unwrap_or_default()),
         if session_mode.should_request_cloud_context_pack() {
-            "Terminal prompt submitted; preparing Architecture history context."
+            "Terminal prompt submitted; preparing Task History context."
         } else {
             "Terminal prompt submitted without managed patch coordination."
         },
@@ -8552,6 +8703,7 @@ async fn cloud_mcp_delete_workspace(
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
+    let _ = cloud_mcp_send_device_workspace_snapshot_event(state.inner(), "workspace_deleted").await;
 
     let response =
         cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
@@ -10355,7 +10507,7 @@ fn cloud_mcp_attach_spec_task_history(mut snapshot: Value, task_history: Value) 
     snapshot
 }
 
-fn cloud_mcp_architecture_history_snapshot(
+fn cloud_mcp_task_history_snapshot(
     req: &CloudMcpSpecGraphSyncRequest,
     task_history: Value,
     sync_state: &str,
@@ -10370,7 +10522,7 @@ fn cloud_mcp_architecture_history_snapshot(
         .to_string();
     json!({
         "ok": true,
-        "kind": "architecture_history",
+        "kind": "task_history_snapshot",
         "repoId": req.repo_id.clone(),
         "repoPath": req.root_display.clone(),
         "repoName": repo_name.clone(),
@@ -10391,12 +10543,12 @@ fn cloud_mcp_architecture_history_snapshot(
         "architectureItems": [],
         "activity": {},
         "sourceOfTruth": {
-            "kind": "architecture_history",
+            "kind": "task_history",
             "mode": "task_history",
             "filetreeSync": false,
         },
         "raw": {
-            "kind": "architecture_history",
+            "kind": "task_history_snapshot",
             "version": 1,
             "repo_id": req.repo_id.clone(),
             "workspace_id": req.workspace_id.clone(),
@@ -10832,7 +10984,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
     let repo_name = cloud_mcp_repo_display_name(&req.root);
     let display_root = cloud_mcp_repo_display_root(&req.root);
     let payload = json!({
-        "source": "rust-diffforge-architecture-history",
+        "source": "rust-diffforge-task-history",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
         "repo_name": repo_name,
@@ -10848,7 +11000,7 @@ async fn cloud_mcp_fetch_full_spec_graph_data(
         "agent_limit": 100,
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(state, "/v1/architecture/history", &payload).await?;
+    let response = cloud_mcp_post_json_endpoint(state, "/v1/task/history", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -10858,7 +11010,7 @@ async fn cloud_mcp_fetch_spec_task_history_data(
 ) -> Result<Value, String> {
     cloud_mcp_connected_or_connect(state).await?;
     let payload = json!({
-        "source": "rust-diffforge-architecture-history",
+        "source": "rust-diffforge-task-history",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
         "repo_id": req.repo_id.clone(),
         "agent_id": "rust-diffforge",
@@ -10872,7 +11024,7 @@ async fn cloud_mcp_fetch_spec_task_history_data(
         "order": "asc",
         "ts_ms": cloud_mcp_now_ms(),
     });
-    let response = cloud_mcp_post_json_endpoint(state, "/v1/architecture/history", &payload).await?;
+    let response = cloud_mcp_post_json_endpoint(state, "/v1/task/history", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -11327,7 +11479,7 @@ async fn cloud_mcp_spec_graph_sync_loop(
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_architecture_history(
+async fn cloud_mcp_get_task_history(
     state: State<'_, CloudMcpState>,
     repo_path: String,
     workspace_id: Option<String>,
@@ -11341,7 +11493,7 @@ async fn cloud_mcp_get_architecture_history(
         .unwrap_or_default()
         .to_string();
     let sync_state = if sync_error.is_empty() { "ready" } else { "error" };
-    Ok(cloud_mcp_architecture_history_snapshot(
+    Ok(cloud_mcp_task_history_snapshot(
         &req,
         task_history,
         sync_state,
@@ -13745,6 +13897,7 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     summary: Option<&str>,
     local_task_status: Option<&str>,
     submit_result: &Value,
+    terminal_task_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = task_id
         .map(str::trim)
@@ -13842,6 +13995,9 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    }
 
     let mut arguments = serde_json::Map::new();
     let summary_text = summary.unwrap_or("Patch submitted through the local coordination kernel.");
@@ -13858,6 +14014,9 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     arguments.insert("metadata".to_string(), Value::Object(metadata));
     arguments.insert("task_id".to_string(), json!(active_task_id));
     arguments.insert("run_id".to_string(), json!(active_task_id));
+    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
     }
@@ -14763,15 +14922,15 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
     .map(|value| value.get("data").cloned().unwrap_or(value))
     .unwrap_or_else(|| json!({"ok": false, "error": "context_pack_refresh_failed"}));
-    let architecture_history = cloud_mcp_proxy_post_json_endpoint(
+    let task_history = cloud_mcp_proxy_post_json_endpoint(
         &base_url,
-        "/v1/architecture/history",
+        "/v1/task/history",
         &context_request.to_string(),
     )
     .ok()
     .and_then(|response| serde_json::from_str::<Value>(&response).ok())
     .map(|value| value.get("data").cloned().unwrap_or(value))
-    .unwrap_or_else(|| json!({"kind": "architecture_task_history", "version": 1, "tasks": []}));
+    .unwrap_or_else(|| json!({"kind": "task_history", "version": 1, "tasks": []}));
 
     identity.log(
         "cloud_mcp.agent_start_task.done",
@@ -14790,7 +14949,7 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         "event": event_data.clone(),
         "spec_activity": event_data["spec_activity"].clone(),
         "context_pack": context_pack,
-        "architecture_history": architecture_history,
+        "task_history": task_history,
     }))
 }
 

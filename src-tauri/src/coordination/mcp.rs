@@ -2778,7 +2778,9 @@ fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Valu
         .as_str()
         .or_else(|| input["currentStepDetail"].as_str())
         .or_else(|| input["detail"].as_str());
-    let title = input["title"].as_str().or_else(|| input["plan_title"].as_str());
+    let title = input["title"]
+        .as_str()
+        .or_else(|| input["plan_title"].as_str());
     let created = kernel.create_terminal_task_plan(
         task_id,
         Some(agent_id),
@@ -2869,8 +2871,8 @@ fn cloud_start_task_for_agent(response: &Value) -> Value {
     );
     insert_if_present(
         &mut view,
-        "architecture_history",
-        cloud_architecture_history_for_agent(&response["architecture_history"]),
+        "task_history",
+        cloud_task_history_for_agent(&response["task_history"]),
     );
     insert_if_present(
         &mut view,
@@ -2938,7 +2940,7 @@ fn cloud_spec_summary_for_agent(spec: &Value) -> Value {
     )
 }
 
-fn cloud_architecture_history_for_agent(history: &Value) -> Value {
+fn cloud_task_history_for_agent(history: &Value) -> Value {
     let mut view = Map::new();
     insert_if_present(
         &mut view,
@@ -3376,13 +3378,11 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     )?;
     let terminal_plan_update =
         kernel.checkpoint_terminal_task_plan(task_id, agent_id, session_id, input)?;
-    let terminal_plan_compact = terminal_plan_update
-        .as_ref()
-        .and_then(|value| {
-            value
-                .get("compact_plan")
-                .filter(|compact| value_has_content(compact))
-        });
+    let terminal_plan_compact = terminal_plan_update.as_ref().and_then(|value| {
+        value
+            .get("compact_plan")
+            .filter(|compact| value_has_content(compact))
+    });
 
     let cloud = match crate::cloud_mcp_forward_agent_checkpoint(
         input["repo_path"].as_str(),
@@ -3462,13 +3462,11 @@ fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         Some(agent_id),
         Some(session_id),
     )?;
-    let terminal_plan_compact = terminal_plan_update
-        .as_ref()
-        .and_then(|value| {
-            value
-                .get("compact_plan")
-                .filter(|compact| value_has_content(compact))
-        });
+    let terminal_plan_compact = terminal_plan_update.as_ref().and_then(|value| {
+        value
+            .get("compact_plan")
+            .filter(|compact| value_has_content(compact))
+    });
     let cloud = match crate::cloud_mcp_forward_agent_complete_task(
         input["repo_path"].as_str(),
         input["db_path"].as_str().map(PathBuf::from).as_deref(),
@@ -3649,6 +3647,19 @@ fn run_submit_patch_job_worker(
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .unwrap_or_else(|| json!({}));
+    let terminal_plan_update = kernel
+        .finish_terminal_task_plan(&task_id, "completed", Some(&agent_id), Some(&session_id))
+        .unwrap_or_else(|error| {
+            Some(json!({
+                "ok": false,
+                "error": error,
+            }))
+        });
+    let terminal_plan_compact = terminal_plan_update.as_ref().and_then(|value| {
+        value
+            .get("compact_plan")
+            .filter(|compact| value_has_content(compact))
+    });
     let cloud = match crate::cloud_mcp_forward_agent_submit_patch(
         Some(repo_path.as_str()),
         db_path.as_deref(),
@@ -3662,12 +3673,14 @@ fn run_submit_patch_job_worker(
         summary.as_deref(),
         task_after["status"].as_str(),
         &submitted,
+        terminal_plan_compact,
     ) {
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
     let mut result = submitted;
     if let Some(data) = result.get_mut("data").and_then(Value::as_object_mut) {
+        data.insert("terminal_plan".to_string(), json!(terminal_plan_update));
         data.insert("cloud".to_string(), cloud);
     }
     let _ = kernel.finish_submit_job_success(&submit_job_id, &result);
@@ -4169,8 +4182,8 @@ mod tests {
                 },
                 "guidance": ["Account for active peers before editing."]
             },
-            "architecture_history": {
-                "kind": "architecture_task_history",
+            "task_history": {
+                "kind": "task_history",
                 "repo_id": "repo-test",
                 "workspace_id": "workspace-test",
                 "tasks": [
@@ -4192,13 +4205,13 @@ mod tests {
             view["spec_summary"]["active_specs"][0]["statement"].as_str(),
             Some("Agents must use start_task before leases.")
         );
-        assert_eq!(view["architecture_history"]["task_count"].as_u64(), Some(2));
+        assert_eq!(view["task_history"]["task_count"].as_u64(), Some(2));
         assert_eq!(view["spec_activity"]["recorded"].as_bool(), Some(true));
         assert!(view.get("event").is_none());
         assert!(view.get("context_pack").is_none());
         assert!(view["peer_work"][0].get("metadata_json").is_none());
         assert!(view["lane_conflicts"][0].get("payload").is_none());
-        assert!(view["architecture_history"].get("repo_id").is_none());
+        assert!(view["task_history"].get("repo_id").is_none());
     }
 
     #[test]

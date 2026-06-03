@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 
 import {
   ButtonRefreshIcon,
@@ -28,10 +28,13 @@ function cleanText(value) {
 
 function stepStatusLabel(status) {
   const normalized = cleanText(status).toLowerCase();
-  if (normalized === "in_progress") {
+  if (["active", "current", "in_progress", "in-progress", "running", "working"].includes(normalized)) {
     return "In progress";
   }
-  if (normalized === "completed") {
+  if (normalized === "pending") {
+    return "Pending";
+  }
+  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
     return "Completed";
   }
   if (normalized === "blocked") {
@@ -56,6 +59,51 @@ function planStatusLabel(status) {
   }
   return "Active";
 }
+
+function stepStatusKind(status) {
+  const normalized = cleanText(status).toLowerCase();
+  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if ([
+    "active",
+    "current",
+    "in_progress",
+    "in-progress",
+    "pending",
+    "running",
+    "working",
+  ].includes(normalized)) {
+    return "active";
+  }
+  if (normalized === "blocked" || normalized === "interrupted") {
+    return "blocked";
+  }
+  if (normalized === "skipped") {
+    return "skipped";
+  }
+  return "queued";
+}
+
+function StepStatusGlyph({ status }) {
+  const kind = stepStatusKind(status);
+
+  if (kind === "completed") {
+    return <Check aria-hidden="true" />;
+  }
+
+  if (kind === "active") {
+    return <StepSpinner aria-hidden="true" />;
+  }
+
+  return <StepQueuedDot aria-hidden="true" />;
+}
+
+const stepSpinnerSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
 
 function timestampLabel(value) {
   const date = new Date(value || "");
@@ -89,13 +137,16 @@ export default function PlansWorkspaceView({
   const titleMaxChars = Number(snapshot?.title_max_chars || selectedPlan?.title_max_chars || 96);
   const workspaceId = target.workspaceId || workspace?.id || "";
 
-  const loadSnapshot = useCallback(async () => {
+  const loadSnapshot = useCallback(async (options = {}) => {
+    const silent = options?.silent === true;
     if (!rootDirectory) {
       setSnapshot(null);
       return;
     }
-    setStatus("loading");
-    setError("");
+    if (!silent) {
+      setStatus("loading");
+      setError("");
+    }
     try {
       const response = await invoke("coordination_terminal_task_plan_snapshot", {
         repoPath: rootDirectory,
@@ -108,14 +159,30 @@ export default function PlansWorkspaceView({
       setSnapshot(dataOf(response));
       setStatus("ready");
     } catch (nextError) {
-      setError(cleanText(nextError?.message || nextError) || "Unable to load terminal plans.");
-      setStatus("error");
+      if (!silent) {
+        setError(cleanText(nextError?.message || nextError) || "Unable to load terminal plans.");
+        setStatus("error");
+      }
     }
   }, [rootDirectory, target.agentId, target.sessionId, target.taskId]);
 
   useEffect(() => {
     loadSnapshot();
   }, [loadSnapshot]);
+
+  useEffect(() => {
+    if (!rootDirectory || editingStepIndex !== null) {
+      return undefined;
+    }
+
+    const timerId = window.setInterval(() => {
+      loadSnapshot({ silent: true });
+    }, 900);
+
+    return () => {
+      window.clearInterval(timerId);
+    };
+  }, [editingStepIndex, loadSnapshot, rootDirectory]);
 
   useEffect(() => {
     setEditingStepIndex(null);
@@ -239,9 +306,12 @@ export default function PlansWorkspaceView({
               const editing = editingStepIndex === index;
               const editable = step.editable === true || cleanText(step.status).toLowerCase() === "queued";
               const saving = savingStepIndex === index;
+              const statusKind = stepStatusKind(step.status);
               return (
                 <StepRow data-status={cleanText(step.status).toLowerCase()} key={step.id || index}>
-                  <StepMarker aria-hidden="true">{index + 1}</StepMarker>
+                  <StepMarker aria-hidden="true" data-status={statusKind}>
+                    <StepStatusGlyph status={step.status} />
+                  </StepMarker>
                   <StepContent>
                     {editing ? (
                       <StepEditRow>
@@ -495,6 +565,51 @@ const StepMarker = styled.span`
   color: rgba(230, 238, 248, 0.74);
   font-size: 11px;
   font-weight: 800;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &[data-status="completed"] {
+    border-color: rgba(92, 214, 132, 0.36);
+    color: #a5efbd;
+    background: rgba(52, 180, 96, 0.12);
+  }
+
+  &[data-status="active"] {
+    border-color: rgba(116, 171, 255, 0.3);
+    color: #a9d2ff;
+    background: rgba(46, 126, 245, 0.1);
+  }
+
+  &[data-status="blocked"] {
+    border-color: rgba(255, 167, 84, 0.28);
+    color: #ffd2a6;
+    background: rgba(214, 113, 48, 0.12);
+  }
+
+  &[data-status="queued"],
+  &[data-status="skipped"] {
+    color: rgba(216, 226, 240, 0.58);
+  }
+`;
+
+const StepSpinner = styled.span`
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(169, 210, 255, 0.22);
+  border-top-color: #a9d2ff;
+  border-radius: 50%;
+  animation: ${stepSpinnerSpin} 0.8s linear infinite;
+`;
+
+const StepQueuedDot = styled.span`
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(216, 226, 240, 0.62);
+  box-shadow: 0 0 0 4px rgba(216, 226, 240, 0.06);
 `;
 
 const StepContent = styled.div`

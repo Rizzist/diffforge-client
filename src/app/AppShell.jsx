@@ -40,6 +40,7 @@ import {
   terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsPaused,
+  terminalActivityStatusIsSendable,
   terminalExecutionPhaseFromState,
   terminalPresenceStatusFromActivityStatus,
   terminalRailStateFromExecutionPhase,
@@ -2248,7 +2249,7 @@ function buildSpecEditAgentPrompt(intentId, payload, workspace, repoPath) {
     "",
     "Use coordination-kernel.start_task before changing files or specs. Include this spec_edit_intent_id in the task metadata or plan if the tool schema allows it.",
     "Acquire leases for affected paths before file edits. Checkpoint progress and submit_patch when complete.",
-    "For delete, retire or supersede the selected spec through the Architecture history workflow; do not hard-delete history.",
+    "For delete, retire or supersede the selected spec through the Task History workflow; do not hard-delete history.",
   );
   return lines.join("\n");
 }
@@ -4809,7 +4810,7 @@ export default function App() {
 
   useEffect(() => {
     workspacesRef.current = workspaces;
-  }, [workspaces]);
+  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, workspaces]);
 
   useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
@@ -11154,7 +11155,7 @@ export default function App() {
       architectureError: "",
     });
 
-    invoke("cloud_mcp_get_architecture_history", {
+    invoke("cloud_mcp_get_task_history", {
       repoPath,
       workspaceId,
       workspaceName,
@@ -11166,7 +11167,7 @@ export default function App() {
         if (!cancelled) {
           setWorkspaceGraphStatus(repoPath, workspaceId, {
             architectureState: "error",
-            architectureError: getErrorMessage(error, "Unable to load Architecture history."),
+            architectureError: getErrorMessage(error, "Unable to load Task History."),
           });
         }
       });
@@ -11190,6 +11191,57 @@ export default function App() {
   const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
     ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
     : {};
+
+  useEffect(() => {
+    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = selectedWorkspace?.id || "";
+    const workspaceName = selectedWorkspace?.name || null;
+    if (
+      visibleView !== "architecture"
+      || !workspaceHydrationReady
+      || !repoPath
+      || !workspaceId
+    ) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const refreshTaskHistory = () => {
+      invoke("cloud_mcp_get_task_history", {
+        repoPath,
+        workspaceId,
+        workspaceName,
+      })
+        .then((result) => {
+          if (!cancelled) applyWorkspaceGraphSnapshot(repoPath, workspaceId, result);
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setWorkspaceGraphStatus(repoPath, workspaceId, {
+              architectureState: "error",
+              architectureError: getErrorMessage(error, "Unable to load Task History."),
+            });
+          }
+        });
+    };
+
+    refreshTaskHistory();
+    const intervalId = window.setInterval(refreshTaskHistory, 3500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [
+    activatedWorkspaceTerminalWorkingDirectory,
+    applyWorkspaceGraphSnapshot,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceFileRoot,
+    setWorkspaceGraphStatus,
+    visibleView,
+    workspaceHydrationReady,
+  ]);
+
   useEffect(() => {
     setPendingSpecEditIntents((current) => {
       let changed = false;
@@ -11348,6 +11400,372 @@ export default function App() {
       receipts.set(receiptKey, now);
       return true;
     };
+    const remoteCommandKind = (event) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      return String(
+        event?.command_kind
+          || event?.commandKind
+          || event?.action
+          || event?.command
+          || payload.command_kind
+          || payload.commandKind
+          || payload.action
+          || payload.command
+          || "create_task",
+      ).trim().toLowerCase().replace(/[\s-]+/g, "_");
+    };
+    const remoteCommandIsCreateTask = (commandKind) => (
+      !commandKind
+      || commandKind === "create_task"
+      || commandKind === "remote.command.create_task"
+      || commandKind === "remote_command.create_task"
+      || commandKind === "remote_command_create_task"
+      || commandKind === "task.create"
+      || commandKind === "task_create"
+      || commandKind === "todo.create"
+      || commandKind === "todo_create"
+    );
+    const recordRemoteCommandStatus = (event, status, message, details = null) => (
+      invoke("cloud_mcp_record_remote_command_status", {
+        event,
+        status,
+        message,
+        ...(details && typeof details === "object" ? { details } : {}),
+      }).catch(() => {})
+    );
+    const syncRemoteControlState = async (reason) => {
+      await new Promise((resolve) => window.setTimeout(resolve, 180));
+      const workspacesSnapshot = Array.isArray(terminalPresenceWorkspacesRef.current)
+        ? terminalPresenceWorkspacesRef.current
+        : [];
+      if (workspacesSnapshot.length > 0) {
+        await invoke("cloud_mcp_sync_terminal_presence", {
+          reason,
+          workspaces: workspacesSnapshot,
+        }).catch(() => {});
+      }
+      await invoke("cloud_mcp_sync_device_workspace_snapshot", {
+        reason,
+      }).catch(() => {});
+    };
+    const remoteControlTerminalText = (terminal, keys) => {
+      for (const key of keys) {
+        const value = terminal?.[key];
+        const text = String(value || "").trim();
+        if (text) return text;
+      }
+      return "";
+    };
+    const remoteControlTerminalNumber = (terminal, keys) => {
+      for (const key of keys) {
+        const number = Number.parseInt(terminal?.[key], 10);
+        if (Number.isInteger(number) && number >= 0) return number;
+      }
+      return null;
+    };
+    const remoteControlTerminalStatusValues = (terminal) => [
+      terminal?.nativeRailState,
+      terminal?.native_rail_state,
+      terminal?.activityStatus,
+      terminal?.activity_status,
+      terminal?.executionPhase,
+      terminal?.execution_phase,
+      terminal?.turnStatus,
+      terminal?.turn_status,
+      terminal?.readiness,
+      terminal?.terminalReadiness,
+      terminal?.terminal_readiness,
+      terminal?.status,
+      terminal?.statusAfter,
+      terminal?.terminalLifecycle,
+      terminal?.terminal_lifecycle,
+      terminal?.sessionState,
+      terminal?.session_state,
+    ].map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+    const remoteControlTerminalLooksClosed = (terminal) => (
+      remoteControlTerminalStatusValues(terminal).some((status) => (
+        ["closed", "closing", "deactivated", "disabled", "exited", "no_session", "offline", "terminated"].includes(status)
+      ))
+    );
+    const assessRemoteControlTerminalIdle = (terminal) => {
+      if (!terminal) {
+        return { idle: false, reason: "unknown" };
+      }
+      if (remoteControlTerminalLooksClosed(terminal)) {
+        return { idle: false, reason: "already_closed" };
+      }
+      const statuses = remoteControlTerminalStatusValues(terminal);
+      const busyStatus = statuses.find((status) => (
+        terminalActivityStatusIsBusy(status)
+          || terminalActivityStatusIsPaused(status)
+          || ["busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+      ));
+      if (busyStatus) {
+        return { idle: false, reason: busyStatus };
+      }
+      const errorStatus = statuses.find((status) => ["error", "failed", "timeout"].includes(status));
+      if (errorStatus) {
+        return { idle: false, reason: errorStatus };
+      }
+      const idleStatus = statuses.find((status) => (
+        terminalActivityStatusIsSendable(status)
+          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
+      ));
+      if (!idleStatus) {
+        return { idle: false, reason: "unknown" };
+      }
+      return { idle: true, reason: idleStatus };
+    };
+    const findRemoteControlPresenceWorkspace = (workspaceId) => (
+      (terminalPresenceWorkspacesRef.current || []).find((workspace) => (
+        String(workspace?.workspaceId || workspace?.workspace_id || "").trim() === workspaceId
+      )) || null
+    );
+    const findRemoteControlTerminal = (workspaceId, target = {}) => {
+      const presenceWorkspace = findRemoteControlPresenceWorkspace(workspaceId);
+      const terminals = Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [];
+      const targetTerminalId = String(target.targetTerminalId || "").trim();
+      const targetThreadId = String(target.targetThreadId || "").trim();
+      const targetTerminalIndex = Number.isInteger(target.targetTerminalIndex)
+        ? target.targetTerminalIndex
+        : null;
+      const terminal = terminals.find((candidate) => (
+        targetTerminalId
+          && [
+            candidate?.paneId,
+            candidate?.pane_id,
+            candidate?.terminalId,
+            candidate?.terminal_id,
+          ].map((value) => String(value || "").trim()).includes(targetTerminalId)
+      )) || terminals.find((candidate) => (
+        targetThreadId
+          && [
+            candidate?.threadId,
+            candidate?.thread_id,
+          ].map((value) => String(value || "").trim()).includes(targetThreadId)
+      )) || terminals.find((candidate) => (
+        Number.isInteger(targetTerminalIndex)
+          && remoteControlTerminalNumber(candidate, ["terminalIndex", "terminal_index"]) === targetTerminalIndex
+      )) || null;
+      return {
+        presenceWorkspace,
+        terminal,
+        terminals,
+      };
+    };
+    const remoteControlTerminalSummary = (terminal, fallback = {}) => ({
+      agentId: remoteControlTerminalText(terminal, ["agentId", "agent_id", "agentKind", "agent_kind"]) || fallback.agentId || "",
+      paneId: remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]) || fallback.targetTerminalId || "",
+      reason: fallback.reason || "",
+      terminalIndex: remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]) ?? fallback.targetTerminalIndex ?? null,
+      threadId: remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || fallback.targetThreadId || "",
+    });
+    const closeRemoteControlTerminal = async (workspaceId, terminal, target = {}) => {
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      const instanceId = remoteControlTerminalText(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
+      if (!paneId) {
+        return {
+          closed: false,
+          reason: "missing_pane_id",
+          terminal: remoteControlTerminalSummary(terminal, target),
+        };
+      }
+      await invoke("terminal_close", {
+        paneId,
+        instanceId: instanceId || undefined,
+        waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP || undefined,
+      });
+      if (Number.isInteger(terminalIndex)) {
+        closeWorkspaceTerminal({
+          threadId,
+          terminalIndex,
+          workspaceId,
+        });
+      }
+      terminalStatusEventEmitterRef.current?.({
+        activityStatus: "closed",
+        commandPhase: "completed",
+        executionPhase: "completed",
+        paneId,
+        readiness: "closed",
+        source: "remote-control-close",
+        status: "closed",
+        terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : 0,
+        threadId,
+        type: "remote-control-close",
+        workspaceId,
+      }, {
+        commandPhase: "completed",
+        executionPhase: "completed",
+        reason: "remote-control-close",
+        status: "closed",
+      });
+      return {
+        closed: true,
+        terminal: remoteControlTerminalSummary(terminal, target),
+      };
+    };
+    const collectRemoteControlWorkspaceBlockers = (workspaceId) => {
+      const presenceWorkspace = findRemoteControlPresenceWorkspace(workspaceId);
+      const terminals = Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [];
+      const activeWorkspaceIds = normalizeEnabledWorkspaceIds(
+        workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+      );
+      const workspaceIsActive = activeWorkspaceIds.includes(workspaceId)
+        || activatedWorkspaceIdRef.current === workspaceId;
+      if (!presenceWorkspace && workspaceIsActive) {
+        const expectedTerminalCount = getWorkspaceTerminalCount(workspaceSettingsRef.current, workspaceId);
+        if (expectedTerminalCount > 0) {
+          return {
+            blockers: [{
+              paneId: "",
+              reason: "missing_presence_snapshot",
+              terminalIndex: null,
+              threadId: "",
+            }],
+            presenceWorkspace,
+            terminals,
+          };
+        }
+      }
+      const blockers = terminals
+        .map((terminal) => ({
+          assessment: assessRemoteControlTerminalIdle(terminal),
+          terminal,
+        }))
+        .filter(({ assessment }) => !assessment.idle && assessment.reason !== "already_closed")
+        .map(({ assessment, terminal }) => remoteControlTerminalSummary(terminal, {
+          reason: assessment.reason,
+        }));
+      return {
+        blockers,
+        presenceWorkspace,
+        terminals,
+      };
+    };
+    const handleRemoteLifecycleControl = async ({
+      commandId,
+      commandKind,
+      event,
+      targetTerminalId,
+      targetTerminalIndex,
+      targetThreadId,
+      workspaceId,
+    }) => {
+      const normalizedKind = commandKind.replace(/\./g, "_");
+      const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
+      const target = { targetTerminalId, targetTerminalIndex, targetThreadId };
+      await recordRemoteCommandStatus(event, "validating", "Desktop is validating the remote control command.");
+      if (!targetWorkspace) {
+        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        return;
+      }
+      if (workspaceDeactivationInFlightRef.current) {
+        await recordRemoteCommandStatus(event, "blocked", "Workspace lifecycle is already changing on this desktop.", {
+          commandId,
+          commandKind,
+          inFlightWorkspaceId: workspaceDeactivationInFlightRef.current,
+          workspaceId,
+        });
+        return;
+      }
+      if (normalizedKind === "workspace_activate" || normalizedKind === "activate_workspace") {
+        activateWorkspace(workspaceId, "remote_control");
+        await syncRemoteControlState("remote_workspace_activate");
+        await recordRemoteCommandStatus(event, "completed", "Workspace activated from the web dashboard.", {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        return;
+      }
+      if (normalizedKind === "terminal_close_idle" || normalizedKind === "close_idle_terminal") {
+        const { terminal } = findRemoteControlTerminal(workspaceId, target);
+        const assessment = assessRemoteControlTerminalIdle(terminal);
+        if (!terminal || !assessment.idle) {
+          await recordRemoteCommandStatus(event, "blocked", "Terminal is not idle, so it was not closed.", {
+            assessment,
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminal, {
+              reason: assessment.reason,
+              ...target,
+            }),
+            workspaceId,
+          });
+          return;
+        }
+        const result = await closeRemoteControlTerminal(workspaceId, terminal, target);
+        await syncRemoteControlState("remote_terminal_close_idle");
+        await recordRemoteCommandStatus(event, result.closed ? "completed" : "blocked", result.closed
+          ? "Idle terminal closed from the web dashboard."
+          : "Terminal could not be closed.", {
+            commandId,
+            commandKind,
+            result,
+            workspaceId,
+          });
+        return;
+      }
+      if (normalizedKind === "workspace_close_idle_terminals" || normalizedKind === "close_idle_terminals") {
+        const { terminals } = findRemoteControlTerminal(workspaceId, target);
+        const closeResults = [];
+        const skipped = [];
+        for (const terminal of terminals) {
+          const assessment = assessRemoteControlTerminalIdle(terminal);
+          if (!assessment.idle) {
+            if (assessment.reason !== "already_closed") {
+              skipped.push(remoteControlTerminalSummary(terminal, { reason: assessment.reason }));
+            }
+            continue;
+          }
+          closeResults.push(await closeRemoteControlTerminal(workspaceId, terminal, target));
+        }
+        await syncRemoteControlState("remote_workspace_close_idle_terminals");
+        await recordRemoteCommandStatus(event, "completed", `Closed ${closeResults.filter((item) => item.closed).length} idle terminal(s).`, {
+          closed: closeResults,
+          closedCount: closeResults.filter((item) => item.closed).length,
+          commandId,
+          commandKind,
+          skipped,
+          workspaceId,
+        });
+        return;
+      }
+      if (normalizedKind === "workspace_deactivate_if_idle" || normalizedKind === "deactivate_workspace_if_idle") {
+        const { blockers, terminals } = collectRemoteControlWorkspaceBlockers(workspaceId);
+        if (blockers.length > 0) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace still has non-idle terminals, so it was not deactivated.", {
+            blockers,
+            commandId,
+            commandKind,
+            terminalCount: terminals.length,
+            workspaceId,
+          });
+          return;
+        }
+        await deactivateWorkspace(workspaceId, "remote_control");
+        await syncRemoteControlState("remote_workspace_deactivate_if_idle");
+        await recordRemoteCommandStatus(event, "completed", "Workspace deactivated from the web dashboard.", {
+          commandId,
+          commandKind,
+          terminalCount: terminals.length,
+          workspaceId,
+        });
+        return;
+      }
+      await recordRemoteCommandStatus(event, "failed", `Unsupported remote control command: ${commandKind}.`, {
+        commandId,
+        commandKind,
+        workspaceId,
+      });
+    };
 
     const startRemoteCommandListener = async () => {
       try {
@@ -11369,6 +11787,7 @@ export default function App() {
           const event = remoteEvent?.payload || {};
           const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+          const commandKind = remoteCommandKind(event);
           const text = remoteCommandText(event);
           const workspaceId = remoteCommandWorkspaceId(event);
           const agentId = normalizeManagedAgentProviderId(
@@ -11417,14 +11836,13 @@ export default function App() {
           const targetTerminalColor = hasTerminalTarget
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
-          if (!text || !workspaceId) {
-            await invoke("cloud_mcp_record_remote_command_status", {
+          if (!workspaceId) {
+            await recordRemoteCommandStatus(
               event,
-              status: "failed",
-              message: !workspaceId
-                ? "No local workspace is available for the remote command."
-                : "Remote command did not include a task message.",
-            }).catch(() => {});
+              "failed",
+              "No local workspace is available for the remote command.",
+              { commandId, commandKind },
+            );
             return;
           }
           if (!claimRemoteCommandReceipt(event, commandId, workspaceId)) {
@@ -11434,11 +11852,39 @@ export default function App() {
               surface: "remote_command_listener",
               workspaceId,
             });
-            await invoke("cloud_mcp_record_remote_command_status", {
-              event,
-              status: "duplicate_ignored",
-              message: "Duplicate remote command ignored by desktop UI.",
-            }).catch(() => {});
+            await recordRemoteCommandStatus(event, "duplicate_ignored", "Duplicate remote command ignored by desktop UI.", {
+              commandId,
+              commandKind,
+              workspaceId,
+            });
+            return;
+          }
+          if (!remoteCommandIsCreateTask(commandKind)) {
+            try {
+              await handleRemoteLifecycleControl({
+                commandId,
+                commandKind,
+                event,
+                targetTerminalId,
+                targetTerminalIndex,
+                targetThreadId,
+                workspaceId,
+              });
+            } catch (error) {
+              await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Remote control command failed."), {
+                commandId,
+                commandKind,
+                workspaceId,
+              });
+            }
+            return;
+          }
+          if (!text) {
+            await recordRemoteCommandStatus(event, "failed", "Remote command did not include a task message.", {
+              commandId,
+              commandKind,
+              workspaceId,
+            });
             return;
           }
           const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
@@ -11501,15 +11947,16 @@ export default function App() {
               status: "queued",
             });
           }
-          await invoke("cloud_mcp_record_remote_command_status", {
+          await recordRemoteCommandStatus(
             event,
-            status: "queued",
-            message: Number.isInteger(targetTerminalIndex)
+            "queued",
+            Number.isInteger(targetTerminalIndex)
               ? `Queued for terminal ${targetTerminalIndex + 1}.`
               : agentId
                 ? `Queued for ${getManagedAgentLabel(agentId)}.`
                 : "Queued for the next available terminal.",
-          }).catch(() => {});
+            { commandId, commandKind, workspaceId },
+          );
         });
       } catch (error) {
         logBigViewSyncDiagnosticEvent("remote_control.listener_error", {
@@ -15320,7 +15767,7 @@ export default function App() {
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Graph</span>
-                          <strong>Architecture history</strong>
+                          <strong>Task history</strong>
                         </SettingsIdentityItem>
                         <SettingsIdentityItem>
                           <span>Remote</span>
@@ -15510,7 +15957,7 @@ export default function App() {
                       workspace={selectedWorkspace}
                     />
                   ) : (
-                    <WorkspaceIdleState detail="Select a workspace to view architecture history." viewMotion={viewMotion} />
+                    <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (

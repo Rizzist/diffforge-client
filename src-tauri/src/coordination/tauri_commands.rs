@@ -445,17 +445,19 @@ pub fn coordination_terminal_task_plan_snapshot(
     input: Option<Value>,
 ) -> Result<Value, String> {
     let input = input.unwrap_or_else(|| json!({}));
-    result(kernel(repo_path, db_path)?.terminal_task_plan_snapshot(
-        input["task_id"]
-            .as_str()
-            .or_else(|| input["taskId"].as_str()),
-        input["session_id"]
-            .as_str()
-            .or_else(|| input["sessionId"].as_str()),
-        input["agent_id"]
-            .as_str()
-            .or_else(|| input["agentId"].as_str()),
-    ))
+    result(
+        kernel(repo_path, db_path)?.terminal_task_plan_snapshot(
+            input["task_id"]
+                .as_str()
+                .or_else(|| input["taskId"].as_str()),
+            input["session_id"]
+                .as_str()
+                .or_else(|| input["sessionId"].as_str()),
+            input["agent_id"]
+                .as_str()
+                .or_else(|| input["agentId"].as_str()),
+        ),
+    )
 }
 
 #[tauri::command]
@@ -484,7 +486,8 @@ pub fn coordination_terminal_task_plan_edit_step_title(
     let session_id = input["session_id"]
         .as_str()
         .or_else(|| input["sessionId"].as_str());
-    let mut response = kernel.edit_terminal_task_plan_step_title(task_id, step_index, title, agent_id)?;
+    let mut response =
+        kernel.edit_terminal_task_plan_step_title(task_id, step_index, title, agent_id)?;
     let compact_plan = response["data"]["compact_plan"].clone();
     let cloud = if response["ok"].as_bool() != Some(false) && !compact_plan.is_null() {
         match crate::cloud_mcp_forward_terminal_task_plan_update(

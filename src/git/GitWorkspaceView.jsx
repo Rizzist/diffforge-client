@@ -4,11 +4,8 @@ import styled from "styled-components";
 
 import {
   ButtonBrowserIcon,
-  ButtonCheckIcon,
-  ButtonRefreshIcon,
   FormMessage,
   PrimaryButton,
-  SecondaryButton,
 } from "../app/appStyles";
 
 function text(value, fallback = "") {
@@ -51,6 +48,22 @@ function repoMeta(repo) {
   return parts.filter(Boolean).join(" · ");
 }
 
+function repoChangeSummary(repo) {
+  const counts = repo?.statusCounts || {};
+  const total = numberValue(counts.total);
+  if (!total) return "Clean";
+  const parts = [];
+  const staged = numberValue(counts.staged);
+  const unstaged = numberValue(counts.unstaged);
+  const untracked = numberValue(counts.untracked);
+  const conflicted = numberValue(counts.conflicted);
+  if (staged) parts.push(`${staged} staged`);
+  if (unstaged) parts.push(`${unstaged} modified`);
+  if (untracked) parts.push(`${untracked} added`);
+  if (conflicted) parts.push(`${conflicted} conflicted`);
+  return parts.length ? parts.join(" · ") : `${total} changed`;
+}
+
 function statusSummary(snapshot) {
   const counts = snapshot?.status?.counts || {};
   const total = numberValue(counts.total);
@@ -76,6 +89,36 @@ function fileStatusTone(file) {
   return "modified";
 }
 
+function historyFileCode(file) {
+  const status = text(file?.status, "M");
+  const match = status.match(/^[A-Z?]+/);
+  return (match?.[0] || status).slice(0, 2);
+}
+
+function historyFileLabel(file) {
+  const status = text(file?.status).toUpperCase();
+  if (status.startsWith("A") || status === "??") return "Added";
+  if (status.startsWith("C")) return "Copied";
+  if (status.startsWith("D")) return "Deleted";
+  if (status.startsWith("R")) return "Renamed";
+  if (status.startsWith("T")) return "Type changed";
+  if (status.startsWith("U")) return "Conflicted";
+  return "Modified";
+}
+
+function historyFileTone(file) {
+  const label = historyFileLabel(file).toLowerCase();
+  if (label === "added" || label === "copied") return "added";
+  if (label === "deleted" || label === "conflicted") return "deleted";
+  if (label === "renamed") return "moved";
+  return "modified";
+}
+
+function commitFileSummary(commit) {
+  const files = Array.isArray(commit?.files) ? commit.files : [];
+  return `${files.length} ${files.length === 1 ? "file" : "files"}`;
+}
+
 function commitActionMessage(result, pushRequested) {
   if (!result?.committed) return "No commit was created.";
   const sha = shortSha(result.commitSha);
@@ -97,10 +140,7 @@ export default function GitWorkspaceView({
   const [snapshotState, setSnapshotState] = useState("idle");
   const [snapshotError, setSnapshotError] = useState("");
   const [snapshot, setSnapshot] = useState(null);
-  const [selectedFilePath, setSelectedFilePath] = useState("");
-  const [diffState, setDiffState] = useState("idle");
-  const [diffError, setDiffError] = useState("");
-  const [diff, setDiff] = useState(null);
+  const [selectedCommitSha, setSelectedCommitSha] = useState("");
   const [messageState, setMessageState] = useState("idle");
   const [messageDraft, setMessageDraft] = useState("");
   const [messageTouched, setMessageTouched] = useState(false);
@@ -118,13 +158,17 @@ export default function GitWorkspaceView({
     () => (Array.isArray(snapshot?.history) ? snapshot.history : []),
     [snapshot],
   );
-  const selectedFile = useMemo(
-    () => changedFiles.find((file) => file.path === selectedFilePath) || null,
-    [changedFiles, selectedFilePath],
-  );
   const selectedRepo = useMemo(
     () => repositories.find((repo) => repo.path === selectedRepoPath) || null,
     [repositories, selectedRepoPath],
+  );
+  const selectedCommit = useMemo(
+    () => history.find((commit) => commit.sha === selectedCommitSha) || history[0] || null,
+    [history, selectedCommitSha],
+  );
+  const selectedCommitFiles = useMemo(
+    () => (Array.isArray(selectedCommit?.files) ? selectedCommit.files : []),
+    [selectedCommit],
   );
   const operationBlocked = snapshot?.operationState && snapshot.operationState.clean === false;
   const hasChanges = changedFiles.length > 0;
@@ -193,10 +237,6 @@ export default function GitWorkspaceView({
       setSnapshot(result);
       setSnapshotState("ready");
       const files = Array.isArray(result?.status?.files) ? result.status.files : [];
-      setSelectedFilePath((current) => {
-        if (current && files.some((file) => file.path === current)) return current;
-        return files[0]?.path || "";
-      });
       if (regenerateMessage && files.length && !messageTouched) {
         void generateMessage(repoPath);
       }
@@ -209,36 +249,13 @@ export default function GitWorkspaceView({
     }
   }, [generateMessage, messageTouched]);
 
-  const loadDiff = useCallback(async (repoPath, file) => {
-    if (!repoPath || !file?.path) {
-      setDiff(null);
-      setDiffState("idle");
-      setDiffError("");
-      return;
-    }
-    setDiffState("loading");
-    setDiffError("");
-    try {
-      const result = await invoke("workspace_git_file_diff", {
-        filePath: file.path,
-        repoPath,
-        staged: Boolean(file.staged && !file.unstaged),
-      });
-      setDiff(result);
-      setDiffState("ready");
-    } catch (error) {
-      setDiffError(error?.message || String(error));
-      setDiffState("error");
-    }
-  }, []);
-
   useEffect(() => {
     void loadRepositories({ refresh: false });
   }, [loadRepositories]);
 
   useEffect(() => {
     setSnapshot(null);
-    setSelectedFilePath("");
+    setSelectedCommitSha("");
     setMessageDraft("");
     setMessageTouched(false);
     setActionMessage("");
@@ -247,15 +264,13 @@ export default function GitWorkspaceView({
   }, [loadSnapshot, selectedRepoPath]);
 
   useEffect(() => {
-    void loadDiff(selectedRepoPath, selectedFile);
-  }, [loadDiff, selectedFile, selectedRepoPath]);
+    setSelectedCommitSha((current) => {
+      if (current && history.some((commit) => commit.sha === current)) return current;
+      return history[0]?.sha || "";
+    });
+  }, [history]);
 
-  const refreshAll = useCallback(() => {
-    void loadRepositories({ refresh: true });
-    if (selectedRepoPath) void loadSnapshot(selectedRepoPath, { regenerateMessage: false });
-  }, [loadRepositories, loadSnapshot, selectedRepoPath]);
-
-  const commitRepo = useCallback(async (push) => {
+  const commitRepo = useCallback(async () => {
     if (!selectedRepoPath || !messageDraft.trim()) return;
     setActionState("running");
     setActionMessage("");
@@ -263,11 +278,12 @@ export default function GitWorkspaceView({
     try {
       const result = await invoke("workspace_git_commit_and_push", {
         message: messageDraft,
-        push,
+        push: true,
         repoPath: selectedRepoPath,
       });
-      setActionMessage(commitActionMessage(result, push));
+      setActionMessage(commitActionMessage(result, true));
       setSnapshot(result?.snapshot || null);
+      setSelectedCommitSha(result?.snapshot?.history?.[0]?.sha || "");
       setMessageDraft("");
       setMessageTouched(false);
       setActionState(result?.pushError ? "warning" : "success");
@@ -288,29 +304,13 @@ export default function GitWorkspaceView({
 
   return (
     <GitSurface aria-label="Workspace Git">
-      <GitHeader>
-        <div>
-          <GitKicker>Git</GitKicker>
-          <GitTitle>{workspaceName || "Workspace repositories"}</GitTitle>
-        </div>
-        <SecondaryButton
-          disabled={repositoriesState === "refreshing"}
-          onClick={refreshAll}
-          title="Refresh Git repositories"
-          type="button"
-        >
-          <ButtonRefreshIcon aria-hidden="true" />
-          <span>{repositoriesState === "refreshing" ? "Refreshing" : "Refresh"}</span>
-        </SecondaryButton>
-      </GitHeader>
-
       {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
       {repositoriesError && <FormMessage $state="error">{repositoriesError}</FormMessage>}
       {snapshotError && <FormMessage $state="error">{snapshotError}</FormMessage>}
       {actionError && <FormMessage $state="error">{actionError}</FormMessage>}
       {actionMessage && <GitNotice data-state={actionState}>{actionMessage}</GitNotice>}
 
-      <RepoStrip aria-label="Git repositories" role="list">
+      <RepoGrid aria-label="Git repositories" role="list">
         {repositories.map((repo) => (
           <RepoButton
             data-active={repo.path === selectedRepoPath ? "true" : undefined}
@@ -320,8 +320,12 @@ export default function GitWorkspaceView({
             title={repo.path}
             type="button"
           >
-            <strong>{repoLabel(repo)}</strong>
+            <RepoCardTop>
+              <strong>{repoLabel(repo)}</strong>
+              <RepoDirtyDot data-dirty={repo.dirty ? "true" : undefined} />
+            </RepoCardTop>
             <span>{repoMeta(repo)}</span>
+            <em>{repoChangeSummary(repo)}</em>
           </RepoButton>
         ))}
         {!repositories.length && (
@@ -329,7 +333,7 @@ export default function GitWorkspaceView({
             {repositoriesState === "loading" ? "Loading repositories..." : "No Git repositories found in this workspace."}
           </GitEmpty>
         )}
-      </RepoStrip>
+      </RepoGrid>
 
       {selectedRepo ? (
         <GitBody>
@@ -342,7 +346,7 @@ export default function GitWorkspaceView({
               <span>{text(snapshot?.repo?.branch, selectedRepo.branch)}</span>
               <span>{shortSha(snapshot?.repo?.headSha || selectedRepo.headSha)}</span>
               <span>{statusSummary(snapshot)}</span>
-              {cacheStatus && <span>scan {cacheStatus}</span>}
+              {cacheStatus && <span>{cacheStatus}</span>}
             </RepoFacts>
           </RepoSummary>
 
@@ -353,62 +357,19 @@ export default function GitWorkspaceView({
           )}
 
           <CommitPanel>
-            <CommitMessage
-              aria-label="Commit message"
-              disabled={!hasChanges || actionState === "running"}
-              onChange={(event) => {
-                setMessageDraft(event.target.value);
-                setMessageTouched(true);
-              }}
-              placeholder={hasChanges ? "Commit message" : "No changes to commit"}
-              spellCheck="true"
-              value={messageDraft}
-            />
-            <CommitActions>
-              <SecondaryButton
-                disabled={!selectedRepoPath || messageState === "loading" || !hasChanges}
-                onClick={() => generateMessage(selectedRepoPath)}
-                type="button"
-              >
-                <ButtonRefreshIcon aria-hidden="true" />
-                <span>{messageState === "loading" ? "Generating" : "Regenerate"}</span>
-              </SecondaryButton>
-              <SecondaryButton
-                disabled={!canCommit}
-                onClick={() => commitRepo(false)}
-                type="button"
-              >
-                <ButtonCheckIcon aria-hidden="true" />
-                <span>{actionState === "running" ? "Committing" : "Commit"}</span>
-              </SecondaryButton>
-              <PrimaryButton
-                disabled={!canCommit}
-                onClick={() => commitRepo(true)}
-                type="button"
-              >
-                <ButtonBrowserIcon aria-hidden="true" />
-                <span>{actionState === "running" ? "Pushing" : "Commit & Push"}</span>
-              </PrimaryButton>
-            </CommitActions>
-          </CommitPanel>
-
-          <GitColumns>
             <ChangesPane>
-              <SectionTitle>Changed Files</SectionTitle>
+              <SectionTitle>Changes</SectionTitle>
               {changedFiles.length ? (
                 <ChangeList>
                   {changedFiles.map((file) => (
-                    <ChangeButton
-                      data-active={file.path === selectedFilePath ? "true" : undefined}
+                    <ChangeItem
                       data-tone={fileStatusTone(file)}
                       key={`${file.code}:${file.path}:${file.oldPath || ""}`}
-                      onClick={() => setSelectedFilePath(file.path)}
                       title={file.path}
-                      type="button"
                     >
                       <span>{file.code}</span>
                       <strong>{file.path}</strong>
-                    </ChangeButton>
+                    </ChangeItem>
                   ))}
                 </ChangeList>
               ) : (
@@ -416,39 +377,83 @@ export default function GitWorkspaceView({
               )}
             </ChangesPane>
 
-            <DiffPane>
-              <SectionTitle>{selectedFilePath || "Diff"}</SectionTitle>
-              {diffError && <FormMessage $state="error">{diffError}</FormMessage>}
-              <DiffText>
-                {diffState === "loading"
-                  ? "Loading diff..."
-                  : diff?.diff
-                    ? diff.diff
-                    : selectedFile?.untracked
-                      ? "Untracked file diff will appear after staging. Commit uses git add -A."
-                      : "No diff text for this file."}
-              </DiffText>
-            </DiffPane>
-          </GitColumns>
+            <CommitComposer>
+              <CommitMessage
+                aria-label="Commit message"
+                disabled={!hasChanges || actionState === "running"}
+                onChange={(event) => {
+                  setMessageDraft(event.target.value);
+                  setMessageTouched(true);
+                }}
+                placeholder={hasChanges ? (messageState === "loading" ? "Generating commit message..." : "Commit message") : "No changes to commit"}
+                spellCheck="true"
+                value={messageDraft}
+              />
+              <PrimaryButton
+                disabled={!canCommit}
+                onClick={commitRepo}
+                type="button"
+              >
+                <ButtonBrowserIcon aria-hidden="true" />
+                <span>{actionState === "running" ? "Pushing" : "Commit & Push"}</span>
+              </PrimaryButton>
+            </CommitComposer>
+          </CommitPanel>
 
-          <HistoryPane>
-            <SectionTitle>Recent History</SectionTitle>
-            {history.length ? history.map((commit) => (
-              <HistoryItem key={commit.sha}>
-                <HistoryItemHeader>
-                  <strong>{commit.subject}</strong>
-                  <span>{shortSha(commit.sha)} · {formatTime(commit.date)}</span>
-                </HistoryItemHeader>
-                <HistoryFiles>
-                  {(Array.isArray(commit.files) ? commit.files : []).slice(0, 6).map((file, index) => (
-                    <span key={`${commit.sha}:${file.path}:${index}`}>{file.status} {file.path}</span>
-                  ))}
-                </HistoryFiles>
-              </HistoryItem>
-            )) : (
-              <GitEmpty>{snapshotState === "loading" ? "Loading history..." : "No commits recorded yet."}</GitEmpty>
-            )}
-          </HistoryPane>
+          <GitColumns>
+            <HistoryPane>
+              <SectionTitle>History</SectionTitle>
+              <HistoryList>
+                {history.length ? history.map((commit) => (
+                  <HistoryButton
+                    data-active={commit.sha === selectedCommit?.sha ? "true" : undefined}
+                    key={commit.sha}
+                    onClick={() => setSelectedCommitSha(commit.sha)}
+                    title={commit.subject}
+                    type="button"
+                  >
+                    <HistoryGraph aria-hidden="true" />
+                    <HistoryItemHeader>
+                      <strong>{commit.subject}</strong>
+                      <span>{shortSha(commit.sha)} · {formatTime(commit.date)}</span>
+                    </HistoryItemHeader>
+                    <CommitFileCount>{commitFileSummary(commit)}</CommitFileCount>
+                  </HistoryButton>
+                )) : (
+                  <GitEmpty>{snapshotState === "loading" ? "Loading history..." : "No commits recorded yet."}</GitEmpty>
+                )}
+              </HistoryList>
+            </HistoryPane>
+
+            <CommitFilesPane>
+              <SectionTitle>{selectedCommit ? `${shortSha(selectedCommit.sha)} files` : "Commit files"}</SectionTitle>
+              {selectedCommit ? (
+                <>
+                  <CommitDetailHeader>
+                    <strong>{selectedCommit.subject}</strong>
+                    <span>{selectedCommit.authorName || "Unknown author"} · {formatTime(selectedCommit.date)}</span>
+                  </CommitDetailHeader>
+                  <CommitFileList>
+                    {selectedCommitFiles.length ? selectedCommitFiles.map((file, index) => (
+                      <CommitFileItem
+                        data-tone={historyFileTone(file)}
+                        key={`${selectedCommit.sha}:${file.path}:${index}`}
+                        title={file.oldPath ? `${file.oldPath} -> ${file.path}` : file.path}
+                      >
+                        <span>{historyFileCode(file)}</span>
+                        <strong>{file.path}</strong>
+                        <em>{historyFileLabel(file)}</em>
+                      </CommitFileItem>
+                    )) : (
+                      <GitEmpty>No files recorded for this commit.</GitEmpty>
+                    )}
+                  </CommitFileList>
+                </>
+              ) : (
+                <GitEmpty>Select a commit to inspect files.</GitEmpty>
+              )}
+            </CommitFilesPane>
+          </GitColumns>
         </GitBody>
       ) : null}
     </GitSurface>
@@ -456,12 +461,12 @@ export default function GitWorkspaceView({
 }
 
 const GitSurface = styled.section`
-  display: grid;
+  display: flex;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  flex-direction: column;
   gap: 10px;
   padding: 12px;
   color: #dbe7f7;
@@ -474,57 +479,34 @@ const GitSurface = styled.section`
   }
 `;
 
-const GitHeader = styled.header`
-  display: flex;
+const RepoGrid = styled.div`
+  display: grid;
   min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-`;
-
-const GitKicker = styled.div`
-  color: #8ea0b8;
-  font-size: 10px;
-  font-weight: 900;
-  letter-spacing: 0;
-  text-transform: uppercase;
-`;
-
-const GitTitle = styled.h2`
-  margin: 2px 0 0;
-  color: #f8fafc;
-  font-size: 15px;
-  font-weight: 880;
-  letter-spacing: 0;
-
-  html[data-forge-theme="light"] & {
-    color: #1d1d1f;
-  }
-`;
-
-const RepoStrip = styled.div`
-  display: flex;
-  min-width: 0;
+  max-height: 126px;
+  flex: 0 0 auto;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 8px;
-  overflow-x: auto;
+  overflow: auto;
   padding-bottom: 2px;
 `;
 
 const RepoButton = styled.button`
   display: grid;
-  min-width: 185px;
-  max-width: 240px;
-  gap: 4px;
+  min-width: 0;
+  min-height: 82px;
+  align-content: start;
+  gap: 6px;
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 8px;
+  border-radius: 7px;
   color: #c8d4e5;
   background: rgba(15, 23, 42, 0.72);
   cursor: pointer;
   text-align: left;
 
   strong,
-  span {
+  span,
+  em {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -541,6 +523,13 @@ const RepoButton = styled.button`
     color: #8ea0b8;
     font-size: 10px;
     font-weight: 720;
+  }
+
+  em {
+    color: #aab8ca;
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 760;
   }
 
   &[data-dirty="true"] {
@@ -563,21 +552,45 @@ const RepoButton = styled.button`
   }
 `;
 
-const GitBody = styled.div`
+const RepoCardTop = styled.div`
   display: grid;
   min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+`;
+
+const RepoDirtyDot = styled.i`
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.46);
+
+  &[data-dirty="true"] {
+    background: #f59e0b;
+    box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.12);
+  }
+`;
+
+const GitBody = styled.div`
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(260px, 1fr) minmax(160px, 0.62fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
 `;
 
 const RepoSummary = styled.section`
-  display: grid;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 10px;
+  padding: 9px 10px;
   border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 8px;
+  border-radius: 7px;
   background: rgba(2, 6, 12, 0.58);
 
   html[data-forge-theme="light"] & {
@@ -589,7 +602,7 @@ const RepoSummary = styled.section`
 const RepoSummaryMain = styled.div`
   display: grid;
   min-width: 0;
-  gap: 3px;
+  gap: 2px;
 
   strong,
   span {
@@ -601,7 +614,7 @@ const RepoSummaryMain = styled.div`
 
   strong {
     color: #f8fafc;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 900;
   }
 
@@ -644,15 +657,21 @@ const RepoFacts = styled.div`
 
 const CommitPanel = styled.section`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 132px;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
   gap: 8px;
-  min-height: 88px;
+  overflow: hidden;
+
+  @media (max-width: 860px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 const CommitMessage = styled.textarea`
   width: 100%;
   min-width: 0;
-  min-height: 88px;
+  min-height: 78px;
   resize: none;
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.18);
@@ -679,12 +698,12 @@ const CommitMessage = styled.textarea`
   }
 `;
 
-const CommitActions = styled.div`
-  display: flex;
-  width: 148px;
+const CommitComposer = styled.div`
+  display: grid;
   min-width: 0;
-  flex-direction: column;
-  gap: 7px;
+  min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 8px;
 
   button {
     width: 100%;
@@ -696,21 +715,16 @@ const GitColumns = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-columns: minmax(165px, 0.42fr) minmax(0, 1fr);
+  grid-template-columns: minmax(240px, 0.42fr) minmax(0, 1fr);
   gap: 10px;
   overflow: hidden;
+
+  @media (max-width: 860px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 const ChangesPane = styled.section`
-  display: grid;
-  min-width: 0;
-  min-height: 0;
-  grid-template-rows: auto minmax(0, 1fr);
-  gap: 8px;
-  overflow: hidden;
-`;
-
-const DiffPane = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
@@ -741,7 +755,7 @@ const ChangeList = styled.div`
   overflow: auto;
 `;
 
-const ChangeButton = styled.button`
+const ChangeItem = styled.div`
   display: grid;
   grid-template-columns: 34px minmax(0, 1fr);
   align-items: center;
@@ -752,7 +766,6 @@ const ChangeButton = styled.button`
   border-radius: 7px;
   color: #dbe7f7;
   background: rgba(15, 23, 42, 0.58);
-  cursor: pointer;
   text-align: left;
 
   span {
@@ -783,34 +796,9 @@ const ChangeButton = styled.button`
     color: #fbbf24;
   }
 
-  &[data-active="true"] {
-    border-color: rgba(56, 189, 248, 0.58);
-    background: rgba(14, 116, 144, 0.18);
-  }
-
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
     background: #fafafc;
-  }
-`;
-
-const DiffText = styled.pre`
-  min-width: 0;
-  min-height: 0;
-  margin: 0;
-  overflow: auto;
-  padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  color: #dbe7f7;
-  background: rgba(2, 6, 12, 0.74);
-  font-size: 10px;
-  line-height: 1.45;
-  white-space: pre-wrap;
-
-  html[data-forge-theme="light"] & {
-    color: #1d1d1f;
-    background: #ffffff;
   }
 `;
 
@@ -820,19 +808,69 @@ const HistoryPane = styled.section`
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 8px;
+  overflow: hidden;
+`;
+
+const HistoryList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  gap: 7px;
   overflow: auto;
 `;
 
-const HistoryItem = styled.article`
+const HistoryButton = styled.button`
   display: grid;
-  gap: 7px;
+  min-width: 0;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
   padding: 9px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 8px;
+  border-radius: 7px;
+  color: inherit;
   background: rgba(15, 23, 42, 0.5);
+  cursor: pointer;
+  text-align: left;
+
+  &[data-active="true"] {
+    border-color: rgba(56, 189, 248, 0.58);
+    background: rgba(14, 116, 144, 0.18);
+  }
 
   html[data-forge-theme="light"] & {
     background: #fafafc;
+  }
+`;
+
+const HistoryGraph = styled.span`
+  position: relative;
+  display: block;
+  width: 12px;
+  height: 100%;
+  min-height: 34px;
+
+  &::before {
+    position: absolute;
+    top: 13px;
+    left: 5px;
+    width: 1px;
+    height: calc(100% - 4px);
+    background: rgba(148, 163, 184, 0.28);
+    content: "";
+  }
+
+  &::after {
+    position: absolute;
+    top: 5px;
+    left: 2px;
+    width: 7px;
+    height: 7px;
+    border: 1px solid rgba(56, 189, 248, 0.68);
+    border-radius: 999px;
+    background: #0f172a;
+    content: "";
   }
 `;
 
@@ -866,23 +904,119 @@ const HistoryItemHeader = styled.div`
   }
 `;
 
-const HistoryFiles = styled.div`
-  display: flex;
-  min-width: 0;
-  flex-wrap: wrap;
-  gap: 5px;
+const CommitFileCount = styled.span`
+  color: #8ea0b8;
+  font-size: 10px;
+  font-weight: 760;
+  white-space: nowrap;
+`;
 
+const CommitFilesPane = styled.section`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+`;
+
+const CommitDetailHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.46);
+
+  strong,
   span {
-    max-width: 100%;
+    min-width: 0;
     overflow: hidden;
-    padding: 3px 6px;
-    border-radius: 999px;
-    color: #aab8ca;
-    background: rgba(2, 6, 12, 0.55);
-    font-size: 9px;
-    font-weight: 760;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  strong {
+    color: #f8fafc;
+    font-size: 12px;
+    font-weight: 860;
+  }
+
+  span {
+    color: #8ea0b8;
+    font-size: 10px;
+    font-weight: 720;
+  }
+
+  html[data-forge-theme="light"] strong {
+    color: #1d1d1f;
+  }
+`;
+
+const CommitFileList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  gap: 6px;
+  overflow: auto;
+`;
+
+const CommitFileItem = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 7px;
+  color: #dbe7f7;
+  background: rgba(15, 23, 42, 0.5);
+
+  span,
+  strong,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: #94a3b8;
+    font-size: 10px;
+    font-weight: 900;
+  }
+
+  strong {
+    font-size: 11px;
+    font-weight: 760;
+  }
+
+  em {
+    color: #8ea0b8;
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 720;
+  }
+
+  &[data-tone="added"] span {
+    color: #34d399;
+  }
+
+  &[data-tone="deleted"] span {
+    color: #fb7185;
+  }
+
+  &[data-tone="moved"] span {
+    color: #fbbf24;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+    background: #fafafc;
   }
 `;
 

@@ -3341,42 +3341,11 @@ function getBreakoutScreenRect(placement, viewport) {
   }
 
   return {
-    height: normalizedPlacement.height * normalizedViewport.zoom,
+    height: normalizedPlacement.height,
     left: (normalizedPlacement.x * normalizedViewport.zoom) + normalizedViewport.x,
     top: (normalizedPlacement.y * normalizedViewport.zoom) + normalizedViewport.y,
-    width: normalizedPlacement.width * normalizedViewport.zoom,
+    width: normalizedPlacement.width,
   };
-}
-
-function getDisplayRowsFromBreakoutPlacements(terminalIndexes, placements) {
-  const orderedIndexes = (terminalIndexes || [])
-    .slice()
-    .sort((leftIndex, rightIndex) => {
-      const leftPlacement = normalizeBreakoutPlacement(placements?.[leftIndex]);
-      const rightPlacement = normalizeBreakoutPlacement(placements?.[rightIndex]);
-
-      if (!leftPlacement && !rightPlacement) {
-        return leftIndex - rightIndex;
-      }
-      if (!leftPlacement) {
-        return 1;
-      }
-      if (!rightPlacement) {
-        return -1;
-      }
-
-      const yDelta = leftPlacement.y - rightPlacement.y;
-      if (Math.abs(yDelta) > 48) {
-        return yDelta;
-      }
-
-      return (leftPlacement.x - rightPlacement.x) || (leftIndex - rightIndex);
-    });
-
-  return orderedIndexes.map((terminalIndex, rowIndex) => ({
-    rowIndex,
-    terminalIndexes: [terminalIndex],
-  }));
 }
 
 function canUseTodoQueueStorage() {
@@ -10090,18 +10059,6 @@ function TerminalView({
 
     measureTerminalLayout();
     clearTerminalBreakoutTransitionTimer();
-    const nextDisplayRows = getDisplayRowsFromBreakoutPlacements(
-      logicalTerminalIndexes,
-      terminalBreakoutPlacementsRef.current,
-    );
-
-    if (nextDisplayRows.length) {
-      reorderWorkspaceTerminalDisplayLayout?.({
-        displayRows: nextDisplayRows,
-        workspaceId: terminalWorkspace?.id || "",
-      });
-    }
-
     setTerminalBreakoutPhase(TERMINAL_BREAKOUT_PHASE_RETURNING);
     terminalBreakoutTransitionTimerRef.current = window.setTimeout(() => {
       terminalBreakoutTransitionTimerRef.current = 0;
@@ -10113,10 +10070,7 @@ function TerminalView({
     }, TERMINAL_BREAKOUT_TRANSITION_MS);
   }, [
     clearTerminalBreakoutTransitionTimer,
-    logicalTerminalIndexes,
     measureTerminalLayout,
-    reorderWorkspaceTerminalDisplayLayout,
-    terminalWorkspace?.id,
   ]);
 
   const toggleTerminalBreakout = useCallback(() => {
@@ -10156,21 +10110,31 @@ function TerminalView({
 
     const minX = Math.min(...placements.map((placement) => placement.x));
     const minY = Math.min(...placements.map((placement) => placement.y));
-    const maxX = Math.max(...placements.map((placement) => placement.x + placement.width));
-    const maxY = Math.max(...placements.map((placement) => placement.y + placement.height));
-    const boundsWidth = maxX - minX;
-    const boundsHeight = maxY - minY;
+    const maxAnchorX = Math.max(...placements.map((placement) => placement.x));
+    const maxAnchorY = Math.max(...placements.map((placement) => placement.y));
+    const maxTerminalWidth = Math.max(...placements.map((placement) => placement.width));
+    const maxTerminalHeight = Math.max(...placements.map((placement) => placement.height));
+    const anchorSpanWidth = maxAnchorX - minX;
+    const anchorSpanHeight = maxAnchorY - minY;
     const margin = 54;
-    const availableWidth = Math.max(1, Number(panelRect.width || 0) - (margin * 2));
-    const availableHeight = Math.max(1, Number(panelRect.height || 0) - (margin * 2));
+    const panelWidth = Number(panelRect.width || 0);
+    const panelHeight = Number(panelRect.height || 0);
+    const availableWidth = Math.max(1, panelWidth - (margin * 2));
+    const availableHeight = Math.max(1, panelHeight - (margin * 2));
     const fitZoom = clampBreakoutZoom(Math.min(
-      availableWidth / Math.max(1, boundsWidth),
-      availableHeight / Math.max(1, boundsHeight),
+      anchorSpanWidth > 0
+        ? (availableWidth - maxTerminalWidth) / anchorSpanWidth
+        : TERMINAL_BREAKOUT_DEFAULT_ZOOM,
+      anchorSpanHeight > 0
+        ? (availableHeight - maxTerminalHeight) / anchorSpanHeight
+        : TERMINAL_BREAKOUT_DEFAULT_ZOOM,
     ));
+    const fittedWidth = (anchorSpanWidth * fitZoom) + maxTerminalWidth;
+    const fittedHeight = (anchorSpanHeight * fitZoom) + maxTerminalHeight;
 
     setTerminalBreakoutViewportState({
-      x: Math.round(((panelRect.width - (boundsWidth * fitZoom)) / 2) - (minX * fitZoom)),
-      y: Math.round(((panelRect.height - (boundsHeight * fitZoom)) / 2) - (minY * fitZoom)),
+      x: Math.round(((panelWidth - fittedWidth) / 2) - (minX * fitZoom)),
+      y: Math.round(((panelHeight - fittedHeight) / 2) - (minY * fitZoom)),
       zoom: fitZoom,
     });
   }, [setTerminalBreakoutViewportState]);
@@ -10251,11 +10215,15 @@ function TerminalView({
       .reduce((maxValue, z) => Math.max(maxValue, z), 0);
     const viewport = normalizeBreakoutViewport(terminalBreakoutViewportRef.current);
     const zoom = Math.max(0.001, viewport.zoom);
+    const panelWidth = Number(panelRect?.width || 0) || width;
+    const panelHeight = Number(panelRect?.height || 0) || height;
+    const screenLeft = (panelWidth / 2) - (width / 2) + 34;
+    const screenTop = (panelHeight / 2) - (height / 2) + 34;
     const placement = {
       height,
       width,
-      x: Math.round((((Number(panelRect?.width || 0) || width) / 2) - viewport.x) / zoom - (width / 2) + 34),
-      y: Math.round((((Number(panelRect?.height || 0) || height) / 2) - viewport.y) / zoom - (height / 2) + 34),
+      x: Math.round((screenLeft - viewport.x) / zoom),
+      y: Math.round((screenTop - viewport.y) / zoom),
       z: maxZ + 1,
     };
 

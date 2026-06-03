@@ -11,11 +11,45 @@ function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function jsonObject(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return jsonObject(parsed);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function normalizeTaskHistory(value) {
+  const object = jsonObject(value);
+  if (!object) return null;
+  if (Array.isArray(object.tasks)) return object;
+  if (Array.isArray(object.recent_tasks)) {
+    return {
+      ...object,
+      tasks: object.recent_tasks,
+    };
+  }
+  return null;
+}
+
 function taskHistoryFromSnapshot(snapshot) {
-  return snapshot?.taskHistory
-    || snapshot?.task_history
-    || snapshot?.raw?.task_history
-    || { kind: "architecture_task_history", version: 1, tasks: [] };
+  const candidates = [
+    snapshot?.taskHistory,
+    snapshot?.task_history,
+    snapshot?.raw?.task_history,
+    snapshot,
+  ].map(normalizeTaskHistory).filter(Boolean);
+
+  return candidates.find((candidate) => jsonArray(candidate.tasks).length)
+    || candidates[0]
+    || { kind: "task_history", version: 1, tasks: [] };
 }
 
 function taskStatus(task) {
@@ -32,6 +66,40 @@ function taskPrompt(task) {
       || task?.title,
     "No task prompt captured.",
   );
+}
+
+function taskTerminalPlan(task) {
+  const metadata = jsonObject(task?.metadata_json || task?.metadata);
+  return jsonObject(task?.terminal_task_plan)
+    || jsonObject(task?.terminalTaskPlan)
+    || jsonObject(metadata?.terminal_task_plan)
+    || jsonObject(metadata?.terminalTaskPlan);
+}
+
+function planStepStatusKind(status) {
+  const normalized = text(status).toLowerCase();
+  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if (["active", "current", "in_progress", "in-progress", "pending", "running", "working"].includes(normalized)) {
+    return "active";
+  }
+  if (["blocked", "interrupted", "cancelled", "canceled", "stopped"].includes(normalized)) {
+    return "blocked";
+  }
+  if (normalized === "skipped") {
+    return "skipped";
+  }
+  return "queued";
+}
+
+function planStatusLabel(status) {
+  const kind = planStepStatusKind(status);
+  if (kind === "completed") return "Completed";
+  if (kind === "active") return "In progress";
+  if (kind === "blocked") return "Blocked";
+  if (kind === "skipped") return "Skipped";
+  return "Queued";
 }
 
 function formatTime(value) {
@@ -53,7 +121,7 @@ export default function ArchitectureWorkspaceView({
   const workspaceId = workspace?.id || "";
   const workspaceName = workspace?.name || "";
   const repoPath = workspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
-  const [viewMode, setViewMode] = useState("history");
+  const [viewMode, setViewMode] = useState("taskHistory");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [rawScan, setRawScan] = useState(null);
   const [rawScanState, setRawScanState] = useState("idle");
@@ -110,11 +178,11 @@ export default function ArchitectureWorkspaceView({
       <ArchitectureToolbar>
         <ViewToggleGroup aria-label="Architecture view mode">
           <ViewToggleButton
-            data-active={viewMode === "history" ? "true" : "false"}
-            onClick={() => setViewMode("history")}
+            data-active={viewMode === "taskHistory" ? "true" : "false"}
+            onClick={() => setViewMode("taskHistory")}
             type="button"
           >
-            History
+            Task History
           </ViewToggleButton>
           <ViewToggleButton
             data-active={viewMode === "rawScan" ? "true" : "false"}
@@ -160,6 +228,8 @@ function HistoryList({ tasks, selectedTaskId, onSelectTask }) {
         const selected = taskId === selectedTaskId;
         const nodeCount = jsonArray(task?.nodes).length;
         const decisionCount = jsonArray(task?.arbiter_decisions).length;
+        const terminalPlan = taskTerminalPlan(task);
+        const terminalPlanStepCount = jsonArray(terminalPlan?.steps).length;
 
         return (
           <TaskButton
@@ -175,6 +245,9 @@ function HistoryList({ tasks, selectedTaskId, onSelectTask }) {
             <TaskPrompt>{taskPrompt(task)}</TaskPrompt>
             <TaskMeta>
               <span>{text(task?.coding_agent || task?.agent_kind, "agent")}</span>
+              {terminalPlanStepCount > 0 && (
+                <span>{terminalPlanStepCount} plan step{terminalPlanStepCount === 1 ? "" : "s"}</span>
+              )}
               <span>{nodeCount} node delta{nodeCount === 1 ? "" : "s"}</span>
               <span>{decisionCount} decision{decisionCount === 1 ? "" : "s"}</span>
             </TaskMeta>
@@ -197,6 +270,8 @@ function HistoryInspector({ task }) {
   const nodes = jsonArray(task.nodes);
   const decisions = jsonArray(task.arbiter_decisions);
   const mutations = jsonArray(task.mutations);
+  const terminalPlan = taskTerminalPlan(task);
+  const terminalPlanSteps = jsonArray(terminalPlan?.steps);
 
   return (
     <InspectorPane>
@@ -220,7 +295,37 @@ function HistoryInspector({ task }) {
         </InfoCell>
       </InspectorGrid>
 
-      <SectionTitle>History Deltas</SectionTitle>
+      {terminalPlan && (
+        <>
+          <SectionTitle>Terminal Plan</SectionTitle>
+          <PlanPanel>
+            <PlanPanelHeader>
+              <strong>{text(terminalPlan.title, "Terminal task plan")}</strong>
+              <StatusPill>{planStatusLabel(terminalPlan.status)}</StatusPill>
+            </PlanPanelHeader>
+            {terminalPlanSteps.length ? (
+              <PlanStepList>
+                {terminalPlanSteps.map((step, index) => {
+                  const statusKind = planStepStatusKind(step?.status);
+                  return (
+                    <PlanStepItem data-status={statusKind} key={`${text(step?.title, "step")}-${index}`}>
+                      <PlanStepMarker aria-hidden="true" data-status={statusKind} />
+                      <div>
+                        <strong>{text(step?.title, "Untitled step")}</strong>
+                        <span>{planStatusLabel(step?.status)}</span>
+                      </div>
+                    </PlanStepItem>
+                  );
+                })}
+              </PlanStepList>
+            ) : (
+              <EmptyState>No plan steps captured for this task.</EmptyState>
+            )}
+          </PlanPanel>
+        </>
+      )}
+
+      <SectionTitle>Task Deltas</SectionTitle>
       <DeltaList>
         {nodes.length ? nodes.map((node) => (
           <DeltaItem key={text(node.node_id) || text(node.title)}>
@@ -481,6 +586,124 @@ const InfoCell = styled.div`
     min-width: 0;
     overflow-wrap: anywhere;
     font-size: 12px;
+  }
+`;
+
+const PlanPanel = styled.div`
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.34);
+`;
+
+const PlanPanelHeader = styled.div`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+
+  strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 13px;
+  }
+`;
+
+const PlanStepList = styled.div`
+  display: grid;
+`;
+
+const PlanStepItem = styled.div`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 9px;
+  padding: 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  strong {
+    display: block;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--forge-text);
+    font-size: 12px;
+    line-height: 1.3;
+  }
+
+  span {
+    display: block;
+    margin-top: 3px;
+    color: var(--forge-text-muted);
+    font-size: 11px;
+    font-weight: 760;
+  }
+`;
+
+const PlanStepMarker = styled.span`
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 50%;
+
+  &::after {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: rgba(148, 163, 184, 0.7);
+    content: "";
+  }
+
+  &[data-status="completed"] {
+    border-color: rgba(74, 222, 128, 0.36);
+    background: rgba(34, 197, 94, 0.12);
+
+    &::after {
+      width: 8px;
+      height: 4px;
+      border: 0 solid #a7f3d0;
+      border-width: 0 0 2px 2px;
+      border-radius: 0;
+      background: transparent;
+      transform: rotate(-45deg) translate(1px, -1px);
+    }
+  }
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.42);
+
+    &::after {
+      width: 10px;
+      height: 10px;
+      border: 2px solid rgba(147, 197, 253, 0.24);
+      border-top-color: #93c5fd;
+      background: transparent;
+      animation: architecture-plan-spin 0.8s linear infinite;
+    }
+  }
+
+  &[data-status="blocked"] {
+    border-color: rgba(251, 146, 60, 0.38);
+    background: rgba(194, 65, 12, 0.12);
+
+    &::after {
+      background: #fed7aa;
+    }
+  }
+
+  @keyframes architecture-plan-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 `;
 

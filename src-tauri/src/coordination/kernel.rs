@@ -169,9 +169,7 @@ fn normalize_terminal_task_plan_step_status(status: &str) -> String {
         }
         "blocked" => "blocked".to_string(),
         "skip" | "skipped" => "skipped".to_string(),
-        "queued" | "pending" | "not_started" | "not-started" | "todo" | "" => {
-            "queued".to_string()
-        }
+        "queued" | "pending" | "not_started" | "not-started" | "todo" | "" => "queued".to_string(),
         _ => "queued".to_string(),
     }
 }
@@ -197,18 +195,28 @@ fn terminal_task_plan_step_title_from_value(value: &Value) -> Option<String> {
                 })
                 .map(str::to_string)
         })
-        .map(|value| compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS))
+        .map(|value| {
+            compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS)
+        })
         .filter(|value| !value.is_empty())
 }
 
 fn terminal_task_plan_step_detail_from_value(value: &Value) -> Option<String> {
-    value.as_object().and_then(|object| {
-        ["detail", "details", "description", "current_step_detail", "currentStepDetail"]
+    value
+        .as_object()
+        .and_then(|object| {
+            [
+                "detail",
+                "details",
+                "description",
+                "current_step_detail",
+                "currentStepDetail",
+            ]
             .iter()
             .find_map(|key| object.get(*key).and_then(Value::as_str))
-    })
-    .map(|value| compact_terminal_task_plan_text(value, 2000))
-    .filter(|value| !value.is_empty())
+        })
+        .map(|value| compact_terminal_task_plan_text(value, 2000))
+        .filter(|value| !value.is_empty())
 }
 
 fn string_from_value_keys(value: &Value, keys: &[&str]) -> Option<String> {
@@ -221,15 +229,13 @@ fn string_from_value_keys(value: &Value, keys: &[&str]) -> Option<String> {
 
 fn optional_i64_field(value: &Value, keys: &[&str]) -> Option<i64> {
     keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(|candidate| {
-                candidate.as_i64().or_else(|| {
-                    candidate
-                        .as_str()
-                        .and_then(|text| text.trim().parse::<i64>().ok())
-                })
+        value.get(*key).and_then(|candidate| {
+            candidate.as_i64().or_else(|| {
+                candidate
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<i64>().ok())
             })
+        })
     })
 }
 
@@ -4719,7 +4725,9 @@ impl CoordinationKernel {
                             &now,
                         ],
                     )
-                    .map_err(|error| format!("Unable to insert terminal task plan step: {error}"))?;
+                    .map_err(|error| {
+                        format!("Unable to insert terminal task plan step: {error}")
+                    })?;
             }
 
             let event_id = self.emit_event(
@@ -4773,7 +4781,12 @@ impl CoordinationKernel {
         );
         let completed_index = optional_i64_field(
             input,
-            &["completed_step_index", "completedStepIndex", "completed_index", "completedIndex"],
+            &[
+                "completed_step_index",
+                "completedStepIndex",
+                "completed_index",
+                "completedIndex",
+            ],
         );
         let next_detail = string_from_value_keys(
             input,
@@ -4790,12 +4803,22 @@ impl CoordinationKernel {
         .filter(|value| !value.is_empty());
         let step_status = string_from_value_keys(
             input,
-            &["plan_step_status", "planStepStatus", "step_status", "stepStatus"],
+            &[
+                "plan_step_status",
+                "planStepStatus",
+                "step_status",
+                "stepStatus",
+            ],
         )
         .map(|value| normalize_terminal_task_plan_step_status(&value));
         let plan_status = string_from_value_keys(
             input,
-            &["plan_status", "planStatus", "terminal_plan_status", "terminalPlanStatus"],
+            &[
+                "plan_status",
+                "planStatus",
+                "terminal_plan_status",
+                "terminalPlanStatus",
+            ],
         )
         .map(|value| normalize_terminal_task_plan_status(&value));
 
@@ -4998,7 +5021,9 @@ impl CoordinationKernel {
                      WHERE task_id=?2",
                     params![&now, &task_id],
                 )
-                .map_err(|error| format!("Unable to update terminal task plan revision: {error}"))?;
+                .map_err(|error| {
+                    format!("Unable to update terminal task plan revision: {error}")
+                })?;
             let event_id = self.emit_event(
                 "terminal_task_plan_step_title_edited",
                 "user",
@@ -5033,7 +5058,10 @@ impl CoordinationKernel {
         let task_id = task_id.trim();
         let plan_status = normalize_terminal_task_plan_status(status);
         if task_id.is_empty()
-            || !matches!(plan_status.as_str(), "completed" | "interrupted" | "blocked")
+            || !matches!(
+                plan_status.as_str(),
+                "completed" | "interrupted" | "blocked"
+            )
             || self.terminal_task_plan_id_for_task(task_id)?.is_none()
         {
             return Ok(None);
@@ -5103,14 +5131,11 @@ impl CoordinationKernel {
         session_id: Option<&str>,
         agent_id: Option<&str>,
     ) -> Result<Value, String> {
-        let selected_plan = if let Some(task_id) = task_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        let selected_plan = if let Some(task_id) =
+            task_id.map(str::trim).filter(|value| !value.is_empty())
         {
             self.terminal_task_plan_view_by_task_id(task_id).ok()
-        } else if let Some(session_id) = session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+        } else if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty())
         {
             self.query_json(
                 "SELECT task_id FROM terminal_task_plans
@@ -5125,27 +5150,25 @@ impl CoordinationKernel {
         } else {
             None
         };
-        let history_rows = if let Some(agent_id) = agent_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
+        let history_rows =
+            if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+                self.query_json(
+                    "SELECT p.*, t.title AS task_title, t.status AS task_status
                  FROM terminal_task_plans p
                  LEFT JOIN tasks t ON t.id=p.task_id
                  WHERE p.agent_id=?1 OR t.claimed_by_agent_id=?1
                  ORDER BY p.updated_at DESC LIMIT 25",
-                &[&agent_id],
-            )?
-        } else {
-            self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
+                    &[&agent_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT p.*, t.title AS task_title, t.status AS task_status
                  FROM terminal_task_plans p
                  LEFT JOIN tasks t ON t.id=p.task_id
                  ORDER BY p.updated_at DESC LIMIT 25",
-                &[],
-            )?
-        };
+                    &[],
+                )?
+            };
         let history = history_rows
             .into_iter()
             .map(|row| {
@@ -25074,8 +25097,8 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body_text).unwrap_or_else(|_| json!({}));
         let body = if path == "/v1/events" {
             json!({"data": fake_cloud_response_data("event", &request_json, default_task_id.as_str(), omit_task_id)})
-        } else if path == "/v1/architecture/history" {
-            json!({"data": fake_cloud_response_data("architecture_history", &request_json, default_task_id.as_str(), omit_task_id)})
+        } else if path == "/v1/task/history" {
+            json!({"data": fake_cloud_response_data("task_history", &request_json, default_task_id.as_str(), omit_task_id)})
         } else {
             json!({"data": {"ok": true}})
         }
@@ -25111,9 +25134,9 @@ mod tests {
                     "spec_activity": {"recorded": true, "node_ids": ["spec-test"]}
                 })
             }
-        } else if kind == "architecture_history" {
+        } else if kind == "task_history" {
             json!({
-                "kind": "architecture_task_history",
+                "kind": "task_history",
                 "version": 1,
                 "repo_id": "repo-test",
                 "workspace_id": "workspace-test",
