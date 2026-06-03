@@ -22983,6 +22983,15 @@ fn prepare_managed_codex_profile_for_terminal(
         });
     }
 
+    crate::ensure_architecture_agent_guide(&paths.repo_path)?;
+    let architecture_graphs_root = codex_architecture_graphs_root(&paths.repo_path);
+    fs::create_dir_all(&architecture_graphs_root).map_err(|error| {
+        format!(
+            "Unable to create Codex architecture graph root {}: {error}",
+            architecture_graphs_root.display()
+        )
+    })?;
+
     let slot_segment = slot_key
         .map(safe_id)
         .filter(|value| !value.is_empty())
@@ -23189,8 +23198,13 @@ fn codex_managed_profile_config(
     let mut config = String::new();
     config = ensure_codex_project_trust_entry(&config, repo_path);
     config = ensure_codex_project_trust_entry(&config, write_root);
+    if codex_architecture_graphs_write_enabled(enforcement_mode) {
+        config =
+            ensure_codex_project_trust_entry(&config, &codex_architecture_graphs_root(repo_path));
+    }
     config = append_codex_managed_permission_profile(
         config,
+        repo_path,
         write_root,
         enforcement_mode,
         slot_key,
@@ -23208,8 +23222,23 @@ struct CodexManagedGitRoute {
     repo_root: PathBuf,
 }
 
+fn codex_architecture_graphs_root(repo_path: &Path) -> PathBuf {
+    repo_path
+        .join(".agents")
+        .join("architectures")
+        .join("graphs")
+}
+
+fn codex_architecture_graphs_write_enabled(enforcement_mode: &str) -> bool {
+    matches!(
+        enforcement_mode,
+        "worktree_required" | "bounded_direct_edit" | "general_worker"
+    )
+}
+
 fn append_codex_managed_permission_profile(
     config: String,
+    repo_path: &Path,
     write_root: &Path,
     enforcement_mode: &str,
     slot_key: Option<&str>,
@@ -23223,6 +23252,12 @@ fn append_codex_managed_permission_profile(
     let write_root = write_root
         .canonicalize()
         .unwrap_or_else(|_| write_root.to_path_buf());
+    let repo_path = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let architecture_graphs_root = codex_architecture_graphs_root(&repo_path)
+        .canonicalize()
+        .unwrap_or_else(|_| codex_architecture_graphs_root(&repo_path));
     let routes = match enforcement_mode {
         "bounded_direct_edit" => {
             codex_managed_git_routes_for_direct_root(&write_root, slot_key, agent_kind)?
@@ -23245,15 +23280,36 @@ fn append_codex_managed_permission_profile(
     };
     let profile = "diffforge-coordinated";
     let mut config = prepend_codex_managed_root_permission_profile(config, profile);
+    let mut workspace_roots = vec![write_root.clone()];
+    if enforcement_mode == "worktree_required"
+        && codex_architecture_graphs_write_enabled(enforcement_mode)
+        && !same_path_text(
+            &process_path_text(&write_root),
+            &process_path_text(&architecture_graphs_root),
+        )
+    {
+        workspace_roots.push(architecture_graphs_root.clone());
+    }
+    workspace_roots.sort_by_key(|root| process_path_text(root));
+    workspace_roots.dedup_by(|left, right| {
+        same_path_text(&process_path_text(left), &process_path_text(right))
+    });
     config.push_str(&format!(
         "\n[permissions.{profile}]\n\
 description = \"Diff Forge coordinated agent filesystem policy.\"\n\
 extends = \"{parent_profile}\"\n\n\
 [permissions.{profile}.workspace_roots]\n\
-\"{}\" = true\n\n\
-[permissions.{profile}.filesystem]\n\
-\":root\" = \"read\"\n",
-        toml_escape(&process_path_text(&write_root))
+",
+    ));
+    for root in &workspace_roots {
+        config.push_str(&format!(
+            "\"{}\" = true\n",
+            toml_escape(&process_path_text(root))
+        ));
+    }
+    config.push_str(&format!(
+        "\n[permissions.{profile}.filesystem]\n\
+\":root\" = \"read\"\n"
     ));
 
     if write_enabled && (enforcement_mode != "general_worker" || !routes.is_empty()) {
@@ -23268,6 +23324,17 @@ extends = \"{parent_profile}\"\n\n\
         for route in &routes {
             let repo_relative = codex_permission_relative_path(&write_root, &route.repo_root)?;
             config.push_str(&format!("\"{}\" = \"read\"\n", toml_escape(&repo_relative)));
+        }
+
+        if enforcement_mode == "general_worker"
+            && codex_architecture_graphs_write_enabled(enforcement_mode)
+        {
+            let architecture_relative =
+                codex_permission_relative_path(&write_root, &architecture_graphs_root)?;
+            config.push_str(&format!(
+                "\"{}\" = \"write\"\n",
+                toml_escape(&architecture_relative)
+            ));
         }
     }
 
@@ -24221,7 +24288,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
 3. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; the visible root is read-only for writes. Target the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT` explicitly for every Git-managed edit. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
+4. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; the visible root is read-only for writes except live architecture graph sources at `.agents/architectures/graphs/*.arch`. Target the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT` explicitly for every Git-managed code or doc edit. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
 5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
 6. When finished, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
@@ -24239,6 +24306,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 \n\
 ## Architecture graphs\n\n\
 - Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, normally `.agents/architectures` in the selected repo.\n\
+- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews; this is the only visible-root direct-write exception in Git workspaces. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - For architecture, diagram, deployment, flow, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
 - Before creating a generic architecture doc, inspect the architecture MCP context and existing `.agents/architectures/graphs/*.arch` files.\n\
 - For architecture, diagram, deployment, flow, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
@@ -26266,6 +26334,22 @@ hooksPath = "{}"
         assert!(config.starts_with("default_permissions = \"diffforge-coordinated\"\n"));
         assert_eq!(config.matches("default_permissions =").count(), 1);
         assert!(!config.contains("permission_profile ="));
+        let architecture_graphs_project_root =
+            repo.join(".agents").join("architectures").join("graphs");
+        let architecture_graphs_workspace_root = repo
+            .canonicalize()
+            .unwrap()
+            .join(".agents")
+            .join("architectures")
+            .join("graphs");
+        assert!(config.contains(&format!(
+            "[projects.\"{}\"]",
+            toml_escape(&process_path_text(&architecture_graphs_project_root))
+        )));
+        assert!(config.contains(&format!(
+            "\"{}\" = true",
+            toml_escape(&process_path_text(&architecture_graphs_workspace_root))
+        )));
         let permissions_index = config.find("[permissions.diffforge-coordinated]").unwrap();
         assert!(permissions_index > 0);
     }
@@ -26404,8 +26488,8 @@ hooksPath = "{}"
         assert!(config.contains("extends = \":read-only\""));
         assert!(config.contains("\".\" = \"read\""));
         assert!(!config.contains("\".\" = \"write\""));
+        assert!(config.contains("\".agents/architectures/graphs\" = \"write\""));
         assert!(!config.contains(".agents/worktrees/slot1"));
-        assert!(!config.contains("\" = \"write\""));
     }
 
     #[test]
@@ -26444,9 +26528,9 @@ hooksPath = "{}"
         assert!(config.contains("extends = \":read-only\""));
         assert!(config.contains("\".\" = \"read\""));
         assert!(!config.contains("\".\" = \"write\""));
+        assert!(config.contains("\".agents/architectures/graphs\" = \"write\""));
         assert!(config.contains("\"packages/nested-app\" = \"read\""));
         assert!(!config.contains("packages/nested-app/.agents/worktrees/slot1"));
-        assert!(!config.contains("\" = \"write\""));
     }
 
     #[test]
@@ -26467,6 +26551,7 @@ hooksPath = "{}"
             !config.contains("[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]")
         );
         assert!(!config.contains("\".\" = \"write\""));
+        assert!(!config.contains(".agents/architectures/graphs\" = \"write\""));
     }
 
     #[test]
@@ -28038,6 +28123,16 @@ Appwrite > Session Store: create session
         assert!(env.contains(&(
             "COORDINATION_FILE_AUTHORITY".to_string(),
             "bounded_direct_edit".to_string()
+        )));
+        assert!(env.contains(&(
+            "DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT".to_string(),
+            repo.canonicalize()
+                .unwrap()
+                .join(".agents")
+                .join("architectures")
+                .join("graphs")
+                .display()
+                .to_string()
         )));
         assert!(env.contains(&(
             "COORDINATION_COMPLETION_MODE".to_string(),

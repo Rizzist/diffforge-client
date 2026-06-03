@@ -321,3 +321,40 @@ export function shouldEmitPromptReadyLifecycle({
       && !alreadyEmitted
   );
 }
+
+export function getPromptReadyLifecycleDeferral({
+  isGenericTerminal = false,
+  latestTurn = null,
+  pendingPrompt = null,
+  source = "terminal-output-prompt-ready",
+  threadId = "",
+} = {}) {
+  if (isGenericTerminal || !String(threadId || "").trim()) {
+    return null;
+  }
+
+  const latestTurnState = String(
+    latestTurn?.state || latestTurn?.status || "",
+  ).trim().toLowerCase();
+  const pendingPromptPresent = Boolean(pendingPrompt);
+
+  if (latestTurnState === "running") {
+    return {
+      latestTurnState,
+      pendingPromptPresent,
+      reason: "running_turn_still_active",
+      source,
+    };
+  }
+
+  if (pendingPromptPresent) {
+    return {
+      latestTurnState,
+      pendingPromptPresent,
+      reason: "pending_prompt_still_active",
+      source,
+    };
+  }
+
+  return null;
+}

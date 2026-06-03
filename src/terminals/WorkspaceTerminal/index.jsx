@@ -374,6 +374,7 @@ import {
 } from "../../threads/threadTerminalGroundTruth.js";
 import {
   buildTerminalReadinessEpochKey,
+  getPromptReadyLifecycleDeferral,
   isReadyLifecycleEmittedForEpoch,
   parseTerminalStateTimestampMs,
   shouldEmitPromptReadyLifecycle,
@@ -424,6 +425,11 @@ import {
   TERMINAL_OUTPUT_BATCH_MAX_MS,
   TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS,
   TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS,
+  TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES,
+  TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES,
+  TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
+  TERMINAL_OUTPUT_FLUSH_SLOW_MS,
+  TERMINAL_OUTPUT_FLUSH_VERY_SLOW_MS,
   TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS,
   TERMINAL_OUTPUT_STATE_EVENT,
   TERMINAL_PARKED_PROMPT_EVENT,
@@ -451,6 +457,7 @@ import {
   TERMINAL_TRANSIENT_HEADER_ARTIFACT_REDRAW_QUIET_MS,
   TERMINAL_TRANSIENT_HEADER_ARTIFACT_RETRY_MS,
   TERMINAL_TRANSIENT_HEADER_ARTIFACT_STABLE_PLAN_MS,
+  TERMINAL_WEBGL_BACKGROUND_DELAY_MS,
   TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS,
   TERMINAL_WEBGL_IDLE_DELAY_MS,
   TERMINAL_WEBGL_MAX_DELAY_MS,
@@ -577,6 +584,33 @@ export {
   getWorkspaceTerminalPaneId,
   normalizeWorkspaceTerminalIndexes,
 } from "./threadRuntime.js";
+
+const TERMINAL_AUDIO_INPUT_TARGET_DEDUPE_MS = 250;
+const TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS = 120;
+const terminalAudioInputTargetRequests = new Map();
+let terminalFocusedWindowCheckRequest = null;
+let terminalFocusedWindowCheckAt = 0;
+
+function getDedupedFocusedWindow() {
+  const now = Date.now();
+  if (
+    terminalFocusedWindowCheckRequest
+    && now - terminalFocusedWindowCheckAt < TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS
+  ) {
+    return terminalFocusedWindowCheckRequest;
+  }
+
+  terminalFocusedWindowCheckAt = now;
+  terminalFocusedWindowCheckRequest = Window.getFocusedWindow()
+    .finally(() => {
+      window.setTimeout(() => {
+        if (Date.now() - terminalFocusedWindowCheckAt >= TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS) {
+          terminalFocusedWindowCheckRequest = null;
+        }
+      }, TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS);
+    });
+  return terminalFocusedWindowCheckRequest;
+}
 
 function getTerminalClipboardImageFiles(clipboardData) {
   const itemFiles = Array.from(clipboardData?.items || [])
@@ -1282,6 +1316,7 @@ function WorkspaceTerminal({
   const terminalFirstVisibleOutputAtRef = useRef(0);
   const terminalRunningSinceRef = useRef(0);
   const terminalActiveRef = useRef(Boolean(isActive));
+  const attachDeferredWebglRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1396,6 +1431,20 @@ function WorkspaceTerminal({
     || (String(thread?.currentAgent || "").toLowerCase() === terminalAgentKind ? thread?.transcriptSessionId : "")
     || "";
   const threadProviderModel = threadProviderBinding?.modelId || "";
+  const terminalThreadTurnStateRef = useRef({
+    latestTurn: null,
+    latestTurnState: "",
+    pendingPrompt: null,
+    pendingPromptPresent: false,
+  });
+  terminalThreadTurnStateRef.current = {
+    latestTurn: thread?.latestTurn || null,
+    latestTurnState: String(
+      thread?.latestTurn?.state || thread?.latestTurn?.status || "",
+    ).trim().toLowerCase(),
+    pendingPrompt: thread?.pendingPrompt || null,
+    pendingPromptPresent: Boolean(thread?.pendingPrompt),
+  };
   const workspaceThreadEntry = workspaceThreads?.[workspace?.id || ""];
   const getTerminalCliStatusLogBase = (fields = {}) => ({
     agentId: terminalAgentKind,
@@ -1598,6 +1647,22 @@ function WorkspaceTerminal({
 
     return "";
   };
+  const getPromptReadyDeferral = ({
+    source = "terminal-output-prompt-ready",
+  } = {}) => {
+    if (isGenericTerminal || !terminalThreadIdRef.current) {
+      return null;
+    }
+
+    const turnState = terminalThreadTurnStateRef.current || {};
+    return getPromptReadyLifecycleDeferral({
+      isGenericTerminal,
+      latestTurn: turnState.latestTurn || { state: turnState.latestTurnState || "" },
+      pendingPrompt: turnState.pendingPrompt || (turnState.pendingPromptPresent ? true : null),
+      source,
+      threadId: terminalThreadIdRef.current,
+    });
+  };
   const flushTerminalPromptReadyPending = (reason = "provider-turn-started") => {
     const pending = terminalThreadPromptReadyPendingRef.current;
     if (!pending || !pending.threadId || pending.threadId !== terminalThreadIdRef.current) {
@@ -1643,9 +1708,14 @@ function WorkspaceTerminal({
       lastWorkStartedAt > 0
         && now - lastWorkStartedAt <= 30 * 60 * 1000
     );
+    const latestTurnState = String(
+      terminalThreadTurnStateRef.current?.latestTurnState || "",
+    ).trim().toLowerCase();
+    const readyLifecycleBlocksActiveOutput = hasTerminalReadyLifecycleForEpoch()
+      && latestTurnState !== "running";
     if (
       !recentWorkStarted
-      || hasTerminalReadyLifecycleForEpoch()
+      || readyLifecycleBlocksActiveOutput
       || now - Number(terminalThreadLastActiveOutputLifecycleAtRef.current || 0) < 500
     ) {
       return false;
@@ -1687,6 +1757,26 @@ function WorkspaceTerminal({
     thread?.workspaceId,
     workspace?.id,
   ]);
+  const terminalEventListenerStateRef = useRef({});
+  terminalEventListenerStateRef.current = {
+    getPromptReadyDeferral,
+    getPromptReadySuppressionReason,
+    getTerminalCliStatusLogBase,
+    getTerminalReadyEpochKey,
+    isGenericTerminal,
+    markTerminalActiveOutputObserved,
+    markTerminalReadyLifecycleEpoch,
+    markTerminalThreadActivityStatus,
+    onThreadTerminalLifecycle,
+    paneId,
+    recordThreadTerminalReadiness,
+    terminalAgentKind,
+    terminalIndex,
+    threadId: thread?.id || "",
+    threadProviderSessionId,
+    threadWorkspaceId: thread?.workspaceId || "",
+    workspaceId: workspace?.id || "",
+  };
   const terminalStartupSnapshotRef = useRef(null);
   const terminalStabilityFeatures = useMemo(() => getTerminalStabilityFeatureFlags({
     agentKind: terminalAgentKind,
@@ -3465,7 +3555,21 @@ function WorkspaceTerminal({
       return Promise.resolve(false);
     }
 
-    return invoke("set_terminal_audio_input_target", {
+    const targetKey = `${paneId}:${Number(instanceId || 0)}`;
+    const now = Date.now();
+    const cachedRequest = terminalAudioInputTargetRequests.get(targetKey);
+    if (
+      cachedRequest
+      && cachedRequest.active === Boolean(active)
+      && now - Number(cachedRequest.updatedAt || 0) < TERMINAL_AUDIO_INPUT_TARGET_DEDUPE_MS
+    ) {
+      if (!active) {
+        clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
+      }
+      return cachedRequest.request || Promise.resolve(true);
+    }
+
+    const request = invoke("set_terminal_audio_input_target", {
       active,
       instanceId,
       paneId,
@@ -3484,6 +3588,25 @@ function WorkspaceTerminal({
 
         return false;
       });
+
+    terminalAudioInputTargetRequests.set(targetKey, {
+      active: Boolean(active),
+      request,
+      updatedAt: now,
+    });
+
+    request.finally(() => {
+      const currentRequest = terminalAudioInputTargetRequests.get(targetKey);
+      if (currentRequest?.request === request) {
+        terminalAudioInputTargetRequests.set(targetKey, {
+          active: Boolean(active),
+          request: null,
+          updatedAt: Date.now(),
+        });
+      }
+    });
+
+    return request;
   }, [paneId]);
 
   const requestTerminalDragFromEvent = useCallback((event, options = {}) => {
@@ -3629,6 +3752,7 @@ function WorkspaceTerminal({
 
     if (isActive) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
+      attachDeferredWebglRef.current?.("terminal_activated");
       requestTerminalAudioInputTarget(true);
       focusTerminalKeyboardInput(true);
       return undefined;
@@ -3876,9 +4000,10 @@ function WorkspaceTerminal({
     let unlisten = null;
 
     listen(TERMINAL_OUTPUT_STATE_EVENT, (event) => {
+      const listenerState = terminalEventListenerStateRef.current || {};
       const payload = event.payload || {};
       if (
-        payload.paneId !== paneId
+        payload.paneId !== listenerState.paneId
         || Number(payload.instanceId || 0) !== Number(terminalInstanceIdRef.current || 0)
       ) {
         return;
@@ -3887,25 +4012,42 @@ function WorkspaceTerminal({
       if (payload.looksReady === true && payload.looksActive !== true) {
         const outputText = payload.outputPreview || payload.decodedPreview || "";
         const promptReadySource = "backend-terminal-output-prompt-ready";
-        const suppressionReason = getPromptReadySuppressionReason(outputText, {
+        const suppressionReason = listenerState.getPromptReadySuppressionReason?.(outputText, {
           source: promptReadySource,
         });
         if (suppressionReason) {
-          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_suppressed", getTerminalCliStatusLogBase({
+          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_suppressed", listenerState.getTerminalCliStatusLogBase?.({
             outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
             promptEventId: terminalThreadSubmittedPromptRef.current?.promptEventId || "",
             promptReadySource,
             reason: suppressionReason,
             source: promptReadySource,
             statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
-          }));
+          }) || {});
+          return;
+        }
+        const promptReadyDeferral = listenerState.getPromptReadyDeferral?.({
+          source: promptReadySource,
+        });
+        if (promptReadyDeferral) {
+          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_deferred", listenerState.getTerminalCliStatusLogBase?.({
+            latestTurnState: promptReadyDeferral.latestTurnState,
+            outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+            pendingPromptPresent: promptReadyDeferral.pendingPromptPresent,
+            promptEventId: terminalThreadSubmittedPromptRef.current?.promptEventId || "",
+            promptReadySource,
+            reason: promptReadyDeferral.reason,
+            source: promptReadySource,
+            statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
+            terminalActivityStatus: terminalThreadActivityStatusRef.current || "",
+          }) || {});
           return;
         }
 
         if (
           !shouldEmitPromptReadyLifecycle({
-            currentReadyEpoch: getTerminalReadyEpochKey(),
-            isGenericTerminal,
+            currentReadyEpoch: listenerState.getTerminalReadyEpochKey?.() || "",
+            isGenericTerminal: listenerState.isGenericTerminal,
             looksActive: payload.looksActive,
             looksReady: payload.looksReady,
             readyLifecycleEmitted: terminalThreadReadyLifecycleEmittedRef.current,
@@ -3913,64 +4055,64 @@ function WorkspaceTerminal({
             threadId: terminalThreadIdRef.current,
           })
         ) {
-          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_ignored", getTerminalCliStatusLogBase({
-            currentReadyEpoch: getTerminalReadyEpochKey(),
+          logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_ignored", listenerState.getTerminalCliStatusLogBase?.({
+            currentReadyEpoch: listenerState.getTerminalReadyEpochKey?.() || "",
             outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
             readyLifecycleEmitted: terminalThreadReadyLifecycleEmittedRef.current,
             readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
             reason: "should_emit_prompt_ready_rejected",
             source: promptReadySource,
             statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
-          }));
+          }) || {});
           return;
         }
 
         const inputReadyAt = new Date().toISOString();
         terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
-        logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_output", getTerminalCliStatusLogBase({
+        logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_output", listenerState.getTerminalCliStatusLogBase?.({
           inputReadyAt,
           outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
           source: promptReadySource,
           statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
-        }));
-        markTerminalThreadActivityStatus("idle", {
+        }) || {});
+        listenerState.markTerminalThreadActivityStatus?.("idle", {
           promptReadySource,
           reason: promptReadySource,
         });
-        markTerminalReadyLifecycleEpoch();
+        listenerState.markTerminalReadyLifecycleEpoch?.();
 
         const promptReadyLifecycle = {
           activityStatus: "idle",
-          agentId: terminalAgentKind,
+          agentId: listenerState.terminalAgentKind,
           inputReady: true,
           inputReadyAt,
           inputReadyConfidence: promptReadySource,
           instanceId: terminalInstanceIdRef.current || undefined,
-          nativeSessionId: threadProviderSessionId || "",
-          nativeSessionKind: threadProviderSessionId ? "session" : "",
-          nativeSessionSource: threadProviderSessionId ? promptReadySource : "",
+          nativeSessionId: listenerState.threadProviderSessionId || "",
+          nativeSessionKind: listenerState.threadProviderSessionId ? "session" : "",
+          nativeSessionSource: listenerState.threadProviderSessionId ? promptReadySource : "",
           ...getTerminalNativeRailStateFields("idle"),
           outputText: String(outputText || "").slice(-1200),
-          paneId,
+          paneId: listenerState.paneId,
           promptReadyAt: inputReadyAt,
-          providerSessionId: threadProviderSessionId || "",
+          providerSessionId: listenerState.threadProviderSessionId || "",
           source: promptReadySource,
           status: "active",
-          terminalIndex,
+          terminalIndex: listenerState.terminalIndex,
           threadId: terminalThreadIdRef.current,
           type: "terminal-prompt-ready",
-          workspaceId: workspace?.id || thread?.workspaceId || "",
+          workspaceId: listenerState.workspaceId || listenerState.threadWorkspaceId || "",
         };
         terminalThreadPromptReadyPendingRef.current = promptReadyLifecycle;
-        recordThreadTerminalReadiness(promptReadyLifecycle);
-        onThreadTerminalLifecycle?.(promptReadyLifecycle);
+        listenerState.recordThreadTerminalReadiness?.(promptReadyLifecycle);
+        listenerState.onThreadTerminalLifecycle?.(promptReadyLifecycle);
         return;
       }
 
       if (payload.looksActive !== true) {
         return;
       }
-      markTerminalActiveOutputObserved({
+      listenerState.markTerminalActiveOutputObserved?.({
         outputText: payload.outputPreview || payload.decodedPreview || "",
         source: "backend-terminal-output-active",
         statusTruth: payload.statusTruth || payload.status_truth || "processing_or_active",
@@ -3991,27 +4133,17 @@ function WorkspaceTerminal({
         unlisten();
       }
     };
-  }, [
-    isGenericTerminal,
-    markTerminalActiveOutputObserved,
-    onThreadTerminalLifecycle,
-    paneId,
-    terminalAgentKind,
-    terminalIndex,
-    thread?.latestTurn?.state,
-    thread?.workspaceId,
-    threadProviderSessionId,
-    workspace?.id,
-  ]);
+  }, []);
 
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
 
     listen(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
+      const listenerState = terminalEventListenerStateRef.current || {};
       const payload = event.payload || {};
       if (
-        payload.paneId !== paneId
+        payload.paneId !== listenerState.paneId
         || Number(payload.instanceId || 0) !== Number(terminalInstanceIdRef.current || 0)
       ) {
         return;
@@ -4019,11 +4151,23 @@ function WorkspaceTerminal({
 
       const promptKey = `${Number(payload.instanceId || 0)}:${payload.taskId || ""}`;
       const promptEventId = String(payload.promptEventId || payload.prompt_event_id || "").trim();
-      const lifecycleThreadId = String(payload.threadId || payload.thread_id || terminalThreadIdRef.current || thread?.id || "").trim();
-      const lifecycleWorkspaceId = String(payload.workspaceId || payload.workspace_id || workspace?.id || thread?.workspaceId || "").trim();
+      const lifecycleThreadId = String(
+        payload.threadId
+        || payload.thread_id
+        || terminalThreadIdRef.current
+        || listenerState.threadId
+        || "",
+      ).trim();
+      const lifecycleWorkspaceId = String(
+        payload.workspaceId
+        || payload.workspace_id
+        || listenerState.workspaceId
+        || listenerState.threadWorkspaceId
+        || "",
+      ).trim();
       const lifecycleTerminalIndex = Number.isFinite(Number(payload.terminalIndex ?? payload.terminal_index))
         ? Number(payload.terminalIndex ?? payload.terminal_index)
-        : terminalIndex;
+        : listenerState.terminalIndex;
       const parkedStatus = String(payload.activityStatus || payload.activity_status || payload.status || "").trim().toLowerCase();
       if (TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES.has(parkedStatus)) {
         if (cancellingParkedPromptKeysRef.current.has(promptKey)) {
@@ -4031,13 +4175,13 @@ function WorkspaceTerminal({
         }
         setParkedPrompt({ ...payload, activityStatus: parkedStatus, status: parkedStatus });
         if (lifecycleThreadId && lifecycleWorkspaceId) {
-          onThreadTerminalLifecycle?.({
+          listenerState.onThreadTerminalLifecycle?.({
             activityStatus: parkedStatus,
-            agentId: terminalAgentKind,
+            agentId: listenerState.terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
             ...getTerminalNativeRailStateFields(parkedStatus),
-            paneId,
+            paneId: listenerState.paneId,
             pendingPromptId: promptEventId,
             promptEventId,
             source: parkedStatus === "parked" ? "terminal-parked" : `terminal-parked-${parkedStatus}`,
@@ -4060,17 +4204,17 @@ function WorkspaceTerminal({
           const startedAt = new Date().toISOString();
           const userMessageId = promptEventId || String(payload.taskId || "").trim() || createThreadProjectionToken("message-user");
           const turnId = `turn-${userMessageId}`;
-          onThreadTerminalLifecycle?.({
+          listenerState.onThreadTerminalLifecycle?.({
             activityStatus: parkedStatus,
-            agentId: terminalAgentKind,
+            agentId: listenerState.terminalAgentKind,
             instanceId: Number(payload.instanceId || terminalInstanceIdRef.current || 0) || undefined,
             inputReady: false,
             ...getTerminalNativeRailStateFields(parkedStatus),
-            paneId,
+            paneId: listenerState.paneId,
             pendingPromptId: promptEventId || userMessageId,
             promptEventId: promptEventId || userMessageId,
             projectionEvents: buildProviderTurnStartProjectionEvents({
-              agentId: terminalAgentKind,
+              agentId: listenerState.terminalAgentKind,
               includeUserMessage: false,
               source: "terminal-parked-resume",
               startedAt,
@@ -4103,7 +4247,7 @@ function WorkspaceTerminal({
         unlisten();
       }
     };
-  }, [onThreadTerminalLifecycle, paneId, terminalAgentKind, terminalIndex, thread?.id, thread?.workspaceId, workspace?.id]);
+  }, []);
 
   useEffect(() => {
     if (!agent) {
@@ -4177,6 +4321,7 @@ function WorkspaceTerminal({
     let webglAttachTimer = 0;
     let webglAttachAt = 0;
     let webglAttachAttempted = false;
+    let webglBackgroundDeferred = false;
     const startupWatchTimers = new Set();
     // Tauri's WebView can corrupt xterm's WebGL glyph atlas during rapid multi-pane resize.
     let rendererMode = useWebglRenderer ? "webgl_pending" : "dom";
@@ -4284,6 +4429,7 @@ function WorkspaceTerminal({
     let pendingOutputBytes = 0;
     let outputBatchQueuedAt = 0;
     let outputWriteInFlight = false;
+    let outputWriteLastCallbackMs = 0;
     let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
@@ -4316,6 +4462,12 @@ function WorkspaceTerminal({
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
+    const noteTerminalInteractiveInput = (reason = "input", durationMs = 0) => {
+      terminalGlobalRenderScheduler.noteInteractiveInput?.(renderSchedulerId, {
+        durationMs,
+        reason,
+      });
+    };
     terminalInstanceIdRef.current = terminalInstanceId;
     resetTerminalReadinessForEpoch({
       activityStatus: "idle",
@@ -5260,7 +5412,11 @@ function WorkspaceTerminal({
     };
     const clearTerminalAudioInputTargetIfAppUnfocused = () => {
       window.setTimeout(() => {
-        Window.getFocusedWindow()
+        if (document.hasFocus()) {
+          return;
+        }
+
+        getDedupedFocusedWindow()
           .then((focusedWindow) => {
             if (!isDisposed && !focusedWindow) {
               clearTerminalAudioInputTarget();
@@ -5393,6 +5549,18 @@ function WorkspaceTerminal({
       if (!useWebglRenderer || isDisposed || webglAttachAttempted || !terminalRendererOpened) {
         return;
       }
+      if (!terminalActiveRef.current && reason !== "terminal_activated") {
+        rendererMode = "canvas_deferred";
+        if (!webglBackgroundDeferred) {
+          webglBackgroundDeferred = true;
+          logTerminalDiagnosticEvent("frontend.webgl.background_deferred", {
+            paneId,
+            reason,
+            terminalIndex,
+          });
+        }
+        return;
+      }
 
       webglAttachAttempted = true;
       const webglStartedAt = performance.now();
@@ -5440,9 +5608,11 @@ function WorkspaceTerminal({
         return;
       }
 
+      const backgroundDelayMs = terminalActiveRef.current ? 0 : TERMINAL_WEBGL_BACKGROUND_DELAY_MS;
+      const staggerDelayMs = reason === "terminal_activated" ? 0 : terminalIndex * TERMINAL_WEBGL_STAGGER_MS;
       const delayMs = Math.min(
         TERMINAL_WEBGL_MAX_DELAY_MS,
-        Math.max(0, baseDelayMs + terminalIndex * TERMINAL_WEBGL_STAGGER_MS),
+        Math.max(0, baseDelayMs + backgroundDelayMs + staggerDelayMs),
       );
       const attachAt = performance.now() + delayMs;
 
@@ -5462,7 +5632,17 @@ function WorkspaceTerminal({
       }, delayMs);
     };
 
-    scheduleWebglAttach("xterm_open", 0);
+    const attachDeferredWebgl = (reason = "terminal_activated") => {
+      scheduleWebglAttach(reason, 0);
+    };
+    attachDeferredWebglRef.current = attachDeferredWebgl;
+    disposables.push(() => {
+      if (attachDeferredWebglRef.current === attachDeferredWebgl) {
+        attachDeferredWebglRef.current = null;
+      }
+    });
+
+    scheduleWebglAttach("xterm_open", TERMINAL_WEBGL_IDLE_DELAY_MS);
 
     const clearTerminalRendererRows = (reason, extraFields = {}) => {
       if (isDisposed || !container?.isConnected) {
@@ -5732,6 +5912,110 @@ function WorkspaceTerminal({
       return combined;
     };
 
+    const getTerminalOutputFlushByteBudget = () => {
+      const active = terminalActiveRef.current;
+      const otherTerminalInteractiveInput = !active
+        && terminalGlobalRenderScheduler.isInteractiveInputActive?.();
+      const baseBudget = active
+        ? TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES
+        : TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES;
+      const slowScale = outputWriteLastCallbackMs >= TERMINAL_OUTPUT_FLUSH_VERY_SLOW_MS
+        ? 0.25
+        : outputWriteLastCallbackMs >= TERMINAL_OUTPUT_FLUSH_SLOW_MS
+          ? 0.5
+          : 1;
+      const rendererScale = rendererMode === "webgl_pending" ? 0.5 : 1;
+      const interactiveScale = otherTerminalInteractiveInput ? 0.5 : 1;
+
+      return Math.max(
+        TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
+        Math.floor(baseBudget * slowScale * rendererScale * interactiveScale),
+      );
+    };
+
+    const splitTerminalOutputWrite = (write, byteCount) => {
+      const originalBytes = Math.max(1, Number(write.data?.byteLength || 0));
+      const selectedData = write.data.slice(0, byteCount);
+      const remainingData = write.data.slice(byteCount);
+      const visibleChars = Number(write.outputDebug?.visibleChars || 0);
+      const selectedVisibleChars = Math.max(
+        0,
+        Math.min(visibleChars, Math.round(visibleChars * (selectedData.byteLength / originalBytes))),
+      );
+      const remainingVisibleChars = Math.max(0, visibleChars - selectedVisibleChars);
+
+      return {
+        remaining: {
+          ...write,
+          data: remainingData,
+          isFirstOutputChunk: false,
+          isFirstVisibleOutputChunk: false,
+          outputDebug: {
+            ...(write.outputDebug || {}),
+            visibleChars: remainingVisibleChars,
+          },
+          scrollToBottomBeforeWrite: false,
+        },
+        selected: {
+          ...write,
+          afterWriteRefreshReason: "",
+          data: selectedData,
+          outputDebug: {
+            ...(write.outputDebug || {}),
+            visibleChars: selectedVisibleChars,
+          },
+          scrollToBottomAfterWrite: false,
+        },
+      };
+    };
+
+    const takeTerminalOutputBatch = (maxBytes) => {
+      const writes = [];
+      const queuedMs = outputBatchQueuedAt ? performance.now() - outputBatchQueuedAt : 0;
+      const budget = Math.max(TERMINAL_OUTPUT_FLUSH_MIN_BYTES, Number(maxBytes || 0));
+      let batchBytes = 0;
+
+      while (pendingOutputWrites.length && batchBytes < budget) {
+        const nextWrite = pendingOutputWrites[0];
+        const nextBytes = Number(nextWrite?.data?.byteLength || 0);
+        if (nextBytes <= 0) {
+          pendingOutputWrites.shift();
+          continue;
+        }
+
+        const remainingBudget = budget - batchBytes;
+        if (nextBytes <= remainingBudget) {
+          writes.push(pendingOutputWrites.shift());
+          batchBytes += nextBytes;
+          continue;
+        }
+
+        if (remainingBudget <= 0) {
+          break;
+        }
+
+        const { selected, remaining } = splitTerminalOutputWrite(nextWrite, remainingBudget);
+        writes.push(selected);
+        pendingOutputWrites[0] = remaining;
+        batchBytes += selected.data.byteLength;
+        break;
+      }
+
+      pendingOutputBytes = Math.max(0, pendingOutputBytes - batchBytes);
+      if (!pendingOutputWrites.length) {
+        pendingOutputBytes = 0;
+        outputBatchQueuedAt = 0;
+      }
+
+      return {
+        batchBytes,
+        budget,
+        queuedMs,
+        remainingBytes: pendingOutputBytes,
+        writes,
+      };
+    };
+
     const flushTerminalOutputBatch = (reason) => {
       if (isDisposed || !pendingOutputWrites.length) {
         cancelTerminalOutputBatchTimers();
@@ -5747,11 +6031,17 @@ function WorkspaceTerminal({
       }
 
       const flushStartedAt = performance.now();
-      const writes = pendingOutputWrites.splice(0);
-      const batchBytes = pendingOutputBytes;
-      const queuedMs = outputBatchQueuedAt ? performance.now() - outputBatchQueuedAt : 0;
-      pendingOutputBytes = 0;
-      outputBatchQueuedAt = 0;
+      const {
+        batchBytes,
+        budget: flushByteBudget,
+        queuedMs,
+        remainingBytes,
+        writes,
+      } = takeTerminalOutputBatch(getTerminalOutputFlushByteBudget());
+      if (!writes.length || batchBytes <= 0) {
+        scheduleTerminalOutputBatchFlush();
+        return;
+      }
       cancelTerminalOutputBatchTimers();
 
       const combineStartedAt = performance.now();
@@ -5821,6 +6111,7 @@ function WorkspaceTerminal({
         });
         const writeCallbackMs = performance.now() - writeStartedAt;
         const elapsedMs = performance.now() - flushStartedAt;
+        outputWriteLastCallbackMs = writeCallbackMs;
         if (terminalDiagnosticsEnabled) {
           outputDiagnosticWriteCallbackMs += writeCallbackMs;
           outputDiagnosticWriteCallbackMaxMs = Math.max(
@@ -5843,9 +6134,11 @@ function WorkspaceTerminal({
             paneId,
             queuedMs,
             reason,
+            remainingBytes,
             rendererMode,
             terminalIndex,
             visibleChars: outputDebug.visibleChars,
+            writeBudgetBytes: flushByteBudget,
             writeCallbackMs,
             writes: writes.length,
           },
@@ -5944,18 +6237,12 @@ function WorkspaceTerminal({
         }
 
         if (batchVisibleChars > 0) {
-          refreshTerminalRenderer("visible_output_written", {
-            bytes: batchData.byteLength,
-            reason,
-            transport: "binary_channel",
-            visibleChars: batchVisibleChars,
-          });
           scheduleVisibleOutputRefresh("visible_output_written_settled", {
             bytes: batchData.byteLength,
             reason,
             transport: "binary_channel",
             visibleChars: batchVisibleChars,
-          });
+          }, terminalActiveRef.current ? 48 : 120);
         }
 
         if (isSlashCommandDiagnosticProbeActive()) {
@@ -8729,6 +9016,11 @@ function WorkspaceTerminal({
                 source: "terminal-output-prompt-ready",
               })
               : "";
+            const promptReadyDeferral = outputLooksPromptReady
+              ? getPromptReadyDeferral({
+                source: "terminal-output-prompt-ready",
+              })
+              : null;
             const promptReadyDetectionArmed = Boolean(terminalThreadReadyDetectionArmedRef.current);
             if (
               thinkingElapsedMs >= TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS
@@ -8761,6 +9053,7 @@ function WorkspaceTerminal({
               !readyLifecycleAlreadyEmitted
               && outputLooksPromptReady
               && !promptReadySuppressionReason
+              && !promptReadyDeferral
               && (
                 (
                   promptReadyDetectionArmed
@@ -8778,11 +9071,26 @@ function WorkspaceTerminal({
                 lifecycleAlreadyEmitted: readyLifecycleAlreadyEmitted,
                 outputPreview: sanitizeTerminalDiagnosticText(readyOutputText, 320),
                 promptReadyDetectionArmed,
+                promptReadyDeferralReason: promptReadyDeferral?.reason || "",
                 promptReadySuppressionReason,
                 readyLifecycleEpoch: terminalThreadReadyLifecycleEpochRef.current,
                 sawAgentOutput,
                 shouldEmitPromptReady,
                 source: "terminal_output_prompt_ready_match",
+                thinkingElapsedMs: Math.round(thinkingElapsedMs),
+                visibleChars,
+              }));
+            }
+            if (promptReadyDeferral) {
+              logTerminalStatus("frontend.terminal_cli.prompt_ready_deferred", getTerminalCliStatusLogBase({
+                latestTurnState: promptReadyDeferral.latestTurnState,
+                outputPreview: sanitizeTerminalDiagnosticText(readyOutputText, 320),
+                pendingPromptPresent: promptReadyDeferral.pendingPromptPresent,
+                promptReadyDetectionArmed,
+                reason: promptReadyDeferral.reason,
+                sawAgentOutput,
+                source: "terminal_output_prompt_ready",
+                terminalActivityStatus: terminalThreadActivityStatusRef.current || "",
                 thinkingElapsedMs: Math.round(thinkingElapsedMs),
                 visibleChars,
               }));
@@ -9781,20 +10089,25 @@ function WorkspaceTerminal({
             poll();
           });
         };
-        const flushTerminalInput = (reason, promptMetadata = null) => {
+        const takeTerminalInputBuffer = () => {
           if (terminalInputFlushTimer) {
             window.clearTimeout(terminalInputFlushTimer);
             terminalInputFlushTimer = 0;
           }
-          if (!terminalInputBuffer || !hasOpenPty || isDisposed) {
-            terminalInputBuffer = "";
-            return terminalInputWriteChain;
-          }
           const queuedData = terminalInputBuffer;
           terminalInputBuffer = "";
+          return queuedData;
+        };
+        const writeBufferedTerminalInput = (queuedData, reason, promptMetadata = null) => {
+          if (!queuedData || !hasOpenPty || isDisposed) {
+            return terminalInputWriteChain;
+          }
           writeTerminalInputChunk(queuedData, reason, promptMetadata);
           return terminalInputWriteChain;
         };
+        const flushTerminalInput = (reason, promptMetadata = null) => (
+          writeBufferedTerminalInput(takeTerminalInputBuffer(), reason, promptMetadata)
+        );
         const scheduleTerminalInputFlush = (delayMs = TERMINAL_INPUT_BATCH_MS) => {
           if (terminalInputFlushTimer) {
             return;
@@ -10050,6 +10363,12 @@ function WorkspaceTerminal({
             ? ""
             : terminalInputChunkVisibleText(safeData);
           const isFocusEventInput = safeData.includes("\x1b[I") || safeData.includes("\x1b[O");
+          if (!startupControlReply && !terminalGeneratedReply && (isSubmitInput || visibleInputText)) {
+            noteTerminalInteractiveInput(
+              isSubmitInput ? "submit" : "input",
+              isSubmitInput ? 1400 : 900,
+            );
+          }
           let confirmedSubmitBridge = null;
           const traceTextInputChunk = !startupControlReply
             && !terminalGeneratedReply
@@ -10376,15 +10695,17 @@ function WorkspaceTerminal({
           ) {
             if (isSubmitInput && confirmedSubmitBridge) {
               const bridge = confirmedSubmitBridge;
+              const submitData = takeTerminalInputBuffer();
+              const promptMetadata = {
+                promptEventId: bridge.promptEventId,
+                promptEventRevision: bridge.promptEventRevision,
+                promptEventSource: bridge.promptEventSource,
+                promptEventSubmittedAt: bridge.promptEventSubmittedAt,
+                promptEventText: bridge.promptEventText,
+              };
               bridge.submittedWaiterReady
                 .then((submittedWaiter) => {
-                  const writePromise = flushTerminalInput("submit", {
-                    promptEventId: bridge.promptEventId,
-                    promptEventRevision: bridge.promptEventRevision,
-                    promptEventSource: bridge.promptEventSource,
-                    promptEventSubmittedAt: bridge.promptEventSubmittedAt,
-                    promptEventText: bridge.promptEventText,
-                  });
+                  const writePromise = writeBufferedTerminalInput(submitData, "submit", promptMetadata);
                   return Promise.resolve(writePromise)
                     .then(() => submittedWaiter.promise)
                     .then(() => {
@@ -10473,7 +10794,7 @@ function WorkspaceTerminal({
                     threadId: bridge.threadId,
                     workspaceId: bridge.workspaceId,
                   });
-                  flushTerminalInput("submit");
+                  writeBufferedTerminalInput(submitData, "submit_waiter_error", promptMetadata);
                 });
               return;
             }

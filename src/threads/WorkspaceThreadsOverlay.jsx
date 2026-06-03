@@ -8,6 +8,7 @@ import { Search } from "@styled-icons/material-rounded/Search";
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
+import { terminalActivityStatusIsBusy } from "../terminals/terminalActivityState.js";
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
@@ -25,6 +26,19 @@ const THREAD_VIEW_STATE = {
   DETACHED_SESSION: "detached-session",
   INACTIVE_NO_SESSION: "inactive-no-session",
 };
+const THREAD_ACTIVITY_LINE_STATES = new Set([
+  "implementing",
+  "pending",
+  "queued",
+  "reasoning",
+  "resume_requested",
+  "resumed",
+  "running",
+  "starting",
+  "submitted",
+  "thinking",
+  "working",
+]);
 
 const overlayFadeIn = keyframes`
   from {
@@ -45,6 +59,16 @@ const overlayPanelIn = keyframes`
   to {
     opacity: 1;
     transform: scale(1);
+  }
+`;
+
+const threadActivitySweep = keyframes`
+  from {
+    transform: translateX(220%);
+  }
+
+  to {
+    transform: translateX(-120%);
   }
 `;
 
@@ -661,6 +685,7 @@ const ThreadSelectButton = styled.button`
 const ThreadRowText = styled.span`
   display: flex;
   min-width: 0;
+  height: 100%;
   align-items: center;
   gap: 5px;
   transition: padding-left 130ms ease;
@@ -669,6 +694,87 @@ const ThreadRowText = styled.span`
   ${ThreadRow}[data-pinned="true"] & {
     padding-left: 17px;
   }
+`;
+
+const ThreadRowTitle = styled.strong`
+  position: relative;
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  flex: 1 1 auto;
+  align-items: center;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+
+  &::before,
+  &::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    bottom: 4px;
+    height: 1px;
+    border-radius: 999px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  &::before {
+    right: 0;
+    background: rgba(255, 255, 255, 0.16);
+  }
+
+  &::after {
+    width: 50%;
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0),
+      rgba(255, 255, 255, 0.94) 42%,
+      rgba(255, 255, 255, 0.94) 62%,
+      rgba(255, 255, 255, 0)
+    );
+    animation: ${threadActivitySweep} 1180ms linear infinite;
+  }
+
+  &[data-working="true"]::before {
+    opacity: 0.78;
+  }
+
+  &[data-working="true"]::after {
+    opacity: 1;
+  }
+
+  html[data-forge-theme="light"] &::before {
+    background: rgba(45, 38, 24, 0.2);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    background: linear-gradient(
+      90deg,
+      rgba(45, 38, 24, 0),
+      rgba(45, 38, 24, 0.72) 42%,
+      rgba(45, 38, 24, 0.72) 62%,
+      rgba(45, 38, 24, 0)
+    );
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      right: 0;
+      left: auto;
+      width: 42%;
+      animation: none;
+      transform: none;
+    }
+  }
+`;
+
+const ThreadRowTitleText = styled.span`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const ThreadPinButton = styled.button`
@@ -897,6 +1003,45 @@ function terminalMatchesThreadBinding(terminal, terminalBinding) {
   return terminalIndexMatches && instanceMatches && paneMatches;
 }
 
+function normalizeThreadActivityLineText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+}
+
+function valueLooksLikeWorkingThreadState(value) {
+  const normalized = normalizeThreadActivityLineText(value);
+  return Boolean(
+    normalized
+      && (
+        terminalActivityStatusIsBusy(normalized)
+        || THREAD_ACTIVITY_LINE_STATES.has(normalized)
+      )
+  );
+}
+
+function getThreadIsWorking({ mappedTerminal = null, providerBinding = null, thread = null, turnState = "" } = {}) {
+  return Boolean(
+    turnState === "running"
+      || thread?.pendingPrompt
+      || valueLooksLikeWorkingThreadState(thread?.activityStatus)
+      || valueLooksLikeWorkingThreadState(thread?.latestTurn?.state || thread?.latestTurn?.status)
+      || valueLooksLikeWorkingThreadState(thread?.status)
+      || valueLooksLikeWorkingThreadState(providerBinding?.activityStatus)
+      || valueLooksLikeWorkingThreadState(providerBinding?.commandPhase || providerBinding?.command_phase)
+      || valueLooksLikeWorkingThreadState(providerBinding?.executionPhase || providerBinding?.execution_phase)
+      || valueLooksLikeWorkingThreadState(providerBinding?.status)
+      || valueLooksLikeWorkingThreadState(providerBinding?.turnStatus || providerBinding?.turn_status)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.activityStatus || mappedTerminal?.activity_status)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.commandPhase || mappedTerminal?.command_phase)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.executionPhase || mappedTerminal?.execution_phase)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.nativeRailState || mappedTerminal?.native_rail_state)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.turnStatus || mappedTerminal?.turn_status)
+      || valueLooksLikeWorkingThreadState(mappedTerminal?.status)
+  );
+}
+
 function getThreadState(thread, entry) {
   const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
   const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
@@ -938,6 +1083,12 @@ function getThreadState(thread, entry) {
     canPin: getWorkspaceThreadCanPin(thread),
     isLive: Boolean(isActiveTerminal),
     isNonSessionActive: threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION,
+    isWorking: getThreadIsWorking({
+      mappedTerminal,
+      providerBinding,
+      thread,
+      turnState,
+    }),
     label: getWorkspaceThreadLabel(thread),
     pinned: getWorkspaceThreadIsPinned(thread),
     state: dotState,
@@ -1525,6 +1676,7 @@ function WorkspaceThreadsOverlay({
                           canPin,
                           isLive,
                           isNonSessionActive,
+                          isWorking,
                           label,
                           pinned,
                           state,
@@ -1555,7 +1707,9 @@ function WorkspaceThreadsOverlay({
                               type="button"
                             >
                               <ThreadRowText>
-                                <strong>{label}</strong>
+                                <ThreadRowTitle data-working={isWorking ? "true" : "false"}>
+                                  <ThreadRowTitleText>{label}</ThreadRowTitleText>
+                                </ThreadRowTitle>
                               </ThreadRowText>
                             </ThreadSelectButton>
                             <ThreadStatusSlot>

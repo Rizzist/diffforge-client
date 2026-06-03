@@ -27,6 +27,8 @@ const CLOUD_MCP_INITIAL_GITIGNORE_WAIT_MS: u64 = 3_000;
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
+const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
+const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_CACHE_MAX: usize = 512;
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -41,6 +43,7 @@ struct CloudMcpState {
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
+    terminal_context_missing_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Default)]
@@ -269,6 +272,7 @@ impl CloudMcpState {
             global_ws_events,
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
+            terminal_context_missing_until_ms: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 }
@@ -5121,6 +5125,48 @@ fn cloud_mcp_terminal_key(pane_id: &str, instance_id: u64) -> String {
     format!("{pane_id}::{instance_id}")
 }
 
+fn cloud_mcp_terminal_context_missing_backed_off(
+    state: &CloudMcpState,
+    terminal_key: &str,
+    now_ms: u64,
+) -> bool {
+    let Ok(mut cache) = state.terminal_context_missing_until_ms.lock() else {
+        return false;
+    };
+    match cache.get(terminal_key).copied() {
+        Some(deadline_ms) if deadline_ms > now_ms => true,
+        Some(_) => {
+            cache.remove(terminal_key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn cloud_mcp_mark_terminal_context_missing(
+    state: &CloudMcpState,
+    terminal_key: &str,
+    now_ms: u64,
+) {
+    let Ok(mut cache) = state.terminal_context_missing_until_ms.lock() else {
+        return;
+    };
+    if cache.len() > CLOUD_MCP_TERMINAL_CONTEXT_MISSING_CACHE_MAX {
+        cache.retain(|_, deadline_ms| *deadline_ms > now_ms);
+    }
+    cache.insert(
+        terminal_key.to_string(),
+        now_ms.saturating_add(CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS),
+    );
+}
+
+fn cloud_mcp_clear_terminal_context_missing(state: &CloudMcpState, terminal_key: &str) {
+    let Ok(mut cache) = state.terminal_context_missing_until_ms.lock() else {
+        return;
+    };
+    cache.remove(terminal_key);
+}
+
 fn cloud_mcp_terminal_agent_id(
     pane_id: &str,
     instance_id: u64,
@@ -6650,18 +6696,24 @@ async fn cloud_mcp_observe_terminal_output(
         return;
     }
 
-    log_terminal_status_event(
-        "backend.terminal.ground_truth.output_observed",
-        json!({
-            "bytes": chunk.len(),
-            "decoded_preview": clean_terminal_diagnostic_log_text(&text),
-            "instance_id": instance_id,
-            "looks_active": looks_active,
-            "looks_ready": looks_ready,
-            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
-        }),
-    );
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let now_ms = cloud_mcp_now_ms();
+    let context_missing_backed_off =
+        cloud_mcp_terminal_context_missing_backed_off(&state, &terminal_key, now_ms);
+    if !context_missing_backed_off {
+        log_terminal_status_event(
+            "backend.terminal.ground_truth.output_observed",
+            json!({
+                "bytes": chunk.len(),
+                "decoded_preview": clean_terminal_diagnostic_log_text(&text),
+                "instance_id": instance_id,
+                "looks_active": looks_active,
+                "looks_ready": looks_ready,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
+            }),
+        );
+    }
     let _ = app.emit(
         TERMINAL_OUTPUT_STATE_EVENT,
         TerminalOutputStatePayload {
@@ -6677,100 +6729,109 @@ async fn cloud_mcp_observe_terminal_output(
             output_preview: clean_terminal_diagnostic_log_text(&text),
         },
     );
-
-    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    if context_missing_backed_off {
+        return;
+    }
     let work_brief = cloud_mcp_extract_agent_work_brief(&text);
-    let (work_update, completion) = {
+    let (work_update, completion, missing_context_lock_ms) = {
         let lock_started_at = Instant::now();
         let mut runtime = state.inner.lock().await;
         let lock_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
-        let Some(entry) = runtime.terminal_contexts.get_mut(&terminal_key) else {
-            log_terminal_status_event(
-                "backend.terminal.ground_truth.missing_context",
-                json!({
-                    "bytes": chunk.len(),
-                    "instance_id": instance_id,
-                    "looks_active": looks_active,
-                    "looks_ready": looks_ready,
-                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                    "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
-                }),
-            );
-            let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
-            if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
-                log_terminal_diagnostic_event(
-                    &app,
-                    "backend.output_observer.missing_context_slow",
-                    json!({
-                        "bytes": chunk.len(),
-                        "decode_ms": decode_ms,
-                        "elapsed_ms": elapsed_ms,
-                        "instance_id": instance_id,
-                        "lock_ms": lock_ms,
-                        "looks_active": looks_active,
-                        "looks_ready": looks_ready,
-                        "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                        "scan_ms": scan_ms,
-                    }),
-                );
+        match runtime.terminal_contexts.get_mut(&terminal_key) {
+            Some(entry) => {
+                if looks_active {
+                    entry.saw_agent_activity = true;
+                }
+                let work_update = if let Some(brief) = work_brief.clone() {
+                    if !entry.work_brief_reported && entry.work_brief.trim().is_empty() {
+                        entry.work_brief = brief.clone();
+                    }
+                    if entry.work_brief_reported {
+                        None
+                    } else {
+                        entry.work_brief_reported = true;
+                        Some((
+                            entry.repo_id.clone(),
+                            entry.agent_id.clone(),
+                            entry.lane.clone(),
+                            entry.local_task_id.clone(),
+                            entry.session_mode.clone(),
+                            brief,
+                            entry.working_directory.clone(),
+                            entry.repo_root.clone(),
+                        ))
+                    }
+                } else {
+                    None
+                };
+                let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
+                let completion =
+                    if entry.saw_agent_activity && !entry.done_reported && old_enough && looks_ready {
+                        entry.done_reported = true;
+                        Some((
+                            entry.local_task_id.clone(),
+                            entry.repo_id.clone(),
+                            entry.agent_id.clone(),
+                            entry.lane.clone(),
+                            entry.last_prompt.clone(),
+                            entry.work_brief.clone(),
+                            entry.working_directory.clone(),
+                            entry.repo_root.clone(),
+                            entry.prompt_event_id.clone(),
+                            entry.prompt_event_source.clone(),
+                            entry.prompt_event_submitted_at.clone(),
+                            entry.terminal_index,
+                            entry.thread_id.clone(),
+                            entry.workspace_id.clone(),
+                            entry.workspace_name.clone(),
+                            entry.session_mode.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
+                if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+                    log_terminal_diagnostic_event(
+                        &app,
+                        "backend.output_observer.match_slow",
+                        json!({
+                            "bytes": chunk.len(),
+                            "decode_ms": decode_ms,
+                            "elapsed_ms": elapsed_ms,
+                            "instance_id": instance_id,
+                            "lock_ms": lock_ms,
+                            "looks_active": looks_active,
+                            "looks_ready": looks_ready,
+                            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                            "scan_ms": scan_ms,
+                            "will_complete": completion.is_some(),
+                            "will_update": work_update.is_some(),
+                        }),
+                    );
+                }
+                (work_update, completion, None)
             }
-            return;
-        };
-        if looks_active {
-            entry.saw_agent_activity = true;
+            None => (None, None, Some(lock_ms)),
         }
-        let work_update = if let Some(brief) = work_brief.clone() {
-            if !entry.work_brief_reported && entry.work_brief.trim().is_empty() {
-                entry.work_brief = brief.clone();
-            }
-            if entry.work_brief_reported {
-                None
-            } else {
-                entry.work_brief_reported = true;
-                Some((
-                    entry.repo_id.clone(),
-                    entry.agent_id.clone(),
-                    entry.lane.clone(),
-                    entry.local_task_id.clone(),
-                    entry.session_mode.clone(),
-                    brief,
-                    entry.working_directory.clone(),
-                    entry.repo_root.clone(),
-                ))
-            }
-        } else {
-            None
-        };
-        let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
-        let completion =
-            if entry.saw_agent_activity && !entry.done_reported && old_enough && looks_ready {
-                entry.done_reported = true;
-                Some((
-                    entry.local_task_id.clone(),
-                    entry.repo_id.clone(),
-                    entry.agent_id.clone(),
-                    entry.lane.clone(),
-                    entry.last_prompt.clone(),
-                    entry.work_brief.clone(),
-                    entry.working_directory.clone(),
-                    entry.repo_root.clone(),
-                    entry.prompt_event_id.clone(),
-                    entry.prompt_event_source.clone(),
-                    entry.prompt_event_submitted_at.clone(),
-                    entry.terminal_index,
-                    entry.thread_id.clone(),
-                    entry.workspace_id.clone(),
-                    entry.workspace_name.clone(),
-                    entry.session_mode.clone(),
-                ))
-            } else {
-                None
-            };
+    };
+    if let Some(lock_ms) = missing_context_lock_ms {
+        cloud_mcp_mark_terminal_context_missing(&state, &terminal_key, now_ms);
+        log_terminal_status_event(
+            "backend.terminal.ground_truth.missing_context",
+            json!({
+                "bytes": chunk.len(),
+                "instance_id": instance_id,
+                "looks_active": looks_active,
+                "looks_ready": looks_ready,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
+            }),
+        );
         let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
         if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
             log_terminal_diagnostic_event(
                 &app,
-                "backend.output_observer.match_slow",
+                "backend.output_observer.missing_context_slow",
                 json!({
                     "bytes": chunk.len(),
                     "decode_ms": decode_ms,
@@ -6781,13 +6842,11 @@ async fn cloud_mcp_observe_terminal_output(
                     "looks_ready": looks_ready,
                     "pane_id": clean_terminal_diagnostic_log_text(pane_id),
                     "scan_ms": scan_ms,
-                    "will_complete": completion.is_some(),
-                    "will_update": work_update.is_some(),
                 }),
             );
         }
-        (work_update, completion)
-    };
+        return;
+    }
 
     log_terminal_status_event(
         "backend.terminal.ground_truth.output_decision",
@@ -7050,6 +7109,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
             },
         );
     }
+    cloud_mcp_clear_terminal_context_missing(&state, &terminal_key);
 
     if let Err(error) = cloud_mcp_connected_or_connect(&state).await {
         let _ = cloud_mcp_workspace_log(

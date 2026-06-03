@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildTerminalReadinessEpochKey,
+  getPromptReadyLifecycleDeferral,
   isReadyLifecycleEmittedForEpoch,
   terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
@@ -71,6 +72,31 @@ test("prompt-ready backend output is emitted again for a restarted terminal epoc
     readyLifecycleEpoch: previousReadyEpoch,
     threadId: "thread-1",
   }), true);
+});
+
+test("prompt-ready backend output is deferred while the owning turn is running", () => {
+  assert.deepEqual(getPromptReadyLifecycleDeferral({
+    latestTurn: {
+      state: "running",
+    },
+    source: "backend-terminal-output-prompt-ready",
+    threadId: "thread-1",
+  }), {
+    latestTurnState: "running",
+    pendingPromptPresent: false,
+    reason: "running_turn_still_active",
+    source: "backend-terminal-output-prompt-ready",
+  });
+});
+
+test("prompt-ready backend output is not deferred after the owning turn completes", () => {
+  assert.equal(getPromptReadyLifecycleDeferral({
+    latestTurn: {
+      state: "completed",
+    },
+    source: "backend-terminal-output-prompt-ready",
+    threadId: "thread-1",
+  }), null);
 });
 
 test("stale thread prop thinking cannot revive a terminal after newer readiness", () => {

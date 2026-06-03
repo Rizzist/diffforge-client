@@ -664,6 +664,9 @@ fn developer_terminal_activity_process_visible(process: &DeveloperProcessInfo) -
     {
         return false;
     }
+    if developer_process_is_diff_forge_mcp_sidecar(process) {
+        return false;
+    }
     if developer_terminal_process_is_dev_server(process) {
         return true;
     }
@@ -680,6 +683,25 @@ fn developer_terminal_activity_process_visible(process: &DeveloperProcessInfo) -
     }
 
     true
+}
+
+fn developer_process_is_diff_forge_mcp_sidecar(process: &DeveloperProcessInfo) -> bool {
+    let command = process.command.to_ascii_lowercase();
+    if !command.contains("--coordination-mcp-proxy")
+        && !command.contains("--workspace-mcp-gateway")
+    {
+        return false;
+    }
+
+    let text = [
+        process.name.as_str(),
+        process.executable.as_str(),
+        process.command.as_str(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+
+    text.contains("rust-diffforge") || text.contains("diff forge ai.app")
 }
 
 fn developer_terminal_activity_process_rank(process: &DeveloperProcessInfo) -> u8 {
@@ -3312,6 +3334,68 @@ fn process_name_matches(name: &str, candidates: &[&str]) -> bool {
 #[cfg(test)]
 mod developer_process_docker_tests {
     use super::*;
+
+    fn test_developer_process_info(name: &str, command: &str) -> DeveloperProcessInfo {
+        DeveloperProcessInfo {
+            pid: 42,
+            parent_pid: Some(7),
+            child_pids: Vec::new(),
+            child_count: 0,
+            name: name.to_string(),
+            display_name: name.to_string(),
+            group_id: "workspace-process".to_string(),
+            group_label: "Workspace process".to_string(),
+            group_kind: "workspace".to_string(),
+            icon_hint: "terminal".to_string(),
+            command: command.to_string(),
+            executable: format!("/Applications/Diff Forge AI.app/Contents/MacOS/{name}"),
+            cwd: "/Users/dev/project".to_string(),
+            cpu_percent: 0.0,
+            memory_bytes: 0,
+            virtual_memory_bytes: 0,
+            start_time: 0,
+            run_time_seconds: 0,
+            attribution: "diffForge".to_string(),
+            attribution_label: "Diff Forge terminal".to_string(),
+            workspace_root: String::new(),
+            risk: "safe".to_string(),
+            killable: true,
+            kill_disabled_reason: String::new(),
+            kill_tree_default: true,
+            terminal_owned: true,
+            terminal_pane_id: "terminal-1".to_string(),
+            terminal_instance_id: Some(1),
+            terminal_workspace_id: "workspace".to_string(),
+            terminal_workspace_name: "Workspace".to_string(),
+            terminal_index: Some(0),
+            terminal_thread_id: "thread".to_string(),
+            terminal_agent_id: "agent".to_string(),
+            terminal_agent_kind: "codex".to_string(),
+            terminal_root_pid: Some(1),
+            bound_ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn terminal_activity_hides_diff_forge_mcp_sidecars() {
+        let process = test_developer_process_info(
+            "rust-diffforge",
+            "/Applications/Diff Forge AI.app/Contents/MacOS/rust-diffforge --workspace-mcp-gateway --repo-path /tmp/repo",
+        );
+
+        assert!(!developer_terminal_activity_process_visible(&process));
+    }
+
+    #[test]
+    fn terminal_activity_keeps_real_dev_server_processes() {
+        let mut process = test_developer_process_info(
+            "node",
+            "node /Users/dev/project/node_modules/.bin/vite --host 127.0.0.1",
+        );
+        process.executable = "/Users/dev/.nvm/versions/node/bin/node".to_string();
+
+        assert!(developer_terminal_activity_process_visible(&process));
+    }
 
     #[test]
     fn docker_workspace_links_match_related_compose_sibling_project() {

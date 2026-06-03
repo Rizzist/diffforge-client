@@ -1,6 +1,7 @@
 const NOTIFICATION_SFX_STORAGE_KEY = "diffforge.notificationSfx.v1";
 const DEFAULT_VOLUME = 0.32;
 const DING_SOUND_PATH = "/ding.mp3";
+const DING_SOUND_MIN_INTERVAL_MS = 1200;
 
 function readSettings() {
   try {
@@ -66,6 +67,8 @@ function playSequence(context, notes, volume) {
 export function createWorkspaceNotificationSfx() {
   let context = null;
   let dingAudio = null;
+  let dingAudioLoaded = false;
+  let lastDingPlayedAtMs = 0;
   let unlocked = false;
 
   const ensureDingAudio = () => {
@@ -99,11 +102,16 @@ export function createWorkspaceNotificationSfx() {
   const playDing = async (volume) => {
     const audio = ensureDingAudio();
     if (!audio) return false;
+    const playedAtMs = Date.now();
+    if (playedAtMs - lastDingPlayedAtMs < DING_SOUND_MIN_INTERVAL_MS) {
+      return true;
+    }
     try {
       audio.pause();
       audio.currentTime = 0;
       audio.volume = Math.max(0.01, Math.min(0.82, volume));
       await audio.play();
+      lastDingPlayedAtMs = playedAtMs;
       return true;
     } catch {
       return false;
@@ -139,6 +147,8 @@ export function createWorkspaceNotificationSfx() {
         }
       }
       dingAudio = null;
+      dingAudioLoaded = false;
+      lastDingPlayedAtMs = 0;
       if (context) {
         try {
           context.close();
@@ -160,12 +170,18 @@ export function createWorkspaceNotificationSfx() {
     },
 
     async unlock() {
+      if (unlocked && dingAudioLoaded && (!context || context.state === "running")) {
+        return;
+      }
       unlocked = true;
       const audio = ensureDingAudio();
-      try {
-        audio?.load();
-      } catch {
-        // Loading the MP3 is opportunistic; the oscillator fallback still works.
+      if (audio && !dingAudioLoaded) {
+        try {
+          audio.load();
+          dingAudioLoaded = true;
+        } catch {
+          // Loading the MP3 is opportunistic; the oscillator fallback still works.
+        }
       }
       await ensureContext();
     },

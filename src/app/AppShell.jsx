@@ -918,6 +918,10 @@ const FILE_PREVIEW_MIN_SIZE = 24;
 const FILE_PREVIEW_MAX_SIZE = 84;
 const WORKSPACE_THREAD_PROJECTION_POLL_INTERVAL_MS = 700;
 const WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const WORKSPACE_THREAD_TERMINAL_SUBMIT_TRANSCRIPT_POLL_TIMEOUT_MS = 4_000;
+const WORKSPACE_THREAD_UNACCEPTED_PROMPT_TRANSCRIPT_POLL_TIMEOUT_MS = 6_000;
+const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_TTL_MS = 2 * 60 * 1000;
+const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_MAX = 512;
 const WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS = 120;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
@@ -927,6 +931,109 @@ const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
+
+function normalizeWorkspaceThreadPromptAcceptanceText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function getWorkspaceThreadPromptAcceptanceKeys({
+  agentId = "",
+  expectedUserMessage = "",
+  promptEventId = "",
+  promptText = "",
+  threadId = "",
+  userMessage = "",
+  workspaceId = "",
+} = {}) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeThreadId = String(threadId || "").trim();
+  if (!safeWorkspaceId || !safeThreadId) {
+    return [];
+  }
+
+  const safePromptEventId = String(promptEventId || "").trim();
+  const normalizedPromptText = normalizeWorkspaceThreadPromptAcceptanceText(
+    promptText || expectedUserMessage || userMessage,
+  );
+  const agentKeys = String(agentId || "").trim().toLowerCase()
+    ? [String(agentId || "").trim().toLowerCase(), "*"]
+    : ["*"];
+  const keys = [];
+
+  agentKeys.forEach((agentKey) => {
+    const baseKey = `${safeWorkspaceId}:${safeThreadId}:${agentKey}`;
+    if (safePromptEventId) {
+      keys.push(`${baseKey}:id:${safePromptEventId}`);
+    }
+    if (normalizedPromptText) {
+      keys.push(`${baseKey}:text:${normalizedPromptText.length}:${normalizedPromptText.slice(0, 160)}`);
+    }
+  });
+
+  return keys;
+}
+
+function pruneWorkspaceThreadPromptAcceptanceCache(cache, now = Date.now()) {
+  if (!cache || typeof cache.forEach !== "function") {
+    return;
+  }
+  cache.forEach((entry, key) => {
+    if (now - Number(entry?.acceptedAt || 0) > WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_TTL_MS) {
+      cache.delete(key);
+    }
+  });
+  while (cache.size > WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_MAX) {
+    const firstKey = cache.keys().next().value;
+    if (!firstKey) {
+      break;
+    }
+    cache.delete(firstKey);
+  }
+}
+
+function rememberWorkspaceThreadPromptAcceptance(cache, detail = {}) {
+  const now = Date.now();
+  const keys = getWorkspaceThreadPromptAcceptanceKeys(detail);
+  if (!cache || typeof cache.set !== "function" || !keys.length) {
+    return null;
+  }
+  const accepted = {
+    acceptedAt: now,
+    agentId: String(detail.agentId || "").trim().toLowerCase(),
+    matchedBy: detail.matchedBy || "terminal-submit",
+    promptEventId: String(detail.promptEventId || "").trim(),
+    promptText: String(detail.promptText || detail.expectedUserMessage || detail.userMessage || "").trim(),
+    sessionId: String(detail.sessionId || "").trim(),
+    threadId: String(detail.threadId || "").trim(),
+    workspaceId: String(detail.workspaceId || "").trim(),
+  };
+  keys.forEach((key) => cache.set(key, accepted));
+  pruneWorkspaceThreadPromptAcceptanceCache(cache, now);
+  return accepted;
+}
+
+function getWorkspaceThreadPromptAcceptance(cache, detail = {}) {
+  if (!cache || typeof cache.get !== "function") {
+    return null;
+  }
+  const now = Date.now();
+  const keys = getWorkspaceThreadPromptAcceptanceKeys(detail);
+  for (const key of keys) {
+    const accepted = cache.get(key);
+    if (!accepted) {
+      continue;
+    }
+    if (now - Number(accepted.acceptedAt || 0) > WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_TTL_MS) {
+      cache.delete(key);
+      continue;
+    }
+    return accepted;
+  }
+  return null;
+}
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
@@ -4115,6 +4222,7 @@ export default function App() {
   const workspaceThreadsHydratedKeyRef = useRef("");
   const workspaceThreadsPersistenceReadyRef = useRef(false);
   const workspaceThreadTranscriptRequestsRef = useRef(new Map());
+  const workspaceThreadAcceptedPromptsRef = useRef(new Map());
   const workspacePendingPromptDeliveriesRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
@@ -4135,6 +4243,9 @@ export default function App() {
   const terminalStatusEventSeqRef = useRef(new Map());
   const terminalStatusEventDedupRef = useRef(new Map());
   const terminalStatusEventEmitterRef = useRef(null);
+  const terminalStatusEventSyncQueueRef = useRef(new Map());
+  const terminalStatusEventSyncTimersRef = useRef(new Map());
+  const terminalStatusEventSyncInFlightRef = useRef(new Set());
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const workspaceCloudSyncKeyRef = useRef("");
@@ -9608,6 +9719,112 @@ export default function App() {
     terminalStatusEventSeqRef.current.set(key, nextSeq);
     return nextSeq;
   }, []);
+
+  function scheduleTerminalStatusEventSyncFlush(syncKey, delayMs = 0) {
+    const key = String(syncKey || "").trim();
+    if (!key || typeof window === "undefined") {
+      return;
+    }
+    const timers = terminalStatusEventSyncTimersRef.current;
+    const existingTimer = timers.get(key);
+    if (existingTimer) {
+      window.clearTimeout(existingTimer);
+    }
+    const timer = window.setTimeout(() => {
+      timers.delete(key);
+      flushTerminalStatusEventSync(key);
+    }, Math.max(0, Number(delayMs) || 0));
+    timers.set(key, timer);
+  }
+
+  function sendTerminalStatusEventSync(item = {}) {
+    const syncKey = String(item.syncKey || "").trim();
+    if (syncKey) {
+      terminalStatusEventSyncInFlightRef.current.add(syncKey);
+    }
+    logTerminalStatus("frontend.terminal_status.event_sync.send", {
+      agentId: item.agentId,
+      coalesced: item.coalesced === true,
+      eventType: item.eventType,
+      commandPhase: item.commandPhase,
+      executionPhase: item.executionPhase,
+      paneId: item.paneId,
+      readinessAfter: item.readinessAfter,
+      reason: item.reason,
+      statusAfter: item.statusAfter,
+      statusSeq: item.statusSeq,
+      terminalIndex: item.terminalIndex,
+      threadId: item.threadId,
+      workspaceId: item.workspaceId,
+    });
+    return invoke("cloud_mcp_sync_terminal_status_event", {
+      workspace: item.workspacePayload,
+      terminal: item.terminalPayload,
+      reason: item.reason,
+    }).catch((error) => {
+      logTerminalStatus("frontend.terminal_status.event_sync.error", {
+        agentId: item.agentId,
+        eventType: item.eventType,
+        message: getErrorMessage(error, "Unable to sync terminal status event."),
+        paneId: item.paneId,
+        statusAfter: item.statusAfter,
+        statusSeq: item.statusSeq,
+        terminalIndex: item.terminalIndex,
+        threadId: item.threadId,
+        workspaceId: item.workspaceId,
+      });
+      void recordCloudConnectionDiagnostic(item.diagnosticToken, {
+        channel: "rust-client-sync",
+        step: "rust.sync.terminal_status_event",
+        status: "error",
+        message: getErrorMessage(error, "Unable to sync terminal status event."),
+        details: {
+          eventType: item.eventType,
+          statusAfter: item.statusAfter,
+          statusSeq: item.statusSeq,
+          terminalIndex: item.terminalIndex,
+          workspaceId: item.workspaceId,
+        },
+      });
+    }).finally(() => {
+      if (syncKey) {
+        terminalStatusEventSyncInFlightRef.current.delete(syncKey);
+        if (terminalStatusEventSyncQueueRef.current.has(syncKey)) {
+          scheduleTerminalStatusEventSyncFlush(syncKey, 250);
+        }
+      }
+    });
+  }
+
+  function flushTerminalStatusEventSync(syncKey) {
+    const key = String(syncKey || "").trim();
+    if (!key) {
+      return;
+    }
+    if (terminalStatusEventSyncInFlightRef.current.has(key)) {
+      scheduleTerminalStatusEventSyncFlush(key, 250);
+      return;
+    }
+    const item = terminalStatusEventSyncQueueRef.current.get(key);
+    if (!item) {
+      return;
+    }
+    terminalStatusEventSyncQueueRef.current.delete(key);
+    void sendTerminalStatusEventSync({
+      ...item,
+      coalesced: true,
+    });
+  }
+
+  useEffect(() => () => {
+    terminalStatusEventSyncTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    terminalStatusEventSyncTimersRef.current.clear();
+    terminalStatusEventSyncQueueRef.current.clear();
+    terminalStatusEventSyncInFlightRef.current.clear();
+  }, []);
+
   const emitTerminalStatusEvent = useCallback((event = {}, options = {}) => {
     if (
       authState !== "authenticated"
@@ -9913,49 +10130,48 @@ export default function App() {
     };
 
     const diagnosticToken = authStore.getToken();
-    logTerminalStatus("frontend.terminal_status.event_sync.send", {
+    const statusSyncReason = options.reason || event.source || eventType;
+    const statusSyncKey = terminalKey;
+    const coalesceStatusSync = Boolean(
+      String(statusSyncReason || "").includes("tui-manual-input")
+        || eventType === "message-submitted"
+        || eventType === "agent-output"
+    );
+    const terminalStatusSyncItem = {
       agentId,
-      eventType,
       commandPhase,
+      diagnosticToken,
+      eventType,
       executionPhase,
       paneId,
       readinessAfter,
+      reason: statusSyncReason,
       statusAfter,
       statusSeq,
+      syncKey: statusSyncKey,
       terminalIndex: safeTerminalIndex,
+      terminalPayload,
       threadId,
+      workspacePayload,
       workspaceId,
-    });
-    invoke("cloud_mcp_sync_terminal_status_event", {
-      workspace: workspacePayload,
-      terminal: terminalPayload,
-      reason: options.reason || event.source || eventType,
-    }).catch((error) => {
-      logTerminalStatus("frontend.terminal_status.event_sync.error", {
+    };
+    if (coalesceStatusSync) {
+      terminalStatusEventSyncQueueRef.current.set(statusSyncKey, terminalStatusSyncItem);
+      scheduleTerminalStatusEventSyncFlush(statusSyncKey, eventType === "message-submitted" ? 450 : 700);
+      logTerminalStatus("frontend.terminal_status.event_sync.coalesced", {
         agentId,
         eventType,
-        message: getErrorMessage(error, "Unable to sync terminal status event."),
         paneId,
+        reason: statusSyncReason,
         statusAfter,
         statusSeq,
         terminalIndex: safeTerminalIndex,
         threadId,
         workspaceId,
       });
-      void recordCloudConnectionDiagnostic(diagnosticToken, {
-        channel: "rust-client-sync",
-        step: "rust.sync.terminal_status_event",
-        status: "error",
-        message: getErrorMessage(error, "Unable to sync terminal status event."),
-        details: {
-          eventType,
-          statusAfter,
-          statusSeq,
-          terminalIndex: safeTerminalIndex,
-          workspaceId,
-        },
-      });
-    });
+      return;
+    }
+    void sendTerminalStatusEventSync(terminalStatusSyncItem);
   }, [
     authState,
     defaultWorkingDirectory,
@@ -10158,6 +10374,7 @@ export default function App() {
     }
 
     let disposed = false;
+    let presenceSyncTimer = 0;
 	    const syncPresence = (reason) => {
 	      const syncKey = `${terminalPresenceSyncKey}:${reason}`;
 	      if (reason === "terminal_presence_snapshot" && terminalPresenceSyncKeyRef.current === syncKey) {
@@ -10237,10 +10454,16 @@ export default function App() {
 	        });
 	    };
 
-    syncPresence("terminal_presence_snapshot");
+    presenceSyncTimer = window.setTimeout(() => {
+      presenceSyncTimer = 0;
+      syncPresence("terminal_presence_snapshot");
+    }, 650);
 
     return () => {
       disposed = true;
+      if (presenceSyncTimer) {
+        window.clearTimeout(presenceSyncTimer);
+      }
     };
   }, [
     authState,
@@ -12337,6 +12560,42 @@ export default function App() {
         || expectedMessageCreatedAt
         || "",
     ).trim();
+    const promptAcceptanceLookup = {
+      agentId,
+      expectedUserMessage,
+      promptEventId,
+      promptText: expectedUserMessage,
+      threadId,
+      workspaceId,
+    };
+    const cachedTerminalSubmitAcceptance = getWorkspaceThreadPromptAcceptance(
+      workspaceThreadAcceptedPromptsRef.current,
+      promptAcceptanceLookup,
+    );
+    const terminalSubmitPromptAccepted = event.terminalPromptAccepted === true
+      || (
+        event.source === "terminal-prompt-submitted"
+        && event.promptAccepted === true
+      )
+      || Boolean(cachedTerminalSubmitAcceptance);
+    const expectedUserMessageIsControlPrompt = Boolean(
+      expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
+    );
+    const promptAcceptanceTimeoutApplies = Boolean(
+      pollUntilTurnComplete
+        && expectedUserMessage
+        && !expectedUserMessageIsControlPrompt
+        && (
+          promptEventId
+          || event.type === "message-submitted"
+          || event.source === "terminal-prompt-submitted"
+        )
+    );
+    const transcriptPollTimeoutMs = terminalSubmitPromptAccepted
+      ? WORKSPACE_THREAD_TERMINAL_SUBMIT_TRANSCRIPT_POLL_TIMEOUT_MS
+      : promptAcceptanceTimeoutApplies
+        ? WORKSPACE_THREAD_UNACCEPTED_PROMPT_TRANSCRIPT_POLL_TIMEOUT_MS
+        : WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
 
     if (workspaceThreadIdIsArchived(workspaceThreadsRef.current, workspaceId, threadId)) {
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -12379,6 +12638,7 @@ export default function App() {
       ).trim()
       : "";
     const requestKey = `${workspaceId}:${threadId}:${lookupKey}${turnRequestKey ? `:turn:${turnRequestKey}` : ""}`;
+    const requestAcceptanceKeys = getWorkspaceThreadPromptAcceptanceKeys(promptAcceptanceLookup);
     const existingRequest = workspaceThreadTranscriptRequestsRef.current.get(requestKey);
     if (existingRequest?.inFlight) {
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.duplicate_in_flight", {
@@ -12408,7 +12668,17 @@ export default function App() {
     }
 
     const runRequest = () => {
-      workspaceThreadTranscriptRequestsRef.current.set(requestKey, { inFlight: true, timer: 0 });
+      workspaceThreadTranscriptRequestsRef.current.set(requestKey, {
+        acceptanceKeys: requestAcceptanceKeys,
+        agentId,
+        expectedUserMessage,
+        inFlight: true,
+        promptEventId,
+        terminalPromptAccepted: terminalSubmitPromptAccepted,
+        threadId,
+        timer: 0,
+        workspaceId,
+      });
       const thread = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.start", {
         agentId,
@@ -12490,7 +12760,7 @@ export default function App() {
       if (threadRequiresSessionHydration) {
         const elapsedMs = Date.now() - pollStartedAt;
         const shouldContinuePolling = pollUntilTurnComplete
-          && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+          && elapsedMs < transcriptPollTimeoutMs;
         logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
           agentId,
           elapsedMs,
@@ -12571,7 +12841,7 @@ export default function App() {
       if (!providerSessionId && !canDiscoverProviderSession) {
         const elapsedMs = Date.now() - pollStartedAt;
         const shouldContinuePolling = pollUntilTurnComplete
-          && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+          && elapsedMs < transcriptPollTimeoutMs;
         logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
           agentId,
           elapsedMs,
@@ -12655,13 +12925,28 @@ export default function App() {
           const discoveredByPrompt = !providerSessionId
             && ["prompt", "prompt+cwd", "cwd+timestamp-recovery"].includes(matchedBy)
             && Boolean(sessionId);
-          const promptAccepted = transcriptHasSubmittedPromptEvidence(messages, {
+          const transcriptPromptAccepted = transcriptHasSubmittedPromptEvidence(messages, {
             allowTimestampFallback,
             expectedUserMessage,
             matchedBy,
             messageCreatedAt: expectedMessageCreatedAt,
             submittedAt,
           });
+          const latestTerminalSubmitAcceptance = getWorkspaceThreadPromptAcceptance(
+            workspaceThreadAcceptedPromptsRef.current,
+            {
+              ...promptAcceptanceLookup,
+              sessionId,
+            },
+          );
+          const terminalSubmitPromptAcceptedForResult = terminalSubmitPromptAccepted
+            || Boolean(latestTerminalSubmitAcceptance);
+          const promptAccepted = transcriptPromptAccepted || terminalSubmitPromptAcceptedForResult;
+          const promptAcceptedBy = transcriptPromptAccepted
+            ? "transcript"
+            : terminalSubmitPromptAcceptedForResult
+              ? "terminal-submit"
+              : "";
           const rawTurnCompleteSeen = transcriptHasTurnCompletionForPromptEvidence(messages, {
             agentId,
             allowTimestampFallback,
@@ -12700,7 +12985,7 @@ export default function App() {
             !pollUntilTurnComplete
               || !expectedUserMessage
               || expectedUserMessageIsControlPrompt
-              || promptAccepted
+              || transcriptPromptAccepted
           );
           const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
           const latestTurnAtTranscriptResult = threadAtTranscriptResult?.latestTurn || null;
@@ -12727,13 +13012,13 @@ export default function App() {
           const authoritativeTranscriptCompletionCanSettleTurn = Boolean(
             activeRunningTurnAtTranscriptResult
               && rawTurnCompleteSeen
-              && promptAccepted
+              && transcriptPromptAccepted
               && transcriptTargetsLatestRunningTurn,
           );
           const matchedTranscriptCompletionCanSettleTurn = Boolean(
             (pollUntilTurnComplete || authoritativeTranscriptCompletionCanSettleTurn)
               && activeRunningTurnAtTranscriptResult
-              && promptAccepted
+              && transcriptPromptAccepted
               && transcriptTargetsLatestRunningTurn
               && rawTurnCompleteSeen
           );
@@ -12742,7 +13027,7 @@ export default function App() {
               || (
                 pollUntilTurnComplete
                 && activeRunningTurnAtTranscriptResult
-                && promptAccepted
+                && transcriptPromptAccepted
                 && transcriptTargetsLatestRunningTurn
                 && (
                   terminalLifecycleCanSettleTurn
@@ -12760,7 +13045,7 @@ export default function App() {
                 pollUntilTurnComplete
                 && activeRunningTurnAtTranscriptResult
                 && rawTurnCompleteSeen
-                && promptAccepted
+                && transcriptPromptAccepted
                 && transcriptTargetsLatestRunningTurn
                 && (
                   terminalLifecycleCanSettleTurn
@@ -12771,7 +13056,7 @@ export default function App() {
           const assistantResponseCompletesTurn = Boolean(
             pollUntilTurnComplete
               && settledAssistantResponseSeen
-              && promptAccepted
+              && transcriptPromptAccepted
               && (
                 activeRunningTurnAtTranscriptResult
                   ? transcriptTargetsLatestRunningTurn && terminalLifecycleCanSettleTurn
@@ -12828,11 +13113,14 @@ export default function App() {
             ),
             threadId,
             promptAccepted,
+            promptAcceptedBy,
             rawTurnCompleteSeen,
             settledAssistantResponseSeen,
             sessionTranscriptCanSettleTurn,
             staleTranscriptCompletionBlocked,
+            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
             terminalReadinessCanSettleTurn,
+            transcriptPromptAccepted,
             transcriptExplicitCompletionCanSettleTurn,
             transcriptTargetsLatestRunningTurn,
             transcriptRequestCanSettleTurn,
@@ -12850,6 +13138,7 @@ export default function App() {
             messageCount: messages.length,
             pollUntilTurnComplete,
             promptAccepted,
+            promptAcceptedBy,
             promptEventId,
             rawTurnCompleteSeen,
             requestKey,
@@ -12857,7 +13146,9 @@ export default function App() {
             settledAssistantResponseSeen,
             sessionTranscriptCanSettleTurn,
             staleTranscriptCompletionBlocked,
+            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
             terminalReadinessCanSettleTurn,
+            transcriptPromptAccepted,
             transcriptExplicitCompletionCanSettleTurn,
             terminalGroundTruthStatus: turnCompleteSeen || assistantResponseCompletesTurn ? "idle_or_done" : "processing_or_unknown",
             threadId,
@@ -12886,12 +13177,12 @@ export default function App() {
             });
           }
           const sessionMatchedByProviderId = matchedBy === "sessionid";
-          const promptDiscoveryAccepted = discoveredByPrompt && promptAccepted;
+          const promptDiscoveryAccepted = discoveredByPrompt && transcriptPromptAccepted;
           const voicePlanPromptEventId = String(promptEventId || "").trim();
           if (!sessionMatchedByProviderId && !promptDiscoveryAccepted) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = pollUntilTurnComplete
-              && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+              && elapsedMs < transcriptPollTimeoutMs;
             if (discoveredByPrompt && sessionId) {
               setWorkspaceThreads((threads) => {
                 const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
@@ -12989,7 +13280,7 @@ export default function App() {
             && !trustedVoicePlanTerminalFinish
           ) {
             const elapsedMs = Date.now() - pollStartedAt;
-            const shouldContinuePolling = elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+            const shouldContinuePolling = elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
               agentId,
               elapsedMs,
@@ -13046,7 +13337,7 @@ export default function App() {
           );
           if (expectedPromptAcceptancePending) {
             const elapsedMs = Date.now() - pollStartedAt;
-            const shouldContinuePolling = elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+            const shouldContinuePolling = elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
               agentId,
               elapsedMs,
@@ -13088,21 +13379,34 @@ export default function App() {
             }
             return;
           }
-          if (promptAccepted && promptEventId) {
+          if (promptAccepted && promptEventId && (!terminalSubmitPromptAcceptedForResult || transcriptPromptAccepted)) {
+            rememberWorkspaceThreadPromptAcceptance(workspaceThreadAcceptedPromptsRef.current, {
+              agentId,
+              matchedBy: transcriptPromptAccepted ? matchedBy : "terminal-submit",
+              promptEventId,
+              promptText: expectedUserMessage,
+              sessionId,
+              threadId,
+              workspaceId,
+            });
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_accepted", {
               agentId,
               matchedBy,
+              promptAcceptedBy,
               promptEventId,
               requestKey,
               sessionIdPresent: Boolean(sessionId),
+              terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
               threadId,
+              transcriptPromptAccepted,
               workspaceId,
             });
             window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
               detail: {
                 agentId,
-                matchedBy,
+                matchedBy: transcriptPromptAccepted ? matchedBy : "terminal-submit",
                 promptEventId,
+                promptText: expectedUserMessage,
                 sessionId,
                 threadId,
                 workspaceId,
@@ -13112,7 +13416,7 @@ export default function App() {
           if (!sessionId && messages.length === 0) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = pollUntilTurnComplete
-              && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+              && elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
               agentId,
               elapsedMs,
@@ -13310,15 +13614,17 @@ export default function App() {
                 )
               )
             )
-              && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+              && elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.poll", {
               activeRunningTurnAtTranscriptResult,
               agentId,
               elapsedMs,
               expectedUserMessagePresent: Boolean(expectedUserMessage),
               promptAccepted,
+              promptAcceptedBy,
               requestKey,
               shouldContinuePolling,
+              timeoutMs: transcriptPollTimeoutMs,
               threadId,
               turnCompleteSeen,
               waitingForPromptAcceptance,
@@ -13329,10 +13635,12 @@ export default function App() {
               agentId,
               elapsedMs,
               promptAccepted,
+              promptAcceptedBy,
               promptEventId,
               requestKey,
               shouldContinuePolling,
               settledAssistantResponseSeen,
+              timeoutMs: transcriptPollTimeoutMs,
               terminalGroundTruthStatus: (turnCompleteSeen || assistantResponseCompletesTurn) && (
                 !voicePlanPromptEventId.startsWith("voice-plan-") || promptAccepted
               ) ? "idle_or_done" : "processing_or_unknown",
@@ -13360,7 +13668,7 @@ export default function App() {
           const elapsedMs = Date.now() - pollStartedAt;
           const shouldContinuePolling = !providerSessionId
             && pollUntilTurnComplete
-            && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS;
+            && elapsedMs < transcriptPollTimeoutMs;
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.error", {
             agentId,
             command: transcriptCommand,
@@ -13406,7 +13714,17 @@ export default function App() {
 
     const delayMs = Math.max(0, Number.parseInt(event.delayMs, 10) || 0);
     const timer = window.setTimeout(runRequest, delayMs);
-    workspaceThreadTranscriptRequestsRef.current.set(requestKey, { inFlight: false, timer });
+    workspaceThreadTranscriptRequestsRef.current.set(requestKey, {
+      acceptanceKeys: requestAcceptanceKeys,
+      agentId,
+      expectedUserMessage,
+      inFlight: false,
+      promptEventId,
+      terminalPromptAccepted: terminalSubmitPromptAccepted,
+      threadId,
+      timer,
+      workspaceId,
+    });
     logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.schedule", {
       agentId,
       delayMs,
@@ -14455,6 +14773,7 @@ export default function App() {
         submittedThread,
         submittedAgentId,
       );
+      const submittedThreadId = String(payload.threadId || submittedThread?.id || "").trim();
       const submittedProviderSessionId = String(
         payload.nativeSessionId
           || payload.providerSessionId
@@ -14475,9 +14794,93 @@ export default function App() {
         promptText: getBigViewTextDiagnosticFields(userMessage),
         source: "terminal-prompt-submitted",
         terminalIndex: payload.terminalIndex ?? "",
-        threadId: payload.threadId || "",
+        threadId: submittedThreadId,
         workspaceId,
       });
+      if (submittedThreadId && userMessage) {
+        let acceptedPromptEventId = String(payload.promptEventId || "").trim();
+        const acceptedPromptDetail = {
+          agentId: submittedAgentId,
+          matchedBy: "terminal-submit",
+          promptEventId: acceptedPromptEventId,
+          promptText: userMessage,
+          sessionId: submittedProviderSessionId,
+          threadId: submittedThreadId,
+          workspaceId,
+        };
+        rememberWorkspaceThreadPromptAcceptance(
+          workspaceThreadAcceptedPromptsRef.current,
+          acceptedPromptDetail,
+        );
+        const acceptedPromptKeys = new Set(getWorkspaceThreadPromptAcceptanceKeys(acceptedPromptDetail));
+        workspaceThreadTranscriptRequestsRef.current.forEach((request, requestKey) => {
+          const requestKeys = Array.isArray(request?.acceptanceKeys)
+            ? request.acceptanceKeys
+            : [];
+          const matchesAcceptedPrompt = requestKeys.some((key) => acceptedPromptKeys.has(key));
+          if (!matchesAcceptedPrompt) {
+            return;
+          }
+          if (!acceptedPromptEventId && request?.promptEventId) {
+            acceptedPromptEventId = String(request.promptEventId || "").trim();
+          }
+          if (request?.inFlight) {
+            workspaceThreadTranscriptRequestsRef.current.set(requestKey, {
+              ...request,
+              terminalPromptAccepted: true,
+            });
+            return;
+          }
+          if (request?.timer) {
+            window.clearTimeout(request.timer);
+          }
+          workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
+          logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.accepted_timer_cancelled", {
+            agentId: submittedAgentId,
+            promptEventId: acceptedPromptEventId,
+            requestKey,
+            threadId: submittedThreadId,
+            workspaceId,
+          });
+        });
+        if (acceptedPromptEventId) {
+          setWorkspaceThreads((threads) => clearWorkspaceThreadPendingPrompt(threads, {
+            promptEventId: acceptedPromptEventId,
+            threadId: submittedThreadId,
+            workspaceId,
+          }));
+          rememberWorkspaceThreadPromptAcceptance(
+            workspaceThreadAcceptedPromptsRef.current,
+            {
+              ...acceptedPromptDetail,
+              promptEventId: acceptedPromptEventId,
+            },
+          );
+        }
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.accepted", {
+          agentId: submittedAgentId,
+          instanceId: payload.instanceId || "",
+          matchedBy: "terminal-submit",
+          paneId: payload.paneId || "",
+          promptEventId: acceptedPromptEventId,
+          providerSessionPresent: Boolean(submittedProviderSessionId),
+          threadId: submittedThreadId,
+          workspaceId,
+        });
+        if (acceptedPromptEventId) {
+          window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
+            detail: {
+              agentId: submittedAgentId,
+              matchedBy: "terminal-submit",
+              promptEventId: acceptedPromptEventId,
+              promptText: userMessage,
+              sessionId: submittedProviderSessionId,
+              threadId: submittedThreadId,
+              workspaceId,
+            },
+          }));
+        }
+      }
       requestWorkspaceThreadTranscript({
         allowTimestampFallback: true,
         agentId: submittedAgentId,
@@ -14488,13 +14891,15 @@ export default function App() {
         paneId: payload.paneId || "",
         pollStartedAt: Date.now(),
         pollUntilTurnComplete: true,
+        promptAccepted: true,
         promptEventId: payload.promptEventId || "",
         promptEventSubmittedAt: payload.promptEventSubmittedAt || "",
         providerSessionId: submittedProviderSessionId,
         source: "terminal-prompt-submitted",
         submittedAt: payload.promptEventSubmittedAt || new Date().toISOString(),
         terminalIndex: payload.terminalIndex,
-        threadId: payload.threadId || "",
+        terminalPromptAccepted: true,
+        threadId: submittedThreadId,
         userMessage,
         workspaceId,
       });

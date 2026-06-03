@@ -51,8 +51,9 @@ export const TERMINAL_START_GEOMETRY_POLL_MS = 16;
 export const TERMINAL_DEFAULT_SCROLLBACK_ROWS = 10000;
 export const TERMINAL_WEBGL_IDLE_DELAY_MS = 420;
 export const TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS = 80;
-export const TERMINAL_WEBGL_STAGGER_MS = 90;
-export const TERMINAL_WEBGL_MAX_DELAY_MS = 1200;
+export const TERMINAL_WEBGL_BACKGROUND_DELAY_MS = 650;
+export const TERMINAL_WEBGL_STAGGER_MS = 220;
+export const TERMINAL_WEBGL_MAX_DELAY_MS = 2600;
 export const TERMINAL_BLANK_STARTUP_PROBE_MS = 800;
 export const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 export const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
@@ -70,9 +71,17 @@ export const WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT = "diffforge:work
 export const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
 export const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
 export const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_OUTPUT_BATCH_MAX_MS;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 75;
-export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 2;
+export const TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES = 8 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = 2 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_MIN_BYTES = 1024;
+export const TERMINAL_OUTPUT_FLUSH_SLOW_MS = 64;
+export const TERMINAL_OUTPUT_FLUSH_VERY_SLOW_MS = 128;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = 140;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 420;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = 650;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = 1400;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS = 900;
+export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 1;
 export const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = 1;
 export const TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS = 8;
 export const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
@@ -491,6 +500,8 @@ export const terminalGlobalRenderScheduler = (() => {
   let rafId = 0;
   let timerId = 0;
   let frameId = 0;
+  let interactiveEntryId = "";
+  let interactiveUntil = 0;
 
   const hasWindow = () => typeof window !== "undefined";
 
@@ -510,18 +521,31 @@ export const terminalGlobalRenderScheduler = (() => {
 
   const isEntryActive = (entry) => Boolean(entry.isActive?.());
 
+  const isInteractiveWindow = (now = terminalRenderNow()) => interactiveUntil > now;
+
+  const isEntryInteractive = (entry) => (
+    interactiveEntryId
+    && entry?.id
+    && entry.id === interactiveEntryId
+    && isInteractiveWindow()
+  );
+
   const isEntryDue = (entry, now = terminalRenderNow()) => {
     if (!entry.hasPending?.()) {
       return false;
     }
 
     const age = entryAge(entry, now);
-    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
-      return true;
-    }
-
     if (isEntryActive(entry)) {
       return age >= 0;
+    }
+
+    if (isInteractiveWindow(now)) {
+      return age >= TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS;
+    }
+
+    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      return true;
     }
 
     return age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
@@ -535,13 +559,16 @@ export const terminalGlobalRenderScheduler = (() => {
         return;
       }
 
-      if (isEntryActive(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      if (isEntryActive(entry)) {
         delay = 0;
         return;
       }
 
       const age = entryAge(entry, now);
-      const remaining = Math.max(0, TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS - age);
+      const backgroundMinMs = isInteractiveWindow(now)
+        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
+        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+      const remaining = Math.max(0, backgroundMinMs - age);
       delay = delay == null ? remaining : Math.min(delay, remaining);
     });
 
@@ -580,7 +607,12 @@ export const terminalGlobalRenderScheduler = (() => {
     timerId = window.setTimeout(() => {
       timerId = 0;
       scheduleFrame();
-    }, Math.min(delay, TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS));
+    }, Math.min(
+      delay,
+      isInteractiveWindow()
+        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS,
+    ));
   };
 
   const scheduleNext = () => {
@@ -606,10 +638,19 @@ export const terminalGlobalRenderScheduler = (() => {
       return leftActive ? -1 : 1;
     }
 
+    const leftInteractive = isEntryInteractive(left);
+    const rightInteractive = isEntryInteractive(right);
+    if (leftInteractive !== rightInteractive) {
+      return leftInteractive ? -1 : 1;
+    }
+
     const leftAge = entryAge(left, now);
     const rightAge = entryAge(right, now);
-    const leftOverdue = leftAge >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
-    const rightOverdue = rightAge >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+    const backgroundMaxMs = isInteractiveWindow(now)
+      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+    const leftOverdue = leftAge >= backgroundMaxMs;
+    const rightOverdue = rightAge >= backgroundMaxMs;
     if (leftOverdue !== rightOverdue) {
       return leftOverdue ? -1 : 1;
     }
@@ -631,7 +672,11 @@ export const terminalGlobalRenderScheduler = (() => {
     if (isEntryActive(entry)) {
       return "global_active_frame";
     }
-    if (age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS) {
+    if (age >= (
+      isInteractiveWindow(now)
+        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
+    )) {
       return "global_background_max_latency_frame";
     }
     return "global_background_frame";
@@ -725,8 +770,33 @@ export const terminalGlobalRenderScheduler = (() => {
         scheduleTimer();
       }
     },
+    noteInteractiveInput(id, options = {}) {
+      const entryId = String(id || "").trim();
+      if (!entryId) {
+        return;
+      }
+      const now = terminalRenderNow();
+      const durationMs = Math.max(
+        TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS,
+        Number(options.durationMs || 0),
+      );
+      interactiveEntryId = entryId;
+      interactiveUntil = Math.max(interactiveUntil, now + durationMs);
+      scheduleNext();
+    },
+    isInteractiveInputActive(id = "") {
+      if (!isInteractiveWindow()) {
+        return false;
+      }
+      const entryId = String(id || "").trim();
+      return !entryId || entryId === interactiveEntryId;
+    },
     unregister(id) {
       entries.delete(id);
+      if (interactiveEntryId === id) {
+        interactiveEntryId = "";
+        interactiveUntil = 0;
+      }
       scheduleNext();
     },
   };

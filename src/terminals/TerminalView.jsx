@@ -170,8 +170,12 @@ const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
 const TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT = 80;
 const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
 const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 1100;
+const TERMINAL_BREAKOUT_ACTIVITY_CACHE_FRESH_MS = 900;
+const TERMINAL_BREAKOUT_ACTIVITY_CACHE_LIMIT = 96;
 const terminalBreakoutPlanCache = new Map();
 const terminalBreakoutPlanRequests = new Map();
+const terminalBreakoutActivityCache = new Map();
+const terminalBreakoutActivityRequests = new Map();
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
@@ -3911,6 +3915,94 @@ function cachedTerminalBreakoutPlanSnapshot(cacheKey, { freshOnly = false } = {}
   }
 
   return entry.snapshot;
+}
+
+function trimTerminalBreakoutActivityCache() {
+  while (terminalBreakoutActivityCache.size > TERMINAL_BREAKOUT_ACTIVITY_CACHE_LIMIT) {
+    const oldestKey = terminalBreakoutActivityCache.keys().next().value;
+    if (!oldestKey) {
+      return;
+    }
+    terminalBreakoutActivityCache.delete(oldestKey);
+  }
+}
+
+function createTerminalBreakoutActivityEntry(paneId, snapshot, error = "") {
+  const message = String(error || "");
+  return {
+    error: message,
+    signature: message ? `error:${message}` : JSON.stringify(snapshot || null),
+    snapshot: message ? null : snapshot,
+    updatedAt: Date.now(),
+    paneId,
+  };
+}
+
+function cacheTerminalBreakoutActivityEntry(paneId, entry) {
+  if (!paneId || !entry) {
+    return;
+  }
+
+  terminalBreakoutActivityCache.delete(paneId);
+  terminalBreakoutActivityCache.set(paneId, entry);
+  trimTerminalBreakoutActivityCache();
+}
+
+function cachedTerminalBreakoutActivityEntry(paneId, { freshOnly = false } = {}) {
+  if (!paneId) {
+    return null;
+  }
+
+  const entry = terminalBreakoutActivityCache.get(paneId);
+  if (!entry) {
+    return null;
+  }
+
+  if (
+    freshOnly
+    && Date.now() - Number(entry.updatedAt || 0) > TERMINAL_BREAKOUT_ACTIVITY_CACHE_FRESH_MS
+  ) {
+    return null;
+  }
+
+  return entry;
+}
+
+function requestTerminalBreakoutActivitySnapshot(paneId, { force = false } = {}) {
+  const safePaneId = cleanTerminalBreakoutPlanText(paneId);
+  if (!safePaneId) {
+    return Promise.resolve(createTerminalBreakoutActivityEntry("", null));
+  }
+
+  if (!force) {
+    const freshEntry = cachedTerminalBreakoutActivityEntry(safePaneId, { freshOnly: true });
+    if (freshEntry) {
+      return Promise.resolve(freshEntry);
+    }
+  }
+
+  const existingRequest = terminalBreakoutActivityRequests.get(safePaneId);
+  if (existingRequest) {
+    return existingRequest;
+  }
+
+  const request = invoke("terminal_activity_snapshot", { paneId: safePaneId })
+    .then((snapshot) => {
+      const entry = createTerminalBreakoutActivityEntry(safePaneId, snapshot);
+      cacheTerminalBreakoutActivityEntry(safePaneId, entry);
+      return entry;
+    })
+    .catch((error) => {
+      const entry = createTerminalBreakoutActivityEntry(safePaneId, null, getErrorMessage(error));
+      cacheTerminalBreakoutActivityEntry(safePaneId, entry);
+      return entry;
+    })
+    .finally(() => {
+      terminalBreakoutActivityRequests.delete(safePaneId);
+    });
+
+  terminalBreakoutActivityRequests.set(safePaneId, request);
+  return request;
 }
 
 function normalizeTerminalBreakoutPlanStatus(status) {
@@ -9021,6 +9113,16 @@ function TerminalView({
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+  const terminalParkedPromptListenerStateRef = useRef({
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    workspaceId: terminalWorkspace?.id || "",
+  });
+  terminalParkedPromptListenerStateRef.current = {
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    workspaceId: terminalWorkspace?.id || "",
+  };
   const getTodoQueueItemAccentColor = useCallback((item) => {
     const targetTerminalId = getTodoQueueTargetTerminalId(item);
     const targetThreadId = getTodoQueueTargetThreadId(item);
@@ -9522,6 +9624,10 @@ function TerminalView({
   const terminalBreakoutPlanTargetSignature = useMemo(() => (
     terminalBreakoutPlanTargets.map((target) => target.cacheKey).join("\n")
   ), [terminalBreakoutPlanTargets]);
+  const terminalBreakoutPlanTargetsRef = useRef([]);
+  const terminalBreakoutLayoutActiveRef = useRef(false);
+  terminalBreakoutPlanTargetsRef.current = terminalBreakoutPlanTargets;
+  terminalBreakoutLayoutActiveRef.current = terminalBreakoutLayoutActive;
   const terminalBreakoutLivePlansByIndex = useMemo(() => {
     const plansByIndex = new Map();
     terminalBreakoutPlanTargets.forEach((target) => {
@@ -9569,29 +9675,25 @@ function TerminalView({
     }
 
     const results = await Promise.all(targets.map(async (target) => {
-      try {
-        const snapshot = await invoke("terminal_activity_snapshot", { paneId: target.paneId });
-        return { signature: JSON.stringify(snapshot || null), snapshot, target };
-      } catch (error) {
-        const message = getErrorMessage(error);
-        return {
-          error: message,
-          signature: `error:${message}`,
-          snapshot: null,
-          target,
-        };
-      }
+      const entry = await requestTerminalBreakoutActivitySnapshot(target.paneId);
+      return {
+        error: entry.error || "",
+        signature: entry.signature || "",
+        snapshot: entry.snapshot || null,
+        target,
+        updatedAt: entry.updatedAt || Date.now(),
+      };
     }));
 
     setTerminalBreakoutActivitySnapshots((currentSnapshots) => {
       const nextSnapshots = {};
-      results.forEach(({ error, signature, snapshot, target }) => {
+      results.forEach(({ error, signature, snapshot, target, updatedAt }) => {
         nextSnapshots[target.paneId] = {
           error: error || "",
           signature: signature || "",
           snapshot,
           terminalIndex: target.terminalIndex,
-          updatedAt: Date.now(),
+          updatedAt,
         };
       });
 
@@ -9660,15 +9762,15 @@ function TerminalView({
         includeTree: true,
         pid,
       });
-      const snapshot = await invoke("terminal_activity_snapshot", { paneId });
+      const activityEntry = await requestTerminalBreakoutActivitySnapshot(paneId, { force: true });
       setTerminalBreakoutActivitySnapshots((currentSnapshots) => ({
         ...currentSnapshots,
         [paneId]: {
-          error: "",
-          signature: JSON.stringify(snapshot || null),
-          snapshot,
+          error: activityEntry.error || "",
+          signature: activityEntry.signature || "",
+          snapshot: activityEntry.snapshot || null,
           terminalIndex: currentSnapshots[paneId]?.terminalIndex,
-          updatedAt: Date.now(),
+          updatedAt: activityEntry.updatedAt || Date.now(),
         },
       }));
       setTerminalBreakoutActivityStopState((currentState) => ({
@@ -9746,20 +9848,21 @@ function TerminalView({
   ]);
 
   useEffect(() => {
-    if (!terminalBreakoutLayoutActive || !terminalBreakoutPlanTargets.length) {
-      return undefined;
-    }
-
     let cancelled = false;
     let unlisten = null;
 
     listen(TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT, (event) => {
-      if (cancelled) {
+      if (cancelled || !terminalBreakoutLayoutActiveRef.current) {
         return;
       }
 
       const payload = event?.payload || {};
-      const matchingTargets = terminalBreakoutPlanTargets.filter((target) => (
+      const targets = terminalBreakoutPlanTargetsRef.current || [];
+      if (!targets.length) {
+        return;
+      }
+
+      const matchingTargets = targets.filter((target) => (
         terminalBreakoutPlanEventMatchesTarget(payload, target)
       ));
       if (!matchingTargets.length) {
@@ -9796,11 +9899,7 @@ function TerminalView({
         unlisten();
       }
     };
-  }, [
-    terminalBreakoutLayoutActive,
-    terminalBreakoutPlanTargetSignature,
-    terminalBreakoutPlanTargets,
-  ]);
+  }, []);
   const handleResumeTerminalPlan = useCallback((plan) => {
     const targetSessionId = String(plan?.session_id || plan?.sessionId || "").trim();
     const targetTaskId = String(plan?.task_id || plan?.taskId || "").trim();
@@ -10041,8 +10140,12 @@ function TerminalView({
     let unlisten = null;
 
     const resolvePayloadTerminalIndex = (payload = {}) => {
+      const {
+        getTerminalPaneId: getCurrentTerminalPaneId,
+        logicalTerminalIndexes: currentLogicalTerminalIndexes = [],
+      } = terminalParkedPromptListenerStateRef.current || {};
       const directIndex = Number(payload.terminalIndex ?? payload.terminal_index);
-      if (Number.isInteger(directIndex) && logicalTerminalIndexes.includes(directIndex)) {
+      if (Number.isInteger(directIndex) && currentLogicalTerminalIndexes.includes(directIndex)) {
         return directIndex;
       }
 
@@ -10051,19 +10154,20 @@ function TerminalView({
         return null;
       }
 
-      const matchingIndex = logicalTerminalIndexes.find((terminalIndex) => (
-        getTerminalPaneId(terminalIndex) === payloadPaneId
+      const matchingIndex = currentLogicalTerminalIndexes.find((terminalIndex) => (
+        getCurrentTerminalPaneId?.(terminalIndex) === payloadPaneId
       ));
       return Number.isInteger(matchingIndex) ? matchingIndex : null;
     };
 
     listen(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
+      const currentWorkspaceId = terminalParkedPromptListenerStateRef.current?.workspaceId || "";
       const payload = event?.payload || {};
       const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
       if (
         payloadWorkspaceId
-        && terminalWorkspace?.id
-        && payloadWorkspaceId !== terminalWorkspace.id
+        && currentWorkspaceId
+        && payloadWorkspaceId !== currentWorkspaceId
       ) {
         return;
       }
@@ -10098,7 +10202,7 @@ function TerminalView({
           taskId,
           terminalIndex: targetTerminalIndex,
           threadId: String(payload.threadId || payload.thread_id || ""),
-          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+          workspaceId: payloadWorkspaceId || currentWorkspaceId,
         });
         setTodoQueueDispatchRevision((revision) => revision + 1);
         logTerminalStatus("frontend.todo_queue.resume_lock_set", {
@@ -10107,7 +10211,7 @@ function TerminalView({
           status,
           targetTerminalIndex,
           threadId: payload.threadId || payload.thread_id || "",
-          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+          workspaceId: payloadWorkspaceId || currentWorkspaceId,
         });
         return;
       }
@@ -10125,7 +10229,7 @@ function TerminalView({
           taskId,
           terminalIndex: targetTerminalIndex,
           threadId: String(payload.threadId || payload.thread_id || ""),
-          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+          workspaceId: payloadWorkspaceId || currentWorkspaceId,
         });
         setTodoQueueDispatchRevision((revision) => revision + 1);
         logTerminalStatus("frontend.todo_queue.resume_lock_set", {
@@ -10134,7 +10238,7 @@ function TerminalView({
           status,
           targetTerminalIndex,
           threadId: payload.threadId || payload.thread_id || "",
-          workspaceId: payloadWorkspaceId || terminalWorkspace?.id || "",
+          workspaceId: payloadWorkspaceId || currentWorkspaceId,
         });
         return;
       }
@@ -10149,7 +10253,7 @@ function TerminalView({
           status,
           targetTerminalIndex,
           threadId: currentLock.threadId || "",
-          workspaceId: currentLock.workspaceId || terminalWorkspace?.id || "",
+          workspaceId: currentLock.workspaceId || currentWorkspaceId,
         });
       }
     })
@@ -10168,7 +10272,7 @@ function TerminalView({
         unlisten();
       }
     };
-  }, [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
+  }, []);
 
   const settleTodoQueueInFlightPrompt = useCallback((terminalIndex, inFlightPrompt, reason, fields = {}) => {
     const safeTerminalIndex = Number(terminalIndex);

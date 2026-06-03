@@ -70,6 +70,15 @@ impl TerminalCoordinationContext {
             .to_string()
     }
 
+    fn architecture_graphs_root_path(&self) -> String {
+        Path::new(&self.repo_path)
+            .join(".agents")
+            .join("architectures")
+            .join("graphs")
+            .display()
+            .to_string()
+    }
+
     fn architecture_guide_path(&self) -> String {
         Path::new(&self.repo_path)
             .join(".agents")
@@ -124,6 +133,7 @@ impl TerminalCoordinationContext {
     pub fn env_vars(&self) -> Vec<(String, String)> {
         let cloud_mcp_repo_id = cloud_mcp_repo_id_for_path(&self.repo_path);
         let architecture_root = self.architecture_root_path();
+        let architecture_graphs_root = self.architecture_graphs_root_path();
         let architecture_guide = self.architecture_guide_path();
         let architecture_icon_reference = self.architecture_icon_reference_path();
         let cwd_policy = if self.enforcement_mode == "worktree_required" {
@@ -139,9 +149,9 @@ impl TerminalCoordinationContext {
         let direct_write_policy = if self.enforcement_mode == "bounded_direct_edit" {
             "allowed_for_bounded_direct_edit"
         } else if self.enforcement_mode == "general_worker" {
-            "resolved_by_task_authority"
+            "task_scoped_except_architecture_graph_sources"
         } else if self.enforcement_mode == "worktree_required" {
-            "deny_root_use_agent_branch_root"
+            "deny_root_except_architecture_graph_sources_use_agent_branch_root"
         } else {
             "not_a_file_editing_authority"
         };
@@ -186,6 +196,14 @@ impl TerminalCoordinationContext {
             (
                 "COORDINATION_ARCHITECTURES_ROOT".to_string(),
                 architecture_root,
+            ),
+            (
+                "DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT".to_string(),
+                architecture_graphs_root.clone(),
+            ),
+            (
+                "COORDINATION_ARCHITECTURE_GRAPHS_ROOT".to_string(),
+                architecture_graphs_root,
             ),
             (
                 "DIFFFORGE_ARCHITECTURE_GUIDE".to_string(),

@@ -2075,9 +2075,20 @@ fn diff_forge_path_is_architecture_artifact(candidate_path: &Path) -> bool {
     let Some(repo_root) = diff_forge_nearest_git_root(&candidate_path) else {
         return false;
     };
-    let architecture_root =
-        claude_guard_clean_path(&repo_root.join(".agents").join("architectures"));
-    claude_guard_path_is_inside(&candidate_path, &architecture_root)
+    let graphs_root = claude_guard_clean_path(
+        &repo_root
+            .join(".agents")
+            .join("architectures")
+            .join("graphs"),
+    );
+    if terminal_paths_equal(&candidate_path, &graphs_root) {
+        return true;
+    }
+    claude_guard_path_is_inside(&candidate_path, &graphs_root)
+        && candidate_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("arch"))
 }
 
 fn diff_forge_git_write_route(
