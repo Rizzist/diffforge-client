@@ -612,26 +612,55 @@ fn handle_shared_daemon_connection(
     }
 }
 
-pub fn run_shared_daemon_stdio_proxy(args: Vec<String>) -> Result<(), String> {
-    let context = McpContext::from_args(&args);
-    record_mcp_client_event_async(
-        &context,
-        "mcp_agent_server_started",
-        json!({"transport": "stdio_proxy", "daemon": "shared"}),
-    );
+struct SharedDaemonProxyConnection {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+}
 
-    let daemon_info_path = parse_arg_value(&args, "--daemon-info")
+fn shared_daemon_info_path_for_proxy(
+    args: &[String],
+    context: &McpContext,
+) -> Result<PathBuf, String> {
+    parse_arg_value(args, "--daemon-info")
         .map(PathBuf::from)
         .or_else(|| context.repo_path.as_deref().map(daemon_info_path_for_repo))
-        .ok_or_else(|| "Shared MCP proxy requires --daemon-info or --repo-path.".to_string())?;
-    let daemon_info_text = fs::read_to_string(&daemon_info_path).map_err(|error| {
+        .ok_or_else(|| "Shared MCP proxy requires --daemon-info or --repo-path.".to_string())
+}
+
+fn read_shared_daemon_info(path: &Path) -> Result<Value, String> {
+    let daemon_info_text = fs::read_to_string(path).map_err(|error| {
         format!(
             "Unable to read shared MCP daemon info {}: {error}",
-            daemon_info_path.display()
+            path.display()
         )
     })?;
-    let daemon_info: Value = serde_json::from_str(&daemon_info_text)
-        .map_err(|error| format!("Shared MCP daemon info was not JSON: {error}"))?;
+    serde_json::from_str(&daemon_info_text)
+        .map_err(|error| format!("Shared MCP daemon info was not JSON: {error}"))
+}
+
+fn ensure_shared_daemon_for_proxy_context(context: &McpContext) -> Result<Value, String> {
+    let repo_path = context
+        .repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Shared MCP proxy self-heal requires --repo-path.".to_string())?;
+    if let Some(db_path) = context
+        .db_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        ensure_shared_daemon_for_paths(Path::new(repo_path), Path::new(db_path))
+    } else {
+        ensure_shared_daemon_for_workspace(Path::new(repo_path), None)
+    }
+}
+
+fn connect_shared_daemon_proxy_from_info(
+    context: &McpContext,
+    daemon_info: &Value,
+) -> Result<SharedDaemonProxyConnection, String> {
     let endpoint = daemon_info["endpoint"]
         .as_str()
         .ok_or_else(|| "Shared MCP daemon info has no endpoint.".to_string())?;
@@ -671,6 +700,59 @@ pub fn run_shared_daemon_stdio_proxy(args: Vec<String>) -> Result<(), String> {
             hello_response["error"].as_str().unwrap_or("unknown error")
         ));
     }
+
+    Ok(SharedDaemonProxyConnection {
+        reader: daemon_reader,
+        writer: daemon_writer,
+    })
+}
+
+fn connect_shared_daemon_stdio_proxy(
+    args: &[String],
+    context: &McpContext,
+) -> Result<SharedDaemonProxyConnection, String> {
+    let daemon_info_path = shared_daemon_info_path_for_proxy(args, context)?;
+    let first_attempt = read_shared_daemon_info(&daemon_info_path)
+        .and_then(|info| connect_shared_daemon_proxy_from_info(context, &info));
+    match first_attempt {
+        Ok(connection) => Ok(connection),
+        Err(first_error) => {
+            record_mcp_client_event_async(
+                context,
+                "mcp_shared_daemon_proxy_self_heal",
+                json!({
+                    "daemon_info_path": daemon_info_path.display().to_string(),
+                    "first_error": first_error,
+                }),
+            );
+            let refreshed = ensure_shared_daemon_for_proxy_context(context)?;
+            let refreshed_info_path = refreshed["info_path"]
+                .as_str()
+                .map(PathBuf::from)
+                .unwrap_or(daemon_info_path);
+            let refreshed_info = read_shared_daemon_info(&refreshed_info_path)?;
+            connect_shared_daemon_proxy_from_info(context, &refreshed_info).map_err(|error| {
+                format!(
+                    "Unable to connect to shared MCP daemon after self-heal via {}: {error}",
+                    refreshed_info_path.display()
+                )
+            })
+        }
+    }
+}
+
+pub fn run_shared_daemon_stdio_proxy(args: Vec<String>) -> Result<(), String> {
+    let context = McpContext::from_args(&args);
+    record_mcp_client_event_async(
+        &context,
+        "mcp_agent_server_started",
+        json!({"transport": "stdio_proxy", "daemon": "shared"}),
+    );
+
+    let SharedDaemonProxyConnection {
+        reader: mut daemon_reader,
+        writer: mut daemon_writer,
+    } = connect_shared_daemon_stdio_proxy(&args, &context)?;
 
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
@@ -4420,6 +4502,69 @@ mod tests {
 
         line.clear();
         reader.read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(response["id"].as_u64(), Some(1));
+        assert_eq!(
+            response["response"]["result"]["serverInfo"]["name"].as_str(),
+            Some("diffforge-coordination-kernel")
+        );
+
+        let stopped = stop_shared_daemon_for_repo(&root, "test_cleanup").unwrap();
+        assert_eq!(stopped["status"].as_str(), Some("stopped"));
+        assert!(!info_path.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_daemon_stdio_proxy_self_heals_missing_info_file_and_initializes() {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge_shared_mcp_proxy_self_heal_{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let kernel = CoordinationKernel::init(&root, None).unwrap();
+        let info_path = daemon_info_path_for_repo(&kernel.paths.repo_path);
+        let _ = fs::remove_file(&info_path);
+
+        let args = vec![
+            "--daemon-info".to_string(),
+            info_path.display().to_string(),
+            "--repo-path".to_string(),
+            kernel.paths.repo_path.display().to_string(),
+            "--db-path".to_string(),
+            kernel.paths.db_path.display().to_string(),
+            "--agent-id".to_string(),
+            "agent-test".to_string(),
+            "--session-id".to_string(),
+            "session-test".to_string(),
+        ];
+        let context = McpContext::from_args(&args);
+        let SharedDaemonProxyConnection {
+            reader: mut daemon_reader,
+            writer: mut daemon_writer,
+        } = connect_shared_daemon_stdio_proxy(&args, &context).unwrap();
+
+        assert!(info_path.exists());
+
+        writeln!(
+            daemon_writer,
+            "{}",
+            json!({
+                "id": 1,
+                "request": {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "initialize",
+                    "params": {}
+                }
+            })
+        )
+        .unwrap();
+        daemon_writer.flush().unwrap();
+
+        let mut line = String::new();
+        daemon_reader.read_line(&mut line).unwrap();
         let response: Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(response["id"].as_u64(), Some(1));
         assert_eq!(

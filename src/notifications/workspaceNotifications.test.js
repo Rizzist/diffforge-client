@@ -48,12 +48,30 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
   const approval = reduceThreadLifecycleNotificationEvent(clarification, {
     promptEventId: "prompt-approval",
     promptingUserKind: "approval",
+    promptingUserSource: "provider-permission",
     terminalIsPromptingUser: true,
     threadId: "thread-1",
+    toolUseId: "tool-1",
     type: "terminal-prompt-ready",
     workspaceId: "workspace-1",
   });
 
   assert.equal(approval.cues.length, 1);
   assert.equal(approval.cues[0].kind, "user.input.required");
+
+  const staleTerminalOutput = reduceThreadLifecycleNotificationEvent(approval, {
+    promptEventId: "prompt-output",
+    promptingUserKind: "approval",
+    promptingUserSource: "terminal-output",
+    terminalIsPromptingUser: true,
+    threadId: "thread-2",
+    type: "terminal-output",
+    workspaceId: "workspace-1",
+  });
+
+  assert.equal(staleTerminalOutput.cues.length, 1);
+  assert.equal(
+    staleTerminalOutput.workspaces["workspace-1"].notifications["user-input:workspace-1:thread-2:agent:prompt-output"],
+    undefined,
+  );
 });

@@ -18,6 +18,20 @@ const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
   "terminal-prompt-ready",
   "thread-starting",
 ]);
+const EXPLICIT_PERMISSION_PROMPT_KINDS = new Set(["approval", "permission"]);
+const EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS = [
+  "approval",
+  "claude-hook",
+  "claude-permission",
+  "codex-hook",
+  "codex-permission",
+  "coordination",
+  "permission",
+  "pre-tool-use",
+  "pretooluse",
+  "provider-permission",
+  "tool-permission",
+];
 export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const READINESS_MAX_AGE_MS = 10 * 60 * 1000;
 let readinessVersion = 0;
@@ -81,6 +95,76 @@ function normalizePromptingUserKind(value, fallback = "unknown") {
   ].includes(kind) ? kind : fallback;
 }
 
+function normalizePromptingUserSource(value, fallback = "") {
+  return cleanText(value, fallback)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function promptingPermissionToken(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return cleanText(
+    source.approvalId
+      || source.approval_id
+      || source.permissionPromptId
+      || source.permission_prompt_id
+      || source.permissionRequestId
+      || source.permission_request_id
+      || source.sourceEventId
+      || source.source_event_id
+      || source.toolUseId
+      || source.tool_use_id,
+  );
+}
+
+function promptingSourceLooksExplicitPermission(source) {
+  const normalized = normalizePromptingUserSource(source);
+  return Boolean(
+    normalized
+      && EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
+      && !normalized.includes("terminal-output")
+  );
+}
+
+function valueHasPromptingUserFlag(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return source.terminalIsPromptingUser === true
+    || source.terminal_is_prompting_user === true
+    || source.promptingUser === true
+    || source.prompting_user === true
+    || source.requiresUserInput === true
+    || source.requires_user_input === true;
+}
+
+function valueLooksExplicitPermissionPrompt(value = {}) {
+  const sourceValue = value && typeof value === "object" ? value : {};
+  if (!valueHasPromptingUserFlag(sourceValue)) {
+    return false;
+  }
+
+  const kind = normalizePromptingUserKind(
+    sourceValue.promptingUserKind
+      || sourceValue.prompting_user_kind
+      || sourceValue.promptingKind
+      || sourceValue.prompting_kind,
+    "",
+  );
+  const source = sourceValue.promptingUserSource
+    || sourceValue.prompting_user_source
+    || sourceValue.promptingSource
+    || sourceValue.prompting_source
+    || sourceValue.source
+    || sourceValue.type;
+  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
+    || sourceValue.requiresUserInput === true
+    || sourceValue.requires_user_input === true;
+
+  return Boolean(
+    hasPermissionKind
+      && (promptingPermissionToken(sourceValue) || promptingSourceLooksExplicitPermission(source))
+  );
+}
+
 function emptyPromptingUserSignal() {
   return {
     confidence: "",
@@ -99,6 +183,45 @@ function promptingUserSignal(kind, source, text, confidence = "pattern") {
     source: cleanText(source, "unknown"),
     text: cleanPromptingText(text, 420),
   };
+}
+
+function explicitPermissionPromptingUserSignal(source) {
+  const value = source && typeof source === "object" ? source : {};
+  if (!valueLooksExplicitPermissionPrompt(value)) {
+    return emptyPromptingUserSignal();
+  }
+  const sourceText = value.promptingUserSource
+    || value.prompting_user_source
+    || value.promptingSource
+    || value.prompting_source
+    || value.source
+    || value.type
+    || "";
+  return promptingUserSignal(
+    value.promptingUserKind
+      || value.prompting_user_kind
+      || value.promptingKind
+      || value.prompting_kind
+      || (value.requiresUserInput || value.requires_user_input ? "permission" : "approval"),
+    promptingSourceLooksExplicitPermission(sourceText)
+      ? sourceText
+      : promptingPermissionToken(value)
+        ? "permission-token"
+        : sourceText || "permission",
+    value.promptingUserText
+      || value.prompting_user_text
+      || value.promptingText
+      || value.prompting_text
+      || value.terminalPrompt
+      || value.outputText
+      || value.text
+      || "",
+    value.promptingUserConfidence
+      || value.prompting_user_confidence
+      || value.promptingConfidence
+      || value.prompting_confidence
+      || "explicit-permission",
+  );
 }
 
 export function classifyTerminalUserPrompt(value, source = "text") {
@@ -188,19 +311,12 @@ function latestAssistantMessageText(thread) {
 
 function storedPromptingUserSignal(liveTerminal, providerBinding) {
   const source = [liveTerminal, providerBinding].find((candidate) => (
-    candidate?.terminalIsPromptingUser === true
-      || candidate?.promptingUser === true
-      || candidate?.requiresUserInput === true
+    valueLooksExplicitPermissionPrompt(candidate)
   ));
   if (!source) {
     return emptyPromptingUserSignal();
   }
-  return promptingUserSignal(
-    source.promptingUserKind || source.promptingKind || "unknown",
-    source.promptingUserSource || source.promptingSource || "stored",
-    source.promptingUserText || source.promptingText || "",
-    source.promptingUserConfidence || source.promptingConfidence || "stored",
-  );
+  return explicitPermissionPromptingUserSignal(source);
 }
 
 function parseTimestampMs(value) {
@@ -271,40 +387,40 @@ function pruneReadinessRecords(nowMs = Date.now()) {
 }
 
 export function recordThreadTerminalReadiness(event = {}) {
-  const key = readinessKey(event.workspaceId, event.threadId);
-  const terminalKeys = terminalReadinessKeys(event.workspaceId, event);
+  const sourceEvent = event && typeof event === "object" ? event : {};
+  const key = readinessKey(sourceEvent.workspaceId, sourceEvent.threadId);
+  const terminalKeys = terminalReadinessKeys(sourceEvent.workspaceId, sourceEvent);
   if (!key && !terminalKeys.length) {
     return;
   }
 
   const readyAt = cleanText(
-    event.inputReadyAt
-      || event.promptReadyAt
-      || event.completedAt
+    sourceEvent.inputReadyAt
+      || sourceEvent.promptReadyAt
+      || sourceEvent.completedAt
       || new Date().toISOString(),
   );
+  const promptingUser = explicitPermissionPromptingUserSignal(sourceEvent);
   const record = {
-    agentId: cleanText(event.agentId || event.currentAgent),
+    agentId: cleanText(sourceEvent.agentId || sourceEvent.currentAgent),
     inputReady: true,
     inputReadyAt: readyAt,
-    inputReadyConfidence: cleanText(event.inputReadyConfidence || event.promptReadyConfidence || event.source),
-    instanceId: event.instanceId ?? "",
-    paneId: cleanText(event.paneId),
-    promptReadyAt: cleanText(event.promptReadyAt, readyAt),
-    promptingUserConfidence: cleanText(event.promptingUserConfidence || event.promptingConfidence),
-    promptingUserKind: cleanText(event.promptingUserKind || event.promptingKind),
-    promptingUserSource: cleanText(event.promptingUserSource || event.promptingSource),
-    promptingUserText: cleanPromptingText(event.promptingUserText || event.promptingText, 420),
-    providerSessionId: cleanText(event.providerSessionId || event.nativeSessionId),
-    source: cleanText(event.source || event.type),
-    status: cleanText(event.status, "active"),
-    terminalIsPromptingUser: event.terminalIsPromptingUser === true
-      || event.promptingUser === true
-      || event.requiresUserInput === true,
-    terminalIndex: event.terminalIndex,
-    threadId: cleanText(event.threadId),
-    type: cleanText(event.type),
-    workspaceId: cleanText(event.workspaceId),
+    inputReadyConfidence: cleanText(sourceEvent.inputReadyConfidence || sourceEvent.promptReadyConfidence || sourceEvent.source),
+    instanceId: sourceEvent.instanceId ?? "",
+    paneId: cleanText(sourceEvent.paneId),
+    promptReadyAt: cleanText(sourceEvent.promptReadyAt, readyAt),
+    promptingUserConfidence: promptingUser.isPromptingUser ? promptingUser.confidence : "",
+    promptingUserKind: promptingUser.isPromptingUser ? promptingUser.kind : "",
+    promptingUserSource: promptingUser.isPromptingUser ? promptingUser.source : "",
+    promptingUserText: promptingUser.isPromptingUser ? promptingUser.text : "",
+    providerSessionId: cleanText(sourceEvent.providerSessionId || sourceEvent.nativeSessionId),
+    source: cleanText(sourceEvent.source || sourceEvent.type),
+    status: cleanText(sourceEvent.status, "active"),
+    terminalIsPromptingUser: promptingUser.isPromptingUser,
+    terminalIndex: sourceEvent.terminalIndex,
+    threadId: cleanText(sourceEvent.threadId),
+    type: cleanText(sourceEvent.type),
+    workspaceId: cleanText(sourceEvent.workspaceId),
   };
   pruneReadinessRecords();
   if (key) {
@@ -553,39 +669,12 @@ export function getThreadTerminalGroundTruth({
       || lifecycleEvent?.requiresUserInput === false
       || ["complete", "completed", "running", "processing", "error", "parked"].includes(lifecycleTerminalWorkState),
   );
-  const explicitPrompting = Boolean(
-    lifecycleEvent?.terminalIsPromptingUser === true
-      || lifecycleEvent?.promptingUser === true
-      || lifecycleEvent?.requiresUserInput === true
-      || lifecycleTerminalWorkState === "prompting_user"
-      || lifecycleTerminalWorkState === "prompting-user",
-  );
-  const lifecyclePromptingText = cleanPromptingText(
-    lifecycleEvent?.promptingUserText
-      || lifecycleEvent?.promptingText
-      || lifecycleEvent?.promptText
-      || lifecycleEvent?.terminalPrompt
-      || lifecycleEvent?.terminalText
-      || lifecycleEvent?.outputText
-      || lifecycleEvent?.text
-      || terminalOutputText,
-  );
+  const explicitPrompting = valueLooksExplicitPermissionPrompt(lifecycleEvent || {});
   let promptingUser = emptyPromptingUserSignal();
   if (explicitPrompting) {
-    promptingUser = promptingUserSignal(
-      lifecycleEvent?.promptingUserKind || lifecycleEvent?.promptingKind || "unknown",
-      lifecycleEvent?.promptingUserSource || lifecycleEvent?.source || lifecycleType || "lifecycle",
-      lifecyclePromptingText,
-      lifecycleEvent?.promptingUserConfidence || "explicit",
-    );
+    promptingUser = explicitPermissionPromptingUserSignal(lifecycleEvent);
   } else if (!promptClearedByLifecycle) {
-    promptingUser = classifyTerminalUserPrompt(lifecyclePromptingText, lifecycleEvent?.source || lifecycleType || "terminal-output");
-    if (!promptingUser.isPromptingUser) {
-      promptingUser = storedPromptingUserSignal(liveTerminal, providerBinding);
-    }
-    if (!promptingUser.isPromptingUser && agentInputReady) {
-      promptingUser = classifyTerminalUserPrompt(latestAssistantMessageText(thread), "latest-assistant-message");
-    }
+    promptingUser = storedPromptingUserSignal(liveTerminal, providerBinding);
   }
   const terminalIsPromptingUser = Boolean(
     promptingUser.isPromptingUser
@@ -660,7 +749,12 @@ export function terminalPromptingUserBlocksShutdown(groundTruth = {}) {
   const source = cleanText(groundTruth?.promptingUserSource)
     .toLowerCase()
     .replace(/[_\s]+/g, "-");
-  return source !== "latest-assistant-message";
+  const kind = normalizePromptingUserKind(groundTruth?.promptingUserKind, "");
+  return Boolean(
+    EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
+      && source !== "latest-assistant-message"
+      && !source.includes("terminal-output")
+  );
 }
 
 export function threadLooksEffectivelyThinking(groundTruth = {}) {

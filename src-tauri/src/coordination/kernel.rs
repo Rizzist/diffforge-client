@@ -9040,6 +9040,9 @@ impl CoordinationKernel {
         if !root.exists() {
             return Ok(());
         }
+        if root == self.paths.repo_path.as_path() {
+            crate::ensure_architecture_agent_guide(root)?;
+        }
         let contract = diffforge_agent_contract_markdown();
         let mut generated = Vec::new();
         if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
@@ -24242,6 +24245,14 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 ## Workspace MCP gateway\n\n\
 - Diff Forge also mounts `workspace-mcp-gateway` when workspace MCPs are installed. Call `workspace_mcp__sync_manifest` before using workspace MCP tools after config changes or when tool availability is unclear.\n\
 - Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
+\n\
+## Architecture graphs\n\n\
+- Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, normally `.agents/architectures` in the selected repo.\n\
+- Before creating a generic architecture doc, inspect `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, and existing `.agents/architectures/graphs/*.arch` files.\n\
+- For architecture, diagram, deployment, flow, or subsystem visualization work, create or update `.agents/architectures/graphs/*.arch` using the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
+- The DSL supports `title`, `folder`, `direction`, containers with `{{ ... }}`, node props such as `[icon: api, desc: Request handling]`, and edges such as `A > B: label`, `A -- B: dependency`, and `A <> B: bidirectional`.\n\
+- Name icons with simple aliases. Prefer semantic tokens like `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `auth`, `users`, `external`, and `settings`; use cloud/logo tokens like `aws:s3`, `aws:lambda`, `gcp:cloud-run`, `azure:functions`, `github`, `postgres`, `redis`, `mongodb`, `docker`, `kubernetes`, `stripe`, `supabase`, `cloudflare`, `auth0`, and `cockroachdb` when they fit.\n\
+- If an exact icon is unknown, choose a semantic alias; the renderer will fall back cleanly.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }

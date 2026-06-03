@@ -675,7 +675,7 @@ fn developer_terminal_activity_process_visible(process: &DeveloperProcessInfo) -
     if developer_process_text_is_shell_noise(&text) {
         return false;
     }
-    if developer_process_text_is_agent_root_noise(&text) && process.child_count > 0 {
+    if developer_process_is_agent_root_noise(process) {
         return false;
     }
 
@@ -783,15 +783,50 @@ fn developer_process_text_is_shell_noise(text: &str) -> bool {
         " pwsh",
         " cmd.exe",
         " login ",
+        "/zsh",
+        "/bash",
+        "/sh",
+        "/fish",
+        "-zsh",
+        "-bash",
+        "-sh",
+        "-fish",
     ]
     .iter()
     .any(|needle| format!(" {trimmed} ").contains(needle))
 }
 
 fn developer_process_text_is_agent_root_noise(text: &str) -> bool {
-    ["codex", "claude", "opencode"]
+    [
+        " codex ",
+        "/codex",
+        "\\codex",
+        " claude ",
+        "/claude",
+        "\\claude",
+        " claude-code ",
+        "/claude-code",
+        "\\claude-code",
+        " opencode ",
+        "/opencode",
+        "\\opencode",
+    ]
         .iter()
-        .any(|needle| text.contains(needle))
+        .any(|needle| format!(" {text} ").contains(needle))
+}
+
+fn developer_process_is_agent_root_noise(process: &DeveloperProcessInfo) -> bool {
+    let text = [
+        process.name.as_str(),
+        process.display_name.as_str(),
+        process.group_id.as_str(),
+        process.group_label.as_str(),
+        process.command.as_str(),
+        process.executable.as_str(),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    developer_process_text_is_agent_root_noise(&text)
 }
 
 fn terminal_activity_subagents_from_events(

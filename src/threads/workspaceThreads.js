@@ -41,6 +41,20 @@ const PROMPTING_CLEARING_TERMINAL_EVENT_TYPES = new Set([
   "terminal-prompt-ready",
   "thread-starting",
 ]);
+const EXPLICIT_PERMISSION_PROMPT_KINDS = new Set(["approval", "permission"]);
+const EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS = [
+  "approval",
+  "claude-hook",
+  "claude-permission",
+  "codex-hook",
+  "codex-permission",
+  "coordination",
+  "permission",
+  "pre-tool-use",
+  "pretooluse",
+  "provider-permission",
+  "tool-permission",
+];
 const THREAD_PROJECTION_EVENT_TYPES = new Set([
   "thread.activity",
   "thread.file",
@@ -130,32 +144,141 @@ function normalizePromptingUserKind(value, fallback = "") {
   ].includes(kind) ? kind : "";
 }
 
-function promptingUserFields(value = {}, fallback = {}) {
-  const active = promptingUserActive(
-    value.terminalIsPromptingUser ?? value.promptingUser ?? value.requiresUserInput,
-    fallback.terminalIsPromptingUser || fallback.promptingUser || fallback.requiresUserInput,
+function normalizePromptingUserSource(value, fallback = "") {
+  return cleanText(value, fallback)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function promptingPermissionToken(value = {}, fallback = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  const fallbackSource = fallback && typeof fallback === "object" ? fallback : {};
+  return cleanText(
+    source.approvalId
+      || source.approval_id
+      || source.permissionPromptId
+      || source.permission_prompt_id
+      || source.permissionRequestId
+      || source.permission_request_id
+      || source.sourceEventId
+      || source.source_event_id
+      || source.toolUseId
+      || source.tool_use_id,
+    fallbackSource.approvalId
+      || fallbackSource.approval_id
+      || fallbackSource.permissionPromptId
+      || fallbackSource.permission_prompt_id
+      || fallbackSource.permissionRequestId
+      || fallbackSource.permission_request_id
+      || fallbackSource.sourceEventId
+      || fallbackSource.source_event_id
+      || fallbackSource.toolUseId
+      || fallbackSource.tool_use_id,
   );
+}
+
+function promptingSourceLooksExplicitPermission(source) {
+  const normalized = normalizePromptingUserSource(source);
+  return Boolean(
+    normalized
+      && EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
+      && !normalized.includes("terminal-output")
+  );
+}
+
+function valueLooksExplicitPermissionPrompt(value = {}, fallback = {}) {
+  const sourceValue = value && typeof value === "object" ? value : {};
+  const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
+  const active = promptingUserActive(
+    sourceValue.terminalIsPromptingUser
+      ?? sourceValue.terminal_is_prompting_user
+      ?? sourceValue.promptingUser
+      ?? sourceValue.prompting_user
+      ?? sourceValue.requiresUserInput
+      ?? sourceValue.requires_user_input,
+    fallbackValue.terminalIsPromptingUser
+      || fallbackValue.terminal_is_prompting_user
+      || fallbackValue.promptingUser
+      || fallbackValue.prompting_user
+      || fallbackValue.requiresUserInput
+      || fallbackValue.requires_user_input,
+  );
+  if (!active) {
+    return false;
+  }
+
+  const kind = normalizePromptingUserKind(
+    sourceValue.promptingUserKind
+      || sourceValue.prompting_user_kind
+      || sourceValue.promptingKind
+      || sourceValue.prompting_kind,
+    fallbackValue.promptingUserKind
+      || fallbackValue.prompting_user_kind
+      || fallbackValue.promptingKind
+      || fallbackValue.prompting_kind
+      || "",
+  );
+  const source = sourceValue.promptingUserSource
+    || sourceValue.prompting_user_source
+    || sourceValue.promptingSource
+    || sourceValue.prompting_source
+    || sourceValue.source
+    || sourceValue.type
+    || fallbackValue.promptingUserSource
+    || fallbackValue.prompting_user_source
+    || fallbackValue.promptingSource
+    || fallbackValue.prompting_source;
+  const hasPermissionKind = EXPLICIT_PERMISSION_PROMPT_KINDS.has(kind)
+    || sourceValue.requiresUserInput === true
+    || sourceValue.requires_user_input === true
+    || fallbackValue.requiresUserInput === true
+    || fallbackValue.requires_user_input === true;
+
+  return Boolean(
+    hasPermissionKind
+      && (promptingPermissionToken(sourceValue, fallbackValue) || promptingSourceLooksExplicitPermission(source))
+  );
+}
+
+function promptingUserFields(value = {}, fallback = {}) {
+  const sourceValue = value && typeof value === "object" ? value : {};
+  const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
+  const active = valueLooksExplicitPermissionPrompt(sourceValue, fallbackValue);
+  const sourceText = sourceValue.promptingUserSource
+    || sourceValue.prompting_user_source
+    || sourceValue.promptingSource
+    || sourceValue.prompting_source
+    || sourceValue.source
+    || fallbackValue.promptingUserSource
+    || fallbackValue.prompting_user_source
+    || fallbackValue.promptingSource
+    || fallbackValue.prompting_source;
   return {
     promptingUserConfidence: active
-      ? cleanText(value.promptingUserConfidence || value.promptingConfidence, fallback.promptingUserConfidence || fallback.promptingConfidence)
+      ? cleanText(sourceValue.promptingUserConfidence || sourceValue.promptingConfidence, fallbackValue.promptingUserConfidence || fallbackValue.promptingConfidence)
       : "",
     promptingUserKind: active
-      ? normalizePromptingUserKind(value.promptingUserKind || value.promptingKind, fallback.promptingUserKind || fallback.promptingKind || "unknown")
+      ? normalizePromptingUserKind(sourceValue.promptingUserKind || sourceValue.promptingKind, fallbackValue.promptingUserKind || fallbackValue.promptingKind || "unknown")
       : "",
     promptingUserSource: active
-      ? cleanText(value.promptingUserSource || value.promptingSource || value.source, fallback.promptingUserSource || fallback.promptingSource)
+      ? cleanText(
+        promptingSourceLooksExplicitPermission(sourceText)
+          ? sourceText
+          : promptingPermissionToken(sourceValue, fallbackValue)
+            ? "permission-token"
+            : sourceText,
+        "permission",
+      )
       : "",
     promptingUserText: active
-      ? cleanText(value.promptingUserText || value.promptingText, fallback.promptingUserText || fallback.promptingText).slice(0, 420)
+      ? cleanText(sourceValue.promptingUserText || sourceValue.promptingText, fallbackValue.promptingUserText || fallbackValue.promptingText).slice(0, 420)
       : "",
     terminalIsPromptingUser: active,
   };
 }
 
 function eventExplicitlyPromptsUser(event = {}) {
-  return event?.terminalIsPromptingUser === true
-    || event?.promptingUser === true
-    || event?.requiresUserInput === true;
+  return valueLooksExplicitPermissionPrompt(event);
 }
 
 function promptingUserFieldsForTerminalEvent(event = {}, fallback = {}, options = {}) {

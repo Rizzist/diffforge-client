@@ -17,6 +17,45 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import styled, { keyframes } from "styled-components";
+import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { AllInbox } from "@styled-icons/material-rounded/AllInbox";
+import { Api } from "@styled-icons/material-rounded/Api";
+import { Cached } from "@styled-icons/material-rounded/Cached";
+import { Cloud } from "@styled-icons/material-rounded/Cloud";
+import { Computer } from "@styled-icons/material-rounded/Computer";
+import { Dns } from "@styled-icons/material-rounded/Dns";
+import { Folder } from "@styled-icons/material-rounded/Folder";
+import { Groups } from "@styled-icons/material-rounded/Groups";
+import { Http } from "@styled-icons/material-rounded/Http";
+import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
+import { Hub } from "@styled-icons/material-rounded/Hub";
+import { Lock } from "@styled-icons/material-rounded/Lock";
+import { Memory } from "@styled-icons/material-rounded/Memory";
+import { Person } from "@styled-icons/material-rounded/Person";
+import { Public } from "@styled-icons/material-rounded/Public";
+import { Route } from "@styled-icons/material-rounded/Route";
+import { Schema } from "@styled-icons/material-rounded/Schema";
+import { Security } from "@styled-icons/material-rounded/Security";
+import { Settings } from "@styled-icons/material-rounded/Settings";
+import { Storage } from "@styled-icons/material-rounded/Storage";
+import { Sync } from "@styled-icons/material-rounded/Sync";
+import { Terminal } from "@styled-icons/material-rounded/Terminal";
+import { VpnKey } from "@styled-icons/material-rounded/VpnKey";
+import { Webhook } from "@styled-icons/material-rounded/Webhook";
+import { Work } from "@styled-icons/material-rounded/Work";
+import { Auth0 } from "@styled-icons/simple-icons/Auth0";
+import { Cloudflare } from "@styled-icons/simple-icons/Cloudflare";
+import { Cockroachlabs } from "@styled-icons/simple-icons/Cockroachlabs";
+import { Docker } from "@styled-icons/simple-icons/Docker";
+import { Github } from "@styled-icons/simple-icons/Github";
+import { Githubactions } from "@styled-icons/simple-icons/Githubactions";
+import { Kubernetes } from "@styled-icons/simple-icons/Kubernetes";
+import { Mongodb } from "@styled-icons/simple-icons/Mongodb";
+import { Nginx } from "@styled-icons/simple-icons/Nginx";
+import { Postgresql } from "@styled-icons/simple-icons/Postgresql";
+import { Redis } from "@styled-icons/simple-icons/Redis";
+import { Stripe } from "@styled-icons/simple-icons/Stripe";
+import { Supabase } from "@styled-icons/simple-icons/Supabase";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -201,6 +240,319 @@ const ARCHITECTURE_EDGE_KIND_OPTIONS = [
   { label: "Depends on", value: "depends" },
 ];
 
+const ARCHITECTURE_LIKEC4_ICON_MODULES = import.meta.glob("/node_modules/@likec4/icons/{aws,azure,gcp,tech,bootstrap}/*.js");
+const ARCHITECTURE_LIKEC4_ICON_CACHE = new Map();
+const ARCHITECTURE_STYLED_SIMPLE_ICON_MODULES = import.meta.glob([
+  "/node_modules/@styled-icons/simple-icons/*/*.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Auth0/Auth0.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Cloudflare/Cloudflare.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Cockroachlabs/Cockroachlabs.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Docker/Docker.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Github/Github.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Githubactions/Githubactions.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Kubernetes/Kubernetes.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Mongodb/Mongodb.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Nginx/Nginx.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Postgresql/Postgresql.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Redis/Redis.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Stripe/Stripe.esm.js",
+  "!/node_modules/@styled-icons/simple-icons/Supabase/Supabase.esm.js",
+]);
+const ARCHITECTURE_STYLED_SIMPLE_ICON_CACHE = new Map();
+let architectureStyledSimpleIconIndex = null;
+
+const ARCHITECTURE_ICON_NAMESPACE_ALIASES = {
+  amazon: "aws",
+  "amazon-web-services": "aws",
+  awslabs: "aws",
+  bi: "bootstrap",
+  bs: "bootstrap",
+  "bootstrap-icons": "bootstrap",
+  google: "gcp",
+  "google-cloud": "gcp",
+  gcloud: "gcp",
+  microsoft: "azure",
+  "microsoft-azure": "azure",
+  simple: "styled",
+  "simple-icons": "styled",
+  "styled-icons": "styled",
+  brand: "tech",
+  company: "tech",
+  logo: "tech",
+};
+
+const ARCHITECTURE_STYLED_SIMPLE_ICON_ALIASES = {
+  "adobe-creative-cloud": "adobecreativecloud",
+  "adobe-photoshop": "adobephotoshop",
+  amazon: "amazon",
+  "amazon-web-services": "amazonaws",
+  amazonaws: "amazonaws",
+  aws: "amazonaws",
+  "aws-dynamodb": "amazondynamodb",
+  "aws-s3": "amazons3",
+  "c-plus-plus": "cplusplus",
+  "c-sharp": "csharp",
+  cockroach: "cockroachlabs",
+  "cockroach-db": "cockroachlabs",
+  cockroachdb: "cockroachlabs",
+  "cockroach-labs": "cockroachlabs",
+  cockraoch: "cockroachlabs",
+  "cockraoch-db": "cockroachlabs",
+  cockraochdb: "cockroachlabs",
+  cockraochlabs: "cockroachlabs",
+  "dot-net": "dotnet",
+  dynamodb: "amazondynamodb",
+  node: "nodedotjs",
+  "node-dot-js": "nodedotjs",
+  "node-js": "nodedotjs",
+  nodejs: "nodedotjs",
+  nuxt: "nuxtdotjs",
+  "nuxt-js": "nuxtdotjs",
+  nuxtjs: "nuxtdotjs",
+  react: "reactlogo",
+  "react-js": "reactlogo",
+  s3: "amazons3",
+  vue: "vuedotjs",
+  "vue-js": "vuedotjs",
+  vuejs: "vuedotjs",
+};
+
+const ARCHITECTURE_ICON_ALIASES = {
+  "aws:api": "aws:api-gateway",
+  "aws:apigateway": "aws:api-gateway",
+  "aws:api-gateway": "aws:api-gateway",
+  "aws:cloudfront": "aws:cloud-front",
+  "aws:cloudwatch": "aws:cloud-watch",
+  "aws:dynamodb": "aws:dynamo-db",
+  "aws:ebs": "aws:elastic-block-store",
+  "aws:ec2": "aws:ec2",
+  "aws:ecr": "aws:elastic-container-registry",
+  "aws:ecs": "aws:elastic-container-service",
+  "aws:eks": "aws:elastic-kubernetes-service",
+  "aws:elasticache": "aws:elasti-cache",
+  "aws:elb": "aws:elastic-load-balancing",
+  "aws:eventbridge": "aws:event-bridge",
+  "aws:iam": "aws:identity-and-access-management",
+  "aws:kms": "aws:key-management-service",
+  "aws:opensearch": "aws:open-search-service",
+  "aws:route53": "aws:route-53",
+  "aws:s3": "aws:simple-storage-service",
+  "aws:secrets": "aws:secrets-manager",
+  "aws:secret-manager": "aws:secrets-manager",
+  "aws:sns": "aws:simple-notification-service",
+  "aws:sqs": "aws:simple-queue-service",
+  "aws:vpc": "aws:virtual-private-cloud",
+  "api-gateway": "generic:api",
+  "aws-api-gateway": "aws:api-gateway",
+  "aws-cloudfront": "aws:cloud-front",
+  "aws-cloudwatch": "aws:cloud-watch",
+  "aws-dynamodb": "aws:dynamo-db",
+  "aws-ec2": "aws:ec2",
+  "aws-ecr": "aws:elastic-container-registry",
+  "aws-ecs": "aws:elastic-container-service",
+  "aws-eks": "aws:elastic-kubernetes-service",
+  "aws-elasticache": "aws:elasti-cache",
+  "aws-elb": "aws:elastic-load-balancing",
+  "aws-eventbridge": "aws:event-bridge",
+  "aws-iam": "aws:identity-and-access-management",
+  "aws-kms": "aws:key-management-service",
+  "aws-lambda": "aws:lambda",
+  "aws-opensearch": "aws:open-search-service",
+  "aws-rds": "aws:rds",
+  "aws-route53": "aws:route-53",
+  "aws-s3": "aws:simple-storage-service",
+  "aws-secrets": "aws:secrets-manager",
+  "aws-sns": "aws:simple-notification-service",
+  "aws-sqs": "aws:simple-queue-service",
+  "aws-vpc": "aws:virtual-private-cloud",
+  bucket: "aws:simple-storage-service",
+  buckets: "aws:simple-storage-service",
+  cloudfront: "aws:cloud-front",
+  cloudwatch: "aws:cloud-watch",
+  dynamodb: "aws:dynamo-db",
+  ec2: "aws:ec2",
+  ecr: "aws:elastic-container-registry",
+  ecs: "aws:elastic-container-service",
+  eks: "aws:elastic-kubernetes-service",
+  elasticache: "aws:elasti-cache",
+  elb: "aws:elastic-load-balancing",
+  eventbridge: "aws:event-bridge",
+  iam: "aws:identity-and-access-management",
+  kinesis: "aws:kinesis",
+  kms: "aws:key-management-service",
+  lambda: "aws:lambda",
+  opensearch: "aws:open-search-service",
+  rds: "aws:rds",
+  route53: "aws:route-53",
+  s3: "aws:simple-storage-service",
+  sns: "aws:simple-notification-service",
+  sqs: "aws:simple-queue-service",
+  vpc: "aws:virtual-private-cloud",
+  "gcp:gcs": "gcp:cloud-storage",
+  "gcp:pubsub": "gcp:pub-sub",
+  "gcp:sql": "gcp:cloud-sql",
+  "google-cloud-run": "gcp:cloud-run",
+  "google-cloud-storage": "gcp:cloud-storage",
+  bigquery: "gcp:big-query",
+  "big-query": "gcp:big-query",
+  "cloud-run": "gcp:cloud-run",
+  "cloud-sql": "gcp:cloud-sql",
+  "cloud-storage": "gcp:cloud-storage",
+  gcs: "gcp:cloud-storage",
+  gke: "gcp:google-kubernetes-engine",
+  pubsub: "gcp:pub-sub",
+  "pub-sub": "gcp:pub-sub",
+  "azure:aks": "azure:kubernetes-services",
+  "azure:blob": "azure:storage-accounts",
+  "azure:blob-storage": "azure:storage-accounts",
+  "azure:cosmosdb": "azure:azure-cosmos-db",
+  "azure:function": "azure:function-apps",
+  "azure:functions": "azure:function-apps",
+  "azure:postgres": "azure:azure-database-postgre-sql-server",
+  "azure:postgresql": "azure:azure-database-postgre-sql-server",
+  "azure:redis": "azure:azure-managed-redis",
+  "azure:service-bus": "azure:azure-service-bus",
+  "azure:sql": "azure:azure-sql",
+  "azure:storage": "azure:storage-accounts",
+  aks: "azure:kubernetes-services",
+  "azure-blob-storage": "azure:storage-accounts",
+  "azure-cosmos": "azure:azure-cosmos-db",
+  "azure-cosmosdb": "azure:azure-cosmos-db",
+  "azure-functions": "azure:function-apps",
+  "blob-storage": "azure:storage-accounts",
+  cosmos: "azure:azure-cosmos-db",
+  cosmosdb: "azure:azure-cosmos-db",
+  cockroach: "styled:cockroachlabs",
+  "cockroach-db": "styled:cockroachlabs",
+  cockroachdb: "styled:cockroachlabs",
+  cockroachlabs: "styled:cockroachlabs",
+  "cockroach-labs": "styled:cockroachlabs",
+  cockraoch: "styled:cockroachlabs",
+  "cockraoch-db": "styled:cockroachlabs",
+  cockraochdb: "styled:cockroachlabs",
+  cockraochlabs: "styled:cockroachlabs",
+  postgres: "tech:postgresql",
+  pg: "tech:postgresql",
+  mongo: "tech:mongodb-icon",
+  mongodb: "tech:mongodb-icon",
+  "mongo-db": "tech:mongodb-icon",
+  github: "tech:github-icon",
+  gh: "tech:github-icon",
+  "github-actions": "tech:github-actions",
+  cloudflare: "tech:cloudflare-icon",
+  "cloudflare-workers": "tech:cloudflare-workers-icon",
+  docker: "tech:docker-icon",
+  supabase: "tech:supabase-icon",
+  auth0: "tech:auth0-icon",
+  node: "tech:nodejs-icon",
+  nodejs: "tech:nodejs-icon",
+  "node-js": "tech:nodejs-icon",
+  next: "tech:nextjs-icon",
+  "next-js": "tech:nextjs-icon",
+  nextjs: "tech:nextjs-icon",
+  typescript: "tech:typescript-icon",
+  ts: "tech:typescript-icon",
+  vue: "styled:vuedotjs",
+  "vue-js": "styled:vuedotjs",
+  vuejs: "styled:vuedotjs",
+  openai: "tech:openai-icon",
+  anthropic: "tech:anthropic-icon",
+  ai: "generic:ai",
+  api: "generic:api",
+  auth: "generic:auth",
+  authentication: "generic:auth",
+  authorization: "generic:auth",
+  browser: "generic:client",
+  box: "generic:group",
+  boxes: "generic:group",
+  cache: "generic:cache",
+  cli: "generic:terminal",
+  client: "generic:client",
+  compute: "generic:compute",
+  database: "generic:database",
+  datastore: "generic:database",
+  db: "generic:database",
+  "external-service": "generic:external",
+  config: "generic:file",
+  document: "generic:file",
+  file: "generic:file",
+  flow: "generic:flow",
+  folder: "generic:folder",
+  gateway: "generic:api",
+  group: "generic:group",
+  users: "generic:users",
+  monitor: "generic:client",
+  persistence: "generic:database",
+  queue: "generic:queue",
+  router: "generic:router",
+  server: "generic:server",
+  service: "generic:service",
+  settings: "generic:settings",
+  storage: "generic:storage",
+  subscription: "generic:subscription",
+  terminal: "generic:terminal",
+  worker: "generic:worker",
+};
+
+const ARCHITECTURE_STYLED_ICON_COMPONENTS = {
+  ai: Memory,
+  api: Api,
+  auth: VpnKey,
+  cache: Cached,
+  client: Computer,
+  cloud: Cloud,
+  cockroachlabs: Cockroachlabs,
+  compute: Memory,
+  database: Storage,
+  db: Storage,
+  docker: Docker,
+  dns: Dns,
+  external: Public,
+  file: InsertDriveFile,
+  flow: AccountTree,
+  folder: Folder,
+  github: Github,
+  "github-actions": Githubactions,
+  group: Hub,
+  http: Http,
+  kubernetes: Kubernetes,
+  lock: Lock,
+  mongodb: Mongodb,
+  nginx: Nginx,
+  postgres: Postgresql,
+  postgresql: Postgresql,
+  queue: AllInbox,
+  redis: Redis,
+  router: Route,
+  security: Security,
+  server: Dns,
+  service: Work,
+  settings: Settings,
+  storage: Storage,
+  stripe: Stripe,
+  subscription: Sync,
+  supabase: Supabase,
+  terminal: Terminal,
+  users: Groups,
+  user: Person,
+  webhook: Webhook,
+  worker: Settings,
+  auth0: Auth0,
+  cloudflare: Cloudflare,
+  schema: Schema,
+};
+
+const ARCHITECTURE_KIND_ICON_FALLBACKS = {
+  api: "generic:api",
+  client: "generic:client",
+  database: "generic:database",
+  external: "generic:external",
+  group: "generic:group",
+  queue: "generic:queue",
+  service: "generic:service",
+  worker: "generic:worker",
+};
+
 const architectureNodeTypes = {
   architectureGroup: ArchitectureCanvasGroup,
   architectureNode: ArchitectureCanvasNode,
@@ -219,6 +571,342 @@ function architectureSlug(value, fallback = "architecture") {
   return slug || fallback;
 }
 
+function architectureIconSlug(value, fallback = "") {
+  const raw = text(value).toLowerCase();
+  const slug = raw
+    .replace(/&/gu, " and ")
+    .replace(/\+/gu, " plus ")
+    .replace(/([a-z])([0-9])/gu, "$1-$2")
+    .replace(/([0-9])([a-z])/gu, "$1-$2")
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "");
+  return slug || fallback;
+}
+
+function architectureIconNamespace(value) {
+  const normalized = architectureIconSlug(value);
+  return ARCHITECTURE_ICON_NAMESPACE_ALIASES[normalized] || normalized;
+}
+
+function architectureIconParts(value) {
+  const raw = text(value).toLowerCase();
+  const namespaceMatch = raw.match(/^([a-z0-9][a-z0-9\s_-]*)\s*[:/]\s*(.+)$/u);
+  if (namespaceMatch) {
+    const namespace = architectureIconNamespace(namespaceMatch[1]);
+    const slug = architectureIconSlug(namespaceMatch[2]);
+    return {
+      key: namespace && slug ? `${namespace}:${slug}` : slug,
+      namespace,
+      slug,
+    };
+  }
+  const slug = architectureIconSlug(raw);
+  return {
+    key: slug,
+    namespace: "",
+    slug,
+  };
+}
+
+function architectureLikeC4IconPath(collection, slug) {
+  return `/node_modules/@likec4/icons/${collection}/${slug}.js`;
+}
+
+function architectureAddLikeC4Candidate(candidates, collection, value) {
+  const slug = architectureIconSlug(value);
+  if (!collection || !slug) return;
+  const path = architectureLikeC4IconPath(collection, slug);
+  if (!ARCHITECTURE_LIKEC4_ICON_MODULES[path]) return;
+  if (candidates.some((candidate) => candidate.path === path)) return;
+  candidates.push({
+    collection,
+    path,
+    slug,
+  });
+}
+
+function architectureStyledSimpleIconFolder(path) {
+  return text(path.match(/\/simple-icons\/([^/]+)\//u)?.[1]);
+}
+
+function architectureStyledSimpleIconIndexes() {
+  if (architectureStyledSimpleIconIndex) return architectureStyledSimpleIconIndex;
+  const byCompact = new Map();
+  const bySlug = new Map();
+  Object.keys(ARCHITECTURE_STYLED_SIMPLE_ICON_MODULES).forEach((path) => {
+    const folder = architectureStyledSimpleIconFolder(path);
+    const slug = architectureIconSlug(folder);
+    const compact = slug.replace(/-/gu, "");
+    if (slug && !bySlug.has(slug)) bySlug.set(slug, path);
+    if (compact && !byCompact.has(compact)) byCompact.set(compact, path);
+  });
+  architectureStyledSimpleIconIndex = { byCompact, bySlug };
+  return architectureStyledSimpleIconIndex;
+}
+
+function architectureStyledSimpleIconPath(value) {
+  const slug = architectureIconSlug(value);
+  if (!slug) return "";
+  const compact = slug.replace(/-/gu, "");
+  const alias = ARCHITECTURE_STYLED_SIMPLE_ICON_ALIASES[slug]
+    || ARCHITECTURE_STYLED_SIMPLE_ICON_ALIASES[compact]
+    || "";
+  const aliasSlug = architectureIconSlug(alias);
+  const aliasCompact = aliasSlug.replace(/-/gu, "");
+  const indexes = architectureStyledSimpleIconIndexes();
+  return indexes.bySlug.get(aliasSlug)
+    || indexes.byCompact.get(aliasCompact)
+    || indexes.bySlug.get(slug)
+    || indexes.byCompact.get(compact)
+    || "";
+}
+
+function architectureAddStyledSimpleCandidate(candidates, value) {
+  const path = architectureStyledSimpleIconPath(value);
+  if (!path) return;
+  const folder = architectureStyledSimpleIconFolder(path);
+  if (!folder) return;
+  if (candidates.some((candidate) => candidate.path === path)) return;
+  candidates.push({
+    folder,
+    path,
+    slug: architectureIconSlug(folder),
+  });
+}
+
+function architectureIconAliasTarget(parts) {
+  if (!parts?.slug) return "";
+  if (parts.key && ARCHITECTURE_ICON_ALIASES[parts.key]) {
+    return ARCHITECTURE_ICON_ALIASES[parts.key];
+  }
+  return ARCHITECTURE_ICON_ALIASES[parts.slug] || "";
+}
+
+function architectureAddIconToken(state, value, depth = 0) {
+  if (!state || depth > 5) return;
+  const parts = architectureIconParts(value);
+  if (!parts.slug) return;
+  const tokenKey = parts.key || parts.slug;
+  if (state.seenTokens.has(tokenKey)) return;
+  state.seenTokens.add(tokenKey);
+
+  const aliasTarget = architectureIconAliasTarget(parts);
+  if (aliasTarget) {
+    architectureAddIconToken(state, aliasTarget, depth + 1);
+  }
+
+  if (parts.namespace === "styled") {
+    architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+    if (!state.styledKey) state.styledKey = parts.slug;
+    return;
+  }
+
+  if (parts.namespace === "generic") {
+    if (!state.styledKey) state.styledKey = parts.slug;
+    return;
+  }
+
+  if (parts.namespace === "aws") {
+    architectureAddLikeC4Candidate(state.candidates, "aws", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `aws-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `aws-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "gcp") {
+    architectureAddLikeC4Candidate(state.candidates, "gcp", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `google-cloud-${parts.slug}`);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `gcp-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `google-cloud-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "azure") {
+    architectureAddLikeC4Candidate(state.candidates, "azure", parts.slug);
+    architectureAddLikeC4Candidate(state.candidates, "tech", `azure-${parts.slug}`);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, `azure-${parts.slug}`);
+    return;
+  }
+
+  if (parts.namespace === "tech") {
+    architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+    architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+    return;
+  }
+
+  if (parts.namespace === "bootstrap") {
+    architectureAddLikeC4Candidate(state.candidates, "bootstrap", parts.slug);
+    return;
+  }
+
+  if (parts.slug.startsWith("aws-")) {
+    const awsSlug = parts.slug.replace(/^aws-/u, "");
+    architectureAddIconToken(state, `aws:${awsSlug}`, depth + 1);
+    architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+  } else if (parts.slug.startsWith("google-cloud-")) {
+    const gcpSlug = parts.slug.replace(/^google-cloud-/u, "");
+    architectureAddIconToken(state, `gcp:${gcpSlug}`, depth + 1);
+    architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+  } else if (parts.slug.startsWith("gcp-")) {
+    architectureAddIconToken(state, `gcp:${parts.slug.replace(/^gcp-/u, "")}`, depth + 1);
+  } else if (parts.slug.startsWith("azure-")) {
+    const azureSlug = parts.slug.replace(/^azure-/u, "");
+    architectureAddIconToken(state, `azure:${azureSlug}`, depth + 1);
+    architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+  }
+
+  if (!parts.slug.endsWith("-icon")) {
+    architectureAddLikeC4Candidate(state.candidates, "tech", `${parts.slug}-icon`);
+  }
+  architectureAddLikeC4Candidate(state.candidates, "tech", parts.slug);
+  architectureAddStyledSimpleCandidate(state.styledCandidates, parts.slug);
+  if (!state.styledKey && ARCHITECTURE_STYLED_ICON_COMPONENTS[parts.slug]) {
+    state.styledKey = parts.slug;
+  }
+}
+
+function architectureIconInitials(value, fallback = "IC") {
+  const raw = text(value, fallback);
+  return raw
+    .split(/[^a-z0-9]+/iu)
+    .filter(Boolean)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase() || fallback;
+}
+
+function architectureResolveIconDescriptor(icon, kind = "service") {
+  const state = {
+    candidates: [],
+    seenTokens: new Set(),
+    styledCandidates: [],
+    styledKey: "",
+  };
+  const rawIcon = text(icon);
+  const rawKind = text(kind, "service");
+  architectureAddIconToken(state, rawIcon || rawKind);
+  const kindFallback = ARCHITECTURE_KIND_ICON_FALLBACKS[architectureIconSlug(rawKind)];
+  if (kindFallback) architectureAddIconToken(state, kindFallback);
+  if (!state.styledKey) {
+    const styledFallback = architectureIconSlug(rawKind);
+    if (ARCHITECTURE_STYLED_ICON_COMPONENTS[styledFallback]) {
+      state.styledKey = styledFallback;
+    }
+  }
+  const displayName = rawIcon || rawKind;
+  return {
+    candidates: state.candidates,
+    key: [
+      rawIcon,
+      rawKind,
+      state.styledKey,
+      ...state.candidates.map((candidate) => candidate.path),
+      ...state.styledCandidates.map((candidate) => candidate.path),
+    ].join("|"),
+    label: architectureIconInitials(displayName),
+    sourceLabel: displayName,
+    styledCandidates: state.styledCandidates,
+    styledKey: state.styledKey,
+  };
+}
+
+function architectureIconFallbackState(descriptor) {
+  const Icon = ARCHITECTURE_STYLED_ICON_COMPONENTS[descriptor.styledKey] || null;
+  return {
+    Icon,
+    label: descriptor.label,
+    source: Icon ? "styled" : "label",
+    title: descriptor.sourceLabel,
+  };
+}
+
+function architectureLoadLikeC4Icon(candidates) {
+  const key = candidates.map((candidate) => candidate.path).join("|");
+  if (!key) return Promise.resolve(null);
+  if (ARCHITECTURE_LIKEC4_ICON_CACHE.has(key)) {
+    return ARCHITECTURE_LIKEC4_ICON_CACHE.get(key);
+  }
+  const promise = (async () => {
+    for (const candidate of candidates) {
+      const load = ARCHITECTURE_LIKEC4_ICON_MODULES[candidate.path];
+      if (!load) continue;
+      try {
+        const iconModule = await load();
+        if (iconModule?.default) {
+          return {
+            Icon: iconModule.default,
+            title: `${candidate.collection}:${candidate.slug}`,
+          };
+        }
+      } catch {
+        // Try the next candidate; bad package entries should not break graph rendering.
+      }
+    }
+    return null;
+  })();
+  ARCHITECTURE_LIKEC4_ICON_CACHE.set(key, promise);
+  return promise;
+}
+
+function architectureLoadStyledSimpleIcon(candidates) {
+  const key = candidates.map((candidate) => candidate.path).join("|");
+  if (!key) return Promise.resolve(null);
+  if (ARCHITECTURE_STYLED_SIMPLE_ICON_CACHE.has(key)) {
+    return ARCHITECTURE_STYLED_SIMPLE_ICON_CACHE.get(key);
+  }
+  const promise = (async () => {
+    for (const candidate of candidates) {
+      const load = ARCHITECTURE_STYLED_SIMPLE_ICON_MODULES[candidate.path];
+      if (!load) continue;
+      try {
+        const iconModule = await load();
+        const Icon = iconModule?.[candidate.folder];
+        if (Icon) {
+          return {
+            Icon,
+            title: `styled:${candidate.slug}`,
+          };
+        }
+      } catch {
+        // Try the next candidate; missing brand fallbacks should not break rendering.
+      }
+    }
+    return null;
+  })();
+  ARCHITECTURE_STYLED_SIMPLE_ICON_CACHE.set(key, promise);
+  return promise;
+}
+
+function useArchitectureIcon(icon, kind = "service") {
+  const descriptor = useMemo(() => architectureResolveIconDescriptor(icon, kind), [icon, kind]);
+  const [state, setState] = useState(() => architectureIconFallbackState(descriptor));
+
+  useEffect(() => {
+    let cancelled = false;
+    setState(architectureIconFallbackState(descriptor));
+    Promise.resolve()
+      .then(async () => (
+        await architectureLoadLikeC4Icon(descriptor.candidates)
+        || await architectureLoadStyledSimpleIcon(descriptor.styledCandidates)
+      ))
+      .then((loaded) => {
+      if (cancelled || !loaded?.Icon) return;
+      setState({
+        Icon: loaded.Icon,
+        label: descriptor.label,
+        source: loaded.title?.startsWith("styled:") ? "styled" : "likec4",
+        title: loaded.title,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [descriptor]);
+
+  return state;
+}
+
 function architectureEntityId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -234,81 +922,507 @@ function architectureGroupPathLabel(value) {
   return parts.length ? parts.join(" / ") : "General";
 }
 
-function architectureStarterGraph({ groupPath = "", kind = "deployment", title = "" } = {}) {
-  const cleanTitle = text(title, `${architectureKindLabel(kind)} Architecture`);
-  const createdAt = String(Date.now());
-  const id = `${architectureSlug(cleanTitle)}-${createdAt.slice(-5)}`;
+function architectureFolderPathParts(value) {
+  return jsonArray(value)
+    .map((item) => text(item))
+    .filter(Boolean);
+}
+
+function architectureFolderPathText(value) {
+  return architectureFolderPathParts(value).join(" / ");
+}
+
+function createArchitectureTreeNode(name = "", path = []) {
+  return {
+    folders: new Map(),
+    graphs: [],
+    name,
+    path,
+  };
+}
+
+function architectureGraphTreeRows(graphs, startDepth = 0) {
+  const root = createArchitectureTreeNode();
+  jsonArray(graphs).forEach((graph) => {
+    const parts = architectureFolderPathParts(graph.groupPath);
+    let node = root;
+    parts.forEach((part) => {
+      const key = part.toLowerCase();
+      if (!node.folders.has(key)) {
+        node.folders.set(key, createArchitectureTreeNode(part, [...node.path, part]));
+      }
+      node = node.folders.get(key);
+    });
+    node.graphs.push(graph);
+  });
+
+  const rows = [];
+  const sortGraphs = (items) => [...items].sort((left, right) => (
+    text(left.title).localeCompare(text(right.title))
+  ));
+  const flatten = (node, depth) => {
+    sortGraphs(node.graphs).forEach((graph) => {
+      rows.push({
+        depth,
+        graph,
+        id: graph.id,
+        kind: "graph",
+      });
+    });
+    [...node.folders.values()]
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .forEach((folder) => {
+        rows.push({
+          depth,
+          id: folder.path.join("/"),
+          kind: "folder",
+          name: folder.name,
+          path: folder.path,
+        });
+        flatten(folder, depth + 1);
+      });
+  };
+
+  flatten(root, startDepth);
+  return rows;
+}
+
+function architectureCloudMcpNoiseError(value) {
+  const raw = text(value).toLowerCase();
+  return raw.includes("cloud mcp app websocket request timed out")
+    || raw.includes("cloud mcp websocket request timed out");
+}
+
+function architectureEscapeDsl(value) {
+  return text(value).replace(/\\/gu, "\\\\").replace(/"/gu, "\\\"");
+}
+
+function architectureDslString(value) {
+  return `"${architectureEscapeDsl(value)}"`;
+}
+
+function architectureDslName(value) {
+  const raw = text(value, "Node");
+  if (/^[A-Za-z0-9][A-Za-z0-9 _./-]*$/u.test(raw) && !/[{}[\],:<>]/u.test(raw)) {
+    return raw;
+  }
+  return architectureDslString(raw);
+}
+
+function architectureStripDslComments(line) {
+  let inQuote = false;
+  let previous = "";
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === "\"" && previous !== "\\") inQuote = !inQuote;
+    if (!inQuote && char === "/" && next === "/") return line.slice(0, index).trim();
+    if (!inQuote && char === "#") return line.slice(0, index).trim();
+    previous = char;
+  }
+  return line.trim();
+}
+
+function architectureUnquoteDsl(value) {
+  const raw = text(value);
+  if (raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"")) {
+    return raw.slice(1, -1).replace(/\\"/gu, "\"").replace(/\\\\/gu, "\\").trim();
+  }
+  return raw.trim();
+}
+
+function architectureSplitDslTopLevel(value, separator = ",") {
+  const parts = [];
+  let inQuote = false;
+  let bracketDepth = 0;
+  let current = "";
+  let previous = "";
+
+  for (const char of text(value)) {
+    if (char === "\"" && previous !== "\\") inQuote = !inQuote;
+    if (!inQuote && char === "[") bracketDepth += 1;
+    if (!inQuote && char === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    if (!inQuote && bracketDepth === 0 && char === separator) {
+      parts.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+    previous = char;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+function architectureExtractDslProps(value) {
+  const raw = text(value);
+  let inQuote = false;
+  let bracketStart = -1;
+  let previous = "";
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const char = raw[index];
+    if (char === "\"" && previous !== "\\") inQuote = !inQuote;
+    if (!inQuote && char === "[") bracketStart = index;
+    previous = char;
+  }
+
+  if (bracketStart < 0 || !raw.endsWith("]")) {
+    return { name: architectureUnquoteDsl(raw), props: {} };
+  }
+
+  const name = architectureUnquoteDsl(raw.slice(0, bracketStart).trim());
+  const propsText = raw.slice(bracketStart + 1, -1);
+  const props = {};
+  architectureSplitDslTopLevel(propsText).forEach((part) => {
+    const colonIndex = part.indexOf(":");
+    if (colonIndex <= 0) return;
+    const key = part.slice(0, colonIndex).trim();
+    const valuePart = architectureUnquoteDsl(part.slice(colonIndex + 1).trim());
+    if (key) props[key] = valuePart;
+  });
+  return { name, props };
+}
+
+function architectureFindDslLabelIndex(value) {
+  let inQuote = false;
+  let bracketDepth = 0;
+  let previous = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (char === "\"" && previous !== "\\") inQuote = !inQuote;
+    if (!inQuote && char === "[") bracketDepth += 1;
+    if (!inQuote && char === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    if (!inQuote && bracketDepth === 0 && char === ":") return index;
+    previous = char;
+  }
+  return -1;
+}
+
+function architectureTokenizeDslConnection(value) {
+  const tokens = [];
+  let inQuote = false;
+  let bracketDepth = 0;
+  let current = "";
+  let previous = "";
+  let index = 0;
+  const pushCurrent = () => {
+    const token = current.trim();
+    if (token) tokens.push({ type: "name", value: token });
+    current = "";
+  };
+
+  while (index < value.length) {
+    const char = value[index];
+    const pair = value.slice(index, index + 2);
+    const triple = value.slice(index, index + 3);
+
+    if (char === "\"" && previous !== "\\") inQuote = !inQuote;
+    if (!inQuote && char === "[") bracketDepth += 1;
+    if (!inQuote && char === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+
+    if (!inQuote && bracketDepth === 0) {
+      const connector = triple === "-->" ? "-->"
+        : pair === "<>" ? "<>"
+          : pair === "--" ? "--"
+            : char === ">" || char === "<" ? char : "";
+      if (connector) {
+        pushCurrent();
+        tokens.push({ type: "connector", value: connector });
+        index += connector.length;
+        previous = "";
+        continue;
+      }
+    }
+
+    current += char;
+    previous = char;
+    index += 1;
+  }
+  pushCurrent();
+  return tokens;
+}
+
+function architectureIconKind(icon, fallback = "service") {
+  const raw = text(icon).toLowerCase();
+  if (!raw) return fallback;
+  if (/(db|database|rds|sql|postgres|mysql|mongo|redis|store|storage|bucket|s3)/u.test(raw)) return "database";
+  if (/(user|client|browser|mobile|cli|bot|agent)/u.test(raw)) return "client";
+  if (/(queue|kafka|pubsub|bus|stream|event)/u.test(raw)) return "queue";
+  if (/(api|gateway|route|router|endpoint)/u.test(raw)) return "api";
+  if (/(worker|lambda|function|job)/u.test(raw)) return "worker";
+  if (/(external|cloud|github|slack|stripe|third)/u.test(raw)) return "external";
+  return fallback;
+}
+
+function architectureDslPropsText(props = {}) {
+  const entries = Object.entries(props)
+    .filter(([, value]) => text(value))
+    .map(([key, value]) => `${key}: ${/[,\][{}:<>]/u.test(text(value)) || /\s/u.test(text(value)) ? architectureDslString(value) : value}`);
+  return entries.length ? ` [${entries.join(", ")}]` : "";
+}
+
+function architectureLayoutGraph(graph) {
+  const nodes = jsonArray(graph.nodes).map((node, index) => ({ ...node, __order: index }));
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const childrenByParent = new Map();
+  nodes.forEach((node) => {
+    const parentId = text(node.parentId || "");
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(node);
+  });
+
+  const direction = text(graph?.layout?.direction, "LR");
+  const topLevel = childrenByParent.get("") || [];
+  const topGroups = topLevel.filter((node) => node.type === "group");
+  const topNodes = topLevel.filter((node) => node.type !== "group");
+  const groupWidth = 360;
+  const nodeWidth = 184;
+  const nodeHeight = 76;
+
+  function layoutGroup(group, groupIndex = 0) {
+    const directChildren = childrenByParent.get(group.id) || [];
+    const childGroups = directChildren.filter((node) => node.type === "group");
+    const childNodes = directChildren.filter((node) => node.type !== "group");
+    const columns = Math.max(1, Math.min(3, Math.ceil(Math.sqrt(Math.max(1, childNodes.length)))));
+    const rows = Math.max(1, Math.ceil(childNodes.length / columns));
+    const nestedHeight = childGroups.length ? childGroups.length * 210 + 24 : 0;
+    const height = Math.max(190, 74 + rows * 102 + nestedHeight);
+    group.width = numberValue(group.width, Math.max(groupWidth, 48 + columns * (nodeWidth + 34)));
+    group.height = numberValue(group.height, height);
+
+    childNodes.forEach((node, index) => {
+      node.position = node.position || {
+        x: 28 + (index % columns) * (nodeWidth + 24),
+        y: 72 + Math.floor(index / columns) * 102,
+      };
+    });
+
+    childGroups.forEach((childGroup, index) => {
+      layoutGroup(childGroup, index);
+      childGroup.position = childGroup.position || {
+        x: 28,
+        y: 72 + rows * 102 + index * 214,
+      };
+      childGroup.width = Math.max(numberValue(childGroup.width, groupWidth - 56), groupWidth - 56);
+    });
+
+    return {
+      height: group.height,
+      width: group.width,
+      x: direction === "TB" ? 80 : 80 + groupIndex * (group.width + 64),
+      y: direction === "TB" ? 80 + groupIndex * (group.height + 64) : 80,
+    };
+  }
+
+  topGroups.forEach((group, index) => {
+    const position = layoutGroup(group, index);
+    group.position = group.position || { x: position.x, y: position.y };
+  });
+
+  const topNodeOffsetX = topGroups.length
+    ? Math.max(...topGroups.map((group) => numberValue(group.position?.x, 0) + numberValue(group.width, groupWidth))) + 72
+    : 80;
+  topNodes.forEach((node, index) => {
+    node.position = node.position || {
+      x: direction === "TB" ? 80 + (index % 3) * 218 : topNodeOffsetX,
+      y: direction === "TB" ? 80 + topGroups.reduce((total, group) => total + numberValue(group.height, groupWidth) + 64, 0) + Math.floor(index / 3) * 108 : 110 + index * 108,
+    };
+  });
+
+  return {
+    ...graph,
+    nodes: nodes
+      .sort((left, right) => left.__order - right.__order)
+      .map(({ __order, ...node }) => node),
+  };
+}
+
+function architectureParseDslGraph(graph) {
+  const source = text(graph?.source);
+  if (!source) return jsonObject(graph) || null;
+
+  const parsed = {
+    id: text(graph?.id, architectureSlug(graph?.title || "architecture")),
+    title: text(graph?.title, "Architecture graph"),
+    kind: "architecture",
+    groupPath: architectureFolderPathParts(graph?.groupPath),
+    layout: { direction: "LR", engine: "dsl" },
+    source,
+    sourceFormat: "eraserDsl",
+    version: 2,
+    createdAt: text(graph?.createdAt),
+    updatedAt: text(graph?.updatedAt),
+    filePath: text(graph?.filePath),
+    nodes: [],
+    edges: [],
+  };
+  const nameToId = new Map();
+  const nodeById = new Map();
+  const stack = [];
+  const idCounts = new Map();
+
+  const uniqueId = (name, prefix = "node") => {
+    const base = architectureSlug(name, prefix);
+    const count = idCounts.get(base) || 0;
+    idCounts.set(base, count + 1);
+    return count ? `${base}-${count + 1}` : base;
+  };
+  const registerNode = (name, props = {}, isGroup = false, explicitParentId = "") => {
+    const cleanName = text(name);
+    if (!cleanName) return null;
+    if (nameToId.has(cleanName)) return nameToId.get(cleanName);
+    const id = uniqueId(cleanName, isGroup ? "group" : "node");
+    const parentId = explicitParentId || stack.at(-1)?.id || "";
+    const icon = text(props.icon);
+    const node = {
+      id,
+      title: text(props.label, cleanName),
+      subtitle: text(props.desc || props.description),
+      kind: isGroup ? "group" : architectureIconKind(icon, "service"),
+      type: isGroup ? "group" : "node",
+      icon,
+      color: text(props.color),
+      ...(parentId ? { parentId } : {}),
+    };
+    parsed.nodes.push(node);
+    nodeById.set(id, node);
+    nameToId.set(cleanName, id);
+    return id;
+  };
+  const ensureNode = (name) => registerNode(name, {}, false, "");
+
+  source.split(/\r?\n/u).forEach((rawLine) => {
+    let line = architectureStripDslComments(rawLine);
+    if (!line) return;
+    if (line === "}") {
+      stack.pop();
+      return;
+    }
+    if (line.startsWith("title ")) {
+      parsed.title = architectureUnquoteDsl(line.slice(6));
+      return;
+    }
+    if (line.startsWith("folder ") || line.startsWith("groupPath ") || line.startsWith("path ")) {
+      parsed.groupPath = architectureUnquoteDsl(line.replace(/^(folder|groupPath|path)\s+/u, ""))
+        .split(/[/>]/u)
+        .map((part) => part.trim())
+        .filter(Boolean);
+      return;
+    }
+    if (line.startsWith("direction ")) {
+      const direction = text(line.slice(10)).toLowerCase();
+      parsed.layout.direction = direction === "down" ? "TB"
+        : direction === "up" ? "BT"
+          : direction === "left" ? "RL" : "LR";
+      return;
+    }
+    if (/^(colorMode|styleMode|typeface|legend)\b/u.test(line)) return;
+
+    const opensGroup = line.endsWith("{");
+    if (opensGroup) {
+      line = line.slice(0, -1).trim();
+      const { name, props } = architectureExtractDslProps(line);
+      const id = registerNode(name, props, true);
+      if (id) stack.push({ id, name });
+      return;
+    }
+
+    const labelIndex = architectureFindDslLabelIndex(line);
+    const connectionExpression = labelIndex >= 0 ? line.slice(0, labelIndex).trim() : line;
+    const connectionLabelRaw = labelIndex >= 0 ? line.slice(labelIndex + 1).trim() : "";
+    const tokens = architectureTokenizeDslConnection(connectionExpression);
+    if (tokens.some((token) => token.type === "connector")) {
+      const cleanLabel = architectureExtractDslProps(connectionLabelRaw).name;
+      for (let index = 0; index < tokens.length - 2; index += 2) {
+        const left = tokens[index];
+        const connector = tokens[index + 1];
+        const right = tokens[index + 2];
+        if (left?.type !== "name" || connector?.type !== "connector" || right?.type !== "name") continue;
+        const leftNames = architectureSplitDslTopLevel(left.value).map((item) => architectureExtractDslProps(item).name).filter(Boolean);
+        const rightNames = architectureSplitDslTopLevel(right.value).map((item) => architectureExtractDslProps(item).name).filter(Boolean);
+        leftNames.forEach((leftName) => {
+          rightNames.forEach((rightName) => {
+            const sourceId = ensureNode(connector.value === "<" ? rightName : leftName);
+            const targetId = ensureNode(connector.value === "<" ? leftName : rightName);
+            if (!sourceId || !targetId) return;
+            parsed.edges.push({
+              id: uniqueId(`${sourceId}-${targetId}`, "edge"),
+              source: sourceId,
+              target: targetId,
+              label: cleanLabel,
+              kind: connector.value === "--" ? "depends" : "calls",
+            });
+            if (connector.value === "<>") {
+              parsed.edges.push({
+                id: uniqueId(`${targetId}-${sourceId}`, "edge"),
+                source: targetId,
+                target: sourceId,
+                label: cleanLabel,
+                kind: "calls",
+              });
+            }
+          });
+        });
+      }
+      return;
+    }
+
+    const { name, props } = architectureExtractDslProps(line);
+    registerNode(name, props, false);
+  });
+
+  return architectureLayoutGraph(parsed);
+}
+
+function architectureStarterSource({ groupPath = "", title = "" } = {}) {
+  const cleanTitle = text(title, "Architecture graph");
   const groupParts = text(groupPath)
     .split(/[/>]/u)
     .map((part) => part.trim())
     .filter(Boolean)
     .slice(0, 8);
-  const graphKind = text(kind, "deployment");
+  const lines = [
+    `title ${architectureDslString(cleanTitle)}`,
+    "direction right",
+  ];
+  if (groupParts.length) lines.push(`folder ${architectureDslString(groupParts.join(" / "))}`);
+  lines.push(
+    "",
+    "Client Layer [icon: users, color: blue] {",
+    "  Client [icon: monitor, desc: Entry point]",
+    "}",
+    "",
+    "Application [icon: server, color: amber] {",
+    "  API [icon: api, desc: Request handling and validation]",
+    "  Service [icon: settings, desc: Core logic]",
+    "}",
+    "",
+    "Persistence [icon: database, color: purple] {",
+    "  Store [icon: database, desc: State and durable records]",
+    "}",
+    "",
+    "Client > API: request",
+    "API > Service: delegate",
+    "Service > Store: read/write",
+  );
+  return `${lines.join("\n")}\n`;
+}
 
-  return {
+function architectureStarterGraph({ groupPath = "", title = "" } = {}) {
+  const cleanTitle = text(title, "Architecture graph");
+  const id = `${architectureSlug(cleanTitle)}-${String(Date.now()).slice(-5)}`;
+  const source = architectureStarterSource({ groupPath, title: cleanTitle });
+  return architectureParseDslGraph({
     id,
     title: cleanTitle,
-    kind: graphKind,
-    groupPath: groupParts,
-    layout: {
-      direction: "LR",
-      engine: "manual",
-    },
-    version: 1,
-    createdAt,
-    updatedAt: createdAt,
-    nodes: [
-      {
-        id: "boundary",
-        title: `${architectureKindLabel(graphKind)} boundary`,
-        kind: "group",
-        type: "group",
-        position: { x: 80, y: 70 },
-        width: 680,
-        height: 330,
-      },
-      {
-        id: "client",
-        parentId: "boundary",
-        title: graphKind === "flow" ? "Actor" : "Client",
-        subtitle: graphKind === "flow" ? "Starts the flow" : "Browser, mobile, or CLI",
-        kind: "client",
-        position: { x: 48, y: 96 },
-      },
-      {
-        id: "api",
-        parentId: "boundary",
-        title: graphKind === "subsystem" ? "Facade" : "API",
-        subtitle: "Request handling and validation",
-        kind: "api",
-        position: { x: 280, y: 96 },
-      },
-      {
-        id: "store",
-        parentId: "boundary",
-        title: graphKind === "data" ? "Primary dataset" : "Store",
-        subtitle: "State, cache, or persistence",
-        kind: "database",
-        position: { x: 512, y: 96 },
-      },
-    ],
-    edges: [
-      {
-        id: "client-api",
-        source: "client",
-        target: "api",
-        label: "request",
-        kind: "calls",
-      },
-      {
-        id: "api-store",
-        source: "api",
-        target: "store",
-        label: "read/write",
-        kind: "writes",
-      },
-    ],
-  };
+    groupPath: text(groupPath)
+      .split(/[/>]/u)
+      .map((part) => part.trim())
+      .filter(Boolean),
+    source,
+    sourceFormat: "eraserDsl",
+  });
 }
 
 function architectureFlowNodeFromGraphNode(node, index = 0) {
@@ -331,6 +1445,8 @@ function architectureFlowNodeFromGraphNode(node, index = 0) {
     },
     style: isGroup ? { width, height } : undefined,
     data: {
+      color: text(node?.color),
+      icon: text(node?.icon),
       kind: isGroup ? "group" : rawKind,
       subtitle: text(node?.subtitle || node?.description),
       title: text(node?.title || node?.label, isGroup ? "Group" : "Node"),
@@ -361,22 +1477,83 @@ function architectureFlowEdgeFromGraphEdge(edge) {
 }
 
 function architectureGraphToFlow(graph) {
-  const nodes = jsonArray(graph?.nodes).map(architectureFlowNodeFromGraphNode);
-  const edges = jsonArray(graph?.edges)
+  const compiledGraph = architectureParseDslGraph(graph) || graph;
+  const nodes = jsonArray(compiledGraph?.nodes).map(architectureFlowNodeFromGraphNode);
+  const edges = jsonArray(compiledGraph?.edges)
     .map(architectureFlowEdgeFromGraphEdge)
     .filter(Boolean);
   return { edges, nodes };
 }
 
+function architectureFlowGraphToDsl(graph, nodes, edges) {
+  const currentGraph = jsonObject(graph) || {};
+  const graphTitle = text(currentGraph.title, "Architecture graph");
+  const groupPath = architectureFolderPathParts(currentGraph.groupPath);
+  const groupNodes = nodes.filter((node) => node.type === "architectureGroup");
+  const regularNodes = nodes.filter((node) => node.type !== "architectureGroup");
+  const childrenByParent = new Map();
+  [...groupNodes, ...regularNodes].forEach((node) => {
+    const parentId = text(node.parentId);
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(node);
+  });
+  const lineForNode = (node, depth) => {
+    const props = {
+      icon: node.data?.icon || node.data?.kind,
+      desc: node.data?.subtitle,
+    };
+    return `${"  ".repeat(depth)}${architectureDslName(node.data?.title || node.id)}${architectureDslPropsText(props)}`;
+  };
+  const lines = [
+    `title ${architectureDslString(graphTitle)}`,
+    "direction right",
+  ];
+  if (groupPath.length) lines.push(`folder ${architectureDslString(groupPath.join(" / "))}`);
+  lines.push("");
+  const emitGroup = (group, depth = 0) => {
+    lines.push(`${"  ".repeat(depth)}${architectureDslName(group.data?.title || group.id)}${architectureDslPropsText({
+      icon: group.data?.icon || "box",
+      color: group.data?.color,
+      desc: group.data?.subtitle,
+    })} {`);
+    const children = childrenByParent.get(group.id) || [];
+    children.filter((child) => child.type === "architectureGroup").forEach((childGroup) => emitGroup(childGroup, depth + 1));
+    children.filter((child) => child.type !== "architectureGroup").forEach((child) => lines.push(lineForNode(child, depth + 1)));
+    lines.push(`${"  ".repeat(depth)}}`);
+    lines.push("");
+  };
+  (childrenByParent.get("") || [])
+    .filter((node) => node.type === "architectureGroup")
+    .forEach((group) => emitGroup(group));
+  (childrenByParent.get("") || [])
+    .filter((node) => node.type !== "architectureGroup")
+    .forEach((node) => lines.push(lineForNode(node, 0)));
+  if (edges.length) lines.push("");
+  const titleById = new Map(nodes.map((node) => [node.id, node.data?.title || node.id]));
+  edges.forEach((edge) => {
+    const source = architectureDslName(titleById.get(edge.source) || edge.source);
+    const target = architectureDslName(titleById.get(edge.target) || edge.target);
+    const label = text(edge.data?.label);
+    lines.push(`${source} > ${target}${label ? `: ${label}` : ""}`);
+  });
+  return `${lines.join("\n").replace(/\n{3,}/gu, "\n\n").trim()}\n`;
+}
+
 function architectureGraphFromFlow(graph, nodes, edges) {
+  const currentGraph = jsonObject(graph) || {};
+  const source = architectureFlowGraphToDsl(currentGraph, nodes, edges);
   return {
-    ...(jsonObject(graph) || {}),
+    ...currentGraph,
+    source,
+    sourceFormat: "eraserDsl",
     nodes: nodes.map((node) => {
       const isGroup = node.type === "architectureGroup";
       return {
         id: node.id,
         title: text(node.data?.title, isGroup ? "Group" : "Node"),
         subtitle: text(node.data?.subtitle),
+        icon: text(node.data?.icon),
+        color: text(node.data?.color),
         kind: isGroup ? "group" : text(node.data?.kind, "service"),
         type: isGroup ? "group" : "node",
         position: {
@@ -976,6 +2153,7 @@ export default function ArchitectureWorkspaceView({
     : viewMode === "rawScan"
       ? `Raw Scan · startup cache · ${repoLabel}`
       : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
+  const visibleArchitectureError = architectureCloudMcpNoiseError(architectureError) ? "" : architectureError;
 
   useEffect(() => {
     setLocalArchitectureSnapshot(architectureSnapshot);
@@ -1099,10 +2277,10 @@ export default function ArchitectureWorkspaceView({
           repoLabel={repoLabel}
         />
       )}
-      {architectureError && (
-        <ArchitectureErrorToast aria-live="polite" role="status" title={architectureError}>
+      {visibleArchitectureError && (
+        <ArchitectureErrorToast aria-live="polite" role="status" title={visibleArchitectureError}>
           <strong>Architecture sync issue</strong>
-          <span>{architectureError}</span>
+          <span>{visibleArchitectureError}</span>
         </ArchitectureErrorToast>
       )}
     </ArchitectureSurface>
@@ -1118,9 +2296,10 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
   const [selectedGraphId, setSelectedGraphId] = useState("");
   const [selectedGraph, setSelectedGraph] = useState(null);
   const [error, setError] = useState("");
-  const [draftTitle, setDraftTitle] = useState("Deployment architecture");
-  const [draftKind, setDraftKind] = useState("deployment");
-  const [draftGroupPath, setDraftGroupPath] = useState("");
+  const [creatingGraph, setCreatingGraph] = useState(false);
+  const [draftTitle, setDraftTitle] = useState("Architecture graph");
+  const [draftLocationMode, setDraftLocationMode] = useState("root");
+  const [draftFolderPath, setDraftFolderPath] = useState("");
   const [saveState, setSaveState] = useState("idle");
 
   useEffect(() => {
@@ -1142,6 +2321,7 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
         if (cancelled) return;
         setRepositories([]);
         setSelectedRepoPath("");
+        setCreatingGraph(false);
         setRepoState("error");
         setError(nextError?.message || String(nextError || "Unable to load architecture repositories."));
       });
@@ -1150,19 +2330,24 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
     };
   }, [repoPath]);
 
-  const loadGraphList = useCallback((repo = selectedRepoPath) => {
+  const loadGraphList = useCallback((repo = selectedRepoPath, options = {}) => {
     if (!repo) {
       setGraphs([]);
       setSelectedGraphId("");
       setSelectedGraph(null);
       return Promise.resolve([]);
     }
-    setGraphState("loading");
+    if (!options.silent) setGraphState("loading");
     setError("");
     return invoke("architecture_graphs_list", { repoPath: repo })
       .then((result) => {
         const nextGraphs = jsonArray(result?.graphs);
         setGraphs(nextGraphs);
+        setRepositories((currentRepositories) => currentRepositories.map((repository) => (
+          repository.path === repo
+            ? { ...repository, graphCount: nextGraphs.length }
+            : repository
+        )));
         setSelectedGraphId((current) => {
           if (current && nextGraphs.some((graph) => graph.id === current)) return current;
           return nextGraphs[0]?.id || "";
@@ -1185,6 +2370,14 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
 
   useEffect(() => {
     void loadGraphList(selectedRepoPath);
+  }, [loadGraphList, selectedRepoPath]);
+
+  useEffect(() => {
+    if (!selectedRepoPath) return undefined;
+    const interval = window.setInterval(() => {
+      void loadGraphList(selectedRepoPath, { silent: true });
+    }, 1800);
+    return () => window.clearInterval(interval);
   }, [loadGraphList, selectedRepoPath]);
 
   useEffect(() => {
@@ -1218,14 +2411,56 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
     };
   }, [selectedGraphId, selectedRepoPath]);
 
+  useEffect(() => {
+    if (!selectedRepoPath || !selectedGraphId || creatingGraph || saveState === "saving") {
+      return undefined;
+    }
+    const interval = window.setInterval(() => {
+      invoke("architecture_graph_read", {
+        graphId: selectedGraphId,
+        repoPath: selectedRepoPath,
+      })
+        .then((graph) => {
+          setSelectedGraph((current) => {
+            const currentSource = text(current?.source);
+            const nextSource = text(graph?.source);
+            const currentUpdatedAt = text(current?.updatedAt);
+            const nextUpdatedAt = text(graph?.updatedAt);
+            if (currentSource === nextSource && currentUpdatedAt === nextUpdatedAt) {
+              return current;
+            }
+            return graph;
+          });
+        })
+        .catch(() => {});
+    }, 1200);
+    return () => window.clearInterval(interval);
+  }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
+
   const selectedRepo = repositories.find((repo) => repo.path === selectedRepoPath) || null;
   const isLoading = repoState === "loading" || graphState === "loading";
+  const singleRepository = repositories.length <= 1;
+  const treeRows = useMemo(() => architectureGraphTreeRows(graphs, singleRepository ? 0 : 1), [graphs, singleRepository]);
+  const folderSuggestions = useMemo(() => (
+    [...new Set(graphs.map((graph) => architectureFolderPathText(graph.groupPath)).filter(Boolean))]
+      .sort((left, right) => left.localeCompare(right))
+  ), [graphs]);
+
+  const beginCreateGraph = useCallback((folderPath = "") => {
+    const nextFolderPath = text(folderPath);
+    setDraftTitle("Architecture graph");
+    setDraftLocationMode(nextFolderPath ? "folder" : "root");
+    setDraftFolderPath(nextFolderPath);
+    setCreatingGraph(true);
+    setError("");
+  }, []);
 
   const createGraph = useCallback(() => {
     if (!selectedRepoPath) return;
+    const groupPath = draftLocationMode === "folder" ? draftFolderPath : "";
     const graph = architectureStarterGraph({
-      groupPath: draftGroupPath,
-      kind: draftKind,
+      groupPath,
+      kind: "architecture",
       title: draftTitle,
     });
     setSaveState("saving");
@@ -1237,7 +2472,10 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
       .then((result) => {
         setSelectedGraph(result?.graph || graph);
         setSelectedGraphId(result?.graphId || graph.id);
-        setDraftTitle(`${architectureKindLabel(draftKind)} architecture`);
+        setCreatingGraph(false);
+        setDraftTitle("Architecture graph");
+        setDraftLocationMode("root");
+        setDraftFolderPath("");
         setSaveState("idle");
         void loadGraphList(selectedRepoPath);
       })
@@ -1245,7 +2483,7 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftGroupPath, draftKind, draftTitle, loadGraphList, selectedRepoPath]);
+  }, [draftFolderPath, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -1270,133 +2508,229 @@ function ArchitecturesPanel({ repoLabel, repoPath }) {
       });
   }, [loadGraphList, selectedRepoPath]);
 
+  const renderTreeRows = useCallback((emptyDepth = 0) => (
+    <>
+      {treeRows.map((row) => (
+        row.kind === "folder" ? (
+          <ArchitectureTreeRow
+            data-kind="folder"
+            key={`folder-${row.id}`}
+            onClick={() => beginCreateGraph(row.path.join(" / "))}
+            style={{ "--tree-depth": row.depth }}
+            title={row.path.join(" / ")}
+            type="button"
+          >
+            <ArchitectureTreeGlyph data-kind="folder" aria-hidden="true" />
+            <span>{row.name}</span>
+          </ArchitectureTreeRow>
+        ) : (
+          <ArchitectureTreeRow
+            data-active={row.graph.id === selectedGraphId && !creatingGraph ? "true" : "false"}
+            data-kind="graph"
+            key={`graph-${row.graph.id}`}
+            onClick={() => {
+              setSelectedGraphId(row.graph.id);
+              setCreatingGraph(false);
+            }}
+            style={{ "--tree-depth": row.depth }}
+            title={row.graph.filePath}
+            type="button"
+          >
+            <ArchitectureTreeGlyph data-kind="graph" aria-hidden="true" />
+            <span>{row.graph.title}</span>
+            <em>{row.graph.nodeCount}</em>
+          </ArchitectureTreeRow>
+        )
+      ))}
+      {graphState === "ready" && !graphs.length && (
+        <ArchitectureTreeEmpty style={{ "--tree-depth": emptyDepth }}>No graphs yet</ArchitectureTreeEmpty>
+      )}
+    </>
+  ), [beginCreateGraph, creatingGraph, graphState, graphs.length, selectedGraphId, treeRows]);
+
   return (
     <ArchitecturesShell>
-      <ArchitectureRepoRail aria-label="Architecture repositories">
-        <ArchitectureRailHeader>
-          <span>Repositories</span>
-          <strong>{repositories.length}</strong>
-        </ArchitectureRailHeader>
-        <ArchitectureRepoList>
-          {repositories.map((repo) => (
-            <ArchitectureRepoButton
-              data-active={repo.path === selectedRepoPath ? "true" : "false"}
-              key={repo.id}
-              onClick={() => {
-                setSelectedRepoPath(repo.path);
-                setSelectedGraphId("");
-                setSelectedGraph(null);
-              }}
-              title={repo.path}
-              type="button"
-            >
-              <strong>{repo.name}</strong>
-              <span>{repo.relativePath}</span>
-              <em>{repo.graphCount} graph{repo.graphCount === 1 ? "" : "s"}</em>
-            </ArchitectureRepoButton>
+      <ArchitectureNavRail aria-label="Architecture repositories">
+        <ArchitectureNavHeader>
+          <strong>Architectures</strong>
+          <ArchitectureIconButton
+            aria-label="Create architecture graph"
+            disabled={!selectedRepoPath || saveState === "saving"}
+            onClick={() => beginCreateGraph()}
+            title="Create architecture graph"
+            type="button"
+          >
+            +
+          </ArchitectureIconButton>
+        </ArchitectureNavHeader>
+        <ArchitectureTree>
+          {singleRepository ? renderTreeRows(0) : repositories.map((repo) => (
+            <ArchitectureTreeRepoGroup key={repo.id}>
+              <ArchitectureTreeRow
+                data-active={repo.path === selectedRepoPath ? "true" : "false"}
+                data-kind="repo"
+                onClick={() => {
+                  setSelectedRepoPath(repo.path);
+                  setSelectedGraphId("");
+                  setSelectedGraph(null);
+                  setCreatingGraph(false);
+                }}
+                style={{ "--tree-depth": 0 }}
+                title={repo.path}
+                type="button"
+              >
+                <ArchitectureTreeGlyph data-kind="repo" aria-hidden="true" />
+                <span>{repo.name}</span>
+                <em>{repo.graphCount}</em>
+              </ArchitectureTreeRow>
+              {repo.path === selectedRepoPath && (
+                <ArchitectureTreeBranch>
+                  {renderTreeRows(1)}
+                </ArchitectureTreeBranch>
+              )}
+            </ArchitectureTreeRepoGroup>
           ))}
           {repoState === "ready" && !repositories.length && (
             <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
           )}
-        </ArchitectureRepoList>
-        <ArchitectureCreatePanel>
-          <ArchitectureRailHeader>
-            <span>New Graph</span>
-            <strong>{architectureKindLabel(draftKind)}</strong>
-          </ArchitectureRailHeader>
-          <ArchitectureField>
-            <span>Title</span>
-            <ArchitectureInput
-              onChange={(event) => setDraftTitle(event.target.value)}
-              value={draftTitle}
-            />
-          </ArchitectureField>
-          <ArchitectureField>
-            <span>Type</span>
-            <ArchitectureSelect
-              onChange={(event) => setDraftKind(event.target.value)}
-              value={draftKind}
-            >
-              {ARCHITECTURE_KIND_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </ArchitectureSelect>
-          </ArchitectureField>
-          <ArchitectureField>
-            <span>Nested path</span>
-            <ArchitectureInput
-              onChange={(event) => setDraftGroupPath(event.target.value)}
-              placeholder="auth / api"
-              value={draftGroupPath}
-            />
-          </ArchitectureField>
-          <ArchitecturePrimaryButton
-            disabled={!selectedRepoPath || saveState === "saving"}
-            onClick={createGraph}
-            type="button"
-          >
-            Create Graph
-          </ArchitecturePrimaryButton>
-        </ArchitectureCreatePanel>
-      </ArchitectureRepoRail>
-
-      <ArchitectureGraphLibrary aria-label="Architecture graphs">
-        <ArchitectureGraphHeader>
-          <div>
-            <TimelineKicker>{selectedRepo?.name || repoLabel}</TimelineKicker>
-            <ArchitectureGraphTitle>{selectedRepo?.relativePath || "Architectures"}</ArchitectureGraphTitle>
-          </div>
-          <ArchitectureGraphHeaderActions>
-            <ArchitectureSmallButton
-              disabled={!selectedRepoPath || isLoading}
-              onClick={() => void loadGraphList(selectedRepoPath)}
-              type="button"
-            >
-              Refresh
-            </ArchitectureSmallButton>
-          </ArchitectureGraphHeaderActions>
-        </ArchitectureGraphHeader>
+        </ArchitectureTree>
         {selectedRepo && (
-          <ArchitectureStoragePath title={selectedRepo.architectureRoot}>
+          <ArchitectureNavStoragePath title={selectedRepo.architectureRoot}>
             .agents/architectures
-          </ArchitectureStoragePath>
+          </ArchitectureNavStoragePath>
         )}
-        <ArchitectureGraphList>
-          {graphs.map((graph) => (
-            <ArchitectureGraphButton
-              data-active={graph.id === selectedGraphId ? "true" : "false"}
-              key={graph.id}
-              onClick={() => setSelectedGraphId(graph.id)}
-              title={graph.filePath}
-              type="button"
-            >
-              <strong>{graph.title}</strong>
-              <span>{architectureKindLabel(graph.kind)} · {architectureGroupPathLabel(graph.groupPath)}</span>
-              <em>{graph.nodeCount} nodes · {graph.edgeCount} edges · {formatRelativeTimeMs(graph.updatedAt)}</em>
-            </ArchitectureGraphButton>
-          ))}
-          {graphState === "ready" && !graphs.length && (
-            <ArchitectureEmptyNote>Create a graph to start mapping this repo.</ArchitectureEmptyNote>
-          )}
-        </ArchitectureGraphList>
-      </ArchitectureGraphLibrary>
+      </ArchitectureNavRail>
 
       <ArchitectureEditorRegion>
         {error && <ArchitectureError>{error}</ArchitectureError>}
-        {selectedGraph ? (
-          <ArchitectureGraphEditor
-            graph={selectedGraph}
-            onSave={saveGraph}
-            saveState={saveState}
-          />
-        ) : (
-          <ArchitectureEditorEmpty>
-            <strong>{isLoading ? "Loading architectures..." : "No graph selected"}</strong>
-            <span>Manual graphs live in the selected repo under .agents/architectures.</span>
-          </ArchitectureEditorEmpty>
-        )}
+        <ArchitectureEditorContent>
+          {creatingGraph || !selectedGraph ? (
+            <ArchitectureCreateSurface
+              canCancel={creatingGraph && Boolean(selectedGraph)}
+              draftFolderPath={draftFolderPath}
+              draftLocationMode={draftLocationMode}
+              draftTitle={draftTitle}
+              folderSuggestions={folderSuggestions}
+              graphCount={graphs.length}
+              isLoading={isLoading}
+              onCancel={() => setCreatingGraph(false)}
+              onCreate={createGraph}
+              onDraftFolderPathChange={setDraftFolderPath}
+              onDraftLocationModeChange={setDraftLocationMode}
+              onDraftTitleChange={setDraftTitle}
+              repoLabel={repoLabel}
+              saveState={saveState}
+              selectedRepo={selectedRepo}
+            />
+          ) : (
+            <ArchitectureGraphEditor
+              graph={selectedGraph}
+              onSave={saveGraph}
+              saveState={saveState}
+            />
+          )}
+        </ArchitectureEditorContent>
       </ArchitectureEditorRegion>
     </ArchitecturesShell>
+  );
+}
+
+function ArchitectureCreateSurface({
+  canCancel,
+  draftFolderPath,
+  draftLocationMode,
+  draftTitle,
+  folderSuggestions,
+  graphCount,
+  isLoading,
+  onCancel,
+  onCreate,
+  onDraftFolderPathChange,
+  onDraftLocationModeChange,
+  onDraftTitleChange,
+  repoLabel,
+  saveState,
+  selectedRepo,
+}) {
+  const canCreate = Boolean(selectedRepo && text(draftTitle));
+  const title = isLoading
+    ? "Loading architectures..."
+    : graphCount ? "Create or select an architecture graph" : "Create architecture graph";
+
+  return (
+    <ArchitectureCreateSurfaceShell>
+      <ArchitectureCreateDialog>
+        <TimelineKicker>{selectedRepo?.name || repoLabel}</TimelineKicker>
+        <ArchitectureCreateTitle>{title}</ArchitectureCreateTitle>
+        <ArchitectureCreateText>
+          Graphs are stored under the selected repo in .agents/architectures.
+        </ArchitectureCreateText>
+        <ArchitectureField>
+          <span>Title</span>
+          <ArchitectureInput
+            onChange={(event) => onDraftTitleChange(event.target.value)}
+            placeholder="Auth flow"
+            value={draftTitle}
+          />
+        </ArchitectureField>
+        <ArchitectureField>
+          <span>Location</span>
+          <ArchitectureLocationToggle aria-label="Architecture graph location">
+            <ArchitectureLocationButton
+              data-active={draftLocationMode === "root" ? "true" : "false"}
+              onClick={() => onDraftLocationModeChange("root")}
+              type="button"
+            >
+              Architecture root
+            </ArchitectureLocationButton>
+            <ArchitectureLocationButton
+              data-active={draftLocationMode === "folder" ? "true" : "false"}
+              onClick={() => onDraftLocationModeChange("folder")}
+              type="button"
+            >
+              Folder
+            </ArchitectureLocationButton>
+          </ArchitectureLocationToggle>
+        </ArchitectureField>
+        {draftLocationMode === "folder" && (
+          <ArchitectureField>
+            <span>Folder path</span>
+            <ArchitectureInput
+              onChange={(event) => onDraftFolderPathChange(event.target.value)}
+              placeholder="auth / api"
+              value={draftFolderPath}
+            />
+          </ArchitectureField>
+        )}
+        {draftLocationMode === "folder" && folderSuggestions.length > 0 && (
+          <ArchitectureFolderSuggestions>
+            {folderSuggestions.slice(0, 6).map((folderPath) => (
+              <button
+                key={folderPath}
+                onClick={() => onDraftFolderPathChange(folderPath)}
+                type="button"
+              >
+                {folderPath}
+              </button>
+            ))}
+          </ArchitectureFolderSuggestions>
+        )}
+        <ArchitectureCreateActions>
+          {canCancel && (
+            <ArchitectureSmallButton onClick={onCancel} type="button">
+              Cancel
+            </ArchitectureSmallButton>
+          )}
+          <ArchitecturePrimaryButton
+            disabled={!canCreate || saveState === "saving"}
+            onClick={onCreate}
+            type="button"
+          >
+            {saveState === "saving" ? "Creating..." : "Create Graph"}
+          </ArchitecturePrimaryButton>
+        </ArchitectureCreateActions>
+      </ArchitectureCreateDialog>
+    </ArchitectureCreateSurfaceShell>
   );
 }
 
@@ -1476,6 +2810,7 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
         position: { x: 120 + count * 34, y: 90 + count * 28 },
         style: { height: 240, width: 380 },
         data: {
+          icon: "box",
           kind: "group",
           subtitle: "Drag nodes into this area",
           title: `Group ${count + 1}`,
@@ -1500,6 +2835,7 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
           ? { x: 44 + (nodeCount % 2) * 190, y: 72 + Math.floor(nodeCount / 2) * 96 }
           : { x: 140 + (nodeCount % 3) * 220, y: 130 + Math.floor(nodeCount / 3) * 128 },
         data: {
+          icon: "server",
           kind: "service",
           subtitle: "",
           title: `Node ${nodeCount + 1}`,
@@ -1606,18 +2942,7 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
             />
           </ArchitectureField>
           <ArchitectureField>
-            <span>Type</span>
-            <ArchitectureSelect
-              onChange={(event) => updateDraftGraph({ kind: event.target.value })}
-              value={text(draftGraph.kind, "deployment")}
-            >
-              {ARCHITECTURE_KIND_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </ArchitectureSelect>
-          </ArchitectureField>
-          <ArchitectureField>
-            <span>Nested path</span>
+            <span>Folder</span>
             <ArchitectureInput
               onChange={(event) => updateDraftGraph({
                 groupPath: event.target.value
@@ -1727,6 +3052,22 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
                   value={text(selectedNode.data?.subtitle)}
                 />
               </ArchitectureField>
+              <ArchitectureField>
+                <span>Icon</span>
+                <ArchitectureInput
+                  onChange={(event) => {
+                    const nextIcon = event.target.value;
+                    updateSelectedNodeData({
+                      icon: nextIcon,
+                      ...(selectedNode.type === "architectureGroup" ? {} : {
+                        kind: architectureIconKind(nextIcon, selectedNode.data?.kind || "service"),
+                      }),
+                    });
+                  }}
+                  placeholder="aws:s3, github, cockroachdb"
+                  value={text(selectedNode.data?.icon)}
+                />
+              </ArchitectureField>
               {selectedNode.type === "architectureGroup" ? (
                 <>
                   <ArchitectureField>
@@ -1798,10 +3139,19 @@ function ArchitectureGraphEditor({ graph, onSave, saveState }) {
 }
 
 function ArchitectureCanvasNode({ data, selected }) {
+  const icon = useArchitectureIcon(data?.icon, data?.kind);
+  const IconComponent = icon.Icon;
   return (
     <ArchitectureCanvasNodeShell data-kind={text(data?.kind, "service")} data-selected={selected ? "true" : "false"}>
       <Handle position={Position.Left} type="target" />
-      <ArchitectureNodeIcon aria-hidden="true" data-kind={text(data?.kind, "service")} />
+      <ArchitectureNodeIcon
+        aria-hidden="true"
+        data-kind={text(data?.kind, "service")}
+        data-source={icon.source}
+        title={icon.title}
+      >
+        {IconComponent ? <IconComponent /> : icon.label}
+      </ArchitectureNodeIcon>
       <ArchitectureNodeText>
         <strong>{text(data?.title, "Node")}</strong>
         <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>
@@ -1812,11 +3162,25 @@ function ArchitectureCanvasNode({ data, selected }) {
 }
 
 function ArchitectureCanvasGroup({ data, selected }) {
+  const icon = useArchitectureIcon(data?.icon, "group");
+  const IconComponent = icon.Icon;
   return (
     <ArchitectureCanvasGroupShell data-selected={selected ? "true" : "false"}>
       <Handle position={Position.Left} type="target" />
-      <strong>{text(data?.title, "Group")}</strong>
-      <span>{text(data?.subtitle, "Architecture group")}</span>
+      <ArchitectureGroupHeader>
+        <ArchitectureNodeIcon
+          aria-hidden="true"
+          data-kind="group"
+          data-source={icon.source}
+          title={icon.title}
+        >
+          {IconComponent ? <IconComponent /> : icon.label}
+        </ArchitectureNodeIcon>
+        <ArchitectureGroupText>
+          <strong>{text(data?.title, "Group")}</strong>
+          <span>{text(data?.subtitle, "Architecture group")}</span>
+        </ArchitectureGroupText>
+      </ArchitectureGroupHeader>
       <Handle position={Position.Right} type="source" />
     </ArchitectureCanvasGroupShell>
   );
@@ -2296,19 +3660,215 @@ const ArchitectureErrorToast = styled.div`
 
 const ArchitecturesShell = styled.div`
   display: grid;
-  grid-template-columns: minmax(190px, 230px) minmax(220px, 280px) minmax(0, 1fr);
+  grid-template-columns: clamp(176px, 15vw, 232px) minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-
-  @media (max-width: 1100px) {
-    grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
-  }
 
   @media (max-width: 760px) {
     grid-template-columns: 1fr;
     overflow: auto;
   }
+`;
+
+const ArchitectureNavRail = styled.aside`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px;
+  overflow: hidden;
+  border-right: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(2, 6, 23, 0.32);
+
+  @media (max-width: 760px) {
+    min-height: 260px;
+    border-right: 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  }
+`;
+
+const ArchitectureNavHeader = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  min-height: 26px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(226, 232, 240, 0.86);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0;
+    text-transform: uppercase;
+  }
+`;
+
+const ArchitectureIconButton = styled.button`
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 6px;
+  color: rgba(204, 251, 241, 0.95);
+  background: rgba(13, 148, 136, 0.18);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 780;
+  line-height: 1;
+  cursor: pointer;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(94, 234, 212, 0.5);
+    background: rgba(20, 184, 166, 0.26);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+`;
+
+const ArchitectureTree = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+`;
+
+const ArchitectureTreeRepoGroup = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  min-width: 0;
+`;
+
+const ArchitectureTreeBranch = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  min-width: 0;
+`;
+
+const ArchitectureTreeRow = styled.button`
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  min-height: 24px;
+  padding: 0 6px 0 calc(6px + var(--tree-depth, 0) * 12px);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.82);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 760;
+  }
+
+  em {
+    min-width: 16px;
+    color: rgba(148, 163, 184, 0.62);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 850;
+    text-align: right;
+  }
+
+  &[data-kind="repo"] {
+    color: rgba(226, 232, 240, 0.92);
+  }
+
+  &[data-kind="repo"] span {
+    font-size: 12px;
+    font-weight: 880;
+  }
+
+  &[data-kind="folder"] {
+    color: rgba(148, 163, 184, 0.86);
+  }
+
+  &[data-kind="graph"] {
+    color: rgba(226, 232, 240, 0.86);
+  }
+
+  &:hover,
+  &[data-active="true"] {
+    border-color: rgba(125, 211, 252, 0.14);
+    background: rgba(148, 163, 184, 0.08);
+  }
+
+  &[data-active="true"] {
+    color: rgba(248, 250, 252, 0.96);
+    background: rgba(14, 165, 233, 0.13);
+    box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.72);
+  }
+`;
+
+const ArchitectureTreeGlyph = styled.i`
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.08);
+
+  &[data-kind="repo"] {
+    border-color: rgba(125, 211, 252, 0.32);
+    background: rgba(14, 165, 233, 0.15);
+  }
+
+  &[data-kind="folder"] {
+    border-color: rgba(251, 191, 36, 0.28);
+    background: rgba(217, 119, 6, 0.15);
+  }
+
+  &[data-kind="graph"] {
+    border-color: rgba(45, 212, 191, 0.28);
+    border-radius: 50%;
+    background: rgba(13, 148, 136, 0.16);
+  }
+`;
+
+const ArchitectureTreeEmpty = styled.div`
+  min-width: 0;
+  min-height: 24px;
+  padding: 5px 6px 5px calc(6px + var(--tree-depth, 0) * 12px + 18px);
+  color: rgba(148, 163, 184, 0.58);
+  font-size: 10px;
+  font-weight: 760;
+`;
+
+const ArchitectureNavStoragePath = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(148, 163, 184, 0.62);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 760;
 `;
 
 const ArchitectureRepoRail = styled.aside`
@@ -2675,6 +4235,15 @@ const ArchitectureEditorRegion = styled.main`
   overflow: hidden;
 `;
 
+const ArchitectureEditorContent = styled.div`
+  display: grid;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+`;
+
 const ArchitectureEditorEmpty = styled.div`
   display: grid;
   place-content: center;
@@ -2698,12 +4267,124 @@ const ArchitectureEditorEmpty = styled.div`
   }
 `;
 
+const ArchitectureCreateSurfaceShell = styled.div`
+  display: grid;
+  align-self: stretch;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 24px;
+  overflow: auto;
+  border: 1px dashed rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.18), rgba(2, 6, 23, 0.12)),
+    rgba(2, 6, 23, 0.18);
+`;
+
+const ArchitectureCreateDialog = styled.div`
+  display: grid;
+  gap: 11px;
+  width: min(460px, 100%);
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.46);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.26);
+`;
+
+const ArchitectureCreateTitle = styled.strong`
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: rgba(248, 250, 252, 0.96);
+  font-size: 18px;
+  font-weight: 920;
+  line-height: 1.2;
+`;
+
+const ArchitectureCreateText = styled.p`
+  min-width: 0;
+  margin: -4px 0 2px;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.4;
+`;
+
+const ArchitectureLocationToggle = styled.div`
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  min-width: 0;
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.36);
+`;
+
+const ArchitectureLocationButton = styled.button`
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  color: rgba(148, 163, 184, 0.82);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 850;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &[data-active="true"] {
+    color: rgba(226, 232, 240, 0.95);
+    background: rgba(148, 163, 184, 0.13);
+  }
+`;
+
+const ArchitectureFolderSuggestions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+
+  button {
+    max-width: 100%;
+    min-height: 24px;
+    padding: 0 8px;
+    overflow: hidden;
+    border: 1px solid rgba(251, 191, 36, 0.16);
+    border-radius: 999px;
+    color: rgba(254, 243, 199, 0.82);
+    background: rgba(120, 53, 15, 0.12);
+    font: inherit;
+    font-size: 10px;
+    font-weight: 820;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+`;
+
+const ArchitectureCreateActions = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 2px;
+`;
+
 const ArchitectureEditorShell = styled.div`
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 8px;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
 `;
 
@@ -2721,7 +4402,7 @@ const ArchitectureEditorToolbar = styled.header`
 
 const ArchitectureEditorMeta = styled.div`
   display: grid;
-  grid-template-columns: minmax(160px, 1.2fr) minmax(110px, 0.55fr) minmax(120px, 0.8fr);
+  grid-template-columns: minmax(180px, 1.25fr) minmax(140px, 0.85fr);
   gap: 8px;
   min-width: 0;
 
@@ -2762,6 +4443,7 @@ const ArchitectureEditorBody = styled.div`
   gap: 10px;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
 
   @media (max-width: 900px) {
@@ -2772,7 +4454,8 @@ const ArchitectureEditorBody = styled.div`
 
 const ArchitectureCanvasViewport = styled.div`
   min-width: 0;
-  min-height: 420px;
+  min-height: 0;
+  height: 100%;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 8px;
@@ -2781,7 +4464,9 @@ const ArchitectureCanvasViewport = styled.div`
     rgba(2, 6, 23, 0.36);
 
   .react-flow {
-    min-height: 420px;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
   }
 
   .react-flow__controls {
@@ -2810,6 +4495,7 @@ const ArchitectureInspector = styled.aside`
   gap: 9px;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   overflow: auto;
   padding: 11px;
   border: 1px solid rgba(148, 163, 184, 0.13);
@@ -2848,7 +4534,7 @@ const ArchitectureInspectorMeta = styled.div`
 
 const ArchitectureCanvasNodeShell = styled.div`
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  grid-template-columns: 26px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   width: 184px;
@@ -2896,15 +4582,50 @@ const ArchitectureCanvasNodeShell = styled.div`
 `;
 
 const ArchitectureNodeIcon = styled.span`
-  width: 18px;
-  height: 18px;
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
   border: 1px solid rgba(125, 211, 252, 0.36);
-  border-radius: 6px;
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.76);
   background: rgba(14, 165, 233, 0.2);
+  font-size: 6px;
+  font-weight: 900;
+  line-height: 1;
+  overflow: hidden;
+
+  svg {
+    display: block;
+    width: 16px;
+    height: 16px;
+    max-width: 18px;
+    max-height: 18px;
+    color: currentColor;
+  }
+
+  &[data-source="likec4"],
+  &[data-source="styled"] {
+    border-color: rgba(226, 232, 240, 0.74);
+    color: rgba(15, 23, 42, 0.92);
+    background: rgba(248, 250, 252, 0.92);
+    box-shadow: 0 5px 14px rgba(0, 0, 0, 0.14);
+  }
+
+  &[data-source="label"] {
+    letter-spacing: 0;
+    font-size: 7px;
+  }
 
   &[data-kind="client"] {
     border-color: rgba(251, 191, 36, 0.42);
     background: rgba(217, 119, 6, 0.22);
+  }
+
+  &[data-kind="client"][data-source="likec4"],
+  &[data-kind="client"][data-source="styled"] {
+    border-color: rgba(254, 240, 138, 0.78);
+    background: rgba(255, 251, 235, 0.94);
   }
 
   &[data-kind="database"] {
@@ -2913,14 +4634,36 @@ const ArchitectureNodeIcon = styled.span`
     background: rgba(5, 150, 105, 0.22);
   }
 
+  &[data-kind="database"][data-source="likec4"],
+  &[data-kind="database"][data-source="styled"] {
+    border-color: rgba(167, 243, 208, 0.82);
+    background: rgba(240, 253, 244, 0.94);
+  }
+
   &[data-kind="external"] {
     border-color: rgba(244, 114, 182, 0.42);
     background: rgba(190, 24, 93, 0.22);
   }
 
+  &[data-kind="external"][data-source="likec4"],
+  &[data-kind="external"][data-source="styled"] {
+    border-color: rgba(251, 207, 232, 0.82);
+    background: rgba(253, 242, 248, 0.94);
+  }
+
   &[data-kind="queue"] {
     border-color: rgba(167, 139, 250, 0.42);
     background: rgba(109, 40, 217, 0.22);
+  }
+
+  &[data-kind="queue"][data-source="likec4"],
+  &[data-kind="queue"][data-source="styled"] {
+    border-color: rgba(221, 214, 254, 0.82);
+    background: rgba(245, 243, 255, 0.94);
+  }
+
+  &[data-kind="group"] {
+    border-radius: 7px;
   }
 `;
 
@@ -2959,27 +4702,6 @@ const ArchitectureCanvasGroupShell = styled.div`
   color: rgba(226, 232, 240, 0.88);
   background: rgba(15, 23, 42, 0.18);
 
-  strong,
-  span {
-    display: block;
-    max-width: calc(100% - 14px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  strong {
-    font-size: 12px;
-    font-weight: 900;
-  }
-
-  span {
-    margin-top: 3px;
-    color: rgba(148, 163, 184, 0.75);
-    font-size: 10px;
-    font-weight: 760;
-  }
-
   &[data-selected="true"] {
     border-color: rgba(251, 191, 36, 0.68);
     background: rgba(120, 53, 15, 0.12);
@@ -2990,6 +4712,40 @@ const ArchitectureCanvasGroupShell = styled.div`
     height: 9px;
     border: 1px solid rgba(2, 6, 23, 0.9);
     background: rgba(251, 191, 36, 0.95);
+  }
+`;
+
+const ArchitectureGroupHeader = styled.div`
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 14px);
+`;
+
+const ArchitectureGroupText = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(248, 250, 252, 0.92);
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.75);
+    font-size: 10px;
+    font-weight: 760;
   }
 `;
 

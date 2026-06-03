@@ -939,41 +939,161 @@ function terminalStatusEventForcesIdle(eventType) {
   return TERMINAL_IDLE_STATUS_EVENT_TYPES.has(String(eventType || "").trim().toLowerCase());
 }
 
+function terminalStatusEventIndicatesParked(event = {}, options = {}) {
+  const sourceEvent = event && typeof event === "object" ? event : {};
+  const sourceOptions = options && typeof options === "object" ? options : {};
+  return Boolean(
+    sourceEvent.terminalIsParked === true
+      || sourceEvent.terminal_is_parked === true
+      || sourceEvent.parked === true
+      || sourceOptions.terminalIsParked === true
+      || sourceOptions.terminal_is_parked === true
+      || sourceOptions.parked === true
+  );
+}
+
+function normalizeTerminalPromptSource(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function terminalPromptPermissionToken(event = {}, options = {}) {
+  const sourceEvent = event && typeof event === "object" ? event : {};
+  const sourceOptions = options && typeof options === "object" ? options : {};
+  return String(
+    sourceOptions.approvalId
+      || sourceOptions.approval_id
+      || sourceOptions.permissionPromptId
+      || sourceOptions.permission_prompt_id
+      || sourceOptions.permissionRequestId
+      || sourceOptions.permission_request_id
+      || sourceOptions.sourceEventId
+      || sourceOptions.source_event_id
+      || sourceOptions.toolUseId
+      || sourceOptions.tool_use_id
+      || sourceEvent.approvalId
+      || sourceEvent.approval_id
+      || sourceEvent.permissionPromptId
+      || sourceEvent.permission_prompt_id
+      || sourceEvent.permissionRequestId
+      || sourceEvent.permission_request_id
+      || sourceEvent.sourceEventId
+      || sourceEvent.source_event_id
+      || sourceEvent.toolUseId
+      || sourceEvent.tool_use_id
+      || "",
+  ).trim();
+}
+
+function terminalPromptSourceLooksExplicitPermission(source) {
+  const normalized = normalizeTerminalPromptSource(source);
+  return Boolean(
+    normalized
+      && [
+        "approval",
+        "claude-hook",
+        "claude-permission",
+        "codex-hook",
+        "codex-permission",
+        "coordination",
+        "permission",
+        "pre-tool-use",
+        "pretooluse",
+        "provider-permission",
+        "tool-permission",
+      ].some((part) => normalized.includes(part))
+      && !normalized.includes("terminal-output")
+  );
+}
+
+function terminalStatusEventHasExplicitPermissionPrompt(event = {}, options = {}) {
+  const sourceEvent = event && typeof event === "object" ? event : {};
+  const sourceOptions = options && typeof options === "object" ? options : {};
+  const active = sourceEvent.terminalIsPromptingUser === true
+    || sourceEvent.terminal_is_prompting_user === true
+    || sourceEvent.promptingUser === true
+    || sourceEvent.prompting_user === true
+    || sourceEvent.requiresUserInput === true
+    || sourceEvent.requires_user_input === true
+    || sourceOptions.terminalIsPromptingUser === true
+    || sourceOptions.terminal_is_prompting_user === true
+    || sourceOptions.promptingUser === true
+    || sourceOptions.prompting_user === true
+    || sourceOptions.requiresUserInput === true
+    || sourceOptions.requires_user_input === true;
+  if (!active) {
+    return false;
+  }
+
+  const kind = String(
+    sourceOptions.promptingUserKind
+      || sourceOptions.prompting_user_kind
+      || sourceEvent.promptingUserKind
+      || sourceEvent.prompting_user_kind
+      || sourceEvent.promptingKind
+      || sourceEvent.prompting_kind
+      || "",
+  ).trim().toLowerCase().replace(/[_\s]+/g, "-");
+  const source = sourceOptions.promptingUserSource
+    || sourceOptions.prompting_user_source
+    || sourceOptions.promptingSource
+    || sourceOptions.prompting_source
+    || sourceOptions.source
+    || sourceOptions.type
+    || sourceEvent.promptingUserSource
+    || sourceEvent.prompting_user_source
+    || sourceEvent.promptingSource
+    || sourceEvent.prompting_source
+    || sourceEvent.source
+    || sourceEvent.type;
+  return Boolean(
+    (
+      kind === "approval"
+        || kind === "permission"
+        || sourceEvent.requiresUserInput === true
+        || sourceEvent.requires_user_input === true
+        || sourceOptions.requiresUserInput === true
+        || sourceOptions.requires_user_input === true
+    )
+      && (
+        terminalPromptPermissionToken(sourceEvent, sourceOptions)
+          || terminalPromptSourceLooksExplicitPermission(source)
+      )
+  );
+}
+
 function terminalStatusEventIndicatesPaused(event = {}, options = {}) {
-  if (
-    event.terminalIsParked === true
-    || event.terminal_is_parked === true
-    || event.parked === true
-    || options.terminalIsParked === true
-    || options.terminal_is_parked === true
-    || options.parked === true
-  ) {
+  const sourceEvent = event && typeof event === "object" ? event : {};
+  const sourceOptions = options && typeof options === "object" ? options : {};
+  if (terminalStatusEventIndicatesParked(sourceEvent, sourceOptions)) {
     return true;
   }
 
   return [
-    options.activityStatus,
-    options.activity_status,
-    options.displayStatus,
-    options.display_status,
-    options.executionPhase,
-    options.execution_phase,
-    options.nativeRailState,
-    options.native_rail_state,
-    options.readiness,
-    options.status,
-    options.statusAfter,
-    event.activityStatus,
-    event.activity_status,
-    event.displayStatus,
-    event.display_status,
-    event.executionPhase,
-    event.execution_phase,
-    event.nativeRailState,
-    event.native_rail_state,
-    event.readiness,
-    event.status,
-    event.statusAfter,
+    sourceOptions.activityStatus,
+    sourceOptions.activity_status,
+    sourceOptions.displayStatus,
+    sourceOptions.display_status,
+    sourceOptions.executionPhase,
+    sourceOptions.execution_phase,
+    sourceOptions.nativeRailState,
+    sourceOptions.native_rail_state,
+    sourceOptions.readiness,
+    sourceOptions.status,
+    sourceOptions.statusAfter,
+    sourceEvent.activityStatus,
+    sourceEvent.activity_status,
+    sourceEvent.displayStatus,
+    sourceEvent.display_status,
+    sourceEvent.executionPhase,
+    sourceEvent.execution_phase,
+    sourceEvent.nativeRailState,
+    sourceEvent.native_rail_state,
+    sourceEvent.readiness,
+    sourceEvent.status,
+    sourceEvent.statusAfter,
   ].some((value) => terminalActivityStatusIsPaused(value));
 }
 
@@ -8151,25 +8271,19 @@ export default function App() {
           || presenceTerminal?.terminal_readiness
           || "",
       ).trim().toLowerCase();
-      const presenceHasNonIdleStatus = [
+      const presenceStatuses = [
         presenceRailState,
         presenceExecutionPhase,
         presenceTurnStatus,
         presenceReadiness,
-      ].some((status) => (
-        terminalActivityStatusIsBusy(status)
-          || terminalActivityStatusIsPaused(status)
-          || ["error", "failed", "failure"].includes(status)
+      ].filter(Boolean);
+      const presenceIdleStatus = presenceStatuses.find((status) => (
+        terminalActivityStatusIsSendable(status)
+          || ["cancelled", "canceled", "complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
       ));
       const presenceSaysIdle = Boolean(
         presenceTerminal
-          && !presenceHasNonIdleStatus
-          && (
-            ["idle", "ready", "prompt_ready", "input_ready"].includes(presenceRailState)
-              || ["idle", "completed", "complete", "done", "interrupted", "cancelled", "canceled"].includes(presenceExecutionPhase)
-              || ["completed", "complete", "done", "interrupted", "cancelled", "canceled"].includes(presenceTurnStatus)
-              || ["ready", "input_ready"].includes(presenceReadiness)
-          )
+          && presenceIdleStatus
       );
       const activityStatus = String(
         presenceSaysIdle
@@ -8223,7 +8337,7 @@ export default function App() {
           || promptingUserBlocksShutdown
           || terminalWorkState === "parked"
           || (terminalWorkState === "prompting_user" && promptingUserBlocksShutdown)
-          || (!presenceSaysIdle && visibleStatus === "paused")
+          || (!presenceSaysIdle && visibleStatus === "paused" && (groundTruth.terminalIsParked || promptingUserBlocksShutdown))
       );
       const hasError = Boolean(
         visibleStatus === "error"
@@ -9552,7 +9666,12 @@ export default function App() {
 
     const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
-    const pausedStatusEvent = terminalStatusEventIndicatesPaused(event, options);
+    const parkedStatusEvent = terminalStatusEventIndicatesParked(event, options);
+    const permissionPromptStatusEvent = terminalStatusEventHasExplicitPermissionPrompt(event, options);
+    const pausedStatusEvent = Boolean(
+      terminalStatusEventIndicatesPaused(event, options)
+        && (parkedStatusEvent || permissionPromptStatusEvent)
+    );
     const idleStatusEvent = terminalStatusEventForcesIdle(eventType) && !pausedStatusEvent;
     const eventActivityStatus = idleStatusEvent
       ? ""
@@ -9592,12 +9711,13 @@ export default function App() {
         liveStatus: ["closed", "closing", "exited", "offline"].includes(rawStatus)
           ? rawStatus
           : "",
-        terminalIsParked: pausedStatusEvent || event.terminalIsParked === true || event.terminal_is_parked === true,
-        terminalIsPromptingUser: event.terminalIsPromptingUser === true || event.terminal_is_prompting_user === true,
+        terminalIsParked: parkedStatusEvent,
+        terminalIsPromptingUser: permissionPromptStatusEvent,
         terminalLifecycle: statusLifecycleHint,
       });
     })();
-    const readinessAfter = String(options.readiness || options.readinessAfter || "").trim().toLowerCase() || (() => {
+    const rawReadinessAfter = String(options.readiness || options.readinessAfter || "").trim().toLowerCase();
+    const readinessAfter = (rawReadinessAfter === "needs_input" && !pausedStatusEvent ? "" : rawReadinessAfter) || (() => {
       return terminalReadinessFromPresenceStatus(statusAfter);
     })();
     const turnStatus = String(options.turnStatus || event.turnStatus || "").trim().toLowerCase() || (() => {
@@ -11564,6 +11684,13 @@ export default function App() {
         return { idle: false, reason: "already_closed" };
       }
       const statuses = remoteControlTerminalStatusValues(terminal);
+      const idleStatus = statuses.find((status) => (
+        terminalActivityStatusIsSendable(status)
+          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
+      ));
+      if (idleStatus) {
+        return { idle: true, reason: idleStatus };
+      }
       const busyStatus = statuses.find((status) => (
         terminalActivityStatusIsBusy(status)
           || terminalActivityStatusIsPaused(status)
@@ -11576,14 +11703,7 @@ export default function App() {
       if (errorStatus) {
         return { idle: false, reason: errorStatus };
       }
-      const idleStatus = statuses.find((status) => (
-        terminalActivityStatusIsSendable(status)
-          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
-      ));
-      if (!idleStatus) {
-        return { idle: false, reason: "unknown" };
-      }
-      return { idle: true, reason: idleStatus };
+      return { idle: false, reason: "unknown" };
     };
     const findRemoteControlPresenceWorkspace = (workspaceId) => (
       (terminalPresenceWorkspacesRef.current || []).find((workspace) => (

@@ -1128,118 +1128,95 @@ const TerminalBreakoutPlanStepText = styled.span`
 `;
 
 const TerminalBreakoutActivityPanel = styled.aside`
-  --terminal-breakout-activity-panel-width: clamp(300px, calc(var(--terminal-slot-width, 640px) * 0.56), 480px);
+  --terminal-breakout-activity-panel-width: clamp(150px, calc(var(--terminal-slot-width, 640px) * 0.32), 240px);
 
   position: absolute;
   top: 0;
-  left: calc(100% + calc(14px * var(--terminal-slot-inverse-scale, 1)));
+  left: calc(100% + 6px);
   z-index: 86;
   display: flex;
   width: var(--terminal-breakout-activity-panel-width);
   height: 100%;
   min-height: 0;
   flex-direction: column;
-  gap: calc(10px * var(--terminal-slot-inverse-scale, 1));
-  padding: calc(14px * var(--terminal-slot-inverse-scale, 1));
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.24);
-  border-radius: calc(10px * var(--terminal-slot-inverse-scale, 1));
+  justify-content: center;
+  padding: 0 0 0 12px;
+  border: 0;
   color: rgba(241, 245, 249, 0.94);
-  background: rgba(3, 7, 18, 0.96);
-  box-shadow:
-    0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(44px * var(--terminal-slot-inverse-scale, 1)) rgba(0, 0, 0, 0.46),
-    inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.05);
-  font-size: calc(12px * var(--terminal-slot-inverse-scale, 1));
-  line-height: 1.35;
-  overflow: hidden;
+  font-size: 10px;
+  line-height: 1.25;
+  overflow: visible;
   pointer-events: auto;
-  backdrop-filter: blur(14px) saturate(135%);
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(20, 184, 166, 0.28);
     color: #111827;
-    background: rgba(255, 255, 255, 0.97);
-    box-shadow:
-      0 calc(18px * var(--terminal-slot-inverse-scale, 1)) calc(38px * var(--terminal-slot-inverse-scale, 1)) rgba(15, 23, 42, 0.14),
-      inset 0 calc(1px * var(--terminal-slot-inverse-scale, 1)) 0 rgba(255, 255, 255, 0.85);
-  }
-`;
-
-const TerminalBreakoutActivityHeader = styled.div`
-  display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: calc(8px * var(--terminal-slot-inverse-scale, 1));
-  align-items: start;
-`;
-
-const TerminalBreakoutActivitySummary = styled.div`
-  display: inline-flex;
-  align-items: center;
-  gap: calc(5px * var(--terminal-slot-inverse-scale, 1));
-  color: rgba(148, 163, 184, 0.78);
-  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
-  font-weight: 900;
-  text-transform: uppercase;
-  white-space: nowrap;
-
-  html[data-forge-theme="light"] & {
-    color: rgba(71, 85, 105, 0.74);
   }
 `;
 
 const TerminalBreakoutActivityList = styled.div`
   display: flex;
-  min-height: 0;
-  flex: 1;
+  min-width: 0;
+  max-height: 100%;
   flex-direction: column;
-  gap: calc(8px * var(--terminal-slot-inverse-scale, 1));
+  gap: 4px;
   overflow: auto;
   overscroll-behavior: contain;
   scrollbar-width: thin;
 `;
 
-const TerminalBreakoutActivitySection = styled.section`
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  gap: calc(6px * var(--terminal-slot-inverse-scale, 1));
-`;
-
-const TerminalBreakoutActivitySectionTitle = styled.div`
-  color: rgba(148, 163, 184, 0.82);
-  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
-  font-weight: 900;
-  letter-spacing: 0;
-  text-transform: uppercase;
-
-  html[data-forge-theme="light"] & {
-    color: rgba(71, 85, 105, 0.78);
-  }
-`;
-
 const TerminalBreakoutActivityRow = styled.div`
+  position: relative;
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: calc(9px * var(--terminal-slot-inverse-scale, 1));
+  grid-template-columns: 9px minmax(0, 1fr) auto;
+  gap: 6px;
   align-items: center;
-  padding: calc(9px * var(--terminal-slot-inverse-scale, 1));
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.18);
-  border-radius: calc(8px * var(--terminal-slot-inverse-scale, 1));
-  background: rgba(15, 23, 42, 0.56);
+  min-height: 24px;
+  padding: 3px 4px 3px 0;
+  border-radius: 6px;
+  background: rgba(3, 7, 18, 0.66);
+  box-shadow: inset 0 0 0 1px rgba(45, 212, 191, 0.16);
+
+  &::before {
+    content: "";
+    position: absolute;
+    left: -12px;
+    top: 50%;
+    width: 12px;
+    height: 1px;
+    background: rgba(45, 212, 191, 0.46);
+  }
 
   &[data-kind="subagent"] {
-    border-color: rgba(96, 165, 250, 0.2);
-    background: rgba(15, 23, 42, 0.62);
+    box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.18);
+  }
+
+  &[data-kind="subagent"]::before {
+    background: rgba(96, 165, 250, 0.46);
   }
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(20, 184, 166, 0.24);
-    background: rgba(248, 250, 252, 0.74);
+    background: rgba(255, 255, 255, 0.76);
+    box-shadow: inset 0 0 0 1px rgba(20, 184, 166, 0.2);
   }
 
   html[data-forge-theme="light"] &[data-kind="subagent"] {
-    border-color: rgba(37, 99, 235, 0.2);
+    box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.2);
+  }
+`;
+
+const TerminalBreakoutActivityNodeDot = styled.span`
+  display: block;
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-radius: 999px;
+  background: rgba(45, 212, 191, 0.96);
+  box-shadow: 0 0 0 2px rgba(20, 184, 166, 0.16);
+
+  &[data-kind="subagent"] {
+    background: rgba(96, 165, 250, 0.96);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.16);
   }
 `;
 
@@ -1250,7 +1227,8 @@ const TerminalBreakoutActivityRowMain = styled.div`
 const TerminalBreakoutActivityRowTitle = styled.div`
   min-width: 0;
   color: rgba(248, 250, 252, 0.98);
-  font-weight: 900;
+  font-size: 10px;
+  font-weight: 780;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1264,11 +1242,11 @@ const TerminalBreakoutActivityRowMeta = styled.div`
   display: flex;
   min-width: 0;
   flex-wrap: wrap;
-  gap: calc(5px * var(--terminal-slot-inverse-scale, 1));
-  margin-top: calc(4px * var(--terminal-slot-inverse-scale, 1));
+  gap: 3px;
+  margin-top: 1px;
   color: rgba(148, 163, 184, 0.82);
-  font-size: calc(10px * var(--terminal-slot-inverse-scale, 1));
-  font-weight: 800;
+  font-size: 8px;
+  font-weight: 760;
 
   html[data-forge-theme="light"] & {
     color: rgba(71, 85, 105, 0.78);
@@ -1278,48 +1256,44 @@ const TerminalBreakoutActivityRowMeta = styled.div`
 const TerminalBreakoutActivityPill = styled.span`
   display: inline-flex;
   align-items: center;
-  min-height: calc(19px * var(--terminal-slot-inverse-scale, 1));
-  padding: 0 calc(7px * var(--terminal-slot-inverse-scale, 1));
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(45, 212, 191, 0.32);
-  border-radius: 999px;
-  color: rgba(153, 246, 228, 0.96);
-  background: rgba(20, 184, 166, 0.1);
-  font-size: calc(9px * var(--terminal-slot-inverse-scale, 1));
-  font-weight: 900;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: rgba(153, 246, 228, 0.82);
+  background: transparent;
+  font-size: 8px;
+  font-weight: 760;
   white-space: nowrap;
 
   &[data-tone="blue"] {
-    border-color: rgba(96, 165, 250, 0.38);
-    color: rgba(191, 219, 254, 0.98);
-    background: rgba(37, 99, 235, 0.12);
+    color: rgba(191, 219, 254, 0.84);
   }
 
   html[data-forge-theme="light"] & {
     color: #0f766e;
-    background: rgba(20, 184, 166, 0.08);
   }
 
   html[data-forge-theme="light"] &[data-tone="blue"] {
     color: #1d4ed8;
-    background: rgba(37, 99, 235, 0.08);
   }
 `;
 
 const TerminalBreakoutActivityStopButton = styled.button`
   display: inline-grid;
-  width: calc(28px * var(--terminal-slot-inverse-scale, 1));
-  height: calc(28px * var(--terminal-slot-inverse-scale, 1));
+  width: 17px;
+  height: 17px;
   place-items: center;
   padding: 0;
-  border: calc(1px * var(--terminal-slot-inverse-scale, 1)) solid rgba(248, 113, 113, 0.34);
-  border-radius: calc(7px * var(--terminal-slot-inverse-scale, 1));
-  color: rgba(252, 165, 165, 0.95);
-  background: rgba(127, 29, 29, 0.16);
+  border: 1px solid rgba(248, 113, 113, 0.28);
+  border-radius: 5px;
+  color: rgba(252, 165, 165, 0.86);
+  background: rgba(127, 29, 29, 0.12);
   cursor: pointer;
 
   svg {
-    width: calc(14px * var(--terminal-slot-inverse-scale, 1));
-    height: calc(14px * var(--terminal-slot-inverse-scale, 1));
+    width: 10px;
+    height: 10px;
   }
 
   &:disabled {
@@ -4084,11 +4058,38 @@ function terminalActivityPortLabel(process) {
 function terminalActivityProcessLabel(process) {
   const command = String(process?.command || "").trim();
   const name = String(process?.name || process?.displayName || process?.groupLabel || "").trim();
+  const compact = command.replace(/\s+/g, " ");
   if (command) {
-    const compact = command.replace(/\s+/g, " ");
-    return compact.length > 72 ? `${compact.slice(0, 69)}...` : compact;
+    const lower = compact.toLowerCase();
+    const known = [
+      "npm run dev",
+      "npm start",
+      "pnpm dev",
+      "pnpm run dev",
+      "yarn dev",
+      "yarn start",
+      "bun dev",
+      "vite",
+      "next dev",
+      "astro dev",
+      "nuxt dev",
+      "python -m http.server",
+      "python3 -m http.server",
+      "cargo run",
+      "tauri dev",
+    ].find((needle) => lower.includes(needle));
+    if (known) {
+      return known;
+    }
   }
-  return name || `PID ${process?.pid || ""}`;
+  if (name) {
+    return name.length > 36 ? `${name.slice(0, 33)}...` : name;
+  }
+  if (command) {
+    const leaf = compact.split(/[\\/]/).filter(Boolean).pop() || compact;
+    return leaf.length > 36 ? `${leaf.slice(0, 33)}...` : leaf;
+  }
+  return process?.pid ? `process ${process.pid}` : "process";
 }
 
 function terminalActivityProcessMeta(process) {
@@ -4097,7 +4098,6 @@ function terminalActivityProcessMeta(process) {
     formatTerminalActivityCpu(process?.cpuPercent),
     formatTerminalActivityBytes(process?.memoryBytes),
     formatTerminalActivityDuration(process?.runTimeSeconds),
-    process?.pid ? `PID ${process.pid}` : "",
   ].filter(Boolean);
 }
 
@@ -15981,7 +15981,6 @@ function TerminalView({
           const terminalBreakoutActivitySnapshot = terminalBreakoutActivityEntry?.snapshot || null;
           const terminalBreakoutSubagents = terminalActivityArray(terminalBreakoutActivitySnapshot?.subagents);
           const terminalBreakoutProcesses = terminalBreakoutActivityProcesses(terminalBreakoutActivitySnapshot);
-          const terminalBreakoutActivityCount = terminalBreakoutSubagents.length + terminalBreakoutProcesses.length;
           const hasMeasuredRect = Boolean(terminalLayoutRects[terminalIndex])
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
@@ -16046,86 +16045,69 @@ function TerminalView({
                   aria-label="Terminal activity"
                   data-terminal-control="true"
                 >
-                  <TerminalBreakoutActivityHeader>
-                    <div>
-                      <TerminalBreakoutPlanKicker>Activity</TerminalBreakoutPlanKicker>
-                      <TerminalBreakoutPlanTitle>
-                        {terminalBreakoutActivitySnapshot.terminalAgentId
-                          || terminalBreakoutActivitySnapshot.terminalAgentKind
-                          || "Terminal"}
-                      </TerminalBreakoutPlanTitle>
-                    </div>
-                    <TerminalBreakoutActivitySummary>
-                      {terminalBreakoutActivityCount}
-                    </TerminalBreakoutActivitySummary>
-                  </TerminalBreakoutActivityHeader>
                   <TerminalBreakoutActivityList>
-                    {terminalBreakoutSubagents.length > 0 && (
-                      <TerminalBreakoutActivitySection>
-                        <TerminalBreakoutActivitySectionTitle>Subagents</TerminalBreakoutActivitySectionTitle>
-                        {terminalBreakoutSubagents.map((subagent) => {
-                          const meta = terminalActivitySubagentMeta(subagent);
-                          return (
-                            <TerminalBreakoutActivityRow
-                              data-kind="subagent"
-                              key={subagent.id || `${subagent.label}-${subagent.updatedAtMs}`}
+                    {terminalBreakoutSubagents.map((subagent) => {
+                      const meta = terminalActivitySubagentMeta(subagent);
+                      return (
+                        <TerminalBreakoutActivityRow
+                          data-kind="subagent"
+                          key={subagent.id || `${subagent.label}-${subagent.updatedAtMs}`}
+                        >
+                          <TerminalBreakoutActivityNodeDot aria-hidden="true" data-kind="subagent" />
+                          <TerminalBreakoutActivityRowMain>
+                            <TerminalBreakoutActivityRowTitle title={subagent.description || subagent.label}>
+                              {subagent.label || "Subagent"}
+                            </TerminalBreakoutActivityRowTitle>
+                            {meta.length > 0 && (
+                              <TerminalBreakoutActivityRowMeta>
+                                {meta.map((item) => (
+                                  <TerminalBreakoutActivityPill data-tone="blue" key={item}>
+                                    {item}
+                                  </TerminalBreakoutActivityPill>
+                                ))}
+                              </TerminalBreakoutActivityRowMeta>
+                            )}
+                          </TerminalBreakoutActivityRowMain>
+                        </TerminalBreakoutActivityRow>
+                      );
+                    })}
+                    {terminalBreakoutProcesses.map((process) => {
+                      const stopKey = `${terminalPaneId}:${process.pid}`;
+                      const stopState = terminalBreakoutActivityStopState[stopKey] || "";
+                      const stopping = stopState === "stopping";
+                      const meta = terminalActivityProcessMeta(process);
+                      const label = terminalActivityProcessLabel(process);
+                      return (
+                        <TerminalBreakoutActivityRow key={process.pid}>
+                          <TerminalBreakoutActivityNodeDot aria-hidden="true" />
+                          <TerminalBreakoutActivityRowMain>
+                            <TerminalBreakoutActivityRowTitle title={process.command || process.executable || label}>
+                              {label}
+                            </TerminalBreakoutActivityRowTitle>
+                            {meta.length > 0 && (
+                              <TerminalBreakoutActivityRowMeta>
+                                {meta.map((item) => (
+                                  <TerminalBreakoutActivityPill key={item}>
+                                    {item}
+                                  </TerminalBreakoutActivityPill>
+                                ))}
+                              </TerminalBreakoutActivityRowMeta>
+                            )}
+                          </TerminalBreakoutActivityRowMain>
+                          {process.killable && (
+                            <TerminalBreakoutActivityStopButton
+                              aria-label={`Stop ${label}`}
+                              disabled={stopping}
+                              onClick={() => stopTerminalBreakoutActivityProcess(terminalPaneId, process)}
+                              title={stopping ? "Stopping..." : `Stop process tree - PID ${process.pid}`}
+                              type="button"
                             >
-                              <TerminalBreakoutActivityRowMain>
-                                <TerminalBreakoutActivityRowTitle title={subagent.description || subagent.label}>
-                                  {subagent.label || "Subagent"}
-                                </TerminalBreakoutActivityRowTitle>
-                                <TerminalBreakoutActivityRowMeta>
-                                  {meta.map((item) => (
-                                    <TerminalBreakoutActivityPill data-tone="blue" key={item}>
-                                      {item}
-                                    </TerminalBreakoutActivityPill>
-                                  ))}
-                                </TerminalBreakoutActivityRowMeta>
-                              </TerminalBreakoutActivityRowMain>
-                            </TerminalBreakoutActivityRow>
-                          );
-                        })}
-                      </TerminalBreakoutActivitySection>
-                    )}
-                    {terminalBreakoutProcesses.length > 0 && (
-                      <TerminalBreakoutActivitySection>
-                        <TerminalBreakoutActivitySectionTitle>Processes</TerminalBreakoutActivitySectionTitle>
-                        {terminalBreakoutProcesses.map((process) => {
-                          const stopKey = `${terminalPaneId}:${process.pid}`;
-                          const stopState = terminalBreakoutActivityStopState[stopKey] || "";
-                          const stopping = stopState === "stopping";
-                          const meta = terminalActivityProcessMeta(process);
-                          const label = terminalActivityProcessLabel(process);
-                          return (
-                            <TerminalBreakoutActivityRow key={process.pid}>
-                              <TerminalBreakoutActivityRowMain>
-                                <TerminalBreakoutActivityRowTitle title={process.command || process.executable || label}>
-                                  {label}
-                                </TerminalBreakoutActivityRowTitle>
-                                <TerminalBreakoutActivityRowMeta>
-                                  {meta.map((item) => (
-                                    <TerminalBreakoutActivityPill key={item}>
-                                      {item}
-                                    </TerminalBreakoutActivityPill>
-                                  ))}
-                                </TerminalBreakoutActivityRowMeta>
-                              </TerminalBreakoutActivityRowMain>
-                              {process.killable && (
-                                <TerminalBreakoutActivityStopButton
-                                  aria-label={`Stop ${label}`}
-                                  disabled={stopping}
-                                  onClick={() => stopTerminalBreakoutActivityProcess(terminalPaneId, process)}
-                                  title={stopping ? "Stopping..." : "Stop process tree"}
-                                  type="button"
-                                >
-                                  <Close aria-hidden="true" />
-                                </TerminalBreakoutActivityStopButton>
-                              )}
-                            </TerminalBreakoutActivityRow>
-                          );
-                        })}
-                      </TerminalBreakoutActivitySection>
-                    )}
+                              <Close aria-hidden="true" />
+                            </TerminalBreakoutActivityStopButton>
+                          )}
+                        </TerminalBreakoutActivityRow>
+                      );
+                    })}
                   </TerminalBreakoutActivityList>
                 </TerminalBreakoutActivityPanel>
               )}

@@ -56,10 +56,21 @@ const MANUAL_ACCEPTANCE_ACTIONABILITIES = new Set([
 
 const MANUAL_ACCEPTANCE_PROMPT_KINDS = new Set([
   "approval",
-  "confirmation",
   "permission",
-  "terminal-control",
 ]);
+const EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS = [
+  "approval",
+  "claude-hook",
+  "claude-permission",
+  "codex-hook",
+  "codex-permission",
+  "coordination",
+  "permission",
+  "pre-tool-use",
+  "pretooluse",
+  "provider-permission",
+  "tool-permission",
+];
 
 function cleanText(value, fallback = "") {
   const text = String(value ?? "").trim();
@@ -115,6 +126,49 @@ function normalizePromptingUserKind(value) {
   return cleanText(value)
     .toLowerCase()
     .replace(/[_\s]+/g, "-");
+}
+
+function normalizePromptingUserSource(value) {
+  return cleanText(value)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function promptingPermissionToken(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return cleanText(
+    source.approvalId
+      || source.approval_id
+      || source.permissionPromptId
+      || source.permission_prompt_id
+      || source.permissionRequestId
+      || source.permission_request_id
+      || source.sourceEventId
+      || source.source_event_id
+      || source.toolUseId
+      || source.tool_use_id,
+  );
+}
+
+function promptingSourceLooksExplicitPermission(source) {
+  const normalized = normalizePromptingUserSource(source);
+  return Boolean(
+    normalized
+      && EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
+      && !normalized.includes("terminal-output")
+  );
+}
+
+function notificationLooksExplicitPermissionPrompt(notification = {}) {
+  const sourceNotification = notification && typeof notification === "object" ? notification : {};
+  const kind = normalizePromptingUserKind(
+    sourceNotification.promptingUserKind || sourceNotification.prompting_user_kind,
+  );
+  const source = sourceNotification.promptingUserSource || sourceNotification.prompting_user_source;
+  return Boolean(
+    MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
+      && (promptingPermissionToken(sourceNotification) || promptingSourceLooksExplicitPermission(source))
+  );
 }
 
 function normalizeNotification(notification, workspaceId) {
@@ -413,7 +467,8 @@ function notificationRequiresManualAcceptance(notification) {
   const promptingKind = normalizePromptingUserKind(
     notification.promptingUserKind || notification.prompting_user_kind,
   );
-  return MANUAL_ACCEPTANCE_PROMPT_KINDS.has(promptingKind);
+  return MANUAL_ACCEPTANCE_PROMPT_KINDS.has(promptingKind)
+    && notificationLooksExplicitPermissionPrompt(notification);
 }
 
 function appendNotificationCue(state, bucket, workspaceId, notification, existing, options = {}) {
@@ -674,12 +729,34 @@ function lifecycleTerminalIsComplete(event) {
 
 function lifecycleTerminalIsPromptingUser(event) {
   const state = lifecycleTerminalWorkState(event);
-  return event?.terminalIsPromptingUser === true
+  const active = event?.terminalIsPromptingUser === true
     || event?.terminal_is_prompting_user === true
     || event?.promptingUser === true
+    || event?.prompting_user === true
     || event?.requiresUserInput === true
+    || event?.requires_user_input === true
     || state === "prompting_user"
     || state === "prompting-user";
+  if (!active) {
+    return false;
+  }
+
+  const kind = normalizePromptingUserKind(
+    event?.promptingUserKind
+      || event?.prompting_user_kind
+      || event?.promptingKind
+      || event?.prompting_kind,
+  );
+  const source = event?.promptingUserSource
+    || event?.prompting_user_source
+    || event?.promptingSource
+    || event?.prompting_source
+    || event?.source
+    || event?.type;
+  return Boolean(
+    (MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind) || event?.requiresUserInput === true || event?.requires_user_input === true)
+      && (promptingPermissionToken(event) || promptingSourceLooksExplicitPermission(source))
+  );
 }
 
 function lifecycleResolvesPromptingNotification(event) {
@@ -691,7 +768,12 @@ function lifecycleResolvesPromptingNotification(event) {
     "exited",
     "message-submitted",
     "pending-prompt-sent",
+    "provider-turn-completed",
+    "provider-turn-error",
+    "provider-turn-interrupted",
     "provider-turn-started",
+    "terminal-input-ready",
+    "terminal-prompt-ready",
     "thread-starting",
   ].includes(type)
     || event?.terminalIsPromptingUser === false
@@ -732,10 +814,21 @@ function buildPromptingNotification(event, workspaceId, existing, options = {}) 
   const createdAt = nowIso();
   const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
   const id = promptingNotificationId(event, workspaceId);
+  const sourceText = event?.promptingUserSource
+    || event?.prompting_user_source
+    || event?.promptingSource
+    || event?.prompting_source
+    || event?.source
+    || event?.type;
+  const sourceEventId = promptingPermissionToken(event)
+    || event?.sourceEventId
+    || event?.source_event_id
+    || existing?.sourceEventId
+    || existing?.source_event_id;
   return {
     actionability: "open_thread",
     agentId: cleanText(event?.agentId || event?.currentAgent || event?.agent_id),
-    approvalId: "",
+    approvalId: cleanText(event?.approvalId || event?.approval_id || existing?.approvalId || existing?.approval_id),
     body: promptingNotificationBody(event) || existing?.body || "",
     createdAt: existing?.createdAt || createdAt,
     dbChangeRequestId: "",
@@ -746,11 +839,18 @@ function buildPromptingNotification(event, workspaceId, existing, options = {}) 
     pendingAction: true,
     promptingUserConfidence: cleanText(event?.promptingUserConfidence || event?.prompting_user_confidence),
     promptingUserKind: normalizePromptingUserKind(event?.promptingUserKind || event?.prompting_user_kind),
-    promptingUserSource: cleanText(event?.promptingUserSource || event?.prompting_user_source),
+    promptingUserSource: cleanText(
+      promptingSourceLooksExplicitPermission(sourceText)
+        ? sourceText
+        : sourceEventId
+          ? "permission-token"
+          : sourceText,
+      "permission",
+    ),
     seenAt: seenOnArrival ? createdAt : existing?.seenAt || "",
     sessionId: cleanText(event?.nativeSessionId || event?.providerSessionId),
     severity: "action_required",
-    sourceEventId: cleanText(event?.sourceEventId || event?.source_event_id),
+    sourceEventId: cleanText(sourceEventId),
     sourceSeq: event?.sourceSeq ?? event?.seq ?? existing?.sourceSeq ?? null,
     status: (existing?.status === "read" || seenOnArrival) ? "read" : "unread",
     taskId: "",

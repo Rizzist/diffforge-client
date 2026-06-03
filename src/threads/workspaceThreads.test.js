@@ -535,6 +535,69 @@ test("prompt-ready clears stale prompting fields from terminal state", () => {
   assert.equal(next[workspaceId].terminals[0].promptingUserSource, "");
 });
 
+test("normalization only preserves explicit permission prompting fields", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const baseTerminal = {
+    agentId: "codex",
+    instanceId: 1,
+    paneId: "pane-test",
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+  };
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminalOrder: ["0", "1"],
+      terminals: {
+        0: {
+          ...baseTerminal,
+          promptingUserKind: "permission",
+          promptingUserSource: "provider-permission",
+          terminalIsPromptingUser: true,
+          toolUseId: "tool-1",
+        },
+        1: {
+          ...baseTerminal,
+          paneId: "pane-stale",
+          promptingUserKind: "permission",
+          promptingUserSource: "terminal-output",
+          terminalIndex: 1,
+          terminalIsPromptingUser: true,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          currentAgent: "codex",
+          id: threadId,
+          materialized: true,
+          providerBindings: {
+            codex: {
+              promptingUserKind: "permission",
+              promptingUserSource: "terminal-output",
+              status: "active",
+              terminalIsPromptingUser: true,
+            },
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const normalized = normalizeWorkspaceThreads(state);
+
+  assert.equal(normalized[workspaceId].terminals[0].terminalIsPromptingUser, true);
+  assert.equal(normalized[workspaceId].terminals[0].promptingUserSource, "provider-permission");
+  assert.equal(normalized[workspaceId].terminals[1].terminalIsPromptingUser, false);
+  assert.equal(normalized[workspaceId].terminals[1].promptingUserSource, "");
+  assert.equal(normalized[workspaceId].threads[threadId].providerBindings.codex.terminalIsPromptingUser, false);
+});
+
 test("detached session transcript completion settles matching idle running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
