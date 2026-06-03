@@ -1874,19 +1874,21 @@ export default function McpsWorkspaceView({
             <PageSubline>Global discovery with workspace-scoped configuration and enablement.</PageSubline>
           </div>
           <McpHeaderMetrics aria-label="MCP summary">
-            <McpMetricPill data-state="enabled">
-              <strong>{numberValue(summary.installed_count)}</strong>
-              <span>installed</span>
-            </McpMetricPill>
-            <McpMetricPill data-state="enabled">
-              <strong>{numberValue(summary.enabled_count)}</strong>
-              <span>enabled</span>
-            </McpMetricPill>
-            <McpMetricPill data-state={summary.config_required_count ? "blocked" : "planned"}>
-              <strong>{numberValue(summary.config_required_count)}</strong>
-              <span>config</span>
-            </McpMetricPill>
-            <McpInlineActions>
+            <McpHeaderTagRow>
+              <McpMetricPill data-state="enabled">
+                <strong>{numberValue(summary.installed_count)}</strong>
+                <span>installed</span>
+              </McpMetricPill>
+              <McpMetricPill data-state="enabled">
+                <strong>{numberValue(summary.enabled_count)}</strong>
+                <span>enabled</span>
+              </McpMetricPill>
+              <McpMetricPill data-state={summary.config_required_count ? "blocked" : "planned"}>
+                <strong>{numberValue(summary.config_required_count)}</strong>
+                <span>config</span>
+              </McpMetricPill>
+            </McpHeaderTagRow>
+            <McpHeaderActions>
               <button
                 disabled={isBusy}
                 onClick={() => {
@@ -1910,7 +1912,7 @@ export default function McpsWorkspaceView({
               <button disabled={isBusy} onClick={refresh} type="button">
                 {buttonContent(isLoading && !isActionBusy, "Refresh", "Refreshing")}
               </button>
-            </McpInlineActions>
+            </McpHeaderActions>
           </McpHeaderMetrics>
         </McpTitleRow>
         {isBusy && (
@@ -1962,23 +1964,25 @@ export default function McpsWorkspaceView({
               Sources
             </McpTransportButton>
           </McpTransportTabs>
-          {view === VIEW_DISCOVER && editorMode !== EDITOR_MANUAL && (
-            <McpRegistryActionBar>
-              <button
-                disabled={isBusy}
-                onClick={() => {
-                  setEditorMode(EDITOR_MANUAL);
-                  setView(VIEW_DISCOVER);
-                }}
-                type="button"
-              >
-                Manual MCP
-              </button>
-            </McpRegistryActionBar>
-          )}
-          {view === VIEW_INSTALLED && renderInstalledList()}
-          {view === VIEW_DISCOVER && renderDiscoverList()}
-          {view === VIEW_MARKETPLACES && renderMarketplaceList()}
+          <McpRegistryBody>
+            {view === VIEW_DISCOVER && editorMode !== EDITOR_MANUAL && (
+              <McpRegistryActionBar>
+                <button
+                  disabled={isBusy}
+                  onClick={() => {
+                    setEditorMode(EDITOR_MANUAL);
+                    setView(VIEW_DISCOVER);
+                  }}
+                  type="button"
+                >
+                  Manual MCP
+                </button>
+              </McpRegistryActionBar>
+            )}
+            {view === VIEW_INSTALLED && renderInstalledList()}
+            {view === VIEW_DISCOVER && renderDiscoverList()}
+            {view === VIEW_MARKETPLACES && renderMarketplaceList()}
+          </McpRegistryBody>
         </McpRegistryPanel>
 
         {status === "missing_workspace" ? (
@@ -1996,6 +2000,64 @@ export default function McpsWorkspaceView({
     </McpWorkspaceSurface>
   );
 }
+
+const McpHeaderTagRow = styled.div`
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+
+  @container (max-width: 1120px) {
+    justify-content: flex-start;
+  }
+`;
+
+const McpHeaderActions = styled(McpInlineActions)`
+  flex: 0 1 auto;
+  width: 100%;
+  min-width: 0;
+  justify-content: flex-end;
+
+  @container (max-width: 1120px) {
+    justify-content: flex-start;
+  }
+
+  @container (max-width: 560px) {
+    button {
+      min-width: 0;
+    }
+  }
+`;
+
+const McpRegistryBody = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  align-content: start;
+  gap: 8px;
+  overflow: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+
+  &::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.34);
+    background-clip: padding-box;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+`;
 
 const McpRegistryActionBar = styled.div`
   display: flex;

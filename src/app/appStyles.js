@@ -8249,7 +8249,7 @@ export const McpWorkspaceSurface = styled.section`
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
-  overflow: auto;
+  overflow: hidden;
   padding: 16px;
   background:
     linear-gradient(90deg, rgba(230, 236, 245, 0.018) 1px, transparent 1px),
@@ -8280,8 +8280,8 @@ export const McpHeaderPanel = styled.section`
 
 export const McpTitleRow = styled.div`
   display: grid;
-  grid-template-columns: 44px minmax(260px, 0.72fr) minmax(420px, 1.28fr);
-  align-items: center;
+  grid-template-columns: 44px minmax(0, 1fr) minmax(260px, auto);
+  align-items: start;
   gap: 12px;
   min-width: 0;
 
@@ -8431,15 +8431,14 @@ export const McpActionStatus = styled.div`
 `;
 
 export const McpHeaderMetrics = styled.div`
-  display: flex;
+  display: grid;
   min-width: 0;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex-wrap: wrap;
+  align-content: start;
+  justify-items: end;
+  gap: 8px;
 
   @container (max-width: 1120px) {
-    justify-content: flex-start;
+    justify-items: start;
   }
 `;
 
@@ -8518,7 +8517,7 @@ export const McpLayout = styled.div`
   grid-template-columns: minmax(216px, 260px) minmax(0, 1fr);
   align-items: stretch;
   gap: 10px;
-  overflow: visible;
+  overflow: hidden;
   transition: opacity 160ms ease;
 
   &[data-busy="true"] {
@@ -8532,7 +8531,7 @@ export const McpLayout = styled.div`
 
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
-    overflow: visible;
+    overflow: auto;
 
     &[data-editor-mode="manual"] > :last-child,
     &[data-editor-mode="marketplace"] > :last-child {
@@ -8548,7 +8547,7 @@ export const McpLayout = styled.div`
 
   @container (max-width: 920px) {
     grid-template-columns: minmax(0, 1fr);
-    overflow: visible;
+    overflow: auto;
 
     &[data-editor-mode="manual"] > :last-child,
     &[data-editor-mode="marketplace"] > :last-child {
@@ -8568,10 +8567,10 @@ export const McpRegistryPanel = styled.aside`
   display: grid;
   min-width: 0;
   min-height: 82px;
-  grid-template-rows: auto minmax(42px, max-content);
+  grid-template-rows: auto auto minmax(0, 1fr);
   align-content: start;
   gap: 8px;
-  overflow: visible;
+  overflow: hidden;
   padding: 10px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
@@ -8615,7 +8614,7 @@ export const McpPanelTopline = styled.div`
 export const McpServerList = styled.div`
   display: grid;
   min-width: 0;
-  min-height: 42px;
+  min-height: 0;
   gap: 4px;
   overflow: visible;
 `;

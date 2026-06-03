@@ -160,8 +160,10 @@ function historyGitStatus(file) {
 
 export default function GitWorkspaceView({
   onRefreshRepositories = null,
+  onRefreshSnapshot = null,
   repositoriesPreload = null,
   rootDirectory = "",
+  snapshotsPreload = null,
   workspace = null,
   workspaceError = "",
 }) {
@@ -194,6 +196,28 @@ export default function GitWorkspaceView({
       && repositoriesPreload.rootDirectory === rootDirectory
       && Array.isArray(repositoriesPreload.repositories),
   );
+  const snapshotsPreloadMatches = Boolean(
+    snapshotsPreload
+      && snapshotsPreload.workspaceId === workspaceId
+      && snapshotsPreload.rootDirectory === rootDirectory
+      && snapshotsPreload.snapshots
+      && typeof snapshotsPreload.snapshots === "object",
+  );
+  const selectedSnapshotEntry = selectedRepoPath && snapshotsPreloadMatches
+    ? snapshotsPreload.snapshots[selectedRepoPath] || null
+    : null;
+  const selectedSnapshotSignature = [
+    snapshotsPreload?.checkKey || "",
+    snapshotsPreload?.state || "",
+    selectedSnapshotEntry?.state || "",
+    selectedSnapshotEntry?.error || "",
+    Number(selectedSnapshotEntry?.generatedAtMs) || 0,
+    Number(selectedSnapshotEntry?.repositoryGeneratedAtMs) || 0,
+    Number(selectedSnapshotEntry?.snapshot?.generatedAtMs) || 0,
+    selectedSnapshotEntry?.snapshot?.repo?.headSha || "",
+    Array.isArray(selectedSnapshotEntry?.snapshot?.history) ? selectedSnapshotEntry.snapshot.history.length : -1,
+    Array.isArray(selectedSnapshotEntry?.snapshot?.status?.files) ? selectedSnapshotEntry.snapshot.status.files.length : -1,
+  ].join(":");
   const preloadSignature = [
     repositoriesPreload?.checkKey || "",
     repositoriesPreload?.state || "",
@@ -219,24 +243,45 @@ export default function GitWorkspaceView({
   const commitBusy = commitState === "generating" || commitState === "committing";
   const canCommit = Boolean(hasChanges && !operationBlocked && commitMessage.trim() && !commitBusy);
 
-  const loadSnapshot = useCallback(async (repoPath) => {
+  const loadSnapshot = useCallback(async (repoPath, options = {}) => {
     if (!repoPath) {
       setSnapshot(null);
       setSnapshotState("idle");
       setSnapshotError("");
-      return;
+      return null;
     }
     setSnapshotState("loading");
     setSnapshotError("");
     try {
-      const result = await invoke("workspace_git_snapshot", { repoPath });
-      setSnapshot(result);
+      const result = typeof onRefreshSnapshot === "function"
+        ? await onRefreshSnapshot({
+          refresh: options.refresh === true,
+          repoPath,
+          rootDirectory,
+          snapshot: options.snapshot || null,
+          repositoryGeneratedAtMs: Number(repositoriesPreload?.generatedAtMs) || 0,
+          workspaceId,
+          workspaceName: workspace?.name || "",
+        })
+        : {
+          snapshot: options.snapshot || await invoke("workspace_git_snapshot", { repoPath }),
+        };
+      const nextSnapshot = result?.snapshot || options.snapshot || null;
+      setSnapshot(nextSnapshot);
       setSnapshotState("ready");
+      return result;
     } catch (error) {
       setSnapshotError(error?.message || String(error));
       setSnapshotState("error");
+      return null;
     }
-  }, []);
+  }, [
+    onRefreshSnapshot,
+    repositoriesPreload?.generatedAtMs,
+    rootDirectory,
+    workspace?.name,
+    workspaceId,
+  ]);
 
   const refreshRepositories = useCallback(() => {
     if (typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
@@ -287,8 +332,38 @@ export default function GitWorkspaceView({
     setCommitState("idle");
     setCommitError("");
     setCommitNotice("");
-    void loadSnapshot(selectedRepoPath);
-  }, [loadSnapshot, selectedRepoPath]);
+  }, [selectedRepoPath]);
+
+  useEffect(() => {
+    if (!selectedRepoPath) {
+      setSnapshot(null);
+      setSnapshotState("idle");
+      setSnapshotError("");
+      return;
+    }
+
+    const nextSnapshot = selectedSnapshotEntry?.snapshot || null;
+    setSnapshot(nextSnapshot);
+    setSnapshotError(selectedSnapshotEntry?.error || "");
+
+    if (selectedSnapshotEntry?.state === "error") {
+      setSnapshotState("error");
+    } else if (selectedSnapshotEntry?.state === "loading") {
+      setSnapshotState("loading");
+    } else if (nextSnapshot) {
+      setSnapshotState("ready");
+    } else if (snapshotsPreloadMatches && repositoriesPreload?.state === "ready") {
+      setSnapshotState("loading");
+    } else {
+      setSnapshotState("idle");
+    }
+  }, [
+    repositoriesPreload?.state,
+    selectedRepoPath,
+    selectedSnapshotEntry,
+    selectedSnapshotSignature,
+    snapshotsPreloadMatches,
+  ]);
 
   useEffect(() => {
     setExpandedHistoryKeys((current) => {
@@ -360,9 +435,9 @@ export default function GitWorkspaceView({
         repoPath: selectedRepoPath,
       });
       if (result?.snapshot) {
-        setSnapshot(result.snapshot);
+        await loadSnapshot(selectedRepoPath, { snapshot: result.snapshot });
       } else {
-        await loadSnapshot(selectedRepoPath);
+        await loadSnapshot(selectedRepoPath, { refresh: true });
       }
       setCommitMessage("");
       setCommitNotice(result?.pushed
@@ -548,7 +623,7 @@ export default function GitWorkspaceView({
                       title="Uncommitted working tree changes"
                       type="button"
                     >
-                      <HistoryGraph aria-hidden="true" />
+                      <HistoryGraph aria-hidden="true" data-node="uncommitted" />
                       <HistoryCommitLine>
                         <strong>Changes</strong>
                         <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"}</span>
@@ -598,7 +673,7 @@ export default function GitWorkspaceView({
                       title={commit.subject}
                       type="button"
                     >
-                      <HistoryGraph aria-hidden="true" />
+                      <HistoryGraph aria-hidden="true" data-node="committed" />
                       <HistoryCommitLine>
                         <strong>{commit.subject}</strong>
                         <span>{commit.shortSha || shortSha(commit.sha)}</span>
@@ -1086,6 +1161,10 @@ const HistoryGraph = styled.span`
     content: "";
     transform: translate(-50%, -50%);
   }
+
+  &[data-node="committed"]::after {
+    background: var(--git-vscode-blue);
+  }
 `;
 
 const HistoryButton = styled.button`
@@ -1188,7 +1267,7 @@ const HistoryFileList = styled.div`
     bottom: 0;
     left: 20px;
     width: 1px;
-    background: color-mix(in srgb, var(--git-vscode-blue) 58%, transparent);
+    background: var(--git-vscode-dotted);
     content: "";
     transform: translateX(-50%);
   }

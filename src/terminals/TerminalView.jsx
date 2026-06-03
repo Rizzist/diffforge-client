@@ -6015,7 +6015,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   getItemAccentColor = null,
   coordinationTargets = [],
   gitRepositoriesPreload = null,
+  gitSnapshotsPreload = null,
   onRefreshGitRepositories = null,
+  onRefreshGitSnapshot = null,
   onBeginWorkspaceFileDrag,
   onBeginTodoDrag,
   onCancelQueuedItem,
@@ -7611,8 +7613,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
         <WorkspaceToolSurface data-tool="git">
           <GitWorkspaceView
             onRefreshRepositories={onRefreshGitRepositories}
+            onRefreshSnapshot={onRefreshGitSnapshot}
             repositoriesPreload={gitRepositoriesPreload}
             rootDirectory={rootDirectory}
+            snapshotsPreload={gitSnapshotsPreload}
             workspace={workspace}
             workspaceError={workspaceError}
           />
@@ -8116,7 +8120,9 @@ function TerminalView({
   createFirstWorkspace,
   chooseNewWorkspaceRootDirectory = () => {},
   gitRepositoriesPreload = null,
+  gitSnapshotsPreload = null,
   onRefreshGitRepositories = null,
+  onRefreshGitSnapshot = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -15455,8 +15461,10 @@ function TerminalView({
                           dropError={todoDropError}
                           getItemAccentColor={getTodoQueueItemAccentColor}
                           gitRepositoriesPreload={gitRepositoriesPreload}
+                          gitSnapshotsPreload={gitSnapshotsPreload}
                           items={visibleTodoQueueItems}
                           onRefreshGitRepositories={onRefreshGitRepositories}
+                          onRefreshGitSnapshot={onRefreshGitSnapshot}
                           onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
                           onBeginTodoDrag={handleBeginTodoDrag}
                           onCancelQueuedItem={cancelQueuedTodoQueueItem}

@@ -4235,6 +4235,7 @@ export default function App() {
   const [workspaceDeleteConfirmId, setWorkspaceDeleteConfirmId] = useState("");
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
+  const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
   const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -10993,6 +10994,7 @@ export default function App() {
         ...(current[checkKey] || {}),
         state: "loading",
         workspaceId,
+        workspaceName,
         rootDirectory,
         checkKey,
         repositories: current[checkKey]?.repositories || [],
@@ -11019,6 +11021,7 @@ export default function App() {
         [checkKey]: {
           state: "ready",
           workspaceId,
+          workspaceName,
           rootDirectory,
           checkKey,
           repositories: allRepositories,
@@ -11042,9 +11045,139 @@ export default function App() {
           ...(current[checkKey] || {}),
           state: "error",
           workspaceId,
+          workspaceName,
           rootDirectory,
           checkKey,
           repositories: current[checkKey]?.repositories || [],
+          error: errorMessage,
+        },
+      }));
+      throw error;
+    }
+  }, []);
+  const refreshWorkspaceGitSnapshotPreload = useCallback(async ({
+    repoPath = "",
+    rootDirectory = "",
+    snapshot = null,
+    repositoryGeneratedAtMs = 0,
+    workspaceId = "",
+    workspaceName = "",
+  } = {}) => {
+    const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
+    const normalizedRepoPath = String(repoPath || "").trim();
+
+    if (!checkKey || !normalizedRepoPath) {
+      return {
+        checkKey,
+        snapshot: null,
+      };
+    }
+
+    if (snapshot && typeof snapshot === "object") {
+      setWorkspaceGitSnapshotPreloads((current) => ({
+        ...current,
+        [checkKey]: {
+          ...(current[checkKey] || {}),
+          state: "ready",
+          workspaceId,
+          workspaceName,
+          rootDirectory,
+          checkKey,
+          snapshots: {
+            ...(current[checkKey]?.snapshots || {}),
+            [normalizedRepoPath]: {
+              state: "ready",
+              repoPath: normalizedRepoPath,
+              snapshot,
+              repositoryGeneratedAtMs: Number(repositoryGeneratedAtMs) || 0,
+              generatedAtMs: Number(snapshot?.generatedAtMs) || Date.now(),
+              error: "",
+            },
+          },
+          error: "",
+        },
+      }));
+      return {
+        checkKey,
+        snapshot,
+      };
+    }
+
+    setWorkspaceGitSnapshotPreloads((current) => ({
+      ...current,
+      [checkKey]: {
+        ...(current[checkKey] || {}),
+        state: "loading",
+        workspaceId,
+        workspaceName,
+        rootDirectory,
+        checkKey,
+        snapshots: {
+          ...(current[checkKey]?.snapshots || {}),
+          [normalizedRepoPath]: {
+            ...(current[checkKey]?.snapshots?.[normalizedRepoPath] || {}),
+            state: "loading",
+            repoPath: normalizedRepoPath,
+            repositoryGeneratedAtMs: Number(repositoryGeneratedAtMs) || 0,
+            error: "",
+          },
+        },
+        error: "",
+      },
+    }));
+
+    try {
+      const nextSnapshot = await invoke("workspace_git_snapshot", {
+        repoPath: normalizedRepoPath,
+      });
+      setWorkspaceGitSnapshotPreloads((current) => ({
+        ...current,
+        [checkKey]: {
+          ...(current[checkKey] || {}),
+          state: "ready",
+          workspaceId,
+          workspaceName,
+          rootDirectory,
+          checkKey,
+          snapshots: {
+            ...(current[checkKey]?.snapshots || {}),
+            [normalizedRepoPath]: {
+              state: "ready",
+              repoPath: normalizedRepoPath,
+              snapshot: nextSnapshot,
+              repositoryGeneratedAtMs: Number(repositoryGeneratedAtMs) || 0,
+              generatedAtMs: Number(nextSnapshot?.generatedAtMs) || Date.now(),
+              error: "",
+            },
+          },
+          error: "",
+        },
+      }));
+      return {
+        checkKey,
+        snapshot: nextSnapshot,
+      };
+    } catch (error) {
+      const errorMessage = getErrorMessage(error, "Unable to load Git history.");
+      setWorkspaceGitSnapshotPreloads((current) => ({
+        ...current,
+        [checkKey]: {
+          ...(current[checkKey] || {}),
+          state: "error",
+          workspaceId,
+          workspaceName,
+          rootDirectory,
+          checkKey,
+          snapshots: {
+            ...(current[checkKey]?.snapshots || {}),
+            [normalizedRepoPath]: {
+              ...(current[checkKey]?.snapshots?.[normalizedRepoPath] || {}),
+              state: "error",
+              repoPath: normalizedRepoPath,
+              repositoryGeneratedAtMs: Number(repositoryGeneratedAtMs) || 0,
+              error: errorMessage,
+            },
+          },
           error: errorMessage,
         },
       }));
@@ -11211,6 +11344,52 @@ export default function App() {
     refreshWorkspaceGitRepositoryPreload,
     workspaceGitRepositoryPreloads,
   ]);
+
+  useEffect(() => {
+    Object.values(workspaceGitRepositoryPreloads).forEach((preload) => {
+      if (!preload || preload.state !== "ready" || !preload.checkKey) {
+        return;
+      }
+
+      const repositories = Array.isArray(preload.repositories)
+        ? preload.repositories
+        : [];
+      if (!repositories.length) {
+        return;
+      }
+
+      const snapshotPreload = workspaceGitSnapshotPreloads[preload.checkKey] || null;
+      const repositoryGeneratedAtMs = Number(preload.generatedAtMs) || 0;
+
+      repositories.forEach((repository) => {
+        const repoPath = String(repository?.path || "").trim();
+        if (!repoPath) {
+          return;
+        }
+
+        const entry = snapshotPreload?.snapshots?.[repoPath] || null;
+        const entryMatchesRepositoryGeneration = Number(entry?.repositoryGeneratedAtMs) === repositoryGeneratedAtMs;
+        if (
+          entryMatchesRepositoryGeneration
+            && (entry?.state === "loading" || entry?.state === "ready" || entry?.state === "error")
+        ) {
+          return;
+        }
+
+        void refreshWorkspaceGitSnapshotPreload({
+          repoPath,
+          rootDirectory: preload.rootDirectory,
+          repositoryGeneratedAtMs,
+          workspaceId: preload.workspaceId,
+          workspaceName: preload.workspaceName || "",
+        }).catch(() => {});
+      });
+    });
+  }, [
+    refreshWorkspaceGitSnapshotPreload,
+    workspaceGitRepositoryPreloads,
+    workspaceGitSnapshotPreloads,
+  ]);
   const isWorkspaceSettingsDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && selectedWorkspace
@@ -11351,12 +11530,30 @@ export default function App() {
       return undefined;
     }
 
+    const workspaceTerminalRecords = selectedWorkspace?.id
+      ? Object.values(workspaceThreads?.[selectedWorkspace.id]?.terminals || {})
+      : [];
+    const selectedWorkspaceAgentTerminalOpened = activatedWorkspaceAgentTerminalEntries.some(({ terminalIndex }) => (
+      workspaceTerminalRecords.some((terminal) => {
+        const status = String(terminal?.status || "").trim().toLowerCase();
+        return Number(terminal?.terminalIndex) === Number(terminalIndex)
+          && !["closed", "exited", "error"].includes(status);
+      })
+    ));
+    const waitingForPrewarmTerminalBatch = Boolean(
+      shouldPrewarmWorkspaceTerminals
+      && (!workspaceAgentLaunchKey || workspaceAgentBatchSentKey !== workspaceAgentLaunchKey)
+    );
+    const waitingForDirectTerminalOpen = Boolean(
+      !shouldPrewarmWorkspaceTerminals
+      && !selectedWorkspaceAgentTerminalOpened
+    );
     const shouldWaitForTerminalStartupScan = Boolean(
       selectedWorkspace?.id
       && activatedWorkspace?.id
       && selectedWorkspace.id === activatedWorkspace.id
       && activatedWorkspaceAgentTerminalEntries.length > 0
-      && (!workspaceAgentLaunchKey || workspaceAgentBatchSentKey !== workspaceAgentLaunchKey),
+      && (waitingForPrewarmTerminalBatch || waitingForDirectTerminalOpen),
     );
     if (shouldWaitForTerminalStartupScan) {
       return undefined;
@@ -11405,16 +11602,18 @@ export default function App() {
   }, [
     activatedWorkspaceTerminalWorkingDirectory,
     activatedWorkspace?.id,
-    activatedWorkspaceAgentTerminalEntries.length,
+    activatedWorkspaceAgentTerminalEntries,
     selectedWorkspace?.id,
     selectedWorkspace?.name,
     selectedWorkspaceFileRoot,
     selectedWorkspaceGraphState.rawScanSnapshot,
     selectedWorkspaceGraphState.rawScanState,
     setWorkspaceGraphStatus,
+    shouldPrewarmWorkspaceTerminals,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
     workspaceHydrationReady,
+    workspaceThreads,
   ]);
 
   useEffect(() => {
@@ -15565,6 +15764,9 @@ export default function App() {
                             gitRepositoriesPreload={workspaceGitRepositoryPreloads[
                               workspaceGitPullPromptCheckKey(runtimeWorkspace.id, runtimeDescriptor.workingDirectory)
                             ] || null}
+                            gitSnapshotsPreload={workspaceGitSnapshotPreloads[
+                              workspaceGitPullPromptCheckKey(runtimeWorkspace.id, runtimeDescriptor.workingDirectory)
+                            ] || null}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
                             isWorkspaceRuntimeVisible={runtimeVisible}
@@ -15575,6 +15777,7 @@ export default function App() {
                             onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
                             onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
+                            onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
                             onThreadTerminalLifecycle={handleThreadTerminalLifecycle}
                             refreshAgentStatuses={refreshAgentStatuses}

@@ -30,6 +30,17 @@ const LIVE_TERMINAL_STATUSES = new Set([
   "running",
   "starting",
 ]);
+const PROMPTING_CLEARING_TERMINAL_EVENT_TYPES = new Set([
+  "message-submitted",
+  "pending-prompt-sent",
+  "provider-turn-completed",
+  "provider-turn-error",
+  "provider-turn-interrupted",
+  "provider-turn-started",
+  "terminal-input-ready",
+  "terminal-prompt-ready",
+  "thread-starting",
+]);
 const THREAD_PROJECTION_EVENT_TYPES = new Set([
   "thread.activity",
   "thread.file",
@@ -139,6 +150,32 @@ function promptingUserFields(value = {}, fallback = {}) {
       : "",
     terminalIsPromptingUser: active,
   };
+}
+
+function eventExplicitlyPromptsUser(event = {}) {
+  return event?.terminalIsPromptingUser === true
+    || event?.promptingUser === true
+    || event?.requiresUserInput === true;
+}
+
+function promptingUserFieldsForTerminalEvent(event = {}, fallback = {}, options = {}) {
+  const eventType = cleanText(options.eventType || event?.type).toLowerCase();
+  const shouldClear = Boolean(
+    options.clear === true
+      || PROMPTING_CLEARING_TERMINAL_EVENT_TYPES.has(eventType)
+      || event?.terminalIsPromptingUser === false
+      || event?.promptingUser === false
+      || event?.requiresUserInput === false,
+  );
+  const value = shouldClear && !eventExplicitlyPromptsUser(event)
+    ? {
+        ...event,
+        promptingUser: false,
+        requiresUserInput: false,
+        terminalIsPromptingUser: false,
+      }
+    : event;
+  return promptingUserFields(value, fallback);
 }
 
 function cleanMessageText(value, fallback = "") {
@@ -2902,10 +2939,10 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
   const inputReadyConfidence = inputReady
     ? cleanText(event.inputReadyConfidence || event.promptReadyConfidence, existing.inputReadyConfidence)
     : "";
-  const terminalPromptingFields = promptingUserFields(
-    marksInputBusy ? { ...event, terminalIsPromptingUser: false } : event,
-    existing,
-  );
+  const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, existing, {
+    clear: marksInputBusy || marksInputReady,
+    eventType,
+  });
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
     inputReady,
@@ -4812,12 +4849,13 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     terminalBinding: existing.terminalBinding,
     updatedAt: existing.updatedAt,
   });
-  const inputReady = event.inputReady === true
+  const marksInputReady = event.inputReady === true
     || eventType === "terminal-input-ready"
     || eventType === "terminal-prompt-ready"
     || eventType === "provider-turn-completed"
     || eventType === "provider-turn-interrupted"
-    || eventType === "provider-turn-error"
+    || eventType === "provider-turn-error";
+  const inputReady = marksInputReady
     ? true
     : latestTurnState === "running"
       ? false
@@ -4831,10 +4869,10 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       existingProviderBindingForAgent?.inputReadyConfidence,
     )
     : "";
-  const providerPromptingFields = promptingUserFields(
-    inputReady ? event : { ...event, terminalIsPromptingUser: false },
-    existingProviderBindingForAgent,
-  );
+  const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, existingProviderBindingForAgent, {
+    clear: !inputReady || marksInputReady,
+    eventType,
+  });
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
   let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
@@ -4879,10 +4917,10 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
-    const terminalPromptingFields = promptingUserFields(
-      inputReady ? event : { ...event, terminalIsPromptingUser: false },
-      terminals[terminalKey],
-    );
+    const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
+      clear: !inputReady || marksInputReady,
+      eventType,
+    });
     terminals[terminalKey] = {
       ...terminals[terminalKey],
       inputReady,
@@ -4995,10 +5033,10 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       previousProviderBinding?.inputReadyConfidence,
     )
     : "";
-  const providerPromptingFields = promptingUserFields(
-    inputReady ? event : { ...event, terminalIsPromptingUser: false },
-    previousProviderBinding,
-  );
+  const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, previousProviderBinding, {
+    clear: !inputReady || marksInputReady,
+    eventType,
+  });
   providerBindings[agentId] = {
     ...previousProviderBinding,
     activityStatus,
@@ -5012,10 +5050,10 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
-    const terminalPromptingFields = promptingUserFields(
-      inputReady ? event : { ...event, terminalIsPromptingUser: false },
-      terminals[terminalKey],
-    );
+    const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
+      clear: !inputReady || marksInputReady,
+      eventType,
+    });
     terminals[terminalKey] = {
       ...terminals[terminalKey],
       inputReady,

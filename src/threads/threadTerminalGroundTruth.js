@@ -10,7 +10,12 @@ const COMPLETED_TURN_STATES = new Set(["completed", "error", "interrupted"]);
 const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
   "message-submitted",
   "pending-prompt-sent",
+  "provider-turn-completed",
+  "provider-turn-error",
+  "provider-turn-interrupted",
   "provider-turn-started",
+  "terminal-input-ready",
+  "terminal-prompt-ready",
   "thread-starting",
 ]);
 export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);

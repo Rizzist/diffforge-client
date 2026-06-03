@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -63,6 +63,52 @@ function taskTerminalPlan(task) {
     || jsonObject(task?.terminalTaskPlan)
     || jsonObject(metadata?.terminal_task_plan)
     || jsonObject(metadata?.terminalTaskPlan);
+}
+
+function taskPlanTaskId(task, fallback = "") {
+  const terminalPlan = taskTerminalPlan(task);
+  return text(
+    terminalPlan?.task_id
+      || terminalPlan?.taskId
+      || task?.task_id
+      || task?.taskId
+      || task?.id,
+    fallback,
+  );
+}
+
+function completedTerminalTaskPlan(plan) {
+  if (!plan) return null;
+  const steps = jsonArray(plan.steps).map((step, index) => {
+    if (typeof step === "string") {
+      return {
+        status: "completed",
+        step_index: index,
+        title: step,
+      };
+    }
+    return {
+      ...step,
+      status: "completed",
+    };
+  });
+  return {
+    ...plan,
+    current_step_index: steps.length ? steps.length - 1 : plan.current_step_index,
+    currentStepIndex: steps.length ? steps.length - 1 : plan.currentStepIndex,
+    status: "completed",
+    steps,
+  };
+}
+
+function taskWithCompletedTerminalPlan(task) {
+  const terminalPlan = taskTerminalPlan(task);
+  const completedPlan = completedTerminalTaskPlan(terminalPlan);
+  if (!completedPlan) return task;
+  return {
+    ...task,
+    terminal_task_plan: completedPlan,
+  };
 }
 
 function formatTime(value) {
@@ -656,14 +702,27 @@ export default function ArchitectureWorkspaceView({
   const [viewMode, setViewMode] = useState("taskHistory");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
   const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
+  const [finishedPlanTaskIds, setFinishedPlanTaskIds] = useState(() => new Set());
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
+  const visibleTasks = useMemo(() => {
+    if (!finishedPlanTaskIds.size) return tasks;
+    return tasks.map((task, index) => {
+      const taskId = taskPlanTaskId(task, `task-${index}`);
+      return finishedPlanTaskIds.has(taskId) ? taskWithCompletedTerminalPlan(task) : task;
+    });
+  }, [finishedPlanTaskIds, tasks]);
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
 
   useEffect(() => {
     setLocalArchitectureSnapshot(architectureSnapshot);
   }, [architectureSnapshot]);
+
+  useEffect(() => {
+    setFinishedPlanTaskIds(new Set());
+    setFinishPlanState({ error: "", taskId: "" });
+  }, [repoPath, workspaceId]);
 
   const refreshTaskHistorySnapshot = useCallback(() => {
     if (!repoPath || !workspaceId) {
@@ -696,22 +755,36 @@ export default function ArchitectureWorkspaceView({
       repoPath,
       input: {
         agent_id: terminalPlan?.agent_id || terminalPlan?.agentId || task?.agent_id || task?.agentId || taskAgentLabel(task),
+        direct_repo_target: true,
         session_id: terminalPlan?.session_id || terminalPlan?.sessionId || task?.session_id || task?.sessionId,
         task_id: taskId,
         workspace_id: workspaceId,
       },
     })
-      .then(() => refreshTaskHistorySnapshot())
+      .then((response) => {
+        if (response?.data?.plan_finished === false) {
+          throw new Error("No terminal plan was found to finish.");
+        }
+        setFinishedPlanTaskIds((current) => {
+          const next = new Set(current);
+          next.add(taskId);
+          return next;
+        });
+        setFinishPlanState((current) => (
+          current.taskId === taskId ? { error: "", taskId: "" } : current
+        ));
+        void refreshTaskHistorySnapshot().catch((error) => {
+          setFinishPlanState((current) => ({
+            ...current,
+            error: `Plan finished locally. Cloud refresh failed: ${error?.message || String(error || "Unable to refresh task history.")}`,
+          }));
+        });
+      })
       .catch((error) => {
         setFinishPlanState({
           error: error?.message || String(error || "Unable to finish terminal plan."),
           taskId: "",
         });
-      })
-      .finally(() => {
-        setFinishPlanState((current) => (
-          current.taskId === taskId ? { ...current, taskId: "" } : current
-        ));
       });
   }, [refreshTaskHistorySnapshot, repoPath, workspaceId]);
 
@@ -748,7 +821,7 @@ export default function ArchitectureWorkspaceView({
           finishPlanError={finishPlanState.error}
           finishingPlanTaskId={finishPlanState.taskId}
           onFinishPlan={finishTerminalTaskPlan}
-          tasks={tasks}
+          tasks={visibleTasks}
           repoLabel={repoLabel}
         />
       )}
@@ -908,10 +981,12 @@ function TaskDetailPanel({
           {canFinishPlan && (
             <FinishPlanButton
               disabled={finishingPlan}
+              data-loading={finishingPlan ? "true" : undefined}
               onClick={() => onFinishPlan(item)}
               type="button"
             >
-              {finishingPlan ? "Finishing..." : "Finish plan"}
+              {finishingPlan && <FinishPlanButtonSpinner aria-hidden="true" />}
+              <span>{finishingPlan ? "Finishing..." : "Finish plan"}</span>
             </FinishPlanButton>
           )}
         </TaskDetailsHeaderActions>
@@ -1585,7 +1660,17 @@ const TaskDetailsUpdated = styled.span`
   white-space: nowrap;
 `;
 
+const finishPlanButtonSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const FinishPlanButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
   min-height: 24px;
   padding: 0 8px;
   border: 1px solid rgba(96, 165, 250, 0.18);
@@ -1609,6 +1694,20 @@ const FinishPlanButton = styled.button`
     cursor: default;
     opacity: 0.55;
   }
+
+  &[data-loading="true"] {
+    opacity: 0.82;
+  }
+`;
+
+const FinishPlanButtonSpinner = styled.i`
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 2px solid rgba(191, 219, 254, 0.22);
+  border-top-color: rgba(191, 219, 254, 0.88);
+  border-radius: 50%;
+  animation: ${finishPlanButtonSpin} 720ms linear infinite;
 `;
 
 const TaskDetailsTitle = styled.strong`

@@ -544,46 +544,83 @@ pub fn coordination_terminal_task_plan_finish(
     db_path: Option<String>,
     input: Value,
 ) -> Result<Value, String> {
-    let kernel = kernel(repo_path, db_path)?;
+    let direct_repo_target = input["direct_repo_target"]
+        .as_bool()
+        .or_else(|| input["directRepoTarget"].as_bool())
+        .unwrap_or(false);
+    let kernel = if direct_repo_target
+        && repo_path
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    {
+        let repo_path = coordination_input_root(repo_path)?;
+        let db_path = clean_optional_path(db_path);
+        CoordinationKernel::open(repo_path, db_path)?
+    } else {
+        kernel(repo_path, db_path)?
+    };
     let task_id = input["task_id"]
         .as_str()
         .or_else(|| input["taskId"].as_str())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "task_id is required.".to_string())?;
+        .ok_or_else(|| "task_id is required.".to_string())?
+        .to_string();
     let agent_id = input["agent_id"]
         .as_str()
-        .or_else(|| input["agentId"].as_str());
+        .or_else(|| input["agentId"].as_str())
+        .map(str::to_string);
     let session_id = input["session_id"]
         .as_str()
-        .or_else(|| input["sessionId"].as_str());
-    let finished = kernel.finish_terminal_task_plan(task_id, "completed", agent_id, session_id)?;
+        .or_else(|| input["sessionId"].as_str())
+        .map(str::to_string);
+    let workspace_id = input["workspace_id"]
+        .as_str()
+        .or_else(|| input["workspaceId"].as_str())
+        .map(str::to_string);
+    let worktree_id = input["worktree_id"]
+        .as_str()
+        .or_else(|| input["worktreeId"].as_str())
+        .map(str::to_string);
+    let worktree_path = input["worktree_path"]
+        .as_str()
+        .or_else(|| input["worktreePath"].as_str())
+        .map(str::to_string);
+    let finished = kernel.finish_terminal_task_plan(
+        &task_id,
+        "completed",
+        agent_id.as_deref(),
+        session_id.as_deref(),
+    )?;
     let mut response = api_ok(json!({
         "plan_finished": finished.is_some(),
         "result": finished,
     }));
     let compact_plan = response["data"]["result"]["compact_plan"].clone();
     let cloud = if !compact_plan.is_null() {
-        match crate::cloud_mcp_forward_terminal_task_plan_update(
-            Some(&kernel.paths.repo_path.display().to_string()),
-            Some(&kernel.paths.db_path),
-            input["workspace_id"]
-                .as_str()
-                .or_else(|| input["workspaceId"].as_str()),
-            agent_id,
-            session_id,
-            Some(task_id),
-            input["worktree_id"]
-                .as_str()
-                .or_else(|| input["worktreeId"].as_str()),
-            input["worktree_path"]
-                .as_str()
-                .or_else(|| input["worktreePath"].as_str()),
-            "user_finished_terminal_task_plan",
-            &compact_plan,
-        ) {
-            Ok(value) => json!({"ok": true, "response": value}),
-            Err(error) => json!({"ok": false, "error": error}),
-        }
+        let repo_path = kernel.paths.repo_path.display().to_string();
+        let db_path = kernel.paths.db_path.clone();
+        let cloud_task_id = task_id.clone();
+        let cloud_agent_id = agent_id.clone();
+        let cloud_session_id = session_id.clone();
+        let cloud_workspace_id = workspace_id.clone();
+        let cloud_worktree_id = worktree_id.clone();
+        let cloud_worktree_path = worktree_path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _ = crate::cloud_mcp_forward_terminal_task_plan_update(
+                Some(&repo_path),
+                Some(&db_path),
+                cloud_workspace_id.as_deref(),
+                cloud_agent_id.as_deref(),
+                cloud_session_id.as_deref(),
+                Some(&cloud_task_id),
+                cloud_worktree_id.as_deref(),
+                cloud_worktree_path.as_deref(),
+                "user_finished_terminal_task_plan",
+                &compact_plan,
+            );
+        });
+        json!({"ok": true, "queued": true, "mode": "background"})
     } else {
         json!({"ok": false, "skipped": true, "reason": "no_compact_plan"})
     };

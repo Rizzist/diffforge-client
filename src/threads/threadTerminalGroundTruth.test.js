@@ -247,6 +247,48 @@ test("live terminal permission prompts still block shutdown", () => {
   assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), true);
 });
 
+test("terminal prompt readiness clears stale terminal prompt signals", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    lifecycleEvent: {
+      outputText: "Allow command to run?",
+      source: "terminal-output-prompt-ready",
+      type: "terminal-prompt-ready",
+    },
+    liveTerminal: {
+      activityStatus: "idle",
+      inputReady: true,
+      promptingUserKind: "permission",
+      promptingUserSource: "terminal-output",
+      promptingUserText: "Allow command to run?",
+      status: "idle",
+      terminalIsPromptingUser: true,
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: true,
+      promptingUserKind: "permission",
+      promptingUserSource: "terminal-output",
+      promptingUserText: "Allow command to run?",
+      status: "idle",
+      terminalIsPromptingUser: true,
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        state: "completed",
+      },
+      messageCount: 0,
+      messages: [],
+      projectionEvents: [],
+    },
+  });
+
+  assert.equal(groundTruth.terminalIsPromptingUser, false);
+  assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), false);
+  assert.equal(groundTruth.terminalWorkState, "complete");
+});
+
 test("fresh prompt readiness settles a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {

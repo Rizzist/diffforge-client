@@ -442,6 +442,99 @@ test("prompt-ready can make a terminal visually idle without releasing pending s
   assert.equal(normalizedThread.providerBindings.codex.inputReady, true);
 });
 
+test("prompt-ready clears stale prompting fields from terminal state", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const paneId = "pane-test";
+  const promptReadyAt = "2026-05-31T04:16:11.000Z";
+
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminalOrder: ["0"],
+      terminals: {
+        0: {
+          agentId: "codex",
+          inputReady: false,
+          instanceId: 1,
+          paneId,
+          promptingUserKind: "permission",
+          promptingUserSource: "terminal-output",
+          promptingUserText: "Allow command to run?",
+          status: "active",
+          terminalIndex: 0,
+          terminalIsPromptingUser: true,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          activityStatus: "idle",
+          currentAgent: "codex",
+          id: threadId,
+          latestTurn: {
+            state: "completed",
+          },
+          materialized: true,
+          messageCount: 0,
+          messages: [],
+          projectionEvents: [],
+          providerBindings: {
+            codex: {
+              activityStatus: "idle",
+              inputReady: false,
+              promptingUserKind: "permission",
+              promptingUserSource: "terminal-output",
+              promptingUserText: "Allow command to run?",
+              status: "active",
+              terminalBinding: {
+                instanceId: 1,
+                paneId,
+                terminalIndex: 0,
+              },
+              terminalIsPromptingUser: true,
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId,
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const next = markWorkspaceThreadAgentActivity(state, {
+    activityStatus: "idle",
+    agentId: "codex",
+    inputReady: true,
+    inputReadyAt: promptReadyAt,
+    instanceId: 1,
+    paneId,
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "terminal-prompt-ready",
+    workspaceId,
+  });
+
+  const thread = next[workspaceId].threads[threadId];
+  assert.equal(thread.providerBindings.codex.inputReady, true);
+  assert.equal(thread.providerBindings.codex.terminalIsPromptingUser, false);
+  assert.equal(thread.providerBindings.codex.promptingUserKind, "");
+  assert.equal(thread.providerBindings.codex.promptingUserSource, "");
+  assert.equal(next[workspaceId].terminals[0].inputReady, true);
+  assert.equal(next[workspaceId].terminals[0].terminalIsPromptingUser, false);
+  assert.equal(next[workspaceId].terminals[0].promptingUserKind, "");
+  assert.equal(next[workspaceId].terminals[0].promptingUserSource, "");
+});
+
 test("detached session transcript completion settles matching idle running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
