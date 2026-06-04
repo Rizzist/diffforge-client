@@ -5,9 +5,9 @@ import {
   withDiagnosticIpcDropCount,
 } from "../diagnostics/diagnosticIpcBudget.js";
 
-export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
-export const TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED = false;
-export const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED = false;
+export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = true;
+export const TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED = true;
+export const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED = true;
 
 const TERMINAL_DIAGNOSTIC_HEARTBEAT_MS = 100;
 const TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS = 120;

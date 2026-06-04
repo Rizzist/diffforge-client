@@ -1487,6 +1487,7 @@ const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 24000;
 const TODO_QUEUE_NOTE_LINE_THRESHOLD = 6;
 const TODO_QUEUE_NOTE_TITLE_LENGTH = 42;
 const TODO_QUEUE_MAX_PASTE_IMAGES = 8;
+const TODO_QUEUE_DRAG_HOLD_MS = 140;
 const ORCHESTRATOR_VOICE_HISTORY_MAX_TURNS = 24;
 const TODO_QUEUE_IMAGE_TERMINALS = new Set(["codex", "claude"]);
 const VOICE_PLAN_STAGE_ORDER = ["execution", "revision"];
@@ -3563,6 +3564,20 @@ function getTodoDropTargetFromPoint({
   return null;
 }
 
+function getTerminalSurfaceSlotIndexFromPoint(clientX, clientY, terminalIndexes) {
+  if (typeof document === "undefined" || typeof document.elementFromPoint !== "function") {
+    return null;
+  }
+
+  const element = document.elementFromPoint(clientX, clientY);
+  const slot = element?.closest?.("[data-terminal-surface-slot='true']");
+  const terminalIndex = Number.parseInt(slot?.getAttribute?.("data-terminal-index") || "", 10);
+
+  return Number.isInteger(terminalIndex) && (terminalIndexes || []).includes(terminalIndex)
+    ? terminalIndex
+    : null;
+}
+
 function getRowsWithMetrics(rows, rects, containerRect, draggedTerminalIndex) {
   return cloneTerminalRows(rows)
     .map((row, rowIndex) => {
@@ -4211,6 +4226,34 @@ function terminalBreakoutPlanEventText(payload, keys) {
     }
   }
   return "";
+}
+
+function terminalBreakoutPlanSnapshotFromEventPayload(payload) {
+  const snapshot = terminalBreakoutPlanData(
+    payload?.planSnapshot
+      || payload?.plan_snapshot
+      || payload?.snapshot
+      || payload?.data?.planSnapshot
+      || payload?.data?.plan_snapshot
+      || null,
+  );
+  if (snapshot?.selected_plan || snapshot?.selectedPlan || Array.isArray(snapshot?.history)) {
+    return {
+      ...snapshot,
+      selected_plan: snapshot.selected_plan || snapshot.selectedPlan || null,
+      history: Array.isArray(snapshot.history) ? snapshot.history : [],
+    };
+  }
+
+  const plan = payload?.plan || payload?.selectedPlan || payload?.selected_plan || null;
+  if (plan && typeof plan === "object") {
+    return {
+      history: [plan],
+      selected_plan: plan,
+      title_max_chars: plan.title_max_chars || plan.titleMaxChars,
+    };
+  }
+  return null;
 }
 
 function terminalBreakoutPlanEventMatchesTarget(payload, target) {
@@ -6752,6 +6795,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   });
   const todoBoardRef = useRef(null);
   const todoItemElementsRef = useRef(new Map());
+  const todoDragGestureRef = useRef(null);
   const todoReorderDragRef = useRef(null);
   const draftTextAreaRef = useRef(null);
   const editingTextAreaRef = useRef(null);
@@ -7775,6 +7819,44 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     todoItemElementsRef.current.delete(itemId);
   }, []);
 
+  const clearPendingTodoDragGesture = useCallback(() => {
+    const gesture = todoDragGestureRef.current;
+    if (!gesture) {
+      return;
+    }
+
+    if (gesture.timerId) {
+      window.clearTimeout(gesture.timerId);
+    }
+    gesture.cleanup?.();
+    todoDragGestureRef.current = null;
+  }, []);
+
+  useEffect(() => () => {
+    clearPendingTodoDragGesture();
+  }, [clearPendingTodoDragGesture]);
+
+  const beginPendingTodoDragGesture = useCallback((gesture, pointerEvent = null) => {
+    if (!gesture || todoDragGestureRef.current !== gesture || gesture.started) {
+      return;
+    }
+
+    gesture.started = true;
+    const clientX = Number(pointerEvent?.clientX ?? gesture.lastX ?? gesture.clientX ?? 0);
+    const clientY = Number(pointerEvent?.clientY ?? gesture.lastY ?? gesture.clientY ?? 0);
+    clearPendingTodoDragGesture();
+    todoReorderDragRef.current = {
+      itemId: gesture.itemId,
+      pointerId: gesture.pointerId,
+    };
+    setReorderingItemId(gesture.itemId);
+    onBeginTodoDrag?.({
+      ...gesture.dragEvent,
+      clientX,
+      clientY,
+    });
+  }, [clearPendingTodoDragGesture, onBeginTodoDrag]);
+
   const handlePointerDown = useCallback((event, item) => {
     if (
       event.button !== 0
@@ -7807,12 +7889,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
     event.preventDefault();
     event.stopPropagation();
-    todoReorderDragRef.current = {
-      itemId: item.id,
-      pointerId: event.pointerId,
-    };
-    setReorderingItemId(item.id);
-    onBeginTodoDrag?.({
+    clearPendingTodoDragGesture();
+
+    const dragEvent = {
       clientX: event.clientX,
       clientY: event.clientY,
       item: {
@@ -7826,8 +7905,74 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       pointerId: event.pointerId,
       sourceRect,
       workspaceId,
-    });
-  }, [editingItemId, onBeginTodoDrag, pendingItems, workspaceId]);
+    };
+    const sidebarRect = event.currentTarget
+      ?.closest?.("[data-workspace-tool-panel='true']")
+      ?.getBoundingClientRect?.()
+      || todoBoardRef.current?.getBoundingClientRect?.()
+      || null;
+    const gesture = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      cleanup: null,
+      dragEvent,
+      itemId: item.id,
+      lastX: event.clientX,
+      lastY: event.clientY,
+      pointerId: event.pointerId,
+      sidebarRect,
+      startX: event.clientX,
+      startY: event.clientY,
+      started: false,
+      timerId: 0,
+    };
+
+    const handlePendingPointerMove = (moveEvent) => {
+      if (moveEvent.pointerId !== gesture.pointerId || todoDragGestureRef.current !== gesture) {
+        return;
+      }
+
+      gesture.lastX = moveEvent.clientX;
+      gesture.lastY = moveEvent.clientY;
+      const leftSidebar = Boolean(
+        gesture.sidebarRect
+        && !pointIsInRect(moveEvent.clientX, moveEvent.clientY, gesture.sidebarRect),
+      );
+      if (!leftSidebar) {
+        return;
+      }
+
+      moveEvent.preventDefault();
+      moveEvent.stopPropagation();
+      beginPendingTodoDragGesture(gesture, moveEvent);
+    };
+    const handlePendingPointerEnd = (endEvent) => {
+      if (endEvent.pointerId !== gesture.pointerId || todoDragGestureRef.current !== gesture) {
+        return;
+      }
+
+      clearPendingTodoDragGesture();
+    };
+
+    gesture.cleanup = () => {
+      window.removeEventListener("pointermove", handlePendingPointerMove);
+      window.removeEventListener("pointerup", handlePendingPointerEnd);
+      window.removeEventListener("pointercancel", handlePendingPointerEnd);
+    };
+    gesture.timerId = window.setTimeout(() => {
+      beginPendingTodoDragGesture(gesture, gesture);
+    }, TODO_QUEUE_DRAG_HOLD_MS);
+    todoDragGestureRef.current = gesture;
+    window.addEventListener("pointermove", handlePendingPointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePendingPointerEnd);
+    window.addEventListener("pointercancel", handlePendingPointerEnd);
+  }, [
+    beginPendingTodoDragGesture,
+    clearPendingTodoDragGesture,
+    editingItemId,
+    pendingItems,
+    workspaceId,
+  ]);
 
   useEffect(() => {
     if (!editingItemId) {
@@ -9214,6 +9359,23 @@ function TerminalView({
       return null;
     }
 
+    if (terminalBreakoutLayoutActive) {
+      const surfaceSlotIndex = getTerminalSurfaceSlotIndexFromPoint(clientX, clientY, logicalTerminalIndexes);
+      if (!Number.isInteger(surfaceSlotIndex)) {
+        return null;
+      }
+
+      const targetTerminalIndex = getTodoDropTargetFromPoint({
+        clientX,
+        clientY,
+        containerRect,
+        fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
+        rects: getTerminalHitTestRects(),
+        terminalIndexes: [surfaceSlotIndex],
+      });
+      return targetTerminalIndex === surfaceSlotIndex ? surfaceSlotIndex : null;
+    }
+
     return getTodoDropTargetFromPoint({
       clientX,
       clientY,
@@ -9222,7 +9384,13 @@ function TerminalView({
       rects: getTerminalHitTestRects(),
       terminalIndexes: logicalTerminalIndexes,
     });
-  }, [fullscreenActive, fullscreenTerminalIndex, getTerminalHitTestRects, logicalTerminalIndexes]);
+  }, [
+    fullscreenActive,
+    fullscreenTerminalIndex,
+    getTerminalHitTestRects,
+    logicalTerminalIndexes,
+    terminalBreakoutLayoutActive,
+  ]);
   const queueWorkspaceFileForTerminalIndex = useCallback((workspaceFile, targetTerminalIndex, source = "fileviewer_global_drop") => {
     if (!Number.isInteger(targetTerminalIndex)) {
       logFileDragDiagnosticEvent("terminal_grid.drop_skip", {
@@ -9866,6 +10034,24 @@ function TerminalView({
         terminalBreakoutPlanEventMatchesTarget(payload, target)
       ));
       if (!matchingTargets.length) {
+        return;
+      }
+
+      const eventSnapshot = terminalBreakoutPlanSnapshotFromEventPayload(payload);
+      if (eventSnapshot) {
+        matchingTargets.forEach((target) => {
+          cacheTerminalBreakoutPlanSnapshot(target.cacheKey, eventSnapshot);
+        });
+        setTerminalBreakoutPlanSnapshots((currentSnapshots) => {
+          const nextSnapshots = { ...currentSnapshots };
+          matchingTargets.forEach((target) => {
+            nextSnapshots[target.cacheKey] = {
+              snapshot: eventSnapshot,
+              updatedAt: Date.now(),
+            };
+          });
+          return nextSnapshots;
+        });
         return;
       }
 
@@ -14821,15 +15007,7 @@ function TerminalView({
 
     measureTerminalLayout();
 
-    const containerRect = terminalPanelsRef.current?.getBoundingClientRect?.();
-    const targetTerminalIndex = getTodoDropTargetFromPoint({
-      clientX: event.clientX,
-      clientY: event.clientY,
-      containerRect,
-      fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-      rects: getTerminalHitTestRects(),
-      terminalIndexes: logicalTerminalIndexes,
-    });
+    const targetTerminalIndex = resolveTerminalDropTarget(event.clientX, event.clientY);
     const dragWidth = Math.max(220, Number(sourceRect.width || 0));
     const dragHeight = Math.max(0, Number(sourceRect.height || 0));
     const offsetX = dragWidth / 2;
@@ -14848,17 +15026,15 @@ function TerminalView({
       source: normalizeTodoQueueSource(event.item?.source),
       ...(image ? { image } : {}),
       ...(note ? { note } : {}),
+      ...(event.item?.planTask ? { planTask: event.item.planTask } : {}),
       width: dragWidth,
       workspaceId: event.workspaceId || terminalWorkspace.id,
       x: Number(event.clientX || 0) - offsetX,
       y: Number(event.clientY || 0) - offsetY,
     });
   }, [
-    fullscreenActive,
-    fullscreenTerminalIndex,
-    getTerminalHitTestRects,
-    logicalTerminalIndexes,
     measureTerminalLayout,
+    resolveTerminalDropTarget,
     terminalDragActive,
     terminalWorkspace?.id,
     updateTodoDragState,
@@ -16097,6 +16273,8 @@ function TerminalView({
               data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
               data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
               data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
+              data-terminal-index={terminalIndex}
+              data-terminal-surface-slot="true"
               key={`${terminalWorkspace.id}-${terminalIndex}`}
               onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
               style={getTerminalSlotStyle(terminalIndex)}

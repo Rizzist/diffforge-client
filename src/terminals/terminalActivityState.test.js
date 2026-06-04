@@ -74,9 +74,26 @@ test("prompt-ready backend output is emitted again for a restarted terminal epoc
   }), true);
 });
 
-test("prompt-ready backend output is deferred while the owning turn is running", () => {
+test("trusted prompt-ready backend output can settle the owning running turn", () => {
+  assert.equal(getPromptReadyLifecycleDeferral({
+    latestTurn: {
+      messageId: "prompt-1",
+      state: "running",
+      turnId: "turn-prompt-1",
+    },
+    submittedPrompt: {
+      promptEventId: "prompt-1",
+      threadId: "thread-1",
+    },
+    source: "backend-terminal-output-prompt-ready",
+    threadId: "thread-1",
+  }), null);
+});
+
+test("trusted prompt-ready backend output is deferred without the current prompt epoch", () => {
   assert.deepEqual(getPromptReadyLifecycleDeferral({
     latestTurn: {
+      messageId: "prompt-1",
       state: "running",
     },
     source: "backend-terminal-output-prompt-ready",
@@ -84,6 +101,39 @@ test("prompt-ready backend output is deferred while the owning turn is running",
   }), {
     latestTurnState: "running",
     pendingPromptPresent: false,
+    reason: "prompt_ready_not_current_running_turn",
+    source: "backend-terminal-output-prompt-ready",
+  });
+});
+
+test("untrusted prompt-ready sources are deferred while the owning turn is running", () => {
+  assert.deepEqual(getPromptReadyLifecycleDeferral({
+    latestTurn: {
+      state: "running",
+    },
+    source: "timer",
+    threadId: "thread-1",
+  }), {
+    latestTurnState: "running",
+    pendingPromptPresent: false,
+    reason: "prompt_ready_not_current_running_turn",
+    source: "timer",
+  });
+});
+
+test("trusted prompt-ready backend output waits while a prompt is still pending", () => {
+  assert.deepEqual(getPromptReadyLifecycleDeferral({
+    latestTurn: {
+      state: "running",
+    },
+    pendingPrompt: {
+      id: "prompt-1",
+    },
+    source: "backend-terminal-output-prompt-ready",
+    threadId: "thread-1",
+  }), {
+    latestTurnState: "running",
+    pendingPromptPresent: true,
     reason: "running_turn_still_active",
     source: "backend-terminal-output-prompt-ready",
   });

@@ -1,5 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { StyleSheetManager } from "styled-components";
 
 import App from "./App.jsx";
 
@@ -11,5 +12,9 @@ window.addEventListener("unhandledrejection", (event) => {
 });
 
 createRoot(document.querySelector("#app")).render(
-  React.createElement(App),
+  React.createElement(
+    StyleSheetManager,
+    { disableCSSOMInjection: true },
+    React.createElement(App),
+  ),
 );

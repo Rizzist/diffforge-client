@@ -439,6 +439,7 @@ async fn write_to_active_terminal_audio_input_target(
         None,
         None,
         None,
+        true,
     )
     .await?;
     emit_terminal_audio_input_refocus(app, &target, Some(data));
@@ -6366,9 +6367,44 @@ pub(crate) fn observe_terminal_coordination_event(
             "artifactId": refs.artifact_id,
             "contextRunId": refs.context_run_id,
         });
+        let task_id = refs.task_id.clone();
+        let agent_id = refs.agent_id.clone();
+        let session_id = refs.session_id.clone();
 
         tauri::async_runtime::spawn(async move {
             sleep(Duration::from_millis(35)).await;
+            let plan_repo_path = repo_path.clone();
+            let plan_db_path = db_path.clone();
+            let plan_task_id = task_id.clone();
+            let plan_agent_id = agent_id.clone();
+            let plan_session_id = session_id.clone();
+            let plan_snapshot = tauri::async_runtime::spawn_blocking(move || {
+                crate::coordination::CoordinationKernel::open(plan_repo_path, Some(plan_db_path))?
+                    .terminal_task_plan_event_snapshot(
+                        plan_task_id.as_deref(),
+                        plan_session_id.as_deref(),
+                        plan_agent_id.as_deref(),
+                    )
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|value| value.get("data").cloned().or(Some(value)))
+            .filter(|value| !value.is_null());
+            let selected_plan = plan_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("selected_plan")
+                        .or_else(|| snapshot.get("selectedPlan"))
+                })
+                .cloned()
+                .filter(|value| !value.is_null());
+            let plan_history = plan_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("history"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             let _ = app.emit(
                 TERMINAL_TASK_PLAN_UPDATED_EVENT,
                 json!({
@@ -6376,7 +6412,14 @@ pub(crate) fn observe_terminal_coordination_event(
                     "repoPath": repo_path.display().to_string(),
                     "dbPath": db_path.display().to_string(),
                     "eventType": event_type,
+                    "taskId": task_id,
+                    "agentId": agent_id,
+                    "sessionId": session_id,
                     "refs": refs_payload,
+                    "plan": selected_plan.clone(),
+                    "selectedPlan": selected_plan,
+                    "history": plan_history,
+                    "planSnapshot": plan_snapshot,
                     "payload": payload,
                 }),
             );
@@ -7589,6 +7632,413 @@ fn terminal_prompt_submitted_source_is_authoritative(
     }
 }
 
+fn terminal_input_queue_key(pane_id: &str, instance_id: Option<u64>) -> String {
+    format!("{pane_id}:{}", instance_id.unwrap_or_default())
+}
+
+fn spawn_terminal_input_queue_worker(
+    app: AppHandle,
+    queue_key: String,
+    queue_id: u64,
+    mut receiver: mpsc::Receiver<TerminalInputQueueItem>,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let item = match timeout(
+                Duration::from_secs(TERMINAL_INPUT_QUEUE_IDLE_SECS),
+                receiver.recv(),
+            )
+            .await
+            {
+                Ok(Some(payload)) => payload,
+                Ok(None) | Err(_) => break,
+            };
+
+            let TerminalInputQueueItem { payload, ack } = item;
+            let pane_id = payload.pane_id.clone();
+            let instance_id = payload.instance_id;
+            let state = app.state::<TerminalState>();
+            let cloud_mcp_state = app.state::<CloudMcpState>();
+            let write_result = terminal_write_inner(
+                app.clone(),
+                state.inner(),
+                cloud_mcp_state.inner(),
+                payload.pane_id,
+                payload.instance_id,
+                payload.data,
+                payload.prompt_event_id,
+                payload.prompt_event_revision,
+                payload.prompt_event_source,
+                payload.prompt_event_submitted_at,
+                payload.prompt_event_text,
+                payload.thread_id,
+                true,
+            )
+            .await;
+
+            match write_result {
+                Ok(()) => {
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Ok(()));
+                    }
+                }
+                Err(error) => {
+                    emit_terminal_input_error(&app, pane_id, instance_id, error.clone());
+                    if let Some(ack) = ack {
+                        let _ = ack.send(Err(error));
+                    }
+                }
+            }
+        }
+
+        let state = app.state::<TerminalState>();
+        if let Ok(mut queues) = state.terminal_input_queues.lock() {
+            if queues
+                .get(&queue_key)
+                .is_some_and(|handle| handle.id == queue_id)
+            {
+                queues.remove(&queue_key);
+            }
+        };
+    });
+}
+
+fn enqueue_terminal_input_event(app: &AppHandle, payload: TerminalInputEventPayload) {
+    enqueue_terminal_input_queue_item(app, payload, None);
+}
+
+fn enqueue_terminal_input_event_with_ack(
+    app: &AppHandle,
+    payload: TerminalInputEventPayload,
+) -> oneshot::Receiver<Result<(), String>> {
+    let (ack_sender, ack_receiver) = oneshot::channel();
+    enqueue_terminal_input_queue_item(app, payload, Some(ack_sender));
+    ack_receiver
+}
+
+fn send_terminal_input_queue_ack(
+    ack: Option<oneshot::Sender<Result<(), String>>>,
+    result: Result<(), String>,
+) {
+    if let Some(ack) = ack {
+        let _ = ack.send(result);
+    }
+}
+
+fn enqueue_terminal_input_queue_item(
+    app: &AppHandle,
+    payload: TerminalInputEventPayload,
+    ack: Option<oneshot::Sender<Result<(), String>>>,
+) {
+    let pane_id = payload.pane_id.clone();
+    let instance_id = payload.instance_id;
+
+    if let Err(error) = validate_terminal_pane_id(&pane_id) {
+        emit_terminal_input_error(app, pane_id, instance_id, error.clone());
+        send_terminal_input_queue_ack(ack, Err(error));
+        return;
+    }
+
+    if payload.data.len() > MAX_TERMINAL_WRITE_BYTES {
+        let error = "Terminal input chunk is too large.".to_string();
+        emit_terminal_input_error(
+            app,
+            pane_id,
+            instance_id,
+            error.clone(),
+        );
+        send_terminal_input_queue_ack(ack, Err(error));
+        return;
+    }
+
+    let state = app.state::<TerminalState>();
+    let queue_key = terminal_input_queue_key(&payload.pane_id, payload.instance_id);
+    let mut item = TerminalInputQueueItem { payload, ack };
+
+    loop {
+        let handle = match state.terminal_input_queues.lock() {
+            Ok(mut queues) => {
+                if let Some(handle) = queues.get(&queue_key).cloned() {
+                    handle
+                } else {
+                    let (sender, receiver) = mpsc::channel(TERMINAL_INPUT_QUEUE_CAPACITY);
+                    let handle = TerminalInputQueueHandle {
+                        id: state
+                            .next_terminal_input_queue_id
+                            .fetch_add(1, Ordering::AcqRel),
+                        sender,
+                    };
+                    queues.insert(queue_key.clone(), handle.clone());
+                    spawn_terminal_input_queue_worker(
+                        app.clone(),
+                        queue_key.clone(),
+                        handle.id,
+                        receiver,
+                    );
+                    handle
+                }
+            }
+            Err(_) => {
+                let error = "Unable to queue terminal input.".to_string();
+                emit_terminal_input_error(
+                    app,
+                    pane_id,
+                    instance_id,
+                    error.clone(),
+                );
+                send_terminal_input_queue_ack(item.ack, Err(error));
+                return;
+            }
+        };
+
+        match handle.sender.try_send(item) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(returned_item)) => {
+                let error = "Terminal input queue is full.".to_string();
+                emit_terminal_input_error(
+                    app,
+                    pane_id,
+                    instance_id,
+                    error.clone(),
+                );
+                send_terminal_input_queue_ack(returned_item.ack, Err(error));
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(returned_item)) => {
+                if let Ok(mut queues) = state.terminal_input_queues.lock() {
+                    if queues
+                        .get(&queue_key)
+                        .is_some_and(|current| current.id == handle.id)
+                    {
+                        queues.remove(&queue_key);
+                    }
+                }
+                item = returned_item;
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn terminal_input_transport_endpoint(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+) -> Result<TerminalInputTransportEndpoint, String> {
+    if let Ok(transport) = state.terminal_input_transport.lock() {
+        if let Some(endpoint) = transport.clone() {
+            return Ok(endpoint);
+        }
+    } else {
+        return Err("Unable to read terminal input transport.".to_string());
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("Unable to start terminal input transport: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Unable to read terminal input transport address: {error}"))?
+        .port();
+    let endpoint = TerminalInputTransportEndpoint {
+        url: format!("ws://127.0.0.1:{port}/terminal-input"),
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+
+    {
+        let mut transport = state
+            .terminal_input_transport
+            .lock()
+            .map_err(|_| "Unable to save terminal input transport.".to_string())?;
+        if let Some(existing) = transport.clone() {
+            return Ok(existing);
+        }
+        *transport = Some(endpoint.clone());
+    }
+
+    spawn_terminal_input_transport_listener(app, listener, endpoint.token.clone());
+    Ok(endpoint)
+}
+
+fn spawn_terminal_input_transport_listener(
+    app: AppHandle,
+    listener: TcpListener,
+    expected_token: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let app_handle = app.clone();
+            let token = expected_token.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_terminal_input_transport_connection(app_handle, stream, token).await;
+            });
+        }
+    });
+}
+
+async fn handle_terminal_input_transport_connection(
+    app: AppHandle,
+    stream: TcpStream,
+    expected_token: String,
+) {
+    let Ok(mut socket) = accept_async(stream).await else {
+        return;
+    };
+
+    while let Some(message) = socket.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let Some(ack) =
+                    handle_terminal_input_transport_message(&app, &expected_token, text.as_ref())
+                        .await
+                else {
+                    let _ = socket.close(None).await;
+                    break;
+                };
+                if let Some(ack) = ack {
+                    let _ = socket
+                        .send(Message::Text(
+                            serde_json::to_string(&ack)
+                                .unwrap_or_else(|_| {
+                                    "{\"type\":\"terminal-input-ack\",\"messageId\":\"\",\"ok\":false,\"error\":\"Unable to serialize terminal input acknowledgement.\"}".to_string()
+                                })
+                                .into(),
+                        ))
+                        .await;
+                }
+            }
+            Ok(Message::Binary(bytes)) => {
+                let Ok(text) = std::str::from_utf8(bytes.as_ref()) else {
+                    continue;
+                };
+                let Some(ack) =
+                    handle_terminal_input_transport_message(&app, &expected_token, text).await
+                else {
+                    let _ = socket.close(None).await;
+                    break;
+                };
+                if let Some(ack) = ack {
+                    let _ = socket
+                        .send(Message::Text(
+                            serde_json::to_string(&ack)
+                                .unwrap_or_else(|_| {
+                                    "{\"type\":\"terminal-input-ack\",\"messageId\":\"\",\"ok\":false,\"error\":\"Unable to serialize terminal input acknowledgement.\"}".to_string()
+                                })
+                                .into(),
+                        ))
+                        .await;
+                }
+            }
+            Ok(Message::Ping(payload)) => {
+                let _ = socket.send(Message::Pong(payload)).await;
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+async fn handle_terminal_input_transport_message(
+    app: &AppHandle,
+    expected_token: &str,
+    text: &str,
+) -> Option<Option<TerminalInputTransportAck>> {
+    if text.len() > MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES {
+        emit_terminal_input_error(
+            app,
+            String::new(),
+            None,
+            "Terminal input transport message is too large.".to_string(),
+        );
+        return Some(None);
+    }
+
+    let envelope = match serde_json::from_str::<TerminalInputTransportEnvelope>(text) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            emit_terminal_input_error(
+                app,
+                String::new(),
+                None,
+                format!("Unable to parse terminal input transport message: {error}"),
+            );
+            return Some(None);
+        }
+    };
+    let message_id = envelope
+        .message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if envelope.token != expected_token {
+        emit_terminal_input_error(
+            app,
+            envelope.payload.pane_id,
+            envelope.payload.instance_id,
+            "Terminal input transport authentication failed.".to_string(),
+        );
+        return None;
+    }
+
+    let Some(message_id) = message_id else {
+        enqueue_terminal_input_event(app, envelope.payload);
+        return Some(None);
+    };
+
+    let ack_payload_log = json!({
+        "data": terminal_write_data_diagnostic(&envelope.payload.data),
+        "has_prompt_event_id": envelope
+            .payload
+            .prompt_event_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "has_prompt_event_text": envelope
+            .payload
+            .prompt_event_text
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "instance_id": envelope.payload.instance_id,
+        "message_id": clean_terminal_diagnostic_log_text(&message_id),
+        "pane_id": clean_terminal_diagnostic_log_text(&envelope.payload.pane_id),
+        "prompt_event_id": envelope.payload.prompt_event_id.as_deref().unwrap_or_default(),
+        "prompt_event_source": envelope.payload.prompt_event_source.as_deref().unwrap_or_default(),
+        "prompt_text_len": envelope.payload.prompt_event_text.as_deref().map(str::len).unwrap_or_default(),
+        "thread_id": envelope.payload.thread_id.as_deref().unwrap_or_default(),
+    });
+    log_terminal_status_event(
+        "backend.terminal_input_transport.submit_received",
+        ack_payload_log.clone(),
+    );
+    let ack_receiver = enqueue_terminal_input_event_with_ack(app, envelope.payload);
+    let result = match timeout(Duration::from_secs(8), ack_receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("Terminal input acknowledgement channel closed.".to_string()),
+        Err(_) => Err("Terminal input write acknowledgement timed out.".to_string()),
+    };
+    let ok = result.is_ok();
+    log_terminal_status_event(
+        "backend.terminal_input_transport.submit_ack",
+        json!({
+            "error": result.as_ref().err().map(|value| clean_terminal_diagnostic_log_text(value)).unwrap_or_default(),
+            "message_id": clean_terminal_diagnostic_log_text(&message_id),
+            "ok": ok,
+            "payload": ack_payload_log,
+        }),
+    );
+
+    Some(Some(TerminalInputTransportAck {
+        r#type: "terminal-input-ack",
+        message_id,
+        ok,
+        error: result.err(),
+    }))
+}
+
 fn register_terminal_input_event_listener(app: &tauri::App) {
     let app_handle = app.handle().clone();
 
@@ -7605,32 +8055,7 @@ fn register_terminal_input_event_listener(app: &tauri::App) {
                 return;
             }
         };
-        let app = app_handle.clone();
-
-        tauri::async_runtime::spawn(async move {
-            let pane_id = payload.pane_id.clone();
-            let instance_id = payload.instance_id;
-            let state = app.state::<TerminalState>();
-            let cloud_mcp_state = app.state::<CloudMcpState>();
-            if let Err(error) = terminal_write_inner(
-                app.clone(),
-                state.inner(),
-                cloud_mcp_state.inner(),
-                payload.pane_id,
-                payload.instance_id,
-                payload.data,
-                payload.prompt_event_id,
-                payload.prompt_event_revision,
-                payload.prompt_event_source,
-                payload.prompt_event_submitted_at,
-                payload.prompt_event_text,
-                payload.thread_id,
-            )
-            .await
-            {
-                emit_terminal_input_error(&app, pane_id, instance_id, error);
-            }
-        });
+        enqueue_terminal_input_event(&app_handle, payload);
     });
 }
 
@@ -7671,6 +8096,7 @@ async fn terminal_write_inner(
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
     thread_id: Option<String>,
+    _realtime_write: bool,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
@@ -8289,8 +8715,57 @@ async fn terminal_write(
         prompt_event_submitted_at,
         prompt_event_text,
         thread_id,
+        false,
     )
     .await
+}
+
+#[tauri::command]
+async fn terminal_write_realtime(
+    app: AppHandle,
+    pane_id: String,
+    instance_id: Option<u64>,
+    data: String,
+    prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    prompt_event_text: Option<String>,
+    thread_id: Option<String>,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    if data.len() > MAX_TERMINAL_WRITE_BYTES {
+        return Err("Terminal input chunk is too large.".to_string());
+    }
+
+    let task_app = app.clone();
+    let error_pane_id = pane_id.clone();
+    let error_instance_id = instance_id;
+    tauri::async_runtime::spawn(async move {
+        let state = task_app.state::<TerminalState>();
+        let cloud_mcp_state = task_app.state::<CloudMcpState>();
+        if let Err(error) = terminal_write_inner(
+            task_app.clone(),
+            state.inner(),
+            cloud_mcp_state.inner(),
+            pane_id,
+            instance_id,
+            data,
+            prompt_event_id,
+            prompt_event_revision,
+            prompt_event_source,
+            prompt_event_submitted_at,
+            prompt_event_text,
+            thread_id,
+            true,
+        )
+        .await
+        {
+            emit_terminal_input_error(&task_app, error_pane_id, error_instance_id, error);
+        }
+    });
+
+    Ok(())
 }
 
 fn terminal_provider_turn_should_reconcile_coordination(

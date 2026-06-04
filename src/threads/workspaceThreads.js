@@ -10,6 +10,9 @@ import {
 const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
 const MAX_THREAD_PROJECTION_EVENTS = 900;
 const MAX_THREAD_MESSAGES = 360;
+const MAX_PERSISTED_THREAD_PROJECTION_EVENTS = 24;
+const MAX_PERSISTED_THREAD_MESSAGES = 32;
+const MAX_PERSISTED_THREAD_TEXT_CHARS = 1800;
 const MAX_THREADS_PER_WORKSPACE = 80;
 const PASTED_LINES_MESSAGE_EQUIVALENCE_MAX_DELTA_MS = 90_000;
 const THREAD_PROMPT_LABEL_MAX_WORDS = 6;
@@ -1120,6 +1123,33 @@ function normalizeThreadMessages(messages) {
   return normalized.slice(-MAX_THREAD_MESSAGES);
 }
 
+function compactPersistedThreadText(value) {
+  const text = cleanMessageText(value);
+  if (text.length <= MAX_PERSISTED_THREAD_TEXT_CHARS) {
+    return text;
+  }
+  return `${text.slice(0, MAX_PERSISTED_THREAD_TEXT_CHARS)}${THREAD_PROMPT_LABEL_ELLIPSIS}`;
+}
+
+function compactPersistedThreadMessage(message) {
+  const normalizedMessage = normalizeThreadMessage(message);
+  if (!normalizedMessage) {
+    return null;
+  }
+
+  return {
+    ...normalizedMessage,
+    text: compactPersistedThreadText(normalizedMessage.text),
+  };
+}
+
+function compactPersistedThreadMessages(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .map(compactPersistedThreadMessage)
+    .filter(Boolean)
+    .slice(-MAX_PERSISTED_THREAD_MESSAGES);
+}
+
 function stableProjectionHash(value) {
   const text = String(value || "");
   let hash = 2166136261;
@@ -1288,6 +1318,27 @@ function normalizeThreadProjectionEvents(events) {
     .sort((left, right) => left.sequence - right.sequence)
     .map((event, index) => ({ ...event, sequence: index }))
     .slice(-MAX_THREAD_PROJECTION_EVENTS)
+    .map((event, index) => ({ ...event, sequence: index }));
+}
+
+function compactPersistedThreadProjectionEvent(event) {
+  const normalizedEvent = normalizeThreadProjectionEvent(event);
+  if (!normalizedEvent) {
+    return null;
+  }
+
+  return {
+    ...normalizedEvent,
+    delta: compactPersistedThreadText(normalizedEvent.delta),
+    text: compactPersistedThreadText(normalizedEvent.text),
+  };
+}
+
+function compactPersistedThreadProjectionEvents(events) {
+  return (Array.isArray(events) ? events : [])
+    .map(compactPersistedThreadProjectionEvent)
+    .filter(Boolean)
+    .slice(-MAX_PERSISTED_THREAD_PROJECTION_EVENTS)
     .map((event, index) => ({ ...event, sequence: index }));
 }
 
@@ -2392,17 +2443,23 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const updatedAt = cleanText(thread.updatedAt, createdAt);
   const projectionEvents = options.stripMessages
     ? []
-    : normalizeThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents);
+    : options.compactPersistence
+      ? compactPersistedThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents)
+      : normalizeThreadProjectionEvents(thread.projectionEvents || thread.threadProjectionEvents);
   const messages = options.stripMessages
     ? []
-    : (
-      projectionEvents.length
-        ? projectThreadProjectionMessages(projectionEvents, thread.messages)
-        : normalizeThreadMessages(thread.messages)
-    );
+    : options.compactPersistence
+      ? compactPersistedThreadMessages(thread.messages)
+      : (
+        projectionEvents.length
+          ? projectThreadProjectionMessages(projectionEvents, thread.messages)
+          : normalizeThreadMessages(thread.messages)
+      );
   const projectedLatestTurn = options.stripMessages
     ? normalizeThreadLatestTurn(thread.latestTurn)
-    : projectLatestTurnFromEvents(projectionEvents, thread.latestTurn);
+    : options.compactPersistence
+      ? normalizeThreadLatestTurn(thread.latestTurn)
+      : projectLatestTurnFromEvents(projectionEvents, thread.latestTurn);
   const messageCount = Math.max(normalizeMessageCount(thread.messageCount), messages.length);
   const materialized = thread.materialized === true || messageCount > 0;
   const status = cleanText(thread.status, "idle").toLowerCase();
@@ -2756,7 +2813,135 @@ export function readWorkspaceThreads() {
 }
 
 export function persistWorkspaceThreads(threads) {
-  return normalizeWorkspaceThreads(threads, { stripLiveBindings: true });
+  return normalizeWorkspaceThreads(threads, {
+    compactPersistence: true,
+    stripLiveBindings: true,
+  });
+}
+
+function workspaceThreadsPersistShell(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return {};
+  }
+
+  const {
+    archivedThreads: _archivedThreads,
+    threads: _threads,
+    ...shell
+  } = entry;
+  return shell;
+}
+
+function workspaceThreadsJsonEqual(left, right) {
+  if (left === right) {
+    return true;
+  }
+  try {
+    return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+  } catch {
+    return false;
+  }
+}
+
+function workspaceThreadPersistRows(currentRows, previousRows) {
+  const rows = [];
+  Object.entries(currentRows || {}).forEach(([threadId, thread]) => {
+    const safeThreadId = cleanText(threadId);
+    if (!safeThreadId) {
+      return;
+    }
+    if (workspaceThreadsJsonEqual(thread, previousRows?.[safeThreadId])) {
+      return;
+    }
+    rows.push({
+      state: thread,
+      threadId: safeThreadId,
+    });
+  });
+  return rows;
+}
+
+function workspaceThreadRemovedIds(currentRows, previousRows) {
+  if (!previousRows || typeof previousRows !== "object" || Array.isArray(previousRows)) {
+    return [];
+  }
+  const current = currentRows && typeof currentRows === "object" && !Array.isArray(currentRows)
+    ? currentRows
+    : {};
+  return Object.keys(previousRows)
+    .map(cleanText)
+    .filter((threadId) => threadId && !current[threadId]);
+}
+
+export function buildWorkspaceThreadsPersistDelta(threads, previousPersistedThreads, targets = []) {
+  const normalizedThreads = persistWorkspaceThreads(threads);
+  const previousThreads = previousPersistedThreads && typeof previousPersistedThreads === "object"
+    ? previousPersistedThreads
+    : {};
+  const targetEntries = Array.isArray(targets) && targets.length
+    ? targets
+    : Object.keys(normalizedThreads).map((workspaceId) => ({ workspaceId }));
+
+  const workspaces = targetEntries
+    .map((target) => {
+      const workspaceId = cleanText(target?.workspaceId || target?.id || target);
+      if (!workspaceId || !normalizedThreads[workspaceId]) {
+        return null;
+      }
+
+      const currentEntry = normalizedThreads[workspaceId];
+      const previousEntry = previousThreads[workspaceId] || null;
+      const shell = workspaceThreadsPersistShell(currentEntry);
+      const previousShell = workspaceThreadsPersistShell(previousEntry);
+      const delta = {
+        rootDirectory: cleanText(target?.rootDirectory),
+        workspaceId,
+      };
+      let changed = false;
+
+      if (!previousEntry || !workspaceThreadsJsonEqual(shell, previousShell)) {
+        delta.shell = shell;
+        changed = true;
+      }
+
+      const changedThreads = workspaceThreadPersistRows(currentEntry.threads, previousEntry?.threads);
+      if (changedThreads.length) {
+        delta.threads = changedThreads;
+        changed = true;
+      }
+
+      const changedArchivedThreads = workspaceThreadPersistRows(
+        currentEntry.archivedThreads,
+        previousEntry?.archivedThreads,
+      );
+      if (changedArchivedThreads.length) {
+        delta.archivedThreads = changedArchivedThreads;
+        changed = true;
+      }
+
+      const removedThreadIds = workspaceThreadRemovedIds(currentEntry.threads, previousEntry?.threads);
+      if (removedThreadIds.length) {
+        delta.removedThreadIds = removedThreadIds;
+        changed = true;
+      }
+
+      const removedArchivedThreadIds = workspaceThreadRemovedIds(
+        currentEntry.archivedThreads,
+        previousEntry?.archivedThreads,
+      );
+      if (removedArchivedThreadIds.length) {
+        delta.removedArchivedThreadIds = removedArchivedThreadIds;
+        changed = true;
+      }
+
+      return changed ? delta : null;
+    })
+    .filter(Boolean);
+
+  return {
+    normalizedThreads,
+    request: { workspaces },
+  };
 }
 
 export function clearWorkspaceThreadsBrowserPersistence() {

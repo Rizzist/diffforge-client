@@ -3,14 +3,42 @@ const CODEX_TRANSCRIPT_MAX_LIMIT: usize = 420;
 const CODEX_TRANSCRIPT_MAX_TEXT: usize = 12_000;
 const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 8_000;
 const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
+const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
+const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 180;
+const AGENT_THREAD_TRANSCRIPT_MAX_WATCHES: usize = 128;
 
-#[derive(Deserialize)]
+use notify::Watcher as NotifyWatcher;
+
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptRequest {
     agent_id: Option<String>,
     provider_session_id: Option<String>,
     cwd: Option<String>,
     max_messages: Option<usize>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentThreadTranscriptWatchRequest {
+    agent_id: Option<String>,
+    allow_timestamp_fallback: Option<bool>,
+    cwd: Option<String>,
+    expected_message_created_at: Option<String>,
+    expected_user_message: Option<String>,
+    instance_id: Option<u64>,
+    max_messages: Option<usize>,
+    pane_id: Option<String>,
+    poll_until_turn_complete: Option<bool>,
+    prompt_event_id: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    provider_session_id: Option<String>,
+    source: Option<String>,
+    submitted_at: Option<String>,
+    terminal_index: Option<i64>,
+    terminal_prompt_accepted: Option<bool>,
+    thread_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -47,7 +75,7 @@ struct CodexRolloutMeta {
     title: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptResult {
     session_id: String,
@@ -58,6 +86,40 @@ struct CodexThreadTranscriptResult {
     latest_timestamp: String,
     messages: Vec<CodexThreadTranscriptMessage>,
 }
+
+#[derive(Clone, Default)]
+struct AgentThreadTranscriptWatchContext {
+    agent_id: String,
+    allow_timestamp_fallback: bool,
+    cwd: String,
+    expected_message_created_at: String,
+    expected_user_message: String,
+    instance_id: Option<u64>,
+    max_messages: usize,
+    pane_id: String,
+    poll_until_turn_complete: bool,
+    prompt_event_id: String,
+    prompt_event_submitted_at: String,
+    provider_session_id: String,
+    source: String,
+    submitted_at: String,
+    terminal_index: Option<i64>,
+    terminal_prompt_accepted: bool,
+    thread_id: String,
+    workspace_id: String,
+}
+
+struct AgentThreadTranscriptWatchEntry {
+    context: Arc<StdMutex<AgentThreadTranscriptWatchContext>>,
+    last_signature: String,
+    pending: Arc<AtomicBool>,
+    touched_ms: u64,
+    _watcher: notify::RecommendedWatcher,
+}
+
+static AGENT_THREAD_TRANSCRIPT_WATCHES: OnceLock<
+    StdMutex<HashMap<String, AgentThreadTranscriptWatchEntry>>,
+> = OnceLock::new();
 
 fn codex_home_dir() -> Option<PathBuf> {
     env::var_os("CODEX_HOME")
@@ -2125,6 +2187,396 @@ fn parse_opencode_session(
     ))
 }
 
+fn read_agent_thread_transcript(
+    agent_id: &str,
+    provider_session_id: &str,
+    cwd: &str,
+    max_messages: usize,
+) -> Result<CodexThreadTranscriptResult, String> {
+    if provider_session_id.trim().is_empty() {
+        return Err("Provider session id is required to read an agent transcript.".to_string());
+    }
+
+    if agent_id == "claude" {
+        let (path, initial_meta, matched_by) = find_claude_session(provider_session_id, cwd)?;
+        let (parsed_meta, messages) = parse_claude_session(&path, max_messages)?;
+        let session_id = if parsed_meta.session_id.is_empty() {
+            initial_meta.session_id
+        } else {
+            parsed_meta.session_id
+        };
+        let cwd = if parsed_meta.cwd.is_empty() {
+            initial_meta.cwd
+        } else {
+            parsed_meta.cwd
+        };
+        let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+            initial_meta.latest_timestamp
+        } else {
+            parsed_meta.latest_timestamp
+        };
+
+        return Ok(CodexThreadTranscriptResult {
+            session_id,
+            session_title: if parsed_meta.title.is_empty() {
+                initial_meta.title
+            } else {
+                parsed_meta.title
+            },
+            rollout_path: path.to_string_lossy().to_string(),
+            cwd,
+            matched_by,
+            latest_timestamp,
+            messages,
+        });
+    }
+
+    if agent_id == "opencode" {
+        let (session_id, title, session_cwd, matched_by) =
+            find_opencode_session(provider_session_id, cwd)?;
+        let (parsed_meta, messages) =
+            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
+        return Ok(CodexThreadTranscriptResult {
+            session_id: parsed_meta.session_id,
+            session_title: parsed_meta.title,
+            rollout_path: opencode_db_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            cwd: parsed_meta.cwd,
+            matched_by,
+            latest_timestamp: parsed_meta.latest_timestamp,
+            messages,
+        });
+    }
+
+    let (path, initial_meta, matched_by) = find_codex_rollout(provider_session_id, cwd)?;
+    let (parsed_meta, messages) = parse_codex_rollout(&path, max_messages)?;
+    let session_id = if parsed_meta.session_id.is_empty() {
+        initial_meta.session_id
+    } else {
+        parsed_meta.session_id
+    };
+    let cwd = if parsed_meta.cwd.is_empty() {
+        initial_meta.cwd
+    } else {
+        parsed_meta.cwd
+    };
+    let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+        initial_meta.latest_timestamp
+    } else {
+        parsed_meta.latest_timestamp
+    };
+    let session_title = first_non_empty_title(&[
+        parsed_meta.title,
+        initial_meta.title,
+        codex_session_index_title(&session_id),
+    ]);
+
+    Ok(CodexThreadTranscriptResult {
+        session_id,
+        session_title,
+        rollout_path: path.to_string_lossy().to_string(),
+        cwd,
+        matched_by,
+        latest_timestamp,
+        messages,
+    })
+}
+
+fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> String {
+    let tail = result.messages.last();
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        result.session_id,
+        result.latest_timestamp,
+        result.messages.len(),
+        tail.map(|message| message.id.as_str()).unwrap_or_default(),
+        tail.map(|message| message.kind.as_str()).unwrap_or_default(),
+        tail.map(|message| message.text.len()).unwrap_or_default(),
+    )
+}
+
+fn agent_thread_transcript_watch_context(
+    request: &AgentThreadTranscriptWatchRequest,
+) -> AgentThreadTranscriptWatchContext {
+    AgentThreadTranscriptWatchContext {
+        agent_id: clean_codex_id(request.agent_id.clone().unwrap_or_else(|| "codex".to_string()))
+            .to_lowercase(),
+        allow_timestamp_fallback: request.allow_timestamp_fallback.unwrap_or(false),
+        cwd: request.cwd.clone().unwrap_or_default(),
+        expected_message_created_at: request
+            .expected_message_created_at
+            .clone()
+            .unwrap_or_default(),
+        expected_user_message: request.expected_user_message.clone().unwrap_or_default(),
+        instance_id: request.instance_id,
+        max_messages: request
+            .max_messages
+            .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
+            .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT),
+        pane_id: request.pane_id.clone().unwrap_or_default(),
+        poll_until_turn_complete: request.poll_until_turn_complete.unwrap_or(false),
+        prompt_event_id: request.prompt_event_id.clone().unwrap_or_default(),
+        prompt_event_submitted_at: request.prompt_event_submitted_at.clone().unwrap_or_default(),
+        provider_session_id: clean_codex_id(request.provider_session_id.clone().unwrap_or_default()),
+        source: request.source.clone().unwrap_or_default(),
+        submitted_at: request.submitted_at.clone().unwrap_or_default(),
+        terminal_index: request.terminal_index,
+        terminal_prompt_accepted: request.terminal_prompt_accepted.unwrap_or(false),
+        thread_id: request.thread_id.clone().unwrap_or_default(),
+        workspace_id: request.workspace_id.clone().unwrap_or_default(),
+    }
+}
+
+fn agent_thread_transcript_watch_key(
+    context: &AgentThreadTranscriptWatchContext,
+    watch_path: &Path,
+) -> String {
+    let path_key = watch_path
+        .canonicalize()
+        .unwrap_or_else(|_| watch_path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!(
+        "{}|{}|{}|{}|{}",
+        context.workspace_id,
+        context.thread_id,
+        context.agent_id,
+        context.provider_session_id,
+        path_key,
+    )
+}
+
+fn agent_thread_transcript_watch_target(agent_id: &str, watch_path: &Path) -> PathBuf {
+    if agent_id == "opencode" && watch_path.is_file() {
+        return watch_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| watch_path.to_path_buf());
+    }
+    watch_path.to_path_buf()
+}
+
+fn agent_thread_transcript_watch_event_matches(watch_path: &Path, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+    let watch_name = watch_path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    paths.iter().any(|path| {
+        path == watch_path
+            || path.starts_with(watch_path)
+            || (
+                !watch_name.is_empty()
+                    && path
+                        .file_name()
+                        .map(|value| value.to_string_lossy().starts_with(&watch_name))
+                        .unwrap_or(false)
+            )
+    })
+}
+
+fn trim_agent_thread_transcript_watches(
+    watches: &mut HashMap<String, AgentThreadTranscriptWatchEntry>,
+) {
+    while watches.len() > AGENT_THREAD_TRANSCRIPT_MAX_WATCHES {
+        let Some(oldest_key) = watches
+            .iter()
+            .min_by_key(|(_, entry)| entry.touched_ms)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        watches.remove(&oldest_key);
+    }
+}
+
+async fn emit_agent_thread_transcript_watch_update(
+    app: AppHandle,
+    key: String,
+    reason: &'static str,
+) {
+    let context = {
+        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
+            .get_or_init(|| StdMutex::new(HashMap::new()));
+        watches
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(&key).map(|entry| entry.context.clone()))
+            .and_then(|context| context.lock().ok().map(|context| context.clone()))
+    };
+    let Some(context) = context else {
+        return;
+    };
+
+    let read_context = context.clone();
+    let read_result = tauri::async_runtime::spawn_blocking(move || {
+        read_agent_thread_transcript(
+            &read_context.agent_id,
+            &read_context.provider_session_id,
+            &read_context.cwd,
+            read_context.max_messages,
+        )
+    })
+    .await
+    .ok()
+    .and_then(Result::ok);
+
+    let Some(result) = read_result else {
+        if let Some(watches) = AGENT_THREAD_TRANSCRIPT_WATCHES.get() {
+            if let Ok(entries) = watches.lock() {
+                if let Some(entry) = entries.get(&key) {
+                    entry.pending.store(false, Ordering::SeqCst);
+                }
+            }
+        }
+        return;
+    };
+
+    let signature = agent_thread_transcript_signature(&result);
+    let should_emit = {
+        let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
+            .get_or_init(|| StdMutex::new(HashMap::new()));
+        let Ok(mut entries) = watches.lock() else {
+            return;
+        };
+        let Some(entry) = entries.get_mut(&key) else {
+            return;
+        };
+        entry.pending.store(false, Ordering::SeqCst);
+        entry.touched_ms = current_time_ms();
+        if entry.last_signature == signature {
+            false
+        } else {
+            entry.last_signature = signature;
+            true
+        }
+    };
+    if !should_emit {
+        return;
+    }
+
+    let _ = app.emit(
+        AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT,
+        json!({
+            "agentId": context.agent_id,
+            "allowTimestampFallback": context.allow_timestamp_fallback,
+            "cwd": context.cwd,
+            "expectedMessageCreatedAt": context.expected_message_created_at,
+            "expectedUserMessage": context.expected_user_message,
+            "instanceId": context.instance_id,
+            "paneId": context.pane_id,
+            "pollUntilTurnComplete": context.poll_until_turn_complete,
+            "promptEventId": context.prompt_event_id,
+            "promptEventSubmittedAt": context.prompt_event_submitted_at,
+            "providerSessionId": context.provider_session_id,
+            "reason": reason,
+            "requestSource": context.source,
+            "result": result,
+            "source": "agent-transcript-watch",
+            "submittedAt": context.submitted_at,
+            "terminalIndex": context.terminal_index,
+            "terminalPromptAccepted": context.terminal_prompt_accepted,
+            "threadId": context.thread_id,
+            "workspaceId": context.workspace_id,
+        }),
+    );
+}
+
+fn register_agent_thread_transcript_watch(
+    app: &AppHandle,
+    request: &AgentThreadTranscriptWatchRequest,
+    result: &CodexThreadTranscriptResult,
+) -> Result<(), String> {
+    let mut context = agent_thread_transcript_watch_context(request);
+    if context.provider_session_id.trim().is_empty() {
+        context.provider_session_id = result.session_id.clone();
+    }
+    if context.cwd.trim().is_empty() {
+        context.cwd = result.cwd.clone();
+    }
+    if context.provider_session_id.trim().is_empty() {
+        return Ok(());
+    }
+
+    let watch_path = PathBuf::from(result.rollout_path.trim());
+    if result.rollout_path.trim().is_empty() || !watch_path.exists() {
+        return Ok(());
+    }
+    let key = agent_thread_transcript_watch_key(&context, &watch_path);
+    let initial_signature = agent_thread_transcript_signature(result);
+    let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
+        .get_or_init(|| StdMutex::new(HashMap::new()));
+    if let Ok(mut entries) = watches.lock() {
+        if let Some(entry) = entries.get_mut(&key) {
+            if let Ok(mut existing_context) = entry.context.lock() {
+                *existing_context = context;
+            }
+            entry.last_signature = initial_signature;
+            entry.touched_ms = current_time_ms();
+            return Ok(());
+        }
+    }
+
+    let app_for_watch = app.clone();
+    let key_for_watch = key.clone();
+    let watch_path_for_filter = watch_path.clone();
+    let pending = Arc::new(AtomicBool::new(false));
+    let pending_for_watch = pending.clone();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let Ok(event) = event else {
+            return;
+        };
+        match event.kind {
+            notify::event::EventKind::Any
+            | notify::event::EventKind::Create(_)
+            | notify::event::EventKind::Modify(_) => {}
+            _ => return,
+        }
+        if !agent_thread_transcript_watch_event_matches(&watch_path_for_filter, &event.paths) {
+            return;
+        }
+        if pending_for_watch
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let app_for_emit = app_for_watch.clone();
+        let key_for_emit = key_for_watch.clone();
+        tauri::async_runtime::spawn(async move {
+            sleep(Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)).await;
+            emit_agent_thread_transcript_watch_update(app_for_emit, key_for_emit, "file-change")
+                .await;
+        });
+    })
+    .map_err(|error| format!("Unable to create transcript watcher: {error}"))?;
+    let watch_target = agent_thread_transcript_watch_target(&context.agent_id, &watch_path);
+    watcher
+        .watch(&watch_target, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| {
+            format!(
+                "Unable to watch transcript path {}: {error}",
+                watch_target.display()
+            )
+        })?;
+
+    let entry = AgentThreadTranscriptWatchEntry {
+        context: Arc::new(StdMutex::new(context)),
+        last_signature: initial_signature,
+        pending,
+        touched_ms: current_time_ms(),
+        _watcher: watcher,
+    };
+    if let Ok(mut entries) = watches.lock() {
+        entries.insert(key, entry);
+        trim_agent_thread_transcript_watches(&mut entries);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn agent_thread_session_discover(
     request: CodexThreadSessionDiscoverRequest,
@@ -2180,92 +2632,21 @@ async fn agent_thread_transcript(
         .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
         .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
 
-    if provider_session_id.is_empty() {
-        return Err("Provider session id is required to read an agent transcript.".to_string());
-    }
+    read_agent_thread_transcript(&agent_id, &provider_session_id, &cwd, max_messages)
+}
 
-    if agent_id == "claude" {
-        let (path, initial_meta, matched_by) = find_claude_session(&provider_session_id, &cwd)?;
-        let (parsed_meta, messages) = parse_claude_session(&path, max_messages)?;
-        let session_id = if parsed_meta.session_id.is_empty() {
-            initial_meta.session_id
-        } else {
-            parsed_meta.session_id
-        };
-        let cwd = if parsed_meta.cwd.is_empty() {
-            initial_meta.cwd
-        } else {
-            parsed_meta.cwd
-        };
-        let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
-            initial_meta.latest_timestamp
-        } else {
-            parsed_meta.latest_timestamp
-        };
-
-        return Ok(CodexThreadTranscriptResult {
-            session_id,
-            session_title: if parsed_meta.title.is_empty() {
-                initial_meta.title
-            } else {
-                parsed_meta.title
-            },
-            rollout_path: path.to_string_lossy().to_string(),
-            cwd,
-            matched_by,
-            latest_timestamp,
-            messages,
-        });
-    }
-
-    if agent_id == "opencode" {
-        let (session_id, title, session_cwd, matched_by) =
-            find_opencode_session(&provider_session_id, &cwd)?;
-        let (parsed_meta, messages) =
-            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
-        return Ok(CodexThreadTranscriptResult {
-            session_id: parsed_meta.session_id,
-            session_title: parsed_meta.title,
-            rollout_path: opencode_db_path()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            cwd: parsed_meta.cwd,
-            matched_by,
-            latest_timestamp: parsed_meta.latest_timestamp,
-            messages,
-        });
-    }
-
-    let (path, initial_meta, matched_by) = find_codex_rollout(&provider_session_id, &cwd)?;
-    let (parsed_meta, messages) = parse_codex_rollout(&path, max_messages)?;
-    let session_id = if parsed_meta.session_id.is_empty() {
-        initial_meta.session_id
-    } else {
-        parsed_meta.session_id
-    };
-    let cwd = if parsed_meta.cwd.is_empty() {
-        initial_meta.cwd
-    } else {
-        parsed_meta.cwd
-    };
-    let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
-        initial_meta.latest_timestamp
-    } else {
-        parsed_meta.latest_timestamp
-    };
-    let session_title = first_non_empty_title(&[
-        parsed_meta.title,
-        initial_meta.title,
-        codex_session_index_title(&session_id),
-    ]);
-
-    Ok(CodexThreadTranscriptResult {
-        session_id,
-        session_title,
-        rollout_path: path.to_string_lossy().to_string(),
-        cwd,
-        matched_by,
-        latest_timestamp,
-        messages,
-    })
+#[tauri::command]
+async fn agent_thread_transcript_watch(
+    app: AppHandle,
+    request: AgentThreadTranscriptWatchRequest,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let context = agent_thread_transcript_watch_context(&request);
+    let result = read_agent_thread_transcript(
+        &context.agent_id,
+        &context.provider_session_id,
+        &context.cwd,
+        context.max_messages,
+    )?;
+    let _ = register_agent_thread_transcript_watch(&app, &request, &result);
+    Ok(result)
 }

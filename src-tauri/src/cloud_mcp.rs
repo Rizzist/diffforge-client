@@ -20,6 +20,7 @@ const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
+const CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT: &str = "cloud-mcp-task-history-updated";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_FILETREE_CHANGE_DEBOUNCE_MS: u64 = 120;
 const CLOUD_MCP_TRANSIENT_WS_RETRY_MS: u64 = 1_200;
@@ -29,6 +30,41 @@ const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_CACHE_MAX: usize = 512;
+const CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS: u64 = 180;
+const CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS: u64 = 20;
+const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
+const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
+const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW: u8 = 2;
+const CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS: u64 = 350;
+
+#[derive(Clone)]
+struct CloudMcpBackgroundSync {
+    pending: Arc<Mutex<HashMap<String, CloudMcpBackgroundSyncJob>>>,
+    notify: Arc<tokio::sync::Notify>,
+    started: Arc<AtomicBool>,
+    tokenomics_pending: Arc<Mutex<Option<CloudMcpTokenomicsSyncJob>>>,
+    tokenomics_notify: Arc<tokio::sync::Notify>,
+    tokenomics_started: Arc<AtomicBool>,
+    tokenomics_cursor: Arc<Mutex<String>>,
+}
+
+#[derive(Clone)]
+struct CloudMcpBackgroundSyncJob {
+    enqueued_ms: u64,
+    event_kind: String,
+    key: String,
+    payload: Value,
+    priority: u8,
+    reason: String,
+}
+
+#[derive(Clone)]
+struct CloudMcpTokenomicsSyncJob {
+    enqueued_ms: u64,
+    force_full: bool,
+    force_resync: bool,
+    reason: String,
+}
 
 #[derive(Clone)]
 struct CloudMcpState {
@@ -44,6 +80,9 @@ struct CloudMcpState {
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
     terminal_context_missing_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
+    task_history_cache: Arc<Mutex<HashMap<String, Value>>>,
+    task_history_refreshes: Arc<Mutex<HashSet<String>>>,
+    background_sync: CloudMcpBackgroundSync,
 }
 
 #[derive(Clone, Default)]
@@ -273,8 +312,343 @@ impl CloudMcpState {
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
             terminal_context_missing_until_ms: Arc::new(StdMutex::new(HashMap::new())),
+            task_history_cache: Arc::new(Mutex::new(HashMap::new())),
+            task_history_refreshes: Arc::new(Mutex::new(HashSet::new())),
+            background_sync: CloudMcpBackgroundSync {
+                pending: Arc::new(Mutex::new(HashMap::new())),
+                notify: Arc::new(tokio::sync::Notify::new()),
+                started: Arc::new(AtomicBool::new(false)),
+                tokenomics_pending: Arc::new(Mutex::new(None)),
+                tokenomics_notify: Arc::new(tokio::sync::Notify::new()),
+                tokenomics_started: Arc::new(AtomicBool::new(false)),
+                tokenomics_cursor: Arc::new(Mutex::new(String::new())),
+            },
         }
     }
+}
+
+fn cloud_mcp_background_sync_ack(
+    kind: &str,
+    key: &str,
+    reason: &str,
+    extra: Value,
+) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("ok".to_string(), json!(true));
+    object.insert("queued".to_string(), json!(true));
+    object.insert("background".to_string(), json!(true));
+    object.insert("kind".to_string(), json!(kind));
+    object.insert("key".to_string(), json!(key));
+    object.insert("reason".to_string(), json!(reason));
+    object.insert("queued_at_ms".to_string(), json!(cloud_mcp_now_ms()));
+    if let Some(extra_object) = extra.as_object() {
+        for (extra_key, extra_value) in extra_object {
+            object.insert(extra_key.clone(), extra_value.clone());
+        }
+    }
+    Value::Object(object)
+}
+
+fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
+    if state
+        .background_sync
+        .started
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    let worker_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_background_sync_worker(worker_state).await;
+    });
+}
+
+async fn cloud_mcp_enqueue_background_sync(
+    state: &CloudMcpState,
+    key: impl Into<String>,
+    event_kind: impl Into<String>,
+    payload: Value,
+    priority: u8,
+    reason: impl Into<String>,
+) {
+    cloud_mcp_background_sync_ensure_started(state);
+
+    let key = key.into();
+    let event_kind = event_kind.into();
+    let reason = reason.into();
+    let job = CloudMcpBackgroundSyncJob {
+        enqueued_ms: cloud_mcp_now_ms(),
+        event_kind,
+        key: key.clone(),
+        payload,
+        priority,
+        reason,
+    };
+    {
+        let mut pending = state.background_sync.pending.lock().await;
+        pending.insert(key, job);
+    }
+    state.background_sync.notify.notify_one();
+}
+
+async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
+    loop {
+        state.background_sync.notify.notified().await;
+        sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS)).await;
+
+        loop {
+            let jobs = {
+                let mut pending = state.background_sync.pending.lock().await;
+                if pending.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut jobs = pending.drain().map(|(_, job)| job).collect::<Vec<_>>();
+                    jobs.sort_by(|left, right| {
+                        left.priority
+                            .cmp(&right.priority)
+                            .then_with(|| left.enqueued_ms.cmp(&right.enqueued_ms))
+                    });
+                    jobs
+                }
+            };
+
+            if jobs.is_empty() {
+                break;
+            }
+
+            for job in jobs {
+                let result =
+                    cloud_mcp_post_event_endpoint(&state, &job.event_kind, &job.payload).await;
+                match result {
+                    Ok(response) => {
+                        log_terminal_status_event(
+                            "backend.cloud_mcp.background_sync.done",
+                            json!({
+                                "event_kind": job.event_kind,
+                                "key": job.key,
+                                "reason": job.reason,
+                                "response": response,
+                            }),
+                        );
+                    }
+                    Err(error) => {
+                        log_terminal_status_event(
+                            "backend.cloud_mcp.background_sync.error",
+                            json!({
+                                "error": clean_terminal_telemetry_text(&error),
+                                "event_kind": job.event_kind,
+                                "key": job.key,
+                                "reason": job.reason,
+                            }),
+                        );
+                    }
+                }
+
+                sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS)).await;
+            }
+        }
+    }
+}
+
+fn cloud_mcp_tokenomics_sync_ensure_started(app: AppHandle, state: &CloudMcpState) {
+    if state
+        .background_sync
+        .tokenomics_started
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+
+    let worker_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        cloud_mcp_tokenomics_sync_worker(app, worker_state).await;
+    });
+}
+
+fn cloud_mcp_merge_tokenomics_sync_jobs(
+    existing: CloudMcpTokenomicsSyncJob,
+    incoming: CloudMcpTokenomicsSyncJob,
+) -> CloudMcpTokenomicsSyncJob {
+    let enqueued_ms = existing.enqueued_ms.min(incoming.enqueued_ms);
+    let force_resync = existing.force_resync || incoming.force_resync;
+    let force_full = force_resync || existing.force_full || incoming.force_full;
+    let reason = if incoming.force_resync
+        || (!existing.force_resync && incoming.force_full)
+        || (!existing.force_resync && !existing.force_full)
+    {
+        incoming.reason
+    } else {
+        existing.reason
+    };
+
+    CloudMcpTokenomicsSyncJob {
+        enqueued_ms,
+        force_full,
+        force_resync,
+        reason,
+    }
+}
+
+async fn cloud_mcp_enqueue_tokenomics_sync(
+    app: AppHandle,
+    state: &CloudMcpState,
+    reason: String,
+    force_full: bool,
+    force_resync: bool,
+) -> CloudMcpTokenomicsSyncJob {
+    cloud_mcp_tokenomics_sync_ensure_started(app, state);
+    let incoming = CloudMcpTokenomicsSyncJob {
+        enqueued_ms: cloud_mcp_now_ms(),
+        force_full: force_full || force_resync,
+        force_resync,
+        reason,
+    };
+
+    let queued_job = {
+        let mut pending = state.background_sync.tokenomics_pending.lock().await;
+        let next = match pending.take() {
+            Some(existing) => cloud_mcp_merge_tokenomics_sync_jobs(existing, incoming),
+            None => incoming,
+        };
+        *pending = Some(next.clone());
+        next
+    };
+    state.background_sync.tokenomics_notify.notify_one();
+    queued_job
+}
+
+async fn cloud_mcp_tokenomics_sync_worker(app: AppHandle, state: CloudMcpState) {
+    loop {
+        state.background_sync.tokenomics_notify.notified().await;
+        sleep(Duration::from_millis(
+            CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS,
+        ))
+        .await;
+
+        loop {
+            let job = {
+                let mut pending = state.background_sync.tokenomics_pending.lock().await;
+                pending.take()
+            };
+
+            let Some(job) = job else {
+                break;
+            };
+
+            cloud_mcp_run_tokenomics_sync_job(app.clone(), state.clone(), job).await;
+        }
+    }
+}
+
+async fn cloud_mcp_run_tokenomics_sync_job(
+    app: AppHandle,
+    worker_state: CloudMcpState,
+    job: CloudMcpTokenomicsSyncJob,
+) {
+    let worker_state_for_summary = worker_state.clone();
+    let force_resync = job.force_resync;
+    let force_full = job.force_full;
+    let reason_for_worker = job.reason.clone();
+    let summary_result = tauri::async_runtime::spawn_blocking(move || {
+        if force_resync {
+            tokenomics_scan_usage_for(&app, false, true)?;
+            tokenomics_summary_for(&app, true, false)
+        } else if force_full {
+            tokenomics_scan_usage_for(&app, false, false)?;
+            tokenomics_summary_for(&app, true, false)
+        } else {
+            tokenomics_scan_usage_for(&app, false, false)?;
+            let cursor = worker_state_for_summary
+                .background_sync
+                .tokenomics_cursor
+                .blocking_lock()
+                .clone();
+            let conn = tokenomics_open_db(&app)?;
+            tokenomics_reconcile_current_provider_accounts(&conn)?;
+            tokenomics_sync_delta_from_conn(
+                &conn,
+                if cursor.trim().is_empty() {
+                    None
+                } else {
+                    Some(cursor.as_str())
+                },
+            )
+        }
+    })
+    .await
+    .map_err(|error| format!("Unable to join background Tokenomics sync: {error}"))
+    .and_then(|result| result);
+
+    let mut summary = match summary_result {
+        Ok(summary) => summary,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.tokenomics_background.error",
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "reason": reason_for_worker,
+                }),
+            );
+            return;
+        }
+    };
+
+    let device_profile = cloud_mcp_desktop_device_profile();
+    cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
+    let hourly_count = summary
+        .get("hourly")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let event_kind = if force_full || force_resync {
+        "tokenomics_hourly_usage_snapshot"
+    } else {
+        "tokenomics_delta"
+    };
+    let payload = json!({
+        "source": "rust-diffforge-tokenomics-sync",
+        "event_kind": event_kind,
+        "scope": "account",
+        "billing_scope_type": billing_scope_type,
+        "team_id": team_id,
+        "account_scoped": true,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": reason_for_worker.clone(),
+        "summary": summary.clone(),
+        "hourly_count": hourly_count,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    if event_kind == "tokenomics_hourly_usage_snapshot" {
+        let mut snapshots = worker_state.runtime_snapshots.lock().await;
+        snapshots.tokenomics = Some(payload.clone());
+    }
+
+    if let Some(cursor) = cloud_mcp_tokenomics_cursor_from_summary(&summary) {
+        let mut tokenomics_cursor = worker_state.background_sync.tokenomics_cursor.lock().await;
+        *tokenomics_cursor = cursor;
+    }
+
+    cloud_mcp_enqueue_background_sync(
+        &worker_state,
+        format!("tokenomics:{event_kind}"),
+        event_kind,
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+        reason_for_worker,
+    )
+    .await;
 }
 
 fn cloud_mcp_base_url() -> String {
@@ -8099,7 +8473,9 @@ async fn cloud_mcp_sync_terminal_presence(
                 .unwrap_or_default()
         })
         .sum::<usize>();
+    let workspace_count = normalized_workspaces.len();
 
+    let reason_for_ack = reason.clone();
     let payload = json!({
         "source": "rust-diffforge-terminal-presence-sync",
         "event_kind": "terminal_presence_snapshot",
@@ -8114,7 +8490,7 @@ async fn cloud_mcp_sync_terminal_presence(
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
-        "workspace_count": normalized_workspaces.len(),
+        "workspace_count": workspace_count,
         "terminal_count": terminal_count,
         "workspaces": normalized_workspaces,
         "summary": "Desktop terminal presence synced.",
@@ -8126,7 +8502,31 @@ async fn cloud_mcp_sync_terminal_presence(
         snapshots.terminal_presence = Some(payload.clone());
     }
 
-    cloud_mcp_post_event_endpoint(state.inner(), "terminal_presence_snapshot", &payload).await
+    let sync_key = "terminal_presence_snapshot".to_string();
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        "terminal_presence_snapshot",
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM,
+        reason_for_ack.clone(),
+    )
+    .await;
+    Ok(cloud_mcp_background_sync_ack(
+        "terminal_presence_snapshot",
+        &sync_key,
+        &reason_for_ack,
+        json!({
+            "stored": {
+                "stored_count": terminal_count,
+                "terminal_count": terminal_count,
+                "workspace_count": workspace_count,
+            },
+            "stored_count": terminal_count,
+            "terminal_count": terminal_count,
+            "workspace_count": workspace_count,
+        }),
+    ))
 }
 
 #[tauri::command]
@@ -8282,6 +8682,8 @@ async fn cloud_mcp_sync_terminal_status_event(
                 .as_ref()
                 .map(|terminal_id| format!("{}:{}", terminal_id, terminal_instance_id))
         });
+    let status_for_priority = status.clone();
+    let event_type_for_priority = event_type.clone();
     let normalized_terminal = json!({
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
@@ -8358,6 +8760,27 @@ async fn cloud_mcp_sync_terminal_status_event(
         "terminal_count": 1,
         "terminals": [normalized_terminal.clone()],
     });
+    let reason_for_ack = reason.clone();
+    let workspace_id_for_key = workspace_payload
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace");
+    let terminal_id_for_key = normalized_terminal
+        .get("terminal_id")
+        .or_else(|| normalized_terminal.get("pane_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("terminal");
+    let sync_key = format!("terminal_status:{workspace_id_for_key}:{terminal_id_for_key}");
+    let priority = if matches!(
+        status_for_priority.as_str(),
+        "closed" | "closing" | "error" | "exited" | "offline"
+    ) || event_type_for_priority.contains("closed")
+        || event_type_for_priority.contains("error")
+    {
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
+    } else {
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
+    };
     let payload = json!({
         "source": "rust-diffforge-terminal-status-event",
         "event_kind": "terminal_status_event",
@@ -8390,7 +8813,30 @@ async fn cloud_mcp_sync_terminal_status_event(
             "reason": reason,
         }),
     );
-    cloud_mcp_post_event_endpoint(state.inner(), "terminal_status_event", &payload).await
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        "terminal_status_event",
+        payload,
+        priority,
+        reason_for_ack.clone(),
+    )
+    .await;
+    Ok(cloud_mcp_background_sync_ack(
+        "terminal_status_event",
+        &sync_key,
+        &reason_for_ack,
+        json!({
+            "stored": {
+                "stored_count": 1,
+                "terminal_count": 1,
+                "workspace_count": 1,
+            },
+            "stored_count": 1,
+            "terminal_count": 1,
+            "workspace_count": 1,
+        }),
+    ))
 }
 
 #[tauri::command]
@@ -8566,6 +9012,8 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
                 .unwrap_or_default()
         })
         .sum::<usize>();
+    let workspace_count = normalized_workspaces.len();
+    let reason_for_ack = reason.clone();
     let payload = json!({
         "source": "rust-diffforge-workspace-mcp-sync",
         "event_kind": "workspace_mcp_snapshot",
@@ -8582,7 +9030,7 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         "agent_label": "Diff Forge Desktop",
         "reason": reason,
         "snapshot_id": snapshot_id,
-        "workspace_count": normalized_workspaces.len(),
+        "workspace_count": workspace_count,
         "server_count": server_count,
         "workspaces": normalized_workspaces,
         "summary": "Desktop workspace MCP settings synced without secret values.",
@@ -8594,7 +9042,31 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         snapshots.workspace_mcps = Some(payload.clone());
     }
 
-    cloud_mcp_post_event_endpoint(state.inner(), "workspace_mcp_snapshot", &payload).await
+    let sync_key = "workspace_mcp_snapshot".to_string();
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        "workspace_mcp_snapshot",
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+        reason_for_ack.clone(),
+    )
+    .await;
+    Ok(cloud_mcp_background_sync_ack(
+        "workspace_mcp_snapshot",
+        &sync_key,
+        &reason_for_ack,
+        json!({
+            "stored": {
+                "stored_count": server_count,
+                "server_count": server_count,
+                "workspace_count": workspace_count,
+            },
+            "stored_count": server_count,
+            "server_count": server_count,
+            "workspace_count": workspace_count,
+        }),
+    ))
 }
 
 fn cloud_mcp_workspace_payload_matches_delete(value: &Value, workspace_id: &str) -> bool {
@@ -8810,6 +9282,9 @@ async fn cloud_mcp_sync_tokenomics_state(
     } else {
         "tokenomics_hourly_usage_snapshot"
     };
+    let reason_for_ack = clean_reason.clone();
+    let event_kind_for_job = event_kind.to_string();
+    let sync_key = format!("tokenomics:{event_kind_for_job}");
     let payload = json!({
         "source": "rust-diffforge-tokenomics-sync",
         "event_kind": event_kind,
@@ -8838,7 +9313,89 @@ async fn cloud_mcp_sync_tokenomics_state(
         snapshots.tokenomics = Some(payload.clone());
     }
 
-    cloud_mcp_post_event_endpoint(state.inner(), event_kind, &payload).await
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        event_kind_for_job.clone(),
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+        reason_for_ack.clone(),
+    )
+    .await;
+    Ok(cloud_mcp_background_sync_ack(
+        &event_kind_for_job,
+        &sync_key,
+        &reason_for_ack,
+        json!({
+            "hourly_count": hourly_count,
+            "delta": is_delta,
+        }),
+    ))
+}
+
+#[tauri::command]
+async fn cloud_mcp_schedule_tokenomics_sync(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    reason: Option<String>,
+    full: Option<bool>,
+    resync_last_30_days: Option<bool>,
+) -> Result<Value, String> {
+    let clean_reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "tokenomics_delta".to_string());
+    let force_full = full.unwrap_or(false);
+    let force_resync = resync_last_30_days.unwrap_or(false);
+    cloud_mcp_background_sync_ensure_started(state.inner());
+    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state.inner(),
+        clean_reason.clone(),
+        force_full,
+        force_resync,
+    )
+    .await;
+
+    Ok(cloud_mcp_background_sync_ack(
+        "tokenomics_sync",
+        "tokenomics:scan",
+        &clean_reason,
+        json!({
+            "full": queued_job.force_full,
+            "resync_last_30_days": queued_job.force_resync,
+            "queued_reason": queued_job.reason,
+        }),
+    ))
+}
+
+fn cloud_mcp_tokenomics_cursor_from_summary(summary: &Value) -> Option<String> {
+    let direct = summary
+        .get("sync_cursor")
+        .or_else(|| summary.get("syncCursor"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if direct.is_some() {
+        return direct;
+    }
+
+    summary
+        .get("hourly")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    row.get("updated_at")
+                        .or_else(|| row.get("updatedAt"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+                .max()
+        })
 }
 
 fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: &Value) {
@@ -9091,28 +9648,6 @@ async fn cloud_mcp_get_activity(repo_path: String) -> Result<Value, String> {
     }))
 }
 
-#[tauri::command]
-async fn cloud_mcp_get_task_history(
-    state: State<'_, CloudMcpState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path, workspace_id, workspace_name);
-    let root_display = req.root_display;
-    let payload = json!({
-        "repo_id": req.repo_id,
-        "repo_path": root_display.clone(),
-        "workspace_root": root_display,
-        "workspace_id": req.workspace_id.unwrap_or_default(),
-        "workspace_name": req.workspace_name.unwrap_or_default(),
-        "history_limit": 80,
-        "task_limit": 120,
-    });
-    let response = cloud_mcp_post_json_endpoint(state.inner(), "/v1/task/history", &payload).await?;
-    Ok(response.get("data").cloned().unwrap_or(response))
-}
-
 #[derive(Clone)]
 struct CloudMcpRepoRequest {
     root: PathBuf,
@@ -9138,6 +9673,179 @@ fn cloud_mcp_repo_request(
         workspace_id,
         workspace_name,
     }
+}
+
+fn cloud_mcp_task_history_cache_key(req: &CloudMcpRepoRequest) -> String {
+    format!(
+        "{}:{}",
+        req.repo_id,
+        req.workspace_id.clone().unwrap_or_default()
+    )
+}
+
+fn cloud_mcp_task_history_loading_snapshot(req: &CloudMcpRepoRequest, cached: bool) -> Value {
+    json!({
+        "kind": "task_history",
+        "version": 1,
+        "cached": cached,
+        "loading": !cached,
+        "repoId": req.repo_id.clone(),
+        "repo_id": req.repo_id.clone(),
+        "repoPath": req.root_display.clone(),
+        "repo_path": req.root_display.clone(),
+        "workspaceId": req.workspace_id.clone().unwrap_or_default(),
+        "workspace_id": req.workspace_id.clone().unwrap_or_default(),
+        "workspaceName": req.workspace_name.clone().unwrap_or_default(),
+        "workspace_name": req.workspace_name.clone().unwrap_or_default(),
+        "syncState": if cached { "cached" } else { "loading" },
+        "tasks": [],
+    })
+}
+
+fn cloud_mcp_task_history_enrich_snapshot(req: &CloudMcpRepoRequest, data: Value) -> Value {
+    let mut object = data
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    object
+        .entry("kind".to_string())
+        .or_insert_with(|| json!("task_history"));
+    object
+        .entry("version".to_string())
+        .or_insert_with(|| json!(1));
+    object.insert("cached".to_string(), json!(false));
+    object.insert("loading".to_string(), json!(false));
+    object.insert("repoId".to_string(), json!(req.repo_id.clone()));
+    object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
+    object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+    object.insert("repo_path".to_string(), json!(req.root_display.clone()));
+    object.insert(
+        "workspaceId".to_string(),
+        json!(req.workspace_id.clone().unwrap_or_default()),
+    );
+    object.insert(
+        "workspace_id".to_string(),
+        json!(req.workspace_id.clone().unwrap_or_default()),
+    );
+    object.insert(
+        "workspaceName".to_string(),
+        json!(req.workspace_name.clone().unwrap_or_default()),
+    );
+    object.insert(
+        "workspace_name".to_string(),
+        json!(req.workspace_name.clone().unwrap_or_default()),
+    );
+    object.insert("syncState".to_string(), json!("ready"));
+    Value::Object(object)
+}
+
+fn cloud_mcp_schedule_task_history_refresh(
+    app: AppHandle,
+    state: CloudMcpState,
+    req: CloudMcpRepoRequest,
+    cache_key: String,
+    payload: Value,
+) {
+    tauri::async_runtime::spawn(async move {
+        let response = cloud_mcp_post_json_endpoint(&state, "/v1/task/history", &payload).await;
+        {
+            let mut refreshes = state.task_history_refreshes.lock().await;
+            refreshes.remove(&cache_key);
+        }
+
+        match response {
+            Ok(response) => {
+                let snapshot = cloud_mcp_task_history_enrich_snapshot(
+                    &req,
+                    response.get("data").cloned().unwrap_or(response),
+                );
+                {
+                    let mut cache = state.task_history_cache.lock().await;
+                    cache.insert(cache_key.clone(), snapshot.clone());
+                }
+                let _ = app.emit(
+                    CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT,
+                    json!({
+                        "cacheKey": cache_key,
+                        "repoId": req.repo_id,
+                        "repoPath": req.root_display,
+                        "workspaceId": req.workspace_id.unwrap_or_default(),
+                        "workspaceName": req.workspace_name.unwrap_or_default(),
+                        "taskHistory": snapshot,
+                    }),
+                );
+            }
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.cloud_mcp.task_history_refresh.error",
+                    json!({
+                        "cacheKey": cache_key,
+                        "error": clean_terminal_telemetry_text(&error),
+                        "repoId": req.repo_id.clone(),
+                        "repoPath": req.root_display.clone(),
+                        "workspaceId": req.workspace_id.clone().unwrap_or_default(),
+                    }),
+                );
+                let _ = app.emit(
+                    CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT,
+                    json!({
+                        "cacheKey": cache_key,
+                        "error": clean_terminal_telemetry_text(&error),
+                        "repoId": req.repo_id.clone(),
+                        "repoPath": req.root_display.clone(),
+                        "workspaceId": req.workspace_id.unwrap_or_default(),
+                        "workspaceName": req.workspace_name.unwrap_or_default(),
+                    }),
+                );
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_task_history(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(repo_path, workspace_id, workspace_name);
+    let cache_key = cloud_mcp_task_history_cache_key(&req);
+    let payload = json!({
+        "repo_id": req.repo_id.clone(),
+        "repo_path": req.root_display.clone(),
+        "workspace_root": req.root_display.clone(),
+        "workspace_id": req.workspace_id.clone().unwrap_or_default(),
+        "workspace_name": req.workspace_name.clone().unwrap_or_default(),
+        "history_limit": 80,
+        "task_limit": 120,
+    });
+    let cached_snapshot = {
+        let cache = state.task_history_cache.lock().await;
+        cache.get(&cache_key).cloned()
+    };
+    let should_refresh = {
+        let mut refreshes = state.task_history_refreshes.lock().await;
+        if refreshes.contains(&cache_key) {
+            false
+        } else {
+            refreshes.insert(cache_key.clone());
+            true
+        }
+    };
+
+    if should_refresh {
+        cloud_mcp_schedule_task_history_refresh(
+            app,
+            state.inner().clone(),
+            req.clone(),
+            cache_key,
+            payload,
+        );
+    }
+
+    Ok(cached_snapshot.unwrap_or_else(|| cloud_mcp_task_history_loading_snapshot(&req, false)))
 }
 
 fn cloud_mcp_container_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount> {

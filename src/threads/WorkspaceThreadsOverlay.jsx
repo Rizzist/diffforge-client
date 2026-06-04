@@ -1068,27 +1068,33 @@ function getThreadState(thread, entry) {
     threadViewState = THREAD_VIEW_STATE.DETACHED_SESSION;
   }
 
+  const inactiveNoSession = threadViewState === THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
   const dotState = isActiveTerminal
     ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
-    : turnState === "error"
+    : inactiveNoSession
+      ? "idle"
+      : turnState === "error"
       ? "error"
       : turnState === "running"
         ? "running"
         : turnState === "interrupted"
           ? "interrupted"
           : "idle";
+  const isWorking = inactiveNoSession
+    ? false
+    : getThreadIsWorking({
+      mappedTerminal,
+      providerBinding,
+      thread,
+      turnState,
+    });
 
   return {
     canArchive: getWorkspaceThreadCanArchive(thread),
     canPin: getWorkspaceThreadCanPin(thread),
     isLive: Boolean(isActiveTerminal),
     isNonSessionActive: threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION,
-    isWorking: getThreadIsWorking({
-      mappedTerminal,
-      providerBinding,
-      thread,
-      turnState,
-    }),
+    isWorking,
     label: getWorkspaceThreadLabel(thread),
     pinned: getWorkspaceThreadIsPinned(thread),
     state: dotState,

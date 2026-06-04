@@ -5249,6 +5249,59 @@ impl CoordinationKernel {
         })))
     }
 
+    pub fn terminal_task_plan_event_snapshot(
+        &self,
+        task_id: Option<&str>,
+        session_id: Option<&str>,
+        _agent_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let selected_plan = if let Some(task_id) =
+            task_id.map(str::trim).filter(|value| !value.is_empty())
+        {
+            self.terminal_task_plan_view_by_task_id(task_id).ok()
+        } else if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty())
+        {
+            self.query_json(
+                "SELECT task_id FROM terminal_task_plans
+                 WHERE session_id=?1
+                 ORDER BY updated_at DESC LIMIT 1",
+                &[&session_id],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["task_id"].as_str().map(str::to_string))
+            .and_then(|task_id| self.terminal_task_plan_view_by_task_id(&task_id).ok())
+        } else {
+            None
+        };
+
+        let history = selected_plan
+            .as_ref()
+            .map(|plan| {
+                vec![json!({
+                    "plan_id": plan["plan_id"].clone(),
+                    "task_id": plan["task_id"].clone(),
+                    "title": plan["title"].clone(),
+                    "task_title": plan["task_title"].clone(),
+                    "status": plan["status"].clone(),
+                    "task_status": plan["task_status"].clone(),
+                    "current_step_index": plan["current_step_index"].clone(),
+                    "revision": plan["revision"].clone(),
+                    "session_id": plan["session_id"].clone(),
+                    "agent_id": plan["agent_id"].clone(),
+                    "updated_at": plan["updated_at"].clone(),
+                    "can_resume": terminal_task_plan_can_resume(plan["status"].as_str().unwrap_or_default()),
+                })]
+            })
+            .unwrap_or_default();
+
+        Ok(api_ok(json!({
+            "selected_plan": selected_plan,
+            "history": history,
+            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+        })))
+    }
+
     fn terminal_task_plan_id_for_task(&self, task_id: &str) -> Result<Option<String>, String> {
         Ok(self
             .query_json(

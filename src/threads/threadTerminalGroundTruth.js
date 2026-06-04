@@ -408,7 +408,10 @@ export function recordThreadTerminalReadiness(event = {}) {
     inputReadyConfidence: cleanText(sourceEvent.inputReadyConfidence || sourceEvent.promptReadyConfidence || sourceEvent.source),
     instanceId: sourceEvent.instanceId ?? "",
     paneId: cleanText(sourceEvent.paneId),
+    pendingPromptId: cleanText(sourceEvent.pendingPromptId || sourceEvent.promptEventId || sourceEvent.promptId),
     promptReadyAt: cleanText(sourceEvent.promptReadyAt, readyAt),
+    promptEventId: cleanText(sourceEvent.promptEventId || sourceEvent.pendingPromptId || sourceEvent.promptId),
+    promptEventSubmittedAt: cleanText(sourceEvent.promptEventSubmittedAt || sourceEvent.submittedAt),
     promptingUserConfidence: promptingUser.isPromptingUser ? promptingUser.confidence : "",
     promptingUserKind: promptingUser.isPromptingUser ? promptingUser.kind : "",
     promptingUserSource: promptingUser.isPromptingUser ? promptingUser.source : "",
@@ -416,6 +419,12 @@ export function recordThreadTerminalReadiness(event = {}) {
     providerSessionId: cleanText(sourceEvent.providerSessionId || sourceEvent.nativeSessionId),
     source: cleanText(sourceEvent.source || sourceEvent.type),
     status: cleanText(sourceEvent.status, "active"),
+    terminalPrompt: cleanText(
+      sourceEvent.terminalPrompt
+        || sourceEvent.expectedUserMessage
+        || sourceEvent.userMessage
+        || sourceEvent.message,
+    ),
     terminalIsPromptingUser: promptingUser.isPromptingUser,
     terminalIndex: sourceEvent.terminalIndex,
     threadId: cleanText(sourceEvent.threadId),

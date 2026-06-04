@@ -32,10 +32,12 @@ use tauri::{
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
+    net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex, RwLock},
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
+    accept_async,
     connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
 };
@@ -72,6 +74,9 @@ const TERMINAL_MIN_ROWS: u16 = 6;
 const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
+const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 1024;
+const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
@@ -110,16 +115,16 @@ const APP_SHUTDOWN_PHASE_STOPPING_DAEMONS: u8 = 4;
 const APP_SHUTDOWN_PHASE_EXITING: u8 = 5;
 const DIAGNOSTIC_LOG_DIR: &str = "logs";
 const TERMINAL_TELEMETRY_MAX_TEXT: usize = 512;
-const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
-const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = false;
+const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const TERMINAL_DIAGNOSTIC_RUNTIME_ENABLE_ALLOWED: bool = true;
 const TERMINAL_DIAGNOSTIC_LOG_FILE: &str = "terminal-performance.jsonl";
-const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
-const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -398,6 +403,8 @@ struct TerminalWorkspaceTopologySnapshot {
 
 struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    terminal_input_queues: Arc<StdMutex<HashMap<String, TerminalInputQueueHandle>>>,
+    terminal_input_transport: Arc<StdMutex<Option<TerminalInputTransportEndpoint>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
@@ -405,6 +412,42 @@ struct TerminalState {
     cleanup_tracker: Arc<TerminalCleanupTracker>,
     workspace_topology_cache: Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
     next_terminal_instance_id: AtomicU64,
+    next_terminal_input_queue_id: AtomicU64,
+}
+
+#[derive(Clone)]
+struct TerminalInputQueueHandle {
+    id: u64,
+    sender: mpsc::Sender<TerminalInputQueueItem>,
+}
+
+struct TerminalInputQueueItem {
+    payload: TerminalInputEventPayload,
+    ack: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInputTransportEndpoint {
+    url: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInputTransportEnvelope {
+    token: String,
+    message_id: Option<String>,
+    payload: TerminalInputEventPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalInputTransportAck {
+    r#type: &'static str,
+    message_id: String,
+    ok: bool,
+    error: Option<String>,
 }
 
 struct TerminalCleanupTracker {
@@ -605,6 +648,12 @@ impl Drop for TerminalState {
                 .collect::<Vec<(String, TerminalInstance)>>(),
             Err(_) => Vec::new(),
         };
+        if let Ok(mut queues) = self.terminal_input_queues.lock() {
+            queues.clear();
+        }
+        if let Ok(mut transport) = self.terminal_input_transport.lock() {
+            *transport = None;
+        }
         let warm_ptys = self.pty_pool.drain_for_shutdown();
 
         for (_, instance) in instances {
@@ -3215,6 +3264,8 @@ pub fn run() {
     builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
+            terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_input_transport: Arc::new(StdMutex::new(None)),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
@@ -3222,6 +3273,7 @@ pub fn run() {
             cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
             workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
             next_terminal_instance_id: AtomicU64::new(1),
+            next_terminal_input_queue_id: AtomicU64::new(1),
         })
         .manage(TerminalDiagnosticState::new())
         .manage(WindowsTerminalDiagnosticState::new())
@@ -3302,6 +3354,7 @@ pub fn run() {
             read_workspace_file_diff,
             workspace_threads_read,
             workspace_threads_persist,
+            workspace_threads_persist_delta,
             architecture_repositories,
             architecture_graphs_list,
             architecture_graph_read,
@@ -3361,6 +3414,7 @@ pub fn run() {
             cloud_mcp_sync_workspace_mcp_snapshot,
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
+            cloud_mcp_schedule_tokenomics_sync,
             tokenomics_scan_usage,
             tokenomics_scan_usage_silent,
             tokenomics_resync_last_30_days,
@@ -3378,6 +3432,7 @@ pub fn run() {
             cloud_mcp_get_task_history,
             agent_thread_session_discover,
             agent_thread_transcript,
+            agent_thread_transcript_watch,
             terminal_workspace_raw_scan,
             workspace_git_pull_candidates,
             workspace_git_pull_repositories,
@@ -3391,6 +3446,8 @@ pub fn run() {
             set_terminal_audio_input_target,
             terminal_write_to_audio_input_target,
             terminal_write,
+            terminal_input_transport_endpoint,
+            terminal_write_realtime,
             terminal_refresh_theme,
             terminal_windows_pty_info,
             terminal_set_diagnostic_logging,

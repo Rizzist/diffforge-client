@@ -1,6 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { Window } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -413,10 +412,12 @@ import {
   TERMINAL_DELETE_INPUT_BATCH_MS,
   TERMINAL_ENABLE_WEBGL_RENDERER,
   TERMINAL_ENTER_SEQUENCE,
+  TERMINAL_ENTER_SEQUENCE_MOD1,
   TERMINAL_INPUT_BATCH_MAX_CHARS,
   TERMINAL_INPUT_BATCH_MS,
-  TERMINAL_INPUT_ERROR_EVENT,
   TERMINAL_INPUT_EVENT,
+  TERMINAL_INPUT_ERROR_EVENT,
+  TERMINAL_INPUT_HOT_EVENT,
   TERMINAL_MAX_COLS,
   TERMINAL_MAX_ROWS,
   TERMINAL_MIN_COLS,
@@ -567,11 +568,13 @@ import {
   terminalInputChunkHasVisibleText,
   terminalInputChunkVisibleText,
   waitForWorkspaceThreadPromptAcceptedWithEnterRetries,
+  warmTerminalPromptSubmittedListener,
   workspaceFileToComposerAttachment,
 } from "./threadRuntime.js";
 import { logTerminalStatus } from "../terminalStatusLog.js";
 
 export {
+  TERMINAL_INPUT_HOT_EVENT,
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
   WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT,
 } from "./terminalCore.js";
@@ -585,31 +588,370 @@ export {
   normalizeWorkspaceTerminalIndexes,
 } from "./threadRuntime.js";
 
-const TERMINAL_AUDIO_INPUT_TARGET_DEDUPE_MS = 250;
-const TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS = 120;
-const terminalAudioInputTargetRequests = new Map();
-let terminalFocusedWindowCheckRequest = null;
-let terminalFocusedWindowCheckAt = 0;
+function terminalInputDataIsSubmit(value) {
+  const text = String(value || "");
+  return text.includes("\r")
+    || text.includes("\n")
+    || text.includes(TERMINAL_ENTER_SEQUENCE)
+    || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
+}
 
-function getDedupedFocusedWindow() {
-  const now = Date.now();
-  if (
-    terminalFocusedWindowCheckRequest
-    && now - terminalFocusedWindowCheckAt < TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS
-  ) {
-    return terminalFocusedWindowCheckRequest;
+const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
+const TERMINAL_INPUT_TRANSPORT_QUEUE_LIMIT = 4096;
+const TERMINAL_INPUT_TRANSPORT_RETRY_MS = 4;
+
+let terminalInputTransportEndpoint = null;
+let terminalInputTransportSocket = null;
+let terminalInputTransportConnectPromise = null;
+let terminalInputTransportFlushTimer = 0;
+let terminalInputTransportFallbackPromise = null;
+let terminalInputTransportQueue = [];
+let terminalInputTransportNextMessageId = 1;
+const terminalInputTransportPendingAcks = new Map();
+
+function isTerminalInputTransportAvailable() {
+  return typeof WebSocket !== "undefined";
+}
+
+function isTerminalInputTransportOpen() {
+  return (
+    isTerminalInputTransportAvailable()
+    && terminalInputTransportSocket?.readyState === WebSocket.OPEN
+  );
+}
+
+function cleanTerminalInputTransportPayload(payload) {
+  const cleanPayload = {};
+  Object.entries(payload || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      cleanPayload[key] = value;
+    }
+  });
+  return cleanPayload;
+}
+
+function getTerminalInputTransportLogFields(payload = {}, extra = {}) {
+  const data = String(payload?.data || "");
+  return {
+    data: getTerminalInputDebugFields(data),
+    hasPromptEventId: Boolean(String(payload?.promptEventId || "").trim()),
+    hasPromptEventText: Boolean(String(payload?.promptEventText || "").trim()),
+    instanceId: payload?.instanceId || "",
+    isSubmitInput: terminalInputDataIsSubmit(data),
+    paneId: payload?.paneId || "",
+    promptEventId: String(payload?.promptEventId || "").trim(),
+    promptEventSource: String(payload?.promptEventSource || "").trim(),
+    promptTextLength: String(payload?.promptEventText || "").trim().length,
+    threadId: payload?.threadId || "",
+    ...extra,
+  };
+}
+
+function logTerminalInputTransportSubmit(phase, payload, extra = {}) {
+  if (!payload?.promptEventId && !payload?.promptEventText) {
+    return;
   }
 
-  terminalFocusedWindowCheckAt = now;
-  terminalFocusedWindowCheckRequest = Window.getFocusedWindow()
+  logTerminalStatus(
+    phase,
+    getTerminalInputTransportLogFields(payload, extra),
+  );
+}
+
+function invokeTerminalInputPayload(payload) {
+  return invoke("terminal_write", {
+    data: payload?.data || "",
+    instanceId: payload?.instanceId,
+    paneId: payload?.paneId,
+    promptEventId: payload?.promptEventId,
+    promptEventRevision: payload?.promptEventRevision,
+    promptEventSource: payload?.promptEventSource,
+    promptEventSubmittedAt: payload?.promptEventSubmittedAt,
+    promptEventText: payload?.promptEventText,
+    threadId: payload?.threadId,
+  });
+}
+
+function scheduleTerminalInputTransportFlush(delayMs = 0) {
+  if (terminalInputTransportFlushTimer || typeof window === "undefined") {
+    return;
+  }
+  terminalInputTransportFlushTimer = window.setTimeout(() => {
+    terminalInputTransportFlushTimer = 0;
+    flushTerminalInputTransportQueue();
+  }, delayMs);
+}
+
+function fallbackTerminalInputTransportQueue() {
+  if (terminalInputTransportFallbackPromise) {
+    return terminalInputTransportFallbackPromise;
+  }
+
+  const queuedEntries = terminalInputTransportQueue.splice(0);
+  terminalInputTransportFallbackPromise = queuedEntries
+    .reduce(
+      (promise, entry) => promise
+        .then(() => {
+          logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit", entry.payload, {
+            messageId: entry.messageId,
+            reason: "transport_unavailable",
+          });
+          return entry.messageId
+            ? invokeTerminalInputPayload(entry.payload)
+            : emit(TERMINAL_INPUT_EVENT, entry.payload);
+        })
+        .then((result) => {
+          entry.resolveAck?.(result);
+          return result;
+        })
+        .catch((error) => {
+          entry.rejectAck?.(error);
+        }),
+      Promise.resolve(),
+    )
     .finally(() => {
-      window.setTimeout(() => {
-        if (Date.now() - terminalFocusedWindowCheckAt >= TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS) {
-          terminalFocusedWindowCheckRequest = null;
-        }
-      }, TERMINAL_FOCUSED_WINDOW_CHECK_DEDUPE_MS);
+      terminalInputTransportFallbackPromise = null;
     });
-  return terminalFocusedWindowCheckRequest;
+  return terminalInputTransportFallbackPromise;
+}
+
+function rejectTerminalInputTransportPendingAcks(error) {
+  Array.from(terminalInputTransportPendingAcks.values()).forEach((ack) => {
+    ack.reject(error);
+  });
+}
+
+function resetTerminalInputTransportSocket(socket) {
+  if (terminalInputTransportSocket === socket) {
+    terminalInputTransportSocket = null;
+  }
+}
+
+function handleTerminalInputTransportMessage(event) {
+  let message = null;
+  try {
+    message = JSON.parse(String(event?.data || ""));
+  } catch {
+    return;
+  }
+  if (message?.type !== "terminal-input-ack" || !message.messageId) {
+    return;
+  }
+
+  const ack = terminalInputTransportPendingAcks.get(message.messageId);
+  if (!ack) {
+    return;
+  }
+  logTerminalStatus("frontend.terminal_input_transport.ack", {
+    ...(ack.fields || {}),
+    error: message.ok ? "" : String(message.error || ""),
+    messageId: message.messageId,
+    ok: Boolean(message.ok),
+  });
+  if (message.ok) {
+    ack.resolve(message);
+  } else {
+    ack.reject(new Error(message.error || "Terminal input write failed."));
+  }
+}
+
+function createTerminalInputTransportEntry(payload, waitForAck = false) {
+  const entry = {
+    logFields: waitForAck ? getTerminalInputTransportLogFields(payload) : null,
+    messageId: "",
+    payload,
+    rejectAck: null,
+    resolveAck: null,
+    waitPromise: null,
+  };
+
+  if (!waitForAck) {
+    return entry;
+  }
+
+  const messageId = `terminal-input-${Date.now().toString(36)}-${terminalInputTransportNextMessageId.toString(36)}`;
+  terminalInputTransportNextMessageId += 1;
+  entry.messageId = messageId;
+  entry.waitPromise = new Promise((resolve, reject) => {
+    const finish = (callback, value) => {
+      const ack = terminalInputTransportPendingAcks.get(messageId);
+      if (ack?.timer) {
+        window.clearTimeout(ack.timer);
+      }
+      terminalInputTransportPendingAcks.delete(messageId);
+      callback(value);
+    };
+    entry.resolveAck = (value) => finish(resolve, value);
+    entry.rejectAck = (error) => finish(reject, error);
+    const timer = typeof window !== "undefined"
+      ? window.setTimeout(() => {
+        entry.rejectAck?.(new Error("Terminal input write acknowledgement timed out."));
+      }, 8000)
+      : 0;
+    terminalInputTransportPendingAcks.set(messageId, {
+      fields: entry.logFields,
+      reject: entry.rejectAck,
+      resolve: entry.resolveAck,
+      timer,
+    });
+  });
+  return entry;
+}
+
+function sendTerminalInputTransportEntry(socket, entry) {
+  socket.send(JSON.stringify({
+    token: terminalInputTransportEndpoint.token,
+    ...(entry.messageId ? { messageId: entry.messageId } : {}),
+    payload: entry.payload,
+  }));
+}
+
+function ensureTerminalInputTransport() {
+  if (!isTerminalInputTransportAvailable()) {
+    return Promise.reject(new Error("Terminal input WebSocket transport is unavailable."));
+  }
+  if (isTerminalInputTransportOpen()) {
+    return Promise.resolve(terminalInputTransportSocket);
+  }
+  if (terminalInputTransportConnectPromise) {
+    return terminalInputTransportConnectPromise;
+  }
+
+  terminalInputTransportConnectPromise = Promise.resolve(terminalInputTransportEndpoint)
+    .then((endpoint) => endpoint || invoke("terminal_input_transport_endpoint"))
+    .then((endpoint) => {
+      terminalInputTransportEndpoint = endpoint;
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const socket = new WebSocket(endpoint.url);
+        socket.onopen = () => {
+          settled = true;
+          terminalInputTransportSocket = socket;
+          terminalInputTransportConnectPromise = null;
+          socket.onmessage = handleTerminalInputTransportMessage;
+          flushTerminalInputTransportQueue();
+          resolve(socket);
+        };
+        socket.onclose = () => {
+          resetTerminalInputTransportSocket(socket);
+          rejectTerminalInputTransportPendingAcks(new Error("Terminal input WebSocket transport closed."));
+          if (!settled) {
+            terminalInputTransportConnectPromise = null;
+            reject(new Error("Terminal input WebSocket transport closed before opening."));
+          }
+        };
+        socket.onerror = () => {
+          if (!settled) {
+            terminalInputTransportConnectPromise = null;
+            reject(new Error("Terminal input WebSocket transport failed."));
+          }
+        };
+      });
+    })
+    .catch((error) => {
+      terminalInputTransportConnectPromise = null;
+      throw error;
+    });
+
+  return terminalInputTransportConnectPromise;
+}
+
+function flushTerminalInputTransportQueue() {
+  if (!terminalInputTransportQueue.length) {
+    return;
+  }
+
+  if (!isTerminalInputTransportOpen() || !terminalInputTransportEndpoint?.token) {
+    ensureTerminalInputTransport().catch(() => {
+      fallbackTerminalInputTransportQueue();
+    });
+    return;
+  }
+
+  const socket = terminalInputTransportSocket;
+  while (
+    terminalInputTransportQueue.length
+    && socket.bufferedAmount < TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES
+  ) {
+    const entry = terminalInputTransportQueue.shift();
+    try {
+      sendTerminalInputTransportEntry(socket, entry);
+      logTerminalInputTransportSubmit("frontend.terminal_input_transport.sent", entry.payload, {
+        messageId: entry.messageId,
+        socketBufferedAmount: socket.bufferedAmount,
+        waitForAck: Boolean(entry.messageId),
+      });
+    } catch {
+      terminalInputTransportQueue.unshift(entry);
+      resetTerminalInputTransportSocket(socket);
+      ensureTerminalInputTransport().catch(() => {
+        fallbackTerminalInputTransportQueue();
+      });
+      return;
+    }
+  }
+
+  if (terminalInputTransportQueue.length) {
+    scheduleTerminalInputTransportFlush(TERMINAL_INPUT_TRANSPORT_RETRY_MS);
+  }
+}
+
+function warmTerminalInputTransport() {
+  ensureTerminalInputTransport().catch(() => {});
+}
+
+function sendTerminalInputPayload(payload, options = {}) {
+  const cleanPayload = cleanTerminalInputTransportPayload(payload);
+  const waitForAck = Boolean(options?.waitForAck);
+  if (!isTerminalInputTransportAvailable()) {
+    logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit_unavailable", cleanPayload, {
+      waitForAck,
+    });
+    return waitForAck
+      ? invokeTerminalInputPayload(cleanPayload)
+      : emit(TERMINAL_INPUT_EVENT, cleanPayload);
+  }
+
+  const entry = createTerminalInputTransportEntry(cleanPayload, waitForAck);
+
+  if (isTerminalInputTransportOpen() && terminalInputTransportEndpoint?.token) {
+    const socket = terminalInputTransportSocket;
+    if (socket.bufferedAmount < TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES) {
+      try {
+        sendTerminalInputTransportEntry(socket, entry);
+        logTerminalInputTransportSubmit("frontend.terminal_input_transport.sent", cleanPayload, {
+          messageId: entry.messageId,
+          socketBufferedAmount: socket.bufferedAmount,
+          waitForAck,
+        });
+        return entry.waitPromise || Promise.resolve({ queued: true, transport: "websocket" });
+      } catch {
+        resetTerminalInputTransportSocket(socket);
+      }
+    }
+  }
+
+  if (terminalInputTransportQueue.length >= TERMINAL_INPUT_TRANSPORT_QUEUE_LIMIT) {
+    logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit_queue_full", cleanPayload, {
+      queueLength: terminalInputTransportQueue.length,
+      waitForAck,
+    });
+    return waitForAck
+      ? invokeTerminalInputPayload(cleanPayload)
+      : emit(TERMINAL_INPUT_EVENT, cleanPayload);
+  }
+
+  terminalInputTransportQueue.push(entry);
+  logTerminalInputTransportSubmit("frontend.terminal_input_transport.queued", cleanPayload, {
+    messageId: entry.messageId,
+    queueLength: terminalInputTransportQueue.length,
+    waitForAck,
+  });
+  ensureTerminalInputTransport().catch(() => {
+    fallbackTerminalInputTransportQueue();
+  });
+  scheduleTerminalInputTransportFlush();
+  return entry.waitPromise || Promise.resolve({ queued: true, transport: "websocket" });
 }
 
 function getTerminalClipboardImageFiles(clipboardData) {
@@ -1361,6 +1703,9 @@ function WorkspaceTerminal({
   useEffect(() => {
     terminalUiViewActiveRef.current = terminalUiViewActive;
   }, [terminalUiViewActive]);
+  useEffect(() => {
+    warmTerminalInputTransport();
+  }, []);
   const isTerminalStabilityRuntimeEnabled = useCallback(
     () => false,
     [],
@@ -1660,6 +2005,7 @@ function WorkspaceTerminal({
       latestTurn: turnState.latestTurn || { state: turnState.latestTurnState || "" },
       pendingPrompt: turnState.pendingPrompt || (turnState.pendingPromptPresent ? true : null),
       source,
+      submittedPrompt: terminalThreadSubmittedPromptRef.current,
       threadId: terminalThreadIdRef.current,
     });
   };
@@ -1996,23 +2342,28 @@ function WorkspaceTerminal({
       return;
     }
 
-    try {
-      terminal.focus();
-    } catch (_) {
+    const terminalHasDomFocus = () => {
+      if (typeof document === "undefined" || typeof Node === "undefined") {
+        return false;
+      }
+      const activeElement = document.activeElement;
+      const terminalElement = terminal.element || containerRef.current;
+      return Boolean(
+        activeElement
+        && terminalElement instanceof Node
+        && terminalElement.contains(activeElement),
+      );
+    };
+
+    if (terminalHasDomFocus()) {
       return;
     }
 
-    window.setTimeout(() => {
-      if (terminal !== xtermRef.current) {
-        return;
-      }
-
-      try {
-        terminal.focus();
-      } catch (_) {
-        // Terminal may have been disposed between activation and the deferred focus pass.
-      }
-    }, 0);
+    try {
+      terminal.focus();
+    } catch (_) {
+      // Terminal may have been disposed between activation and the focus request.
+    }
   }, []);
   const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "", options = {}) => {
     if (isGenericTerminal) {
@@ -3525,9 +3876,7 @@ function WorkspaceTerminal({
     const focusKeyboard = options?.focusKeyboard !== false;
     const instanceId = terminalInstanceIdRef.current || 0;
     terminalActiveRef.current = true;
-    if (focusKeyboard) {
-      setActiveTerminalKeyboardTarget(paneId, instanceId);
-    }
+    setActiveTerminalKeyboardTarget(paneId, instanceId);
     setTerminalFocused(true);
     updateTerminalInteractiveState(true);
     onActivateTerminal?.({
@@ -3548,66 +3897,6 @@ function WorkspaceTerminal({
     updateTerminalInteractiveState,
     workspace?.id,
   ]);
-  const requestTerminalAudioInputTarget = useCallback((active) => {
-    const instanceId = terminalInstanceIdRef.current || undefined;
-
-    if (active && !instanceId) {
-      return Promise.resolve(false);
-    }
-
-    const targetKey = `${paneId}:${Number(instanceId || 0)}`;
-    const now = Date.now();
-    const cachedRequest = terminalAudioInputTargetRequests.get(targetKey);
-    if (
-      cachedRequest
-      && cachedRequest.active === Boolean(active)
-      && now - Number(cachedRequest.updatedAt || 0) < TERMINAL_AUDIO_INPUT_TARGET_DEDUPE_MS
-    ) {
-      if (!active) {
-        clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
-      }
-      return cachedRequest.request || Promise.resolve(true);
-    }
-
-    const request = invoke("set_terminal_audio_input_target", {
-      active,
-      instanceId,
-      paneId,
-    })
-      .then(() => {
-        if (!active) {
-          clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
-        }
-
-        return true;
-      })
-      .catch(() => {
-        if (active) {
-          clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
-        }
-
-        return false;
-      });
-
-    terminalAudioInputTargetRequests.set(targetKey, {
-      active: Boolean(active),
-      request,
-      updatedAt: now,
-    });
-
-    request.finally(() => {
-      const currentRequest = terminalAudioInputTargetRequests.get(targetKey);
-      if (currentRequest?.request === request) {
-        terminalAudioInputTargetRequests.set(targetKey, {
-          active: Boolean(active),
-          request: null,
-          updatedAt: Date.now(),
-        });
-      }
-    });
-
-    return request;
-  }, [paneId]);
 
   const requestTerminalDragFromEvent = useCallback((event, options = {}) => {
     const breakoutSurfaceDrag = options?.breakoutSurfaceDrag === true;
@@ -3630,7 +3919,6 @@ function WorkspaceTerminal({
     event.stopPropagation();
 
     activateTerminalPane(breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag");
-    requestTerminalAudioInputTarget(true);
 
     onBeginTerminalDrag?.({
       clientX: event.clientX,
@@ -3649,7 +3937,6 @@ function WorkspaceTerminal({
     isFullscreen,
     onBeginTerminalDrag,
     paneId,
-    requestTerminalAudioInputTarget,
     terminalBreakoutActive,
     terminalClosed,
     terminalClosing,
@@ -3688,8 +3975,7 @@ function WorkspaceTerminal({
     }
 
     activateTerminalPane("terminal_focus");
-    requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget, terminalSelectsOnPointerDown]);
+  }, [activateTerminalPane, terminalSelectsOnPointerDown]);
 
   const handleTerminalSurfacePointerDownCapture = useCallback((event) => {
     if (isTerminalControlEventTarget(event.target)) {
@@ -3710,11 +3996,9 @@ function WorkspaceTerminal({
     }
 
     activateTerminalPane("terminal_pointer");
-    requestTerminalAudioInputTarget(true);
   }, [
     activateTerminalPane,
     beginBreakoutSurfaceDragGesture,
-    requestTerminalAudioInputTarget,
     terminalBreakoutActive,
     terminalSelectsOnPointerDown,
   ]);
@@ -3738,12 +4022,10 @@ function WorkspaceTerminal({
   }, [terminalSelectsOnPointerDown]);
   const handleTerminalUiViewFocusCapture = useCallback(() => {
     activateTerminalPane("terminal_ui_view_focus", { focusKeyboard: false });
-    requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  }, [activateTerminalPane]);
   const handleTerminalUiViewPointerDownCapture = useCallback(() => {
     activateTerminalPane("terminal_ui_view_pointer", { focusKeyboard: false });
-    requestTerminalAudioInputTarget(true);
-  }, [activateTerminalPane, requestTerminalAudioInputTarget]);
+  }, [activateTerminalPane]);
 
   useEffect(() => {
     terminalActiveRef.current = Boolean(isActive);
@@ -3753,15 +4035,13 @@ function WorkspaceTerminal({
     if (isActive) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
       attachDeferredWebglRef.current?.("terminal_activated");
-      requestTerminalAudioInputTarget(true);
       focusTerminalKeyboardInput(true);
       return undefined;
     }
 
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
-    requestTerminalAudioInputTarget(false);
     return undefined;
-  }, [focusTerminalKeyboardInput, isActive, paneId, requestTerminalAudioInputTarget, updateTerminalInteractiveState]);
+  }, [focusTerminalKeyboardInput, isActive, paneId, updateTerminalInteractiveState]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -4068,10 +4348,12 @@ function WorkspaceTerminal({
         }
 
         const inputReadyAt = new Date().toISOString();
+        const submittedPromptForReady = terminalThreadSubmittedPromptRef.current;
         terminalThreadLastReadyAtMsRef.current = parseTerminalStateTimestampMs(inputReadyAt) || Date.now();
         logTerminalStatus("frontend.terminal_cli.backend_prompt_ready_output", listenerState.getTerminalCliStatusLogBase?.({
           inputReadyAt,
           outputPreview: sanitizeTerminalDiagnosticText(outputText, 320),
+          promptEventId: submittedPromptForReady?.promptEventId || "",
           source: promptReadySource,
           statusTruth: payload.statusTruth || payload.status_truth || "idle_or_prompt_ready",
         }) || {});
@@ -4084,6 +4366,7 @@ function WorkspaceTerminal({
         const promptReadyLifecycle = {
           activityStatus: "idle",
           agentId: listenerState.terminalAgentKind,
+          expectedUserMessage: submittedPromptForReady?.promptText || "",
           inputReady: true,
           inputReadyAt,
           inputReadyConfidence: promptReadySource,
@@ -4094,10 +4377,15 @@ function WorkspaceTerminal({
           ...getTerminalNativeRailStateFields("idle"),
           outputText: String(outputText || "").slice(-1200),
           paneId: listenerState.paneId,
+          pendingPromptId: submittedPromptForReady?.promptEventId || "",
+          promptEventId: submittedPromptForReady?.promptEventId || "",
+          promptEventSubmittedAt: submittedPromptForReady?.submittedAt || "",
           promptReadyAt: inputReadyAt,
           providerSessionId: listenerState.threadProviderSessionId || "",
           source: promptReadySource,
           status: "active",
+          submittedAt: submittedPromptForReady?.submittedAt || "",
+          terminalPrompt: submittedPromptForReady?.promptText || "",
           terminalIndex: listenerState.terminalIndex,
           threadId: terminalThreadIdRef.current,
           type: "terminal-prompt-ready",
@@ -4710,6 +4998,7 @@ function WorkspaceTerminal({
     syncTerminalDiagnosticLogging();
     syncWindowsTerminalDiagnosticLogging();
     startTerminalDiagnosticHeartbeat();
+    warmTerminalPromptSubmittedListener();
     let terminalRendererOpened = false;
     let windowsPtyOptions = TERMINAL_IS_WINDOWS_HOST ? buildWindowsPtyOptions() : null;
     const applyWindowsPtyOptions = (info = null) => {
@@ -5393,83 +5682,6 @@ function WorkspaceTerminal({
 
     disposables.push(() => flushOutputDiagnosticWindow("dispose"));
 
-    let terminalFocusClearTimer = 0;
-    const markTerminalAudioInputTarget = () => {
-      if (terminalFocusClearTimer) {
-        window.clearTimeout(terminalFocusClearTimer);
-        terminalFocusClearTimer = 0;
-      }
-
-      if (!isDisposed) {
-        activateTerminalPane("terminal_dom_focus");
-        requestTerminalAudioInputTarget(true);
-      }
-    };
-    const clearTerminalAudioInputTarget = () => {
-      if (!isDisposed) {
-        requestTerminalAudioInputTarget(false);
-      }
-    };
-    const clearTerminalAudioInputTargetIfAppUnfocused = () => {
-      window.setTimeout(() => {
-        if (document.hasFocus()) {
-          return;
-        }
-
-        getDedupedFocusedWindow()
-          .then((focusedWindow) => {
-            if (!isDisposed && !focusedWindow) {
-              clearTerminalAudioInputTarget();
-            }
-          })
-          .catch(() => {});
-      }, 30);
-    };
-    const scheduleClearTerminalAudioInputTarget = () => {
-      if (terminalFocusClearTimer) {
-        window.clearTimeout(terminalFocusClearTimer);
-      }
-
-      terminalFocusClearTimer = window.setTimeout(() => {
-        terminalFocusClearTimer = 0;
-        if (!container.contains(document.activeElement) && document.hasFocus()) {
-          clearTerminalAudioInputTarget();
-        }
-      }, 0);
-    };
-    const clearTerminalAudioInputTargetIfPointerOutside = (event) => {
-      const targetNode = event.target instanceof Node ? event.target : null;
-      const surfaceElement = surfaceRef.current;
-      if (
-        targetNode
-        && !container.contains(targetNode)
-        && !surfaceElement?.contains(targetNode)
-      ) {
-        clearTerminalAudioInputTarget();
-      }
-    };
-
-    container.addEventListener("focusin", markTerminalAudioInputTarget, true);
-    container.addEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
-    container.addEventListener("pointerdown", markTerminalAudioInputTarget, true);
-    document.addEventListener("pointerdown", clearTerminalAudioInputTargetIfPointerOutside, true);
-    window.addEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
-    Window.getCurrent()
-      .onFocusChanged((event) => {
-        if (!event.payload) {
-          clearTerminalAudioInputTargetIfAppUnfocused();
-        }
-      })
-      .then((unlisten) => {
-        if (isDisposed) {
-          unlisten();
-          return;
-        }
-
-        disposables.push(unlisten);
-      })
-      .catch(() => {});
-
     const pendingTerminalAudioInputChunks = [];
     let applyTerminalAudioInputChunk = (insertedText) => {
       if (insertedText) {
@@ -5488,7 +5700,6 @@ function WorkspaceTerminal({
 
       const insertedText = String(event.payload?.insertedText || "");
       if (terminalActiveRef.current) {
-        requestTerminalAudioInputTarget(true);
         if (terminalUiViewActiveRef.current) {
           if (insertedText) {
             setTerminalUiComposerFocusToken((token) => token + 1);
@@ -5527,22 +5738,10 @@ function WorkspaceTerminal({
       }
 
       activateTerminalPane(detail.reason || "terminal_focus_request");
-      requestTerminalAudioInputTarget(true);
-      focusTerminalKeyboardInput(true);
     };
     window.addEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
     disposables.push(() => {
-      if (terminalFocusClearTimer) {
-        window.clearTimeout(terminalFocusClearTimer);
-        terminalFocusClearTimer = 0;
-      }
       window.removeEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
-      container.removeEventListener("focusin", markTerminalAudioInputTarget, true);
-      container.removeEventListener("focusout", scheduleClearTerminalAudioInputTarget, true);
-      container.removeEventListener("pointerdown", markTerminalAudioInputTarget, true);
-      document.removeEventListener("pointerdown", clearTerminalAudioInputTargetIfPointerOutside, true);
-      window.removeEventListener("blur", clearTerminalAudioInputTargetIfAppUnfocused, true);
-      clearTerminalAudioInputTarget();
     });
 
     const attachWebglRenderer = (reason = "scheduled") => {
@@ -6316,6 +6515,10 @@ function WorkspaceTerminal({
       flush: (reason) => flushTerminalOutputBatch(reason),
       getPendingBytes: () => pendingOutputBytes,
       getQueuedAt: () => outputBatchQueuedAt,
+      hasPriorityPending: () => pendingOutputWrites.some((write) => (
+        write?.isFirstOutputChunk === true
+        || write?.isFirstVisibleOutputChunk === true
+      )),
       hasPending: () => !isDisposed && !outputWriteInFlight && pendingOutputWrites.length > 0,
       id: renderSchedulerId,
       isActive: () => terminalActiveRef.current,
@@ -9097,6 +9300,7 @@ function WorkspaceTerminal({
             }
             if (shouldEmitPromptReady) {
               const inputReadyAt = new Date().toISOString();
+              const submittedPromptForReady = terminalThreadSubmittedPromptRef.current;
               const promptReadySource = promptReadyDetectionArmed
                 ? "terminal-output-prompt-ready"
                 : "terminal-output-prompt-ready-early";
@@ -9104,6 +9308,7 @@ function WorkspaceTerminal({
                 candidateConfidence: promptReadyDetectionArmed && sawAgentOutput ? "prompt_ready_after_agent_output" : "prompt_ready_early",
                 finishCandidateAt: inputReadyAt,
                 outputPreview: sanitizeTerminalDiagnosticText(readyOutputText, 320),
+                promptEventId: submittedPromptForReady?.promptEventId || "",
                 promptReadyDetectionArmed,
                 promptReadySource,
                 sawAgentOutput,
@@ -9136,6 +9341,7 @@ function WorkspaceTerminal({
               const promptReadyLifecycle = {
                 activityStatus: "idle",
                 agentId: terminalAgentKind,
+                expectedUserMessage: submittedPromptForReady?.promptText || "",
                 inputReady: true,
                 inputReadyAt,
                 inputReadyConfidence: promptReadySource,
@@ -9146,10 +9352,15 @@ function WorkspaceTerminal({
                 ...getTerminalNativeRailStateFields("idle"),
                 outputText: readyOutputText.slice(-1200),
                 paneId,
+                pendingPromptId: submittedPromptForReady?.promptEventId || "",
+                promptEventId: submittedPromptForReady?.promptEventId || "",
+                promptEventSubmittedAt: submittedPromptForReady?.submittedAt || "",
                 promptReadyAt: inputReadyAt,
                 providerSessionId: capturedProviderSessionId || threadProviderSessionId || "",
                 source: promptReadySource,
                 status: "active",
+                submittedAt: submittedPromptForReady?.submittedAt || "",
+                terminalPrompt: submittedPromptForReady?.promptText || "",
                 terminalIndex,
                 threadId: terminalThreadIdRef.current,
                 type: "terminal-prompt-ready",
@@ -9283,6 +9494,12 @@ function WorkspaceTerminal({
         let terminalInputBuffer = "";
         let terminalInputFlushTimer = 0;
         let terminalInputWriteChain = Promise.resolve();
+        let terminalInputWriteQueue = [];
+        let terminalInputWriteQueueTimer = 0;
+        let terminalInputWriteQueueDraining = false;
+        let terminalComposerDraftSyncTimer = 0;
+        let terminalComposerDraftSyncPending = false;
+        let terminalComposerDraftSyncValue = "";
         let terminalSubmittedInputHasText = false;
         let terminalSubmittedInputText = "";
         let terminalSubmittedComposerState = createTerminalComposerState();
@@ -9294,6 +9511,10 @@ function WorkspaceTerminal({
           terminalSubmittedComposerState = nextState || createTerminalComposerState();
           terminalSubmittedInputText = getTerminalComposerText(terminalSubmittedComposerState);
           terminalSubmittedInputHasText = terminalSubmittedInputText.trim().length > 0;
+          const traceComposerStateUpdate = !["terminal_input", "terminal_input_hot"].includes(reason);
+          if (!traceComposerStateUpdate) {
+            return;
+          }
           logBigViewSyncDiagnosticEvent("tui.text.composer_state_updated", {
             agentId: terminalAgentKind,
             confidence: terminalSubmittedComposerState.confidence,
@@ -9356,6 +9577,33 @@ function WorkspaceTerminal({
             value,
             "terminal_input_observed",
           );
+        };
+        const flushCurrentTerminalComposerDraftSync = () => {
+          if (!terminalComposerDraftSyncPending) {
+            return;
+          }
+          if (terminalComposerDraftSyncTimer) {
+            window.clearTimeout(terminalComposerDraftSyncTimer);
+            terminalComposerDraftSyncTimer = 0;
+          }
+          terminalComposerDraftSyncPending = false;
+          const pendingValue = terminalComposerDraftSyncValue;
+          terminalComposerDraftSyncValue = "";
+          syncCurrentTerminalComposerDraft(pendingValue);
+        };
+        const scheduleCurrentTerminalComposerDraftSync = (value, delayMs = 180) => {
+          terminalComposerDraftSyncPending = true;
+          terminalComposerDraftSyncValue = String(value || "");
+          if (terminalComposerDraftSyncTimer) {
+            window.clearTimeout(terminalComposerDraftSyncTimer);
+          }
+          terminalComposerDraftSyncTimer = window.setTimeout(() => {
+            terminalComposerDraftSyncTimer = 0;
+            terminalComposerDraftSyncPending = false;
+            const pendingValue = terminalComposerDraftSyncValue;
+            terminalComposerDraftSyncValue = "";
+            syncCurrentTerminalComposerDraft(pendingValue);
+          }, Math.max(0, Number(delayMs) || 0));
         };
         const isTerminalControlUiSuppressionActive = () => (
           terminalControlUiSuppressionUntilMs > Date.now()
@@ -9512,8 +9760,27 @@ function WorkspaceTerminal({
           const promptEventSource = String(promptMetadata?.promptEventSource || "").trim();
           const promptEventSubmittedAt = String(promptMetadata?.promptEventSubmittedAt || "").trim();
           const isEscapeInput = String(data || "").includes("\x1b");
-          const isSubmitInput = textData.includes("\r") || textData.includes("\n");
+          const isSubmitInput = terminalInputDataIsSubmit(textData);
           const isFocusEventInput = textData.includes("\x1b[I") || textData.includes("\x1b[O");
+          if (typeof window !== "undefined") {
+            const hotDurationMs = isSubmitInput ? 4500 : 2500;
+            const hotUntil = Date.now() + hotDurationMs;
+            window.__diffforgeTerminalInputHotUntil = Math.max(
+              Number(window.__diffforgeTerminalInputHotUntil || 0),
+              hotUntil,
+            );
+            window.dispatchEvent(new CustomEvent(TERMINAL_INPUT_HOT_EVENT, {
+              detail: {
+                hotUntil,
+                instanceId: terminalInstanceId,
+                isSubmitInput,
+                paneId,
+                reason,
+                terminalIndex,
+                workspaceId: workspace?.id || "",
+              },
+            }));
+          }
           const tracePtyInputWrite = !isGenericTerminal
             && (
               textData.length > 1
@@ -9550,93 +9817,160 @@ function WorkspaceTerminal({
             });
           }
 
-          terminalInputWriteChain = terminalInputWriteChain
-            .catch(() => {})
-            .then(() => {
-              if (escapeDebugFields) {
-              }
-
-              if (tracePtyInputWrite) {
-                logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_invoke", {
-                  agentId: terminalAgentKind,
-                  inputDebug: getTerminalInputDebugFields(textData),
-                  instanceId: terminalInstanceId,
-                  isFocusEventInput,
-                  isSubmitInput,
-                  paneId,
-                  promptEventId,
-                  promptEventTextLength: promptEventText.length,
-                  reason,
-                  terminalIndex,
-                  threadId: terminalThreadIdRef.current || "",
-                  workspaceId: workspace?.id || "",
-                });
-              }
-              return emit(TERMINAL_INPUT_EVENT, {
-                paneId,
-                instanceId: terminalInstanceId,
-                data,
-                promptEventId: promptEventId || undefined,
-                promptEventRevision: Number.isFinite(promptEventRevision) ? promptEventRevision : undefined,
-                promptEventSource: promptEventSource || undefined,
-                promptEventSubmittedAt: promptEventSubmittedAt || undefined,
-                promptEventText: promptEventText || undefined,
-                threadId: terminalThreadIdRef.current,
-              }).then((result) => {
-                if (escapeDebugFields) {
-                }
-
-                if (tracePtyInputWrite) {
-                  logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_done", {
-                    agentId: terminalAgentKind,
-                    inputDebug: getTerminalInputDebugFields(textData),
-                    instanceId: terminalInstanceId,
-                    isFocusEventInput,
-                    isSubmitInput,
-                    paneId,
-                    promptEventId,
-                    promptEventTextLength: promptEventText.length,
-                    reason,
-                    terminalIndex,
-                    threadId: terminalThreadIdRef.current || "",
-                    workspaceId: workspace?.id || "",
-                  });
-                }
-                return result;
-              });
-            })
-            .catch((error) => {
-              if (escapeDebugFields) {
-              }
-
-              if (isTerminalSessionMissingError(error)) {
-                return;
-              }
-
-              if (tracePtyInputWrite) {
-                logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_error", {
-                  agentId: terminalAgentKind,
-                  inputDebug: getTerminalInputDebugFields(textData),
-                  instanceId: terminalInstanceId,
-                  isFocusEventInput,
-                  isSubmitInput,
-                  message: error?.message || String(error || ""),
-                  paneId,
-                  promptEventId,
-                  promptEventTextLength: promptEventText.length,
-                  reason,
-                  terminalIndex,
-                  threadId: terminalThreadIdRef.current || "",
-                  workspaceId: workspace?.id || "",
-                });
-              }
-              if (!isDisposed) {
-                setTerminalError(getErrorMessage(error, "Unable to write to terminal."));
-              }
+          const scheduleTerminalInputWriteQueueDrain = () => {
+            if (terminalInputWriteQueueTimer || isDisposed) {
+              return;
+            }
+            terminalInputWriteQueueTimer = window.setTimeout(() => {
+              terminalInputWriteQueueTimer = 0;
+              drainTerminalInputWriteQueue();
+            }, 0);
+          };
+          const enqueueTerminalInputWrite = (invokeWrite, handleWriteError, waitForCompletion) => {
+            let resolveQueuedWrite = null;
+            const queuedWritePromise = new Promise((resolve) => {
+              resolveQueuedWrite = resolve;
             });
+            terminalInputWriteQueue.push({
+              handleWriteError,
+              invokeWrite,
+              resolve: resolveQueuedWrite,
+            });
+            if (waitForCompletion) {
+              drainTerminalInputWriteQueue();
+            } else {
+              scheduleTerminalInputWriteQueueDrain();
+            }
+            return waitForCompletion ? queuedWritePromise : Promise.resolve({ queued: true });
+          };
+          function drainTerminalInputWriteQueue() {
+            if (terminalInputWriteQueueDraining || isDisposed) {
+              return;
+            }
+            terminalInputWriteQueueDraining = true;
+            const drainNext = () => {
+              if (isDisposed) {
+                terminalInputWriteQueue = [];
+                terminalInputWriteQueueDraining = false;
+                return Promise.resolve();
+              }
+              const entry = terminalInputWriteQueue.shift();
+              if (!entry) {
+                terminalInputWriteQueueDraining = false;
+                return Promise.resolve();
+              }
+              return Promise.resolve()
+                .then(entry.invokeWrite)
+                .catch((error) => {
+                  entry.handleWriteError?.(error);
+                })
+                .then((result) => {
+                  entry.resolve?.(result);
+                })
+                .then(drainNext);
+            };
+            terminalInputWriteChain = terminalInputWriteChain
+              .catch(() => {})
+              .then(drainNext);
+          }
+          const invokeTerminalInputWrite = () => {
+            if (escapeDebugFields) {
+            }
+
+            if (tracePtyInputWrite) {
+              logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_invoke", {
+                agentId: terminalAgentKind,
+                inputDebug: getTerminalInputDebugFields(textData),
+                instanceId: terminalInstanceId,
+                isFocusEventInput,
+                isSubmitInput,
+                paneId,
+                promptEventId,
+                promptEventTextLength: promptEventText.length,
+                reason,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+            }
+            return sendTerminalInputPayload({
+              paneId,
+              instanceId: terminalInstanceId,
+              data,
+              promptEventId: promptEventId || undefined,
+              promptEventRevision: Number.isFinite(promptEventRevision) ? promptEventRevision : undefined,
+              promptEventSource: promptEventSource || undefined,
+              promptEventSubmittedAt: promptEventSubmittedAt || undefined,
+              promptEventText: promptEventText || undefined,
+              threadId: terminalThreadIdRef.current,
+            }, {
+              waitForAck: serializeInputWrite,
+            }).then((result) => {
+              if (escapeDebugFields) {
+              }
+
+              if (tracePtyInputWrite) {
+                logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_done", {
+                  agentId: terminalAgentKind,
+                  inputDebug: getTerminalInputDebugFields(textData),
+                  instanceId: terminalInstanceId,
+                  isFocusEventInput,
+                  isSubmitInput,
+                  paneId,
+                  promptEventId,
+                  promptEventTextLength: promptEventText.length,
+                  reason,
+                  terminalIndex,
+                  threadId: terminalThreadIdRef.current || "",
+                  workspaceId: workspace?.id || "",
+                });
+              }
+              return result;
+            });
+          };
+          const handleTerminalInputWriteError = (error) => {
+            if (escapeDebugFields) {
+            }
+
+            if (isTerminalSessionMissingError(error)) {
+              return;
+            }
+
+            if (tracePtyInputWrite) {
+              logBigViewSyncDiagnosticEvent("tui.text.pty_input_write_error", {
+                agentId: terminalAgentKind,
+                inputDebug: getTerminalInputDebugFields(textData),
+                instanceId: terminalInstanceId,
+                isFocusEventInput,
+                isSubmitInput,
+                message: error?.message || String(error || ""),
+                paneId,
+                promptEventId,
+                promptEventTextLength: promptEventText.length,
+                reason,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+            }
+            if (!isDisposed) {
+              setTerminalError(getErrorMessage(error, "Unable to write to terminal."));
+            }
+          };
+          const serializeInputWrite = isSubmitInput
+            || Boolean(promptEventId || promptEventText)
+            || String(reason || "").includes("submit")
+            || String(reason || "").includes("sync")
+            || String(reason || "").includes("flush_before");
+          const queuedInputWrite = enqueueTerminalInputWrite(
+            invokeTerminalInputWrite,
+            handleTerminalInputWriteError,
+            serializeInputWrite,
+          );
+          terminalInputWriteChain = queuedInputWrite.catch(() => {});
           if (data.length > 1) {
           }
-          return terminalInputWriteChain;
+          return queuedInputWrite;
         };
         const normalizeTerminalComposerObservation = (value) => String(value || "").replace(/\s+/g, "");
         const getTerminalComposerObservationText = () => {
@@ -10102,8 +10436,7 @@ function WorkspaceTerminal({
           if (!queuedData || !hasOpenPty || isDisposed) {
             return terminalInputWriteChain;
           }
-          writeTerminalInputChunk(queuedData, reason, promptMetadata);
-          return terminalInputWriteChain;
+          return writeTerminalInputChunk(queuedData, reason, promptMetadata);
         };
         const flushTerminalInput = (reason, promptMetadata = null) => (
           writeBufferedTerminalInput(takeTerminalInputBuffer(), reason, promptMetadata)
@@ -10122,7 +10455,18 @@ function WorkspaceTerminal({
             window.clearTimeout(terminalInputFlushTimer);
             terminalInputFlushTimer = 0;
           }
+          if (terminalInputWriteQueueTimer) {
+            window.clearTimeout(terminalInputWriteQueueTimer);
+            terminalInputWriteQueueTimer = 0;
+          }
+          if (terminalComposerDraftSyncTimer) {
+            window.clearTimeout(terminalComposerDraftSyncTimer);
+            terminalComposerDraftSyncTimer = 0;
+          }
           terminalInputBuffer = "";
+          terminalInputWriteQueue = [];
+          terminalComposerDraftSyncPending = false;
+          terminalComposerDraftSyncValue = "";
         });
         const handleTerminalShiftEnterKey = (event, source = "xterm_custom_key_handler") => {
           if (
@@ -10139,6 +10483,7 @@ function WorkspaceTerminal({
           event.stopPropagation?.();
           event.stopImmediatePropagation?.();
 
+          flushCurrentTerminalComposerDraftSync();
           refreshTerminalComposerDraftFromStore("shift_enter_before_update");
           flushTerminalInput("shift_enter_flush_before");
           setTerminalSubmittedComposerState(
@@ -10163,6 +10508,7 @@ function WorkspaceTerminal({
             return false;
           }
 
+          flushCurrentTerminalComposerDraftSync();
           refreshTerminalComposerDraftFromStore("image_submit_before_submit");
           flushTerminalInput("image_submit_flush_before");
           const promptResolution = getTerminalPromptTextForSubmit(terminalSubmittedInputText);
@@ -10358,11 +10704,20 @@ function WorkspaceTerminal({
             });
           }
 
-          const isSubmitInput = safeData.includes("\r") || safeData.includes("\n");
+          const isSubmitInput = terminalInputDataIsSubmit(safeData);
           const visibleInputText = terminalGeneratedReply
             ? ""
             : terminalInputChunkVisibleText(safeData);
           const isFocusEventInput = safeData.includes("\x1b[I") || safeData.includes("\x1b[O");
+          if (
+            !startupControlReply
+            && !terminalGeneratedReply
+            && isFocusEventInput
+            && !isSubmitInput
+            && !visibleInputText
+          ) {
+            return;
+          }
           if (!startupControlReply && !terminalGeneratedReply && (isSubmitInput || visibleInputText)) {
             noteTerminalInteractiveInput(
               isSubmitInput ? "submit" : "input",
@@ -10405,6 +10760,10 @@ function WorkspaceTerminal({
             ? getTerminalControlUiPromptSnapshot()
             : null;
           const isControlUiPromptActive = Boolean(controlUiPromptSnapshot?.active);
+          const shouldDeferComposerDraftSync = !startupControlReply
+            && !terminalGeneratedReply
+            && !isSubmitInput
+            && !isControlUiPromptActive;
           if (
             !startupControlReply
             && !terminalGeneratedReply
@@ -10422,7 +10781,9 @@ function WorkspaceTerminal({
                 workspaceId: workspace?.id || "",
               });
             } else {
-              refreshTerminalComposerDraftFromStore("visible_input_before_apply");
+              if (!shouldDeferComposerDraftSync) {
+                refreshTerminalComposerDraftFromStore("visible_input_before_apply");
+              }
               terminalSubmittedInputHasText = true;
             }
           }
@@ -10438,7 +10799,16 @@ function WorkspaceTerminal({
               syncCurrentTerminalComposerDraft("");
             }
           } else if (!startupControlReply && !terminalGeneratedReply) {
-            refreshTerminalComposerDraftFromStore("input_before_apply");
+            if (shouldDeferComposerDraftSync) {
+              const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
+              const storeHasDraft = Boolean(syncKey && threadComposerDraftsRef.current.has(syncKey));
+              if (storeHasDraft && !terminalSubmittedInputText) {
+                refreshTerminalComposerDraftFromStore("input_before_apply");
+              }
+            } else {
+              flushCurrentTerminalComposerDraftSync();
+              refreshTerminalComposerDraftFromStore("input_before_apply");
+            }
             const draftBeforeApply = terminalSubmittedInputText;
             const selectionText = getTerminalSelectionTextForComposer();
             setTerminalSubmittedComposerState(
@@ -10451,16 +10821,20 @@ function WorkspaceTerminal({
                     ? "submit_boundary"
                     : safeData.startsWith("\x1b")
                       ? "escape_sequence"
-                      : "terminal_input",
+                    : "terminal_input",
                 },
               ),
-              isSubmitInput ? "submit_boundary" : "terminal_input",
+              isSubmitInput ? "submit_boundary" : shouldDeferComposerDraftSync ? "terminal_input_hot" : "terminal_input",
             );
             if (selectionText) {
               terminalLastSelectionAt = 0;
               terminalLastSelectionText = "";
             }
-            syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+            if (shouldDeferComposerDraftSync) {
+              scheduleCurrentTerminalComposerDraftSync(terminalSubmittedInputText);
+            } else {
+              syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
+            }
             if (traceTextInputChunk) {
               logBigViewSyncDiagnosticEvent("tui.text.input_chunk_applied", {
                 agentId: terminalAgentKind,
@@ -10488,6 +10862,7 @@ function WorkspaceTerminal({
             }
           }
           if (!startupControlReply && !terminalGeneratedReply && isSubmitInput) {
+            flushCurrentTerminalComposerDraftSync();
             if (submitTerminalComposerWithQueuedImages(safeData)) {
               return;
             }
@@ -10624,7 +10999,12 @@ function WorkspaceTerminal({
                 workspaceId: workspace?.id || "",
               });
             }
-            if (terminalSubmittedInputHasText && promptTextAtSubmit && !shouldSuppressSubmitLifecycle) {
+            if (
+              terminalSubmittedInputHasText
+              && promptTextAtSubmit
+              && !shouldSuppressSubmitLifecycle
+              && !confirmedSubmitBridge
+            ) {
               rememberTerminalThreadSubmittedPrompt({
                 promptEventId: confirmedSubmitBridge?.promptEventId || "",
                 promptText: promptTextAtSubmit,
@@ -10651,6 +11031,23 @@ function WorkspaceTerminal({
                     source: "tui-manual-input",
                   },
               );
+            } else if (
+              terminalSubmittedInputHasText
+              && promptTextAtSubmit
+              && !shouldSuppressSubmitLifecycle
+              && confirmedSubmitBridge
+            ) {
+              logBigViewSyncDiagnosticEvent("tui.text.submit_local_turn_deferred", {
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                paneId,
+                promptEventId: confirmedSubmitBridge.promptEventId,
+                promptText: getBigViewTextDiagnosticFields(promptTextAtSubmit),
+                reason: "await_backend_prompt_observed",
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
             }
             setTerminalSubmittedComposerState(
               setTerminalComposerText(terminalSubmittedComposerState, "", {
@@ -10670,7 +11067,7 @@ function WorkspaceTerminal({
             });
           }
 
-          if (safeData.startsWith("\x1b")) {
+          if (safeData.startsWith("\x1b") && !isSubmitInput) {
             flushTerminalInput("escape_sequence_flush_before");
             writeTerminalInputChunk(
               safeData,
@@ -10703,12 +11100,70 @@ function WorkspaceTerminal({
                 promptEventSubmittedAt: bridge.promptEventSubmittedAt,
                 promptEventText: bridge.promptEventText,
               };
-              bridge.submittedWaiterReady
-                .then((submittedWaiter) => {
-                  const writePromise = writeBufferedTerminalInput(submitData, "submit", promptMetadata);
+              logTerminalStatus("frontend.tui_submit.enter_write_start", {
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                inputDebug: getTerminalInputDebugFields(submitData),
+                paneId,
+                promptEventId: bridge.promptEventId,
+                promptTextLength: bridge.promptEventText.length,
+                terminalIndex,
+                threadId: bridge.threadId,
+                workspaceId: bridge.workspaceId,
+              });
+              const writePromise = writeBufferedTerminalInput(submitData, "submit", promptMetadata);
+              let submittedWaiter = null;
+              Promise.resolve(bridge.submittedWaiterReady)
+                .then((resolvedSubmittedWaiter) => {
+                  submittedWaiter = resolvedSubmittedWaiter;
                   return Promise.resolve(writePromise)
+                    .then((writeResult) => {
+                      logTerminalStatus("frontend.tui_submit.enter_write_done", {
+                        agentId: terminalAgentKind,
+                        instanceId: terminalInstanceId,
+                        paneId,
+                        promptEventId: bridge.promptEventId,
+                        promptTextLength: bridge.promptEventText.length,
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        transport: writeResult?.transport || "",
+                        workspaceId: bridge.workspaceId,
+                      });
+                    })
                     .then(() => submittedWaiter.promise)
-                    .then(() => {
+                    .then((submittedPayload) => {
+                      rememberTerminalThreadSubmittedPrompt({
+                        promptEventId: bridge.promptEventId,
+                        promptText: bridge.promptEventText,
+                        source: bridge.promptEventSource || "tui-manual-input",
+                        submittedAt: bridge.promptEventSubmittedAt || "",
+                        threadId: terminalThreadIdRef.current || bridge.threadId || "",
+                      });
+                      recordSubmittedAgentMessage(
+                        terminalInstanceId,
+                        bridge.promptEventText,
+                        {
+                          messageCreatedAt: bridge.startedAt,
+                          messageId: bridge.promptEventId,
+                          messageSource: "tui-manual-input",
+                          promptEventId: bridge.promptEventId,
+                          promptEventRevision: bridge.promptEventRevision,
+                          promptEventSource: bridge.promptEventSource,
+                          source: "tui-manual-input",
+                          turnId: bridge.turnId,
+                        },
+                      );
+                      logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_observed", {
+                        agentId: terminalAgentKind,
+                        instanceId: terminalInstanceId,
+                        observedPromptLength: String(submittedPayload?.observedPrompt || submittedPayload?.prompt || "").trim().length,
+                        paneId,
+                        promptEventId: bridge.promptEventId,
+                        promptSource: submittedPayload?.promptSource || "",
+                        terminalIndex,
+                        threadId: bridge.threadId,
+                        workspaceId: bridge.workspaceId,
+                      });
                       armTerminalPromptReadyDetection();
                       return bridge.acceptedWaiter.promise;
                     })
@@ -10768,7 +11223,7 @@ function WorkspaceTerminal({
                       flushTerminalPromptReadyPending("provider-turn-started");
                     })
                     .catch((error) => {
-                      submittedWaiter.cancel();
+                      submittedWaiter?.cancel?.();
                       bridge.acceptedWaiter.cancel();
                       logBigViewSyncDiagnosticEvent("tui.text.confirmed_submit_bridge_error", {
                         agentId: terminalAgentKind,
@@ -10794,7 +11249,6 @@ function WorkspaceTerminal({
                     threadId: bridge.threadId,
                     workspaceId: bridge.workspaceId,
                   });
-                  writeBufferedTerminalInput(submitData, "submit_waiter_error", promptMetadata);
                 });
               return;
             }
@@ -12223,8 +12677,6 @@ function WorkspaceTerminal({
     }
 
     activateTerminalPane("todo_native_drop");
-    requestTerminalAudioInputTarget(true);
-    focusTerminalKeyboardInput(true);
 
     if (isWorkspaceFileDragTransfer(event.dataTransfer)) {
       const workspaceFile = getDraggedWorkspaceFile(event.dataTransfer);
@@ -12467,12 +12919,10 @@ function WorkspaceTerminal({
     }
   }, [
     activateTerminalPane,
-    focusTerminalKeyboardInput,
     getCurrentThreadComposerSyncKey,
     isGenericTerminal,
     paneId,
     recordSubmittedAgentMessage,
-    requestTerminalAudioInputTarget,
     setThreadComposerDraftValue,
     terminalAgentKind,
     terminalClosed,
@@ -12751,7 +13201,6 @@ function WorkspaceTerminal({
     }
 
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
-    requestTerminalAudioInputTarget(true);
     terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
     if (!nextUiViewActive) {
@@ -12761,7 +13210,6 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
-    requestTerminalAudioInputTarget,
     terminalUiViewActive,
   ]);
   const setTerminalUiViewFromArrowShortcut = useCallback((nextUiViewActive) => {
@@ -12780,7 +13228,6 @@ function WorkspaceTerminal({
       activateTerminalPane("terminal_tui_view_arrow_shortcut", { focusKeyboard: false });
     }
 
-    requestTerminalAudioInputTarget(true);
     terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
     if (!nextUiViewActive) {
@@ -12791,7 +13238,6 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
-    requestTerminalAudioInputTarget,
   ]);
   useEffect(() => {
     if (isActive && canOpenTerminalUiView && !terminalUiViewMounted) {

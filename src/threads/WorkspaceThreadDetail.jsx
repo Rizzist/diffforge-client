@@ -63,6 +63,56 @@ import {
   getWorkspaceThreadProviderBinding,
 } from "./workspaceThreads";
 
+function workspaceThreadDetailTimestampMs(value) {
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getWorkspaceThreadDetailLatestUserMessage(thread) {
+  return [...(Array.isArray(thread?.messages) ? thread.messages : [])]
+    .reverse()
+    .find((message) => String(message?.role || "").trim().toLowerCase() === "user") || null;
+}
+
+function terminalReadinessSnapshotMatchesRunningTurn(thread, snapshot) {
+  if (!thread || !snapshot) {
+    return true;
+  }
+
+  const latestTurn = thread.latestTurn || null;
+  const latestTurnState = String(latestTurn?.state || latestTurn?.status || "").trim().toLowerCase();
+  if (latestTurnState !== "running") {
+    return true;
+  }
+
+  const readyAtMs = workspaceThreadDetailTimestampMs(snapshot.inputReadyAt || snapshot.promptReadyAt);
+  const turnStartedAtMs = workspaceThreadDetailTimestampMs(
+    latestTurn?.startedAt || latestTurn?.requestedAt || latestTurn?.updatedAt,
+  );
+  if (readyAtMs && turnStartedAtMs && readyAtMs < turnStartedAtMs - 1000) {
+    return false;
+  }
+
+  const promptEventId = String(
+    snapshot.promptEventId
+      || snapshot.pendingPromptId
+      || snapshot.promptId
+      || "",
+  ).trim();
+  if (!promptEventId) {
+    return false;
+  }
+
+  const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  const latestMessageId = String(latestTurn?.messageId || "").trim();
+  const latestUserMessageId = String(getWorkspaceThreadDetailLatestUserMessage(thread)?.id || "").trim();
+  return Boolean(
+    latestMessageId === promptEventId
+      || latestUserMessageId === promptEventId
+      || (latestTurnId && latestTurnId.includes(promptEventId))
+  );
+}
+
 const thinkingPulse = keyframes`
   0%, 100% {
     opacity: 0.42;
@@ -1966,7 +2016,7 @@ const WORKSPACE_FILE_OPEN_EVENT = "diffforge:workspace-file-open";
 const THREAD_AGENT_IDS = new Set(["codex", "claude", "opencode"]);
 const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za-z0-9_.@ -]+\.[A-Za-z0-9]+(?::\d+)?|[A-Za-z0-9_.@-]+\.(?:cjs|css|html|js|jsx|json|lock|md|mdx|mjs|ps1|py|rs|scss|sh|toml|ts|tsx|txt|yaml|yml)(?::\d+)?)/g;
 const THREAD_DIFF_SUMMARY_STORAGE_PREFIX = "diffforge.threadDiffSummary.v1";
-const THREAD_DIFF_POLL_INTERVAL_MS = 1100;
+const THREAD_DIFF_POLL_INTERVAL_MS = 3500;
 const THREAD_DIFF_TERMINAL_STATES = new Set(["completed", "error", "interrupted", "cancelled", "canceled"]);
 const THREAD_DIFF_LIVE_STATES = new Set(["running", "thinking", "starting", "queued"]);
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
@@ -4827,6 +4877,10 @@ function WorkspaceThreadDetail({
       return activeLiveTerminal;
     }
 
+    if (!terminalReadinessSnapshotMatchesRunningTurn(thread, terminalReadinessSnapshot)) {
+      return activeLiveTerminal;
+    }
+
     if (
       activeLiveTerminal?.paneId
       && terminalReadinessSnapshot.paneId
@@ -4860,7 +4914,7 @@ function WorkspaceThreadDetail({
       terminalIndex: activeLiveTerminal?.terminalIndex ?? terminalReadinessSnapshot.terminalIndex,
       threadId: activeLiveTerminal?.threadId || terminalReadinessSnapshot.threadId || thread?.id || "",
     };
-  }, [activeLiveTerminal, terminalReadinessSnapshot, thread?.id]);
+  }, [activeLiveTerminal, terminalReadinessSnapshot, thread]);
   const threadGroundTruth = useMemo(() => getThreadTerminalGroundTruth({
     liveTerminal: effectiveLiveTerminal,
     providerBinding: activeProviderBinding,
@@ -4920,6 +4974,25 @@ function WorkspaceThreadDetail({
     return turnIds;
   }, [diffTurnId, transcriptItems]);
   const assistantBlockDiffTurnKey = assistantBlockDiffTurnIds.join("\n");
+  const diffSummarySurfaceVisible = useMemo(() => {
+    if (!visible) {
+      return false;
+    }
+    if (visibleLiveDiffSummary?.fileCount || visibleFinalDiffSummary?.fileCount) {
+      return true;
+    }
+    return assistantBlockDiffTurnIds.some((turnId) => (
+      diffSummariesByTurnId[turnId]?.fileCount
+      && diffSummaryExpandedByTurnId[turnId] !== false
+    ));
+  }, [
+    assistantBlockDiffTurnIds,
+    diffSummariesByTurnId,
+    diffSummaryExpandedByTurnId,
+    visible,
+    visibleFinalDiffSummary,
+    visibleLiveDiffSummary,
+  ]);
   useEffect(() => {
     const snapshot = getThreadDetailRenderDiagnosticSnapshot({
       activeAgentId,
@@ -5002,7 +5075,8 @@ function WorkspaceThreadDetail({
       return undefined;
     }
 
-    if (!visible) {
+    if (!diffSummarySurfaceVisible) {
+      setLiveDiffSummary((currentSummary) => (currentSummary ? null : currentSummary));
       return undefined;
     }
 
@@ -5010,6 +5084,13 @@ function WorkspaceThreadDetail({
     let timeoutId = 0;
     let firstFrameId = 0;
     let secondFrameId = 0;
+
+    const getTerminalInputHotDelayMs = (extraMs = 1200) => {
+      const hotUntil = typeof window === "undefined"
+        ? 0
+        : Number(window.__diffforgeTerminalInputHotUntil || 0);
+      return Math.max(0, hotUntil + Math.max(0, Number(extraMs) || 0) - Date.now());
+    };
 
     const fetchSummary = async () => {
       try {
@@ -5035,10 +5116,23 @@ function WorkspaceThreadDetail({
       }
     };
 
+    const schedulePoll = (delayMs) => {
+      if (cancelled) {
+        return;
+      }
+      timeoutId = window.setTimeout(poll, Math.max(0, Number(delayMs) || 0));
+    };
+
     const poll = async () => {
+      timeoutId = 0;
+      const hotDelayMs = getTerminalInputHotDelayMs(1400);
+      if (hotDelayMs > 0) {
+        schedulePoll(hotDelayMs);
+        return;
+      }
       await fetchSummary();
       if (!cancelled && diffTurnLive) {
-        timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
+        schedulePoll(THREAD_DIFF_POLL_INTERVAL_MS);
       }
     };
 
@@ -5047,13 +5141,7 @@ function WorkspaceThreadDetail({
         return;
       }
 
-      timeoutId = window.setTimeout(async () => {
-        timeoutId = 0;
-        await fetchSummary();
-        if (!cancelled && diffTurnLive) {
-          timeoutId = window.setTimeout(poll, THREAD_DIFF_POLL_INTERVAL_MS);
-        }
-      }, 0);
+      schedulePoll(Math.max(diffTurnLive ? 1800 : 250, getTerminalInputHotDelayMs(1400)));
     };
 
     if (typeof window.requestAnimationFrame === "function") {
@@ -5083,12 +5171,12 @@ function WorkspaceThreadDetail({
   }, [
     diffRefreshToken,
     diffRepoPath,
+    diffSummarySurfaceVisible,
     diffTurnId,
     diffTurnLive,
     diffWorktreePath,
     thread?.id,
     thread?.workspaceId,
-    visible,
     workspace?.id,
   ]);
 

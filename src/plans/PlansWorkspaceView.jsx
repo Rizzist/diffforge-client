@@ -10,6 +10,7 @@ import { FormMessage } from "../app/appStyles";
 const TERMINAL_TASK_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
 const PLAN_SNAPSHOT_CACHE_LIMIT = 80;
 const PLAN_SNAPSHOT_CACHE_FRESH_MS = 5000;
+const PLAN_SNAPSHOT_FOCUS_SETTLE_MS = 700;
 const planSnapshotCache = new Map();
 const planSnapshotRequests = new Map();
 
@@ -241,6 +242,73 @@ function planEventText(payload, keys) {
   return "";
 }
 
+function planEventSnapshot(payload) {
+  const snapshot = dataOf(
+    payload?.planSnapshot
+      || payload?.plan_snapshot
+      || payload?.snapshot
+      || payload?.data?.planSnapshot
+      || payload?.data?.plan_snapshot
+      || null,
+  );
+  if (snapshot?.selected_plan || snapshot?.selectedPlan || Array.isArray(snapshot?.history)) {
+    return {
+      ...snapshot,
+      selected_plan: snapshot.selected_plan || snapshot.selectedPlan || null,
+      history: Array.isArray(snapshot.history) ? snapshot.history : [],
+    };
+  }
+
+  const plan = payload?.plan || payload?.selectedPlan || payload?.selected_plan || null;
+  if (plan && typeof plan === "object") {
+    return {
+      history: [plan],
+      selected_plan: plan,
+      title_max_chars: plan.title_max_chars || plan.titleMaxChars,
+    };
+  }
+  return null;
+}
+
+function mergePlanEventSnapshot(current, eventSnapshot) {
+  if (!eventSnapshot || typeof eventSnapshot !== "object") {
+    return current || null;
+  }
+  const eventPlan = eventSnapshot.selected_plan || eventSnapshot.selectedPlan || null;
+  const currentHistory = Array.isArray(current?.history) ? current.history : [];
+  const eventHistory = Array.isArray(eventSnapshot.history) ? eventSnapshot.history : [];
+  const mergedHistory = [...currentHistory];
+  eventHistory.forEach((nextPlan) => {
+    const nextIdentity = planIdentity(nextPlan);
+    if (!nextIdentity) {
+      return;
+    }
+    const existingIndex = mergedHistory.findIndex((candidate) => planIdentity(candidate) === nextIdentity);
+    if (existingIndex >= 0) {
+      mergedHistory[existingIndex] = {
+        ...mergedHistory[existingIndex],
+        ...nextPlan,
+      };
+    } else {
+      mergedHistory.unshift(nextPlan);
+    }
+  });
+
+  const selectedIdentity = planIdentity(current?.selected_plan);
+  const eventIdentity = planIdentity(eventPlan);
+  const selectedPlan = eventPlan && (!selectedIdentity || selectedIdentity === eventIdentity)
+    ? eventPlan
+    : current?.selected_plan || eventPlan || null;
+
+  return {
+    ...(current || {}),
+    ...eventSnapshot,
+    selected_plan: selectedPlan,
+    history: mergedHistory,
+    title_max_chars: eventSnapshot.title_max_chars || current?.title_max_chars,
+  };
+}
+
 function stepStatusKind(status) {
   const normalized = cleanText(status).toLowerCase();
   if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
@@ -316,6 +384,14 @@ export default function PlansWorkspaceView({
   const [editingTitle, setEditingTitle] = useState("");
   const [savingStepIndex, setSavingStepIndex] = useState(null);
   const snapshotRequestKeyRef = useRef("");
+  const planEventStateRef = useRef({
+    editingStepIndex: null,
+    loadSnapshot: null,
+    rootPath: "",
+    snapshotAgentId: "",
+    snapshotSessionId: "",
+    snapshotTaskId: "",
+  });
 
   const normalizedRepoTargets = useMemo(() => {
     const targets = dedupeRepoTargets(repoTargets);
@@ -467,10 +543,35 @@ export default function PlansWorkspaceView({
   useEffect(() => {
     const cachedSnapshot = cachedPlanSnapshot(snapshotCacheKeys);
     if (cachedSnapshot && cachedPlanSnapshotIsFresh(snapshotCacheKeys)) {
-      return;
+      return undefined;
     }
-    loadSnapshot({ silent: Boolean(cachedSnapshot) });
+    const loadTimer = window.setTimeout(() => {
+      loadSnapshot({ silent: Boolean(cachedSnapshot) });
+    }, PLAN_SNAPSHOT_FOCUS_SETTLE_MS);
+    return () => {
+      window.clearTimeout(loadTimer);
+    };
   }, [activeSnapshotRequestKey, loadSnapshot, snapshotCacheKeys]);
+
+  useEffect(() => {
+    planEventStateRef.current = {
+      editingStepIndex,
+      loadSnapshot,
+      rootPath: pathIdentity(activeRepoPath),
+      snapshotAgentId,
+      snapshotCacheKeys,
+      snapshotSessionId,
+      snapshotTaskId,
+    };
+  }, [
+    activeRepoPath,
+    editingStepIndex,
+    loadSnapshot,
+    snapshotAgentId,
+    snapshotCacheKeys,
+    snapshotSessionId,
+    snapshotTaskId,
+  ]);
 
   useEffect(() => {
     if (!activeRepoPath) {
@@ -482,22 +583,24 @@ export default function PlansWorkspaceView({
     const rootPath = pathIdentity(activeRepoPath);
 
     listen(TERMINAL_TASK_PLAN_UPDATED_EVENT, (event) => {
-      if (cancelled || editingStepIndex !== null) {
+      const state = planEventStateRef.current || {};
+      if (cancelled || state.editingStepIndex !== null) {
         return;
       }
 
       const payload = event?.payload || {};
       const eventRepoPath = cleanText(payload.repoPath || payload.repo_path);
-      if (eventRepoPath && rootPath && pathIdentity(eventRepoPath) !== rootPath) {
+      const currentRootPath = state.rootPath || rootPath;
+      if (eventRepoPath && currentRootPath && pathIdentity(eventRepoPath) !== currentRootPath) {
         return;
       }
 
       const eventTaskId = planEventText(payload, ["taskId", "task_id"]);
       const eventSessionId = planEventText(payload, ["sessionId", "session_id"]);
       const eventAgentId = planEventText(payload, ["agentId", "agent_id"]);
-      const targetTaskId = cleanText(snapshotTaskId);
-      const targetSessionId = cleanText(snapshotSessionId);
-      const targetAgentId = cleanText(snapshotAgentId);
+      const targetTaskId = cleanText(state.snapshotTaskId);
+      const targetSessionId = cleanText(state.snapshotSessionId);
+      const targetAgentId = cleanText(state.snapshotAgentId);
 
       if (targetTaskId && eventTaskId && eventTaskId !== targetTaskId) {
         return;
@@ -509,7 +612,17 @@ export default function PlansWorkspaceView({
         return;
       }
 
-      loadSnapshot({ silent: true });
+      const eventSnapshot = planEventSnapshot(payload);
+      if (eventSnapshot) {
+        setSnapshot((current) => {
+          const nextSnapshot = mergePlanEventSnapshot(current, eventSnapshot);
+          cachePlanSnapshot(state.snapshotCacheKeys, nextSnapshot);
+          return nextSnapshot;
+        });
+        return;
+      }
+
+      state.loadSnapshot?.({ silent: true });
     }).then((dispose) => {
       if (cancelled) {
         dispose();
@@ -524,7 +637,7 @@ export default function PlansWorkspaceView({
         unlisten();
       }
     };
-  }, [activeRepoPath, editingStepIndex, loadSnapshot, snapshotAgentId, snapshotSessionId, snapshotTaskId]);
+  }, [activeRepoPath]);
 
   useEffect(() => {
     setEditingStepIndex(null);
@@ -578,7 +691,6 @@ export default function PlansWorkspaceView({
       }
       setEditingStepIndex(null);
       setEditingTitle("");
-      loadSnapshot();
     } catch (nextError) {
       setError(cleanText(nextError?.message || nextError) || "Unable to save plan step.");
     } finally {

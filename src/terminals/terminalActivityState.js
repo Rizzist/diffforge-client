@@ -296,6 +296,42 @@ export function isReadyLifecycleEmittedForEpoch({
   );
 }
 
+function promptReadyMatchesRunningTurn({
+  latestTurn = null,
+  submittedPrompt = null,
+  threadId = "",
+} = {}) {
+  const latestTurnState = String(
+    latestTurn?.state || latestTurn?.status || "",
+  ).trim().toLowerCase();
+  if (latestTurnState !== "running") {
+    return false;
+  }
+
+  const safeThreadId = String(threadId || "").trim();
+  const submittedThreadId = String(submittedPrompt?.threadId || "").trim();
+  if (safeThreadId && submittedThreadId && safeThreadId !== submittedThreadId) {
+    return false;
+  }
+
+  const promptEventId = String(
+    submittedPrompt?.promptEventId
+      || submittedPrompt?.pendingPromptId
+      || submittedPrompt?.promptId
+      || "",
+  ).trim();
+  if (!promptEventId) {
+    return false;
+  }
+
+  const turnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  const messageId = String(latestTurn?.messageId || "").trim();
+  return Boolean(
+    messageId === promptEventId
+      || (turnId && turnId.includes(promptEventId))
+  );
+}
+
 export function shouldEmitPromptReadyLifecycle({
   currentReadyEpoch = "",
   isGenericTerminal = false,
@@ -327,6 +363,7 @@ export function getPromptReadyLifecycleDeferral({
   latestTurn = null,
   pendingPrompt = null,
   source = "terminal-output-prompt-ready",
+  submittedPrompt = null,
   threadId = "",
 } = {}) {
   if (isGenericTerminal || !String(threadId || "").trim()) {
@@ -337,12 +374,27 @@ export function getPromptReadyLifecycleDeferral({
     latestTurn?.state || latestTurn?.status || "",
   ).trim().toLowerCase();
   const pendingPromptPresent = Boolean(pendingPrompt);
+  const normalizedSource = normalizeActivityText(source, "");
+  const trustedPromptReadyOutput = Boolean(
+    normalizedSource.includes("terminal_output_prompt_ready")
+      || normalizedSource.includes("backend_terminal_output_prompt_ready")
+  );
+
+  const matchesRunningTurn = trustedPromptReadyOutput && promptReadyMatchesRunningTurn({
+    latestTurn,
+    submittedPrompt,
+    threadId,
+  });
+
+  if (latestTurnState === "running" && trustedPromptReadyOutput && !pendingPromptPresent && matchesRunningTurn) {
+    return null;
+  }
 
   if (latestTurnState === "running") {
     return {
       latestTurnState,
       pendingPromptPresent,
-      reason: "running_turn_still_active",
+      reason: pendingPromptPresent ? "running_turn_still_active" : "prompt_ready_not_current_running_turn",
       source,
     };
   }

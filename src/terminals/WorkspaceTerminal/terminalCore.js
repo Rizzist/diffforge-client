@@ -59,6 +59,7 @@ export const TERMINAL_BLANK_STARTUP_CONFIRM_MS = 800;
 export const TERMINAL_BACKEND_PREP_DETAIL_MS = 2500;
 export const TERMINAL_AGENT_COLOR_SLOT_COUNT = 16;
 export const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-refocus";
+export const TERMINAL_INPUT_HOT_EVENT = "diffforge:terminal-input-hot";
 export const TERMINAL_INPUT_EVENT = "forge-terminal-input";
 export const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
 export const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
@@ -90,6 +91,7 @@ export const TERMINAL_INPUT_BATCH_MS = 8;
 export const TERMINAL_DELETE_INPUT_BATCH_MS = 28;
 export const TERMINAL_INPUT_BATCH_MAX_CHARS = 64;
 export const TERMINAL_ENTER_SEQUENCE = "\x1b[13u";
+export const TERMINAL_ENTER_SEQUENCE_MOD1 = "\x1b[13;1u";
 export const TERMINAL_SHIFT_ENTER_SEQUENCE = "\x1b[13;2u";
 export const TODO_DRAG_MIME = "application/x-diffforge-todo";
 export const TERMINAL_CODEX_RESIZE_GATE_MAX_BYTES = 0;
@@ -521,7 +523,20 @@ export const terminalGlobalRenderScheduler = (() => {
 
   const isEntryActive = (entry) => Boolean(entry.isActive?.());
 
+  const entryHasPriority = (entry) => Boolean(entry.hasPriorityPending?.());
+
   const isInteractiveWindow = (now = terminalRenderNow()) => interactiveUntil > now;
+
+  const getGlobalInputHotRemainingMs = () => {
+    if (!hasWindow()) {
+      return 0;
+    }
+    return Math.max(0, Number(window.__diffforgeTerminalInputHotUntil || 0) - Date.now());
+  };
+
+  const isInputHotWindow = (now = terminalRenderNow()) => (
+    isInteractiveWindow(now) || getGlobalInputHotRemainingMs() > 0
+  );
 
   const isEntryInteractive = (entry) => (
     interactiveEntryId
@@ -538,6 +553,10 @@ export const terminalGlobalRenderScheduler = (() => {
     const age = entryAge(entry, now);
     if (isEntryActive(entry)) {
       return age >= 0;
+    }
+
+    if (entryHasPriority(entry)) {
+      return true;
     }
 
     if (isInteractiveWindow(now)) {
@@ -564,8 +583,13 @@ export const terminalGlobalRenderScheduler = (() => {
         return;
       }
 
+      if (entryHasPriority(entry)) {
+        delay = 0;
+        return;
+      }
+
       const age = entryAge(entry, now);
-      const backgroundMinMs = isInteractiveWindow(now)
+      const backgroundMinMs = isInputHotWindow(now)
         ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
         : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
       const remaining = Math.max(0, backgroundMinMs - age);
@@ -609,7 +633,7 @@ export const terminalGlobalRenderScheduler = (() => {
       scheduleFrame();
     }, Math.min(
       delay,
-      isInteractiveWindow()
+      isInputHotWindow()
         ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
         : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS,
     ));
@@ -638,6 +662,12 @@ export const terminalGlobalRenderScheduler = (() => {
       return leftActive ? -1 : 1;
     }
 
+    const leftPriority = entryHasPriority(left);
+    const rightPriority = entryHasPriority(right);
+    if (leftPriority !== rightPriority) {
+      return leftPriority ? -1 : 1;
+    }
+
     const leftInteractive = isEntryInteractive(left);
     const rightInteractive = isEntryInteractive(right);
     if (leftInteractive !== rightInteractive) {
@@ -646,7 +676,7 @@ export const terminalGlobalRenderScheduler = (() => {
 
     const leftAge = entryAge(left, now);
     const rightAge = entryAge(right, now);
-    const backgroundMaxMs = isInteractiveWindow(now)
+    const backgroundMaxMs = isInputHotWindow(now)
       ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
       : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
     const leftOverdue = leftAge >= backgroundMaxMs;
@@ -672,8 +702,11 @@ export const terminalGlobalRenderScheduler = (() => {
     if (isEntryActive(entry)) {
       return "global_active_frame";
     }
+    if (entryHasPriority(entry)) {
+      return "global_priority_frame";
+    }
     if (age >= (
-      isInteractiveWindow(now)
+      isInputHotWindow(now)
         ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
         : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
     )) {
@@ -699,16 +732,23 @@ export const terminalGlobalRenderScheduler = (() => {
     for (const entry of candidates) {
       const active = isEntryActive(entry);
       const age = entryAge(entry, frameStartedAt);
-      const starved = age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+      const priority = entryHasPriority(entry);
+      const starved = age >= (
+        isInputHotWindow(frameStartedAt)
+          ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+          : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
+      );
       const elapsedMs = terminalRenderNow() - frameStartedAt;
       const reachedPaneBudget = flushed >= TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME;
       const reachedBackgroundBudget = !active
         && backgroundFlushed >= TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME
-        && !starved;
+        && !starved
+        && !priority;
       const reachedTimeBudget = !active
         && flushed > 0
         && elapsedMs >= TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS
-        && !starved;
+        && !starved
+        && !priority;
 
       if (reachedPaneBudget || reachedBackgroundBudget || reachedTimeBudget) {
         deferred += 1;
@@ -763,7 +803,7 @@ export const terminalGlobalRenderScheduler = (() => {
         scheduleNext();
         return;
       }
-      if (isEntryActive(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      if (isEntryActive(entry) || entryHasPriority(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
         clearTimer();
         scheduleFrame();
       } else {
@@ -785,11 +825,12 @@ export const terminalGlobalRenderScheduler = (() => {
       scheduleNext();
     },
     isInteractiveInputActive(id = "") {
-      if (!isInteractiveWindow()) {
+      const globalInputHotActive = getGlobalInputHotRemainingMs() > 0;
+      if (!isInteractiveWindow() && !globalInputHotActive) {
         return false;
       }
       const entryId = String(id || "").trim();
-      return !entryId || entryId === interactiveEntryId;
+      return globalInputHotActive || !entryId || entryId === interactiveEntryId;
     },
     unregister(id) {
       entries.delete(id);

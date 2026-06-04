@@ -5,7 +5,7 @@ import {
   withDiagnosticIpcDropCount,
 } from "../diagnostics/diagnosticIpcBudget.js";
 
-export const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED = false;
+export const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED = true;
 export const FILE_DRAG_DIAGNOSTIC_LOGGING_ENABLED = false;
 
 const BIGVIEW_SYNC_DIAGNOSTIC_DEFAULT_SAMPLE_MS = 1000;

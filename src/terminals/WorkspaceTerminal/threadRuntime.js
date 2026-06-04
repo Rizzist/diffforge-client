@@ -31,6 +31,45 @@ import {
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminalPromptSubmission.js";
 
+const terminalPromptSubmittedSubscribers = new Set();
+let terminalPromptSubmittedListenerPromise = null;
+
+function ensureTerminalPromptSubmittedListener() {
+  if (terminalPromptSubmittedListenerPromise) {
+    return terminalPromptSubmittedListenerPromise;
+  }
+
+  terminalPromptSubmittedListenerPromise = listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (event) => {
+    terminalPromptSubmittedSubscribers.forEach((subscriber) => {
+      try {
+        subscriber(event);
+      } catch (_error) {
+        // Keep one waiter failure from blocking the rest of the submit observers.
+      }
+    });
+  }).catch((error) => {
+    terminalPromptSubmittedListenerPromise = null;
+    throw error;
+  });
+
+  return terminalPromptSubmittedListenerPromise;
+}
+
+function subscribeTerminalPromptSubmitted(handler) {
+  if (typeof handler !== "function") {
+    return () => {};
+  }
+
+  terminalPromptSubmittedSubscribers.add(handler);
+  return () => {
+    terminalPromptSubmittedSubscribers.delete(handler);
+  };
+}
+
+export function warmTerminalPromptSubmittedListener() {
+  ensureTerminalPromptSubmittedListener().catch(() => {});
+}
+
 function getSubmitSequenceDiagnosticFields(sequence) {
   const value = String(sequence || "");
   return {
@@ -1271,7 +1310,7 @@ function delayThreadBridgeMs(delayMs) {
   });
 }
 
-export async function createTerminalPromptSubmittedWaiter({
+export function createTerminalPromptSubmittedWaiter({
   agentId = "",
   expectedPrompt = "",
   instanceId,
@@ -1288,7 +1327,7 @@ export async function createTerminalPromptSubmittedWaiter({
   const safeExpectedPrompt = String(expectedPrompt || "").trim();
   let settled = false;
   let timeoutId = 0;
-  let unlistenPromptSubmitted = null;
+  let unsubscribePromptSubmitted = null;
   let resolvePromptSubmitted = null;
   let rejectPromptSubmitted = null;
 
@@ -1300,7 +1339,7 @@ export async function createTerminalPromptSubmittedWaiter({
         return;
       }
       settled = true;
-      unlistenPromptSubmitted?.();
+      unsubscribePromptSubmitted?.();
       logThreadBridgeDiagnostic("frontend.bridge.submit.confirm_timeout", {
         agentId,
         expectedPromptLength: safeExpectedPrompt.length,
@@ -1315,85 +1354,83 @@ export async function createTerminalPromptSubmittedWaiter({
     }, Math.max(1000, timeoutMs));
   });
 
-  try {
-    const unlisten = await listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (event) => {
-      const payload = event?.payload || {};
-      const eventPromptId = String(payload.promptEventId || "").trim();
-      const eventPaneId = String(payload.paneId || "").trim();
-      const eventThreadId = String(payload.threadId || "").trim();
-      const eventInstanceId = Number(payload.instanceId);
-      const promptMatches = !safePromptId || eventPromptId === safePromptId;
-      const paneMatches = !safePaneId || eventPaneId === safePaneId;
-      const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
-      const instanceMatches = !Number.isFinite(Number(instanceId))
-        || eventInstanceId === Number(instanceId);
-      const submittedPromptMatchesExpected = payload.promptMatch !== false;
-      const promptSource = String(payload.promptSource || "").trim();
-      const submittedPromptIsAuthoritative = terminalPromptSubmittedPayloadIsAuthoritative(payload);
+  const handlePromptSubmitted = (event) => {
+    const payload = event?.payload || {};
+    const eventPromptId = String(payload.promptEventId || "").trim();
+    const eventPaneId = String(payload.paneId || "").trim();
+    const eventThreadId = String(payload.threadId || "").trim();
+    const eventInstanceId = Number(payload.instanceId);
+    const promptMatches = !safePromptId || eventPromptId === safePromptId;
+    const paneMatches = !safePaneId || eventPaneId === safePaneId;
+    const threadMatches = !safeThreadId || eventThreadId === safeThreadId;
+    const instanceMatches = !Number.isFinite(Number(instanceId))
+      || eventInstanceId === Number(instanceId);
+    const submittedPromptMatchesExpected = payload.promptMatch !== false;
+    const promptSource = String(payload.promptSource || "").trim();
+    const submittedPromptIsAuthoritative = terminalPromptSubmittedPayloadIsAuthoritative(payload);
 
-      if (!promptMatches || !paneMatches || !threadMatches || !instanceMatches || settled) {
-        return;
-      }
-      if (!submittedPromptIsAuthoritative || (requirePromptMatch && !submittedPromptMatchesExpected)) {
-        const observedPrompt = String(payload.observedPrompt || "").trim();
-        logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
-          agentId,
-          expectedPromptLength: safeExpectedPrompt.length,
-          instanceId: eventInstanceId,
-          observedPromptLength: observedPrompt.length,
-          paneId: eventPaneId,
-          promptId: eventPromptId,
-          promptSource,
-          reason: submittedPromptIsAuthoritative ? "prompt_mismatch" : "prompt_not_authoritative",
-          threadId: eventThreadId,
-          workspaceId: payload.workspaceId || workspaceId || "",
-        });
-        settled = true;
-        window.clearTimeout(timeoutId);
-        unlistenPromptSubmitted?.();
-        const error = new Error(
-          observedPrompt
-            ? "The terminal submitted a different prompt than the queued todo."
-            : "The queued todo was written, but the terminal did not submit it.",
-        );
-        error.terminalPromptSubmitMismatch = true;
-        error.terminalPromptSubmitUnobserved = !observedPrompt || !submittedPromptIsAuthoritative;
-        error.terminalPromptSubmitNotAuthoritative = !submittedPromptIsAuthoritative;
-        error.promptSource = promptSource;
-        error.promptId = eventPromptId;
-        error.workspaceId = payload.workspaceId || workspaceId || "";
-        rejectPromptSubmitted?.(error);
-        return;
-      }
-
-      settled = true;
-      window.clearTimeout(timeoutId);
-      unlistenPromptSubmitted?.();
-      logThreadBridgeDiagnostic("frontend.bridge.submit.confirmed", {
+    if (!promptMatches || !paneMatches || !threadMatches || !instanceMatches || settled) {
+      return;
+    }
+    if (!submittedPromptIsAuthoritative || (requirePromptMatch && !submittedPromptMatchesExpected)) {
+      const observedPrompt = String(payload.observedPrompt || "").trim();
+      logThreadBridgeDiagnostic("frontend.bridge.submit.mismatch_blocked", {
         agentId,
+        expectedPromptLength: safeExpectedPrompt.length,
         instanceId: eventInstanceId,
-        observedPromptLength: String(payload.prompt || "").trim().length,
+        observedPromptLength: observedPrompt.length,
         paneId: eventPaneId,
-        promptMatch: payload.promptMatch !== false,
         promptId: eventPromptId,
-        promptSource: payload.promptSource || "",
+        promptSource,
+        reason: submittedPromptIsAuthoritative ? "prompt_mismatch" : "prompt_not_authoritative",
         threadId: eventThreadId,
         workspaceId: payload.workspaceId || workspaceId || "",
       });
-      resolvePromptSubmitted?.(payload);
-    });
-    if (settled) {
-      unlisten();
-    } else {
-      unlistenPromptSubmitted = unlisten;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      unsubscribePromptSubmitted?.();
+      const error = new Error(
+        observedPrompt
+          ? "The terminal submitted a different prompt than the queued todo."
+          : "The queued todo was written, but the terminal did not submit it.",
+      );
+      error.terminalPromptSubmitMismatch = true;
+      error.terminalPromptSubmitUnobserved = !observedPrompt || !submittedPromptIsAuthoritative;
+      error.terminalPromptSubmitNotAuthoritative = !submittedPromptIsAuthoritative;
+      error.promptSource = promptSource;
+      error.promptId = eventPromptId;
+      error.workspaceId = payload.workspaceId || workspaceId || "";
+      rejectPromptSubmitted?.(error);
+      return;
     }
-  } catch (error) {
+
+    settled = true;
+    window.clearTimeout(timeoutId);
+    unsubscribePromptSubmitted?.();
+    logThreadBridgeDiagnostic("frontend.bridge.submit.confirmed", {
+      agentId,
+      instanceId: eventInstanceId,
+      observedPromptLength: String(payload.prompt || "").trim().length,
+      paneId: eventPaneId,
+      promptMatch: payload.promptMatch !== false,
+      promptId: eventPromptId,
+      promptSource: payload.promptSource || "",
+      threadId: eventThreadId,
+      workspaceId: payload.workspaceId || workspaceId || "",
+    });
+    resolvePromptSubmitted?.(payload);
+  };
+
+  unsubscribePromptSubmitted = subscribeTerminalPromptSubmitted(handlePromptSubmitted);
+
+  ensureTerminalPromptSubmittedListener().catch((error) => {
     if (!settled) {
       settled = true;
       window.clearTimeout(timeoutId);
+      unsubscribePromptSubmitted?.();
       rejectPromptSubmitted?.(error);
     }
-  }
+  });
 
   return {
     cancel() {
@@ -1402,7 +1439,7 @@ export async function createTerminalPromptSubmittedWaiter({
       }
       settled = true;
       window.clearTimeout(timeoutId);
-      unlistenPromptSubmitted?.();
+      unsubscribePromptSubmitted?.();
     },
     promise,
   };

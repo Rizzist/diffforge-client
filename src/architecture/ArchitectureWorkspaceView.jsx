@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Background,
   BaseEdge,
@@ -2783,6 +2784,53 @@ export default function ArchitectureWorkspaceView({
   useEffect(() => {
     setLocalArchitectureSnapshot(architectureSnapshot);
   }, [architectureSnapshot]);
+
+  useEffect(() => {
+    if (!repoPath || !activeWorkspaceId) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let unlistenTaskHistory = null;
+    listen("cloud-mcp-task-history-updated", (event) => {
+      if (cancelled) return;
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      const eventRepoPath = text(payload.repoPath || payload.repo_path);
+      const eventWorkspaceId = text(payload.workspaceId || payload.workspace_id);
+      if (
+        eventWorkspaceId
+        && activeWorkspaceId
+        && eventWorkspaceId !== activeWorkspaceId
+      ) {
+        return;
+      }
+      if (
+        eventRepoPath
+        && repoPath
+        && eventRepoPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+          !== repoPath.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+      ) {
+        return;
+      }
+      const taskHistory = payload.taskHistory || payload.task_history || payload.data || null;
+      if (taskHistory && typeof taskHistory === "object") {
+        setLocalArchitectureSnapshot(taskHistory);
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenTaskHistory = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenTaskHistory) {
+        unlistenTaskHistory();
+      }
+    };
+  }, [activeWorkspaceId, repoPath]);
 
   useEffect(() => {
     setFinishedPlanTaskIds(new Set());
