@@ -2268,7 +2268,7 @@ function taskUpdatedMs(task) {
 
 function taskStatusKind(task) {
   const status = taskStatus(task).toLowerCase().replaceAll("_", "-");
-  if (["merged", "applied", "done", "completed", "complete", "success", "idle", "ready", "prompt-ready"].includes(status)) return "done";
+  if (["merged", "applied", "done", "completed", "complete", "success", "idle", "ready"].includes(status)) return "done";
   if (["active", "running", "started", "claimed", "in-progress", "working", "starting"].includes(status)) return "active";
   if (["integrator-reviewing", "merge-queued", "patch-submitted", "resolved-patch-submitted", "review", "submitted"].includes(status)) return "active";
   if (["queued", "dispatched"].includes(status)) return "queued";

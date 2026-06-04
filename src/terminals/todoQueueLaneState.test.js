@@ -142,19 +142,89 @@ test("queued prompt is released when its terminal disappears before acceptance",
   assert.equal(evaluation.releaseReason, "terminal_unavailable");
 });
 
-test("queued prompt completes after exact prompt has a later assistant completion", () => {
+test("queued prompt completes after its provider turn closes", () => {
   const evaluation = baseEvaluation({
     targetThread: {
       id: "thread-1",
       latestTurn: {
-        messageId: "codex-82-user",
+        messageId: "todo-drop-prompt-1",
         startedAt: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-codex-82-user",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
         createdAt: submittedAt,
-        id: "codex-82-user",
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:12.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Sure, I can build those pages.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.assistantCompletionAfterPrompt, true);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
+test("hook-managed queued prompt releases from provider turn closure", () => {
+  const evaluation = baseEvaluation({
+    hookManaged: true,
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:12.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.hookManaged, true);
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
+test("queued prompt does not release when transcript completion belongs to a different prompt", () => {
+  const evaluation = baseEvaluation({
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-newer",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-todo-drop-prompt-newer",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
@@ -171,9 +241,157 @@ test("queued prompt completes after exact prompt has a later assistant completio
 
   assert.equal(evaluation.promptTurnMatches, false);
   assert.equal(evaluation.assistantCompletionAfterPrompt, true);
-  assert.equal(evaluation.exactPromptTranscriptFinished, true);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
+});
+
+test("exact transcript completion does not release with stale terminal readiness", () => {
+  const evaluation = baseEvaluation({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:34:40.000Z",
+      instanceId: 4,
+      status: "idle",
+      threadId: "thread-1",
+    },
+    providerBinding: {
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:34:40.000Z",
+      nativeSessionId: "session-1",
+      status: "idle",
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:12.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.freshInputReady, false);
+  assert.equal(evaluation.terminalReadinessMatchesPrompt, false);
   assert.equal(evaluation.terminalConfirmedFinished, true);
-  assert.equal(evaluation.releaseReason, "terminal_confirmed_finished");
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
+test("exact transcript completion does not release with mismatched readiness prompt id", () => {
+  const evaluation = baseEvaluation({
+    liveTerminal: {
+      inputReady: true,
+      inputReadyAt: "2026-06-01T01:35:12.000Z",
+      instanceId: 4,
+      promptEventId: "todo-drop-prompt-other",
+      status: "idle",
+      threadId: "thread-1",
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:12.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.freshInputReady, true);
+  assert.equal(evaluation.terminalReadinessPromptMatches, false);
+  assert.equal(evaluation.terminalReadinessMatchesPrompt, false);
+  assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
+test("exact transcript completion does not release while the terminal is not ready", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "thinking",
+    effectiveLatestTurnState: "running",
+    liveTerminal: {
+      inputReady: false,
+      instanceId: 4,
+      status: "active",
+      threadId: "thread-1",
+    },
+    providerBinding: {
+      inputReady: false,
+      nativeSessionId: "session-1",
+      status: "active",
+    },
+    terminalGroundTruth: {
+      agentInputReady: false,
+      completedTurnLooksSendable: false,
+      effectiveActivityStatus: "thinking",
+      effectiveLatestTurnState: "running",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    terminalStatus: "active",
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:10.000Z",
+        id: "assistant-task-complete",
+        kind: "task_complete",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.transcriptCompletionAfterPrompt, false);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, false);
+  assert.equal(evaluation.latestTurnClosed, false);
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
 });
 
 test("idle terminal status can release an accepted completed queued prompt", () => {
@@ -195,14 +413,14 @@ test("idle terminal status can release an accepted completed queued prompt", () 
     targetThread: {
       id: "thread-1",
       latestTurn: {
-        messageId: "codex-82-user",
+        messageId: "todo-drop-prompt-1",
         startedAt: submittedAt,
         state: "completed",
-        turnId: "turn-thread-1-codex-82-user",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
       },
       messages: [{
         createdAt: submittedAt,
-        id: "codex-82-user",
+        id: "todo-drop-prompt-1",
         role: "user",
         text: "i want to make some pages",
       }, {
@@ -218,11 +436,12 @@ test("idle terminal status can release an accepted completed queued prompt", () 
   });
 
   assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.promptTurnMatches, true);
   assert.equal(evaluation.terminalConfirmedFinished, true);
-  assert.equal(evaluation.releaseReason, "terminal_confirmed_finished");
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
 });
 
-test("exact matching turn id can release the terminal lane when closed", () => {
+test("exact matching turn id alone does not release a queued prompt", () => {
   const evaluation = baseEvaluation({
     targetThread: {
       id: "thread-1",
@@ -244,7 +463,9 @@ test("exact matching turn id can release the terminal lane when closed", () => {
 
   assert.equal(evaluation.promptTurnMatches, true);
   assert.equal(evaluation.completedMatchingTurn, true);
+  assert.equal(evaluation.exactPromptTranscriptFinished, false);
   assert.equal(evaluation.terminalConfirmedFinished, true);
+  assert.equal(evaluation.releaseReason, "provider_turn_closed");
 });
 
 test("terminal restart releases the stale lane without claiming task completion", () => {

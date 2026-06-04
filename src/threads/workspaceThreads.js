@@ -40,8 +40,6 @@ const PROMPTING_CLEARING_TERMINAL_EVENT_TYPES = new Set([
   "provider-turn-error",
   "provider-turn-interrupted",
   "provider-turn-started",
-  "terminal-input-ready",
-  "terminal-prompt-ready",
   "thread-starting",
 ]);
 const EXPLICIT_PERMISSION_PROMPT_KINDS = new Set(["approval", "permission"]);
@@ -76,6 +74,10 @@ const THREAD_PROJECTION_EVENT_TYPES = new Set([
 ]);
 const THREAD_TURN_STATES = new Set(["completed", "error", "interrupted", "running"]);
 const CLOSED_THREAD_TURN_STATES = new Set(["completed", "error", "interrupted"]);
+
+function isThreadTurnLifecycleProjectionEvent(event) {
+  return cleanText(event?.type).startsWith("thread.turn.");
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -954,6 +956,14 @@ function normalizeThreadTurnState(value, fallback = "") {
   return THREAD_TURN_STATES.has(state) ? state : "";
 }
 
+function normalizeThreadPromptEpoch(value) {
+  const numericValue = Number(value || 0);
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return 0;
+  }
+  return Math.floor(numericValue);
+}
+
 function normalizeThreadLatestTurn(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -976,6 +986,8 @@ function normalizeThreadLatestTurn(value) {
     completedAt,
     error: cleanText(value.error || value.message),
     messageId: cleanText(value.messageId || value.message_id),
+    promptEpoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
+    prompt_epoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
     requestedAt,
     startedAt,
     state,
@@ -994,9 +1006,6 @@ function createTurnIdForMessage(thread, messageId) {
 
 function activityStatusForLatestTurn(latestTurn, fallback = "idle") {
   const normalizedTurn = normalizeThreadLatestTurn(latestTurn);
-  if (normalizedTurn?.state === "running") {
-    return "thinking";
-  }
   if (CLOSED_THREAD_TURN_STATES.has(normalizedTurn?.state)) {
     return "idle";
   }
@@ -1275,6 +1284,8 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     kind,
     messageId,
     assistantMessageId: cleanText(event.assistantMessageId || event.assistant_message_id),
+    promptEpoch: normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch),
+    prompt_epoch: normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch),
     replaceText: event.replaceText === true,
     role: ["activity", "assistant", "system", "user"].includes(role) ? role : "assistant",
     sequence: Number.isInteger(sequence) && sequence >= 0 ? sequence : fallbackSequence,
@@ -1555,7 +1566,7 @@ function projectionEventsFromMessages(messages, options = {}) {
     });
   });
 
-  return events;
+  return events.filter((eventToAdd) => !isThreadTurnLifecycleProjectionEvent(eventToAdd));
 }
 
 function ensureThreadProjectionEvents(thread) {
@@ -1719,6 +1730,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
       latestTurn = normalizeThreadLatestTurn({
         agentId: event.agentId,
         messageId: event.messageId,
+        promptEpoch: event.promptEpoch || event.prompt_epoch,
         requestedAt: event.createdAt,
         startedAt: event.createdAt,
         state: "running",
@@ -1854,11 +1866,14 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
   const turnId = cleanText(event.turnId || event.turn_id, createTurnIdForMessage(thread, messageId));
   const agentId = cleanAgentId(event.agentId || event.currentAgent, "");
   const source = cleanText(event.source || event.messageSource, "local-submit");
+  const promptEpoch = normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch);
   return [{
     agentId,
     createdAt,
     id: `projection-turn-started-${stableProjectionKey(turnId, "turn")}`,
     messageId,
+    promptEpoch,
+    prompt_epoch: promptEpoch,
     source,
     status: "running",
     turnId,
@@ -1868,6 +1883,8 @@ function createSubmittedUserProjectionEvents(thread, event = {}) {
     createdAt,
     id: `projection-user-submitted-${stableProjectionKey(messageId, "message")}`,
     messageId,
+    promptEpoch,
+    prompt_epoch: promptEpoch,
     role: "user",
     source,
     status: "submitted",
@@ -1881,6 +1898,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   const agentId = cleanAgentId(event.agentId || event.currentAgent || thread?.currentAgent, "");
   const source = transcriptHistoryProjectionSource(agentId, event.source);
   const promptEventId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
+  const promptEpoch = normalizeThreadPromptEpoch(event.promptEpoch || event.prompt_epoch);
   const expectedUserMessage = cleanSubmittedUserMessage(
     event.expectedUserMessage
       || event.userMessage
@@ -1924,21 +1942,9 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         || latestUserMessageMatchesExpectedPrompt
       )
   );
-  const transcriptExplicitCompletionCanSettleRunningTurn = Boolean(
-    runningLatestTurnId
-      && latestRunningTurnMatchesExpectedPrompt
-      && (promptAccepted || Boolean(expectedPromptTranscriptMessageId))
-      && transcriptHasTurnCompleteForExpectedPrompt(
-        normalizedIncomingMessages,
-        expectedPromptTranscriptMessageId,
-      )
-  );
-  const allowTranscriptTurnCompletion = event.allowTranscriptTurnCompletion === true
-    || transcriptExplicitCompletionCanSettleRunningTurn;
-  const assistantResponseCompletesTurn = allowTranscriptTurnCompletion
-    && event.assistantResponseCompletesTurn === true;
-  const transcriptTurnCompleteSeen = event.turnCompleteSeen === true
-    || transcriptExplicitCompletionCanSettleRunningTurn;
+  const allowTranscriptTurnCompletion = false;
+  const assistantResponseCompletesTurn = false;
+  const transcriptTurnCompleteSeen = false;
   let currentTurnId = "";
   let transcriptAdvancedTurn = false;
 
@@ -1975,6 +1981,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       createdAt,
       kind: message.kind,
       messageId,
+      promptEpoch,
+      prompt_epoch: promptEpoch,
       source,
       title: message.title,
       turnId: messageTurnId,
@@ -2176,6 +2184,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         stableProjectionHash(completedAt),
       ].join("-"),
       messageId: assistantMessage?.id || completedTurnId,
+      promptEpoch,
+      prompt_epoch: promptEpoch,
       source,
       status: "completed",
       turnId: completedTurnId,
@@ -2184,6 +2194,23 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   }
 
   return events;
+}
+
+function preserveRunningLatestTurnWhenTranscriptCompletionBlocked(existingLatestTurn, projectedLatestTurn, event = {}) {
+  const normalizedExistingLatestTurn = normalizeThreadLatestTurn(existingLatestTurn);
+  const normalizedProjectedLatestTurn = normalizeThreadLatestTurn(projectedLatestTurn);
+  const blocked = Boolean(
+    event.allowTranscriptTurnCompletion !== true
+      && normalizedExistingLatestTurn?.state === "running"
+      && normalizedProjectedLatestTurn
+      && cleanText(normalizedProjectedLatestTurn.turnId) === cleanText(normalizedExistingLatestTurn.turnId)
+      && CLOSED_THREAD_TURN_STATES.has(normalizedProjectedLatestTurn.state)
+  );
+
+  return {
+    blocked,
+    latestTurn: blocked ? normalizedExistingLatestTurn : normalizedProjectedLatestTurn,
+  };
 }
 
 function defaultThreadTitle(terminalIndex, agentId) {
@@ -2313,8 +2340,8 @@ function normalizeActiveTerminal(value) {
     agentId: cleanAgentId(value.agentId || value.currentAgent),
     instanceId: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
     inputReady: value.inputReady === true,
-    inputReadyAt: cleanText(value.inputReadyAt || value.promptReadyAt),
-    inputReadyConfidence: cleanText(value.inputReadyConfidence || value.promptReadyConfidence),
+    inputReadyAt: cleanText(value.inputReadyAt),
+    inputReadyConfidence: cleanText(value.inputReadyConfidence),
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
     ...promptingUserFields(value),
@@ -2355,12 +2382,12 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
       : Boolean(binding.inputReady ?? fallback.inputReady),
     inputReadyAt: options.stripLiveBindings
       ? ""
-      : cleanText(binding.inputReadyAt || binding.promptReadyAt, fallback.inputReadyAt || fallback.promptReadyAt),
+      : cleanText(binding.inputReadyAt, fallback.inputReadyAt),
     inputReadyConfidence: options.stripLiveBindings
       ? ""
       : cleanText(
-        binding.inputReadyConfidence || binding.promptReadyConfidence,
-        fallback.inputReadyConfidence || fallback.promptReadyConfidence,
+        binding.inputReadyConfidence,
+        fallback.inputReadyConfidence,
       ),
     ...(
       options.stripLiveBindings
@@ -3225,12 +3252,12 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     && Number.isInteger(eventInstanceId)
     && eventInstanceId > 0
     && Number(existing.instanceId) === eventInstanceId;
-  const marksInputReady = explicitInputReady === true
-    || eventType === "terminal-input-ready"
-    || eventType === "terminal-prompt-ready"
+  const terminalReadinessIgnoredEvent = eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready";
+  const marksInputReady = !terminalReadinessIgnoredEvent && (explicitInputReady === true
     || eventType === "provider-turn-completed"
     || eventType === "provider-turn-interrupted"
-    || eventType === "provider-turn-error";
+    || eventType === "provider-turn-error");
   const marksInputBusy = explicitInputReady === false
     || (eventType === "opened" && !openedExistingReadyInstance)
     || eventType === "message-submitted"
@@ -3242,13 +3269,13 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
       ? false
       : Boolean(existing.inputReady);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt || event.promptReadyAt, existing.inputReadyAt || now)
+    ? cleanText(event.inputReadyAt, existing.inputReadyAt || now)
     : "";
   const inputReadyConfidence = inputReady
-    ? cleanText(event.inputReadyConfidence || event.promptReadyConfidence, existing.inputReadyConfidence)
+    ? cleanText(event.inputReadyConfidence, existing.inputReadyConfidence)
     : "";
   const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, existing, {
-    clear: marksInputBusy || marksInputReady,
+    clear: terminalReadinessIgnoredEvent ? false : marksInputBusy || marksInputReady,
     eventType,
   });
   const terminal = normalizeActiveTerminal({
@@ -3400,6 +3427,7 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
   const safeStatus = ["active", "closed", "error", "exited", "idle", "starting"].includes(status)
     ? status
     : "active";
+  const eventType = cleanText(event.type).toLowerCase();
   const terminalBinding = normalizeTerminalBinding({
     instanceId: event.instanceId ?? activeTerminal?.instanceId,
     paneId: event.paneId || activeTerminal?.paneId,
@@ -3458,9 +3486,11 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
   });
   const activityStatus = options.incrementMessageCount
     ? "thinking"
-    : shouldClearOrphanRunning
+    : eventType === "opened"
       ? "idle"
-      : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
+      : shouldClearOrphanRunning
+        ? "idle"
+        : normalizeThreadActivityStatus(existing.activityStatus, providerBinding?.activityStatus);
   const eventSessionName = cleanThreadLabelCandidate(event.sessionName);
   const eventTitle = eventSessionName
     || getWorkspaceThreadPromptLabel(event.title || event.userMessage, "");
@@ -4340,15 +4370,16 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
     expectedUserMessage: event.expectedUserMessage,
     latestTimestamp: event.latestTimestamp,
     matchedBy: event.matchedBy,
+    promptEpoch: event.promptEpoch || event.prompt_epoch,
     promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
     promptAccepted: event.promptAccepted,
     promptEventSubmittedAt: event.promptEventSubmittedAt,
     source: cleanText(event.source, `${agentId}-session`),
     submittedAt: event.submittedAt,
-    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
-    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-    transcriptExplicitCompletionCanSettleTurn,
-    turnCompleteSeen: event.turnCompleteSeen,
+    allowTranscriptTurnCompletion: false,
+    assistantResponseCompletesTurn: false,
+    transcriptExplicitCompletionCanSettleTurn: false,
+    turnCompleteSeen: false,
   });
   const projectionEventsAfter = appendThreadProjectionEvents(
     projectionEventsBefore,
@@ -4357,7 +4388,7 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
   const messagesBefore = normalizeThreadMessages(existing?.messages);
   const messagesAfter = projectThreadProjectionMessages(projectionEventsAfter, existing?.messages);
   const latestTurnBefore = normalizeThreadLatestTurn(existing?.latestTurn);
-  const latestTurnAfter = projectLatestTurnFromEvents(projectionEventsAfter, existing?.latestTurn);
+  const latestTurnAfter = latestTurnBefore;
   const lastBefore = messagesBefore[messagesBefore.length - 1] || null;
   const lastAfter = messagesAfter[messagesAfter.length - 1] || null;
   return {
@@ -4372,6 +4403,7 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
     lastRoleAfter: cleanText(lastAfter?.role),
     lastTextLengthBefore: cleanMessageText(lastBefore?.text).length,
     lastTextLengthAfter: cleanMessageText(lastAfter?.text).length,
+    transcriptTurnCompletionBlocked: false,
     wouldChange: projectionEventsToAdd.length > 0
       || messagesAfter.length !== messagesBefore.length
       || cleanText(latestTurnAfter?.state) !== cleanText(latestTurnBefore?.state),
@@ -4899,6 +4931,8 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     return state || {};
   }
 
+  const rawState = state || {};
+  const rawExisting = rawState?.[workspaceId]?.threads?.[threadId] || null;
   const currentState = normalizeWorkspaceThreads(state);
   let entry = currentState[workspaceId];
   let existing = entry?.threads?.[threadId];
@@ -4944,7 +4978,6 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
   const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
   const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
-  const eventTranscriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
     agentId,
     completedAt: event.completedAt,
@@ -4952,75 +4985,33 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     expectedUserMessage: event.expectedUserMessage,
     latestTimestamp: event.latestTimestamp,
     matchedBy: event.matchedBy,
+    promptEpoch: event.promptEpoch || event.prompt_epoch,
     promptEventId: event.promptEventId || event.pendingPromptId || event.promptId,
     promptAccepted: event.promptAccepted,
     promptEventSubmittedAt: event.promptEventSubmittedAt,
     source: cleanText(event.source, `${agentId}-session`),
     submittedAt: event.submittedAt,
-    allowTranscriptTurnCompletion: event.allowTranscriptTurnCompletion,
-    assistantResponseCompletesTurn: event.assistantResponseCompletesTurn,
-    transcriptExplicitCompletionCanSettleTurn: eventTranscriptExplicitCompletionCanSettleTurn,
-    turnCompleteSeen: event.turnCompleteSeen,
+    allowTranscriptTurnCompletion: false,
+    assistantResponseCompletesTurn: false,
+    transcriptExplicitCompletionCanSettleTurn: false,
+    turnCompleteSeen: false,
   });
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
     projectionEventsToAdd,
   );
   const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
-  const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
-  const existingLatestTurn = normalizeThreadLatestTurn(existing.latestTurn);
-  const transcriptCompletionSettledTurn = Boolean(
-    eventTranscriptExplicitCompletionCanSettleTurn
-      || (
-        existingLatestTurn?.state === "running"
-        && projectedLatestTurn?.state === "completed"
-        && projectionEventsToAdd.some((projectionEvent) => (
-          projectionEvent?.type === "thread.turn.completed"
-          && cleanText(projectionEvent.turnId) === cleanText(existingLatestTurn.turnId)
-        ))
-      )
+  const lifecycleExisting = rawExisting || existing;
+  const existingLatestTurn = normalizeThreadLatestTurn(lifecycleExisting.latestTurn);
+  const latestTurn = existingLatestTurn;
+  const activityStatus = normalizeThreadActivityStatus(
+    lifecycleExisting.activityStatus,
+    activityStatusForLatestTurn(latestTurn, "idle"),
   );
-  const transcriptExplicitInputReadyAt = transcriptCompletionSettledTurn
-    ? cleanText(event.completedAt || projectedLatestTurn?.completedAt || event.latestTimestamp, now)
-    : "";
-  const pendingPromptId = cleanText(event.promptEventId || event.pendingPromptId || event.promptId);
-  const shouldClearAcceptedPendingPrompt = Boolean(
-    event.promptAccepted === true
-      && existing.pendingPrompt
-      && (
-        !pendingPromptId
-        || workspaceThreadPromptIdsMatch(existing.pendingPrompt.id, pendingPromptId)
-      )
-  );
-  const shouldClearOrphanRunning = isOrphanRunningThreadState({
-    latestTurn: projectedLatestTurn,
-    messageCount: messages.length,
-    messages,
-    pendingPrompt: shouldClearAcceptedPendingPrompt ? null : existing.pendingPrompt,
-    projectionEvents,
-    providerBindings: existing.providerBindings,
-    transcriptSessionId: sessionId || existing.transcriptSessionId,
-  });
-  const existingStatus = cleanText(existing.status).toLowerCase();
-  const projectedLatestTurnState = normalizeThreadLatestTurn(projectedLatestTurn)?.state || "";
-  const detachedIdleHydrateKeepsIdle = Boolean(
-    projectedLatestTurnState === "running"
-      && projectionEventsToAdd.length === 0
-      && !normalizeTerminalBinding(existing.terminalBinding)
-      && ["closed", "exited", "idle"].includes(existingStatus)
-      && event.allowTranscriptTurnCompletion !== true
-      && event.assistantResponseCompletesTurn !== true
-      && event.transcriptExplicitCompletionCanSettleTurn !== true
-      && event.turnCompleteSeen !== true
-  );
-  const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
-  const activityStatus = detachedIdleHydrateKeepsIdle
-    ? "idle"
-    : activityStatusForLatestTurn(latestTurn, "idle");
   const lastMessageAt = messages.length
     ? messages[messages.length - 1].createdAt
     : existing.lastMessageAt;
-  let providerBindings = normalizeProviderBindings(
+  const providerBindings = normalizeProviderBindings(
     existing.providerBindings,
     existing.currentAgent,
     {
@@ -5034,9 +5025,6 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
       updatedAt: now,
     },
   );
-  if (shouldClearOrphanRunning) {
-    providerBindings = clearOrphanRunningProviderBindings(providerBindings);
-  }
 
   if (sessionId && providerBindings[agentId]) {
     providerBindings[agentId] = {
@@ -5053,26 +5041,12 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
         ? now
         : providerBindings[agentId].nativeSessionTitleUpdatedAt || now,
       nativeSessionUpdatedAt: now,
-      inputReady: transcriptCompletionSettledTurn ? true : providerBindings[agentId].inputReady,
-      inputReadyAt: transcriptCompletionSettledTurn
-        ? transcriptExplicitInputReadyAt
-        : providerBindings[agentId].inputReadyAt,
-      inputReadyConfidence: transcriptCompletionSettledTurn
-        ? "transcript-explicit-completion"
-        : providerBindings[agentId].inputReadyConfidence,
       updatedAt: now,
     };
   } else if (providerBindings[agentId]) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
       activityStatus,
-      inputReady: transcriptCompletionSettledTurn ? true : providerBindings[agentId].inputReady,
-      inputReadyAt: transcriptCompletionSettledTurn
-        ? transcriptExplicitInputReadyAt
-        : providerBindings[agentId].inputReadyAt,
-      inputReadyConfidence: transcriptCompletionSettledTurn
-        ? "transcript-explicit-completion"
-        : providerBindings[agentId].inputReadyConfidence,
       updatedAt: now,
     };
   }
@@ -5091,7 +5065,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
           materialized: true,
           messageCount: messages.length,
           messages,
-          pendingPrompt: shouldClearAcceptedPendingPrompt ? null : existing.pendingPrompt,
+          pendingPrompt: lifecycleExisting.pendingPrompt || existing.pendingPrompt,
           projectionEvents,
           providerBindings,
           sessionName: sessionTitle || existingSessionName || existingTitle || title,
@@ -5142,11 +5116,13 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const latestTurn = shouldClearOrphanRunning ? null : projectedLatestTurn;
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const eventType = cleanText(event.type).toLowerCase();
-  const activityStatus = latestTurnState === "running"
+  const activityStatus = eventType === "provider-turn-started"
     ? "thinking"
-    : ["completed", "error", "interrupted"].includes(latestTurnState)
-      ? "idle"
-      : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
+    : eventType === "provider-turn-error"
+      ? "error"
+      : eventType === "provider-turn-completed" || eventType === "provider-turn-interrupted"
+        ? "idle"
+        : activityStatusForLatestTurn(latestTurn, existing.activityStatus);
   const existingProviderBindingForAgent = normalizeProviderBinding(existing.providerBindings?.[agentId], agentId, {
     activityStatus: existing.activityStatus,
     coordination: existing.coordination,
@@ -5157,28 +5133,28 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     terminalBinding: existing.terminalBinding,
     updatedAt: existing.updatedAt,
   });
-  const marksInputReady = event.inputReady === true
-    || eventType === "terminal-input-ready"
-    || eventType === "terminal-prompt-ready"
+  const terminalReadinessIgnoredEvent = eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready";
+  const marksInputReady = !terminalReadinessIgnoredEvent && (event.inputReady === true
     || eventType === "provider-turn-completed"
     || eventType === "provider-turn-interrupted"
-    || eventType === "provider-turn-error";
+    || eventType === "provider-turn-error");
   const inputReady = marksInputReady
     ? true
-    : latestTurnState === "running"
+    : eventType === "provider-turn-started"
       ? false
       : Boolean(event.inputReady ?? existingProviderBindingForAgent?.inputReady);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt || event.promptReadyAt, existingProviderBindingForAgent?.inputReadyAt)
+    ? cleanText(event.inputReadyAt, existingProviderBindingForAgent?.inputReadyAt)
     : "";
   const inputReadyConfidence = inputReady
     ? cleanText(
-      event.inputReadyConfidence || event.promptReadyConfidence,
+      event.inputReadyConfidence,
       existingProviderBindingForAgent?.inputReadyConfidence,
     )
     : "";
   const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, existingProviderBindingForAgent, {
-    clear: !inputReady || marksInputReady,
+    clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
     eventType,
   });
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
@@ -5226,7 +5202,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
     const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
-      clear: !inputReady || marksInputReady,
+      clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
       eventType,
     });
     terminals[terminalKey] = {
@@ -5320,12 +5296,12 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     || previousProviderBinding?.status
     || existing.status
     || "idle";
-  const marksInputReady = explicitInputReady === true
-    || eventType === "terminal-input-ready"
-    || eventType === "terminal-prompt-ready"
+  const terminalReadinessIgnoredEvent = eventType === "terminal-input-ready"
+    || eventType === "terminal-prompt-ready";
+  const marksInputReady = !terminalReadinessIgnoredEvent && (explicitInputReady === true
     || eventType === "provider-turn-completed"
     || eventType === "provider-turn-interrupted"
-    || eventType === "provider-turn-error";
+    || eventType === "provider-turn-error");
   const marksInputBusy = explicitInputReady === false || activityStatus === "thinking";
   const inputReady = marksInputReady
     ? true
@@ -5333,16 +5309,16 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       ? false
       : Boolean(previousProviderBinding?.inputReady);
   const inputReadyAt = inputReady
-    ? cleanText(event.inputReadyAt || event.promptReadyAt, previousProviderBinding?.inputReadyAt || now)
+    ? cleanText(event.inputReadyAt, previousProviderBinding?.inputReadyAt || now)
     : "";
   const inputReadyConfidence = inputReady
     ? cleanText(
-      event.inputReadyConfidence || event.promptReadyConfidence,
+      event.inputReadyConfidence,
       previousProviderBinding?.inputReadyConfidence,
     )
     : "";
   const providerPromptingFields = promptingUserFieldsForTerminalEvent(event, previousProviderBinding, {
-    clear: !inputReady || marksInputReady,
+    clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
     eventType,
   });
   providerBindings[agentId] = {
@@ -5359,7 +5335,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   const terminals = { ...entry.terminals };
   if (terminalKey && terminals[terminalKey]) {
     const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
-      clear: !inputReady || marksInputReady,
+      clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
       eventType,
     });
     terminals[terminalKey] = {

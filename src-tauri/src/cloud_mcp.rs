@@ -7036,6 +7036,13 @@ fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
         || cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
 }
 
+fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
+    matches!(
+        agent_id.trim().to_ascii_lowercase().as_str(),
+        "claude" | "codex"
+    )
+}
+
 async fn cloud_mcp_observe_terminal_output(
     app: AppHandle,
     state: CloudMcpState,
@@ -7113,10 +7120,13 @@ async fn cloud_mcp_observe_terminal_output(
         let lock_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
         match runtime.terminal_contexts.get_mut(&terminal_key) {
             Some(entry) => {
-                if looks_active {
+                let hooks_own_turn_state = cloud_mcp_agent_uses_activity_hooks(&entry.agent_id);
+                if looks_active && !hooks_own_turn_state {
                     entry.saw_agent_activity = true;
                 }
-                let work_update = if let Some(brief) = work_brief.clone() {
+                let work_update = if hooks_own_turn_state {
+                    None
+                } else if let Some(brief) = work_brief.clone() {
                     if !entry.work_brief_reported && entry.work_brief.trim().is_empty() {
                         entry.work_brief = brief.clone();
                     }
@@ -7140,7 +7150,12 @@ async fn cloud_mcp_observe_terminal_output(
                 };
                 let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
                 let completion =
-                    if entry.saw_agent_activity && !entry.done_reported && old_enough && looks_ready {
+                    if !hooks_own_turn_state
+                        && entry.saw_agent_activity
+                        && !entry.done_reported
+                        && old_enough
+                        && looks_ready
+                    {
                         entry.done_reported = true;
                         Some((
                             entry.local_task_id.clone(),
@@ -7163,6 +7178,20 @@ async fn cloud_mcp_observe_terminal_output(
                     } else {
                         None
                     };
+                if hooks_own_turn_state && (looks_active || looks_ready) {
+                    log_terminal_status_event(
+                        "backend.terminal.ground_truth.output_hook_managed_ignored",
+                        json!({
+                            "agent_id": entry.agent_id.clone(),
+                            "bytes": chunk.len(),
+                            "instance_id": instance_id,
+                            "looks_active": looks_active,
+                            "looks_ready": looks_ready,
+                            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
+                        }),
+                    );
+                }
                 let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
                 if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
                     log_terminal_diagnostic_event(

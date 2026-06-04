@@ -28,7 +28,6 @@ const TERMINAL_ACTIVITY_IDLE_STATES = new Set([
   "idle",
   "input_ready",
   "interrupted",
-  "prompt_ready",
   "ready",
 ]);
 
@@ -66,6 +65,8 @@ const TERMINAL_ACTIVITY_CLOSED_STATES = new Set([
   "terminated",
 ]);
 
+const TERMINAL_ACTIVITY_HOOK_AGENT_KINDS = new Set(["claude", "codex"]);
+
 function normalizeActivityText(value, fallback = "") {
   const text = String(value || "")
     .trim()
@@ -76,6 +77,10 @@ function normalizeActivityText(value, fallback = "") {
 
 export function normalizeTerminalActivityStatus(value, fallback = "") {
   return normalizeActivityText(value, fallback);
+}
+
+export function terminalAgentUsesActivityHooks(agentKind) {
+  return TERMINAL_ACTIVITY_HOOK_AGENT_KINDS.has(normalizeActivityText(agentKind, ""));
 }
 
 export function terminalRailStateFromActivityStatus(activityStatus, fallback = "idle") {
@@ -146,8 +151,6 @@ export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
   if (type === "message_submitted" || type === "message-submitted") return "input_written";
   if (type === "provider_turn_started" || type === "provider-turn-started") return "running";
   if (type === "agent_output" || type === "agent-output") return "running";
-  if (type === "terminal_prompt_ready" || type === "terminal-prompt-ready") return "completed";
-  if (type === "terminal_input_ready" || type === "terminal-input-ready") return "completed";
   if (type === "provider_turn_completed" || type === "provider-turn-completed") return "completed";
   if (type === "provider_turn_interrupted" || type === "provider-turn-interrupted") return "cancelled";
   if (type === "pending_prompt_error" || type === "pending-prompt-error") return "failed";
@@ -194,7 +197,7 @@ export function terminalExecutionPhaseFromState(fields = {}) {
     return "running";
   }
   if (
-    ["terminal_prompt_ready", "terminal_input_ready", "provider_turn_completed"].includes(eventType)
+    eventType === "provider_turn_completed"
       || ["completed", "complete", "done"].includes(commandPhase)
       || TERMINAL_TURN_FINISHED_STATES.has(turn)
       || TERMINAL_ACTIVITY_IDLE_STATES.has(activity)
@@ -225,7 +228,6 @@ export function shouldSuppressThreadPropThinking({
   source = "",
   submittedPrompt = null,
   threadId = "",
-  readyLifecycleEmitted = false,
 } = {}) {
   const normalizedSource = String(source || "").trim().toLowerCase();
   const normalizedNext = String(nextStatus || "").trim().toLowerCase();
@@ -257,156 +259,12 @@ export function shouldSuppressThreadPropThinking({
   );
 
   return Boolean(
-    readyLifecycleEmitted
-      && (
-        latestTurnState === "thinking"
-        || latestTurnState === "running"
-        || latestTurnState === "working"
-        || !latestTurnState
-      )
+    (
+      latestTurnState === "thinking"
+      || latestTurnState === "running"
+      || latestTurnState === "working"
+      || !latestTurnState
+    )
       && readyIsNewerThanTurn
   );
-}
-
-export function buildTerminalReadinessEpochKey({
-  instanceId = 0,
-  paneId = "",
-  threadId = "",
-} = {}) {
-  const safePaneId = String(paneId || "").trim();
-  const safeThreadId = String(threadId || "").trim();
-  const safeInstanceId = Number(instanceId || 0);
-  if (!safePaneId || !safeThreadId || !Number.isFinite(safeInstanceId) || safeInstanceId <= 0) {
-    return "";
-  }
-
-  return `${safePaneId}::${safeInstanceId}::${safeThreadId}`;
-}
-
-export function isReadyLifecycleEmittedForEpoch({
-  currentEpoch = "",
-  readyLifecycleEmitted = false,
-  readyLifecycleEpoch = "",
-} = {}) {
-  const safeCurrentEpoch = String(currentEpoch || "").trim();
-  return Boolean(
-    readyLifecycleEmitted
-      && safeCurrentEpoch
-      && String(readyLifecycleEpoch || "").trim() === safeCurrentEpoch
-  );
-}
-
-function promptReadyMatchesRunningTurn({
-  latestTurn = null,
-  submittedPrompt = null,
-  threadId = "",
-} = {}) {
-  const latestTurnState = String(
-    latestTurn?.state || latestTurn?.status || "",
-  ).trim().toLowerCase();
-  if (latestTurnState !== "running") {
-    return false;
-  }
-
-  const safeThreadId = String(threadId || "").trim();
-  const submittedThreadId = String(submittedPrompt?.threadId || "").trim();
-  if (safeThreadId && submittedThreadId && safeThreadId !== submittedThreadId) {
-    return false;
-  }
-
-  const promptEventId = String(
-    submittedPrompt?.promptEventId
-      || submittedPrompt?.pendingPromptId
-      || submittedPrompt?.promptId
-      || "",
-  ).trim();
-  if (!promptEventId) {
-    return false;
-  }
-
-  const turnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
-  const messageId = String(latestTurn?.messageId || "").trim();
-  return Boolean(
-    messageId === promptEventId
-      || (turnId && turnId.includes(promptEventId))
-  );
-}
-
-export function shouldEmitPromptReadyLifecycle({
-  currentReadyEpoch = "",
-  isGenericTerminal = false,
-  looksActive = false,
-  looksReady = false,
-  readyLifecycleEmitted = false,
-  readyLifecycleEpoch = "",
-  threadId = "",
-} = {}) {
-  const alreadyEmitted = currentReadyEpoch
-    ? isReadyLifecycleEmittedForEpoch({
-      currentEpoch: currentReadyEpoch,
-      readyLifecycleEmitted,
-      readyLifecycleEpoch,
-    })
-    : readyLifecycleEmitted;
-
-  return Boolean(
-    looksReady === true
-      && looksActive !== true
-      && !isGenericTerminal
-      && String(threadId || "").trim()
-      && !alreadyEmitted
-  );
-}
-
-export function getPromptReadyLifecycleDeferral({
-  isGenericTerminal = false,
-  latestTurn = null,
-  pendingPrompt = null,
-  source = "terminal-output-prompt-ready",
-  submittedPrompt = null,
-  threadId = "",
-} = {}) {
-  if (isGenericTerminal || !String(threadId || "").trim()) {
-    return null;
-  }
-
-  const latestTurnState = String(
-    latestTurn?.state || latestTurn?.status || "",
-  ).trim().toLowerCase();
-  const pendingPromptPresent = Boolean(pendingPrompt);
-  const normalizedSource = normalizeActivityText(source, "");
-  const trustedPromptReadyOutput = Boolean(
-    normalizedSource.includes("terminal_output_prompt_ready")
-      || normalizedSource.includes("backend_terminal_output_prompt_ready")
-  );
-
-  const matchesRunningTurn = trustedPromptReadyOutput && promptReadyMatchesRunningTurn({
-    latestTurn,
-    submittedPrompt,
-    threadId,
-  });
-
-  if (latestTurnState === "running" && trustedPromptReadyOutput && !pendingPromptPresent && matchesRunningTurn) {
-    return null;
-  }
-
-  if (latestTurnState === "running") {
-    return {
-      latestTurnState,
-      pendingPromptPresent,
-      reason: pendingPromptPresent ? "running_turn_still_active" : "prompt_ready_not_current_running_turn",
-      source,
-    };
-  }
-
-  if (pendingPromptPresent) {
-    return {
-      latestTurnState,
-      pendingPromptPresent,
-      reason: "pending_prompt_still_active",
-      source,
-    };
-  }
-
-  return null;
 }

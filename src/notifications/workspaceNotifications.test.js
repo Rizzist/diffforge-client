@@ -39,7 +39,7 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
     promptingUserKind: "clarification",
     terminalIsPromptingUser: true,
     threadId: "thread-1",
-    type: "terminal-prompt-ready",
+    type: "provider-turn-started",
     workspaceId: "workspace-1",
   });
 
@@ -52,7 +52,7 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
     terminalIsPromptingUser: true,
     threadId: "thread-1",
     toolUseId: "tool-1",
-    type: "terminal-prompt-ready",
+    type: "provider-turn-started",
     workspaceId: "workspace-1",
   });
 

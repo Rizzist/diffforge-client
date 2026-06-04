@@ -3,33 +3,10 @@ import test from "node:test";
 
 import {
   getThreadTerminalGroundTruth,
-  recordThreadTerminalReadiness,
   terminalPromptingUserBlocksShutdown,
-  terminalOutputLooksActive,
-  terminalOutputLooksPromptReady,
 } from "./threadTerminalGroundTruth.js";
 
-test("terminal output active classifier detects agent work without prompt-ready text", () => {
-  assert.equal(terminalOutputLooksActive("• Ran pwd\n/Users/test/project"), true);
-  assert.equal(terminalOutputLooksActive("I’ll inspect the repo and then summarize it."), true);
-  assert.equal(terminalOutputLooksActive("\n› "), false);
-  assert.equal(terminalOutputLooksPromptReady("\n› "), true);
-});
-
-test("terminal output prompt-ready classifier handles Codex ANSI redraws", () => {
-  const finishedCodexScreen = "\u001b[39;49m\u001b[K\u001b[2m•  \u001b[22mThe project is basically empty.\u001b[39m\u001b[49m\u001b[0m"
-    + "\u001b[r\u001b[47;3H\u001b[45;2H\u001b[0m\u001b[49m\u001b[K"
-    + "\u001b[47;1H\u001b[1m›\u001b[47;3H\u001b[22m\u001b[2mExplain this codebase"
-    + "\u001b[49;3H\u001b[22m\u001b[38;2;246;226;183;49mgpt-5.5 xhigh\u001b[2m\u001b[39;49m · "
-    + "\u001b[22m\u001b[38;2;171;223;167;49m~/Documents/CODING/testforge\u001b[39m\u001b[49m";
-
-  assert.equal(terminalOutputLooksPromptReady(finishedCodexScreen), true);
-  assert.equal(terminalOutputLooksActive(finishedCodexScreen), false);
-});
-
 test("null terminal prompt sources are treated as idle", () => {
-  assert.doesNotThrow(() => recordThreadTerminalReadiness(null));
-
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: null,
     providerBinding: null,
@@ -49,15 +26,7 @@ test("null terminal prompt sources are treated as idle", () => {
   assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), false);
 });
 
-test("terminal output keeps Codex working screen active even when the prompt line is visible", () => {
-  const workingCodexScreen = "\u001b[44;3H\u001b[2mWorking\u001b[22m \u001b[2m(10s • esc to interrupt)\u001b[39m"
-    + "\u001b[47;1H\u001b[22m\u001b[1m›\u001b[47;3H\u001b[22m\u001b[2mExplain this codebase";
-
-  assert.equal(terminalOutputLooksPromptReady(workingCodexScreen), false);
-  assert.equal(terminalOutputLooksActive(workingCodexScreen), true);
-});
-
-test("active terminal output keeps a stale completed turn working", () => {
+test("active lifecycle status keeps a stale completed turn working", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: false,
@@ -87,7 +56,7 @@ test("active terminal output keeps a stale completed turn working", () => {
   assert.equal(groundTruth.agentInputReady, false);
 });
 
-test("fresh prompt readiness still completes a completed turn", () => {
+test("fresh lifecycle input-ready still completes a completed turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: true,
@@ -119,7 +88,7 @@ test("fresh prompt readiness still completes a completed turn", () => {
   assert.equal(groundTruth.terminalIsComplete, true);
 });
 
-test("idle terminal activity is sendable when prompt readiness is fresh", () => {
+test("idle terminal activity is sendable when lifecycle input-ready is fresh", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       activityStatus: "idle",
@@ -307,12 +276,12 @@ test("terminal output permission-looking text does not create needs-input state"
   assert.equal(terminalPromptingUserBlocksShutdown(groundTruth), false);
 });
 
-test("terminal prompt readiness clears stale terminal prompt signals", () => {
+test("provider lifecycle clears stale terminal prompt signals", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     lifecycleEvent: {
       outputText: "Allow command to run?",
-      source: "terminal-output-prompt-ready",
-      type: "terminal-prompt-ready",
+      source: "cli-hook:provider-turn-completed",
+      type: "provider-turn-completed",
     },
     liveTerminal: {
       activityStatus: "idle",
@@ -349,7 +318,7 @@ test("terminal prompt readiness clears stale terminal prompt signals", () => {
   assert.equal(groundTruth.terminalWorkState, "complete");
 });
 
-test("fresh prompt readiness settles a restored running turn", () => {
+test("fresh lifecycle input-ready settles a restored running turn", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       activityStatus: "idle",
@@ -385,10 +354,100 @@ test("fresh prompt readiness settles a restored running turn", () => {
   assert.equal(groundTruth.runningTurnLooksIdle, true);
   assert.equal(groundTruth.effectiveActivityStatus, "idle");
   assert.equal(groundTruth.effectiveLatestTurnState, "completed");
-  assert.equal(groundTruth.terminalGroundTruthStatus, "idle_or_prompt_ready");
+  assert.equal(groundTruth.terminalGroundTruthStatus, "idle_or_input_ready");
+  assert.equal(groundTruth.terminalWorkState, "complete");
+  assert.equal(groundTruth.terminalIsComplete, true);
 });
 
-test("pending session acceptance keeps a running turn active despite prompt readiness", () => {
+test("idle hook-managed runtime settles a restored running turn without input-ready", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      activityStatus: "idle",
+      agentId: "codex",
+      inputReady: false,
+      status: "active",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: false,
+      nativeSessionId: "codex-session-1",
+      status: "active",
+    },
+    targetRole: "codex",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "running",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "audit the project" },
+        { role: "assistant", text: "Done." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+      providerBindings: {
+        codex: {
+          activityStatus: "idle",
+          nativeSessionId: "codex-session-1",
+        },
+      },
+      transcriptSessionId: "codex-session-1",
+    },
+  });
+
+  assert.equal(groundTruth.restoredRunningTurnLooksIdle, true);
+  assert.equal(groundTruth.runningTurnLooksIdle, true);
+  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
+  assert.equal(groundTruth.terminalGroundTruthStatus, "idle_or_input_ready");
+  assert.equal(groundTruth.completedTurnLooksSendable, true);
+  assert.equal(groundTruth.agentInputReady, true);
+  assert.equal(groundTruth.terminalWorkState, "complete");
+});
+
+test("idle non-hook runtime does not settle a restored running turn", () => {
+  const groundTruth = getThreadTerminalGroundTruth({
+    liveTerminal: {
+      activityStatus: "idle",
+      agentId: "opencode",
+      inputReady: false,
+      status: "active",
+    },
+    providerBinding: {
+      activityStatus: "idle",
+      inputReady: false,
+      status: "active",
+    },
+    targetRole: "opencode",
+    thread: {
+      activityStatus: "idle",
+      latestTurn: {
+        startedAt: "2026-05-30T10:00:00.000Z",
+        state: "running",
+      },
+      messageCount: 2,
+      messages: [
+        { role: "user", text: "audit the project" },
+        { role: "assistant", text: "Done." },
+      ],
+      projectionEvents: [
+        { type: "thread.message.user" },
+        { type: "thread.message.assistant.complete" },
+      ],
+    },
+  });
+
+  assert.equal(groundTruth.restoredRunningTurnLooksIdle, false);
+  assert.equal(groundTruth.runningTurnLooksIdle, false);
+  assert.equal(groundTruth.effectiveLatestTurnState, "running");
+  assert.equal(groundTruth.terminalGroundTruthStatus, "processing_or_active");
+  assert.equal(groundTruth.agentInputReady, false);
+});
+
+test("pending session acceptance keeps a running turn active despite lifecycle input-ready", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: true,

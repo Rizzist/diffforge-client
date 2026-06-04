@@ -23058,9 +23058,8 @@ fn prepare_managed_codex_profile_for_terminal(
         });
     let profile = codex_managed_profile_name(&paths.repo_path, &slot_segment);
     let profile_home = codex_profile_home_for_launch(paths, &slot_segment)?;
-    let hooks_path = codex_managed_hooks_path(&profile_home, &profile);
     let profile_path = profile_home.join(format!("{profile}.config.toml"));
-    let hooks_config = codex_managed_hooks_config(
+    let hooks_json = codex_managed_hooks_config_json(
         mcp_command,
         &paths.repo_path,
         &paths.db_path,
@@ -23069,34 +23068,28 @@ fn prepare_managed_codex_profile_for_terminal(
         slot_key.unwrap_or(&slot_segment),
         agent_kind,
     );
-    let hook_file_will_change = !json_file_matches(&hooks_path, &hooks_config);
+    let hooks_path = profile_home.join(format!("{profile}.hooks.json"));
+    let hooks_config = codex_managed_hooks_config_toml(&hooks_json);
     let config = codex_managed_profile_config(
         &paths.repo_path,
         Path::new(write_root),
         enforcement_mode,
         slot_key,
         agent_kind,
-        Some(&hooks_path),
+        Some(&hooks_config),
     )?;
     let config = codex_managed_profile_config_with_preserved_hook_state(
         &profile_home,
         &profile_path,
         &config,
-        hook_file_will_change.then_some(hooks_path.as_path()),
     );
-    let hook_trusted =
-        !hook_file_will_change && codex_managed_profile_config_has_hook_trust(&config, &hooks_path);
-    let bypass_hook_trust = codex_should_bypass_untrusted_hook_prompt(
-        &profile_home,
-        &hooks_path,
-        &paths.repo_path,
-        hook_trusted,
-    )?;
+    let hooks_json_text = serde_json::to_string(&hooks_json)
+        .map_err(|error| format!("Unable to serialize Codex hooks self-test payload: {error}"))?;
+    let bypass_hook_trust = true;
     if enforcement_mode == "worktree_required" {
         codex_managed_git_launch_self_test(
             &config,
-            &hooks_config,
-            &hooks_path,
+            &hooks_json_text,
             &paths.repo_path,
             Path::new(write_root),
             &paths.db_path,
@@ -23106,8 +23099,10 @@ fn prepare_managed_codex_profile_for_terminal(
             agent_kind,
         )?;
     }
+    if !json_file_matches(&hooks_path, &hooks_json) {
+        write_json_file_atomic(&hooks_path, &hooks_json)?;
+    }
     write_text_file_atomic(&profile_path, &config)?;
-    write_json_file_atomic(&hooks_path, &hooks_config)?;
 
     Ok(ManagedCodexProfileLaunch {
         profile: Some(profile),
@@ -23208,10 +23203,6 @@ fn codex_link_or_copy_private_home_file(source: &Path, destination: &Path) -> st
     fs::copy(source, destination).map(|_| ())
 }
 
-fn codex_managed_hooks_path(profile_home: &Path, profile: &str) -> PathBuf {
-    profile_home.join(format!("{profile}.hooks.json"))
-}
-
 fn codex_managed_profile_name(repo_path: &Path, slot_segment: &str) -> String {
     let repo_name = repo_path
         .file_name()
@@ -23246,7 +23237,7 @@ fn codex_managed_profile_config(
     enforcement_mode: &str,
     slot_key: Option<&str>,
     agent_kind: &str,
-    hooks_path: Option<&Path>,
+    hooks_config: Option<&str>,
 ) -> Result<String, String> {
     let mut config = String::new();
     config = ensure_codex_project_trust_entry(&config, repo_path);
@@ -23262,8 +23253,16 @@ fn codex_managed_profile_config(
         enforcement_mode,
         slot_key,
         agent_kind,
-        hooks_path,
+        hooks_config,
     )?;
+    if let Some(hooks_config) = hooks_config {
+        config = config.trim_end().to_string();
+        if !config.is_empty() {
+            config.push_str("\n\n");
+        }
+        config.push_str(hooks_config.trim());
+        config.push('\n');
+    }
     if !config.ends_with('\n') {
         config.push('\n');
     }
@@ -23296,7 +23295,7 @@ fn append_codex_managed_permission_profile(
     enforcement_mode: &str,
     slot_key: Option<&str>,
     agent_kind: &str,
-    hooks_path: Option<&Path>,
+    _hooks_config: Option<&str>,
 ) -> Result<String, String> {
     let slot_key = slot_key
         .map(str::trim)
@@ -23391,18 +23390,72 @@ extends = \"{parent_profile}\"\n\n\
         }
     }
 
-    if let Some(hooks_path) = hooks_path {
-        config.push_str(&format!(
-            "\n[core]\n\
-hooksPath = \"{}\"\n",
-            toml_escape(&process_path_text(hooks_path))
-        ));
-    }
-
     Ok(config)
 }
 
-fn codex_managed_hooks_config(
+pub(crate) fn codex_managed_hooks_config_toml(hooks_json: &Value) -> String {
+    let Some(hooks) = hooks_json.get("hooks").and_then(Value::as_object) else {
+        return String::new();
+    };
+    let mut config = String::new();
+    for event_name in [
+        "UserPromptSubmit",
+        "Stop",
+        "PreToolUse",
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+    ] {
+        let Some(entries) = hooks.get(event_name).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(entry_object) = entry.as_object() else {
+                continue;
+            };
+            if !config.is_empty() {
+                config.push('\n');
+            }
+            config.push_str(&format!("[[hooks.{event_name}]]\n"));
+            if let Some(matcher) = entry_object.get("matcher").and_then(Value::as_str) {
+                config.push_str(&format!("matcher = \"{}\"\n", toml_escape(matcher)));
+            }
+            let Some(hooks) = entry_object.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for hook in hooks {
+                let Some(hook) = hook.as_object() else {
+                    continue;
+                };
+                config.push_str(&format!("\n[[hooks.{event_name}.hooks]]\n"));
+                if let Some(kind) = hook.get("type").and_then(Value::as_str) {
+                    config.push_str(&format!("type = \"{}\"\n", toml_escape(kind)));
+                }
+                if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                    config.push_str(&format!("command = \"{}\"\n", toml_escape(command)));
+                }
+                if let Some(command_windows) = hook.get("commandWindows").and_then(Value::as_str) {
+                    config.push_str(&format!(
+                        "commandWindows = \"{}\"\n",
+                        toml_escape(command_windows)
+                    ));
+                }
+                if let Some(timeout) = hook.get("timeout").and_then(Value::as_u64) {
+                    config.push_str(&format!("timeout = {timeout}\n"));
+                }
+                if let Some(status_message) = hook.get("statusMessage").and_then(Value::as_str) {
+                    config.push_str(&format!(
+                        "statusMessage = \"{}\"\n",
+                        toml_escape(status_message)
+                    ));
+                }
+            }
+        }
+    }
+    config
+}
+
+fn codex_managed_hooks_config_json(
     mcp_command: &str,
     repo_path: &Path,
     db_path: &Path,
@@ -23412,81 +23465,80 @@ fn codex_managed_hooks_config(
     agent_kind: &str,
 ) -> Value {
     let activity_hook_command = codex_activity_hook_command(mcp_command);
-    json!({
-        "hooks": {
-            "PreToolUse": [
-                {
-                    "matcher": "apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": codex_write_guard_hook_command(
-                                mcp_command,
-                                repo_path,
-                                db_path,
-                                agent_id,
-                                session_id,
-                                slot_key,
-                                agent_kind,
-                            ),
-                            "timeout": 30,
-                            "statusMessage": "Validating Diff Forge writes"
-                        }
-                    ]
-                },
-                {
-                    "matcher": "Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_hook_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": "Bash|Shell|exec_command|functions.exec_command|RunCommand|Command",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_hook_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "SubagentStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_hook_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "SubagentStop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_hook_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ]
-        }
-    })
+    let write_guard_hook_command = codex_write_guard_hook_command(
+        mcp_command,
+        repo_path,
+        db_path,
+        agent_id,
+        session_id,
+        slot_key,
+        agent_kind,
+    );
+    let mut hooks = Map::new();
+    hooks.insert(
+        "UserPromptSubmit".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "Stop".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "PreToolUse".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            Some("apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command"),
+            &write_guard_hook_command,
+            30,
+            Some("Validating Diff Forge writes"),
+        )]),
+    );
+
+    let mut root = Map::new();
+    root.insert("hooks".to_string(), Value::Object(hooks));
+    Value::Object(root)
+}
+
+fn codex_managed_command_hook_json(
+    matcher: Option<&str>,
+    command: &str,
+    timeout_sec: u64,
+    status_message: Option<&str>,
+) -> Value {
+    let mut hook = Map::new();
+    hook.insert("type".to_string(), Value::String("command".to_string()));
+    hook.insert("command".to_string(), Value::String(command.to_string()));
+    hook.insert(
+        "timeout".to_string(),
+        Value::Number(serde_json::Number::from(timeout_sec)),
+    );
+    if let Some(status_message) = status_message {
+        hook.insert(
+            "statusMessage".to_string(),
+            Value::String(status_message.to_string()),
+        );
+    }
+
+    let mut entry = Map::new();
+    if let Some(matcher) = matcher {
+        entry.insert("matcher".to_string(), Value::String(matcher.to_string()));
+    }
+    entry.insert("hooks".to_string(), Value::Array(vec![Value::Object(hook)]));
+    Value::Object(entry)
 }
 
 fn codex_managed_git_launch_self_test(
     config: &str,
-    hooks_config: &Value,
-    hooks_path: &Path,
+    hooks_config: &str,
     repo_path: &Path,
     write_root: &Path,
     db_path: &Path,
@@ -23496,7 +23548,6 @@ fn codex_managed_git_launch_self_test(
     agent_kind: &str,
 ) -> Result<(), String> {
     let mut missing = Vec::new();
-    let hooks_path_text = process_path_text(hooks_path);
     for expected in [
         "default_permissions = \"diffforge-coordinated\"",
         "extends = \":workspace\"",
@@ -23505,6 +23556,11 @@ fn codex_managed_git_launch_self_test(
         "\":root\" = \"read\"",
         "[permissions.diffforge-coordinated.filesystem.\":workspace_roots\"]",
         "\".\" = \"write\"",
+        "[[hooks.UserPromptSubmit]]",
+        "[[hooks.Stop]]",
+        "[[hooks.PreToolUse]]",
+        "--diff-forge-activity-hook",
+        "--diff-forge-write-guard",
         &format!(
             "[projects.\"{}\"]",
             toml_escape(&process_path_text(repo_path))
@@ -23513,25 +23569,25 @@ fn codex_managed_git_launch_self_test(
             "[projects.\"{}\"]",
             toml_escape(&process_path_text(write_root))
         ),
-        &format!("hooksPath = \"{}\"", toml_escape(&hooks_path_text)),
     ] {
         if !config.contains(expected) {
             missing.push(format!("profile missing {expected}"));
         }
     }
 
-    let pre_tool_use = hooks_config
-        .get("hooks")
-        .and_then(|hooks| hooks.get("PreToolUse"))
-        .and_then(Value::as_array)
-        .and_then(|hooks| hooks.first())
-        .ok_or_else(|| {
-            "Diff Forge managed Codex launch self-test failed: missing PreToolUse hook.".to_string()
-        })?;
-    let matcher = pre_tool_use
-        .get("matcher")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    for expected in [
+        "\"UserPromptSubmit\"",
+        "\"Stop\"",
+        "\"PreToolUse\"",
+        "--diff-forge-activity-hook",
+        "--diff-forge-write-guard",
+        "functions.apply_patch",
+    ] {
+        if !hooks_config.contains(expected) {
+            missing.push(format!("hooks config missing {expected}"));
+        }
+    }
+
     for expected in [
         "apply_patch",
         "functions.apply_patch",
@@ -23541,18 +23597,11 @@ fn codex_managed_git_launch_self_test(
         "Shell",
         "functions.exec_command",
     ] {
-        if !matcher.contains(expected) {
+        if !hooks_config.contains(expected) {
             missing.push(format!("hook matcher missing {expected}"));
         }
     }
 
-    let command = pre_tool_use
-        .get("hooks")
-        .and_then(Value::as_array)
-        .and_then(|hooks| hooks.first())
-        .and_then(|hook| hook.get("command"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     for expected in [
         "--diff-forge-write-guard".to_string(),
         format!("--provider {}", quote_shell_literal_for_config("codex")),
@@ -23575,7 +23624,7 @@ fn codex_managed_git_launch_self_test(
             quote_shell_literal_for_config(agent_kind)
         ),
     ] {
-        if !command.contains(&expected) {
+        if !hooks_config.contains(&expected) {
             missing.push(format!("hook command missing {expected}"));
         }
     }
@@ -23594,23 +23643,12 @@ fn codex_managed_profile_config_with_preserved_hook_state(
     profile_home: &Path,
     profile_path: &Path,
     generated_config: &str,
-    invalidated_hooks_path: Option<&Path>,
 ) -> String {
     let mut sections = Vec::new();
     let mut seen = HashSet::new();
-    let invalidated_hooks_path = invalidated_hooks_path.map(|path| {
-        let path = process_path_text(path);
-        let escaped = toml_escape(&path);
-        (path, escaped)
-    });
 
     if let Ok(body) = fs::read_to_string(profile_path) {
-        collect_codex_hook_state_sections(
-            &body,
-            &mut sections,
-            &mut seen,
-            invalidated_hooks_path.as_ref(),
-        );
+        collect_codex_hook_state_sections(&body, &mut sections, &mut seen);
     }
 
     let mut sibling_paths = fs::read_dir(profile_home)
@@ -23632,12 +23670,7 @@ fn codex_managed_profile_config_with_preserved_hook_state(
 
     for path in sibling_paths {
         if let Ok(body) = fs::read_to_string(path) {
-            collect_codex_hook_state_sections(
-                &body,
-                &mut sections,
-                &mut seen,
-                invalidated_hooks_path.as_ref(),
-            );
+            collect_codex_hook_state_sections(&body, &mut sections, &mut seen);
         }
     }
 
@@ -23689,7 +23722,6 @@ fn collect_codex_hook_state_sections(
     body: &str,
     sections: &mut Vec<String>,
     seen_headers: &mut HashSet<String>,
-    invalidated_hooks_path: Option<&(String, String)>,
 ) {
     let lines = body.lines().collect::<Vec<_>>();
     let mut index = 0;
@@ -23702,17 +23734,6 @@ fn collect_codex_hook_state_sections(
             index += 1;
             continue;
         }
-        if invalidated_hooks_path.is_some_and(|(path, escaped)| {
-            section.starts_with("hooks.state.")
-                && codex_hook_state_section_mentions_path(&section, path, escaped)
-        }) {
-            index += 1;
-            while index < lines.len() && toml_section_name(lines[index]).is_none() {
-                index += 1;
-            }
-            continue;
-        }
-
         let start = index;
         index += 1;
         while index < lines.len() && toml_section_name(lines[index]).is_none() {
@@ -23733,49 +23754,6 @@ fn collect_codex_hook_state_sections(
 
 fn codex_toml_section_is_hook_state(section: &str) -> bool {
     section == "hooks.state" || section.starts_with("hooks.state.")
-}
-
-fn codex_hook_state_section_mentions_path(section: &str, path: &str, escaped_path: &str) -> bool {
-    section.contains(path) || section.contains(escaped_path)
-}
-
-fn codex_managed_profile_config_has_hook_trust(config: &str, hooks_path: &Path) -> bool {
-    let hooks_path = process_path_text(hooks_path);
-    let hooks_path_escaped = toml_escape(&hooks_path);
-    config.lines().any(|line| {
-        toml_section_name(line).is_some_and(|section| {
-            section.starts_with("hooks.state.")
-                && codex_hook_state_section_mentions_path(
-                    &section,
-                    &hooks_path,
-                    &hooks_path_escaped,
-                )
-        })
-    })
-}
-
-fn codex_should_bypass_untrusted_hook_prompt(
-    profile_home: &Path,
-    hooks_path: &Path,
-    repo_path: &Path,
-    hook_trusted: bool,
-) -> Result<bool, String> {
-    if hook_trusted {
-        return Ok(false);
-    }
-
-    static PROMPT_SCOPES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let scope = format!(
-        "{}\x1f{}\x1f{}",
-        process_path_text(profile_home),
-        process_path_text(hooks_path),
-        process_path_text(repo_path)
-    );
-    let mut scopes = PROMPT_SCOPES
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .map_err(|_| "Unable to lock Codex hook trust prompt state.".to_string())?;
-    Ok(!scopes.insert(scope))
 }
 
 fn prepend_codex_managed_root_permission_profile(config: String, profile: &str) -> String {
@@ -26279,8 +26257,18 @@ APPWRITE_PROJECT_ID = "project"
     fn managed_codex_home_config_strips_native_mcp_servers() {
         let repo = init_git_repo("managed_codex_home_config");
         let worktree = repo.join(".agents").join("worktrees").join("1");
-        let hooks_path = worktree.join("diffforge.hooks.json");
         fs::create_dir_all(&worktree).unwrap();
+        let hooks_json = codex_managed_hooks_config_json(
+            "diffforge",
+            &repo,
+            &repo.join(".agents").join("coordination.db"),
+            "agent-1",
+            "session-1",
+            "1",
+            "codex",
+        );
+        let hooks = codex_managed_hooks_config_toml(&hooks_json);
+        let hooks_json = serde_json::to_string(&hooks_json).unwrap();
 
         let config = codex_managed_profile_config(
             &repo,
@@ -26288,7 +26276,7 @@ APPWRITE_PROJECT_ID = "project"
             "worktree_required",
             Some("1"),
             "codex",
-            Some(hooks_path.as_path()),
+            Some(&hooks),
         )
         .unwrap();
 
@@ -26305,11 +26293,55 @@ APPWRITE_PROJECT_ID = "project"
             "[projects.\"{}\"]\ntrust_level = \"trusted\"",
             toml_escape(&process_path_text(&worktree))
         )));
-        assert!(config.contains(&format!(
-            "hooksPath = \"{}\"",
-            toml_escape(&process_path_text(&hooks_path))
-        )));
-        assert!(!config.contains("[[hooks.PreToolUse]]"));
+        assert!(hooks_json.contains("\"UserPromptSubmit\""));
+        assert!(hooks_json.contains("\"Stop\""));
+        assert!(hooks_json.contains("\"PreToolUse\""));
+        assert!(!hooks_json.contains("\"PostToolUse\""));
+        assert!(!hooks_json.contains("\"SubagentStart\""));
+        assert!(!hooks_json.contains("\"SubagentStop\""));
+        assert!(hooks_json.contains("--diff-forge-activity-hook"));
+        assert!(hooks_json.contains("--diff-forge-write-guard"));
+        assert!(config.contains("[[hooks.UserPromptSubmit]]"));
+        assert!(config.contains("[[hooks.Stop]]"));
+        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("--diff-forge-activity-hook"));
+        assert!(config.contains("--diff-forge-write-guard"));
+        assert!(!config.contains("[[hooks.user_prompt_submit]]"));
+        assert!(!config.contains("hooksPath ="));
+    }
+
+    #[test]
+    fn managed_codex_hooks_config_toml_uses_inline_codex_shape() {
+        let repo = init_git_repo("managed_codex_hooks_inline_shape");
+        let hooks_json = codex_managed_hooks_config_json(
+            "diffforge",
+            &repo,
+            &repo.join(".agents").join("coordination.db"),
+            "agent-1",
+            "session-1",
+            "1",
+            "codex",
+        );
+        let hooks = codex_managed_hooks_config_toml(&hooks_json);
+        let submit_index = hooks.find("[[hooks.UserPromptSubmit]]").unwrap();
+        let submit_hook_index = hooks[submit_index..]
+            .find("[[hooks.UserPromptSubmit.hooks]]")
+            .unwrap();
+        assert!(submit_hook_index > 0);
+        assert!(hooks[submit_index..].contains("--diff-forge-activity-hook"));
+
+        let pre_tool_index = hooks.find("[[hooks.PreToolUse]]").unwrap();
+        let pre_tool_hook_index = hooks[pre_tool_index..]
+            .find("[[hooks.PreToolUse.hooks]]")
+            .unwrap();
+        assert!(pre_tool_hook_index > 0);
+        assert!(hooks[pre_tool_index..].contains("--diff-forge-write-guard"));
+        assert!(!hooks[pre_tool_index..].contains("--diff-forge-activity-hook"));
+        assert!(!hooks.contains("[[hooks.PostToolUse]]"));
+        assert!(!hooks.contains("[[hooks.SubagentStart]]"));
+        assert!(!hooks.contains("[[hooks.SubagentStop]]"));
+        assert!(!hooks.contains("[core]"));
+        assert!(!hooks.contains("hooksPath"));
     }
 
     #[test]
@@ -26317,61 +26349,35 @@ APPWRITE_PROJECT_ID = "project"
         let profile_home = temp_repo("managed_codex_hook_state_home");
         let profile_path = profile_home.join("diffforge-repo-hash-1.config.toml");
         let sibling_path = profile_home.join("diffforge-repo-hash-2.config.toml");
-        let hooks_path = profile_home.join("diffforge.hooks.json");
-        let hooks_key = format!("{}:pre_tool_use:0:0", process_path_text(&hooks_path));
         fs::write(
             &sibling_path,
-            format!(
-                r#"[hooks.state]
+            r#"[hooks.state]
 
-[hooks.state."{}"]
+[hooks.state."managed:pre_tool_use:0"]
 trusted_hash = "sha256:abc"
 "#,
-                toml_escape(&hooks_key)
-            ),
         )
         .unwrap();
-        let generated = format!(
-            r#"default_permissions = "diffforge-coordinated"
+        let generated = r#"default_permissions = "diffforge-coordinated"
 
-[core]
-hooksPath = "{}"
-"#,
-            toml_escape(&process_path_text(&hooks_path))
-        );
+[[hooks.pre_tool_use]]
+command = "diffforge --diff-forge-write-guard"
+"#;
 
         let config = codex_managed_profile_config_with_preserved_hook_state(
             &profile_home,
             &profile_path,
             &generated,
-            None,
         );
 
         assert!(config.contains("[hooks.state]"));
         assert!(config.contains("trusted_hash = \"sha256:abc\""));
-        assert!(codex_managed_profile_config_has_hook_trust(
-            &config,
-            &hooks_path
-        ));
-
-        let invalidated = codex_managed_profile_config_with_preserved_hook_state(
-            &profile_home,
-            &profile_path,
-            &generated,
-            Some(&hooks_path),
-        );
-        assert!(!invalidated.contains("trusted_hash = \"sha256:abc\""));
-        assert!(!codex_managed_profile_config_has_hook_trust(
-            &invalidated,
-            &hooks_path
-        ));
     }
 
     #[test]
     fn managed_codex_home_config_sets_permission_profile_at_document_root() {
         let repo = init_git_repo("managed_codex_home_root_permission_profile");
         let worktree = repo.join(".agents").join("worktrees").join("1");
-        let hooks_path = worktree.join("diffforge.hooks.json");
         fs::create_dir_all(&worktree).unwrap();
 
         let config = codex_managed_profile_config(
@@ -26380,7 +26386,7 @@ hooksPath = "{}"
             "worktree_required",
             Some("1"),
             "codex",
-            Some(hooks_path.as_path()),
+            None,
         )
         .unwrap();
 
@@ -26411,20 +26417,9 @@ hooksPath = "{}"
     fn managed_codex_git_launch_self_test_requires_apply_patch_hook() {
         let repo = init_git_repo("managed_codex_launch_self_test");
         let worktree = repo.join(".agents").join("worktrees").join("1");
-        let hooks_path = worktree.join("diffforge.hooks.json");
         let db_path = repo.join(".agents").join("coordination.db");
         fs::create_dir_all(&worktree).unwrap();
-
-        let config = codex_managed_profile_config(
-            &repo,
-            &worktree,
-            "worktree_required",
-            Some("slot1"),
-            "codex",
-            Some(hooks_path.as_path()),
-        )
-        .unwrap();
-        let hooks = codex_managed_hooks_config(
+        let hooks_json = codex_managed_hooks_config_json(
             "diffforge",
             &repo,
             &db_path,
@@ -26433,11 +26428,21 @@ hooksPath = "{}"
             "slot1",
             "codex",
         );
+        let hooks = codex_managed_hooks_config_toml(&hooks_json);
+        let hooks_json = serde_json::to_string(&hooks_json).unwrap();
+        let config = codex_managed_profile_config(
+            &repo,
+            &worktree,
+            "worktree_required",
+            Some("slot1"),
+            "codex",
+            Some(&hooks),
+        )
+        .unwrap();
 
         codex_managed_git_launch_self_test(
             &config,
-            &hooks,
-            &hooks_path,
+            &hooks_json,
             &repo,
             &worktree,
             &db_path,
@@ -26448,14 +26453,11 @@ hooksPath = "{}"
         )
         .unwrap();
 
-        let mut broken_hooks = hooks.clone();
-        broken_hooks["hooks"]["PreToolUse"][0]["matcher"] =
-            Value::String("Edit|Write|Bash|Shell".to_string());
+        let broken_hooks = hooks_json.replace("functions.apply_patch", "functions.not_apply_patch");
 
         let error = codex_managed_git_launch_self_test(
             &config,
             &broken_hooks,
-            &hooks_path,
             &repo,
             &worktree,
             &db_path,
@@ -26490,17 +26492,16 @@ hooksPath = "{}"
             ],
         );
 
-        let hooks_path = container.join("diffforge.hooks.json");
         let config = codex_managed_profile_config(
             &container,
             &container,
             "bounded_direct_edit",
             Some("slot1"),
             "codex",
-            Some(hooks_path.as_path()),
+            None,
         )
         .unwrap();
-        let hooks = codex_managed_hooks_config(
+        let hooks_json = codex_managed_hooks_config_json(
             "diffforge",
             &container,
             &container.join(".agents").join("coordination.db"),
@@ -26509,24 +26510,22 @@ hooksPath = "{}"
             "slot1",
             "codex",
         );
+        let hooks_json = serde_json::to_string(&hooks_json).unwrap();
 
         assert!(config.contains("default_permissions = \"diffforge-coordinated\""));
         assert!(!config.contains("sandbox_mode ="));
         assert!(config.contains("\"nested/repo\" = \"read\""));
         assert!(!config.contains("nested/repo/.agents/worktrees/slot1"));
         assert!(!config.contains("--diff-forge-write-guard"));
-        assert!(hooks.to_string().contains("--diff-forge-write-guard"));
-        assert!(hooks
-            .to_string()
-            .contains(process_path_text(&container).as_str()));
-        assert!(hooks.to_string().contains("slot1"));
-        assert!(hooks.to_string().contains("--agent-kind"));
+        assert!(hooks_json.contains("--diff-forge-write-guard"));
+        assert!(hooks_json.contains(process_path_text(&container).as_str()));
+        assert!(hooks_json.contains("slot1"));
+        assert!(hooks_json.contains("--agent-kind"));
     }
 
     #[test]
     fn managed_codex_home_config_general_worker_reads_root_without_raw_worktree_write() {
         let repo = init_git_repo("managed_codex_general_worker");
-        let hooks_path = repo.join("diffforge.hooks.json");
 
         let config = codex_managed_profile_config(
             &repo,
@@ -26534,7 +26533,7 @@ hooksPath = "{}"
             "general_worker",
             Some("slot1"),
             "codex",
-            Some(hooks_path.as_path()),
+            None,
         )
         .unwrap();
 
@@ -26566,7 +26565,6 @@ hooksPath = "{}"
                 "init",
             ],
         );
-        let hooks_path = repo.join("diffforge.hooks.json");
 
         let config = codex_managed_profile_config(
             &repo,
@@ -26574,7 +26572,7 @@ hooksPath = "{}"
             "general_worker",
             Some("slot1"),
             "codex",
-            Some(hooks_path.as_path()),
+            None,
         )
         .unwrap();
 
@@ -26595,7 +26593,7 @@ hooksPath = "{}"
             "activity_only",
             Some("slot1"),
             "codex",
-            Some(root.join("diffforge.hooks.json").as_path()),
+            None,
         )
         .unwrap();
 

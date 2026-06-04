@@ -159,6 +159,7 @@ export function evaluateTodoQueueInFlightPrompt({
   closedTurnStates = DEFAULT_CLOSED_TURN_STATES,
   effectiveActivityStatus = "",
   effectiveLatestTurnState = "",
+  hookManaged = false,
   inFlightPrompt = null,
   liveTerminal = null,
   nowMs = Date.now(),
@@ -211,9 +212,7 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const terminalInputReadyAtMs = parseTimestampMs(
     liveTerminal?.inputReadyAt
-      || liveTerminal?.promptReadyAt
       || providerBinding?.inputReadyAt
-      || providerBinding?.promptReadyAt
       || "",
   );
   const terminalInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
@@ -239,6 +238,32 @@ export function evaluateTodoQueueInFlightPrompt({
       && terminalInputReadyAtMs
       && terminalInputReadyAtMs >= submittedAtMs - readyGraceMs,
   );
+  const terminalReadinessPromptId = cleanText(
+    liveTerminal?.promptEventId
+      || liveTerminal?.prompt_event_id
+      || liveTerminal?.pendingPromptId
+      || liveTerminal?.pending_prompt_id
+      || providerBinding?.promptEventId
+      || providerBinding?.prompt_event_id
+      || providerBinding?.pendingPromptId
+      || providerBinding?.pending_prompt_id
+      || terminalGroundTruth?.promptEventId
+      || terminalGroundTruth?.pendingPromptId
+      || "",
+  );
+  const terminalReadinessPromptMatches = Boolean(
+    promptId
+      && terminalReadinessPromptId
+      && terminalReadinessPromptId === promptId,
+  );
+  const terminalReadinessMatchesPrompt = Boolean(
+    freshInputReady
+      && (
+        !promptId
+        || !terminalReadinessPromptId
+        || terminalReadinessPromptMatches
+      )
+  );
   const normalizedActivityStatus = normalizeTurnState(
     effectiveActivityStatus
       || terminalGroundTruth?.effectiveActivityStatus
@@ -258,7 +283,7 @@ export function evaluateTodoQueueInFlightPrompt({
         terminalGroundTruth?.agentInputReady
           || terminalGroundTruth?.completedTurnLooksSendable
           || terminalGroundTruth?.runningTurnLooksIdle
-          || closedTurnStates.has(normalizeTurnState(effectiveLatestTurnState || terminalGroundTruth?.effectiveLatestTurnState))
+          || freshInputReady
       )
   );
   const promptAccepted = Boolean(
@@ -290,23 +315,11 @@ export function evaluateTodoQueueInFlightPrompt({
     readyGraceMs,
     submittedAtMs,
   });
-  const exactPromptTranscriptFinished = Boolean(
-    latestTurnClosed
-      && completionEvidence.promptUserMessageSeen
-      && (
-        completionEvidence.assistantCompletionAfterPrompt
-          || (
-            latestTurnState === "completed"
-            && completionEvidence.assistantTextAfterPrompt
-          )
-          || latestTurnState === "error"
-          || latestTurnState === "interrupted"
-      )
-  );
+  const transcriptCompletionAfterPrompt = false;
+  const exactPromptTranscriptFinished = false;
   const promptAcceptedByCompletedThread = Boolean(
     !promptAccepted
-      && exactPromptTranscriptFinished
-      && (freshInputReady || terminalReadyForNextPrompt)
+      && false
   );
   const effectivePromptAccepted = Boolean(
     promptAccepted
@@ -318,11 +331,7 @@ export function evaluateTodoQueueInFlightPrompt({
       && promptTurnMatches
       && latestTurnClosed
   );
-  const terminalConfirmedFinished = Boolean(
-    effectivePromptAccepted
-      && (completedMatchingTurn || exactPromptTranscriptFinished)
-      && (freshInputReady || terminalReadyForNextPrompt)
-  );
+  const terminalConfirmedFinished = completedMatchingTurn;
   const promptInstanceId = Number.parseInt(inFlightPrompt?.terminalInstanceId, 10);
   const liveInstanceId = Number.parseInt(liveTerminal?.instanceId, 10);
   const terminalInstanceChanged = Boolean(
@@ -344,7 +353,7 @@ export function evaluateTodoQueueInFlightPrompt({
       && nowMs - Number(inFlightPrompt.startedAtMs || 0) > timeoutMs
   );
   const releaseReason = terminalConfirmedFinished
-    ? "terminal_confirmed_finished"
+    ? "provider_turn_closed"
     : terminalClosed
       ? "terminal_closed"
       : terminalUnavailable
@@ -371,6 +380,7 @@ export function evaluateTodoQueueInFlightPrompt({
     latestTurnId,
     latestTurnState,
     latestUserPromptMatches,
+    hookManaged: Boolean(hookManaged),
     promptAccepted,
     promptAcceptedByCompletedThread,
     promptComparisonText,
@@ -387,9 +397,13 @@ export function evaluateTodoQueueInFlightPrompt({
     terminalInputReady,
     terminalInputReadyAtMs,
     terminalInstanceChanged,
+    terminalReadinessMatchesPrompt,
+    terminalReadinessPromptId,
+    terminalReadinessPromptMatches,
     terminalReadyForNextPrompt,
     terminalReadyActivityStatus: normalizedActivityStatus,
     terminalUnavailable,
+    transcriptCompletionAfterPrompt,
     threadChanged,
   };
 }

@@ -1,4 +1,5 @@
 import {
+  terminalAgentUsesActivityHooks,
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsClosed,
   terminalActivityStatusIsError,
@@ -14,8 +15,6 @@ const PROMPTING_CLEARING_LIFECYCLE_TYPES = new Set([
   "provider-turn-error",
   "provider-turn-interrupted",
   "provider-turn-started",
-  "terminal-input-ready",
-  "terminal-prompt-ready",
   "thread-starting",
 ]);
 const EXPLICIT_PERMISSION_PROMPT_KINDS = new Set(["approval", "permission"]);
@@ -33,12 +32,6 @@ const EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS = [
   "tool-permission",
 ];
 export const PARKED_TERMINAL_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
-const READINESS_MAX_AGE_MS = 10 * 60 * 1000;
-let readinessVersion = 0;
-const readinessListeners = new Set();
-const readinessByThread = new Map();
-const readinessByTerminal = new Map();
-
 function cleanText(value, fallback = "") {
   const text = String(value || "").trim();
   return text || fallback;
@@ -51,33 +44,6 @@ function cleanPromptingText(value, maxLength = 1200) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, maxLength);
-}
-
-function cleanTerminalStateText(value, maxLength = 2400) {
-  return String(value || "")
-    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, " ")
-    .replace(/\u001b[@-_][0-?]*[ -/]*[@-~]?/g, " ")
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-function terminalStateTextHasWorkingIndicator(text) {
-  const lower = cleanTerminalStateText(text).toLowerCase();
-  return Boolean(
-    /\bworking\s*\(/.test(lower)
-      || /\besc\s+to\s+interrupt\b/.test(lower)
-      || /\bcontext\s+refresh\b/.test(lower)
-  );
-}
-
-function terminalStateTextHasPromptMarker(text) {
-  const normalized = cleanTerminalStateText(text);
-  return Boolean(
-    normalized.includes("›")
-  );
 }
 
 function normalizePromptingUserKind(value, fallback = "unknown") {
@@ -335,149 +301,6 @@ function normalizeMessageCount(value) {
   return Number.isFinite(count) ? count : 0;
 }
 
-function readinessKey(workspaceId, threadId) {
-  const safeWorkspaceId = cleanText(workspaceId);
-  const safeThreadId = cleanText(threadId);
-  return safeWorkspaceId && safeThreadId ? `${safeWorkspaceId}:${safeThreadId}` : "";
-}
-
-function terminalReadinessKeys(workspaceId, terminal = {}) {
-  const safeWorkspaceId = cleanText(workspaceId || terminal.workspaceId);
-  if (!safeWorkspaceId) {
-    return [];
-  }
-
-  const keys = [];
-  const terminalIndex = terminal.terminalIndex;
-  if (terminalIndex !== undefined && terminalIndex !== null && cleanText(terminalIndex) !== "") {
-    keys.push(`${safeWorkspaceId}:terminal:${terminalIndex}`);
-  }
-  const paneId = cleanText(terminal.paneId);
-  if (paneId) {
-    keys.push(`${safeWorkspaceId}:pane:${paneId}`);
-  }
-  const instanceId = cleanText(terminal.instanceId);
-  if (instanceId) {
-    keys.push(`${safeWorkspaceId}:instance:${instanceId}`);
-  }
-
-  return Array.from(new Set(keys));
-}
-
-function notifyReadinessListeners() {
-  readinessVersion += 1;
-  readinessListeners.forEach((listener) => {
-    try {
-      listener();
-    } catch (_) {
-      // Listener failures should not block terminal readiness propagation.
-    }
-  });
-}
-
-function pruneReadinessRecords(nowMs = Date.now()) {
-  const pruneMap = (map) => map.forEach((record, key) => {
-    const readyAtMs = parseTimestampMs(record?.inputReadyAt || record?.promptReadyAt);
-    if (readyAtMs > 0 && nowMs - readyAtMs > READINESS_MAX_AGE_MS) {
-      map.delete(key);
-    }
-  });
-  pruneMap(readinessByThread);
-  pruneMap(readinessByTerminal);
-}
-
-export function recordThreadTerminalReadiness(event = {}) {
-  const sourceEvent = event && typeof event === "object" ? event : {};
-  const key = readinessKey(sourceEvent.workspaceId, sourceEvent.threadId);
-  const terminalKeys = terminalReadinessKeys(sourceEvent.workspaceId, sourceEvent);
-  if (!key && !terminalKeys.length) {
-    return;
-  }
-
-  const readyAt = cleanText(
-    sourceEvent.inputReadyAt
-      || sourceEvent.promptReadyAt
-      || sourceEvent.completedAt
-      || new Date().toISOString(),
-  );
-  const promptingUser = explicitPermissionPromptingUserSignal(sourceEvent);
-  const record = {
-    agentId: cleanText(sourceEvent.agentId || sourceEvent.currentAgent),
-    inputReady: true,
-    inputReadyAt: readyAt,
-    inputReadyConfidence: cleanText(sourceEvent.inputReadyConfidence || sourceEvent.promptReadyConfidence || sourceEvent.source),
-    instanceId: sourceEvent.instanceId ?? "",
-    paneId: cleanText(sourceEvent.paneId),
-    pendingPromptId: cleanText(sourceEvent.pendingPromptId || sourceEvent.promptEventId || sourceEvent.promptId),
-    promptReadyAt: cleanText(sourceEvent.promptReadyAt, readyAt),
-    promptEventId: cleanText(sourceEvent.promptEventId || sourceEvent.pendingPromptId || sourceEvent.promptId),
-    promptEventSubmittedAt: cleanText(sourceEvent.promptEventSubmittedAt || sourceEvent.submittedAt),
-    promptingUserConfidence: promptingUser.isPromptingUser ? promptingUser.confidence : "",
-    promptingUserKind: promptingUser.isPromptingUser ? promptingUser.kind : "",
-    promptingUserSource: promptingUser.isPromptingUser ? promptingUser.source : "",
-    promptingUserText: promptingUser.isPromptingUser ? promptingUser.text : "",
-    providerSessionId: cleanText(sourceEvent.providerSessionId || sourceEvent.nativeSessionId),
-    source: cleanText(sourceEvent.source || sourceEvent.type),
-    status: cleanText(sourceEvent.status, "active"),
-    terminalPrompt: cleanText(
-      sourceEvent.terminalPrompt
-        || sourceEvent.expectedUserMessage
-        || sourceEvent.userMessage
-        || sourceEvent.message,
-    ),
-    terminalIsPromptingUser: promptingUser.isPromptingUser,
-    terminalIndex: sourceEvent.terminalIndex,
-    threadId: cleanText(sourceEvent.threadId),
-    type: cleanText(sourceEvent.type),
-    workspaceId: cleanText(sourceEvent.workspaceId),
-  };
-  pruneReadinessRecords();
-  if (key) {
-    readinessByThread.set(key, record);
-  }
-  terminalKeys.forEach((terminalKey) => {
-    readinessByTerminal.set(terminalKey, record);
-  });
-  notifyReadinessListeners();
-}
-
-export function subscribeThreadTerminalReadiness(listener) {
-  if (typeof listener !== "function") {
-    return () => {};
-  }
-
-  readinessListeners.add(listener);
-  return () => {
-    readinessListeners.delete(listener);
-  };
-}
-
-export function getThreadTerminalReadinessVersion() {
-  return readinessVersion;
-}
-
-function newestReadinessRecord(records) {
-  let newest = null;
-  let newestAt = 0;
-  records.filter(Boolean).forEach((record) => {
-    const readyAt = parseTimestampMs(record.inputReadyAt || record.promptReadyAt);
-    if (!newest || readyAt >= newestAt) {
-      newest = record;
-      newestAt = readyAt;
-    }
-  });
-  return newest;
-}
-
-export function getThreadTerminalReadinessSnapshot(workspaceId, threadId, terminalHint = null) {
-  pruneReadinessRecords();
-  const records = [
-    readinessByThread.get(readinessKey(workspaceId, threadId)),
-    ...terminalReadinessKeys(workspaceId, terminalHint || {}).map((key) => readinessByTerminal.get(key)),
-  ];
-  return newestReadinessRecord(records);
-}
-
 export function getLiveTerminalForThread(thread, providerBinding, workspaceThreadEntry) {
   if (!thread || !workspaceThreadEntry?.terminals) {
     return null;
@@ -584,9 +407,7 @@ export function getThreadTerminalGroundTruth({
   const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
   const inputReadyAt = cleanText(
     liveTerminal?.inputReadyAt
-      || liveTerminal?.promptReadyAt
       || providerBinding?.inputReadyAt
-      || providerBinding?.promptReadyAt,
   );
   const inputReadyAtMs = parseTimestampMs(inputReadyAt);
   const turnStartedAt = cleanText(
@@ -597,15 +418,39 @@ export function getThreadTerminalGroundTruth({
   const turnStartedAtMs = parseTimestampMs(turnStartedAt);
   const terminalLooksActive = terminalActivityStatusIsBusy(activityStatus);
   const terminalLooksSendable = terminalActivityStatusIsSendable(activityStatus);
+  const liveTerminalLooksSendable = terminalActivityStatusIsSendable(liveActivityStatus);
+  const hookManagedAgent = terminalAgentUsesActivityHooks(targetRole)
+    || terminalAgentUsesActivityHooks(liveTerminal?.agentId || liveTerminal?.agent_id)
+    || terminalAgentUsesActivityHooks(providerBinding?.agentId || providerBinding?.agent_id);
+  const hasLoadedTerminalRuntime = Boolean(
+    liveTerminal
+      && (
+        terminalStatus === "active"
+        || terminalStatus === "idle"
+        || terminalStatus === "ready"
+        || liveTerminalLooksSendable
+      )
+  );
   const inputReadyIsFreshForTurn = Boolean(
     recordedAgentInputReady
       && inputReadyAtMs > 0
       && (!turnStartedAtMs || inputReadyAtMs >= turnStartedAtMs - 1000)
   );
+  const restoredRunningTurnLooksIdle = Boolean(
+    latestTurnState === "running"
+      && hookManagedAgent
+      && hasLoadedTerminalRuntime
+      && terminalLooksSendable
+      && liveTerminalLooksSendable
+      && !terminalIsParked
+      && !hasPendingPrompt
+      && !terminalLooksActive
+  );
   const runningTurnLooksIdle = Boolean(
     latestTurnState === "running"
       && (
         orphanRunningLooksIdle
+        || restoredRunningTurnLooksIdle
         || (
           terminalLooksSendable
           && inputReadyIsFreshForTurn
@@ -667,7 +512,7 @@ export function getThreadTerminalGroundTruth({
       && inputReadyIsFreshForTurn
       && terminalLooksSendable
     )
-      ? "idle_or_prompt_ready"
+      ? "idle_or_input_ready"
       : latestTurnState === "running" || terminalActivityStatusIsBusy(activityStatus)
         ? "processing_or_active"
         : "idle_or_unknown";
@@ -696,10 +541,10 @@ export function getThreadTerminalGroundTruth({
       ? "prompting_user"
       : latestTurnState === "error" || terminalActivityStatusIsError(effectiveActivityStatus || activityStatus)
         ? "error"
-        : latestTurnState === "running" || terminalActivityStatusIsBusy(effectiveActivityStatus)
+        : effectiveLatestTurnState === "running" || terminalActivityStatusIsBusy(effectiveActivityStatus)
           ? "running"
           : (
-              terminalGroundTruthStatus === "idle_or_prompt_ready"
+              terminalGroundTruthStatus === "idle_or_input_ready"
               || COMPLETED_TURN_STATES.has(effectiveLatestTurnState)
               || agentInputReady
             )
@@ -727,6 +572,7 @@ export function getThreadTerminalGroundTruth({
     promptSubmissionPending,
     recordedAgentInputReady,
     requiresAgentInputReady,
+    restoredRunningTurnLooksIdle,
     runningTurnLooksIdle,
     promptingUserConfidence: terminalIsPromptingUser ? promptingUser.confidence : "",
     promptingUserKind: terminalIsPromptingUser ? promptingUser.kind : "",
@@ -779,55 +625,5 @@ export function threadLooksEffectivelyThinking(groundTruth = {}) {
   return Boolean(
     latestTurnState === "running"
       || terminalActivityStatusIsBusy(activityStatus)
-  );
-}
-
-export function terminalOutputLooksPromptReady(value) {
-  const text = typeof value === "string"
-    ? value
-    : value == null
-      ? ""
-      : String(value);
-  if (terminalStateTextHasWorkingIndicator(text)) {
-    return false;
-  }
-  return Boolean(
-    text.includes("\n›")
-      || text.includes("\r›")
-      || text.includes("› ")
-      || text.includes("\n> ")
-      || text.includes("\r> ")
-      || terminalStateTextHasPromptMarker(text)
-  );
-}
-
-export function terminalOutputLooksActive(value) {
-  const text = cleanTerminalStateText(value, 1600);
-  if (!text) {
-    return false;
-  }
-
-  const lower = text.toLowerCase();
-  if (terminalStateTextHasWorkingIndicator(text)) {
-    return true;
-  }
-  if (terminalStateTextHasPromptMarker(text)) {
-    return false;
-  }
-
-  return Boolean(
-    /(?:^|\s)•\s*(?:called|ran|edited|created|updated|modified|explored|exploring|read|listed|searched|checked|checking|wrote|applied|started|starting)\b/i.test(text)
-      || lower.includes("working (")
-      || /\bcalled\s+/.test(lower)
-      || /\bran\s+/.test(lower)
-      || /\bedited\s+/.test(lower)
-      || /\bcreated\s+/.test(lower)
-      || /\bupdated\s+/.test(lower)
-      || /\bmodified\s+/.test(lower)
-      || /\bi(?:'|’)ll\s+/.test(lower)
-      || /\bi\s+will\s+/.test(lower)
-      || /\bi(?:'|’)m\s+/.test(lower)
-      || /\bi\s+am\s+/.test(lower)
-      || lower.includes("context refresh")
   );
 }

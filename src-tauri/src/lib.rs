@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    io::{Read, Write},
+    io::{Read, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -32,13 +32,13 @@ use tauri::{
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex, RwLock},
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
-    accept_async,
-    connect_async,
+    accept_async, connect_async,
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
 };
 
@@ -82,6 +82,7 @@ const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
+const TERMINAL_ACTIVITY_HOOK_POLL_MS: u64 = 50;
 const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
 const TERMINAL_ENTER_SEQUENCE_MOD1: &str = "\x1b[13;1u";
 const TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
@@ -144,6 +145,7 @@ const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-ref
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
+const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const TERMINAL_TASK_PLAN_UPDATED_EVENT: &str = "forge-terminal-task-plan-updated";
@@ -1530,6 +1532,43 @@ struct TerminalPromptSubmittedPayload {
     prompt_match: bool,
     prompt_source: String,
     prompt: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivityHookPayload {
+    pane_id: String,
+    instance_id: u64,
+    workspace_id: String,
+    workspace_name: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+    provider: String,
+    event_type: String,
+    hook_event_name: String,
+    source: String,
+    status: String,
+    activity_status: String,
+    command_phase: String,
+    input_ready: bool,
+    input_ready_at: Option<String>,
+    prompt_ready_at: Option<String>,
+    completed_at: Option<String>,
+    provider_session_id: Option<String>,
+    native_session_id: Option<String>,
+    provider_turn_id: Option<String>,
+    turn_id: Option<String>,
+    transcript_path: Option<String>,
+    cwd: Option<String>,
+    user_message: Option<String>,
+    message: Option<String>,
+    tool_name: Option<String>,
+    tool_use_id: Option<String>,
+    hook_timestamp_ms: u64,
+    observed_at_ms: u64,
+    completion_evidence: String,
 }
 
 #[derive(Serialize, Clone)]

@@ -659,6 +659,58 @@ fn terminal_coordination_session_from_context(
     }
 }
 
+fn clear_terminal_activity_hook_files(pane_id: &str, instance_id: u64) {
+    let _ = fs::remove_file(terminal_activity_events_path(pane_id, instance_id));
+    let _ = fs::remove_file(terminal_activity_debug_path(pane_id, instance_id));
+}
+
+fn refresh_codex_activity_hook_profile_for_launch(
+    coordination: Option<&TerminalCoordinationSession>,
+    provider_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+) {
+    if !provider_id.to_ascii_lowercase().contains("codex") || coordination.is_none() {
+        return;
+    }
+    clear_terminal_activity_hook_files(pane_id, instance_id);
+    match refresh_codex_activity_hook_profile_for_terminal(
+        coordination,
+        provider_id,
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+    ) {
+        Ok(updated) => log_terminal_status_event(
+            "backend.terminal_activity_hook.profile_scoped",
+            json!({
+                "activity_debug_path": terminal_activity_debug_path(pane_id, instance_id).to_string_lossy().to_string(),
+                "activity_events_path": terminal_activity_events_path(pane_id, instance_id).to_string_lossy().to_string(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "provider_id": provider_id,
+                "terminal_index": terminal_index,
+                "updated": updated,
+                "workspace_id": workspace_id.unwrap_or_default(),
+            }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.terminal_activity_hook.profile_scope_error",
+            json!({
+                "error": clean_terminal_diagnostic_log_text(&error),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "provider_id": provider_id,
+                "terminal_index": terminal_index,
+                "workspace_id": workspace_id.unwrap_or_default(),
+            }),
+        ),
+    }
+}
+
 fn ensure_terminal_coordination_ready_for_prompt(
     coordination: &TerminalCoordinationSession,
 ) -> Result<(), String> {
@@ -4133,6 +4185,7 @@ async fn terminal_open(
             .next_terminal_instance_id
             .fetch_add(1, Ordering::Relaxed)
     });
+    clear_terminal_activity_hook_files(&pane_id, instance_id);
     ensure_app_not_shutting_down("terminal open")?;
     let terminal_launch_epoch = format!("{pane_id}:{instance_id}");
     if (!is_prewarm_pty || !plain_shell) && session_mode.should_prepare_coordination() {
@@ -4250,6 +4303,14 @@ async fn terminal_open(
                     kind.as_str()
                 }
             });
+        refresh_codex_activity_hook_profile_for_launch(
+            terminal_coordination.as_ref(),
+            launch_provider_id,
+            &pane_id,
+            instance_id,
+            workspace_id.as_deref(),
+            terminal_index,
+        );
         let launch_args = terminal_args_with_codex_mcp_identity(
             launch_provider_id,
             &args,
@@ -4368,6 +4429,12 @@ async fn terminal_open(
         cloud_mcp_state.inner().clone(),
         output_channel,
         reader,
+    );
+    spawn_terminal_activity_hook_watcher(
+        app.clone(),
+        Arc::clone(&state.terminals),
+        pane_id.clone(),
+        instance_id,
     );
 
     log_terminal_crash_forensics_event(
@@ -4645,6 +4712,14 @@ async fn terminal_start_agent(
         None,
     )
     .await?;
+    refresh_codex_activity_hook_profile_for_launch(
+        instance.coordination.as_ref(),
+        definition.id,
+        &pane_id,
+        instance.id,
+        Some(instance.metadata.workspace_id.as_str()),
+        instance.metadata.terminal_index,
+    );
     let launch_args = terminal_args_with_codex_mcp_identity(
         definition.id,
         &args,
@@ -4840,6 +4915,14 @@ async fn start_terminal_agent_in_prepared_pty(
                 ),
             };
         };
+        refresh_codex_activity_hook_profile_for_launch(
+            instance.coordination.as_ref(),
+            definition.id,
+            &pane_id,
+            instance.id,
+            Some(instance.metadata.workspace_id.as_str()),
+            instance.metadata.terminal_index,
+        );
         let launch_args = terminal_args_with_codex_mcp_identity(
             definition.id,
             &args,
@@ -7612,6 +7695,354 @@ fn emit_terminal_prompt_submitted(
             prompt: prompt.to_string(),
         },
     );
+}
+
+fn terminal_activity_hook_string(event: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        let Some(value) = event.get(*key).and_then(Value::as_str) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
+fn terminal_activity_hook_name_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
+    match terminal_activity_hook_name_key(hook_event_name).as_str() {
+        "userpromptsubmit" | "userpromptsubmitted" | "promptsubmit" | "promptsubmitted" => Some((
+            "provider-turn-started",
+            "thinking",
+            "active",
+            "running",
+            false,
+        )),
+        "stop" | "turnstop" | "assistantstop" => Some((
+            "provider-turn-completed",
+            "idle",
+            "active",
+            "completed",
+            true,
+        )),
+        "error" | "turnerror" | "assistantturnerror" => Some((
+            "provider-turn-error",
+            "error",
+            "error",
+            "failed",
+            true,
+        )),
+        _ => None,
+    }
+}
+
+fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bool {
+    matches!(
+        terminal_activity_hook_name_key(hook_event_name).as_str(),
+        "pretooluse" | "posttooluse" | "subagentstart" | "subagentstop"
+    )
+}
+
+fn terminal_activity_hook_payload(
+    instance: &TerminalInstance,
+    event: &Value,
+) -> Option<TerminalActivityHookPayload> {
+    let hook_event_name = terminal_activity_hook_string(event, &["hookEventName", "hook_event_name", "eventName", "event_name"])?;
+    let (event_type, activity_status, status, command_phase, input_ready) =
+        terminal_activity_hook_lifecycle_kind(&hook_event_name)?;
+    let metadata = instance.metadata.clone();
+    let now_ms = terminal_now_ms();
+    let event_time_ms = event
+        .get("timestampMs")
+        .or_else(|| event.get("timestamp_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(now_ms);
+    let event_time = crate::coordination::kernel::now_rfc3339();
+    let provider = terminal_activity_hook_string(event, &["provider"])
+        .unwrap_or_else(|| metadata.agent_kind.clone());
+    let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"]);
+    let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
+    let user_message = terminal_activity_hook_string(event, &[
+        "prompt",
+        "userPrompt",
+        "user_prompt",
+        "message",
+        "description",
+        "lastMessage",
+        "last_message",
+    ]);
+    let input_ready_at = input_ready.then(|| event_time.clone());
+    let prompt_ready_at = input_ready.then(|| event_time.clone());
+    let completed_at = input_ready.then(|| event_time.clone());
+
+    Some(TerminalActivityHookPayload {
+        pane_id: metadata.pane_id,
+        instance_id: instance.id,
+        workspace_id: metadata.workspace_id,
+        workspace_name: metadata.workspace_name,
+        terminal_index: metadata.terminal_index,
+        thread_id: metadata.thread_id,
+        agent_id: metadata.agent_id,
+        agent_kind: metadata.agent_kind,
+        provider,
+        event_type: event_type.to_string(),
+        hook_event_name,
+        source: format!("cli-hook:{event_type}"),
+        status: status.to_string(),
+        activity_status: activity_status.to_string(),
+        command_phase: command_phase.to_string(),
+        input_ready,
+        input_ready_at,
+        prompt_ready_at,
+        completed_at,
+        provider_session_id: provider_session_id.clone(),
+        native_session_id: provider_session_id,
+        provider_turn_id: provider_turn_id.clone(),
+        turn_id: provider_turn_id,
+        transcript_path: terminal_activity_hook_string(event, &["transcriptPath", "transcript_path"]),
+        cwd: terminal_activity_hook_string(event, &["cwd"]),
+        user_message: user_message.clone(),
+        message: user_message,
+        tool_name: terminal_activity_hook_string(event, &["toolName", "tool_name"]),
+        tool_use_id: terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]),
+        hook_timestamp_ms: event_time_ms,
+        observed_at_ms: now_ms,
+        completion_evidence: if input_ready {
+            "cli_hook_stop".to_string()
+        } else {
+            "cli_hook_prompt_submit".to_string()
+        },
+    })
+}
+
+async fn terminal_activity_hook_current_instance(
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pane_id: &str,
+    instance_id: u64,
+) -> Option<TerminalInstance> {
+    let terminals = terminals.read().await;
+    terminals
+        .get(pane_id)
+        .filter(|instance| instance.id == instance_id)
+        .cloned()
+}
+
+async fn read_terminal_activity_hook_chunk(
+    path: &Path,
+    offset: u64,
+) -> Result<(u64, String), String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("Unable to read activity hook metadata: {error}"))?;
+    let length = metadata.len();
+    if length <= offset {
+        return Ok((length, String::new()));
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .map_err(|error| format!("Unable to open activity hook events: {error}"))?;
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|error| format!("Unable to seek activity hook events: {error}"))?;
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk)
+        .await
+        .map_err(|error| format!("Unable to read activity hook events: {error}"))?;
+    let next_offset = offset.saturating_add(chunk.as_bytes().len() as u64);
+
+    Ok((next_offset, chunk))
+}
+
+fn spawn_terminal_activity_hook_watcher(
+    app: AppHandle,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    pane_id: String,
+    instance_id: u64,
+) {
+    let activity_events_path = terminal_activity_events_path(&pane_id, instance_id);
+    let activity_debug_path = terminal_activity_debug_path(&pane_id, instance_id);
+    tauri::async_runtime::spawn(async move {
+        let mut offset = 0u64;
+        let mut debug_offset = 0u64;
+        let mut partial = String::new();
+        let mut debug_partial = String::new();
+        loop {
+            if app_shutdown_requested() {
+                break;
+            }
+            let Some(instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                break;
+            };
+
+            match read_terminal_activity_hook_chunk(&activity_events_path, offset).await {
+                Ok((next_offset, chunk)) => {
+                    if next_offset < offset {
+                        partial.clear();
+                    }
+                    offset = next_offset;
+                    if !chunk.is_empty() {
+                        partial.push_str(&chunk);
+                        let has_complete_tail = partial.ends_with('\n');
+                        let mut lines = partial.lines().map(str::to_string).collect::<Vec<_>>();
+                        partial = if has_complete_tail {
+                            String::new()
+                        } else {
+                            lines.pop().unwrap_or_default()
+                        };
+
+                        for line in lines {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                continue;
+                            };
+                            let Some(payload) = terminal_activity_hook_payload(&instance, &event)
+                            else {
+                                let hook_event_name = terminal_activity_hook_string(
+                                    &event,
+                                    &["hookEventName", "hook_event_name", "eventName", "event_name"],
+                                )
+                                .unwrap_or_default();
+                                if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
+                                    continue;
+                                }
+                                let event_keys = event
+                                    .as_object()
+                                    .map(|object| object.keys().take(16).cloned().collect::<Vec<_>>())
+                                    .unwrap_or_default();
+                                log_terminal_status_event(
+                                    "backend.terminal_activity_hook.unmapped",
+                                    json!({
+                                        "event_keys": event_keys,
+                                        "hook_event_name": clean_terminal_diagnostic_log_text(&hook_event_name),
+                                        "instance_id": instance_id,
+                                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                        "reason": if hook_event_name.is_empty() {
+                                            "missing_hook_event_name"
+                                        } else {
+                                            "unsupported_hook_event_name"
+                                        },
+                                    }),
+                                );
+                                continue;
+                            };
+                            log_terminal_status_event(
+                                "backend.terminal_activity_hook.lifecycle",
+                                json!({
+                                    "activity_status": payload.activity_status.clone(),
+                                    "event_type": payload.event_type.clone(),
+                                    "hook_event_name": payload.hook_event_name.clone(),
+                                    "instance_id": payload.instance_id,
+                                    "pane_id": payload.pane_id.clone(),
+                                    "provider_session_id_present": payload.provider_session_id.is_some(),
+                                    "thread_id": payload.thread_id.clone(),
+                                    "workspace_id": payload.workspace_id.clone(),
+                                }),
+                            );
+                            let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
+                        }
+                    }
+                }
+                Err(error) => {
+                    if activity_events_path.exists() {
+                        log_terminal_status_event(
+                            "backend.terminal_activity_hook.read_error",
+                            json!({
+                                "error": clean_terminal_diagnostic_log_text(&error),
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            }),
+                        );
+                    }
+                }
+            }
+
+            match read_terminal_activity_hook_chunk(&activity_debug_path, debug_offset).await {
+                Ok((next_offset, chunk)) => {
+                    if next_offset < debug_offset {
+                        debug_partial.clear();
+                    }
+                    debug_offset = next_offset;
+                    if !chunk.is_empty() {
+                        debug_partial.push_str(&chunk);
+                        let has_complete_tail = debug_partial.ends_with('\n');
+                        let mut lines = debug_partial
+                            .lines()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        debug_partial = if has_complete_tail {
+                            String::new()
+                        } else {
+                            lines.pop().unwrap_or_default()
+                        };
+
+                        for line in lines {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                continue;
+                            };
+                            log_terminal_status_event(
+                                "backend.terminal_activity_hook.debug",
+                                json!({
+                                    "activity_path": event.get("activityPath").and_then(Value::as_str).unwrap_or_default(),
+                                    "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
+                                    "details": event.get("details").cloned().unwrap_or(Value::Null),
+                                    "hook_instance_id": event.get("instanceId").and_then(Value::as_u64).unwrap_or_default(),
+                                    "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("paneId").and_then(Value::as_str).unwrap_or_default()),
+                                    "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                                    "instance_id": instance_id,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                    "terminal_index": event.get("terminalIndex").and_then(Value::as_str).unwrap_or_default(),
+                                    "workspace_id": event.get("workspaceId").and_then(Value::as_str).unwrap_or_default(),
+                                }),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    if activity_debug_path.exists() {
+                        log_terminal_status_event(
+                            "backend.terminal_activity_hook.debug_read_error",
+                            json!({
+                                "error": clean_terminal_diagnostic_log_text(&error),
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                            }),
+                        );
+                    }
+                }
+            }
+
+            sleep(Duration::from_millis(TERMINAL_ACTIVITY_HOOK_POLL_MS)).await;
+        }
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.watcher_stopped",
+            json!({
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            }),
+        );
+    });
 }
 
 fn terminal_prompt_submitted_source_is_authoritative(
@@ -10429,7 +10860,7 @@ mod terminal_tests {
         )));
         assert!(env.contains(&(
             "COORDINATION_DIRECT_PROJECT_ROOT_WRITES_POLICY".to_string(),
-            "deny_root_use_agent_branch_root".to_string()
+            "deny_root_except_architecture_graph_sources_use_agent_branch_root".to_string()
         )));
         assert!(env.contains(&(
             "COORDINATION_VISIBLE_ROOT".to_string(),
@@ -10579,6 +11010,37 @@ mod terminal_tests {
             true,
             Some("what else is there"),
         ));
+    }
+
+    #[test]
+    fn cli_activity_hooks_map_turn_start_and_stop_only() {
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("UserPromptSubmit"),
+            Some((
+                "provider-turn-started",
+                "thinking",
+                "active",
+                "running",
+                false
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("Stop"),
+            Some((
+                "provider-turn-completed",
+                "idle",
+                "active",
+                "completed",
+                true
+            ))
+        );
+        assert_eq!(terminal_activity_hook_lifecycle_kind("SubagentStop"), None);
+        assert_eq!(terminal_activity_hook_lifecycle_kind("PostToolUse"), None);
+        assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStop"));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStart"));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected("PreToolUse"));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected("PostToolUse"));
+        assert!(!terminal_activity_hook_non_lifecycle_is_expected("Stop"));
     }
 
     #[test]
@@ -10861,6 +11323,115 @@ mod terminal_tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+    }
+
+    #[test]
+    fn coordinated_codex_activity_hook_profile_refresh_scopes_commands() {
+        let mut coordination = terminal_test_coordination("codex_hook_profile_scope");
+        let home = terminal_test_directory("codex_hook_profile_home");
+        let profile = "diffforge-test-profile";
+        let hooks_path = home.join(format!("{profile}.hooks.json"));
+        let profile_path = home.join(format!("{profile}.config.toml"));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            &profile_path,
+            "default_permissions = \"diffforge-coordinated\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "'coordination_mcp' --diff-forge-activity-hook --provider 'codex'",
+                                    "timeout": 5
+                                }
+                            ]
+                        }
+                    ],
+                    "PreToolUse": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "'coordination_mcp' --diff-forge-write-guard --provider 'codex'",
+                                    "timeout": 30
+                                }
+                            ],
+                            "matcher": "functions.apply_patch"
+                        }
+                    ],
+                    "PostToolUse": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "'coordination_mcp' --diff-forge-activity-hook --provider 'codex'",
+                                    "timeout": 5
+                                }
+                            ],
+                            "matcher": "Bash|Shell"
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let home_text = home.to_string_lossy().to_string();
+        coordination
+            .env_vars
+            .push(("DIFFFORGE_CODEX_HOME".to_string(), home_text.clone()));
+        coordination
+            .env_vars
+            .push(("CODEX_HOME".to_string(), home_text));
+        coordination.env_vars.push((
+            "DIFFFORGE_CODEX_PROFILE".to_string(),
+            profile.to_string(),
+        ));
+
+        let updated = refresh_codex_activity_hook_profile_for_terminal(
+            Some(&coordination),
+            "codex",
+            "workspace-terminal/workspace-1-0-codex",
+            42,
+            Some("workspace-1"),
+            Some(2),
+        )
+        .unwrap();
+
+        assert!(updated);
+        let hooks = fs::read_to_string(&hooks_path).unwrap();
+        assert!(hooks.contains("--diff-forge-activity-hook"));
+        assert!(hooks.contains("UserPromptSubmit"));
+        assert!(hooks.contains("Stop"));
+        assert!(hooks.contains("--pane-id"));
+        assert!(hooks.contains("workspace-terminal/workspace-1-0-codex"));
+        assert!(hooks.contains("--instance-id"));
+        assert!(hooks.contains("42"));
+        assert!(hooks.contains("--workspace-id"));
+        assert!(hooks.contains("workspace-1"));
+        assert!(hooks.contains("--terminal-index"));
+        assert!(hooks.contains("--events-path"));
+        assert!(hooks.contains("--debug-path"));
+        assert!(hooks.contains("--diff-forge-write-guard"));
+        assert!(!hooks.contains("PostToolUse"));
+        assert_eq!(hooks.matches("--pane-id").count(), 2);
+        let profile_config = fs::read_to_string(&profile_path).unwrap();
+        assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
+        assert!(profile_config.contains("[[hooks.Stop]]"));
+        assert!(profile_config.contains("[[hooks.PreToolUse]]"));
+        assert!(!profile_config.contains("[[hooks.PostToolUse]]"));
+        assert!(profile_config.contains("--diff-forge-activity-hook"));
+        assert!(profile_config.contains("--pane-id"));
+        assert!(profile_config.contains("workspace-terminal/workspace-1-0-codex"));
+        assert!(profile_config.contains("--debug-path"));
+        assert!(profile_config.contains("--diff-forge-write-guard"));
+        assert!(!profile_config.contains("hooksPath ="));
     }
 
     #[test]

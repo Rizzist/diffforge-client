@@ -10,7 +10,7 @@ import { ExpandMore } from "@styled-icons/material-rounded/ExpandMore";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Undo } from "@styled-icons/material-rounded/Undo";
-import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { Children, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Prism from "prismjs";
 import "prismjs/components/prism-markup";
 import "prismjs/components/prism-css";
@@ -52,9 +52,6 @@ import {
 import {
   getLiveTerminalForThread,
   getThreadTerminalGroundTruth,
-  getThreadTerminalReadinessSnapshot,
-  getThreadTerminalReadinessVersion,
-  subscribeThreadTerminalReadiness,
   threadLooksEffectivelyThinking,
 } from "./threadTerminalGroundTruth.js";
 import {
@@ -62,56 +59,6 @@ import {
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
 } from "./workspaceThreads";
-
-function workspaceThreadDetailTimestampMs(value) {
-  const parsed = Date.parse(String(value || ""));
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function getWorkspaceThreadDetailLatestUserMessage(thread) {
-  return [...(Array.isArray(thread?.messages) ? thread.messages : [])]
-    .reverse()
-    .find((message) => String(message?.role || "").trim().toLowerCase() === "user") || null;
-}
-
-function terminalReadinessSnapshotMatchesRunningTurn(thread, snapshot) {
-  if (!thread || !snapshot) {
-    return true;
-  }
-
-  const latestTurn = thread.latestTurn || null;
-  const latestTurnState = String(latestTurn?.state || latestTurn?.status || "").trim().toLowerCase();
-  if (latestTurnState !== "running") {
-    return true;
-  }
-
-  const readyAtMs = workspaceThreadDetailTimestampMs(snapshot.inputReadyAt || snapshot.promptReadyAt);
-  const turnStartedAtMs = workspaceThreadDetailTimestampMs(
-    latestTurn?.startedAt || latestTurn?.requestedAt || latestTurn?.updatedAt,
-  );
-  if (readyAtMs && turnStartedAtMs && readyAtMs < turnStartedAtMs - 1000) {
-    return false;
-  }
-
-  const promptEventId = String(
-    snapshot.promptEventId
-      || snapshot.pendingPromptId
-      || snapshot.promptId
-      || "",
-  ).trim();
-  if (!promptEventId) {
-    return false;
-  }
-
-  const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
-  const latestMessageId = String(latestTurn?.messageId || "").trim();
-  const latestUserMessageId = String(getWorkspaceThreadDetailLatestUserMessage(thread)?.id || "").trim();
-  return Boolean(
-    latestMessageId === promptEventId
-      || latestUserMessageId === promptEventId
-      || (latestTurnId && latestTurnId.includes(promptEventId))
-  );
-}
 
 const thinkingPulse = keyframes`
   0%, 100% {
@@ -3936,7 +3883,6 @@ function getTerminalDiagnosticSummary(terminal) {
     inputReadyConfidence: String(terminal.inputReadyConfidence || ""),
     instanceId: terminal.instanceId ?? "",
     paneId: String(terminal.paneId || ""),
-    promptReadyAt: String(terminal.promptReadyAt || ""),
     status: String(terminal.status || ""),
     terminalIndex: terminal.terminalIndex ?? "",
     threadId: String(terminal.threadId || ""),
@@ -3963,7 +3909,6 @@ function getProviderBindingDiagnosticSummary(binding) {
         || "",
     ),
     nativeSessionIdPresent: Boolean(binding.nativeSessionId),
-    promptReadyAt: String(binding.promptReadyAt || ""),
     terminalBinding: getTerminalDiagnosticSummary(binding.terminalBinding),
   };
 }
@@ -3988,8 +3933,6 @@ function getThreadDetailRenderDiagnosticSnapshot({
   effectiveLiveTerminal,
   latestActivity,
   messages,
-  terminalReadinessSnapshot,
-  terminalReadinessVersion,
   thread,
   threadGroundTruth,
   transcriptItems,
@@ -4061,8 +4004,6 @@ function getThreadDetailRenderDiagnosticSnapshot({
     rawStatus: String(thread?.status || ""),
     rawTurnState: threadLatestTurnState(thread),
     terminalCount,
-    terminalReadinessSnapshot: getTerminalDiagnosticSummary(terminalReadinessSnapshot),
-    terminalReadinessVersion,
     threadId: String(thread?.id || ""),
     transcriptItemCount: Array.isArray(transcriptItems) ? transcriptItems.length : 0,
     workspaceId: String(workspace?.id || thread?.workspaceId || ""),
@@ -4083,7 +4024,6 @@ function getThreadDetailRenderDiagnosticSignature(snapshot) {
     liveActivityVisible: snapshot?.liveActivityVisible === true,
     rawActivityStatus: snapshot?.rawActivityStatus || "",
     rawStatus: snapshot?.rawStatus || "",
-    readinessVersion: snapshot?.terminalReadinessVersion || 0,
     threadId: snapshot?.threadId || "",
     workspaceId: snapshot?.workspaceId || "",
   });
@@ -4852,69 +4792,7 @@ function WorkspaceThreadDetail({
     activeProviderBinding,
     workspaceThreadEntry,
   );
-  const terminalReadinessHint = activeLiveTerminal
-    || activeProviderBinding?.terminalBinding
-    || thread?.terminalBinding
-    || { terminalIndex: thread?.terminalIndex };
-  const terminalReadinessVersion = useSyncExternalStore(
-    subscribeThreadTerminalReadiness,
-    getThreadTerminalReadinessVersion,
-    getThreadTerminalReadinessVersion,
-  );
-  const terminalReadinessSnapshot = useMemo(() => getThreadTerminalReadinessSnapshot(
-    workspace?.id || thread?.workspaceId || "",
-    thread?.id || "",
-    terminalReadinessHint,
-  ), [
-    terminalReadinessHint,
-    terminalReadinessVersion,
-    thread?.id,
-    thread?.workspaceId,
-    workspace?.id,
-  ]);
-  const effectiveLiveTerminal = useMemo(() => {
-    if (!terminalReadinessSnapshot) {
-      return activeLiveTerminal;
-    }
-
-    if (!terminalReadinessSnapshotMatchesRunningTurn(thread, terminalReadinessSnapshot)) {
-      return activeLiveTerminal;
-    }
-
-    if (
-      activeLiveTerminal?.paneId
-      && terminalReadinessSnapshot.paneId
-      && activeLiveTerminal.paneId !== terminalReadinessSnapshot.paneId
-    ) {
-      return activeLiveTerminal;
-    }
-
-    if (
-      activeLiveTerminal?.instanceId
-      && terminalReadinessSnapshot.instanceId
-      && Number(activeLiveTerminal.instanceId) !== Number(terminalReadinessSnapshot.instanceId)
-    ) {
-      return activeLiveTerminal;
-    }
-
-    return {
-      ...(activeLiveTerminal || {}),
-      inputReady: true,
-      inputReadyAt: terminalReadinessSnapshot.inputReadyAt || activeLiveTerminal?.inputReadyAt || "",
-      inputReadyConfidence: terminalReadinessSnapshot.inputReadyConfidence
-        || activeLiveTerminal?.inputReadyConfidence
-        || "",
-      instanceId: activeLiveTerminal?.instanceId || terminalReadinessSnapshot.instanceId || "",
-      paneId: activeLiveTerminal?.paneId || terminalReadinessSnapshot.paneId || "",
-      promptReadyAt: terminalReadinessSnapshot.promptReadyAt
-        || terminalReadinessSnapshot.inputReadyAt
-        || activeLiveTerminal?.promptReadyAt
-        || "",
-      status: activeLiveTerminal?.status || terminalReadinessSnapshot.status || "active",
-      terminalIndex: activeLiveTerminal?.terminalIndex ?? terminalReadinessSnapshot.terminalIndex,
-      threadId: activeLiveTerminal?.threadId || terminalReadinessSnapshot.threadId || thread?.id || "",
-    };
-  }, [activeLiveTerminal, terminalReadinessSnapshot, thread]);
+  const effectiveLiveTerminal = activeLiveTerminal;
   const threadGroundTruth = useMemo(() => getThreadTerminalGroundTruth({
     liveTerminal: effectiveLiveTerminal,
     providerBinding: activeProviderBinding,
@@ -5002,8 +4880,6 @@ function WorkspaceThreadDetail({
       effectiveLiveTerminal,
       latestActivity,
       messages,
-      terminalReadinessSnapshot,
-      terminalReadinessVersion,
       thread,
       threadGroundTruth,
       transcriptItems,
@@ -5028,8 +4904,6 @@ function WorkspaceThreadDetail({
     effectiveLiveTerminal,
     latestActivity,
     messages,
-    terminalReadinessSnapshot,
-    terminalReadinessVersion,
     thread,
     threadGroundTruth,
     transcriptItems,

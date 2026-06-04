@@ -1187,6 +1187,28 @@ fn claude_write_authority_guard_settings(
             "deny": deny_rules
         },
         "hooks": {
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
             "PreToolUse": [
                 {
                     "matcher": "Edit|Write|NotebookEdit",
@@ -1198,55 +1220,11 @@ fn claude_write_authority_guard_settings(
                     ]
                 },
                 {
-                    "matcher": "Agent|Task|Bash|PowerShell|Monitor",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                },
-                {
                     "matcher": "Bash|PowerShell|Monitor",
                     "hooks": [
                         {
                             "type": "command",
                             "command": guard_command
-                        }
-                    ]
-                }
-            ],
-            "PostToolUse": [
-                {
-                    "matcher": "Agent|Task|Bash|PowerShell|Monitor",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "SubagentStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "SubagentStop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_command.clone(),
-                            "timeout": 5
                         }
                     ]
                 }
@@ -1375,6 +1353,56 @@ fn diff_forge_activity_hook_command(
     }
 }
 
+fn diff_forge_scoped_activity_hook_command(
+    coordination: &TerminalCoordinationSession,
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+) -> String {
+    let command_path = coordination.mcp_command.as_str();
+    let events_path = terminal_activity_events_path(pane_id, instance_id);
+    let debug_path = terminal_activity_debug_path(pane_id, instance_id);
+    let instance_id = instance_id.to_string();
+    let terminal_index = terminal_index
+        .map(|index| index.to_string())
+        .unwrap_or_default();
+    let workspace_id = workspace_id.unwrap_or_default();
+    let events_path = events_path.to_string_lossy().to_string();
+    let debug_path = debug_path.to_string_lossy().to_string();
+
+    #[cfg(windows)]
+    {
+        format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-activity-hook --provider {} --pane-id {} --instance-id {} --workspace-id {} --terminal-index {} --events-path {} --debug-path {}\"",
+            quote_powershell_literal(command_path),
+            quote_powershell_literal(provider),
+            quote_powershell_literal(pane_id),
+            quote_powershell_literal(&instance_id),
+            quote_powershell_literal(workspace_id),
+            quote_powershell_literal(&terminal_index),
+            quote_powershell_literal(&events_path),
+            quote_powershell_literal(&debug_path),
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!(
+            "{} --diff-forge-activity-hook --provider {} --pane-id {} --instance-id {} --workspace-id {} --terminal-index {} --events-path {} --debug-path {}",
+            quote_shell_literal(command_path),
+            quote_shell_literal(provider),
+            quote_shell_literal(pane_id),
+            quote_shell_literal(&instance_id),
+            quote_shell_literal(workspace_id),
+            quote_shell_literal(&terminal_index),
+            quote_shell_literal(&events_path),
+            quote_shell_literal(&debug_path),
+        )
+    }
+}
+
 fn terminal_activity_events_path(pane_id: &str, instance_id: u64) -> PathBuf {
     let safe_pane_id = pane_id
         .chars()
@@ -1389,6 +1417,12 @@ fn terminal_activity_events_path(pane_id: &str, instance_id: u64) -> PathBuf {
     env::temp_dir()
         .join("diffforge-terminal-activity")
         .join(format!("{safe_pane_id}-{instance_id}.jsonl"))
+}
+
+fn terminal_activity_debug_path(pane_id: &str, instance_id: u64) -> PathBuf {
+    let mut path = terminal_activity_events_path(pane_id, instance_id);
+    path.set_extension("debug.jsonl");
+    path
 }
 
 fn terminal_activity_env_vars(
@@ -1421,6 +1455,12 @@ fn terminal_activity_env_vars(
             "DIFFFORGE_ACTIVITY_EVENTS_PATH".to_string(),
             activity_path.to_string_lossy().to_string(),
         ),
+        (
+            "DIFFFORGE_ACTIVITY_DEBUG_PATH".to_string(),
+            terminal_activity_debug_path(pane_id, instance_id)
+                .to_string_lossy()
+                .to_string(),
+        ),
     ]
 }
 
@@ -1438,6 +1478,336 @@ fn extend_terminal_activity_env_vars(
         env_vars.retain(|(existing_key, _)| existing_key != &key);
         env_vars.push((key, value));
     }
+}
+
+fn refresh_codex_activity_hook_profile_for_terminal(
+    coordination: Option<&TerminalCoordinationSession>,
+    provider_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+) -> Result<bool, String> {
+    if !provider_id.to_ascii_lowercase().contains("codex") {
+        return Ok(false);
+    }
+    let Some(coordination) = coordination else {
+        return Ok(false);
+    };
+    let Some(profile) = terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_PROFILE")
+    else {
+        return Ok(false);
+    };
+    let Some(home) = terminal_coordination_env_value(coordination, "DIFFFORGE_CODEX_HOME")
+        .or_else(|| terminal_coordination_env_value(coordination, "CODEX_HOME"))
+    else {
+        return Ok(false);
+    };
+
+    let profile_path = PathBuf::from(&home).join(format!("{profile}.config.toml"));
+    let hooks_path = codex_hooks_path_from_profile(&profile_path)?
+        .unwrap_or_else(|| PathBuf::from(&home).join(format!("{profile}.hooks.json")));
+    let body = match fs::read_to_string(&hooks_path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read Codex hooks config {}: {error}",
+                hooks_path.display()
+            ))
+        }
+    };
+    let mut hooks_json: Value = serde_json::from_str(&body).map_err(|error| {
+        format!(
+            "Unable to parse Codex hooks config {}: {error}",
+            hooks_path.display()
+        )
+    })?;
+    let scoped_command = diff_forge_scoped_activity_hook_command(
+        coordination,
+        "codex",
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+    );
+    let replaced = replace_activity_hook_commands_in_json(&mut hooks_json, scoped_command.as_str());
+    let removed = remove_codex_non_lifecycle_activity_hooks(&mut hooks_json);
+    let added = ensure_codex_lifecycle_activity_hooks(&mut hooks_json, scoped_command.as_str());
+    let mut updated = replaced > 0 || removed > 0 || added > 0;
+    if !json_file_matches_local(&hooks_path, &hooks_json) {
+        let body = serde_json::to_vec_pretty(&hooks_json).map_err(|error| {
+            format!(
+                "Unable to serialize Codex hooks config {}: {error}",
+                hooks_path.display()
+            )
+        })?;
+        fs::write(&hooks_path, body).map_err(|error| {
+            format!(
+                "Unable to write Codex hooks config {}: {error}",
+                hooks_path.display()
+            )
+        })?;
+        updated = true;
+    }
+    if sync_codex_profile_inline_hooks(&profile_path, &hooks_json)? {
+        updated = true;
+    }
+    Ok(updated)
+}
+
+fn codex_hooks_path_from_profile(profile_path: &Path) -> Result<Option<PathBuf>, String> {
+    let Ok(body) = fs::read_to_string(profile_path) else {
+        return Ok(None);
+    };
+    let profile_dir = profile_path.parent().unwrap_or_else(|| Path::new("."));
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let Some(value) = trimmed.strip_prefix("hooksPath") else {
+            continue;
+        };
+        let Some(value) = value.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let Some(path) = terminal_toml_string_literal_value(value) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        return Ok(Some(if path.is_absolute() {
+            path
+        } else {
+            profile_dir.join(path)
+        }));
+    }
+    Ok(None)
+}
+
+fn terminal_toml_string_literal_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !(value.starts_with('"') && value.ends_with('"') && value.len() >= 2) {
+        return None;
+    }
+    let body = &value[1..value.len().saturating_sub(1)];
+    let mut output = String::new();
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some(other) => output.push(other),
+            None => return None,
+        }
+    }
+    Some(output)
+}
+
+fn replace_activity_hook_commands_in_json(value: &mut Value, scoped_command: &str) -> usize {
+    match value {
+        Value::Object(object) => {
+            let mut replaced = 0usize;
+            for (key, value) in object.iter_mut() {
+                if key == "command"
+                    && value
+                        .as_str()
+                        .is_some_and(|command| command.contains("--diff-forge-activity-hook"))
+                {
+                    *value = Value::String(scoped_command.to_string());
+                    replaced += 1;
+                } else {
+                    replaced += replace_activity_hook_commands_in_json(value, scoped_command);
+                }
+            }
+            replaced
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|item| replace_activity_hook_commands_in_json(item, scoped_command))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn ensure_codex_lifecycle_activity_hooks(value: &mut Value, scoped_command: &str) -> usize {
+    let Some(root) = value.as_object_mut() else {
+        return 0;
+    };
+    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
+    let Some(hooks) = hooks.as_object_mut() else {
+        return 0;
+    };
+
+    let mut added = 0usize;
+    for event_name in ["UserPromptSubmit", "Stop"] {
+        let entry = hooks
+            .entry(event_name)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(entries) = entry.as_array_mut() else {
+            continue;
+        };
+        let has_activity_hook = entries
+            .iter()
+            .any(|entry| hook_entry_contains_activity_command(entry));
+        if !has_activity_hook {
+            entries.push(json!({
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": scoped_command,
+                        "timeout": 5
+                    }
+                ]
+            }));
+            added += 1;
+        }
+    }
+
+    added
+}
+
+fn sync_codex_profile_inline_hooks(profile_path: &Path, hooks_json: &Value) -> Result<bool, String> {
+    let body = fs::read_to_string(profile_path).map_err(|error| {
+        format!(
+            "Unable to read Codex profile config {}: {error}",
+            profile_path.display()
+        )
+    })?;
+    let hooks_config = crate::coordination::kernel::codex_managed_hooks_config_toml(hooks_json);
+    if hooks_config.trim().is_empty() {
+        return Ok(false);
+    }
+    let mut next = strip_codex_profile_inline_hook_events(&body)
+        .trim_end()
+        .to_string();
+    if !next.is_empty() {
+        next.push_str("\n\n");
+    }
+    next.push_str(hooks_config.trim_end());
+    next.push('\n');
+    if next == body {
+        return Ok(false);
+    }
+    fs::write(profile_path, next).map_err(|error| {
+        format!(
+            "Unable to write Codex profile config {}: {error}",
+            profile_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn strip_codex_profile_inline_hook_events(body: &str) -> String {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut next = Vec::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if let Some(section) = terminal_toml_section_header_name(lines[index]) {
+            if codex_toml_section_is_inline_hook_event(&section) {
+                index += 1;
+                while index < lines.len() && terminal_toml_section_header_name(lines[index]).is_none()
+                {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+        next.push(lines[index]);
+        index += 1;
+    }
+    let mut body = next.join("\n");
+    if !body.trim().is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body
+}
+
+fn terminal_toml_section_header_name(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("[[") && trimmed.ends_with("]]") && trimmed.len() >= 4 {
+        let section = &trimmed[2..trimmed.len().saturating_sub(2)];
+        return (!section.trim().is_empty()).then(|| section.trim().to_string());
+    }
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() >= 2 {
+        let section = &trimmed[1..trimmed.len().saturating_sub(1)];
+        return (!section.trim().is_empty()).then(|| section.trim().to_string());
+    }
+    None
+}
+
+fn codex_toml_section_is_inline_hook_event(section: &str) -> bool {
+    (section == "hooks" || section.starts_with("hooks."))
+        && section != "hooks.state"
+        && !section.starts_with("hooks.state.")
+}
+
+fn hook_entry_contains_activity_command(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            key == "command"
+                && value
+                    .as_str()
+                    .is_some_and(|command| command.contains("--diff-forge-activity-hook"))
+                || hook_entry_contains_activity_command(value)
+        }),
+        Value::Array(items) => items.iter().any(hook_entry_contains_activity_command),
+        _ => false,
+    }
+}
+
+fn remove_codex_non_lifecycle_activity_hooks(value: &mut Value) -> usize {
+    let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+
+    let mut removed = 0usize;
+    for event_name in ["PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop"] {
+        let Some(entries) = hooks.get_mut(event_name).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries.iter_mut() {
+            let Some(hook_entries) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let before = hook_entries.len();
+            hook_entries.retain(|hook| !hook_entry_contains_activity_command(hook));
+            removed += before.saturating_sub(hook_entries.len());
+        }
+        entries.retain(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hook_entries| !hook_entries.is_empty())
+        });
+    }
+
+    let empty_events = hooks
+        .iter()
+        .filter_map(|(event_name, entries)| {
+            entries
+                .as_array()
+                .is_some_and(Vec::is_empty)
+                .then(|| event_name.clone())
+        })
+        .collect::<Vec<_>>();
+    for event_name in empty_events {
+        hooks.remove(&event_name);
+    }
+
+    removed
+}
+
+fn json_file_matches_local(path: &Path, value: &Value) -> bool {
+    let Ok(expected) = serde_json::to_vec_pretty(value) else {
+        return false;
+    };
+    fs::read(path).is_ok_and(|current| current == expected)
 }
 
 pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
@@ -1472,12 +1842,55 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
     )
     .map(PathBuf::from)
     .unwrap_or_else(|| terminal_activity_events_path(&pane_id, instance_id));
+    let debug_path =
+        terminal_cli_arg_or_env(args, "--debug-path", &["DIFFFORGE_ACTIVITY_DEBUG_PATH"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| terminal_activity_debug_path(&pane_id, instance_id));
+
+    write_diff_forge_activity_hook_debug(
+        &debug_path,
+        "started",
+        &provider,
+        &pane_id,
+        instance_id,
+        &workspace_id,
+        &terminal_index,
+        &activity_path,
+        json!({
+            "argCount": args.len(),
+            "hasEventsPathArg": terminal_cli_arg_value(args, "--events-path").is_some(),
+            "hasPaneIdArg": terminal_cli_arg_value(args, "--pane-id").is_some(),
+            "hasInstanceIdArg": terminal_cli_arg_value(args, "--instance-id").is_some(),
+        }),
+    );
 
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "stdin_read_error",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            Value::Null,
+        );
         return 0;
     }
     let Ok(hook_input) = serde_json::from_str::<Value>(&input) else {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "json_parse_error",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            json!({ "inputLength": input.len() }),
+        );
         return 0;
     };
     let record = diff_forge_activity_hook_record(
@@ -1496,10 +1909,83 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         .append(true)
         .open(&activity_path)
     {
-        let _ = writeln!(file, "{record}");
+        let record_line = format!("{record}\n");
+        match file.write_all(record_line.as_bytes()) {
+            Ok(_) => write_diff_forge_activity_hook_debug(
+                &debug_path,
+                "event_written",
+                &provider,
+                &pane_id,
+                instance_id,
+                &workspace_id,
+                &terminal_index,
+                &activity_path,
+                json!({
+                    "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
+                }),
+            ),
+            Err(error) => write_diff_forge_activity_hook_debug(
+                &debug_path,
+                "event_write_error",
+                &provider,
+                &pane_id,
+                instance_id,
+                &workspace_id,
+                &terminal_index,
+                &activity_path,
+                json!({ "error": error.to_string() }),
+            ),
+        }
+    } else {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "event_open_error",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            Value::Null,
+        );
     }
 
     0
+}
+
+fn write_diff_forge_activity_hook_debug(
+    debug_path: &Path,
+    phase: &str,
+    provider: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: &str,
+    terminal_index: &str,
+    activity_path: &Path,
+    details: Value,
+) {
+    if let Some(parent) = debug_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let record = json!({
+        "activityPath": activity_path.to_string_lossy(),
+        "details": details,
+        "instanceId": instance_id,
+        "paneId": pane_id,
+        "phase": phase,
+        "provider": provider,
+        "terminalIndex": terminal_index,
+        "timestampMs": terminal_now_ms(),
+        "workspaceId": workspace_id,
+    });
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(debug_path)
+    {
+        let record_line = format!("{record}\n");
+        let _ = file.write_all(record_line.as_bytes());
+    }
 }
 
 fn diff_forge_activity_hook_record(
@@ -1510,16 +1996,70 @@ fn diff_forge_activity_hook_record(
     terminal_index: &str,
     hook_input: &Value,
 ) -> Value {
-    let tool_input = &hook_input["tool_input"];
-    let agent_type = hook_input["agent_type"]
-        .as_str()
-        .or_else(|| tool_input["agent_type"].as_str())
-        .or_else(|| tool_input["subagent_type"].as_str())
-        .unwrap_or_default();
-    let description = tool_input["description"]
-        .as_str()
-        .or_else(|| tool_input["prompt"].as_str())
-        .unwrap_or_default();
+    let empty_tool_input = Value::Null;
+    let tool_input = hook_input
+        .get("tool_input")
+        .or_else(|| hook_input.get("toolInput"))
+        .unwrap_or(&empty_tool_input);
+    let hook_string = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|key| hook_input.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let tool_string = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|key| tool_input.get(*key).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let first_string = |values: Vec<String>| -> String {
+        values
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
+    let hook_event_name = hook_string(&[
+        "hook_event_name",
+        "hookEventName",
+        "event_name",
+        "eventName",
+    ]);
+    let session_id = hook_string(&["session_id", "sessionId"]);
+    let turn_id = hook_string(&["turn_id", "turnId"]);
+    let permission_mode = hook_string(&["permission_mode", "permissionMode"]);
+    let transcript_path = hook_string(&["transcript_path", "transcriptPath"]);
+    let agent_id = hook_string(&["agent_id", "agentId"]);
+    let agent_type = first_string(vec![
+        hook_string(&["agent_type", "agentType"]),
+        tool_string(&["agent_type", "agentType", "subagent_type", "subagentType"]),
+    ]);
+    let agent_transcript_path = hook_string(&[
+        "agent_transcript_path",
+        "agentTranscriptPath",
+    ]);
+    let last_message = hook_string(&[
+        "last_assistant_message",
+        "lastAssistantMessage",
+        "last_message",
+        "lastMessage",
+    ]);
+    let description = first_string(vec![
+        tool_string(&["description", "prompt"]),
+        hook_string(&["description"]),
+    ]);
+    let user_prompt = first_string(vec![
+        hook_string(&["prompt", "user_prompt", "userPrompt", "message"]),
+        tool_string(&["prompt", "description"]),
+    ]);
+    let tool_name = hook_string(&["tool_name", "toolName"]);
+    let tool_use_id = hook_string(&["tool_use_id", "toolUseId"]);
+    let command = tool_string(&["command"]);
     json!({
         "timestampMs": current_time_ms(),
         "provider": provider,
@@ -1527,22 +2067,56 @@ fn diff_forge_activity_hook_record(
         "instanceId": instance_id,
         "workspaceId": workspace_id,
         "terminalIndex": terminal_index,
-        "eventName": hook_input["hook_event_name"].as_str().unwrap_or_default(),
-        "hookEventName": hook_input["hook_event_name"].as_str().unwrap_or_default(),
-        "sessionId": hook_input["session_id"].as_str().unwrap_or_default(),
-        "turnId": hook_input["turn_id"].as_str().unwrap_or_default(),
-        "cwd": hook_input["cwd"].as_str().unwrap_or_default(),
-        "permissionMode": hook_input["permission_mode"].as_str().unwrap_or_default(),
-        "transcriptPath": hook_input["transcript_path"].as_str().unwrap_or_default(),
-        "agentId": hook_input["agent_id"].as_str().unwrap_or_default(),
+        "eventName": hook_event_name.clone(),
+        "hookEventName": hook_event_name,
+        "sessionId": session_id,
+        "turnId": turn_id,
+        "cwd": hook_string(&["cwd"]),
+        "permissionMode": permission_mode,
+        "transcriptPath": transcript_path,
+        "agentId": agent_id,
         "agentType": agent_type,
-        "agentTranscriptPath": hook_input["agent_transcript_path"].as_str().unwrap_or_default(),
-        "lastMessage": hook_input["last_assistant_message"].as_str().unwrap_or_default(),
-        "toolName": hook_input["tool_name"].as_str().unwrap_or_default(),
-        "toolUseId": hook_input["tool_use_id"].as_str().unwrap_or_default(),
-        "command": tool_input["command"].as_str().unwrap_or_default(),
-        "description": description,
+        "agentTranscriptPath": agent_transcript_path,
+        "lastMessage": last_message,
+        "message": user_prompt.clone(),
+        "prompt": user_prompt.clone(),
+        "toolName": tool_name,
+        "toolUseId": tool_use_id,
+        "command": command,
+        "description": if description.is_empty() { user_prompt } else { description },
     })
+}
+
+#[cfg(test)]
+mod terminal_cli_tests {
+    use super::*;
+
+    #[test]
+    fn activity_hook_record_accepts_camel_case_fields() {
+        let record = diff_forge_activity_hook_record(
+            "codex",
+            "pane-1",
+            42,
+            "workspace-1",
+            "3",
+            &json!({
+                "hookEventName": "Stop",
+                "sessionId": "session-123",
+                "turnId": "turn-456",
+                "transcriptPath": "/tmp/session.jsonl",
+                "userPrompt": "ship it",
+                "toolInput": {
+                    "description": "fallback description"
+                }
+            }),
+        );
+
+        assert_eq!(record["hookEventName"], "Stop");
+        assert_eq!(record["sessionId"], "session-123");
+        assert_eq!(record["turnId"], "turn-456");
+        assert_eq!(record["transcriptPath"], "/tmp/session.jsonl");
+        assert_eq!(record["prompt"], "ship it");
+    }
 }
 
 pub fn run_claude_worktree_guard(args: &[String]) -> i32 {

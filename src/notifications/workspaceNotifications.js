@@ -24,12 +24,10 @@ const COMPLETION_LIFECYCLE_TYPES = new Set([
   "pending-prompt-error",
   "provider-turn-completed",
   "provider-turn-error",
-  "terminal-prompt-ready",
 ]);
 
 const ALL_DONE_COMPLETION_TYPES = new Set([
   "provider-turn-completed",
-  "terminal-prompt-ready",
 ]);
 
 const PENDING_APPROVAL_STATUSES = new Set([
@@ -772,8 +770,6 @@ function lifecycleResolvesPromptingNotification(event) {
     "provider-turn-error",
     "provider-turn-interrupted",
     "provider-turn-started",
-    "terminal-input-ready",
-    "terminal-prompt-ready",
     "thread-starting",
   ].includes(type)
     || event?.terminalIsPromptingUser === false
@@ -1041,8 +1037,6 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
     "exited",
     "provider-turn-completed",
     "provider-turn-error",
-    "terminal-input-ready",
-    "terminal-prompt-ready",
   ].includes(type);
   let nextBucket = resolvePromptingNotificationsForLifecycle(bucket, lifecycleEvent);
   let cueNotification = null;

@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   appendWorkspaceThreadProjectionEvents,
+  bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
   hydrateWorkspaceThreadSessionTranscript,
   markWorkspaceThreadAgentActivity,
@@ -10,7 +11,7 @@ import {
   normalizeWorkspaceThreads,
 } from "./workspaceThreads.js";
 
-test("session transcript completion settles the active running turn", () => {
+test("session transcript completion hydrates content without settling the active running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -30,6 +31,7 @@ test("session transcript completion settles the active running turn", () => {
           currentAgent: "codex",
           latestTurn: {
             messageId: promptId,
+            promptEpoch: 7,
             startedAt: submittedAt,
             state: "running",
             turnId,
@@ -46,6 +48,7 @@ test("session transcript completion settles the active running turn", () => {
             createdAt: submittedAt,
             id: "turn-start",
             messageId: promptId,
+            promptEpoch: 7,
             status: "running",
             turnId,
             type: "thread.turn.started",
@@ -110,6 +113,7 @@ test("session transcript completion settles the active running turn", () => {
       text: "The project is basically an empty workspace.",
     }],
     promptAccepted: true,
+    promptEpoch: 7,
     promptEventId: promptId,
     providerSessionId: sessionId,
     sessionId,
@@ -122,13 +126,264 @@ test("session transcript completion settles the active running turn", () => {
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.latestTurn.state, "completed");
-  assert.equal(nextThread.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.inputReady, true);
+  assert.equal(nextThread.latestTurn.state, "running");
+  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.providerBindings.codex.inputReady, false);
+  assert.equal(nextThread.messages.some((message) => message.id === "assistant-final"), true);
+});
+
+test("session transcript completion cannot settle a running turn without terminal lifecycle permission", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "prompt-test";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-05-31T04:15:07.094Z";
+  const completedAt = "2026-05-31T04:15:33.000Z";
+  const sessionId = "session-test";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            promptEpoch: 7,
+            startedAt: submittedAt,
+            state: "running",
+            turnId,
+          },
+          messages: [{
+            createdAt: submittedAt,
+            id: promptId,
+            role: "user",
+            text: "Explain this codebase",
+            turnId,
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "turn-start",
+            messageId: promptId,
+            promptEpoch: 7,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }, {
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "user-message",
+            messageId: promptId,
+            role: "user",
+            status: "submitted",
+            text: "Explain this codebase",
+            turnId,
+            type: "thread.message.user",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId: "pane-test",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          transcriptSessionId: sessionId,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    allowTranscriptTurnCompletion: false,
+    completedAt,
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "Explain this codebase",
+    latestTimestamp: completedAt,
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: "Explain this codebase",
+    }, {
+      createdAt: completedAt,
+      id: "assistant-final",
+      kind: "message",
+      role: "assistant",
+      text: "The project is basically an empty workspace.",
+    }, {
+      createdAt: completedAt,
+      id: "task-complete",
+      kind: "task_complete",
+      role: "assistant",
+      text: "The project is basically an empty workspace.",
+    }],
+    promptAccepted: true,
+    promptEpoch: 7,
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    transcriptCompletionCanSettleTurn: false,
+    transcriptExplicitCompletionCanSettleTurn: false,
+    turnCompleteSeen: true,
+    workspaceId,
+    threadId,
+  });
+
+  const nextThread = nextState[workspaceId].threads[threadId];
+  assert.equal(nextThread.latestTurn.state, "running");
+  assert.equal(nextThread.latestTurn.promptEpoch, 7);
+  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.providerBindings.codex.inputReady, false);
   assert.equal(
-    nextThread.providerBindings.codex.inputReadyConfidence,
-    "transcript-explicit-completion",
+    nextThread.projectionEvents.some((event) => (
+      event.type === "thread.turn.completed" && event.turnId === turnId
+    )),
+    false,
   );
+  assert.equal(
+    nextThread.messages.some((message) => message.id === "assistant-final"),
+    true,
+  );
+});
+
+test("transcript hydration preserves a live running turn over stale completed projection history", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-test";
+  const promptId = "prompt-test";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-05-31T04:15:07.094Z";
+  const completedAt = "2026-05-31T04:15:33.000Z";
+  const sessionId = "session-test";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            promptEpoch: 9,
+            startedAt: submittedAt,
+            state: "running",
+            turnId,
+          },
+          messages: [{
+            createdAt: submittedAt,
+            id: promptId,
+            role: "user",
+            text: "Explain this codebase",
+            turnId,
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "turn-start",
+            messageId: promptId,
+            promptEpoch: 9,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }, {
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "user-message",
+            messageId: promptId,
+            role: "user",
+            status: "submitted",
+            text: "Explain this codebase",
+            turnId,
+            type: "thread.message.user",
+          }, {
+            agentId: "codex",
+            completedAt,
+            createdAt: completedAt,
+            id: "stale-turn-completed",
+            messageId: promptId,
+            status: "completed",
+            turnId,
+            type: "thread.turn.completed",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId: "pane-test",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          transcriptSessionId: sessionId,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    allowTranscriptTurnCompletion: false,
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "Explain this codebase",
+    latestTimestamp: completedAt,
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: "Explain this codebase",
+    }, {
+      createdAt: completedAt,
+      id: "assistant-final",
+      kind: "message",
+      role: "assistant",
+      text: "The project is basically an empty workspace.",
+    }],
+    promptAccepted: true,
+    promptEpoch: 9,
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    transcriptCompletionCanSettleTurn: false,
+    workspaceId,
+    threadId,
+  });
+
+  const nextThread = nextState[workspaceId].threads[threadId];
+  assert.equal(nextThread.latestTurn.state, "running");
+  assert.equal(nextThread.latestTurn.promptEpoch, 9);
+  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.providerBindings.codex.activityStatus, "thinking");
 });
 
 test("normalization clears orphan running turn with stale message count only", () => {
@@ -176,7 +431,83 @@ test("normalization clears orphan running turn with stale message count only", (
   assert.equal(thread.providerBindings.codex.activityStatus, "idle");
 });
 
-test("session acceptance clears a locally pending submitted prompt", () => {
+test("opening a restored terminal clears stale thinking without closing historical running turn", () => {
+  const workspaceId = "workspace-open";
+  const threadId = "thread-open";
+  const paneId = "pane-open";
+  const startedAt = "2026-06-04T11:39:25.514Z";
+  const turnId = "turn-stale-open";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      terminalThreadIds: {
+        0: threadId,
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: "prompt-open",
+            startedAt,
+            state: "running",
+            turnId,
+          },
+          materialized: true,
+          messageCount: 1,
+          messages: [{
+            createdAt: startedAt,
+            id: "prompt-open",
+            role: "user",
+            text: "stale prompt",
+            turnId,
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: startedAt,
+            id: "turn-start",
+            messageId: "prompt-open",
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const opened = bindWorkspaceThreadTerminal(state, {
+    agentId: "codex",
+    instanceId: 1,
+    paneId,
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "opened",
+    workspaceId,
+  });
+
+  const thread = opened[workspaceId].threads[threadId];
+  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.providerBindings.codex.activityStatus, "idle");
+  assert.equal(opened[workspaceId].terminals[0].status, "active");
+});
+
+test("session transcript acceptance preserves a locally pending submitted prompt", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -229,12 +560,12 @@ test("session acceptance clears a locally pending submitted prompt", () => {
   });
 
   const acceptedThread = accepted[workspaceId].threads[threadId];
-  assert.equal(acceptedThread.pendingPrompt, null);
+  assert.equal(acceptedThread.pendingPrompt.id, promptId);
   assert.equal(acceptedThread.latestTurn.state, "running");
   assert.equal(acceptedThread.activityStatus, "thinking");
 });
 
-test("session acceptance clears pending prompts when transcript ids include the thread prefix", () => {
+test("session transcript acceptance preserves pending prompts when transcript ids include the thread prefix", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-d8811d42-91b5-448a-99df-47c238ef5dc4-2-43b4a654-e98c-482e-959e-061087816685";
   const promptId = "todo-drop-prompt-mpwi1po9-7c820d2f1dfda";
@@ -282,7 +613,7 @@ test("session acceptance clears pending prompts when transcript ids include the 
     workspaceId,
   });
 
-  assert.equal(accepted[workspaceId].threads[threadId].pendingPrompt, null);
+  assert.equal(accepted[workspaceId].threads[threadId].pendingPrompt.id, promptId);
 });
 
 test("prompt clear accepts canonical pending ids without keeping a stale prompt", () => {
@@ -379,7 +710,7 @@ test("message submission persists the actual submitted user prompt", () => {
   );
 });
 
-test("prompt-ready can make a terminal visually idle without releasing pending session acceptance", () => {
+test("prompt-ready does not mark input ready for pending session acceptance", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -426,12 +757,12 @@ test("prompt-ready can make a terminal visually idle without releasing pending s
   assert.equal(nextThread.latestTurn.state, "running");
   assert.equal(nextThread.pendingPrompt.id, promptId);
   assert.equal(nextThread.providerBindings.codex.activityStatus, "idle");
-  assert.equal(nextThread.providerBindings.codex.inputReady, true);
-  assert.equal(nextThread.providerBindings.codex.inputReadyAt, promptReadyAt);
+  assert.equal(nextThread.providerBindings.codex.inputReady, false);
+  assert.equal(nextThread.providerBindings.codex.inputReadyAt, "");
 
   const terminal = nextState[workspaceId].terminals["0"];
-  assert.equal(terminal.inputReady, true);
-  assert.equal(terminal.inputReadyAt, promptReadyAt);
+  assert.equal(terminal.inputReady, false);
+  assert.equal(terminal.inputReadyAt, "");
   assert.equal(terminal.status, "active");
 
   const normalizedState = normalizeWorkspaceThreads(nextState);
@@ -439,10 +770,10 @@ test("prompt-ready can make a terminal visually idle without releasing pending s
   assert.equal(normalizedThread.activityStatus, "idle");
   assert.equal(normalizedThread.latestTurn.state, "running");
   assert.equal(normalizedThread.pendingPrompt.id, promptId);
-  assert.equal(normalizedThread.providerBindings.codex.inputReady, true);
+  assert.equal(normalizedThread.providerBindings.codex.inputReady, false);
 });
 
-test("prompt-ready clears stale prompting fields from terminal state", () => {
+test("prompt-ready does not mark stale prompting fields as input ready", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const paneId = "pane-test";
@@ -525,11 +856,11 @@ test("prompt-ready clears stale prompting fields from terminal state", () => {
   });
 
   const thread = next[workspaceId].threads[threadId];
-  assert.equal(thread.providerBindings.codex.inputReady, true);
+  assert.equal(thread.providerBindings.codex.inputReady, false);
   assert.equal(thread.providerBindings.codex.terminalIsPromptingUser, false);
   assert.equal(thread.providerBindings.codex.promptingUserKind, "");
   assert.equal(thread.providerBindings.codex.promptingUserSource, "");
-  assert.equal(next[workspaceId].terminals[0].inputReady, true);
+  assert.equal(next[workspaceId].terminals[0].inputReady, false);
   assert.equal(next[workspaceId].terminals[0].terminalIsPromptingUser, false);
   assert.equal(next[workspaceId].terminals[0].promptingUserKind, "");
   assert.equal(next[workspaceId].terminals[0].promptingUserSource, "");
@@ -598,7 +929,7 @@ test("normalization only preserves explicit permission prompting fields", () => 
   assert.equal(normalized[workspaceId].threads[threadId].providerBindings.codex.terminalIsPromptingUser, false);
 });
 
-test("detached session transcript completion settles matching idle running turn", () => {
+test("detached session transcript completion hydrates content without settling matching idle running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -689,6 +1020,7 @@ test("detached session transcript completion settles matching idle running turn"
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
     agentId: "codex",
+    allowTranscriptTurnCompletion: true,
     expectedMessageCreatedAt: submittedAt,
     expectedUserMessage: "is this a git repo?",
     matchedBy: "sessionId",
@@ -716,23 +1048,20 @@ test("detached session transcript completion settles matching idle running turn"
     sessionId,
     source: "codex-session",
     submittedAt,
+    transcriptExplicitCompletionCanSettleTurn: true,
     threadId,
     workspaceId,
   });
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
   assert.equal(hydratedThread.status, "exited");
-  assert.equal(hydratedThread.latestTurn.state, "completed");
+  assert.equal(hydratedThread.latestTurn.state, "running");
   assert.equal(hydratedThread.activityStatus, "idle");
   assert.equal(hydratedThread.providerBindings.codex.activityStatus, "idle");
-  assert.equal(hydratedThread.providerBindings.codex.inputReady, true);
-  assert.equal(
-    hydratedThread.providerBindings.codex.inputReadyConfidence,
-    "transcript-explicit-completion",
-  );
+  assert.equal(hydratedThread.providerBindings.codex.inputReady, false);
 });
 
-test("timestamp recovered transcript settles queued running turn without prior user projection", () => {
+test("timestamp recovered transcript hydrates content without settling queued running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "todo-drop-prompt-test";
@@ -795,6 +1124,7 @@ test("timestamp recovered transcript settles queued running turn without prior u
 
   const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
     agentId: "codex",
+    allowTranscriptTurnCompletion: true,
     expectedMessageCreatedAt: submittedAt,
     expectedUserMessage: "",
     latestTimestamp: completedAt,
@@ -823,17 +1153,18 @@ test("timestamp recovered transcript settles queued running turn without prior u
     sessionId,
     source: "codex-session",
     submittedAt,
+    transcriptExplicitCompletionCanSettleTurn: true,
     threadId,
     workspaceId,
   });
 
   const thread = hydrated[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn.state, "completed");
+  assert.equal(thread.latestTurn.state, "running");
   assert.equal(thread.latestTurn.turnId, turnId);
   assert.equal(thread.activityStatus, "idle");
   assert.equal(thread.messages[0].text, "i need your help");
   assert.equal(thread.transcriptSessionId, sessionId);
-  assert.equal(thread.providerBindings.codex.inputReady, true);
+  assert.equal(thread.providerBindings.codex.inputReady, false);
 });
 
 test("session transcript completion does not settle running turn for a later prompt", () => {

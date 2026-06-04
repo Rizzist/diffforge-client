@@ -33,6 +33,9 @@ import {
   terminalPromptSubmittedPayloadIsAuthoritative,
 } from "../terminals/terminalPromptSubmission.js";
 import {
+  TERMINAL_ACTIVITY_HOOK_EVENT,
+} from "../terminals/WorkspaceTerminal/terminalCore.js";
+import {
   getProviderTurnCompletionIntent,
   shouldReconcileProviderTurnCompletion,
 } from "../terminals/providerTurnIntent.js";
@@ -42,6 +45,7 @@ import {
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsPaused,
   terminalActivityStatusIsSendable,
+  terminalAgentUsesActivityHooks,
   terminalExecutionPhaseFromState,
   terminalPresenceStatusFromActivityStatus,
   terminalRailStateFromExecutionPhase,
@@ -57,7 +61,6 @@ import {
 import {
   getLiveTerminalForThread,
   getThreadTerminalGroundTruth,
-  recordThreadTerminalReadiness,
   terminalPromptingUserBlocksShutdown,
 } from "../threads/threadTerminalGroundTruth.js";
 import {
@@ -1067,12 +1070,11 @@ function getWorkspaceThreadPromptAcceptance(cache, detail = {}) {
   }
   return null;
 }
+
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
   "provider-turn-interrupted",
-  "terminal-input-ready",
-  "terminal-prompt-ready",
 ]);
 
 function terminalStatusEventForcesIdle(eventType) {
@@ -1369,8 +1371,155 @@ function getPromptEventIdFromRunningThread(thread) {
     return turnId.slice(5);
   }
 
-  const latestUserMessageId = String(getLatestWorkspaceThreadUserMessage(thread)?.id || "").trim();
+  const latestUserMessage = getLatestWorkspaceThreadUserMessage(thread);
+  const latestUserMessageId = String(latestUserMessage?.id || "").trim();
+  if (!latestUserMessageId) {
+    return "";
+  }
+  const latestTurnStartedAtMs = workspaceThreadMessageTimestampMs({
+    createdAt: latestTurn?.startedAt || latestTurn?.requestedAt || latestTurn?.updatedAt,
+  });
+  const latestUserMessageAtMs = workspaceThreadMessageTimestampMs(latestUserMessage);
+  if (
+    latestTurnStartedAtMs
+    && latestUserMessageAtMs
+    && latestUserMessageAtMs < latestTurnStartedAtMs - 2500
+  ) {
+    return "";
+  }
   return latestUserMessageId;
+}
+
+function getWorkspaceThreadRunningPromptMessage(thread, promptEventId = "") {
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  const latestTurn = thread?.latestTurn || null;
+  const safePromptEventId = String(promptEventId || "").trim();
+  const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  const latestMessageId = String(latestTurn?.messageId || "").trim();
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (String(message?.role || "").trim().toLowerCase() !== "user") {
+      continue;
+    }
+    const messageId = String(message?.id || message?.messageId || message?.message_id || "").trim();
+    const messageTurnId = String(message?.turnId || message?.turn_id || "").trim();
+    const messagePromptEventId = String(message?.promptEventId || message?.prompt_event_id || "").trim();
+    if (
+      safePromptEventId
+        && (
+          messageId === safePromptEventId
+          || messagePromptEventId === safePromptEventId
+          || messageTurnId === safePromptEventId
+          || messageTurnId.includes(safePromptEventId)
+        )
+    ) {
+      return message;
+    }
+    if (
+      latestMessageId
+        && (
+          messageId === latestMessageId
+          || messagePromptEventId === latestMessageId
+        )
+    ) {
+      return message;
+    }
+    if (
+      latestTurnId
+        && (
+          messageTurnId === latestTurnId
+          || (messageId && latestTurnId.includes(messageId))
+        )
+    ) {
+      return message;
+    }
+  }
+  return null;
+}
+
+function getWorkspaceThreadRunningPromptInfo(thread, promptEventId = "") {
+  const matchedMessage = getWorkspaceThreadRunningPromptMessage(thread, promptEventId);
+  const latestTurn = thread?.latestTurn || null;
+  const pendingPrompt = thread?.pendingPrompt || null;
+  const safePromptEventId = String(promptEventId || "").trim();
+  const pendingPromptId = String(pendingPrompt?.id || pendingPrompt?.promptEventId || "").trim();
+  const pendingPromptMatches = Boolean(
+    pendingPrompt
+      && (
+        !safePromptEventId
+        || !pendingPromptId
+        || pendingPromptId === safePromptEventId
+      )
+  );
+  const messageText = matchedMessage?.text || matchedMessage?.message || "";
+  const pendingPromptText = pendingPromptMatches
+    ? String(pendingPrompt?.text || pendingPrompt?.message || pendingPrompt?.promptText || "").trim()
+    : "";
+  const latestTurnPromptText = String(
+    latestTurn?.promptText
+      || latestTurn?.userMessage
+      || latestTurn?.terminalPrompt
+      || "",
+  ).trim();
+  return {
+    createdAt: matchedMessage?.createdAt
+      || matchedMessage?.created_at
+      || pendingPrompt?.createdAt
+      || pendingPrompt?.submittedAt
+      || latestTurn?.startedAt
+      || latestTurn?.requestedAt
+      || "",
+    message: matchedMessage || null,
+    text: String(messageText || pendingPromptText || latestTurnPromptText || "").trim(),
+  };
+}
+
+function getWorkspaceThreadPromptEventId(event = {}) {
+  return String(event.promptEventId || event.pendingPromptId || event.promptId || "").trim();
+}
+
+function getWorkspaceThreadPromptEpoch(event = {}) {
+  const numericValue = Number(event.promptEpoch ?? event.prompt_epoch ?? 0);
+  if (!Number.isFinite(numericValue) || numericValue <= 0) {
+    return 0;
+  }
+  return Math.floor(numericValue);
+}
+
+function threadLatestTurnMatchesPrompt(thread, event = {}) {
+  const latestTurn = thread?.latestTurn || null;
+  const promptEventId = getWorkspaceThreadPromptEventId(event);
+  if (!latestTurn) {
+    return false;
+  }
+
+  const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  const latestMessageId = String(latestTurn?.messageId || "").trim();
+  const latestUserMessageId = String(getLatestWorkspaceThreadUserMessage(thread)?.id || "").trim();
+  const promptEpoch = getWorkspaceThreadPromptEpoch(event);
+  const latestPromptEpoch = getWorkspaceThreadPromptEpoch(latestTurn);
+  const promptEpochMatches = Boolean(
+    promptEpoch > 0
+      && latestPromptEpoch > 0
+      && promptEpoch === latestPromptEpoch
+  );
+  if (!promptEventId) {
+    return promptEpochMatches;
+  }
+
+  const promptIdMatches = Boolean(
+    latestTurnId.includes(promptEventId)
+      || latestMessageId === promptEventId
+      || latestUserMessageId === promptEventId
+  );
+  return Boolean(
+    promptIdMatches
+      && (
+        promptEpoch <= 0
+          || latestPromptEpoch <= 0
+          || promptEpochMatches
+      )
+  );
 }
 
 function threadLatestRunningTurnMatchesPrompt(thread, event = {}) {
@@ -1380,17 +1529,7 @@ function threadLatestRunningTurnMatchesPrompt(thread, event = {}) {
     return false;
   }
 
-  const promptEventId = String(event.promptEventId || event.pendingPromptId || event.promptId || "").trim();
-  const latestTurnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
-  const latestMessageId = String(latestTurn?.messageId || "").trim();
-  if (
-    promptEventId
-    && (
-      latestTurnId.includes(promptEventId)
-      || latestMessageId === promptEventId
-      || String(getLatestWorkspaceThreadUserMessage(thread)?.id || "").trim() === promptEventId
-    )
-  ) {
+  if (threadLatestTurnMatchesPrompt(thread, event)) {
     return true;
   }
 
@@ -1423,58 +1562,6 @@ function threadLatestRunningTurnMatchesPrompt(thread, event = {}) {
   return Math.abs(latestUserAtMs - expectedAtMs) <= 2500;
 }
 
-function buildTerminalReadyProjectionEvents(thread, event = {}, groundTruth = null) {
-  const latestTurn = thread?.latestTurn || null;
-  const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
-  const turnId = String(latestTurn?.turnId || "").trim();
-  if (latestTurnState !== "running" || !turnId) {
-    return [];
-  }
-
-  const eventType = String(event.type || "").trim().toLowerCase();
-  const readinessCanCompleteTurn = eventType === "terminal-prompt-ready"
-    || eventType === "terminal-input-ready";
-  const pendingPrompt = thread?.pendingPrompt || null;
-  const pendingPromptWaitingForSession = Boolean(
-    pendingPrompt
-      && event.promptAccepted !== true
-      && event.sessionAccepted !== true
-  );
-  if (pendingPromptWaitingForSession) {
-    return [];
-  }
-  const readinessMatchesRunningTurn = threadLatestRunningTurnMatchesPrompt(thread, event);
-  const shouldCompleteFromReadiness = readinessCanCompleteTurn
-    && readinessMatchesRunningTurn
-    && groundTruth?.inputReadyIsFreshForTurn !== false;
-  if (!shouldCompleteFromReadiness) {
-    return [];
-  }
-
-  const completedAt = String(
-    event.promptReadyAt
-      || event.inputReadyAt
-      || event.completedAt
-      || new Date().toISOString(),
-  ).trim();
-  const eventKey = workspaceThreadProjectionIdPart(
-    event.promptEventId || event.pendingPromptId || turnId,
-    eventType || "terminal-ready",
-  );
-  return [{
-    agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
-    assistantMessageId: latestTurn.assistantMessageId || "",
-    completedAt,
-    createdAt: completedAt,
-    id: `projection-terminal-ready-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
-    messageId: latestTurn.messageId || "",
-    source: eventType || "terminal-ready",
-    status: "completed",
-    turnId,
-    type: "thread.turn.completed",
-  }];
-}
-
 function buildTerminalCompletedProjectionEvents(thread, event = {}) {
   const latestTurn = thread?.latestTurn || null;
   const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
@@ -1485,7 +1572,6 @@ function buildTerminalCompletedProjectionEvents(thread, event = {}) {
 
   const completedAt = String(
     event.completedAt
-      || event.promptReadyAt
       || event.inputReadyAt
       || new Date().toISOString(),
   ).trim();
@@ -1493,6 +1579,7 @@ function buildTerminalCompletedProjectionEvents(thread, event = {}) {
     event.promptEventId || event.pendingPromptId || turnId,
     "provider-turn-completed",
   );
+  const promptEpoch = getWorkspaceThreadPromptEpoch(event);
   return [{
     agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
     assistantMessageId: latestTurn.assistantMessageId || "",
@@ -1500,10 +1587,83 @@ function buildTerminalCompletedProjectionEvents(thread, event = {}) {
     createdAt: completedAt,
     id: `projection-provider-turn-completed-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
     messageId: latestTurn.messageId || "",
+    promptEpoch: promptEpoch || latestTurn.promptEpoch || 0,
+    prompt_epoch: promptEpoch || latestTurn.promptEpoch || 0,
     source: event.source || event.type || "provider-turn-completed",
     status: "completed",
     turnId,
     type: "thread.turn.completed",
+  }];
+}
+
+function buildTerminalStartedProjectionEvents(event = {}) {
+  const text = String(
+    event.userMessage
+      || event.message
+      || event.expectedUserMessage
+      || event.prompt
+      || "",
+  ).trim();
+  if (!text || isTerminalControlHistoryPrompt(text)) {
+    return [];
+  }
+
+  const createdAt = String(
+    event.submittedAt
+      || event.promptEventSubmittedAt
+      || event.startedAt
+      || event.hookObservedAt
+      || new Date().toISOString(),
+  ).trim();
+  const eventKey = workspaceThreadProjectionIdPart(
+    event.promptEventId
+      || event.pendingPromptId
+      || event.providerTurnId
+      || event.turnId
+      || event.hookTimestampMs
+      || event.observedAtMs
+      || createdAt,
+    "hook-start",
+  );
+  const messageId = String(
+    event.messageId
+      || event.promptEventId
+      || event.pendingPromptId
+      || `message-hook-${eventKey}`,
+  ).trim();
+  const turnId = String(
+    event.turnId
+      || event.providerTurnId
+      || `turn-${messageId}`,
+  ).trim();
+  const agentId = event.agentId || event.currentAgent || "";
+  const source = event.source || event.type || "provider-turn-started";
+  const promptEpoch = getWorkspaceThreadPromptEpoch(event);
+
+  return [{
+    agentId,
+    createdAt,
+    id: `projection-provider-turn-started-${workspaceThreadProjectionIdPart(turnId, "turn")}`,
+    messageId,
+    promptEpoch,
+    prompt_epoch: promptEpoch,
+    source,
+    status: "running",
+    turnId,
+    type: "thread.turn.started",
+  }, {
+    agentId,
+    createdAt,
+    id: `projection-provider-user-${workspaceThreadProjectionIdPart(messageId, "message")}`,
+    messageId,
+    promptEpoch,
+    prompt_epoch: promptEpoch,
+    role: "user",
+    source,
+    status: "submitted",
+    text,
+    turnId,
+    type: "thread.message.user",
   }];
 }
 
@@ -1518,7 +1678,6 @@ function buildTerminalInterruptedProjectionEvents(thread, event = {}) {
   const interruptedAt = String(
     event.interruptedAt
       || event.inputReadyAt
-      || event.promptReadyAt
       || event.completedAt
       || new Date().toISOString(),
   ).trim();
@@ -1526,6 +1685,7 @@ function buildTerminalInterruptedProjectionEvents(thread, event = {}) {
     event.promptEventId || event.pendingPromptId || turnId,
     "terminal-interrupted",
   );
+  const promptEpoch = getWorkspaceThreadPromptEpoch(event);
   return [{
     agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
     assistantMessageId: latestTurn.assistantMessageId || "",
@@ -1533,6 +1693,8 @@ function buildTerminalInterruptedProjectionEvents(thread, event = {}) {
     createdAt: interruptedAt,
     id: `projection-terminal-interrupted-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
     messageId: latestTurn.messageId || "",
+    promptEpoch: promptEpoch || latestTurn.promptEpoch || 0,
+    prompt_epoch: promptEpoch || latestTurn.promptEpoch || 0,
     source: event.source || event.type || "terminal-interrupted",
     status: "interrupted",
     turnId,
@@ -4263,6 +4425,7 @@ export default function App() {
   const workspaceThreadAcceptedPromptsRef = useRef(new Map());
   const workspaceThreadTranscriptEventHandlerRef = useRef(null);
   const terminalPromptSubmittedHandlerRef = useRef(null);
+  const terminalActivityHookHandlerRef = useRef(null);
   const workspacePendingPromptDeliveriesRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
@@ -8473,7 +8636,7 @@ export default function App() {
       ].filter(Boolean);
       const presenceIdleStatus = presenceStatuses.find((status) => (
         terminalActivityStatusIsSendable(status)
-          || ["cancelled", "canceled", "complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
+          || ["cancelled", "canceled", "complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
       ));
       const presenceSaysIdle = Boolean(
         presenceTerminal
@@ -9923,6 +10086,7 @@ export default function App() {
   }, []);
 
   const emitTerminalStatusEvent = useCallback((event = {}, options = {}) => {
+    const earlyEventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     if (
       authState !== "authenticated"
       || !isPaidUser(user)
@@ -9930,6 +10094,20 @@ export default function App() {
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
     ) {
+      if (earlyEventType === "provider-turn-completed") {
+        logTerminalStatus("frontend.terminal_status.event_sync.skip", {
+          authState,
+          eventType: earlyEventType,
+          isPaidUser: isPaidUser(user),
+          paneId: options.paneId || event.paneId || "",
+          reason: "app_not_ready_for_status_sync",
+          shouldShowWorkspaceSetup,
+          threadId: options.threadId || event.threadId || "",
+          workspaceHydrationReady,
+          workspaceId: options.workspaceId || event.workspaceId || "",
+          workspaceSyncState,
+        });
+      }
       return;
     }
     const workspaceId = String(options.workspaceId || event.workspaceId || "").trim();
@@ -9999,9 +10177,7 @@ export default function App() {
     );
     const statusActivity = (idleStatusEvent ? "idle" : eventActivityStatus)
       || (
-        eventType === "terminal-prompt-ready"
-        || eventType === "terminal-input-ready"
-        || eventType === "provider-turn-completed"
+        eventType === "provider-turn-completed"
         || eventType === "provider-turn-interrupted"
           ? "idle"
           : ""
@@ -10229,6 +10405,25 @@ export default function App() {
     const diagnosticToken = authStore.getToken();
     const statusSyncReason = options.reason || event.source || eventType;
     const statusSyncKey = terminalKey;
+    if (eventType === "provider-turn-completed") {
+      logTerminalStatus("frontend.terminal_status.event_sync.completion_decision", {
+        activityStatus: statusActivity,
+        agentId,
+        commandPhase,
+        eventType,
+        executionPhase,
+        nativeRailState,
+        paneId,
+        readinessAfter,
+        reason: statusSyncReason,
+        statusAfter,
+        terminalIndex: safeTerminalIndex,
+        threadId,
+        turnStatus,
+        visibleActivityStatus,
+        workspaceId,
+      });
+    }
     const terminalStatusSyncItem = {
       agentId,
       commandPhase,
@@ -10250,9 +10445,6 @@ export default function App() {
     const statusSyncDelayMs = (() => {
       if (["closed", "closing", "exited", "provider-turn-error"].includes(eventType)) {
         return 250;
-      }
-      if (eventType === "terminal-prompt-ready" || eventType === "terminal-input-ready") {
-        return 500;
       }
       if (eventType === "message-submitted") {
         return 900;
@@ -12145,7 +12337,7 @@ export default function App() {
       const statuses = remoteControlTerminalStatusValues(terminal);
       const idleStatus = statuses.find((status) => (
         terminalActivityStatusIsSendable(status)
-          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "prompt_ready", "ready"].includes(status)
+          || ["complete", "completed", "done", "idle", "input_ready", "interrupted", "ready"].includes(status)
       ));
       if (idleStatus) {
         return { idle: true, reason: idleStatus };
@@ -12827,6 +13019,7 @@ export default function App() {
         || getPromptEventIdFromRunningThread(thread)
         || "",
     ).trim();
+    const transcriptLifecycleUsesActivityHooks = terminalAgentUsesActivityHooks(agentId);
     const matchedBy = String(result.matchedBy || event.matchedBy || "sessionid").trim().toLowerCase();
     const allowTimestampFallback = event.allowTimestampFallback === true
       || matchedBy.includes("timestamp")
@@ -12850,9 +13043,12 @@ export default function App() {
         workspaceId,
       },
     );
-    const terminalSubmitPromptAccepted = event.terminalPromptAccepted === true
-      || Boolean(latestTerminalSubmitAcceptance);
-    const promptAccepted = transcriptPromptAccepted || terminalSubmitPromptAccepted;
+	    const terminalSubmitPromptAccepted = event.terminalPromptAccepted === true
+	      || Boolean(latestTerminalSubmitAcceptance);
+    const currentReadinessCanSettleTurn = false;
+	    const terminalReadinessCanSettleTurn = false;
+	    const terminalLifecycleCanSettleTurn = false;
+	    const promptAccepted = transcriptPromptAccepted || terminalSubmitPromptAccepted;
     const rawTurnCompleteSeen = transcriptHasTurnCompletionForPromptEvidence(messages, {
       agentId,
       allowTimestampFallback,
@@ -12868,15 +13064,23 @@ export default function App() {
       messageCreatedAt: expectedMessageCreatedAt,
       submittedAt,
     });
-    const activeRunningTurn = String(thread.latestTurn?.state || "").trim().toLowerCase() === "running";
-    const transcriptTargetsLatestRunningTurn = threadLatestRunningTurnMatchesPrompt(thread, {
-      ...event,
-      expectedMessageCreatedAt,
+	    const activeRunningTurn = String(thread.latestTurn?.state || "").trim().toLowerCase() === "running";
+	    const transcriptTargetsLatestTurn = threadLatestTurnMatchesPrompt(thread, {
+	      ...event,
+	      promptEventId,
+	    });
+	    const transcriptTargetsLatestRunningTurn = threadLatestRunningTurnMatchesPrompt(thread, {
+	      ...event,
+	      expectedMessageCreatedAt,
       expectedUserMessage,
       matchedBy,
-      promptEventId,
-      submittedAt,
-    });
+	      promptEventId,
+	      submittedAt,
+	    });
+	    const promptTurnIdentityRequired = Boolean(promptEventId);
+	    const transcriptTargetsRequestedTurn = Boolean(
+	      !promptTurnIdentityRequired || transcriptTargetsLatestTurn,
+	    );
     const expectedUserMessageIsControlPrompt = Boolean(
       expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
     );
@@ -12885,34 +13089,53 @@ export default function App() {
         || expectedUserMessageIsControlPrompt
         || transcriptPromptAccepted
     );
-    const turnCompleteSeen = Boolean(
-      rawTurnCompleteSeen
-        && transcriptCompletionHasPromptEvidence
-        && (!activeRunningTurn || transcriptTargetsLatestRunningTurn),
-    );
-    const assistantResponseCompletesTurn = Boolean(
-      settledAssistantResponseSeen
-        && promptAccepted
-        && activeRunningTurn
-        && transcriptTargetsLatestRunningTurn
-        && event.terminalPromptReady === true,
-    );
+	    const turnCompleteSeen = false;
+	    const assistantResponseCompletesTurn = false;
+		    const terminalFinishSignal = false;
+		    const transcriptCompletionCanSettleTurn = false;
+	    const transcriptCompletionBlockers = [
+		      "transcript_hydration_content_only",
+		      transcriptLifecycleUsesActivityHooks ? "activity_hooks_own_lifecycle" : "",
+		      rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
+		      transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
+		      promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
+		      activeRunningTurn && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
+			      promptTurnIdentityRequired && !terminalFinishSignal ? "no_terminal_lifecycle_finish_signal" : "",
+			      activeRunningTurn && !promptTurnIdentityRequired && !terminalFinishSignal ? "no_terminal_lifecycle_finish_signal" : "",
+			      settledAssistantResponseSeen && !promptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
+		    ].filter(Boolean);
 
     logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_result", {
       agentId,
+      activeRunningTurn,
       assistantResponseCompletesTurn,
+      completionBlockers: transcriptCompletionBlockers,
+      expectedMessageCreatedAtPresent: Boolean(expectedMessageCreatedAt),
+      expectedUserMessageLength: getThreadDiagnosticTextLength(expectedUserMessage),
       latestTimestampPresent: Boolean(result.latestTimestamp),
+      latestTurnId: thread.latestTurn?.turnId || thread.latestTurn?.id || "",
+      latestTurnMessageId: thread.latestTurn?.messageId || "",
+      latestTurnState: thread.latestTurn?.state || thread.latestTurn?.status || "",
       matchedBy,
       messageCount: messages.length,
       promptAccepted,
       promptEventIdPresent: Boolean(promptEventId),
       rawTurnCompleteSeen,
       sessionIdPresent: Boolean(sessionId),
-      settledAssistantResponseSeen,
-      threadId,
-      transcriptPromptAccepted,
-      transcriptTargetsLatestRunningTurn,
-      turnCompleteSeen,
+	      settledAssistantResponseSeen,
+	      submittedAtPresent: Boolean(submittedAt),
+			      terminalLifecycleCanSettleTurn,
+			      terminalFinishSignal,
+			      terminalReadinessCanSettleTurn,
+	      terminalSubmitPromptAccepted,
+	      transcriptCompletionCanSettleTurn,
+	      transcriptLifecycleUsesActivityHooks,
+	      threadId,
+	      transcriptPromptAccepted,
+	      transcriptTargetsLatestTurn,
+	      transcriptTargetsLatestRunningTurn,
+	      transcriptTargetsRequestedTurn,
+	      turnCompleteSeen,
       workspaceId,
     });
 
@@ -12939,20 +13162,23 @@ export default function App() {
       }));
     }
 
-    if (
-      activeRunningTurn
-      && rawTurnCompleteSeen
-      && !transcriptTargetsLatestRunningTurn
-    ) {
-      logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_skip", {
-        agentId,
-        matchedBy,
-        messageCount: messages.length,
-        promptEventId,
-        reason: "stale_completion_not_current_turn",
-        threadId,
-        workspaceId,
-      });
+	    if (
+	      !transcriptLifecycleUsesActivityHooks
+	      && rawTurnCompleteSeen
+	      && promptTurnIdentityRequired
+	      && !transcriptTargetsLatestTurn
+	    ) {
+	      logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_skip", {
+	        agentId,
+	        matchedBy,
+	        messageCount: messages.length,
+	        promptEventId,
+	        reason: "stale_completion_not_current_prompt_turn",
+	        threadId,
+	        transcriptTargetsLatestRunningTurn,
+	        transcriptTargetsLatestTurn,
+	        workspaceId,
+	      });
       return;
     }
 
@@ -12965,7 +13191,7 @@ export default function App() {
       );
       const hydrateEvent = {
         agentId,
-        allowTranscriptTurnCompletion: turnCompleteSeen || assistantResponseCompletesTurn,
+	        allowTranscriptTurnCompletion: false,
         assistantResponseCompletesTurn,
         expectedMessageCreatedAt,
         expectedUserMessage,
@@ -12973,6 +13199,7 @@ export default function App() {
         messages,
         matchedBy: result.matchedBy || matchedBy,
         promptAccepted,
+        promptEpoch: getWorkspaceThreadPromptEpoch(event),
         promptEventId,
         promptEventSubmittedAt: event.promptEventSubmittedAt || submittedAt || expectedMessageCreatedAt,
         providerSessionId: sessionId,
@@ -12983,9 +13210,9 @@ export default function App() {
         source: `${agentId}-session-watch`,
         sourcePath: result.rolloutPath || "",
         submittedAt,
-        transcriptExplicitCompletionCanSettleTurn: turnCompleteSeen,
+	        transcriptExplicitCompletionCanSettleTurn: false,
         threadId,
-        turnCompleteSeen,
+        turnCompleteSeen: false,
         workspaceId,
       };
       const hydrationDiagnostics = diagnoseWorkspaceThreadSessionTranscriptHydration(
@@ -12998,6 +13225,8 @@ export default function App() {
         after: getWorkspaceThreadDiagnosticSnapshot(nextThreads, workspaceId, threadId, agentId),
         agentId,
         before: beforeSnapshot,
+        completionFallbackApplied: false,
+        completionFallbackProjectionEvents: 0,
         hydrationDiagnostics,
         messageCount: messages.length,
         stateChanged,
@@ -13007,26 +13236,6 @@ export default function App() {
       return nextThreads;
     });
 
-    if (turnCompleteSeen || assistantResponseCompletesTurn) {
-      terminalStatusEventEmitterRef.current?.({
-        ...event,
-        agentId,
-        inputReady: true,
-        providerSessionId: sessionId,
-        readiness: "ready",
-        status: "idle",
-        threadId,
-        turnStatus: "completed",
-        type: "provider-turn-completed",
-        workspaceId,
-      }, {
-        eventType: "provider-turn-completed",
-        reason: "transcript_watch_turn_completed",
-        readiness: "ready",
-        status: "idle",
-        turnStatus: "completed",
-      });
-    }
   }, []);
 
   const requestWorkspaceThreadTranscript = useCallback((event = {}) => {
@@ -13043,6 +13252,7 @@ export default function App() {
       return;
     }
 
+    const requestUsesActivityHooks = terminalAgentUsesActivityHooks(agentId);
     const requestedProviderSessionId = String(
       event.nativeSessionId
         || event.providerSessionId
@@ -13059,7 +13269,8 @@ export default function App() {
         || "",
     ).trim();
     const requestedRepoPath = String(event.repoPath || "").trim();
-    const pollUntilTurnComplete = event.pollUntilTurnComplete === true || event.pollUntilAssistant === true;
+    const requestedPollUntilTurnComplete = event.pollUntilTurnComplete === true || event.pollUntilAssistant === true;
+    const pollUntilTurnComplete = requestedPollUntilTurnComplete && !requestUsesActivityHooks;
     const pollStartedAt = Number.parseFloat(event.pollStartedAt) || Date.now();
     const expectedUserMessage = String(
       event.expectedUserMessage
@@ -13407,10 +13618,19 @@ export default function App() {
         threadId,
         workspaceId,
       });
+      let providerTranscriptWatchKeyRegisteredByRequest = false;
       if (providerTranscriptWatchKey) {
-        if (workspaceThreadTranscriptWatchKeysRef.current.has(providerTranscriptWatchKey)) {
+        const providerTranscriptWatchAlreadyActive = workspaceThreadTranscriptWatchKeysRef.current.has(providerTranscriptWatchKey);
+        const shouldRefreshActiveTranscriptWatch = Boolean(
+          providerTranscriptWatchAlreadyActive
+            && pollUntilTurnComplete
+            && (promptEventId || expectedUserMessage)
+        );
+        if (providerTranscriptWatchAlreadyActive && !shouldRefreshActiveTranscriptWatch) {
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
             agentId,
+            pollUntilTurnComplete,
+            promptEventIdPresent: Boolean(promptEventId),
             providerSessionPresent: Boolean(providerSessionId),
             reason: "transcript_watch_already_active",
             requestKey,
@@ -13420,7 +13640,22 @@ export default function App() {
           workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
           return;
         }
-        workspaceThreadTranscriptWatchKeysRef.current.add(providerTranscriptWatchKey);
+        if (providerTranscriptWatchAlreadyActive) {
+          logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.watch_refresh", {
+            agentId,
+            expectedUserMessageLength: getThreadDiagnosticTextLength(expectedUserMessage),
+            pollUntilTurnComplete,
+            promptEventIdPresent: Boolean(promptEventId),
+            providerSessionPresent: Boolean(providerSessionId),
+            reason: "turn_completion_refresh",
+            requestKey,
+            threadId,
+            workspaceId,
+          });
+        } else {
+          workspaceThreadTranscriptWatchKeysRef.current.add(providerTranscriptWatchKey);
+          providerTranscriptWatchKeyRegisteredByRequest = true;
+        }
       }
 
       const transcriptCommand = providerSessionId
@@ -13526,22 +13761,12 @@ export default function App() {
             messageCreatedAt: expectedMessageCreatedAt,
             submittedAt,
           });
-          const transcriptRequestCanSettleTurn = Boolean(
-            pollUntilTurnComplete
-              || event.type === "terminal-prompt-ready"
-              || event.inputReady === true
-              || event.terminalPromptReady === true
-          );
-          const terminalReadinessCanSettleTurn = Boolean(
-            event.type === "terminal-prompt-ready"
-              || event.inputReady === true
-              || event.terminalPromptReady === true
-          );
-          const terminalDetachedCanSettleTurn = Boolean(
-            ["closed", "exited"].includes(String(event.type || "").trim().toLowerCase())
-          );
-          const terminalLifecycleCanSettleTurn = terminalReadinessCanSettleTurn
-            || terminalDetachedCanSettleTurn;
+          const transcriptRequestCanSettleTurn = false;
+          const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
+          const currentReadinessCanSettleTurn = false;
+          const terminalReadinessCanSettleTurn = false;
+          const terminalDetachedCanSettleTurn = false;
+          const terminalLifecycleCanSettleTurn = false;
           const expectedUserMessageIsControlPrompt = Boolean(
             expectedUserMessage && isTerminalControlHistoryPrompt(expectedUserMessage),
           );
@@ -13551,98 +13776,53 @@ export default function App() {
               || expectedUserMessageIsControlPrompt
               || transcriptPromptAccepted
           );
-          const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
           const latestTurnAtTranscriptResult = threadAtTranscriptResult?.latestTurn || null;
           const activeRunningTurnAtTranscriptResult = String(
             latestTurnAtTranscriptResult?.state || "",
           ).trim().toLowerCase() === "running";
-          const transcriptTargetsLatestRunningTurn = threadLatestRunningTurnMatchesPrompt(
-            threadAtTranscriptResult,
-            {
+	          const transcriptTargetsLatestRunningTurn = threadLatestRunningTurnMatchesPrompt(
+	            threadAtTranscriptResult,
+	            {
               ...event,
               expectedMessageCreatedAt,
               expectedUserMessage,
               promptEventId,
               matchedBy,
               submittedAt,
-            },
-          );
-          const staleTranscriptCompletionBlocked = Boolean(
-            transcriptRequestCanSettleTurn
-              && activeRunningTurnAtTranscriptResult
-              && rawTurnCompleteSeen
-              && !transcriptTargetsLatestRunningTurn,
-          );
-          const authoritativeTranscriptCompletionCanSettleTurn = Boolean(
-            activeRunningTurnAtTranscriptResult
-              && rawTurnCompleteSeen
-              && transcriptPromptAccepted
-              && transcriptTargetsLatestRunningTurn,
-          );
-          const matchedTranscriptCompletionCanSettleTurn = Boolean(
-            (pollUntilTurnComplete || authoritativeTranscriptCompletionCanSettleTurn)
-              && activeRunningTurnAtTranscriptResult
-              && transcriptPromptAccepted
-              && transcriptTargetsLatestRunningTurn
-              && rawTurnCompleteSeen
-          );
-          const sessionTranscriptCanSettleTurn = Boolean(
-            authoritativeTranscriptCompletionCanSettleTurn
-              || (
-                pollUntilTurnComplete
-                && activeRunningTurnAtTranscriptResult
-                && transcriptPromptAccepted
-                && transcriptTargetsLatestRunningTurn
-                && (
-                  terminalLifecycleCanSettleTurn
-                  || matchedTranscriptCompletionCanSettleTurn
-                )
-                && (
-                  rawTurnCompleteSeen
-                  || settledAssistantResponseSeen
-                )
-              )
-          );
-          const transcriptExplicitCompletionCanSettleTurn = Boolean(
-            authoritativeTranscriptCompletionCanSettleTurn
-              || (
-                pollUntilTurnComplete
-                && activeRunningTurnAtTranscriptResult
-                && rawTurnCompleteSeen
-                && transcriptPromptAccepted
-                && transcriptTargetsLatestRunningTurn
-                && (
-                  terminalLifecycleCanSettleTurn
-                  || matchedTranscriptCompletionCanSettleTurn
-                )
-              )
-          );
-          const assistantResponseCompletesTurn = Boolean(
-            pollUntilTurnComplete
-              && settledAssistantResponseSeen
-              && transcriptPromptAccepted
-              && (
-                activeRunningTurnAtTranscriptResult
-                  ? transcriptTargetsLatestRunningTurn && terminalLifecycleCanSettleTurn
-                  : terminalLifecycleCanSettleTurn
-              )
-          );
-          const turnCompleteSeen = Boolean(
-            rawTurnCompleteSeen
-              && transcriptCompletionHasPromptEvidence
-              && (
-                !activeRunningTurnAtTranscriptResult
-                || (
-                  transcriptTargetsLatestRunningTurn
-                  && (
-                    terminalLifecycleCanSettleTurn
-                    || matchedTranscriptCompletionCanSettleTurn
-                    || authoritativeTranscriptCompletionCanSettleTurn
-                  )
-                )
-              ),
-          );
-          const allowTranscriptTurnCompletion = turnCompleteSeen || assistantResponseCompletesTurn;
+	            },
+	          );
+	          const transcriptTargetsLatestTurn = threadLatestTurnMatchesPrompt(
+	            threadAtTranscriptResult,
+	            {
+	              ...event,
+	              promptEventId,
+	            },
+	          );
+	          const promptTurnIdentityRequired = Boolean(promptEventId);
+	          const transcriptTargetsRequestedTurn = Boolean(
+	            !promptTurnIdentityRequired || transcriptTargetsLatestTurn,
+	          );
+	          const terminalFinishSignal = false;
+	          const staleTranscriptCompletionBlocked = false;
+	          const authoritativeTranscriptCompletionCanSettleTurn = false;
+	          const matchedTranscriptCompletionCanSettleTurn = false;
+	          const sessionTranscriptCanSettleTurn = false;
+          const transcriptExplicitCompletionCanSettleTurn = false;
+	          const assistantResponseCompletesTurn = false;
+          const turnCompleteSeen = false;
+		          const allowTranscriptTurnCompletion = false;
+		          const transcriptCompletionCanSettleTurn = false;
+          const transcriptCompletionBlockers = [
+            "transcript_hydration_content_only",
+            requestUsesActivityHooks ? "activity_hooks_own_lifecycle" : "",
+	            transcriptRequestCanSettleTurn ? "" : "request_not_allowed_to_settle_turn",
+	            rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
+	            transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
+	            promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
+	            activeRunningTurnAtTranscriptResult && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
+	            terminalFinishSignal ? "" : "no_terminal_lifecycle_finish_signal",
+	            settledAssistantResponseSeen && !transcriptPromptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
+	          ].filter(Boolean);
           const transcriptMessageDiagnostics = messages.slice(-4).map((message) => ({
             createdAtPresent: Boolean(String(message?.createdAt || message?.created_at || "").trim()),
             idPresent: Boolean(String(message?.id || "").trim()),
@@ -13659,7 +13839,11 @@ export default function App() {
             allowTranscriptTurnCompletion,
             authoritativeTranscriptCompletionCanSettleTurn,
             assistantResponseCompletesTurn,
+            completionBlockers: transcriptCompletionBlockers,
             latestTimestampPresent: Boolean(result?.latestTimestamp),
+            latestTurnId: latestTurnAtTranscriptResult?.turnId || latestTurnAtTranscriptResult?.id || "",
+            latestTurnMessageId: latestTurnAtTranscriptResult?.messageId || "",
+            latestTurnState: latestTurnAtTranscriptResult?.state || latestTurnAtTranscriptResult?.status || "",
             matchedBy: result?.matchedBy || "",
             matchedTranscriptCompletionCanSettleTurn,
             messageCount: messages.length,
@@ -13680,14 +13864,19 @@ export default function App() {
             promptAcceptedBy,
             rawTurnCompleteSeen,
             settledAssistantResponseSeen,
-            sessionTranscriptCanSettleTurn,
-            staleTranscriptCompletionBlocked,
-            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
-            terminalReadinessCanSettleTurn,
-            transcriptPromptAccepted,
-            transcriptExplicitCompletionCanSettleTurn,
-            transcriptTargetsLatestRunningTurn,
-            transcriptRequestCanSettleTurn,
+		            sessionTranscriptCanSettleTurn,
+		            staleTranscriptCompletionBlocked,
+		            terminalFinishSignal,
+		            terminalLifecycleCanSettleTurn,
+	            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
+	            terminalReadinessCanSettleTurn,
+		            transcriptCompletionCanSettleTurn,
+		            transcriptPromptAccepted,
+	            transcriptExplicitCompletionCanSettleTurn,
+	            transcriptTargetsLatestTurn,
+	            transcriptTargetsLatestRunningTurn,
+	            transcriptTargetsRequestedTurn,
+	            transcriptRequestCanSettleTurn,
             turnCompleteSeen,
             workspaceId,
           });
@@ -13697,6 +13886,10 @@ export default function App() {
             allowTranscriptTurnCompletion,
             authoritativeTranscriptCompletionCanSettleTurn,
             assistantResponseCompletesTurn,
+            completionBlockers: transcriptCompletionBlockers,
+            latestTurnId: latestTurnAtTranscriptResult?.turnId || latestTurnAtTranscriptResult?.id || "",
+            latestTurnMessageId: latestTurnAtTranscriptResult?.messageId || "",
+            latestTurnState: latestTurnAtTranscriptResult?.state || latestTurnAtTranscriptResult?.status || "",
             matchedBy: result?.matchedBy || "",
             matchedTranscriptCompletionCanSettleTurn,
             messageCount: messages.length,
@@ -13708,16 +13901,21 @@ export default function App() {
             requestKey,
             sessionIdPresent: Boolean(sessionId),
             settledAssistantResponseSeen,
-            sessionTranscriptCanSettleTurn,
-            staleTranscriptCompletionBlocked,
-            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
-            terminalReadinessCanSettleTurn,
-            transcriptPromptAccepted,
-            transcriptExplicitCompletionCanSettleTurn,
-            terminalGroundTruthStatus: turnCompleteSeen || assistantResponseCompletesTurn ? "idle_or_done" : "processing_or_unknown",
-            threadId,
-            transcriptTargetsLatestRunningTurn,
-            transcriptRequestCanSettleTurn,
+		            sessionTranscriptCanSettleTurn,
+		            staleTranscriptCompletionBlocked,
+		            terminalFinishSignal,
+		            terminalLifecycleCanSettleTurn,
+	            terminalSubmitPromptAccepted: terminalSubmitPromptAcceptedForResult,
+	            terminalReadinessCanSettleTurn,
+		            transcriptCompletionCanSettleTurn,
+		            transcriptPromptAccepted,
+		            transcriptExplicitCompletionCanSettleTurn,
+		            terminalGroundTruthStatus: transcriptCompletionCanSettleTurn ? "idle_or_done" : "processing_or_unknown",
+	            threadId,
+	            transcriptTargetsLatestTurn,
+	            transcriptTargetsLatestRunningTurn,
+	            transcriptTargetsRequestedTurn,
+	            transcriptRequestCanSettleTurn,
             turnCompleteSeen,
             workspaceId,
           });
@@ -14074,29 +14272,36 @@ export default function App() {
               agentId,
               matchedBy,
               messageCount: messages.length,
-              pollUntilTurnComplete,
-              promptEventId,
-              rawTurnCompleteSeen,
-              reason: "stale_completion_not_current_turn",
-              requestKey,
-              sessionIdPresent: Boolean(sessionId),
-              terminalReadinessCanSettleTurn,
-              threadId,
-              transcriptTargetsLatestRunningTurn,
-              workspaceId,
-            });
-            logTerminalStatus("frontend.terminal_status.stale_transcript_completion_ignored", {
-              agentId,
-              latestRunningTurnId: latestTurnAtTranscriptResult?.turnId || latestTurnAtTranscriptResult?.id || "",
-              latestRunningTurnMessageId: latestTurnAtTranscriptResult?.messageId || "",
-              matchedBy,
-              promptEventId,
-              rawTurnCompleteSeen,
-              requestKey,
-              terminalReadinessCanSettleTurn,
-              threadId,
-              workspaceId,
-            });
+	              pollUntilTurnComplete,
+	              promptEventId,
+	              rawTurnCompleteSeen,
+	              reason: "stale_completion_not_current_prompt_turn",
+	              requestKey,
+	              sessionIdPresent: Boolean(sessionId),
+	              terminalFinishSignal,
+	              terminalReadinessCanSettleTurn,
+	              threadId,
+	              transcriptTargetsLatestTurn,
+	              transcriptTargetsLatestRunningTurn,
+	              transcriptTargetsRequestedTurn,
+	              workspaceId,
+	            });
+	            logTerminalStatus("frontend.terminal_status.stale_transcript_completion_ignored", {
+	              agentId,
+	              latestTurnId: latestTurnAtTranscriptResult?.turnId || latestTurnAtTranscriptResult?.id || "",
+	              latestTurnMessageId: latestTurnAtTranscriptResult?.messageId || "",
+	              latestTurnState: latestTurnAtTranscriptResult?.state || latestTurnAtTranscriptResult?.status || "",
+	              matchedBy,
+	              promptEventId,
+	              rawTurnCompleteSeen,
+	              requestKey,
+	              terminalFinishSignal,
+	              terminalReadinessCanSettleTurn,
+	              threadId,
+	              transcriptTargetsLatestTurn,
+	              transcriptTargetsLatestRunningTurn,
+	              workspaceId,
+	            });
             return;
           }
 
@@ -14114,6 +14319,7 @@ export default function App() {
               latestTimestamp: result?.latestTimestamp || "",
               messages,
               matchedBy: result?.matchedBy || "",
+              promptEpoch: getWorkspaceThreadPromptEpoch(event),
               promptEventId,
               promptEventSubmittedAt: event.promptEventSubmittedAt || submittedAt || expectedMessageCreatedAt,
               promptAccepted,
@@ -14125,11 +14331,12 @@ export default function App() {
               source: `${agentId}-session`,
               sourcePath: result?.rolloutPath || "",
               submittedAt,
-              allowTranscriptTurnCompletion,
-              assistantResponseCompletesTurn,
-              transcriptExplicitCompletionCanSettleTurn,
-              threadId,
-              turnCompleteSeen,
+	              allowTranscriptTurnCompletion: false,
+	              assistantResponseCompletesTurn: false,
+	              transcriptCompletionCanSettleTurn: false,
+	              transcriptExplicitCompletionCanSettleTurn: false,
+	              threadId,
+	              turnCompleteSeen: false,
               workspaceId,
             };
             const hydrationDiagnostics = diagnoseWorkspaceThreadSessionTranscriptHydration(
@@ -14148,6 +14355,8 @@ export default function App() {
               after: afterSnapshot,
               agentId,
               before: beforeSnapshot,
+              completionFallbackApplied: false,
+              completionFallbackProjectionEvents: 0,
               hydrationDiagnostics,
               messageCount: messages.length,
               requestKey,
@@ -14160,6 +14369,8 @@ export default function App() {
                 after: afterSnapshot,
                 agentId,
                 before: beforeSnapshot,
+                completionFallbackApplied: false,
+                completionFallbackProjectionEvents: 0,
                 hydrationDiagnostics,
                 messageCount: messages.length,
                 requestKey,
@@ -14169,58 +14380,6 @@ export default function App() {
 	            }
 	            return nextThreads;
 	          });
-	          if (turnCompleteSeen || assistantResponseCompletesTurn) {
-	            terminalStatusEventEmitterRef.current?.({
-	              ...event,
-	              agentId,
-	              inputReady: true,
-	              providerSessionId: sessionId || providerSessionId,
-	              readiness: "ready",
-	              status: "idle",
-	              threadId,
-	              turnStatus: "completed",
-	              type: "provider-turn-completed",
-	              workspaceId,
-	            }, {
-	              eventType: "provider-turn-completed",
-	              reason: "transcript_turn_completed",
-	              readiness: "ready",
-	              status: "idle",
-	              turnStatus: "completed",
-	            });
-	          }
-	          if (turnCompleteSeen && voicePlanPromptEventId.startsWith("voice-plan-") && promptAccepted) {
-	            logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
-              agentId,
-              completionSource: trustedVoicePlanTerminalFinish
-                ? "transcript_session_terminal_finish"
-                : "transcript_turn_complete",
-              matchedBy,
-              pendingPromptId: voicePlanPromptEventId,
-              promptAccepted,
-              promptEventId: voicePlanPromptEventId,
-              reason: "transcript_turn_complete_seen",
-              threadId,
-              type: "provider-turn-completed",
-              workspaceId,
-            });
-            window.dispatchEvent(new CustomEvent(VOICE_PLAN_TASK_LIFECYCLE_EVENT, {
-              detail: {
-                agentId,
-                completionSource: trustedVoicePlanTerminalFinish
-                  ? "transcript_session_terminal_finish"
-                  : "transcript_turn_complete",
-                matchedBy,
-                pendingPromptId: voicePlanPromptEventId,
-                promptAccepted,
-                promptEventId: voicePlanPromptEventId,
-                threadId,
-                turnCompleteSeen: true,
-                type: "provider-turn-completed",
-                workspaceId,
-              },
-            }));
-          }
           if (pollUntilTurnComplete) {
             const elapsedMs = Date.now() - pollStartedAt;
             const waitingForPromptAcceptance = Boolean(
@@ -14231,12 +14390,12 @@ export default function App() {
             const shouldContinuePolling = (
               waitingForPromptAcceptance
               || (
-                activeRunningTurnAtTranscriptResult
-                && (
-                  !(turnCompleteSeen || assistantResponseCompletesTurn)
-                  || (voicePlanPromptEventId.startsWith("voice-plan-") && !promptAccepted)
-                )
-              )
+	                activeRunningTurnAtTranscriptResult
+	                && (
+	                  !transcriptCompletionCanSettleTurn
+	                  || (voicePlanPromptEventId.startsWith("voice-plan-") && !promptAccepted)
+	                )
+	              )
             )
               && elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.poll", {
@@ -14247,11 +14406,12 @@ export default function App() {
               promptAccepted,
               promptAcceptedBy,
               requestKey,
-              shouldContinuePolling,
-              timeoutMs: transcriptPollTimeoutMs,
-              threadId,
-              turnCompleteSeen,
-              waitingForPromptAcceptance,
+	              shouldContinuePolling,
+	              timeoutMs: transcriptPollTimeoutMs,
+	              threadId,
+	              transcriptCompletionCanSettleTurn,
+	              turnCompleteSeen,
+	              waitingForPromptAcceptance,
               workspaceId,
             });
             logTerminalStatus("frontend.terminal_status.transcript_poll_decision", {
@@ -14263,13 +14423,14 @@ export default function App() {
               promptEventId,
               requestKey,
               shouldContinuePolling,
-              settledAssistantResponseSeen,
-              timeoutMs: transcriptPollTimeoutMs,
-              terminalGroundTruthStatus: (turnCompleteSeen || assistantResponseCompletesTurn) && (
-                !voicePlanPromptEventId.startsWith("voice-plan-") || promptAccepted
-              ) ? "idle_or_done" : "processing_or_unknown",
-              threadId,
-              turnCompleteSeen,
+	              settledAssistantResponseSeen,
+	              timeoutMs: transcriptPollTimeoutMs,
+	              terminalGroundTruthStatus: transcriptCompletionCanSettleTurn && (
+	                !voicePlanPromptEventId.startsWith("voice-plan-") || promptAccepted
+	              ) ? "idle_or_done" : "processing_or_unknown",
+	              threadId,
+	              transcriptCompletionCanSettleTurn,
+	              turnCompleteSeen,
               waitingForPromptAcceptance,
               workspaceId,
             });
@@ -14289,7 +14450,7 @@ export default function App() {
           }
         })
         .catch((error) => {
-          if (providerTranscriptWatchKey) {
+          if (providerTranscriptWatchKeyRegisteredByRequest) {
             workspaceThreadTranscriptWatchKeysRef.current.delete(providerTranscriptWatchKey);
           }
           const elapsedMs = Date.now() - pollStartedAt;
@@ -14339,18 +14500,12 @@ export default function App() {
         });
     };
 
-    const transcriptEventType = String(event.type || "").trim().toLowerCase();
-    const promptReadyTranscriptEvent = (
-      transcriptEventType === "terminal-prompt-ready"
-      || transcriptEventType === "terminal-input-ready"
-      || event.inputReady === true
-      || event.terminalPromptReady === true
-    );
+    const inputReadyTranscriptEvent = event.inputReady === true;
     const requestedDelayMs = Math.max(0, Number.parseInt(event.delayMs, 10) || 0);
-    const minimumDelayMs = pollUntilTurnComplete && !promptReadyTranscriptEvent
+    const minimumDelayMs = pollUntilTurnComplete && !inputReadyTranscriptEvent
       ? (terminalSubmitPromptAccepted ? 1100 : 1500)
       : 250;
-    const hotDelayMs = promptReadyTranscriptEvent ? 0 : getTerminalInputHotDelayMs(900);
+    const hotDelayMs = inputReadyTranscriptEvent ? 0 : getTerminalInputHotDelayMs(900);
     const delayMs = Math.max(requestedDelayMs, minimumDelayMs, hotDelayMs);
     const timer = window.setTimeout(runRequest, delayMs);
     workspaceThreadTranscriptRequestsRef.current.set(requestKey, {
@@ -14471,6 +14626,7 @@ export default function App() {
     const lifecycleAgentId = String(
       lifecycleEvent.agentId || lifecycleEvent.currentAgent || "",
     ).trim().toLowerCase();
+    const lifecycleUsesActivityHooks = terminalAgentUsesActivityHooks(lifecycleAgentId);
     const lifecycleThreadId = String(lifecycleEvent.threadId || "").trim();
     const lifecycleWorkspaceId = String(lifecycleEvent.workspaceId || "").trim();
     const lifecycleNativeSessionId = String(
@@ -14502,19 +14658,13 @@ export default function App() {
           ? false
           : lifecycleLiveTerminalForGroundTruth?.inputReady,
       inputReadyAt: lifecycleEvent.inputReadyAt
-        || lifecycleEvent.promptReadyAt
         || lifecycleLiveTerminalForGroundTruth?.inputReadyAt
         || "",
       inputReadyConfidence: lifecycleEvent.inputReadyConfidence
-        || lifecycleEvent.promptReadyConfidence
         || lifecycleLiveTerminalForGroundTruth?.inputReadyConfidence
         || "",
       instanceId: lifecycleEvent.instanceId || lifecycleLiveTerminalForGroundTruth?.instanceId || "",
       paneId: lifecycleEvent.paneId || lifecycleLiveTerminalForGroundTruth?.paneId || "",
-      promptReadyAt: lifecycleEvent.promptReadyAt
-        || lifecycleEvent.inputReadyAt
-        || lifecycleLiveTerminalForGroundTruth?.promptReadyAt
-        || "",
       status: lifecycleEvent.status || lifecycleLiveTerminalForGroundTruth?.status || "active",
       terminalIndex: lifecycleEvent.terminalIndex ?? lifecycleLiveTerminalForGroundTruth?.terminalIndex,
       threadId: lifecycleThreadId || lifecycleLiveTerminalForGroundTruth?.threadId || "",
@@ -14558,52 +14708,25 @@ export default function App() {
         || lifecycleEvent.promptId
         || "",
     ).trim();
+    const lifecyclePromptEpoch = getWorkspaceThreadPromptEpoch(lifecycleEvent);
     const lifecycleReadinessEvent = Boolean(
       lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "terminal-input-ready"
     );
-    if (!lifecyclePromptEventId && lifecycleReadinessEvent) {
-      const lifecycleThreadRunning = String(
-        lifecycleThreadForGroundTruth?.latestTurn?.state
-          || lifecycleThreadForGroundTruth?.latestTurn?.status
-          || "",
-      ).trim().toLowerCase() === "running";
-      const inferredPromptEventId = lifecycleThreadRunning
-        ? ""
-        : getPromptEventIdFromRunningThread(lifecycleThreadForGroundTruth);
-      if (inferredPromptEventId) {
-        lifecyclePromptEventId = inferredPromptEventId;
-        lifecycleEvent = {
-          ...lifecycleEvent,
-          promptEventId: lifecyclePromptEventId,
-          pendingPromptId: lifecycleEvent.pendingPromptId || lifecyclePromptEventId,
-        };
-      } else if (lifecycleThreadRunning) {
-        logTerminalStatus("frontend.terminal_cli.readiness_prompt_id_backfill_skipped", {
-          agentId: lifecycleAgentId,
-          reason: "running_turn_requires_explicit_prompt_epoch",
-          source: lifecycleEvent.source || "",
-          terminalIndex: lifecycleEvent.terminalIndex ?? "",
-          threadId: lifecycleThreadId,
-          type: lifecycleEvent.type || "",
-          workspaceId: lifecycleWorkspaceId,
-        });
-      }
+    if (lifecycleReadinessEvent) {
+      logTerminalStatus("frontend.terminal_cli.readiness_lifecycle_disabled", {
+        agentId: lifecycleAgentId,
+        inputReadyAt: lifecycleEvent.inputReadyAt || "",
+        paneId: lifecycleEvent.paneId || "",
+        reason: "provider_hooks_own_readiness",
+        source: lifecycleEvent.source || "",
+        terminalIndex: lifecycleEvent.terminalIndex ?? "",
+        threadId: lifecycleThreadId,
+        type: lifecycleEvent.type || "",
+        workspaceId: lifecycleWorkspaceId,
+      });
+      return;
     }
-    const lifecycleRunningTurn = String(
-      lifecycleThreadForGroundTruth?.latestTurn?.state
-        || lifecycleThreadForGroundTruth?.latestTurn?.status
-        || "",
-    ).trim().toLowerCase() === "running";
-    const lifecyclePendingPromptWaitingForSession = Boolean(
-      lifecycleThreadForGroundTruth?.pendingPrompt && lifecycleRunningTurn,
-    );
-    const lifecycleStaleRunningReadiness = Boolean(
-      lifecycleReadinessEvent
-        && lifecycleRunningTurn
-        && !lifecyclePendingPromptWaitingForSession
-        && !threadLatestRunningTurnMatchesPrompt(lifecycleThreadForGroundTruth, lifecycleEvent)
-    );
     logTerminalStatus("frontend.terminal_status.lifecycle_received", {
       activityStatus: lifecycleEvent.activityStatus || "",
       agentId: lifecycleAgentId,
@@ -14611,70 +14734,36 @@ export default function App() {
       hasOutputText: Boolean(lifecycleEvent.outputText || lifecycleEvent.text),
       instanceId: lifecycleEvent.instanceId || "",
       pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+      promptEpoch: lifecyclePromptEpoch,
       promptEventId: lifecycleEvent.promptEventId || "",
       promptingUserKind: lifecycleEvent.promptingUserKind || "",
       promptingUserSource: lifecycleEvent.promptingUserSource || "",
+      restoredPromptReady: lifecycleEvent.restoredPromptReady === true,
       source: lifecycleEvent.source || "",
       status: lifecycleEvent.status || "",
-      staleRunningReadiness: lifecycleStaleRunningReadiness,
       terminalGroundTruthStatus: lifecycleEvent.terminalWorkState
         || lifecycleEvent.activityStatus
-        || (lifecycleEvent.type === "terminal-input-ready" || lifecycleEvent.type === "terminal-prompt-ready"
-          ? "idle"
-          : lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
-            ? "processing"
-            : lifecycleEvent.type === "provider-turn-completed"
-              ? "idle_or_done"
-              : ""),
+        || (lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
+          ? "processing"
+          : lifecycleEvent.type === "provider-turn-completed"
+            ? "idle_or_done"
+            : ""),
       terminalIsComplete: lifecycleEvent.terminalIsComplete === true,
       terminalIsPromptingUser: lifecycleEvent.terminalIsPromptingUser === true,
       terminalIndex: lifecycleEvent.terminalIndex ?? "",
       threadId: lifecycleThreadId,
       type: lifecycleEvent.type || "",
+      unidentifiedPromptReady: lifecycleEvent.unidentifiedPromptReady === true,
       workspaceId: lifecycleWorkspaceId,
     });
-    if (lifecycleStaleRunningReadiness) {
-      logTerminalStatus("frontend.terminal_status.lifecycle_emit_skip", {
-        agentId: lifecycleAgentId,
-        promptEventId: lifecyclePromptEventId,
-        reason: "stale_running_readiness",
-        source: lifecycleEvent.source || "",
-        terminalIndex: lifecycleEvent.terminalIndex ?? "",
-        threadId: lifecycleThreadId,
-        type: lifecycleEvent.type || "",
-        workspaceId: lifecycleWorkspaceId,
-      });
-    } else {
-      terminalStatusEventEmitterRef.current?.(lifecycleEvent, {
-        reason: lifecycleEvent.source || `lifecycle:${lifecycleEvent.type || "terminal-status"}`,
-      });
-    }
+    terminalStatusEventEmitterRef.current?.(lifecycleEvent, {
+      reason: lifecycleEvent.source || `lifecycle:${lifecycleEvent.type || "terminal-status"}`,
+    });
     setWorkspaceNotifications((current) => reduceThreadLifecycleNotificationEvent(
       current,
       lifecycleEvent,
       workspaceNotificationReducerOptions(lifecycleWorkspaceId),
     ));
-    if (
-      lifecycleReadinessEvent
-      && !lifecycleStaleRunningReadiness
-    ) {
-      recordThreadTerminalReadiness(lifecycleEvent);
-      logTerminalStatus("frontend.terminal_cli.readiness_signal_received", {
-        agentId: lifecycleAgentId,
-        eventTime: new Date().toISOString(),
-        inputReadyAt: lifecycleEvent.inputReadyAt || lifecycleEvent.promptReadyAt || "",
-        inputReadyConfidence: lifecycleEvent.inputReadyConfidence || "",
-        instanceId: lifecycleEvent.instanceId || "",
-        nativeSessionIdPresent: Boolean(lifecycleEvent.nativeSessionId || lifecycleEvent.providerSessionId),
-        paneId: lifecycleEvent.paneId || "",
-        promptEventId: lifecyclePromptEventId,
-        source: lifecycleEvent.source || "",
-        terminalIndex: lifecycleEvent.terminalIndex ?? "",
-        threadId: lifecycleThreadId,
-        type: lifecycleEvent.type || "",
-        workspaceId: lifecycleWorkspaceId,
-      });
-    }
     if (lifecycleEvent.type === "provider-turn-completed" && lifecycleEvent.paneId) {
       const shouldReconcileCoordination = shouldReconcileProviderTurnCompletion(lifecycleEvent);
       if (!shouldReconcileCoordination) {
@@ -14737,18 +14826,6 @@ export default function App() {
           type: lifecycleEvent.type,
         },
       }));
-    } else if (
-      lifecyclePromptEventId.startsWith("voice-plan-")
-      && lifecycleEvent.type === "terminal-prompt-ready"
-    ) {
-      logTerminalStatus("frontend.voice_plan.lifecycle_not_dispatched", {
-        lifecycleType: lifecycleEvent.type,
-        promptEventId: lifecyclePromptEventId,
-        reason: "terminal_prompt_ready_is_not_provider_turn_complete",
-        terminalGroundTruthStatus: "idle_or_prompt_ready",
-        threadId: lifecycleThreadId,
-        workspaceId: lifecycleWorkspaceId,
-      });
     }
     logWorkspaceThreadDiagnosticEvent("frontend.thread_lifecycle.event", {
       activityStatus: lifecycleEvent.activityStatus || "",
@@ -14761,6 +14838,8 @@ export default function App() {
         lifecycleEvent.outputText || lifecycleEvent.text || "",
       ),
       paneId: lifecycleEvent.paneId || "",
+      promptEpoch: lifecyclePromptEpoch,
+      promptEventId: lifecyclePromptEventId,
       source: lifecycleEvent.source || "",
       status: lifecycleEvent.status || "",
       terminalIndex: lifecycleEvent.terminalIndex ?? "",
@@ -14810,7 +14889,6 @@ export default function App() {
       lifecycleEvent.type === "message-submitted"
       || lifecycleEvent.type === "provider-turn-started"
       || lifecycleEvent.type === "provider-turn-completed"
-      || lifecycleEvent.type === "terminal-prompt-ready"
       || lifecycleEvent.type === "provider-turn-error"
       || lifecycleEvent.type === "provider-turn-interrupted"
     ) {
@@ -14832,6 +14910,8 @@ export default function App() {
         ),
         messageId: lifecycleEvent.messageId || "",
         pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+        promptEpoch: lifecyclePromptEpoch,
+        promptEventId: lifecyclePromptEventId,
         projectionEventCount: projectionEvents.length,
         projectionSources: Array.from(new Set(
           projectionEvents.map((projectionEvent) => projectionEvent?.source || "").filter(Boolean),
@@ -14930,53 +15010,6 @@ export default function App() {
       );
       let operation = "update_active_terminal";
       let nextThreads = threads;
-      const getReadinessProjectionEvents = (existingThread, event) => {
-        if (!existingThread) {
-          return [];
-        }
-
-        const providerBinding = getWorkspaceThreadProviderBinding(existingThread, lifecycleAgentId);
-        const liveTerminal = getLiveTerminalForThread(
-          existingThread,
-          providerBinding,
-          threads?.[lifecycleWorkspaceId],
-        );
-        const readinessAt = event.inputReadyAt
-          || event.promptReadyAt
-          || event.completedAt
-          || new Date().toISOString();
-        const readinessTerminal = {
-          ...(liveTerminal || {}),
-          inputReady: true,
-          inputReadyAt: readinessAt,
-          instanceId: event.instanceId || liveTerminal?.instanceId || "",
-          paneId: event.paneId || liveTerminal?.paneId || "",
-          promptReadyAt: event.promptReadyAt || readinessAt,
-          status: event.status || liveTerminal?.status || "active",
-          terminalIndex: event.terminalIndex ?? liveTerminal?.terminalIndex,
-          threadId: event.threadId || liveTerminal?.threadId || existingThread.id || "",
-        };
-        const groundTruth = getThreadTerminalGroundTruth({
-          liveTerminal: readinessTerminal,
-          providerBinding,
-          targetRole: lifecycleAgentId,
-          thread: existingThread,
-        });
-        logTerminalStatus("frontend.terminal_status.readiness_projection_decision", {
-          agentId: lifecycleAgentId,
-          inputReadyAt: readinessAt,
-          inputReadyIsFreshForTurn: Boolean(groundTruth.inputReadyIsFreshForTurn),
-          latestTurnState: groundTruth.latestTurnState || "",
-          orphanRunningLooksIdle: Boolean(groundTruth.orphanRunningLooksIdle),
-          runningTurnLooksIdle: Boolean(groundTruth.runningTurnLooksIdle),
-          terminalGroundTruthStatus: groundTruth.terminalGroundTruthStatus || "",
-          terminalIndex: event.terminalIndex ?? "",
-          threadId: lifecycleThreadId,
-          type: event.type || "",
-          workspaceId: lifecycleWorkspaceId,
-        });
-        return buildTerminalReadyProjectionEvents(existingThread, event, groundTruth);
-      };
       if (lifecycleEvent.type === "provider-session-invalid") {
         operation = "provider_session_invalid";
         nextThreads = invalidateWorkspaceThreadProviderSession(threads, lifecycleEvent);
@@ -15027,6 +15060,27 @@ export default function App() {
           const projectionEvents = existingProjectionEvents.length
             ? existingProjectionEvents
             : buildTerminalCompletedProjectionEvents(existingThread, lifecycleEvent);
+          logWorkspaceThreadDiagnosticEvent("frontend.thread_lifecycle.provider_turn_completed_decision", {
+            agentId: lifecycleAgentId,
+            existingLatestTurnId: existingThread?.latestTurn?.turnId || existingThread?.latestTurn?.id || "",
+            existingLatestTurnMessageId: existingThread?.latestTurn?.messageId || "",
+            existingLatestTurnState: existingThread?.latestTurn?.state || existingThread?.latestTurn?.status || "",
+            existingProjectionEventCount: existingProjectionEvents.length,
+            hasExistingThread: Boolean(existingThread),
+            inputProjectionEventCount: existingProjectionEvents.length,
+            pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+            promptEpoch: lifecyclePromptEpoch,
+            promptEventId: lifecyclePromptEventId,
+            projectionEventCount: projectionEvents.length,
+            projectionEventTypes: projectionEvents
+              .map((projectionEvent) => projectionEvent?.type || "")
+              .filter(Boolean)
+              .slice(0, 8),
+            source: lifecycleEvent.source || "",
+            terminalIndex: lifecycleEvent.terminalIndex ?? "",
+            threadId: lifecycleThreadId,
+            workspaceId: lifecycleWorkspaceId,
+          });
           nextThreads = appendWorkspaceThreadProjectionEvents(threads, {
             ...lifecycleEvent,
             activityStatus: "idle",
@@ -15037,139 +15091,6 @@ export default function App() {
           });
         } else {
           nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
-        }
-      } else if (lifecycleEvent.type === "terminal-input-ready") {
-        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
-        const projectionEvents = getReadinessProjectionEvents(existingThread, lifecycleEvent);
-        const pendingPromptWaitingForSession = Boolean(
-          existingThread?.pendingPrompt
-            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
-        );
-        const staleRunningReadiness = Boolean(
-          existingThread
-            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
-            && !pendingPromptWaitingForSession
-            && !projectionEvents.length
-            && !threadLatestRunningTurnMatchesPrompt(existingThread, lifecycleEvent)
-        );
-        if (staleRunningReadiness) {
-          operation = "terminal_input_ready_stale_running_ignored";
-          nextThreads = threads;
-          logTerminalStatus("frontend.terminal_cli.readiness_stale_running_ignored", {
-            agentId: lifecycleAgentId,
-            inputReadyAt: lifecycleEvent.inputReadyAt || lifecycleEvent.promptReadyAt || "",
-            pendingPromptWaitingForSession,
-            promptEventId: lifecyclePromptEventId,
-            source: lifecycleEvent.source || "",
-            terminalIndex: lifecycleEvent.terminalIndex ?? "",
-            threadId: lifecycleThreadId,
-            type: lifecycleEvent.type || "",
-            workspaceId: lifecycleWorkspaceId,
-          });
-        } else if (!existingThread && !projectionEvents.length) {
-          operation = "terminal_input_ready_active_terminal";
-          nextThreads = updateWorkspaceActiveTerminal(threads, {
-            ...lifecycleEvent,
-            activityStatus: "idle",
-            status: lifecycleEvent.status || "active",
-          });
-        } else {
-          operation = projectionEvents.length
-            ? "terminal_input_ready_completed"
-            : pendingPromptWaitingForSession
-              ? "terminal_input_ready_waiting_for_session_acceptance"
-              : "terminal_input_ready_idle";
-          nextThreads = projectionEvents.length
-            ? appendWorkspaceThreadProjectionEvents(threads, {
-              ...lifecycleEvent,
-              clearPendingPrompt: true,
-              projectionEvents,
-            })
-            : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
-              ? {
-                ...lifecycleEvent,
-                activityStatus: "idle",
-                inputReady: true,
-              }
-              : {
-                ...lifecycleEvent,
-                activityStatus: "idle",
-              });
-        }
-      } else if (lifecycleEvent.type === "terminal-prompt-ready") {
-        const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
-        const projectionEvents = getReadinessProjectionEvents(existingThread, lifecycleEvent);
-        const pendingPromptWaitingForSession = Boolean(
-          existingThread?.pendingPrompt
-            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
-        );
-        const staleRunningReadiness = Boolean(
-          existingThread
-            && String(existingThread?.latestTurn?.state || "").trim().toLowerCase() === "running"
-            && !pendingPromptWaitingForSession
-            && !projectionEvents.length
-            && !threadLatestRunningTurnMatchesPrompt(existingThread, lifecycleEvent)
-        );
-        logTerminalStatus("frontend.terminal_cli.finish_candidate_projection", {
-          agentId: lifecycleAgentId,
-          eventTime: new Date().toISOString(),
-          inputReadyAt: lifecycleEvent.inputReadyAt || lifecycleEvent.promptReadyAt || "",
-          pendingPromptWaitingForSession,
-          projectionEventCount: projectionEvents.length,
-          projectedCompletion: projectionEvents.some((projectionEvent) => (
-            projectionEvent?.type === "thread.turn.completed"
-            || projectionEvent?.type === "thread.turn.error"
-          )),
-          promptEventId: lifecyclePromptEventId,
-          source: lifecycleEvent.source || "",
-          terminalIndex: lifecycleEvent.terminalIndex ?? "",
-          threadId: lifecycleThreadId,
-          type: lifecycleEvent.type || "",
-          workspaceId: lifecycleWorkspaceId,
-        });
-        if (staleRunningReadiness) {
-          operation = "terminal_prompt_ready_stale_running_ignored";
-          nextThreads = threads;
-          logTerminalStatus("frontend.terminal_cli.readiness_stale_running_ignored", {
-            agentId: lifecycleAgentId,
-            inputReadyAt: lifecycleEvent.inputReadyAt || lifecycleEvent.promptReadyAt || "",
-            pendingPromptWaitingForSession,
-            promptEventId: lifecyclePromptEventId,
-            source: lifecycleEvent.source || "",
-            terminalIndex: lifecycleEvent.terminalIndex ?? "",
-            threadId: lifecycleThreadId,
-            type: lifecycleEvent.type || "",
-            workspaceId: lifecycleWorkspaceId,
-          });
-        } else if (!existingThread && !projectionEvents.length) {
-          operation = "terminal_prompt_ready_active_terminal";
-          nextThreads = updateWorkspaceActiveTerminal(threads, {
-            ...lifecycleEvent,
-            activityStatus: "idle",
-            status: lifecycleEvent.status || "active",
-          });
-        } else {
-          operation = projectionEvents.length
-            ? "terminal_prompt_ready_completed"
-            : pendingPromptWaitingForSession
-              ? "terminal_prompt_ready_waiting_for_session_acceptance"
-              : "terminal_prompt_ready_idle";
-          nextThreads = projectionEvents.length
-            ? appendWorkspaceThreadProjectionEvents(threads, {
-              ...lifecycleEvent,
-              clearPendingPrompt: true,
-              projectionEvents,
-            })
-            : markWorkspaceThreadAgentActivity(threads, pendingPromptWaitingForSession
-              ? {
-                ...lifecycleEvent,
-                activityStatus: "idle",
-                inputReady: true,
-              }
-              : {
-                ...lifecycleEvent,
-                activityStatus: "idle",
-              });
         }
       } else if (lifecycleEvent.type === "agent-output") {
         operation = "mark_agent_activity";
@@ -15261,16 +15182,36 @@ export default function App() {
         stateChanged: nextThreads !== threads,
         terminalGroundTruthStatus: afterSnapshot.activityStatus
           || lifecycleEvent.activityStatus
-          || (lifecycleEvent.type === "terminal-input-ready" || lifecycleEvent.type === "terminal-prompt-ready"
-            ? "idle"
-            : lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
-              ? "processing"
-              : ""),
+          || (lifecycleEvent.type === "provider-turn-started" || lifecycleEvent.type === "message-submitted"
+            ? "processing"
+            : ""),
         terminalIndex: lifecycleEvent.terminalIndex ?? "",
         threadId: lifecycleThreadId,
         type: lifecycleEvent.type || "",
         workspaceId: lifecycleWorkspaceId,
       });
+      if (lifecycleEvent.type === "provider-turn-completed") {
+        logTerminalStatus("frontend.terminal_status.provider_turn_completed_apply", {
+          afterActivityStatus: afterSnapshot.activityStatus || "",
+          afterLatestTurnIdPresent: Boolean(afterSnapshot.latestTurnIdPresent),
+          afterLatestTurnState: afterSnapshot.latestTurnState || "",
+          afterMessageCount: afterSnapshot.messageCount || 0,
+          afterProjectionEventCount: afterSnapshot.projectionEventCount || 0,
+          agentId: lifecycleAgentId,
+          beforeActivityStatus: beforeSnapshot.activityStatus || "",
+          beforeLatestTurnIdPresent: Boolean(beforeSnapshot.latestTurnIdPresent),
+          beforeLatestTurnState: beforeSnapshot.latestTurnState || "",
+          beforeMessageCount: beforeSnapshot.messageCount || 0,
+          beforeProjectionEventCount: beforeSnapshot.projectionEventCount || 0,
+          operation,
+          pendingPromptId: lifecycleEvent.pendingPromptId || lifecycleEvent.promptId || "",
+          source: lifecycleEvent.source || "",
+          stateChanged: nextThreads !== threads,
+          terminalIndex: lifecycleEvent.terminalIndex ?? "",
+          threadId: lifecycleThreadId,
+          workspaceId: lifecycleWorkspaceId,
+        });
+      }
       if (
         lifecycleEvent.type === "model-selected"
         || lifecycleEvent.type === "opened"
@@ -15324,7 +15265,6 @@ export default function App() {
         lifecycleEvent.type === "message-submitted"
         || lifecycleEvent.type === "provider-turn-started"
         || lifecycleEvent.type === "provider-turn-completed"
-        || lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "provider-turn-error"
       ) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.apply_delta", {
@@ -15353,8 +15293,7 @@ export default function App() {
     const lifecycleHasOutputText = Boolean(lifecycleEvent.outputText || lifecycleEvent.text);
     const lifecycleThreadForTranscript = workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
     const lifecycleLatestUserMessage = (
-      lifecycleEvent.type === "terminal-prompt-ready"
-      || lifecycleEvent.type === "closed"
+      lifecycleEvent.type === "closed"
       || lifecycleEvent.type === "exited"
     )
       ? getLatestWorkspaceThreadUserMessage(lifecycleThreadForTranscript)
@@ -15398,16 +15337,17 @@ export default function App() {
         lifecycleAgentId,
       )
       && (
-        lifecycleEvent.type === "message-submitted"
-        || lifecycleEvent.type === "terminal-prompt-ready"
+        (!lifecycleUsesActivityHooks && lifecycleEvent.type === "message-submitted")
+        || lifecycleEvent.type === "provider-turn-completed"
         || lifecycleEvent.type === "provider-session"
         || (lifecycleEvent.type === "opened" && Boolean(lifecycleNativeSessionId))
-        || lifecycleDetachedNeedsTranscriptReconcile
-      )
-    );
+		        || (!lifecycleUsesActivityHooks && lifecycleDetachedNeedsTranscriptReconcile)
+	      )
+	    );
     logWorkspaceThreadDiagnosticEvent("frontend.thread_lifecycle.transcript_decision", {
       agentId: lifecycleAgentId,
       hasOutputText: lifecycleHasOutputText,
+      lifecycleUsesActivityHooks,
       shouldRequestTranscript,
       threadId: lifecycleThreadId,
       type: lifecycleEvent.type || "",
@@ -15416,14 +15356,13 @@ export default function App() {
     if (shouldRequestTranscript) {
       requestWorkspaceThreadTranscript({
         ...lifecycleEvent,
-        allowRecovery: lifecycleEvent.type === "terminal-prompt-ready",
-        allowTimestampFallback: lifecycleEvent.type === "terminal-prompt-ready"
-          || lifecycleDetachedNeedsTranscriptReconcile
+        allowRecovery: false,
+        allowTimestampFallback: lifecycleDetachedNeedsTranscriptReconcile
           || lifecycleEvent.allowTimestampFallback === true,
         delayMs: lifecycleEvent.type === "message-submitted"
           ? 240
-          : lifecycleEvent.type === "terminal-prompt-ready"
-            ? WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS
+          : lifecycleEvent.type === "provider-turn-completed"
+            ? 80
             : lifecycleDetachedNeedsTranscriptReconcile
               ? 0
               : 120,
@@ -15444,7 +15383,101 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    terminalPromptSubmittedHandlerRef.current = (promptEvent) => {
+    terminalActivityHookHandlerRef.current = (hookEvent) => {
+      const payload = hookEvent?.payload || {};
+      const type = String(payload.eventType || payload.type || "").trim();
+      const workspaceId = String(payload.workspaceId || "").trim();
+      if (!type || !workspaceId) {
+        logTerminalStatus("frontend.terminal_activity_hook.skip", {
+          hasType: Boolean(type),
+          hasWorkspaceId: Boolean(workspaceId),
+          hookEventName: payload.hookEventName || "",
+          paneId: payload.paneId || "",
+          threadId: payload.threadId || "",
+        });
+        return;
+      }
+      const inputReady = payload.inputReady === true
+        || type === "provider-turn-completed"
+        || type === "provider-turn-error"
+        || type === "provider-turn-interrupted";
+      const activityStatus = payload.activityStatus
+        || (inputReady ? "idle" : "thinking");
+      const hookAgentId = payload.agentId || payload.agentKind || "";
+      const hookProjectionEvents = type === "provider-turn-started"
+        ? buildTerminalStartedProjectionEvents({
+          ...payload,
+          agentId: hookAgentId,
+          source: payload.source || `cli-hook:${type}`,
+          type,
+        })
+        : [];
+      const lifecycleEvent = {
+        ...payload,
+        activityStatus,
+        agentId: hookAgentId,
+        commandPhase: payload.commandPhase || (inputReady ? "completed" : "running"),
+        completionEvidence: payload.completionEvidence || "cli-hook",
+        completedAt: payload.completedAt || (inputReady ? new Date().toISOString() : ""),
+        inputReady,
+        inputReadyAt: payload.inputReadyAt || (inputReady ? new Date().toISOString() : ""),
+        inputReadyConfidence: payload.inputReadyConfidence || payload.completionEvidence || "cli-hook",
+        nativeSessionId: payload.nativeSessionId || payload.providerSessionId || "",
+        nativeSessionKind: payload.nativeSessionId || payload.providerSessionId ? "session" : "",
+        nativeSessionSource: payload.nativeSessionId || payload.providerSessionId ? "cli-hook" : "",
+        projectionEvents: hookProjectionEvents,
+        providerSessionId: payload.providerSessionId || payload.nativeSessionId || "",
+        source: payload.source || `cli-hook:${type}`,
+        status: payload.status || "active",
+        terminalIndex: payload.terminalIndex,
+        threadId: payload.threadId || "",
+        type,
+        userMessage: payload.userMessage || payload.message || "",
+        workspaceId,
+      };
+      logTerminalStatus("frontend.terminal_activity_hook.lifecycle", {
+        activityStatus,
+        hookEventName: payload.hookEventName || "",
+        instanceId: payload.instanceId || "",
+        inputReady,
+        paneId: payload.paneId || "",
+        providerSessionPresent: Boolean(lifecycleEvent.providerSessionId),
+        terminalIndex: payload.terminalIndex ?? "",
+        threadId: lifecycleEvent.threadId,
+        type,
+        workspaceId,
+      });
+      handleThreadTerminalLifecycle(lifecycleEvent);
+    };
+  }, [handleThreadTerminalLifecycle]);
+
+  useEffect(() => {
+    let unlistenActivityHook = null;
+    let cancelled = false;
+
+    listen(TERMINAL_ACTIVITY_HOOK_EVENT, (hookEvent) => {
+      if (cancelled) {
+        return;
+      }
+      terminalActivityHookHandlerRef.current?.(hookEvent);
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenActivityHook = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenActivityHook) {
+        unlistenActivityHook();
+      }
+    };
+  }, []);
+
+	  useEffect(() => {
+	    terminalPromptSubmittedHandlerRef.current = (promptEvent) => {
       const payload = promptEvent?.payload || {};
       if (!terminalPromptSubmittedPayloadIsAuthoritative(payload)) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
@@ -15705,15 +15738,13 @@ export default function App() {
         );
         if (!hasSessionPointer) {
           if (runningTurn && thread.latestTurn?.startedAt && thread.coordination?.worktreePath) {
-            const lastUserMessage = [...(Array.isArray(thread.messages) ? thread.messages : [])]
-              .reverse()
-              .find((message) => message?.role === "user");
+            const runningPromptInfo = getWorkspaceThreadRunningPromptInfo(thread, runningPromptEventId);
             requestWorkspaceThreadTranscript({
               agentId,
               allowTimestampFallback: true,
               delayMs: 240,
-              expectedMessageCreatedAt: lastUserMessage?.createdAt || thread.latestTurn?.startedAt || "",
-              expectedUserMessage: lastUserMessage?.text || "",
+              expectedMessageCreatedAt: runningPromptInfo.createdAt || thread.latestTurn?.startedAt || "",
+              expectedUserMessage: runningPromptInfo.text || "",
               pollStartedAt: Date.parse(thread.latestTurn?.startedAt || thread.latestTurn?.requestedAt || "")
                 || Date.now(),
               pollUntilTurnComplete: true,
@@ -15738,14 +15769,12 @@ export default function App() {
           if (runningWatchKey && workspaceThreadTranscriptWatchKeysRef.current.has(runningWatchKey)) {
             return;
           }
-          const lastUserMessage = [...(Array.isArray(thread.messages) ? thread.messages : [])]
-            .reverse()
-            .find((message) => message?.role === "user");
+          const runningPromptInfo = getWorkspaceThreadRunningPromptInfo(thread, runningPromptEventId);
           requestWorkspaceThreadTranscript({
             agentId,
             delayMs: 160,
-            expectedMessageCreatedAt: lastUserMessage?.createdAt || thread.latestTurn?.startedAt || "",
-            expectedUserMessage: lastUserMessage?.text || "",
+            expectedMessageCreatedAt: runningPromptInfo.createdAt || thread.latestTurn?.startedAt || "",
+            expectedUserMessage: runningPromptInfo.text || "",
             pollStartedAt: Date.parse(thread.latestTurn?.startedAt || thread.latestTurn?.requestedAt || "")
               || Date.now(),
             pollUntilTurnComplete: true,
