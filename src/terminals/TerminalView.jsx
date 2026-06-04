@@ -2213,7 +2213,7 @@ const OrchestratorHistoryList = styled.div`
   min-height: 100%;
   align-content: start;
   gap: 14px;
-  padding: 14px 12px 16px;
+  padding: 14px clamp(8px, 2vw, 14px) 16px;
 `;
 
 const OrchestratorHistoryTurn = styled.article`
@@ -2522,11 +2522,14 @@ const OrchestratorHistoryInlineSpinner = styled.span`
 
 const OrchestratorHistoryPlan = styled.div`
   display: grid;
-  width: min(94%, 560px);
+  width: 100%;
+  max-width: 680px;
   min-width: 0;
+  box-sizing: border-box;
+  container-type: inline-size;
   gap: 10px;
-  justify-self: start;
-  padding: 10px;
+  justify-self: center;
+  padding: 12px clamp(10px, 2vw, 14px);
   border: 1px solid rgba(45, 212, 191, 0.2);
   border-radius: 8px;
   background: rgba(5, 12, 20, 0.62);
@@ -2558,9 +2561,8 @@ const OrchestratorHistoryPlanTitle = styled.div`
   font-size: 12.5px;
   font-weight: 820;
   line-height: 1.24;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 
   html[data-forge-theme="light"] & {
     color: #20242b;
@@ -2570,8 +2572,10 @@ const OrchestratorHistoryPlanTitle = styled.div`
 const OrchestratorHistoryPlanMeta = styled.div`
   display: flex;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 7px;
+  column-gap: 7px;
+  row-gap: 3px;
   color: #b9c7d9;
   font-size: 10px;
   font-weight: 760;
@@ -2662,8 +2666,9 @@ const OrchestratorHistoryPlanTaskList = styled.div`
 const OrchestratorHistoryPlanTask = styled.div`
   display: grid;
   min-width: 0;
-  grid-template-columns: 18px minmax(0, 1fr) auto auto;
-  gap: 6px;
+  grid-template-columns: 20px minmax(0, 1fr) max-content 28px;
+  column-gap: 8px;
+  row-gap: 3px;
   align-items: center;
   padding: 5px 0;
   border-top: 1px solid rgba(226, 232, 240, 0.06);
@@ -2681,6 +2686,11 @@ const OrchestratorHistoryPlanTask = styled.div`
     border-top-color: rgba(15, 23, 42, 0.07);
     color: #343a46;
   }
+
+  @container (max-width: 430px) {
+    grid-template-columns: 20px minmax(0, 1fr) 28px;
+    align-items: center;
+  }
 `;
 
 const OrchestratorHistoryPlanTaskIcon = styled.span`
@@ -2688,14 +2698,15 @@ const OrchestratorHistoryPlanTaskIcon = styled.span`
   width: 14px;
   height: 14px;
   align-self: center;
-  align-items: center;
+  place-content: center;
+  place-items: center;
   justify-self: center;
-  justify-items: center;
   border: 1px solid rgba(148, 163, 184, 0.28);
   border-radius: 999px;
   color: #94a3b8;
   font-size: 9px;
   font-weight: 900;
+  line-height: 0;
 
   svg {
     width: 10px;
@@ -2737,7 +2748,7 @@ const OrchestratorHistoryPlanTaskText = styled.div`
 
 const OrchestratorHistoryPlanTaskStatus = styled.span`
   justify-self: end;
-  min-width: 58px;
+  min-width: 0;
   color: #7f8da1;
   font-size: 9px;
   font-weight: 820;
@@ -2764,37 +2775,57 @@ const OrchestratorHistoryPlanTaskStatus = styled.span`
   html[data-forge-theme="light"] & {
     color: #6b7280;
   }
+
+  @container (max-width: 430px) {
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: start;
+    text-align: left;
+  }
 `;
 
 const OrchestratorHistoryPlanTaskActions = styled.div`
   display: flex;
   min-width: 0;
+  width: 28px;
   align-items: center;
-  justify-content: flex-end;
+  justify-self: center;
+  justify-content: center;
   gap: 4px;
+
+  @container (max-width: 430px) {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+    align-self: center;
+  }
 `;
 
 const OrchestratorHistoryPlanHeaderActions = styled(OrchestratorHistoryPlanTaskActions)`
   align-self: start;
+  width: auto;
+  justify-self: end;
 `;
 
 const OrchestratorHistoryPlanActionButton = styled.button`
   display: inline-grid;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-content: center;
+  place-items: center;
+  padding: 0;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 7px;
   background: rgba(15, 23, 42, 0.54);
   color: #cbd5e1;
   cursor: pointer;
+  line-height: 0;
   transition: border-color 120ms ease, color 120ms ease, background 120ms ease, transform 120ms ease;
 
   svg {
     width: 14px;
     height: 14px;
+    display: block;
   }
 
   &:hover {
@@ -2826,16 +2857,34 @@ const OrchestratorHistoryPlanActionButton = styled.button`
 const OrchestratorHistoryPlanTaskDoneIcon = styled(Check)`
   width: 10px;
   height: 10px;
+  display: block;
 `;
 
 const OrchestratorHistoryPlanTaskCancelIcon = styled(Close)`
   width: 10px;
   height: 10px;
+  display: block;
 `;
 
 const OrchestratorHistoryPlanTaskQueueIcon = styled(AddToQueue)`
   width: 10px;
   height: 10px;
+  display: block;
+`;
+
+const OrchestratorHistoryPlanActionGlyph = styled.span`
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  place-content: center;
+  place-items: center;
+  line-height: 0;
+
+  svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+  }
 `;
 
 const OrchestratorHistoryPlanTaskPulse = styled.span`
@@ -2855,9 +2904,9 @@ const OrchestratorHistoryPlanTaskMark = styled.span`
 `;
 
 const OrchestratorHistoryPlanTaskHiddenAction = styled.span`
-  display: inline-block;
-  width: 24px;
-  height: 24px;
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
 `;
 
 const OrchestratorHistoryPlanGoal = styled.div`
@@ -9687,7 +9736,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                             title="Resume unfinished tasks"
                                             type="button"
                                           >
-                                            <OrchestratorHistoryPlanTaskQueueIcon aria-hidden="true" />
+                                            <OrchestratorHistoryPlanActionGlyph aria-hidden="true">
+                                              <OrchestratorHistoryPlanTaskQueueIcon />
+                                            </OrchestratorHistoryPlanActionGlyph>
                                           </OrchestratorHistoryPlanActionButton>
                                         )}
                                         {canCancelPlan && (
@@ -9703,7 +9754,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                             title="Cancel plan"
                                             type="button"
                                           >
-                                            <OrchestratorHistoryPlanTaskCancelIcon aria-hidden="true" />
+                                            <OrchestratorHistoryPlanActionGlyph aria-hidden="true">
+                                              <OrchestratorHistoryPlanTaskCancelIcon />
+                                            </OrchestratorHistoryPlanActionGlyph>
                                           </OrchestratorHistoryPlanActionButton>
                                         )}
                                       </OrchestratorHistoryPlanHeaderActions>
@@ -9713,6 +9766,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                 {item.plan.steps.length > 0 && (
                                   <OrchestratorHistoryPlanSteps>
                                     {item.plan.steps.map((step) => {
+                                      const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
                                       const renderStage = (stageName, stageStatus, tasks) => {
                                         const normalizedStageStatus = String(stageStatus || "").trim().toLowerCase();
                                         if (!tasks.length && !stageStatus) {
@@ -9782,20 +9836,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                                             title="Cancel task"
                                                             type="button"
                                                           >
-                                                            <OrchestratorHistoryPlanTaskCancelIcon aria-hidden="true" />
+                                                            <OrchestratorHistoryPlanActionGlyph aria-hidden="true">
+                                                              <OrchestratorHistoryPlanTaskCancelIcon />
+                                                            </OrchestratorHistoryPlanActionGlyph>
                                                           </OrchestratorHistoryPlanActionButton>
                                                         ) : control.canRequeue ? (
                                                           <OrchestratorHistoryPlanActionButton
                                                             aria-label="Requeue task"
                                                             data-action="requeue"
                                                             data-todo-control="true"
-                                                            disabled={!releasedTask}
                                                             onClick={(event) => {
                                                               event.preventDefault();
                                                               event.stopPropagation();
-                                                              if (!releasedTask) {
-                                                                return;
-                                                              }
                                                               onRequeueVoicePlanTask?.({
                                                                 plan: item.plan,
                                                                 planTask,
@@ -9806,7 +9858,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                                             title="Requeue task"
                                                             type="button"
                                                           >
-                                                            <OrchestratorHistoryPlanTaskQueueIcon aria-hidden="true" />
+                                                            <OrchestratorHistoryPlanActionGlyph aria-hidden="true">
+                                                              <OrchestratorHistoryPlanTaskQueueIcon />
+                                                            </OrchestratorHistoryPlanActionGlyph>
                                                           </OrchestratorHistoryPlanActionButton>
                                                         ) : (
                                                           <OrchestratorHistoryPlanTaskHiddenAction aria-hidden="true" />
@@ -14273,7 +14327,7 @@ function TerminalView({
       taskId: normalizedPlanTask?.taskId,
       text: task?.text || normalizedPlanTask?.text || task?.title || "",
     }, plan);
-    if (!normalizedPlanTask || !normalizedReleasedTask) {
+    if (!normalizedPlanTask) {
       return;
     }
     const result = await recordVoicePlanTaskStatus(normalizedPlanTask, "queued", {
@@ -14288,13 +14342,30 @@ function TerminalView({
     }
     voicePlanClientCancelledTasksRef.current.delete(normalizedPlanTask.taskId);
     voicePlanNeedsRequeueReportedRef.current.delete(getVoicePlanReleasedTaskKey(normalizedPlanTask));
-    queueReleasedVoicePlanTasks([normalizedReleasedTask], plan, {
+    const serverReleasedTasks = getVoicePlanReleasedTasksFromPayload(result);
+    const serverReleasedTask = serverReleasedTasks.find((candidate) => (
+      voicePlanTaskMatchesPlanTask({ id: candidate.taskId, planTask: candidate }, normalizedPlanTask)
+    )) || null;
+    if (serverReleasedTask) {
+      return;
+    }
+    if (!normalizedReleasedTask) {
+      logTerminalStatus("frontend.voice_plan.manual_requeue_missing_release_task", {
+        planRunId: normalizedPlanTask.runId,
+        planTaskId: normalizedPlanTask.taskId,
+        reason: "server_result_missing_released_task_and_local_task_unqueueable",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return;
+    }
+    queueReleasedVoicePlanTasks([normalizedReleasedTask], getVoicePlanSnapshotFromPayload(result) || plan, {
       force: true,
-      source: "voice_plan_manual_requeue",
+      source: "voice_plan_manual_requeue_fallback",
     });
   }, [
     queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
+    terminalWorkspace?.id,
   ]);
 
   const handleRequeueVoicePlanUnfinished = useCallback(async (plan) => {
@@ -14313,13 +14384,10 @@ function TerminalView({
           if (!control.canRequeue) {
             return;
           }
-          const releasedTask = getVoicePlanReleasedTaskFromControlTask(plan, step, stageName, task);
-          if (releasedTask) {
-            releasedTasks.push({
-              planTask,
-              releasedTask,
-            });
-          }
+          releasedTasks.push({
+            planTask,
+            releasedTask: getVoicePlanReleasedTaskFromControlTask(plan, step, stageName, task),
+          });
         });
       });
     });
@@ -14341,7 +14409,13 @@ function TerminalView({
       }
       voicePlanClientCancelledTasksRef.current.delete(planTask.taskId);
       voicePlanNeedsRequeueReportedRef.current.delete(getVoicePlanReleasedTaskKey(planTask));
-      queuedTasks.push(releasedTask);
+      const serverReleasedTasks = getVoicePlanReleasedTasksFromPayload(result);
+      const serverReleasedTask = serverReleasedTasks.find((candidate) => (
+        voicePlanTaskMatchesPlanTask({ id: candidate.taskId, planTask: candidate }, planTask)
+      )) || null;
+      if (!serverReleasedTask && releasedTask) {
+        queuedTasks.push(releasedTask);
+      }
     }
     if (!queuedTasks.length) {
       return;

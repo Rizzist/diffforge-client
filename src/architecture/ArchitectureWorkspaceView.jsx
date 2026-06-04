@@ -248,11 +248,282 @@ function shortLabel(value, maxLength = 30) {
 }
 
 const ARCHITECTURE_KIND_OPTIONS = [
+  { label: "Architecture", value: "architecture" },
   { label: "Deployment", value: "deployment" },
-  { label: "Flow", value: "flow" },
+  { label: "API pathway", value: "api-pathway" },
+  { label: "Data flow", value: "data-flow" },
+  { label: "Control graph", value: "control-graph" },
+  { label: "State machine", value: "state-machine" },
+  { label: "Dependency graph", value: "dependency-graph" },
   { label: "Subsystem", value: "subsystem" },
-  { label: "Data", value: "data" },
+  { label: "Runtime", value: "runtime" },
 ];
+
+const ARCHITECTURE_GRAPH_TEMPLATE_OPTIONS = [
+  { label: "System graph", value: "system" },
+  { label: "Architecture", value: "architecture" },
+  { label: "API pathway", value: "api-pathway" },
+  { label: "Data flow", value: "data-flow" },
+  { label: "Control graph", value: "control-graph" },
+  { label: "State machine", value: "state-machine" },
+  { label: "Dependency graph", value: "dependency-graph" },
+  { label: "Deployment", value: "deployment" },
+];
+
+const ARCHITECTURE_NODE_ROLE_OPTIONS = [
+  "actor",
+  "service",
+  "api",
+  "endpoint",
+  "controller",
+  "worker",
+  "queue",
+  "datastore",
+  "cache",
+  "file",
+  "external",
+  "state",
+  "decision",
+  "action",
+  "event",
+  "timer",
+  "terminal",
+  "dependency",
+  "package",
+];
+
+const ARCHITECTURE_EDGE_ROLE_OPTIONS = [
+  "calls",
+  "reads",
+  "writes",
+  "publishes",
+  "subscribes",
+  "transitions",
+  "guards",
+  "depends-on",
+  "emits",
+  "retries",
+  "fails-to",
+  "resolves-to",
+];
+
+const ARCHITECTURE_GROUP_INTENT_VALUES = new Set(ARCHITECTURE_KIND_OPTIONS.map((option) => option.value));
+const ARCHITECTURE_NODE_ROLE_VALUES = new Set(ARCHITECTURE_NODE_ROLE_OPTIONS);
+const ARCHITECTURE_EDGE_ROLE_VALUES = new Set(ARCHITECTURE_EDGE_ROLE_OPTIONS);
+
+const ARCHITECTURE_GROUP_INTENT_ICONS = {
+  architecture: "group",
+  "api-pathway": "api",
+  "data-flow": "flow",
+  "control-graph": "router",
+  "state-machine": "flow",
+  "dependency-graph": "schema",
+  deployment: "cloud",
+  runtime: "server",
+  subsystem: "settings",
+};
+
+const ARCHITECTURE_GROUP_INTENT_COLORS = {
+  architecture: "blue",
+  "api-pathway": "sky",
+  "data-flow": "emerald",
+  "control-graph": "amber",
+  "state-machine": "violet",
+  "dependency-graph": "rose",
+  deployment: "cyan",
+  runtime: "slate",
+  subsystem: "blue",
+};
+
+const ARCHITECTURE_NODE_ROLE_ICONS = {
+  actor: "users",
+  service: "service",
+  api: "api",
+  endpoint: "api",
+  controller: "router",
+  worker: "worker",
+  queue: "queue",
+  datastore: "database",
+  cache: "cache",
+  file: "file",
+  external: "external",
+  state: "flow",
+  decision: "router",
+  action: "settings",
+  event: "webhook",
+  timer: "cache",
+  terminal: "security",
+  dependency: "schema",
+  package: "schema",
+};
+
+const ARCHITECTURE_NODE_ROLE_KIND = {
+  actor: "client",
+  service: "service",
+  api: "api",
+  endpoint: "api",
+  controller: "router",
+  worker: "worker",
+  queue: "queue",
+  datastore: "database",
+  cache: "database",
+  file: "service",
+  external: "external",
+  state: "state",
+  decision: "decision",
+  action: "action",
+  event: "event",
+  timer: "event",
+  terminal: "terminal",
+  dependency: "dependency",
+  package: "dependency",
+};
+
+const ARCHITECTURE_EDGE_ROLE_KIND = {
+  "depends-on": "depends",
+  reads: "reads",
+  writes: "writes",
+  publishes: "publishes",
+  subscribes: "subscribes",
+  transitions: "transitions",
+  guards: "guards",
+  retries: "retries",
+  "fails-to": "fails-to",
+  emits: "emits",
+  "resolves-to": "resolves-to",
+};
+
+const ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES = {
+  architecture: {
+    title: "System Architecture",
+    intent: "architecture",
+    icon: "group",
+    color: "blue",
+    subtitle: "System-level components and boundaries",
+    nodes: [
+      { id: "user", title: "User", role: "actor", icon: "users", display: "compact", x: 58, y: 98 },
+      { id: "app", title: "App", role: "service", icon: "server", desc: "Primary application surface", x: 228, y: 92 },
+      { id: "api", title: "API", role: "api", icon: "api", desc: "Request handling boundary", x: 448, y: 92 },
+      { id: "store", title: "Store", role: "datastore", icon: "database", desc: "Durable state", x: 448, y: 214 },
+    ],
+    edges: [
+      { source: "user", target: "app", label: "use", role: "calls" },
+      { source: "app", target: "api", label: "request", role: "calls" },
+      { source: "api", target: "store", label: "read/write", role: "writes" },
+    ],
+  },
+  "api-pathway": {
+    title: "API Pathway",
+    intent: "api-pathway",
+    icon: "api",
+    color: "sky",
+    subtitle: "Request path from caller to effect",
+    nodes: [
+      { id: "client", title: "Client", role: "actor", icon: "users", display: "compact", x: 58, y: 98 },
+      { id: "endpoint", title: "Endpoint", role: "endpoint", icon: "api", desc: "Public route or handler", x: 220, y: 92 },
+      { id: "controller", title: "Controller", role: "controller", icon: "router", desc: "Validation and orchestration", x: 438, y: 92 },
+      { id: "effect", title: "Effect", role: "service", icon: "service", desc: "Domain operation", x: 438, y: 214 },
+    ],
+    edges: [
+      { source: "client", target: "endpoint", label: "request", role: "calls" },
+      { source: "endpoint", target: "controller", label: "route", role: "calls" },
+      { source: "controller", target: "effect", label: "execute", role: "calls" },
+    ],
+  },
+  "data-flow": {
+    title: "Data Flow",
+    intent: "data-flow",
+    icon: "flow",
+    color: "emerald",
+    subtitle: "Data movement and persistence",
+    nodes: [
+      { id: "producer", title: "Producer", role: "service", icon: "service", desc: "Creates data", x: 58, y: 92 },
+      { id: "queue", title: "Event Queue", role: "queue", icon: "queue", desc: "Buffers changes", x: 278, y: 92 },
+      { id: "worker", title: "Worker", role: "worker", icon: "worker", desc: "Processes events", x: 498, y: 92 },
+      { id: "store", title: "Data Store", role: "datastore", icon: "database", desc: "Persists records", x: 498, y: 214 },
+    ],
+    edges: [
+      { source: "producer", target: "queue", label: "publish", role: "publishes" },
+      { source: "queue", target: "worker", label: "consume", role: "subscribes" },
+      { source: "worker", target: "store", label: "write", role: "writes" },
+    ],
+  },
+  "control-graph": {
+    title: "Control Graph",
+    intent: "control-graph",
+    icon: "router",
+    color: "amber",
+    subtitle: "Branching decisions and control paths",
+    nodes: [
+      { id: "start", title: "Start", role: "state", lifecycle: "start", icon: "flow", desc: "Entry condition", x: 58, y: 102 },
+      { id: "decide", title: "Decision", role: "decision", icon: "router", desc: "Branch condition", x: 240, y: 96 },
+      { id: "action", title: "Action", role: "action", icon: "settings", desc: "Primary path", x: 454, y: 80 },
+      { id: "retry", title: "Retry", role: "action", lifecycle: "retry", icon: "worker", desc: "Recovery path", x: 454, y: 196 },
+      { id: "failed", title: "Failed", role: "terminal", lifecycle: "terminal", icon: "security", desc: "Stop condition", x: 454, y: 302 },
+    ],
+    edges: [
+      { source: "start", target: "decide", label: "evaluate", role: "transitions" },
+      { source: "decide", target: "action", label: "ok", role: "guards", condition: "valid" },
+      { source: "decide", target: "retry", label: "retry", role: "guards", condition: "recoverable" },
+      { source: "decide", target: "failed", label: "fail", role: "fails-to", condition: "invalid" },
+    ],
+  },
+  "state-machine": {
+    title: "State Machine",
+    intent: "state-machine",
+    icon: "flow",
+    color: "violet",
+    subtitle: "States, events, and terminal transitions",
+    nodes: [
+      { id: "idle", title: "Idle", role: "state", lifecycle: "start", icon: "flow", desc: "Waiting", x: 58, y: 96 },
+      { id: "active", title: "Active", role: "state", icon: "flow", desc: "Running", x: 260, y: 96 },
+      { id: "paused", title: "Paused", role: "state", icon: "flow", desc: "Suspended", x: 462, y: 196 },
+      { id: "done", title: "Done", role: "terminal", lifecycle: "terminal", icon: "security", desc: "Completed", x: 462, y: 80 },
+    ],
+    edges: [
+      { source: "idle", target: "active", label: "start", role: "transitions", event: "start" },
+      { source: "active", target: "paused", label: "pause", role: "transitions", event: "pause" },
+      { source: "paused", target: "active", label: "resume", role: "transitions", event: "resume" },
+      { source: "active", target: "done", label: "complete", role: "transitions", event: "complete" },
+    ],
+  },
+  "dependency-graph": {
+    title: "Dependency Graph",
+    intent: "dependency-graph",
+    icon: "schema",
+    color: "rose",
+    subtitle: "Packages, modules, and dependency direction",
+    nodes: [
+      { id: "app", title: "Application", role: "package", icon: "schema", desc: "Root package", x: 58, y: 96 },
+      { id: "sdk", title: "SDK", role: "dependency", icon: "schema", desc: "Shared client", x: 260, y: 72 },
+      { id: "runtime", title: "Runtime", role: "dependency", icon: "server", desc: "Execution layer", x: 260, y: 188 },
+      { id: "database", title: "Database Client", role: "dependency", icon: "database", desc: "Persistence adapter", x: 462, y: 72 },
+    ],
+    edges: [
+      { source: "app", target: "sdk", label: "imports", role: "depends-on" },
+      { source: "app", target: "runtime", label: "runs on", role: "depends-on" },
+      { source: "sdk", target: "database", label: "uses", role: "depends-on" },
+    ],
+  },
+  deployment: {
+    title: "Deployment Slice",
+    intent: "deployment",
+    icon: "cloud",
+    color: "cyan",
+    subtitle: "Runtime placement and external services",
+    nodes: [
+      { id: "browser", title: "Browser", role: "actor", icon: "browser", display: "compact", x: 58, y: 98 },
+      { id: "web", title: "Web Runtime", role: "service", icon: "cloud", desc: "Hosted frontend", x: 220, y: 92 },
+      { id: "api", title: "API Runtime", role: "api", icon: "server", desc: "Backend runtime", x: 438, y: 92 },
+      { id: "database", title: "Database", role: "datastore", icon: "database", desc: "Managed persistence", x: 438, y: 214 },
+    ],
+    edges: [
+      { source: "browser", target: "web", label: "load", role: "calls" },
+      { source: "web", target: "api", label: "https", role: "calls" },
+      { source: "api", target: "database", label: "query", role: "reads" },
+    ],
+  },
+};
 
 const ARCHITECTURE_LIKEC4_ICON_MODULES = import.meta.glob("/node_modules/@likec4/icons/{aws,azure,gcp,tech,bootstrap}/*.js");
 const ARCHITECTURE_LIKEC4_ICON_CACHE = new Map();
@@ -494,6 +765,12 @@ const ARCHITECTURE_ICON_ALIASES = {
   folder: "generic:folder",
   gateway: "generic:api",
   group: "generic:group",
+  decision: "generic:router",
+  dependency: "generic:schema",
+  event: "generic:webhook",
+  package: "generic:schema",
+  state: "generic:flow",
+  terminal: "generic:security",
   users: "generic:users",
   monitor: "generic:client",
   persistence: "generic:database",
@@ -502,9 +779,10 @@ const ARCHITECTURE_ICON_ALIASES = {
   server: "generic:server",
   service: "generic:service",
   settings: "generic:settings",
+  schema: "generic:schema",
+  start: "generic:flow",
   storage: "generic:storage",
   subscription: "generic:subscription",
-  terminal: "generic:terminal",
   worker: "generic:worker",
 };
 
@@ -542,6 +820,7 @@ const ARCHITECTURE_STYLED_ICON_COMPONENTS = {
   server: Dns,
   service: Work,
   settings: Settings,
+  schema: Schema,
   storage: Storage,
   stripe: Stripe,
   subscription: Sync,
@@ -553,7 +832,6 @@ const ARCHITECTURE_STYLED_ICON_COMPONENTS = {
   worker: Settings,
   auth0: Auth0,
   cloudflare: Cloudflare,
-  schema: Schema,
 };
 
 const ARCHITECTURE_KIND_ICON_FALLBACKS = {
@@ -564,6 +842,12 @@ const ARCHITECTURE_KIND_ICON_FALLBACKS = {
   group: "generic:group",
   queue: "generic:queue",
   service: "generic:service",
+  state: "generic:flow",
+  decision: "generic:router",
+  action: "generic:settings",
+  event: "generic:webhook",
+  terminal: "generic:security",
+  dependency: "generic:schema",
   worker: "generic:worker",
 };
 
@@ -592,14 +876,21 @@ const ARCHITECTURE_SEMANTIC_ICON_SLUGS = new Set([
   "folder",
   "gateway",
   "group",
+  "decision",
+  "dependency",
+  "event",
+  "package",
   "monitor",
   "persistence",
   "queue",
   "router",
+  "schema",
   "security",
   "server",
   "service",
   "settings",
+  "state",
+  "start",
   "storage",
   "subscription",
   "terminal",
@@ -1284,6 +1575,84 @@ function architectureExtractDslProps(value) {
   return { name, props };
 }
 
+function architectureSemanticSlug(value, fallback = "") {
+  const raw = text(value);
+  if (!raw) return fallback;
+  return raw
+    .toLowerCase()
+    .replace(/[_\s]+/gu, "-")
+    .replace(/[^a-z0-9:-]+/gu, "-")
+    .replace(/-{2,}/gu, "-")
+    .replace(/^-|-$/gu, "") || fallback;
+}
+
+function architectureSemanticOptionLabel(options, value, fallback = "") {
+  const slug = architectureSemanticSlug(value);
+  return options.find((option) => option.value === slug)?.label
+    || text(fallback)
+    || slug.replace(/[-_]+/gu, " ");
+}
+
+function architectureGroupIntent(value, fallback = "architecture") {
+  const slug = architectureSemanticSlug(value, fallback);
+  return ARCHITECTURE_GROUP_INTENT_VALUES.has(slug) ? slug : slug;
+}
+
+function architectureGroupIntentLabel(value) {
+  return architectureSemanticOptionLabel(ARCHITECTURE_KIND_OPTIONS, value, "Architecture");
+}
+
+function architectureNodeRole(value, fallback = "service") {
+  const slug = architectureSemanticSlug(value, fallback);
+  if (slug === "client" || slug === "user" || slug === "users") return "actor";
+  if (slug === "database" || slug === "db" || slug === "store" || slug === "storage") return "datastore";
+  if (slug === "router") return "controller";
+  if (slug === "depends" || slug === "dependency") return "dependency";
+  return ARCHITECTURE_NODE_ROLE_VALUES.has(slug) ? slug : slug;
+}
+
+function architectureEdgeRole(value, fallback = "calls") {
+  const slug = architectureSemanticSlug(value, fallback);
+  if (slug === "depends" || slug === "dependency") return "depends-on";
+  if (slug === "call") return "calls";
+  if (slug === "transition") return "transitions";
+  if (slug === "guard") return "guards";
+  if (slug === "fail" || slug === "failure") return "fails-to";
+  return ARCHITECTURE_EDGE_ROLE_VALUES.has(slug) ? slug : slug;
+}
+
+function architectureNodeKindFromRole(role, fallback = "service") {
+  return ARCHITECTURE_NODE_ROLE_KIND[architectureNodeRole(role)] || fallback;
+}
+
+function architectureEdgeKindFromRole(role, fallback = "calls") {
+  return ARCHITECTURE_EDGE_ROLE_KIND[architectureEdgeRole(role)] || fallback;
+}
+
+function architectureCleanDslProps(props = {}) {
+  const object = jsonObject(props) || {};
+  return Object.fromEntries(
+    Object.entries(object)
+      .map(([key, value]) => [text(key), text(value)])
+      .filter(([key, value]) => key && value),
+  );
+}
+
+function architecturePropsWithOrderedOverrides(baseProps = {}, overrides = {}) {
+  const next = {
+    ...architectureCleanDslProps(baseProps),
+    ...architectureCleanDslProps(overrides),
+  };
+  return Object.fromEntries(Object.entries(next).filter(([, value]) => text(value)));
+}
+
+function architectureEdgeConnectorForRole(role, kind = "") {
+  const edgeRole = architectureEdgeRole(role || kind);
+  const edgeKind = text(kind);
+  if (edgeRole === "depends-on" || edgeKind === "depends") return "--";
+  return ">";
+}
+
 function architectureFindDslLabelIndex(value) {
   let inQuote = false;
   let bracketDepth = 0;
@@ -1690,18 +2059,44 @@ function architectureParseDslGraph(graph) {
     if (nameToId.has(cleanName)) return nameToId.get(cleanName);
     const id = uniqueId(cleanName, isGroup ? "group" : "node");
     const parentId = explicitParentId || stack.at(-1)?.id || "";
-    const icon = text(props.icon);
+    const semanticProps = architectureCleanDslProps(props);
     const title = text(props.label, cleanName);
-    const kind = isGroup ? "group" : architectureIconKind(icon, "service");
-    const display = architectureNodeDisplayMode({ ...props, icon, kind, title }, isGroup);
+    const intent = isGroup
+      ? architectureGroupIntent(props.intent || props.view || props.kind || props.type)
+      : "";
+    const role = !isGroup
+      ? architectureNodeRole(props.role || props.kind || props.type || architectureIconKind(props.icon, "service"))
+      : "";
+    const icon = text(
+      props.icon,
+      isGroup
+        ? ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group"
+        : ARCHITECTURE_NODE_ROLE_ICONS[role] || "",
+    );
+    const kind = isGroup ? "group" : architectureNodeKindFromRole(role, architectureIconKind(icon, "service"));
+    const display = architectureNodeDisplayMode({ ...props, icon, kind, role, title }, isGroup);
     const node = {
       id,
       title,
-      subtitle: display === "compact" ? "" : text(props.desc || props.description),
+      subtitle: display === "compact"
+        ? ""
+        : text(props.desc || props.description, isGroup ? architectureGroupIntentLabel(intent) : ""),
       kind,
       type: isGroup ? "group" : "node",
       icon,
-      color: text(props.color),
+      color: text(props.color, isGroup ? ARCHITECTURE_GROUP_INTENT_COLORS[intent] : ""),
+      semanticProps,
+      ...(isGroup ? {
+        intent,
+        owner: text(props.owner),
+        scope: text(props.scope),
+        status: text(props.status),
+      } : {
+        lifecycle: text(props.lifecycle),
+        role,
+        source: text(props.source || props.ref || props.reference),
+        status: text(props.status),
+      }),
       ...(!isGroup ? { display } : {}),
       ...(parentId ? { parentId } : {}),
     };
@@ -1753,7 +2148,9 @@ function architectureParseDslGraph(graph) {
     const connectionLabelRaw = labelIndex >= 0 ? line.slice(labelIndex + 1).trim() : "";
     const tokens = architectureTokenizeDslConnection(connectionExpression);
     if (tokens.some((token) => token.type === "connector")) {
-      const cleanLabel = architectureExtractDslProps(connectionLabelRaw).name;
+      const labelParts = architectureExtractDslProps(connectionLabelRaw);
+      const cleanLabel = labelParts.name;
+      const edgeProps = architectureCleanDslProps(labelParts.props);
       for (let index = 0; index < tokens.length - 2; index += 2) {
         const left = tokens[index];
         const connector = tokens[index + 1];
@@ -1766,12 +2163,21 @@ function architectureParseDslGraph(graph) {
             const sourceId = ensureNode(connector.value === "<" ? rightName : leftName);
             const targetId = ensureNode(connector.value === "<" ? leftName : rightName);
             if (!sourceId || !targetId) return;
+            const role = architectureEdgeRole(
+              edgeProps.role || edgeProps.kind || edgeProps.type,
+              connector.value === "--" ? "depends-on" : "calls",
+            );
             parsed.edges.push({
               id: uniqueId(`${sourceId}-${targetId}`, "edge"),
               source: sourceId,
               target: targetId,
               label: cleanLabel,
-              kind: connector.value === "--" ? "depends" : "calls",
+              kind: architectureEdgeKindFromRole(role, connector.value === "--" ? "depends" : "calls"),
+              role,
+              condition: text(edgeProps.condition || edgeProps.guard),
+              criticality: text(edgeProps.criticality),
+              event: text(edgeProps.event),
+              semanticProps: edgeProps,
             });
             if (connector.value === "<>") {
               parsed.edges.push({
@@ -1779,7 +2185,12 @@ function architectureParseDslGraph(graph) {
                 source: targetId,
                 target: sourceId,
                 label: cleanLabel,
-                kind: "calls",
+                kind: architectureEdgeKindFromRole(role, "calls"),
+                role,
+                condition: text(edgeProps.condition || edgeProps.guard),
+                criticality: text(edgeProps.criticality),
+                event: text(edgeProps.event),
+                semanticProps: edgeProps,
               });
             }
           });
@@ -1795,7 +2206,46 @@ function architectureParseDslGraph(graph) {
   return architectureLayoutGraph(parsed);
 }
 
-function architectureStarterSource({ groupPath = "", title = "" } = {}) {
+function architectureSliceTemplateLines(templateKey = "architecture") {
+  const template = ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES[templateKey]
+    || ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES.architecture;
+  const groupProps = {
+    icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[template.intent] || "group",
+    color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[template.intent],
+    intent: template.intent,
+    desc: template.subtitle,
+  };
+  const lines = [
+    `${architectureDslName(template.title)}${architectureDslPropsText(groupProps)} {`,
+  ];
+  template.nodes.forEach((node) => {
+    const props = {
+      icon: node.icon || ARCHITECTURE_NODE_ROLE_ICONS[node.role],
+      role: node.role,
+      ...(node.display ? { display: node.display } : {}),
+      ...(node.lifecycle ? { lifecycle: node.lifecycle } : {}),
+      ...(!node.display || node.display !== "compact" ? { desc: node.desc } : {}),
+    };
+    lines.push(`  ${architectureDslName(node.title)}${architectureDslPropsText(props)}`);
+  });
+  lines.push("}", "");
+  template.edges.forEach((edge) => {
+    const source = template.nodes.find((node) => node.id === edge.source)?.title || edge.source;
+    const target = template.nodes.find((node) => node.id === edge.target)?.title || edge.target;
+    const edgeProps = {
+      role: edge.role,
+      ...(edge.condition ? { condition: edge.condition } : {}),
+      ...(edge.event ? { event: edge.event } : {}),
+      ...(edge.criticality ? { criticality: edge.criticality } : {}),
+    };
+    const label = text(edge.label);
+    const labelWithProps = `${label}${architectureDslPropsText(edgeProps)}`;
+    lines.push(`${architectureDslName(source)} ${architectureEdgeConnectorForRole(edge.role)} ${architectureDslName(target)}: ${labelWithProps.trim()}`);
+  });
+  return lines;
+}
+
+function architectureStarterSource({ groupPath = "", template = "system", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const groupParts = text(groupPath)
     .split(/[/>]/u)
@@ -1807,32 +2257,21 @@ function architectureStarterSource({ groupPath = "", title = "" } = {}) {
     "direction right",
   ];
   if (groupParts.length) lines.push(`folder ${architectureDslString(groupParts.join(" / "))}`);
-  lines.push(
-    "",
-    "Client Layer [icon: users, color: blue] {",
-    "  Client [icon: monitor, desc: Entry point]",
-    "}",
-    "",
-    "Application [icon: server, color: amber] {",
-    "  API [icon: api, desc: Request handling and validation]",
-    "  Service [icon: settings, desc: Core logic]",
-    "}",
-    "",
-    "Persistence [icon: database, color: purple] {",
-    "  Store [icon: database, desc: State and durable records]",
-    "}",
-    "",
-    "Client > API: request",
-    "API > Service: delegate",
-    "Service > Store: read/write",
-  );
+  lines.push("");
+  const templateKeys = template === "system"
+    ? ["architecture", "api-pathway", "data-flow"]
+    : [template];
+  templateKeys.forEach((templateKey, index) => {
+    if (index) lines.push("");
+    lines.push(...architectureSliceTemplateLines(templateKey));
+  });
   return `${lines.join("\n")}\n`;
 }
 
-function architectureStarterGraph({ groupPath = "", title = "" } = {}) {
+function architectureStarterGraph({ groupPath = "", template = "system", title = "" } = {}) {
   const cleanTitle = text(title, "Architecture graph");
   const id = `${architectureSlug(cleanTitle)}-${String(Date.now()).slice(-5)}`;
-  const source = architectureStarterSource({ groupPath, title: cleanTitle });
+  const source = architectureStarterSource({ groupPath, template, title: cleanTitle });
   return architectureParseDslGraph({
     id,
     title: cleanTitle,
@@ -1860,14 +2299,27 @@ function architectureTargetHandlePosition(direction) {
 }
 
 function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
-  const rawKind = text(node?.kind || node?.type, "service");
+  const isSourceGroup = text(node?.kind || node?.type) === "group" || text(node?.type) === "group";
+  const intent = isSourceGroup ? architectureGroupIntent(node?.intent || node?.view || node?.groupIntent) : "";
+  const role = !isSourceGroup ? architectureNodeRole(node?.role || node?.semanticRole || node?.kind || node?.type) : "";
+  const rawKind = text(
+    node?.kind && node?.kind !== "node" ? node.kind : "",
+    isSourceGroup ? "group" : architectureNodeKindFromRole(role, "service"),
+  );
   const isGroup = rawKind === "group" || text(node?.type) === "group";
   const id = text(node?.id, architectureEntityId(isGroup ? "group" : "node"));
   const parentId = text(node?.parentId || node?.parent_id);
   const position = jsonObject(node?.position) || {};
   const title = text(node?.title || node?.label, isGroup ? "Group" : "Node");
-  const display = architectureNodeDisplayMode({ ...node, kind: rawKind, title }, isGroup);
+  const semanticProps = architectureCleanDslProps(node?.semanticProps || node?.semantic_props || node?.props);
+  const display = architectureNodeDisplayMode({ ...node, kind: rawKind, role, title }, isGroup);
   const compact = display === "compact";
+  const icon = text(
+    node?.icon,
+    isGroup
+      ? ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group"
+      : ARCHITECTURE_NODE_ROLE_ICONS[role] || "",
+  );
   const width = numberValue(
     node?.width || node?.style?.width,
     isGroup ? 460 : compact ? ARCHITECTURE_NODE_COMPACT_WIDTH : ARCHITECTURE_NODE_CARD_WIDTH,
@@ -1893,9 +2345,20 @@ function architectureFlowNodeFromGraphNode(node, index = 0, direction = "LR") {
       color: text(node?.color),
       display,
       flowDirection: direction,
-      icon: text(node?.icon),
+      icon,
+      intent,
       kind: isGroup ? "group" : rawKind,
-      subtitle: compact ? "" : text(node?.subtitle || node?.description),
+      lifecycle: text(node?.lifecycle),
+      owner: text(node?.owner),
+      role,
+      scope: text(node?.scope),
+      semanticProps,
+      source: text(node?.source || node?.sourceRef || node?.reference),
+      status: text(node?.status),
+      subtitle: compact ? "" : text(
+        node?.subtitle || node?.description,
+        isGroup ? architectureGroupIntentLabel(intent) : "",
+      ),
       title,
     },
   };
@@ -1918,8 +2381,13 @@ function architectureFlowEdgeFromGraphEdge(edge) {
       width: 18,
     },
     data: {
-      kind: text(edge?.kind, "calls"),
+      condition: text(edge?.condition || edge?.guard),
+      criticality: text(edge?.criticality),
+      event: text(edge?.event),
+      kind: text(edge?.kind, architectureEdgeKindFromRole(edge?.role, "calls")),
       label: text(edge?.label || edge?.title),
+      role: architectureEdgeRole(edge?.role || edge?.kind, "calls"),
+      semanticProps: architectureCleanDslProps(edge?.semanticProps || edge?.semantic_props || edge?.props),
     },
   };
 }
@@ -1942,21 +2410,47 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   const groupPath = architectureFolderPathParts(currentGraph.groupPath);
   const groupNodes = nodes.filter((node) => node.type === "architectureGroup");
   const regularNodes = nodes.filter((node) => node.type !== "architectureGroup");
+  const allNodes = [...groupNodes, ...regularNodes];
+  const nodeById = new Map(allNodes.map((node) => [node.id, node]));
   const childrenByParent = new Map();
-  [...groupNodes, ...regularNodes].forEach((node) => {
+  allNodes.forEach((node) => {
     const parentId = text(node.parentId);
     if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
     childrenByParent.get(parentId).push(node);
   });
+  const titleCounts = new Map();
+  allNodes.forEach((node) => {
+    const title = text(node.data?.title || node.id, node.id).toLowerCase();
+    titleCounts.set(title, (titleCounts.get(title) || 0) + 1);
+  });
+  const dslNameById = new Map();
+  const dslLabelById = new Map();
+  allNodes.forEach((node) => {
+    const title = text(node.data?.title || node.id, node.id);
+    const duplicateTitle = (titleCounts.get(title.toLowerCase()) || 0) > 1;
+    const parentTitle = text(nodeById.get(node.parentId)?.data?.title);
+    const idSuffix = text(node.id).split("-").filter(Boolean).at(-1);
+    const dslName = duplicateTitle
+      ? [parentTitle, title, idSuffix].filter(Boolean).join(" / ")
+      : title;
+    dslNameById.set(node.id, dslName);
+    if (dslName !== title) dslLabelById.set(node.id, title);
+  });
   const lineForNode = (node, depth) => {
     const display = architectureNodeDisplayMode(node.data || {}, false);
     const compact = display === "compact";
-    const props = {
-      icon: node.data?.icon || node.data?.kind,
+    const role = architectureNodeRole(node.data?.role || node.data?.kind);
+    const props = architecturePropsWithOrderedOverrides(node.data?.semanticProps, {
+      icon: node.data?.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || node.data?.kind,
+      ...(dslLabelById.has(node.id) ? { label: dslLabelById.get(node.id) } : {}),
+      role,
       ...(compact ? { display: "compact" } : {}),
+      ...(node.data?.lifecycle ? { lifecycle: node.data.lifecycle } : {}),
+      ...(node.data?.source ? { source: node.data.source } : {}),
+      ...(node.data?.status ? { status: node.data.status } : {}),
       ...(!compact ? { desc: node.data?.subtitle } : {}),
-    };
-    return `${"  ".repeat(depth)}${architectureDslName(node.data?.title || node.id)}${architectureDslPropsText(props)}`;
+    });
+    return `${"  ".repeat(depth)}${architectureDslName(dslNameById.get(node.id) || node.data?.title || node.id)}${architectureDslPropsText(props)}`;
   };
   const lines = [
     `title ${architectureDslString(graphTitle)}`,
@@ -1965,11 +2459,17 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   if (groupPath.length) lines.push(`folder ${architectureDslString(groupPath.join(" / "))}`);
   lines.push("");
   const emitGroup = (group, depth = 0) => {
-    lines.push(`${"  ".repeat(depth)}${architectureDslName(group.data?.title || group.id)}${architectureDslPropsText({
-      icon: group.data?.icon || "box",
-      color: group.data?.color,
+    const intent = architectureGroupIntent(group.data?.intent);
+    lines.push(`${"  ".repeat(depth)}${architectureDslName(dslNameById.get(group.id) || group.data?.title || group.id)}${architectureDslPropsText(architecturePropsWithOrderedOverrides(group.data?.semanticProps, {
+      icon: group.data?.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "box",
+      color: group.data?.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
+      intent,
+      ...(dslLabelById.has(group.id) ? { label: dslLabelById.get(group.id) } : {}),
+      ...(group.data?.scope ? { scope: group.data.scope } : {}),
+      ...(group.data?.owner ? { owner: group.data.owner } : {}),
+      ...(group.data?.status ? { status: group.data.status } : {}),
       desc: group.data?.subtitle,
-    })} {`);
+    }))} {`);
     const children = childrenByParent.get(group.id) || [];
     children.filter((child) => child.type === "architectureGroup").forEach((childGroup) => emitGroup(childGroup, depth + 1));
     children.filter((child) => child.type !== "architectureGroup").forEach((child) => lines.push(lineForNode(child, depth + 1)));
@@ -1983,12 +2483,19 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     .filter((node) => node.type !== "architectureGroup")
     .forEach((node) => lines.push(lineForNode(node, 0)));
   if (edges.length) lines.push("");
-  const titleById = new Map(nodes.map((node) => [node.id, node.data?.title || node.id]));
   edges.forEach((edge) => {
-    const source = architectureDslName(titleById.get(edge.source) || edge.source);
-    const target = architectureDslName(titleById.get(edge.target) || edge.target);
+    const source = architectureDslName(dslNameById.get(edge.source) || edge.source);
+    const target = architectureDslName(dslNameById.get(edge.target) || edge.target);
     const label = text(edge.data?.label);
-    lines.push(`${source} > ${target}${label ? `: ${label}` : ""}`);
+    const role = architectureEdgeRole(edge.data?.role || edge.data?.kind);
+    const props = architecturePropsWithOrderedOverrides(edge.data?.semanticProps, {
+      role,
+      ...(edge.data?.condition ? { condition: edge.data.condition } : {}),
+      ...(edge.data?.event ? { event: edge.data.event } : {}),
+      ...(edge.data?.criticality ? { criticality: edge.data.criticality } : {}),
+    });
+    const labelWithProps = `${label}${architectureDslPropsText(props)}`.trim();
+    lines.push(`${source} ${architectureEdgeConnectorForRole(role, edge.data?.kind)} ${target}${labelWithProps ? `: ${labelWithProps}` : ""}`);
   });
   return `${lines.join("\n").replace(/\n{3,}/gu, "\n\n").trim()}\n`;
 }
@@ -2004,6 +2511,8 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       const isGroup = node.type === "architectureGroup";
       const display = architectureNodeDisplayMode(node.data || {}, isGroup);
       const compact = display === "compact";
+      const intent = isGroup ? architectureGroupIntent(node.data?.intent) : "";
+      const role = !isGroup ? architectureNodeRole(node.data?.role || node.data?.kind) : "";
       return {
         id: node.id,
         title: text(node.data?.title, isGroup ? "Group" : "Node"),
@@ -2012,7 +2521,19 @@ function architectureGraphFromFlow(graph, nodes, edges) {
         color: text(node.data?.color),
         kind: isGroup ? "group" : text(node.data?.kind, "service"),
         type: isGroup ? "group" : "node",
-        ...(!isGroup ? { display } : {}),
+        semanticProps: architectureCleanDslProps(node.data?.semanticProps),
+        ...(isGroup ? {
+          intent,
+          owner: text(node.data?.owner),
+          scope: text(node.data?.scope),
+          status: text(node.data?.status),
+        } : {
+          display,
+          lifecycle: text(node.data?.lifecycle),
+          role,
+          source: text(node.data?.source),
+          status: text(node.data?.status),
+        }),
         position: {
           x: Math.round(numberValue(node.position?.x, 0)),
           y: Math.round(numberValue(node.position?.y, 0)),
@@ -2034,8 +2555,13 @@ function architectureGraphFromFlow(graph, nodes, edges) {
       id: edge.id,
       source: edge.source,
       target: edge.target,
+      condition: text(edge.data?.condition),
+      criticality: text(edge.data?.criticality),
+      event: text(edge.data?.event),
       label: text(edge.data?.label),
       kind: text(edge.data?.kind, "calls"),
+      role: architectureEdgeRole(edge.data?.role || edge.data?.kind),
+      semanticProps: architectureCleanDslProps(edge.data?.semanticProps),
     })),
     layout: {
       ...(jsonObject(graph?.layout) || {}),
@@ -2078,6 +2604,199 @@ function architectureExpandParentNodesForChild(nodes, parentId, childPosition, c
   }
 
   return nextNodes;
+}
+
+function architectureCreateSemanticSliceFlow(intentValue = "architecture", options = {}) {
+  const intent = architectureGroupIntent(intentValue);
+  const template = ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES[intent]
+    || ARCHITECTURE_SEMANTIC_SLICE_TEMPLATES.architecture;
+  const index = numberValue(options.index, 0);
+  const groupId = architectureEntityId(`group-${intent}`);
+  const groupWidth = 650;
+  const groupHeight = intent === "control-graph" ? 430 : 340;
+  const rootPosition = {
+    x: 110 + (index % 3) * 48,
+    y: 90 + Math.floor(index / 3) * 44,
+  };
+  const nodeIdByTemplateId = new Map();
+  const nodes = [
+    {
+      id: groupId,
+      type: "architectureGroup",
+      position: rootPosition,
+      style: { height: groupHeight, width: groupWidth },
+      data: {
+        color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
+        icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group",
+        intent,
+        kind: "group",
+        semanticProps: {
+          color: template.color || ARCHITECTURE_GROUP_INTENT_COLORS[intent],
+          desc: template.subtitle,
+          icon: template.icon || ARCHITECTURE_GROUP_INTENT_ICONS[intent] || "group",
+          intent,
+        },
+        subtitle: template.subtitle,
+        title: template.title,
+      },
+    },
+  ];
+  template.nodes.forEach((templateNode) => {
+    const id = architectureEntityId(`${intent}-${templateNode.id}`);
+    const role = architectureNodeRole(templateNode.role);
+    const display = text(templateNode.display);
+    nodeIdByTemplateId.set(templateNode.id, id);
+    nodes.push({
+      id,
+      type: "architectureNode",
+      parentId: groupId,
+      extent: "parent",
+      position: {
+        x: numberValue(templateNode.x, 58),
+        y: numberValue(templateNode.y, 98),
+      },
+      style: display === "compact" ? {
+        height: ARCHITECTURE_NODE_COMPACT_HEIGHT,
+        width: ARCHITECTURE_NODE_COMPACT_WIDTH,
+      } : undefined,
+      data: {
+        display,
+        icon: templateNode.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || "service",
+        kind: architectureNodeKindFromRole(role, "service"),
+        lifecycle: text(templateNode.lifecycle),
+        role,
+        semanticProps: {
+          ...(templateNode.desc && display !== "compact" ? { desc: templateNode.desc } : {}),
+          ...(display ? { display } : {}),
+          icon: templateNode.icon || ARCHITECTURE_NODE_ROLE_ICONS[role] || "service",
+          ...(templateNode.lifecycle ? { lifecycle: templateNode.lifecycle } : {}),
+          role,
+        },
+        subtitle: display === "compact" ? "" : text(templateNode.desc),
+        title: templateNode.title,
+      },
+    });
+  });
+  const edges = template.edges
+    .map((templateEdge) => {
+      const source = nodeIdByTemplateId.get(templateEdge.source);
+      const target = nodeIdByTemplateId.get(templateEdge.target);
+      if (!source || !target) return null;
+      const role = architectureEdgeRole(templateEdge.role);
+      return {
+        id: architectureEntityId(`edge-${intent}`),
+        source,
+        target,
+        type: "architectureEdge",
+        zIndex: 0,
+        markerEnd: {
+          color: "rgba(125, 211, 252, 0.88)",
+          height: 18,
+          type: MarkerType.ArrowClosed,
+          width: 18,
+        },
+        data: {
+          condition: text(templateEdge.condition),
+          criticality: text(templateEdge.criticality),
+          event: text(templateEdge.event),
+          kind: architectureEdgeKindFromRole(role, "calls"),
+          label: text(templateEdge.label),
+          role,
+          semanticProps: {
+            ...(templateEdge.condition ? { condition: templateEdge.condition } : {}),
+            ...(templateEdge.event ? { event: templateEdge.event } : {}),
+            ...(templateEdge.criticality ? { criticality: templateEdge.criticality } : {}),
+            role,
+          },
+        },
+      };
+    })
+    .filter(Boolean);
+  return { edges, nodes };
+}
+
+function architectureGroupDescendantIds(groupId, nodes) {
+  const childrenByParent = new Map();
+  jsonArray(nodes).forEach((node) => {
+    const parentId = text(node.parentId);
+    if (!parentId) return;
+    if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+    childrenByParent.get(parentId).push(node);
+  });
+  const ids = new Set();
+  const visit = (parentId) => {
+    (childrenByParent.get(parentId) || []).forEach((child) => {
+      if (ids.has(child.id)) return;
+      ids.add(child.id);
+      visit(child.id);
+    });
+  };
+  visit(groupId);
+  return ids;
+}
+
+function architectureValidateSemanticGraph(graph, nodes, edges) {
+  const warnings = [];
+  const nodeById = new Map(jsonArray(nodes).map((node) => [node.id, node]));
+  const edgesBySource = new Map();
+  jsonArray(edges).forEach((edge) => {
+    if (!edgesBySource.has(edge.source)) edgesBySource.set(edge.source, []);
+    edgesBySource.get(edge.source).push(edge);
+  });
+  const groups = jsonArray(nodes).filter((node) => node.type === "architectureGroup");
+  groups.forEach((group) => {
+    const intent = architectureGroupIntent(group.data?.intent);
+    if (!["control-graph", "state-machine", "data-flow", "api-pathway", "dependency-graph"].includes(intent)) return;
+    const descendantIds = architectureGroupDescendantIds(group.id, nodes);
+    const groupNodes = [...descendantIds]
+      .map((id) => nodeById.get(id))
+      .filter((node) => node && node.type !== "architectureGroup");
+    const groupEdges = jsonArray(edges).filter((edge) => descendantIds.has(edge.source) && descendantIds.has(edge.target));
+    const title = text(group.data?.title, architectureGroupIntentLabel(intent));
+    if (!groupNodes.length) {
+      warnings.push(`${title}: add nodes for this ${architectureGroupIntentLabel(intent).toLowerCase()}.`);
+      return;
+    }
+    if (intent === "control-graph" || intent === "state-machine") {
+      const startNodes = groupNodes.filter((node) => text(node.data?.lifecycle) === "start" || text(node.data?.role) === "start");
+      const terminalNodes = groupNodes.filter((node) => text(node.data?.lifecycle) === "terminal" || text(node.data?.role) === "terminal");
+      if (!startNodes.length) warnings.push(`${title}: mark one state as lifecycle start.`);
+      if (!terminalNodes.length) warnings.push(`${title}: mark at least one terminal state.`);
+      const decisionNodes = groupNodes.filter((node) => architectureNodeRole(node.data?.role) === "decision");
+      decisionNodes.forEach((decision) => {
+        const outgoing = groupEdges.filter((edge) => edge.source === decision.id);
+        const unlabeled = outgoing.filter((edge) => !text(edge.data?.label) && !text(edge.data?.condition));
+        if (outgoing.length < 2) warnings.push(`${text(decision.data?.title, "Decision")}: decision should branch to at least two paths.`);
+        if (unlabeled.length) warnings.push(`${text(decision.data?.title, "Decision")}: label or condition each decision edge.`);
+      });
+      if (startNodes.length) {
+        const reachable = new Set(startNodes.map((node) => node.id));
+        const queue = [...reachable];
+        for (let cursor = 0; cursor < queue.length; cursor += 1) {
+          (edgesBySource.get(queue[cursor]) || []).forEach((edge) => {
+            if (!descendantIds.has(edge.target) || reachable.has(edge.target)) return;
+            reachable.add(edge.target);
+            queue.push(edge.target);
+          });
+        }
+        const unreachable = groupNodes.filter((node) => !reachable.has(node.id));
+        if (unreachable.length) warnings.push(`${title}: ${unreachable.length} state/control node${unreachable.length === 1 ? "" : "s"} unreachable from start.`);
+      }
+    }
+    if (intent === "data-flow") {
+      const hasDataEdge = groupEdges.some((edge) => ["reads", "writes", "publishes", "subscribes"].includes(architectureEdgeRole(edge.data?.role || edge.data?.kind)));
+      if (!hasDataEdge) warnings.push(`${title}: use reads/writes/publishes/subscribes edges for the data path.`);
+    }
+    if (intent === "api-pathway") {
+      const hasEndpoint = groupNodes.some((node) => ["api", "endpoint"].includes(architectureNodeRole(node.data?.role || node.data?.kind)));
+      if (!hasEndpoint) warnings.push(`${title}: include an api or endpoint node.`);
+    }
+    if (intent === "dependency-graph") {
+      const hasDepends = groupEdges.some((edge) => architectureEdgeRole(edge.data?.role || edge.data?.kind) === "depends-on");
+      if (!hasDepends) warnings.push(`${title}: use depends-on edges to show dependency direction.`);
+    }
+  });
+  return warnings.slice(0, 8);
 }
 
 function architectureTodoQueueStorageKey(workspaceId) {
@@ -2130,7 +2849,9 @@ function architectureAgentTaskText({
     repoPath ? `Repo: ${repoPath}` : "",
     "",
     "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
-    "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar graph entrypoints: write `User [icon: users, display: compact]` or `AI Agent [icon: ai, display: compact]` and omit `desc` for those compact nodes. Use full cards with `desc` for services, APIs, databases, workers, queues, and important system components.",
+    "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
+    "Preserve semantic props when editing. Groups should use intent. Nodes should use role, lifecycle, source, and status when useful. Edges should use role plus condition, event, and criticality when useful.",
+    "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar graph entrypoints: write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.",
   ].filter(Boolean).join("\n");
 }
 
@@ -2956,6 +3677,7 @@ function ArchitecturesPanel({
   const [draftTitle, setDraftTitle] = useState("Architecture graph");
   const [draftLocationMode, setDraftLocationMode] = useState("root");
   const [draftFolderPath, setDraftFolderPath] = useState("");
+  const [draftGraphTemplate, setDraftGraphTemplate] = useState("system");
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("idle");
 
@@ -3106,6 +3828,7 @@ function ArchitecturesPanel({
   const beginCreateGraph = useCallback((folderPath = "") => {
     const nextFolderPath = text(folderPath);
     setDraftTitle("Architecture graph");
+    setDraftGraphTemplate("system");
     setDraftLocationMode(nextFolderPath ? "folder" : "root");
     setDraftFolderPath(nextFolderPath);
     setCreatingGraph(true);
@@ -3118,6 +3841,7 @@ function ArchitecturesPanel({
     const graph = architectureStarterGraph({
       groupPath,
       kind: "architecture",
+      template: draftGraphTemplate,
       title: draftTitle,
     });
     setSaveState("saving");
@@ -3131,6 +3855,7 @@ function ArchitecturesPanel({
         setSelectedGraphId(result?.graphId || graph.id);
         setCreatingGraph(false);
         setDraftTitle("Architecture graph");
+        setDraftGraphTemplate("system");
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
@@ -3140,7 +3865,7 @@ function ArchitecturesPanel({
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftFolderPath, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath]);
+  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -3287,6 +4012,7 @@ function ArchitecturesPanel({
             <ArchitectureCreateSurface
               canCancel={creatingGraph && Boolean(selectedGraph)}
               draftFolderPath={draftFolderPath}
+              draftGraphTemplate={draftGraphTemplate}
               draftLocationMode={draftLocationMode}
               draftTitle={draftTitle}
               folderSuggestions={folderSuggestions}
@@ -3295,6 +4021,7 @@ function ArchitecturesPanel({
               onCancel={() => setCreatingGraph(false)}
               onCreate={createGraph}
               onDraftFolderPathChange={setDraftFolderPath}
+              onDraftGraphTemplateChange={setDraftGraphTemplate}
               onDraftLocationModeChange={setDraftLocationMode}
               onDraftTitleChange={setDraftTitle}
               repoLabel={repoLabel}
@@ -3320,6 +4047,7 @@ function ArchitecturesPanel({
 function ArchitectureCreateSurface({
   canCancel,
   draftFolderPath,
+  draftGraphTemplate,
   draftLocationMode,
   draftTitle,
   folderSuggestions,
@@ -3328,6 +4056,7 @@ function ArchitectureCreateSurface({
   onCancel,
   onCreate,
   onDraftFolderPathChange,
+  onDraftGraphTemplateChange,
   onDraftLocationModeChange,
   onDraftTitleChange,
   repoLabel,
@@ -3354,6 +4083,17 @@ function ArchitectureCreateSurface({
             placeholder="Auth flow"
             value={draftTitle}
           />
+        </ArchitectureField>
+        <ArchitectureField>
+          <span>Starter</span>
+          <ArchitectureSelect
+            onChange={(event) => onDraftGraphTemplateChange(event.target.value)}
+            value={draftGraphTemplate}
+          >
+            {ARCHITECTURE_GRAPH_TEMPLATE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </ArchitectureSelect>
         </ArchitectureField>
         <ArchitectureField>
           <span>Location</span>
@@ -3442,6 +4182,10 @@ function ArchitectureGraphEditor({
     interactive: routingMode === "interactive",
     routeCache: routeCacheRef.current,
   }), [edges, renderNodes, routingMode]);
+  const semanticWarnings = useMemo(
+    () => architectureValidateSemanticGraph(draftGraph, nodes, edges),
+    [draftGraph, edges, nodes],
+  );
 
   useEffect(() => {
     const nextFlow = architectureGraphToFlow(graph);
@@ -3553,6 +4297,15 @@ function ArchitectureGraphEditor({
     });
     setDirty(true);
   }, [nodes, selectedNodes, setNodes]);
+
+  const addSemanticSlice = useCallback((intent) => {
+    const slice = architectureCreateSemanticSliceFlow(intent, {
+      index: nodes.filter((node) => node.type === "architectureGroup").length,
+    });
+    setNodes((currentNodes) => [...currentNodes, ...slice.nodes]);
+    setEdges((currentEdges) => [...currentEdges, ...slice.edges]);
+    setDirty(true);
+  }, [nodes, setEdges, setNodes]);
 
   const addNode = useCallback(() => {
     const selectedGroup = selectedNodes.find((node) => node.type === "architectureGroup")
@@ -3707,6 +4460,26 @@ function ArchitectureGraphEditor({
           >
             <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
           </ReactFlow>
+          <ArchitectureSliceToolbar aria-label="Add architecture slice">
+            {["api-pathway", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment"].map((intent) => (
+              <ArchitectureSliceButton
+                key={intent}
+                onClick={() => addSemanticSlice(intent)}
+                title={`Add ${architectureGroupIntentLabel(intent)}`}
+                type="button"
+              >
+                {architectureGroupIntentLabel(intent)}
+              </ArchitectureSliceButton>
+            ))}
+          </ArchitectureSliceToolbar>
+          {semanticWarnings.length > 0 && (
+            <ArchitectureValidationPanel title="Semantic graph warnings">
+              <strong>{semanticWarnings.length} warning{semanticWarnings.length === 1 ? "" : "s"}</strong>
+              {semanticWarnings.slice(0, 4).map((warning) => (
+                <span key={warning}>{warning}</span>
+              ))}
+            </ArchitectureValidationPanel>
+          )}
           <ArchitectureFloatingActions>
             <ArchitectureFloatingDangerButton
               disabled={!selectedNodes.length && !selectedEdges.length}
@@ -3759,10 +4532,14 @@ function ArchitectureCanvasNode({ data, selected }) {
   const direction = text(data?.flowDirection, "LR").toUpperCase();
   const display = architectureNodeDisplayMode(data || {});
   const compact = display === "compact";
+  const role = architectureNodeRole(data?.role || data?.kind);
+  const lifecycle = architectureSemanticSlug(data?.lifecycle);
   return (
     <ArchitectureCanvasNodeShell
       data-display={display}
       data-kind={text(data?.kind, "service")}
+      data-lifecycle={lifecycle}
+      data-role={role}
       data-selected={selected ? "true" : "false"}
     >
       <Handle position={architectureTargetHandlePosition(direction)} type="target" />
@@ -3776,7 +4553,7 @@ function ArchitectureCanvasNode({ data, selected }) {
       </ArchitectureNodeIcon>
       <ArchitectureNodeText>
         <strong>{text(data?.title, "Node")}</strong>
-        {!compact && <span>{text(data?.subtitle, architectureKindLabel(data?.kind))}</span>}
+        {!compact && <span>{text(data?.subtitle, role.replace(/[-_]+/gu, " "))}</span>}
       </ArchitectureNodeText>
       <Handle position={architectureSourceHandlePosition(direction)} type="source" />
     </ArchitectureCanvasNodeShell>
@@ -3787,8 +4564,9 @@ function ArchitectureCanvasGroup({ data, selected }) {
   const icon = useArchitectureIcon(data?.icon, "group", data?.title);
   const IconComponent = icon.Icon;
   const direction = text(data?.flowDirection, "LR").toUpperCase();
+  const intent = architectureGroupIntent(data?.intent);
   return (
-    <ArchitectureCanvasGroupShell data-selected={selected ? "true" : "false"}>
+    <ArchitectureCanvasGroupShell data-intent={intent} data-selected={selected ? "true" : "false"}>
       <Handle position={architectureTargetHandlePosition(direction)} type="target" />
       <ArchitectureGroupHeader>
         <ArchitectureNodeIcon
@@ -3801,7 +4579,7 @@ function ArchitectureCanvasGroup({ data, selected }) {
         </ArchitectureNodeIcon>
         <ArchitectureGroupText>
           <strong>{text(data?.title, "Group")}</strong>
-          <span>{text(data?.subtitle, "Architecture group")}</span>
+          <span>{text(data?.subtitle, architectureGroupIntentLabel(intent))}</span>
         </ArchitectureGroupText>
       </ArchitectureGroupHeader>
       <Handle position={architectureSourceHandlePosition(direction)} type="source" />
@@ -5321,6 +6099,25 @@ function architectureOrthogonalEdgePath({
   ];
 }
 
+function architectureEdgeStrokeColor(role, selected = false) {
+  if (selected) return "rgba(251, 191, 36, 0.95)";
+  const edgeRole = architectureEdgeRole(role);
+  if (edgeRole === "writes" || edgeRole === "publishes") return "rgba(52, 211, 153, 0.86)";
+  if (edgeRole === "reads" || edgeRole === "subscribes") return "rgba(251, 191, 36, 0.84)";
+  if (edgeRole === "transitions" || edgeRole === "guards") return "rgba(167, 139, 250, 0.88)";
+  if (edgeRole === "depends-on") return "rgba(244, 114, 182, 0.8)";
+  if (edgeRole === "fails-to" || edgeRole === "retries") return "rgba(251, 113, 133, 0.86)";
+  return "rgba(125, 211, 252, 0.8)";
+}
+
+function architectureEdgeStrokeDash(role, kind = "") {
+  const edgeRole = architectureEdgeRole(role || kind);
+  if (edgeRole === "depends-on" || kind === "depends") return "7 5";
+  if (edgeRole === "subscribes" || edgeRole === "guards") return "2 6";
+  if (edgeRole === "retries") return "5 4 1 4";
+  return "0";
+}
+
 function ArchitectureCanvasEdge({
   data,
   id,
@@ -5334,6 +6131,7 @@ function ArchitectureCanvasEdge({
   targetY,
 }) {
   const kind = text(data?.kind, "calls");
+  const role = architectureEdgeRole(data?.role || kind);
   const label = text(data?.label);
   const [edgePath, labelX, labelY, labelPlacement] = architectureOrthogonalEdgePath({
     avoidanceRects: data?.avoidanceRects,
@@ -5357,8 +6155,8 @@ function ArchitectureCanvasEdge({
         markerEnd={markerEnd}
         path={edgePath}
         style={{
-          stroke: selected ? "rgba(251, 191, 36, 0.95)" : "rgba(125, 211, 252, 0.8)",
-          strokeDasharray: kind === "depends" ? "7 5" : kind === "subscribes" ? "2 6" : "0",
+          stroke: architectureEdgeStrokeColor(role, selected),
+          strokeDasharray: architectureEdgeStrokeDash(role, kind),
           strokeLinecap: "round",
           strokeLinejoin: "round",
           strokeWidth: selected ? 3 : 2.2,
@@ -5367,7 +6165,7 @@ function ArchitectureCanvasEdge({
       {label && !labelPlacement?.hidden && (
         <EdgeLabelRenderer>
           <ArchitectureEdgeLabel
-            data-kind={kind}
+            data-kind={role}
             data-orientation={labelPlacement?.orientation || "horizontal"}
             style={{
               transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
@@ -6712,6 +7510,30 @@ const ArchitectureFloatingActions = styled.div`
   }
 `;
 
+const ArchitectureSliceToolbar = styled.div`
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 8;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: min(620px, calc(100% - 220px));
+  pointer-events: auto;
+  opacity: 0.74;
+  transition: opacity 120ms ease;
+
+  ${ArchitectureCanvasViewport}:hover &,
+  &:focus-within {
+    opacity: 1;
+  }
+
+  @media (max-width: 900px) {
+    right: 12px;
+    max-width: calc(100% - 24px);
+  }
+`;
+
 const ArchitectureFloatingButton = styled.button`
   height: 32px;
   padding: 0 12px;
@@ -6733,6 +7555,15 @@ const ArchitectureFloatingButton = styled.button`
   }
 `;
 
+const ArchitectureSliceButton = styled(ArchitectureFloatingButton)`
+  height: 28px;
+  padding: 0 9px;
+  border-color: rgba(125, 211, 252, 0.2);
+  color: rgba(224, 242, 254, 0.9);
+  background: rgba(15, 23, 42, 0.68);
+  font-size: 10px;
+`;
+
 const ArchitectureFloatingDangerButton = styled(ArchitectureFloatingButton)`
   border-color: rgba(251, 113, 133, 0.28);
   color: #fecdd3;
@@ -6743,6 +7574,42 @@ const ArchitectureFloatingPrimaryButton = styled(ArchitectureFloatingButton)`
   border-color: rgba(45, 212, 191, 0.3);
   color: #ccfbf1;
   background: rgba(13, 69, 63, 0.66);
+`;
+
+const ArchitectureValidationPanel = styled.div`
+  position: absolute;
+  left: 12px;
+  bottom: 58px;
+  z-index: 7;
+  display: grid;
+  gap: 4px;
+  width: min(380px, calc(100% - 24px));
+  max-height: 154px;
+  padding: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(251, 191, 36, 0.2);
+  border-radius: 8px;
+  color: rgba(254, 243, 199, 0.86);
+  background: rgba(15, 23, 42, 0.78);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(10px);
+  pointer-events: none;
+
+  strong {
+    color: rgba(254, 249, 195, 0.95);
+    font-size: 11px;
+    font-weight: 920;
+  }
+
+  span {
+    overflow: hidden;
+    color: rgba(253, 230, 138, 0.82);
+    font-size: 10px;
+    font-weight: 760;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 `;
 
 const ArchitectureAgentCommandForm = styled.form`
@@ -6921,6 +7788,31 @@ const ArchitectureCanvasNodeShell = styled.div`
   &[data-kind="queue"] {
     border-color: rgba(167, 139, 250, 0.36);
     background: linear-gradient(180deg, rgba(109, 40, 217, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-role="state"] {
+    border-color: rgba(167, 139, 250, 0.38);
+    background: linear-gradient(180deg, rgba(124, 58, 237, 0.2), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-role="decision"] {
+    border-color: rgba(251, 191, 36, 0.42);
+    background: linear-gradient(180deg, rgba(217, 119, 6, 0.2), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-role="terminal"] {
+    border-color: rgba(251, 113, 133, 0.42);
+    background: linear-gradient(180deg, rgba(190, 18, 60, 0.18), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-role="dependency"],
+  &[data-role="package"] {
+    border-color: rgba(244, 114, 182, 0.34);
+    background: linear-gradient(180deg, rgba(190, 24, 93, 0.16), rgba(15, 23, 42, 0.86));
+  }
+
+  &[data-lifecycle="start"] {
+    box-shadow: inset 0 0 0 1px rgba(52, 211, 153, 0.24), 0 12px 30px rgba(0, 0, 0, 0.22);
   }
 
   &[data-display="compact"],
@@ -7123,6 +8015,48 @@ const ArchitectureCanvasGroupShell = styled.div`
     rgba(15, 23, 42, 0.18);
   box-shadow: inset 0 0 0 1px rgba(248, 250, 252, 0.025);
 
+  &[data-intent="api-pathway"] {
+    border-color: rgba(125, 211, 252, 0.42);
+    background:
+      linear-gradient(180deg, rgba(14, 165, 233, 0.12), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
+  &[data-intent="data-flow"] {
+    border-color: rgba(52, 211, 153, 0.38);
+    background:
+      linear-gradient(180deg, rgba(5, 150, 105, 0.12), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
+  &[data-intent="control-graph"] {
+    border-color: rgba(251, 191, 36, 0.42);
+    background:
+      linear-gradient(180deg, rgba(217, 119, 6, 0.12), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
+  &[data-intent="state-machine"] {
+    border-color: rgba(167, 139, 250, 0.42);
+    background:
+      linear-gradient(180deg, rgba(124, 58, 237, 0.12), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
+  &[data-intent="dependency-graph"] {
+    border-color: rgba(244, 114, 182, 0.38);
+    background:
+      linear-gradient(180deg, rgba(190, 24, 93, 0.1), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
+  &[data-intent="deployment"] {
+    border-color: rgba(45, 212, 191, 0.38);
+    background:
+      linear-gradient(180deg, rgba(13, 148, 136, 0.1), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
   &[data-selected="true"] {
     border-color: rgba(251, 191, 36, 0.68);
     background:
@@ -7202,6 +8136,23 @@ const ArchitectureEdgeLabel = styled.div`
   &[data-kind="subscribes"] {
     border-color: rgba(251, 191, 36, 0.24);
     color: rgba(254, 243, 199, 0.92);
+  }
+
+  &[data-kind="transitions"],
+  &[data-kind="guards"] {
+    border-color: rgba(167, 139, 250, 0.28);
+    color: rgba(237, 233, 254, 0.94);
+  }
+
+  &[data-kind="depends-on"] {
+    border-color: rgba(244, 114, 182, 0.26);
+    color: rgba(251, 207, 232, 0.92);
+  }
+
+  &[data-kind="fails-to"],
+  &[data-kind="retries"] {
+    border-color: rgba(251, 113, 133, 0.28);
+    color: rgba(254, 205, 211, 0.94);
   }
 `;
 

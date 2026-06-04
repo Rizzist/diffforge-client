@@ -14,7 +14,9 @@ Architecture graphs are first-class Diff Forge agent artifacts. They are not gen
 - `.agents/architectures/AGENTS.md` and `.agents/architectures/icon-aliases.json` are generated reference files for agents.
 - In Git workspaces, `.agents/architectures/graphs/*.arch` graph source files are the only visible-root direct-write exception. Code and docs still belong in the assigned worktree/branch root.
 
-When a user asks for an architecture, diagram, system map, deployment view, data flow, auth flow, billing/subscription flow, or subsystem visualization, create or update a `.arch` graph in `.agents/architectures/graphs/`.
+When a user asks for an architecture, diagram, system map, deployment view, data flow, auth flow, billing/subscription flow, control graph, state machine, dependency graph, API pathway, or subsystem visualization, create or update a `.arch` graph in `.agents/architectures/graphs/`.
+
+Architecture graphs are general system graphs. One `.arch` graph may contain multiple connected or disconnected semantic groups: architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem. Do not remove disconnected groups just because they are not connected to the current slice.
 
 ## Agent workflow
 
@@ -25,10 +27,11 @@ Call `coordination-kernel.architecture_context` before architecture, diagram, de
 3. Create a new graph file only when there is no relevant existing graph.
 4. Write nodes and containers first, then edges.
 5. Save the `.arch` file incrementally after each valid block. Diff Forge reloads valid graph source live in the Architecture tab.
-6. Keep titles human-readable. The title, not a separate type field, should explain the graph's purpose.
-7. Use compact actor nodes for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints. Write `User [icon: users, display: compact]` or `AI Agent [icon: ai, display: compact]` and omit `desc` for those compact nodes.
-8. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
-9. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
+6. Keep titles human-readable. The title should explain the graph's purpose; group `intent` should explain each slice's semantics.
+7. Preserve semantic props when editing. Groups use `intent`, `scope`, `owner`, and `status`. Nodes use `role`, `lifecycle`, `source`, and `status`. Edges use `role`, `condition`, `event`, and `criticality`.
+8. Use compact actor nodes for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints. Write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.
+9. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
+10. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
 
 ## DSL syntax
 
@@ -39,27 +42,27 @@ title "MCP Hot-Reload Subsystem Architecture"
 direction right
 folder "workspace mcp / hot reload"
 
-Client Layer [icon: users, color: blue] {
-  AI Agent [icon: ai, display: compact]
-  User API [icon: users, display: compact]
+Client Layer [icon: users, color: blue, intent: api-pathway] {
+  AI Agent [icon: ai, role: actor, display: compact]
+  User API [icon: users, role: actor, display: compact]
 }
 
-Workspace MCP [icon: settings, color: amber] {
-  Router [icon: api, desc: Routes tool calls]
-  Registry [icon: database, desc: Tracks status, tools, config]
-  Lifecycle Manager [icon: worker, desc: Connects, disconnects, reloads]
+Workspace MCP [icon: settings, color: amber, intent: architecture] {
+  Router [icon: api, role: api, desc: Routes tool calls]
+  Registry [icon: database, role: datastore, desc: Tracks status, tools, config]
+  Lifecycle Manager [icon: worker, role: worker, desc: Connects, disconnects, reloads]
 }
 
-Persistence [icon: database, color: purple] {
-  mcp_config.json [icon: file, desc: MCP config file]
-  State Store [icon: database]
+Persistence [icon: database, color: purple, intent: data-flow] {
+  mcp_config.json [icon: file, role: file, desc: MCP config file]
+  State Store [icon: database, role: datastore]
 }
 
-AI Agent > Router: call tool
-User API > Lifecycle Manager: manage
-Router > Registry: lookup
-Registry > mcp_config.json: read/write
-Registry > State Store: persist
+AI Agent > Router: call tool [role: calls]
+User API > Lifecycle Manager: manage [role: calls]
+Router > Registry: lookup [role: reads]
+Registry > mcp_config.json: read/write [role: writes]
+Registry > State Store: persist [role: writes]
 ```
 
 Supported basics:
@@ -67,12 +70,34 @@ Supported basics:
 - `title "Name"` sets the graph title.
 - `folder "Area / Subarea"` nests the graph in the Architecture sidebar.
 - `direction right`, `direction down`, `direction left`, or `direction up` controls layout.
-- `Container [icon: box, color: amber] { ... }` creates a group/container.
-- `Node [icon: api, desc: Short description]` creates a node.
-- `Actor [icon: users, display: compact]` creates an icon + label actor/client node. Omit `desc` on compact nodes.
-- `A > B: label` creates a directional edge.
-- `A -- B: label` creates a dependency edge.
-- `A <> B: label` creates bidirectional call edges.
+- `Container [icon: box, color: amber, intent: control-graph] { ... }` creates a typed group/container.
+- `Node [icon: api, role: endpoint, desc: Short description]` creates a semantic node.
+- `Actor [icon: users, role: actor, display: compact]` creates an icon + label actor/client node. Omit `desc` on compact nodes.
+- `A > B: label [role: calls]` creates a directional edge.
+- `A -- B: label [role: depends-on]` creates a dependency edge.
+- `A <> B: label [role: calls]` creates bidirectional call edges.
+- Control/state edges should use `role: transitions`, `role: guards`, `condition: ...`, or `event: ...` when useful.
+
+## Semantic schema
+
+Group intents:
+
+- `architecture`, `api-pathway`, `data-flow`, `control-graph`, `state-machine`, `dependency-graph`, `deployment`, `runtime`, `subsystem`
+
+Node roles:
+
+- `actor`, `service`, `api`, `endpoint`, `controller`, `worker`, `queue`, `datastore`, `cache`, `file`, `external`
+- `state`, `decision`, `action`, `event`, `timer`, `terminal`, `dependency`, `package`
+
+Node lifecycle values:
+
+- `start`, `normal`, `error`, `retry`, `terminal`, `fallback`
+
+Edge roles:
+
+- `calls`, `reads`, `writes`, `publishes`, `subscribes`, `transitions`, `guards`, `depends-on`, `emits`, `retries`, `fails-to`, `resolves-to`
+
+Use these props to make graph meaning durable for humans, the Architecture tab, and future agent edits.
 
 ## Icon naming
 
@@ -107,7 +132,8 @@ If an exact icon is unknown, use the best semantic alias. The graph should still
 - Use compact nodes without descriptions for actors/entrypoints such as User, Customer, Admin, AI Agent, Browser, CLI, or Bot.
 - Use containers for ownership or runtime boundaries, not decoration.
 - Prefer readable labels on important edges.
-- Avoid overloading one graph. Split deployment, auth flow, billing flow, and subsystem internals into separate graphs when needed.
+- A single graph may contain multiple semantic groups, connected or disconnected. Split into separate graph files only when the scope is genuinely separate.
+- For control graphs and state machines, include a start lifecycle, terminal states, and labels/conditions on decision branches.
 - Architecture files are for humans and agents: optimize for understanding, debugging, and future planning.
 "##;
 
@@ -118,8 +144,15 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
   "notes": [
     "Use simple aliases first. The renderer resolves LikeC4 icons, styled-icons simple-icons, and semantic fallbacks.",
     "When a node or container title names a real provider, product, framework, cloud service, database, or company, prefer that exact lowercase slug as the icon alias.",
-    "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service. The renderer also tries to infer installed package icons from titles when a generic fallback is used."
+    "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service. The renderer also tries to infer installed package icons from titles when a generic fallback is used.",
+    "Architecture graphs are general system graphs. Use group intent, node role, and edge role props to preserve meaning across agent edits and visual saves."
   ],
+  "semanticSchema": {
+    "groupIntents": ["architecture", "api-pathway", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment", "runtime", "subsystem"],
+    "nodeRoles": ["actor", "service", "api", "endpoint", "controller", "worker", "queue", "datastore", "cache", "file", "external", "state", "decision", "action", "event", "timer", "terminal", "dependency", "package"],
+    "nodeLifecycle": ["start", "normal", "error", "retry", "terminal", "fallback"],
+    "edgeRoles": ["calls", "reads", "writes", "publishes", "subscribes", "transitions", "guards", "depends-on", "emits", "retries", "fails-to", "resolves-to"]
+  },
   "packageResolution": {
     "likec4": "Any installed @likec4/icons slug in aws, azure, gcp, tech, or bootstrap can be used, for example appwrite, appwrite-icon, aws:s3, gcp:cloud-run, or azure:functions.",
     "styledSimpleIcons": "Any installed @styled-icons/simple-icons brand/component can be used by simple slug, for example appwrite, cockroachlabs, vercel, react, stripe, or supabase.",
@@ -139,12 +172,17 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "flow",
     "folder",
     "group",
+    "decision",
+    "dependency",
+    "event",
     "queue",
     "router",
+    "schema",
     "security",
     "server",
     "service",
     "settings",
+    "state",
     "storage",
     "subscription",
     "terminal",
@@ -217,13 +255,18 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "vercel"
   ],
   "examples": [
-    "User [icon: users, display: compact]",
-    "AI Agent [icon: ai, display: compact]",
+    "User [icon: users, role: actor, display: compact]",
+    "AI Agent [icon: ai, role: actor, display: compact]",
     "Appwrite [icon: appwrite, desc: Backend-as-a-service platform]",
-    "API [icon: api, desc: Request handling]",
-    "Object Store [icon: aws:s3, desc: Stores uploads]",
-    "CockroachDB [icon: cockroachdb, desc: Durable SQL state]",
-    "GitHub Actions [icon: github-actions, desc: CI pipeline]"
+    "API Pathway [icon: api, intent: api-pathway] { ... }",
+    "Decision [icon: router, role: decision, desc: Branch condition]",
+    "Idle [icon: flow, role: state, lifecycle: start]",
+    "Done [icon: security, role: terminal, lifecycle: terminal]",
+    "API > Store: persist [role: writes]",
+    "Decision > Retry: retry [role: guards, condition: recoverable]",
+    "Object Store [icon: aws:s3, role: datastore, desc: Stores uploads]",
+    "CockroachDB [icon: cockroachdb, role: datastore, desc: Durable SQL state]",
+    "GitHub Actions [icon: github-actions, role: service, desc: CI pipeline]"
   ]
 }
 "##;
@@ -254,6 +297,7 @@ struct ArchitectureGraphSummary {
     title: String,
     kind: String,
     group_path: Vec<String>,
+    group_intents: Vec<String>,
     node_count: usize,
     edge_count: usize,
     created_at: String,
@@ -535,6 +579,90 @@ fn architecture_source_counts(source: &str) -> (usize, usize) {
     (node_count, edge_count)
 }
 
+fn architecture_semantic_slug(value: &str) -> String {
+    architecture_slug(&value.replace('_', "-"))
+}
+
+fn architecture_parse_dsl_props(value: &str) -> HashMap<String, String> {
+    let trimmed = value.trim();
+    let Some(open_index) = trimmed.rfind('[') else {
+        return HashMap::new();
+    };
+    let Some(close_index) = trimmed.rfind(']') else {
+        return HashMap::new();
+    };
+    if close_index <= open_index {
+        return HashMap::new();
+    }
+    let props_text = &trimmed[open_index + 1..close_index];
+    let mut props = HashMap::new();
+    for part in props_text.split(',') {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = architecture_unquote(value.trim());
+        if !key.is_empty() && !value.is_empty() {
+            props.insert(key.to_string(), value);
+        }
+    }
+    props
+}
+
+fn architecture_source_group_intents(source: &str) -> Vec<String> {
+    let mut intents = HashSet::new();
+    for line in source.lines().map(architecture_clean_line) {
+        if !line.ends_with('{') {
+            continue;
+        }
+        let group_line = line.trim_end_matches('{').trim();
+        let props = architecture_parse_dsl_props(group_line);
+        let Some(intent) = props
+            .get("intent")
+            .or_else(|| props.get("view"))
+            .or_else(|| props.get("kind"))
+            .or_else(|| props.get("type"))
+            .map(|value| architecture_semantic_slug(value))
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        intents.insert(intent);
+    }
+    let mut intents: Vec<String> = intents.into_iter().collect();
+    intents.sort();
+    intents
+}
+
+fn architecture_graph_value_group_intents(graph: &Value) -> Vec<String> {
+    let mut intents = HashSet::new();
+    if let Some(nodes) = graph.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            let is_group = node
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| node.get("kind").and_then(Value::as_str))
+                .map(|value| value == "group")
+                .unwrap_or(false);
+            if !is_group {
+                continue;
+            }
+            if let Some(intent) = node
+                .get("intent")
+                .or_else(|| node.get("view"))
+                .and_then(Value::as_str)
+                .map(architecture_semantic_slug)
+                .filter(|value| !value.is_empty())
+            {
+                intents.insert(intent);
+            }
+        }
+    }
+    let mut intents: Vec<String> = intents.into_iter().collect();
+    intents.sort();
+    intents
+}
+
 fn architecture_graph_group_path(graph: &Value) -> Vec<String> {
     graph
         .get("groupPath")
@@ -564,6 +692,7 @@ fn architecture_summary_from_arch(path: &Path, fallback_id: &str) -> Option<Arch
     let source = fs::read_to_string(path).ok()?;
     let title = architecture_parse_title(&source, fallback_id);
     let group_path = architecture_parse_group_path(&source);
+    let group_intents = architecture_source_group_intents(&source);
     let (node_count, edge_count) = architecture_source_counts(&source);
     let updated_at = architecture_modified_millis(path);
 
@@ -572,6 +701,7 @@ fn architecture_summary_from_arch(path: &Path, fallback_id: &str) -> Option<Arch
         title,
         kind: "architecture".to_string(),
         group_path,
+        group_intents,
         node_count,
         edge_count,
         created_at: updated_at.clone(),
@@ -635,6 +765,7 @@ fn architecture_graph_summary_from_value(
         title,
         kind,
         group_path: architecture_graph_group_path(graph),
+        group_intents: architecture_graph_value_group_intents(graph),
         node_count,
         edge_count,
         created_at,
@@ -672,6 +803,7 @@ fn architecture_read_arch_graph(path: &Path, graph_id: &str) -> Result<Value, St
         .map_err(|error| format!("Unable to read architecture DSL file: {error}"))?;
     let title = architecture_parse_title(&source, graph_id);
     let group_path = architecture_parse_group_path(&source);
+    let group_intents = architecture_source_group_intents(&source);
     let (node_count, edge_count) = architecture_source_counts(&source);
     let updated_at = architecture_modified_millis(path);
 
@@ -680,6 +812,7 @@ fn architecture_read_arch_graph(path: &Path, graph_id: &str) -> Result<Value, St
         "title": title,
         "kind": "architecture",
         "groupPath": group_path,
+        "groupIntents": group_intents,
         "source": source,
         "sourceFormat": "eraserDsl",
         "version": 2,
@@ -1022,7 +1155,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
     let architecture_root = architecture_agents_root(&repo);
     Ok(json!({
         "kind": "architecture_context",
-        "version": 1,
+        "version": 2,
         "repoPath": workspace_path_display(&repo),
         "architectureRoot": workspace_path_display(&architecture_root),
         "graphsRoot": workspace_path_display(&architecture_root.join("graphs")),
@@ -1033,20 +1166,22 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
         "graphExtension": ".arch",
         "graphs": graphs,
         "contract": {
-            "purpose": "Architecture graphs are repo-scoped Diff Forge artifacts for humans and agents.",
+            "purpose": "Architecture graphs are repo-scoped general system graph artifacts for humans and agents.",
             "preferredMcpTools": [
                 "coordination-kernel.architecture_context",
                 "coordination-kernel.architecture_list",
                 "coordination-kernel.architecture_icon_reference"
             ],
             "workflow": [
-                "Call architecture_context or architecture_list before creating a new architecture.",
+                "Call architecture_context or architecture_list before creating or updating architecture/system graph artifacts.",
                 "Read the closest existing .agents/architectures/graphs/*.arch file directly before modifying a known subsystem.",
                 "Create or update .agents/architectures/graphs/*.arch with normal file edits using the eraser-like DSL.",
+                "One .arch graph may contain connected or disconnected groups for architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
+                "Preserve group intent, node role/lifecycle/source/status, and edge role/condition/event/criticality props when editing.",
                 "Write containers and nodes first, then edges, and save the file incrementally so the Architecture tab updates live.",
                 "Use architecture_icon_reference when choosing cloud, tech, company, product, framework, or semantic icon aliases.",
                 "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks.",
-                "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints: `User [icon: users, display: compact]`; omit desc on compact nodes."
+                "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints: `User [icon: users, role: actor, display: compact]`; omit desc on compact nodes."
             ],
             "doNotCreateUnlessExplicitlyRequested": [
                 "ARCHITECTURE.md",
@@ -1057,19 +1192,81 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
                 "SVG"
             ]
         },
+        "semanticSchema": {
+            "groupIntents": [
+                "architecture",
+                "api-pathway",
+                "data-flow",
+                "control-graph",
+                "state-machine",
+                "dependency-graph",
+                "deployment",
+                "runtime",
+                "subsystem"
+            ],
+            "nodeRoles": [
+                "actor",
+                "service",
+                "api",
+                "endpoint",
+                "controller",
+                "worker",
+                "queue",
+                "datastore",
+                "cache",
+                "file",
+                "external",
+                "state",
+                "decision",
+                "action",
+                "event",
+                "timer",
+                "terminal",
+                "dependency",
+                "package"
+            ],
+            "nodeLifecycle": [
+                "start",
+                "normal",
+                "error",
+                "retry",
+                "terminal",
+                "fallback"
+            ],
+            "edgeRoles": [
+                "calls",
+                "reads",
+                "writes",
+                "publishes",
+                "subscribes",
+                "transitions",
+                "guards",
+                "depends-on",
+                "emits",
+                "retries",
+                "fails-to",
+                "resolves-to"
+            ],
+            "validationHints": [
+                "control-graph and state-machine groups should have a start lifecycle, terminal states, and labeled decision branches",
+                "data-flow groups should use reads, writes, publishes, or subscribes edges",
+                "dependency-graph groups should use depends-on edges"
+            ]
+        },
         "dsl": {
             "title": "title \"Human-readable graph name\"",
             "folder": "folder \"Area / Subarea\"",
             "direction": "direction right | down | left | up",
-            "container": "Runtime Boundary [icon: cloud, color: blue] { ... }",
-            "node": "API [icon: api, desc: Request handling]",
-            "compactNode": "User [icon: users, display: compact]",
+            "container": "Runtime Boundary [icon: cloud, color: blue, intent: deployment] { ... }",
+            "node": "API [icon: api, role: endpoint, desc: Request handling]",
+            "compactNode": "User [icon: users, role: actor, display: compact]",
             "edges": [
-                "Client > API: request",
-                "API -- Database: dependency",
-                "API <> Worker: bidirectional"
+                "Client > API: request [role: calls]",
+                "API -- Database: dependency [role: depends-on]",
+                "Decision > Retry: retry [role: guards, condition: recoverable]",
+                "Idle > Active: start [role: transitions, event: start]"
             ],
-            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nClient [icon: users, display: compact]\nAPI [icon: api, desc: Handles requests]\nDatabase [icon: database]\n\nClient > API: request\nAPI > Database: read/write"
+            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nAPI Pathway [icon: api, intent: api-pathway] {\n  Client [icon: users, role: actor, display: compact]\n  API [icon: api, role: endpoint, desc: Handles requests]\n  Database [icon: database, role: datastore]\n}\n\nClient > API: request [role: calls]\nAPI > Database: read/write [role: writes]"
         }
     }))
 }
