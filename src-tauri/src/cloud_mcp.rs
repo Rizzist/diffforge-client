@@ -2857,7 +2857,12 @@ async fn cloud_mcp_fetch_direct_route_async(
     team_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
-    let body = json!({"requestedPath": endpoint_path});
+    let body = json!({
+        "requestedPath": endpoint_path,
+        "billingScopeType": billing_scope_type,
+        "scopeType": billing_scope_type,
+        "teamId": team_id,
+    });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .build()
@@ -12227,7 +12232,12 @@ fn cloud_mcp_fetch_direct_route_blocking(
     team_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
-    let body = json!({"requestedPath": endpoint_path});
+    let body = json!({
+        "requestedPath": endpoint_path,
+        "billingScopeType": billing_scope_type,
+        "scopeType": billing_scope_type,
+        "teamId": team_id,
+    });
     let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .build()

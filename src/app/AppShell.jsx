@@ -6550,6 +6550,12 @@ export default function App() {
         details: {},
       });
       await syncCloudMcpDesktopSessionToken(session.token, {
+        accountScope: {
+          id: "personal",
+          type: "personal",
+          label: "Personal",
+          teamId: null,
+        },
         flowId: callback.state,
         requireConnected: true,
       });
