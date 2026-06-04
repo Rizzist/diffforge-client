@@ -12,7 +12,6 @@
 import {
   collapseFunctionalRepoPathToCoreRepoPath as collapseWorkspaceFunctionalRepoPathToCoreRepoPath,
   createWorkspacePathAliases,
-  getWorkspaceDisplayRootLabel,
   normalizeWorkspacePathSeparators,
   workspacePathLeaf,
   workspacePathLooksCaseInsensitive,
@@ -56,10 +55,6 @@ function replacementForCoreRepo(coreRepoPath, childPath = "") {
 
 export function collapseFunctionalRepoPathToCoreRepoPath(value) {
   return collapseWorkspaceFunctionalRepoPathToCoreRepoPath(value);
-}
-
-export function getCoreRepoDisplayLabel(value, fallback = "Project") {
-  return getWorkspaceDisplayRootLabel(collapseFunctionalRepoPathToCoreRepoPath(value), fallback);
 }
 
 function regexFlagsForPath(value) {

@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect } from "react";
 
 import { logTerminalDiagnosticDuration, logTerminalDiagnosticEvent } from "./terminalDiagnostics";
 
@@ -757,28 +756,4 @@ export function createTerminalResizeController({
   observer.observe(container);
 
   return controller;
-}
-
-export function useTerminalResizeController(options = {}) {
-  const {
-    enabled = true,
-    containerRef,
-    termRef,
-  } = options;
-
-  useEffect(() => {
-    if (!enabled) {
-      return undefined;
-    }
-
-    const controller = createTerminalResizeController({
-      ...options,
-      container: options.container || containerRef?.current,
-      term: options.term || termRef?.current,
-    });
-
-    return () => {
-      controller?.dispose();
-    };
-  }, [enabled, options.paneId, options.instanceId]);
 }

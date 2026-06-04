@@ -8,16 +8,26 @@ export function parseTerminalStateTimestampMs(value) {
 
 const TERMINAL_ACTIVITY_THINKING_STATES = new Set([
   "busy",
+  "delegating",
   "dispatched",
+  "editing",
   "implementing",
+  "mcp",
   "pending",
   "queued",
   "reasoning",
   "resume_requested",
   "resumed",
   "running",
+  "shell",
+  "subagent",
+  "subagent_completed",
+  "subagent_running",
   "submitted",
   "thinking",
+  "tool",
+  "tool_completed",
+  "tool_running",
   "working",
 ]);
 
@@ -73,10 +83,6 @@ function normalizeActivityText(value, fallback = "") {
     .toLowerCase()
     .replace(/[\s-]+/g, "_");
   return text || fallback;
-}
-
-export function normalizeTerminalActivityStatus(value, fallback = "") {
-  return normalizeActivityText(value, fallback);
 }
 
 export function terminalAgentUsesActivityHooks(agentKind) {

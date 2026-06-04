@@ -453,7 +453,6 @@ import {
   TERMINAL_WEBGL_MAX_DELAY_MS,
   TERMINAL_WEBGL_STAGGER_MS,
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
-  WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT,
   adjustTerminalRowAfterDeletion,
   applyCodexResizeTopArtifactPurge,
   applyTerminalTransientHeaderArtifactCleanup,
@@ -525,7 +524,6 @@ import {
   getNextWorkspaceTerminalInstanceId,
   getPlainDomRect,
   getTerminalAgentColorSlot,
-  getTerminalKeyDebugFields,
   getTerminalPanelRows,
   getTerminalPaneMinSizePercent,
   getTerminalRoleSwitchOptions,
@@ -569,7 +567,6 @@ import {
 export {
   TERMINAL_INPUT_HOT_EVENT,
   WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
-  WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT,
 } from "./terminalCore.js";
 export {
   closeWorkspaceTerminalPane,
@@ -1962,6 +1959,29 @@ function WorkspaceTerminal({
         return;
       }
 
+      const promptSource = String(
+        payload.promptSource
+          || payload.prompt_source
+          || payload.promptEventSource
+          || payload.prompt_event_source
+          || "terminal-prompt-submitted",
+      ).trim();
+      const submittedByActivityHook = promptSource === "activity_hook_user_prompt_submit"
+        || promptSource === "cli_hook_user_prompt_submit";
+      if (listenerState.terminalUsesActivityHooks && !submittedByActivityHook) {
+        logTerminalStatus("frontend.terminal_cli.prompt_submitted_event_ignored", listenerState.getTerminalCliStatusLogBase?.({
+          instanceId: payload.instanceId || payload.instance_id || "",
+          paneId: payloadPaneId,
+          promptEventId: payload.promptEventId || payload.prompt_event_id || "",
+          promptMatch: payload.promptMatch,
+          promptSource,
+          reason: "activity_hook_owns_prompt_acceptance",
+          source: "terminal_prompt_submitted_event",
+          threadId: payloadThreadId || currentThreadId,
+        }) || {});
+        return;
+      }
+
       if (!terminalPromptSubmittedPayloadIsAuthoritative(payload)) {
         logTerminalStatus("frontend.terminal_cli.prompt_submitted_event_ignored", listenerState.getTerminalCliStatusLogBase?.({
           instanceId: payload.instanceId || payload.instance_id || "",
@@ -1977,13 +1997,6 @@ function WorkspaceTerminal({
       }
 
       const promptEventId = String(payload.promptEventId || payload.prompt_event_id || "").trim();
-      const promptSource = String(
-        payload.promptSource
-          || payload.prompt_source
-          || payload.promptEventSource
-          || payload.prompt_event_source
-          || "terminal-prompt-submitted",
-      ).trim();
       const observedPrompt = String(payload.observedPrompt || payload.observed_prompt || "").trim();
       const expectedPrompt = String(payload.expectedPrompt || payload.expected_prompt || "").trim();
       const fallbackPrompt = String(
@@ -4240,10 +4253,8 @@ function WorkspaceTerminal({
     };
 
     window.addEventListener(WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
-    window.addEventListener(WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
     return () => {
       window.removeEventListener(WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
-      window.removeEventListener(WORKSPACE_THREAD_NEW_SESSION_TERMINAL_RESET_EVENT, handleEmptyThreadReset);
     };
   }, [paneId, restartWithEmptyTerminalSession, terminalClosed, terminalIndex, thread?.id, workspace?.id]);
 

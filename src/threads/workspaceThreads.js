@@ -306,6 +306,29 @@ function promptingUserFieldsForTerminalEvent(event = {}, fallback = {}, options 
   return promptingUserFields(value, fallback);
 }
 
+function hookHealthFields(value = {}, fallback = {}) {
+  const sourceValue = value && typeof value === "object" ? value : {};
+  const fallbackValue = fallback && typeof fallback === "object" ? fallback : {};
+  const observedAtMs = Number(
+    sourceValue.hookHealthObservedAtMs
+      || sourceValue.hook_health_observed_at_ms
+      || fallbackValue.hookHealthObservedAtMs
+      || fallbackValue.hook_health_observed_at_ms
+      || 0,
+  );
+  return {
+    hookHealthEvent: cleanText(
+      sourceValue.hookHealthEvent || sourceValue.hook_health_event,
+      fallbackValue.hookHealthEvent || fallbackValue.hook_health_event,
+    ),
+    hookHealthObservedAtMs: Number.isFinite(observedAtMs) && observedAtMs > 0 ? observedAtMs : 0,
+    hookHealthStatus: cleanText(
+      sourceValue.hookHealthStatus || sourceValue.hook_health_status,
+      fallbackValue.hookHealthStatus || fallbackValue.hook_health_status,
+    ),
+  };
+}
+
 function cleanMessageText(value, fallback = "") {
   const text = String(value || "")
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, " ")
@@ -948,7 +971,27 @@ function normalizeMessageCount(value) {
 
 function normalizeThreadActivityStatus(value, fallback = "idle") {
   const status = cleanText(value, fallback).toLowerCase();
-  return ["idle", "thinking"].includes(status) ? status : "idle";
+  return [
+    "delegating",
+    "editing",
+    "error",
+    "failed",
+    "idle",
+    "mcp",
+    "needs_input",
+    "paused",
+    "prompting_user",
+    "running",
+    "shell",
+    "subagent",
+    "subagent_completed",
+    "subagent_running",
+    "thinking",
+    "tool",
+    "tool_completed",
+    "tool_running",
+    "working",
+  ].includes(status) ? status : "idle";
 }
 
 function normalizeThreadTurnState(value, fallback = "") {
@@ -2342,6 +2385,7 @@ function normalizeActiveTerminal(value) {
     inputReady: value.inputReady === true,
     inputReadyAt: cleanText(value.inputReadyAt),
     inputReadyConfidence: cleanText(value.inputReadyConfidence),
+    ...hookHealthFields(value),
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
     ...promptingUserFields(value),
@@ -2389,6 +2433,11 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
         binding.inputReadyConfidence,
         fallback.inputReadyConfidence,
       ),
+    ...(
+      options.stripLiveBindings
+        ? hookHealthFields({ hookHealthEvent: "", hookHealthObservedAtMs: 0, hookHealthStatus: "" })
+        : hookHealthFields(binding, fallback)
+    ),
     ...(
       options.stripLiveBindings
         ? promptingUserFields({ terminalIsPromptingUser: false })
@@ -3283,6 +3332,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
+    ...hookHealthFields(event, existing),
     instanceId: event.instanceId ?? existing.instanceId,
     lastActiveAt: now,
     paneId: event.paneId || existing.paneId,
@@ -3508,6 +3558,7 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       lastActiveAt: now,
       lastMessageAt: options.incrementMessageCount ? now : providerBinding?.lastMessageAt || existing.lastMessageAt,
       messageCount: nextMessageCount,
+      ...hookHealthFields(activeTerminal, providerBinding),
       modelId: cleanModelId(event.modelId || event.model, providerBinding?.modelId),
       modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "user") : providerBinding?.modelSource,
       modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBinding?.modelUpdatedAt || "",
@@ -5185,6 +5236,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...hookHealthFields(event, providerBindings[agentId]),
       ...providerPromptingFields,
       modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
       modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "provider-turn") : providerBindings[agentId].modelSource,
@@ -5210,6 +5262,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...hookHealthFields(event, terminals[terminalKey]),
       ...terminalPromptingFields,
       updatedAt: now,
     };
@@ -5324,6 +5377,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   providerBindings[agentId] = {
     ...previousProviderBinding,
     activityStatus,
+    ...hookHealthFields(event, previousProviderBinding),
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
@@ -5343,6 +5397,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      ...hookHealthFields(event, terminals[terminalKey]),
       ...terminalPromptingFields,
       status: eventStatus || terminals[terminalKey].status,
       updatedAt: now,
@@ -5473,10 +5528,6 @@ export function archiveWorkspaceThread(state, workspaceId, threadId) {
     ...currentState,
     [safeWorkspaceId]: entry,
   };
-}
-
-export function deleteWorkspaceThread(state, workspaceId, threadId) {
-  return archiveWorkspaceThread(state, workspaceId, threadId);
 }
 
 export function toggleWorkspaceThreadPinned(state, workspaceId, threadId) {
@@ -5637,10 +5688,6 @@ export function getWorkspaceThreadProviderBinding(thread, agentId) {
     terminalBinding: thread.currentAgent === safeAgentId ? thread.terminalBinding : null,
     updatedAt: thread.updatedAt,
   });
-}
-
-export function getWorkspaceThreadLatestTurn(thread) {
-  return normalizeThreadLatestTurn(thread?.latestTurn);
 }
 
 export function getWorkspaceThreadTurnState(thread) {

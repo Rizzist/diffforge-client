@@ -254,25 +254,6 @@ const ARCHITECTURE_KIND_OPTIONS = [
   { label: "Data", value: "data" },
 ];
 
-const ARCHITECTURE_NODE_KIND_OPTIONS = [
-  { label: "Service", value: "service" },
-  { label: "Client", value: "client" },
-  { label: "API", value: "api" },
-  { label: "Worker", value: "worker" },
-  { label: "Database", value: "database" },
-  { label: "External", value: "external" },
-  { label: "Queue", value: "queue" },
-];
-
-const ARCHITECTURE_EDGE_KIND_OPTIONS = [
-  { label: "Calls", value: "calls" },
-  { label: "Reads", value: "reads" },
-  { label: "Writes", value: "writes" },
-  { label: "Publishes", value: "publishes" },
-  { label: "Subscribes", value: "subscribes" },
-  { label: "Depends on", value: "depends" },
-];
-
 const ARCHITECTURE_LIKEC4_ICON_MODULES = import.meta.glob("/node_modules/@likec4/icons/{aws,azure,gcp,tech,bootstrap}/*.js");
 const ARCHITECTURE_LIKEC4_ICON_CACHE = new Map();
 const ARCHITECTURE_STYLED_SIMPLE_ICON_MODULES = import.meta.glob([
@@ -1139,11 +1120,6 @@ function architectureKindLabel(value) {
   const raw = text(value, "architecture");
   return ARCHITECTURE_KIND_OPTIONS.find((option) => option.value === raw)?.label
     || raw.replace(/[-_]+/gu, " ");
-}
-
-function architectureGroupPathLabel(value) {
-  const parts = jsonArray(value).map((item) => text(item)).filter(Boolean);
-  return parts.length ? parts.join(" / ") : "General";
 }
 
 function architectureFolderPathParts(value) {
@@ -3912,12 +3888,6 @@ function architectureNodeRect(node, nodeById, positionCache) {
     x: position.x,
     y: position.y,
   };
-}
-
-function architectureRectBelongsToNode(rect, nodeId) {
-  const cleanRectId = text(rect?.id);
-  const cleanNodeId = text(nodeId);
-  return cleanRectId === cleanNodeId || cleanRectId.startsWith(`${cleanNodeId}:`);
 }
 
 function architectureNodeHandlePoint(node, side, nodeById, positionCache) {

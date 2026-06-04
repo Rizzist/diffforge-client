@@ -45,7 +45,7 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
 
   assert.equal(clarification.cues.length, 0);
 
-  const approval = reduceThreadLifecycleNotificationEvent(clarification, {
+  const inferredApproval = reduceThreadLifecycleNotificationEvent(clarification, {
     promptEventId: "prompt-approval",
     promptingUserKind: "approval",
     promptingUserSource: "provider-permission",
@@ -53,6 +53,50 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
     threadId: "thread-1",
     toolUseId: "tool-1",
     type: "provider-turn-started",
+    workspaceId: "workspace-1",
+  });
+
+  assert.equal(inferredApproval.cues.length, 0);
+
+  const observedTool = reduceThreadLifecycleNotificationEvent(inferredApproval, {
+    hookEventName: "PreToolUse",
+    promptingUserKind: "approval",
+    promptingUserSource: "cli-hook:tool-observed",
+    terminalIsPromptingUser: true,
+    threadId: "thread-1",
+    toolUseId: "tool-observed",
+    type: "provider-tool-observed",
+    workspaceId: "workspace-1",
+  });
+
+  assert.equal(observedTool.cues.length, 0);
+
+  const autoTool = reduceThreadLifecycleNotificationEvent(observedTool, {
+    hookEventName: "PreToolUse",
+    manualApprovalRequired: true,
+    manualPromptSource: "hook",
+    permissionDecision: "allow",
+    promptingUserKind: "approval",
+    promptingUserSource: "cli-hook:manual-prompt",
+    terminalIsPromptingUser: true,
+    threadId: "thread-1",
+    toolUseId: "tool-auto",
+    type: "provider-user-prompt-started",
+    workspaceId: "workspace-1",
+  });
+
+  assert.equal(autoTool.cues.length, 0);
+
+  const approval = reduceThreadLifecycleNotificationEvent(autoTool, {
+    manualApprovalRequired: true,
+    manualPromptSource: "hook",
+    promptEventId: "prompt-approval",
+    promptingUserKind: "approval",
+    promptingUserSource: "cli-hook:manual-prompt",
+    terminalIsPromptingUser: true,
+    threadId: "thread-1",
+    toolUseId: "tool-1",
+    type: "provider-user-prompt-started",
     workspaceId: "workspace-1",
   });
 

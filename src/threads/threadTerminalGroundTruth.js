@@ -190,58 +190,6 @@ function explicitPermissionPromptingUserSignal(source) {
   );
 }
 
-export function classifyTerminalUserPrompt(value, source = "text") {
-  const text = cleanPromptingText(value);
-  if (!text) {
-    return emptyPromptingUserSignal();
-  }
-
-  const lower = text.toLowerCase();
-  if (
-    /\bselect\s+(?:model|reasoning|effort)\b/.test(lower)
-    || /\bpress\s+enter\s+to\s+confirm\b/.test(lower) && /\besc(?:ape)?\b/.test(lower)
-  ) {
-    return promptingUserSignal("terminal-control", source, text, "terminal-control");
-  }
-
-  if (
-    /\bapproval\s+(?:required|requested|needed)\b/.test(lower)
-    || /\bawaiting\s+approval\b/.test(lower)
-    || /\bapprove\s+or\s+(?:deny|reject)\b/.test(lower)
-  ) {
-    return promptingUserSignal("approval", source, text, "approval");
-  }
-
-  if (
-    /\b(permission|authorization)\b.{0,80}\?/.test(lower)
-    || /\b(?:allow|deny|grant)\b.{0,80}\?/.test(lower)
-    || /\b(?:allow|deny)\s+(?:this|the)\b/.test(lower)
-  ) {
-    return promptingUserSignal("permission", source, text, "permission");
-  }
-
-  if (
-    /\b(?:continue|proceed|confirm)\s*\?/.test(lower)
-    || /\b(?:yes|no)\b\s*[\/|]\s*\b(?:yes|no)\b/.test(lower)
-    || /(?:\[[yn]\/[yn]\]|\([yn]\/[yn]\))/.test(lower)
-    || /\bpress\s+enter\s+to\s+(?:continue|confirm|proceed)\b/.test(lower)
-  ) {
-    return promptingUserSignal("confirmation", source, text, "confirmation");
-  }
-
-  if (
-    /\b(?:choose|select|pick)\s+(?:one|an option|which|a)\b/.test(lower)
-    || /\b(?:which|what)\s+(?:option|approach|file|workspace|branch|model)\b/.test(lower)
-    || /\b(?:please\s+provide|need\s+(?:your\s+)?input|needs\s+(?:your\s+)?input|waiting\s+for\s+(?:your\s+)?input)\b/.test(lower)
-    || /\b(?:can you clarify|could you clarify|please clarify)\b/.test(lower)
-    || /\b(?:do you want|would you like|should i)\b.{0,160}\?/.test(lower)
-  ) {
-    return promptingUserSignal("clarification", source, text, "clarification");
-  }
-
-  return emptyPromptingUserSignal();
-}
-
 function messageText(message) {
   if (!message || typeof message !== "object") {
     return "";

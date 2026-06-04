@@ -1209,7 +1209,38 @@ fn claude_write_authority_guard_settings(
                     ]
                 }
             ],
+            "Error": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "Interrupt": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
             "PreToolUse": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                },
                 {
                     "matcher": "Edit|Write|NotebookEdit",
                     "hooks": [
@@ -1225,6 +1256,39 @@ fn claude_write_authority_guard_settings(
                         {
                             "type": "command",
                             "command": guard_command
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "SubagentStop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
                         }
                     ]
                 }
@@ -1532,9 +1596,8 @@ fn refresh_codex_activity_hook_profile_for_terminal(
         terminal_index,
     );
     let replaced = replace_activity_hook_commands_in_json(&mut hooks_json, scoped_command.as_str());
-    let removed = remove_codex_non_lifecycle_activity_hooks(&mut hooks_json);
-    let added = ensure_codex_lifecycle_activity_hooks(&mut hooks_json, scoped_command.as_str());
-    let mut updated = replaced > 0 || removed > 0 || added > 0;
+    let added = ensure_codex_activity_hooks(&mut hooks_json, scoped_command.as_str());
+    let mut updated = replaced > 0 || added > 0;
     if !json_file_matches_local(&hooks_path, &hooks_json) {
         let body = serde_json::to_vec_pretty(&hooks_json).map_err(|error| {
             format!(
@@ -1635,7 +1698,7 @@ fn replace_activity_hook_commands_in_json(value: &mut Value, scoped_command: &st
     }
 }
 
-fn ensure_codex_lifecycle_activity_hooks(value: &mut Value, scoped_command: &str) -> usize {
+fn ensure_codex_activity_hooks(value: &mut Value, scoped_command: &str) -> usize {
     let Some(root) = value.as_object_mut() else {
         return 0;
     };
@@ -1645,7 +1708,16 @@ fn ensure_codex_lifecycle_activity_hooks(value: &mut Value, scoped_command: &str
     };
 
     let mut added = 0usize;
-    for event_name in ["UserPromptSubmit", "Stop"] {
+    for event_name in [
+        "UserPromptSubmit",
+        "Stop",
+        "Error",
+        "Interrupt",
+        "PreToolUse",
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+    ] {
         let entry = hooks
             .entry(event_name)
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -1759,48 +1831,6 @@ fn hook_entry_contains_activity_command(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(hook_entry_contains_activity_command),
         _ => false,
     }
-}
-
-fn remove_codex_non_lifecycle_activity_hooks(value: &mut Value) -> usize {
-    let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return 0;
-    };
-
-    let mut removed = 0usize;
-    for event_name in ["PreToolUse", "PostToolUse", "SubagentStart", "SubagentStop"] {
-        let Some(entries) = hooks.get_mut(event_name).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for entry in entries.iter_mut() {
-            let Some(hook_entries) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            let before = hook_entries.len();
-            hook_entries.retain(|hook| !hook_entry_contains_activity_command(hook));
-            removed += before.saturating_sub(hook_entries.len());
-        }
-        entries.retain(|entry| {
-            entry
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|hook_entries| !hook_entries.is_empty())
-        });
-    }
-
-    let empty_events = hooks
-        .iter()
-        .filter_map(|(event_name, entries)| {
-            entries
-                .as_array()
-                .is_some_and(Vec::is_empty)
-                .then(|| event_name.clone())
-        })
-        .collect::<Vec<_>>();
-    for event_name in empty_events {
-        hooks.remove(&event_name);
-    }
-
-    removed
 }
 
 fn json_file_matches_local(path: &Path, value: &Value) -> bool {
@@ -2017,6 +2047,14 @@ fn diff_forge_activity_hook_record(
             .unwrap_or_default()
             .to_string()
     };
+    let hook_bool = |keys: &[&str]| -> bool {
+        keys.iter()
+            .any(|key| hook_input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    };
+    let tool_bool = |keys: &[&str]| -> bool {
+        keys.iter()
+            .any(|key| tool_input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    };
     let first_string = |values: Vec<String>| -> String {
         values
             .into_iter()
@@ -2057,9 +2095,59 @@ fn diff_forge_activity_hook_record(
         hook_string(&["prompt", "user_prompt", "userPrompt", "message"]),
         tool_string(&["prompt", "description"]),
     ]);
-    let tool_name = hook_string(&["tool_name", "toolName"]);
-    let tool_use_id = hook_string(&["tool_use_id", "toolUseId"]);
+    let tool_name = first_string(vec![
+        hook_string(&["tool_name", "toolName"]),
+        tool_string(&["tool_name", "toolName"]),
+    ]);
+    let tool_use_id = first_string(vec![
+        hook_string(&["tool_use_id", "toolUseId"]),
+        tool_string(&["tool_use_id", "toolUseId"]),
+    ]);
     let command = tool_string(&["command"]);
+    let approval_id = first_string(vec![
+        hook_string(&["approval_id", "approvalId"]),
+        tool_string(&["approval_id", "approvalId"]),
+    ]);
+    let permission_prompt_id = first_string(vec![
+        hook_string(&["permission_prompt_id", "permissionPromptId"]),
+        tool_string(&["permission_prompt_id", "permissionPromptId"]),
+    ]);
+    let permission_request_id = first_string(vec![
+        hook_string(&["permission_request_id", "permissionRequestId"]),
+        tool_string(&["permission_request_id", "permissionRequestId"]),
+    ]);
+    let permission_status = first_string(vec![
+        hook_string(&["permission_status", "permissionStatus"]),
+        tool_string(&["permission_status", "permissionStatus"]),
+    ]);
+    let permission_decision = first_string(vec![
+        hook_string(&["permission_decision", "permissionDecision", "decision"]),
+        tool_string(&["permission_decision", "permissionDecision", "decision"]),
+    ]);
+    let approval_status = first_string(vec![
+        hook_string(&["approval_status", "approvalStatus"]),
+        tool_string(&["approval_status", "approvalStatus"]),
+    ]);
+    let prompting_user_kind = first_string(vec![
+        hook_string(&["prompting_user_kind", "promptingUserKind", "prompting_kind", "promptingKind"]),
+        tool_string(&["prompting_user_kind", "promptingUserKind", "prompting_kind", "promptingKind"]),
+    ]);
+    let prompting_user_source = first_string(vec![
+        hook_string(&["prompting_user_source", "promptingUserSource", "prompting_source", "promptingSource"]),
+        tool_string(&["prompting_user_source", "promptingUserSource", "prompting_source", "promptingSource"]),
+    ]);
+    let prompting_user_text = first_string(vec![
+        hook_string(&["prompting_user_text", "promptingUserText", "prompting_text", "promptingText"]),
+        tool_string(&["prompting_user_text", "promptingUserText", "prompting_text", "promptingText"]),
+    ]);
+    let manual_approval_required = hook_bool(&["manual_approval_required", "manualApprovalRequired"])
+        || tool_bool(&["manual_approval_required", "manualApprovalRequired"]);
+    let provider_blocked_for_user = hook_bool(&["provider_blocked_for_user", "providerBlockedForUser"])
+        || tool_bool(&["provider_blocked_for_user", "providerBlockedForUser"]);
+    let requires_user_input = hook_bool(&["requires_user_input", "requiresUserInput"])
+        || tool_bool(&["requires_user_input", "requiresUserInput"]);
+    let prompting_user = hook_bool(&["prompting_user", "promptingUser", "terminal_is_prompting_user", "terminalIsPromptingUser"])
+        || tool_bool(&["prompting_user", "promptingUser", "terminal_is_prompting_user", "terminalIsPromptingUser"]);
     json!({
         "timestampMs": current_time_ms(),
         "provider": provider,
@@ -2083,6 +2171,20 @@ fn diff_forge_activity_hook_record(
         "toolName": tool_name,
         "toolUseId": tool_use_id,
         "command": command,
+        "approvalId": approval_id,
+        "permissionPromptId": permission_prompt_id,
+        "permissionRequestId": permission_request_id,
+        "permissionStatus": permission_status,
+        "permissionDecision": permission_decision,
+        "approvalStatus": approval_status,
+        "promptingUserKind": prompting_user_kind,
+        "promptingUserSource": prompting_user_source,
+        "promptingUserText": prompting_user_text,
+        "manualApprovalRequired": manual_approval_required,
+        "providerBlockedForUser": provider_blocked_for_user,
+        "requiresUserInput": requires_user_input,
+        "promptingUser": prompting_user,
+        "terminalIsPromptingUser": prompting_user,
         "description": if description.is_empty() { user_prompt } else { description },
     })
 }
@@ -2105,6 +2207,9 @@ mod terminal_cli_tests {
                 "turnId": "turn-456",
                 "transcriptPath": "/tmp/session.jsonl",
                 "userPrompt": "ship it",
+                "manualApprovalRequired": true,
+                "approvalId": "approval-123",
+                "promptingUserKind": "approval",
                 "toolInput": {
                     "description": "fallback description"
                 }
@@ -2116,6 +2221,9 @@ mod terminal_cli_tests {
         assert_eq!(record["turnId"], "turn-456");
         assert_eq!(record["transcriptPath"], "/tmp/session.jsonl");
         assert_eq!(record["prompt"], "ship it");
+        assert_eq!(record["manualApprovalRequired"], true);
+        assert_eq!(record["approvalId"], "approval-123");
+        assert_eq!(record["promptingUserKind"], "approval");
     }
 }
 
@@ -4590,6 +4698,7 @@ fn kill_login_terminal_child(child: &mut std::process::Child) -> TerminalKillRep
     report
 }
 
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn track_login_terminal_child(mut child: std::process::Child) {
     let children = LOGIN_TERMINAL_CHILDREN.get_or_init(|| StdMutex::new(Vec::new()));
 

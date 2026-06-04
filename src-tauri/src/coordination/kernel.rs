@@ -23401,6 +23401,8 @@ pub(crate) fn codex_managed_hooks_config_toml(hooks_json: &Value) -> String {
     for event_name in [
         "UserPromptSubmit",
         "Stop",
+        "Error",
+        "Interrupt",
         "PreToolUse",
         "PostToolUse",
         "SubagentStart",
@@ -23494,12 +23496,60 @@ fn codex_managed_hooks_config_json(
         )]),
     );
     hooks.insert(
-        "PreToolUse".to_string(),
+        "Error".to_string(),
         Value::Array(vec![codex_managed_command_hook_json(
-            Some("apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command"),
-            &write_guard_hook_command,
-            30,
-            Some("Validating Diff Forge writes"),
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "Interrupt".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "PreToolUse".to_string(),
+        Value::Array(vec![
+            codex_managed_command_hook_json(None, &activity_hook_command, 5, None),
+            codex_managed_command_hook_json(
+                Some("apply_patch|functions.apply_patch|Edit|Write|MultiEdit|NotebookEdit|Bash|Shell|exec_command|functions.exec_command|RunCommand|Command"),
+                &write_guard_hook_command,
+                30,
+                Some("Validating Diff Forge writes"),
+            ),
+        ]),
+    );
+    hooks.insert(
+        "PostToolUse".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "SubagentStart".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
+        )]),
+    );
+    hooks.insert(
+        "SubagentStop".to_string(),
+        Value::Array(vec![codex_managed_command_hook_json(
+            None,
+            &activity_hook_command,
+            5,
+            None,
         )]),
     );
 
@@ -23558,7 +23608,12 @@ fn codex_managed_git_launch_self_test(
         "\".\" = \"write\"",
         "[[hooks.UserPromptSubmit]]",
         "[[hooks.Stop]]",
+        "[[hooks.Error]]",
+        "[[hooks.Interrupt]]",
         "[[hooks.PreToolUse]]",
+        "[[hooks.PostToolUse]]",
+        "[[hooks.SubagentStart]]",
+        "[[hooks.SubagentStop]]",
         "--diff-forge-activity-hook",
         "--diff-forge-write-guard",
         &format!(
@@ -23578,7 +23633,12 @@ fn codex_managed_git_launch_self_test(
     for expected in [
         "\"UserPromptSubmit\"",
         "\"Stop\"",
+        "\"Error\"",
+        "\"Interrupt\"",
         "\"PreToolUse\"",
+        "\"PostToolUse\"",
+        "\"SubagentStart\"",
+        "\"SubagentStop\"",
         "--diff-forge-activity-hook",
         "--diff-forge-write-guard",
         "functions.apply_patch",
@@ -26295,15 +26355,22 @@ APPWRITE_PROJECT_ID = "project"
         )));
         assert!(hooks_json.contains("\"UserPromptSubmit\""));
         assert!(hooks_json.contains("\"Stop\""));
+        assert!(hooks_json.contains("\"Error\""));
+        assert!(hooks_json.contains("\"Interrupt\""));
         assert!(hooks_json.contains("\"PreToolUse\""));
-        assert!(!hooks_json.contains("\"PostToolUse\""));
-        assert!(!hooks_json.contains("\"SubagentStart\""));
-        assert!(!hooks_json.contains("\"SubagentStop\""));
+        assert!(hooks_json.contains("\"PostToolUse\""));
+        assert!(hooks_json.contains("\"SubagentStart\""));
+        assert!(hooks_json.contains("\"SubagentStop\""));
         assert!(hooks_json.contains("--diff-forge-activity-hook"));
         assert!(hooks_json.contains("--diff-forge-write-guard"));
         assert!(config.contains("[[hooks.UserPromptSubmit]]"));
         assert!(config.contains("[[hooks.Stop]]"));
+        assert!(config.contains("[[hooks.Error]]"));
+        assert!(config.contains("[[hooks.Interrupt]]"));
         assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("[[hooks.PostToolUse]]"));
+        assert!(config.contains("[[hooks.SubagentStart]]"));
+        assert!(config.contains("[[hooks.SubagentStop]]"));
         assert!(config.contains("--diff-forge-activity-hook"));
         assert!(config.contains("--diff-forge-write-guard"));
         assert!(!config.contains("[[hooks.user_prompt_submit]]"));
@@ -26335,11 +26402,21 @@ APPWRITE_PROJECT_ID = "project"
             .find("[[hooks.PreToolUse.hooks]]")
             .unwrap();
         assert!(pre_tool_hook_index > 0);
+        assert!(hooks[pre_tool_index..].contains("--diff-forge-activity-hook"));
         assert!(hooks[pre_tool_index..].contains("--diff-forge-write-guard"));
-        assert!(!hooks[pre_tool_index..].contains("--diff-forge-activity-hook"));
-        assert!(!hooks.contains("[[hooks.PostToolUse]]"));
-        assert!(!hooks.contains("[[hooks.SubagentStart]]"));
-        assert!(!hooks.contains("[[hooks.SubagentStop]]"));
+        for event_name in [
+            "Error",
+            "Interrupt",
+            "PostToolUse",
+            "SubagentStart",
+            "SubagentStop",
+        ] {
+            let event_header = format!("[[hooks.{event_name}]]");
+            let event_hook_header = format!("[[hooks.{event_name}.hooks]]");
+            let event_index = hooks.find(&event_header).unwrap();
+            assert!(hooks[event_index..].contains(&event_hook_header));
+            assert!(hooks[event_index..].contains("--diff-forge-activity-hook"));
+        }
         assert!(!hooks.contains("[core]"));
         assert!(!hooks.contains("hooksPath"));
     }

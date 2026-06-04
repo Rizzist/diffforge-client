@@ -212,6 +212,43 @@ test("hook-managed queued prompt releases from provider turn closure", () => {
   assert.equal(evaluation.releaseReason, "provider_turn_closed");
 });
 
+test("hook-managed queued prompt does not accept from matching transcript state", () => {
+  const evaluation = baseEvaluation({
+    hookManaged: true,
+    inFlightPrompt: {
+      accepted: false,
+      itemId: "todo-1",
+      promptId: "todo-drop-prompt-1",
+      promptText: "i want to make some pages",
+      startedAtMs: submittedAtMs,
+      submittedAt,
+      submittedAtMs,
+      terminalInstanceId: 4,
+      threadId: "thread-1",
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.sessionAcceptedByThread, false);
+  assert.equal(evaluation.effectivePromptAccepted, false);
+  assert.equal(evaluation.releaseReason, "");
+});
+
 test("queued prompt does not release when transcript completion belongs to a different prompt", () => {
   const evaluation = baseEvaluation({
     targetThread: {

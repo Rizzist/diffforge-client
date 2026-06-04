@@ -4,7 +4,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     db::StoragePaths,
-    kernel::{api_error, api_ok, CoordinationKernel},
+    kernel::{api_ok, CoordinationKernel},
     mcp, watcher,
 };
 
@@ -1408,11 +1408,6 @@ fn req_text<'a>(input: &'a str, key: &str) -> Result<&'a str, String> {
         return Err(format!("{key} is required."));
     }
     Ok(trimmed)
-}
-
-#[allow(dead_code)]
-fn safe_command_error(error: String) -> Value {
-    api_error("coordination_command_failed", error, json!({}))
 }
 
 #[cfg(test)]

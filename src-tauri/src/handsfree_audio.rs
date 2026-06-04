@@ -444,6 +444,7 @@ fn audio_shortcuts_conflict(left: &str, right: &str) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn audio_shortcut_is_bare_context_menu(shortcut: &str) -> bool {
     audio_shortcuts_conflict(shortcut, "ContextMenu")
 }
@@ -653,6 +654,7 @@ fn audio_push_to_talk_shortcut_for(app: &AppHandle) -> String {
     audio_shortcuts_status_for(app).push_to_talk.shortcut
 }
 
+#[cfg(windows)]
 fn audio_push_to_talk_uses_context_menu(app: &AppHandle) -> bool {
     audio_shortcut_is_bare_context_menu(&audio_push_to_talk_shortcut_for(app))
 }

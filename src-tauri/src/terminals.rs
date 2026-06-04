@@ -7719,6 +7719,202 @@ fn terminal_activity_hook_name_key(value: &str) -> String {
         .collect()
 }
 
+fn terminal_activity_hook_bool(event: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| event.get(*key).and_then(Value::as_bool).unwrap_or(false))
+}
+
+fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
+    terminal_activity_hook_string(event, keys)
+        .map(|value| terminal_activity_hook_name_key(&value))
+}
+
+#[derive(Debug, Clone)]
+struct TerminalActivityHookManualPrompt {
+    kind: String,
+    text: Option<String>,
+    approval_id: Option<String>,
+    permission_prompt_id: Option<String>,
+    permission_request_id: Option<String>,
+}
+
+fn terminal_activity_hook_manual_prompt(
+    hook_event_name: &str,
+    event: &Value,
+) -> Option<TerminalActivityHookManualPrompt> {
+    let hook_key = terminal_activity_hook_name_key(hook_event_name);
+    let manual_event = matches!(
+        hook_key.as_str(),
+        "manualapprovalrequired"
+            | "manualprompt"
+            | "permissionprompt"
+            | "permissionpromptstarted"
+            | "providerblockedforuser"
+            | "userinputrequired"
+            | "userinputrequested"
+            | "userpromptrequired"
+            | "userpromptstarted"
+    );
+    let resolved_decision = terminal_activity_hook_status_key(event, &[
+        "permissionDecision",
+        "permission_decision",
+        "decision",
+        "approvalDecision",
+        "approval_decision",
+    ])
+    .is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            "allow"
+                | "allowed"
+                | "approve"
+                | "approved"
+                | "auto"
+                | "autoallow"
+                | "autoallowed"
+                | "autoapprove"
+                | "autoapproved"
+                | "autodeny"
+                | "autodenied"
+                | "deny"
+                | "denied"
+                | "reject"
+                | "rejected"
+        )
+    });
+    let resolved_status = terminal_activity_hook_status_key(event, &[
+        "permissionStatus",
+        "permission_status",
+        "approvalStatus",
+        "approval_status",
+        "status",
+    ])
+    .is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            "allow"
+                | "allowed"
+                | "approve"
+                | "approved"
+                | "auto"
+                | "autoallow"
+                | "autoallowed"
+                | "autoapprove"
+                | "autoapproved"
+                | "autodeny"
+                | "autodenied"
+                | "deny"
+                | "denied"
+                | "reject"
+                | "rejected"
+                | "resolved"
+        )
+    });
+    if resolved_decision || resolved_status {
+        return None;
+    }
+
+    let pending_status = terminal_activity_hook_status_key(event, &[
+        "permissionStatus",
+        "permission_status",
+        "approvalStatus",
+        "approval_status",
+        "status",
+    ])
+    .is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            "approvalrequired"
+                | "awaitingapproval"
+                | "awaitinginput"
+                | "awaitinguser"
+                | "manualapprovalrequired"
+                | "needsuser"
+                | "needsuserinput"
+                | "pending"
+                | "requested"
+                | "requiresapproval"
+                | "requiresinput"
+                | "requiresuserinput"
+                | "reviewrequested"
+                | "waitingforapproval"
+                | "waitingforuser"
+        )
+    });
+    let explicit_pending = manual_event
+        || pending_status
+        || terminal_activity_hook_bool(event, &[
+            "manualApprovalRequired",
+            "manual_approval_required",
+            "providerBlockedForUser",
+            "provider_blocked_for_user",
+            "requiresUserInput",
+            "requires_user_input",
+            "terminalIsPromptingUser",
+            "terminal_is_prompting_user",
+            "promptingUser",
+            "prompting_user",
+        ]);
+    if !explicit_pending {
+        return None;
+    }
+
+    let approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
+    let permission_prompt_id = terminal_activity_hook_string(event, &[
+        "permissionPromptId",
+        "permission_prompt_id",
+    ]);
+    let permission_request_id = terminal_activity_hook_string(event, &[
+        "permissionRequestId",
+        "permission_request_id",
+    ]);
+    let tool_use_id = terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]);
+    let has_action_token = approval_id.is_some()
+        || permission_prompt_id.is_some()
+        || permission_request_id.is_some()
+        || tool_use_id.is_some();
+    if !manual_event && !has_action_token {
+        return None;
+    }
+
+    let kind = terminal_activity_hook_string(event, &[
+        "promptingUserKind",
+        "prompting_user_kind",
+        "promptingKind",
+        "prompting_kind",
+    ])
+    .map(|value| terminal_activity_hook_name_key(&value))
+    .filter(|value| matches!(value.as_str(), "approval" | "permission"))
+    .unwrap_or_else(|| {
+        if terminal_activity_hook_bool(event, &["manualApprovalRequired", "manual_approval_required"])
+            || hook_key.contains("approval")
+        {
+            "approval".to_string()
+        } else {
+            "permission".to_string()
+        }
+    });
+    let text = terminal_activity_hook_string(event, &[
+        "promptingUserText",
+        "prompting_user_text",
+        "promptingText",
+        "prompting_text",
+        "description",
+        "message",
+        "prompt",
+        "lastMessage",
+        "last_message",
+    ]);
+
+    Some(TerminalActivityHookManualPrompt {
+        kind,
+        text,
+        approval_id,
+        permission_prompt_id,
+        permission_request_id,
+    })
+}
+
 fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
     match terminal_activity_hook_name_key(hook_event_name).as_str() {
         "userpromptsubmit" | "userpromptsubmitted" | "promptsubmit" | "promptsubmitted" => Some((
@@ -7742,6 +7938,96 @@ fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'sta
             "failed",
             true,
         )),
+        "interrupt"
+        | "interrupted"
+        | "turninterrupt"
+        | "turninterrupted"
+        | "assistantinterrupt"
+        | "assistantturninterrupted"
+        | "userinterrupt"
+        | "userinterrupted" => Some((
+            "provider-turn-interrupted",
+            "idle",
+            "active",
+            "interrupted",
+            true,
+        )),
+        _ => None,
+    }
+}
+
+fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
+    let tool_name = terminal_activity_hook_string(event, &["toolName", "tool_name"])
+        .unwrap_or_default();
+    let tool_key = terminal_activity_hook_name_key(&tool_name);
+    if tool_key.contains("mcp") {
+        return "mcp";
+    }
+    if tool_key.contains("applypatch")
+        || tool_key == "edit"
+        || tool_key == "write"
+        || tool_key.contains("multiedit")
+        || tool_key.contains("notebookedit")
+    {
+        return "editing";
+    }
+    if tool_key.contains("bash")
+        || tool_key.contains("shell")
+        || tool_key.contains("execcommand")
+        || tool_key.contains("runcommand")
+        || tool_key == "command"
+        || tool_key.contains("powershell")
+    {
+        return "shell";
+    }
+
+    "tool_running"
+}
+
+fn terminal_activity_hook_activity_kind(
+    hook_event_name: &str,
+    event: &Value,
+) -> Option<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    bool,
+    &'static str,
+)> {
+    match terminal_activity_hook_name_key(hook_event_name).as_str() {
+        "pretooluse" => Some((
+            "provider-tool-started",
+            terminal_activity_hook_tool_activity_status(event),
+            "active",
+            "tool_running",
+            false,
+            "cli_hook_tool_start",
+        )),
+        "posttooluse" => Some((
+            "provider-tool-completed",
+            "thinking",
+            "active",
+            "tool_completed",
+            false,
+            "cli_hook_tool_complete",
+        )),
+        "subagentstart" => Some((
+            "provider-subagent-started",
+            "subagent_running",
+            "active",
+            "subagent_running",
+            false,
+            "cli_hook_subagent_start",
+        )),
+        "subagentstop" => Some((
+            "provider-subagent-completed",
+            "thinking",
+            "active",
+            "subagent_completed",
+            false,
+            "cli_hook_subagent_complete",
+        )),
         _ => None,
     }
 }
@@ -7758,8 +8044,46 @@ fn terminal_activity_hook_payload(
     event: &Value,
 ) -> Option<TerminalActivityHookPayload> {
     let hook_event_name = terminal_activity_hook_string(event, &["hookEventName", "hook_event_name", "eventName", "event_name"])?;
-    let (event_type, activity_status, status, command_phase, input_ready) =
-        terminal_activity_hook_lifecycle_kind(&hook_event_name)?;
+    let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
+    let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
+        if manual_prompt.is_some() {
+            (
+                "provider-user-prompt-started",
+                "paused",
+                "active",
+                "awaiting_input",
+                false,
+                "cli_hook_manual_prompt",
+            )
+        } else {
+            let (event_type, activity_status, status, command_phase, input_ready, evidence) =
+                if let Some((event_type, activity_status, status, command_phase, input_ready)) =
+                    terminal_activity_hook_lifecycle_kind(&hook_event_name)
+                {
+                    (
+                        event_type,
+                        activity_status,
+                        status,
+                        command_phase,
+                        input_ready,
+                        if input_ready {
+                            "cli_hook_stop"
+                        } else {
+                            "cli_hook_prompt_submit"
+                        },
+                    )
+                } else {
+                    terminal_activity_hook_activity_kind(&hook_event_name, event)?
+                };
+            (
+                event_type,
+                activity_status,
+                status,
+                command_phase,
+                input_ready,
+                evidence,
+            )
+        };
     let metadata = instance.metadata.clone();
     let now_ms = terminal_now_ms();
     let event_time_ms = event
@@ -7784,6 +8108,26 @@ fn terminal_activity_hook_payload(
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
+    let permission_mode = terminal_activity_hook_string(event, &["permissionMode", "permission_mode"]);
+    let manual_prompt_source = manual_prompt.as_ref().map(|_| "hook".to_string());
+    let manual_approval_required = manual_prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.kind == "approval")
+        || terminal_activity_hook_bool(event, &["manualApprovalRequired", "manual_approval_required"]);
+    let provider_blocked_for_user = manual_prompt.is_some()
+        || terminal_activity_hook_bool(event, &["providerBlockedForUser", "provider_blocked_for_user"]);
+    let terminal_is_prompting_user = manual_prompt.is_some();
+    let prompting_user_kind = manual_prompt.as_ref().map(|prompt| prompt.kind.clone());
+    let prompting_user_text = manual_prompt.as_ref().and_then(|prompt| prompt.text.clone());
+    let approval_id = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.approval_id.clone());
+    let permission_prompt_id = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.permission_prompt_id.clone());
+    let permission_request_id = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.permission_request_id.clone());
 
     Some(TerminalActivityHookPayload {
         pane_id: metadata.pane_id,
@@ -7797,7 +8141,11 @@ fn terminal_activity_hook_payload(
         provider,
         event_type: event_type.to_string(),
         hook_event_name,
-        source: format!("cli-hook:{event_type}"),
+        source: if manual_prompt.is_some() {
+            "cli-hook:manual-prompt".to_string()
+        } else {
+            format!("cli-hook:{event_type}")
+        },
         status: status.to_string(),
         activity_status: activity_status.to_string(),
         command_phase: command_phase.to_string(),
@@ -7815,13 +8163,28 @@ fn terminal_activity_hook_payload(
         message: user_message,
         tool_name: terminal_activity_hook_string(event, &["toolName", "tool_name"]),
         tool_use_id: terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]),
+        approval_id,
+        permission_prompt_id,
+        permission_request_id,
+        permission_mode,
+        manual_prompt_source,
+        manual_approval_required,
+        provider_blocked_for_user,
+        terminal_is_prompting_user,
+        prompting_user_kind,
+        prompting_user_source: manual_prompt
+            .as_ref()
+            .map(|_| "cli-hook:manual-prompt".to_string()),
+        prompting_user_confidence: manual_prompt
+            .as_ref()
+            .map(|_| "cli_hook_manual_prompt".to_string()),
+        prompting_user_text,
+        hook_health_status: "ok".to_string(),
+        hook_health_event: "event_observed".to_string(),
+        hook_health_observed_at_ms: now_ms,
         hook_timestamp_ms: event_time_ms,
         observed_at_ms: now_ms,
-        completion_evidence: if input_ready {
-            "cli_hook_stop".to_string()
-        } else {
-            "cli_hook_prompt_submit".to_string()
-        },
+        completion_evidence: completion_evidence.to_string(),
     })
 }
 
@@ -7948,6 +8311,8 @@ fn spawn_terminal_activity_hook_watcher(
                                 json!({
                                     "activity_status": payload.activity_status.clone(),
                                     "event_type": payload.event_type.clone(),
+                                    "hook_health_event": payload.hook_health_event.clone(),
+                                    "hook_health_status": payload.hook_health_status.clone(),
                                     "hook_event_name": payload.hook_event_name.clone(),
                                     "instance_id": payload.instance_id,
                                     "pane_id": payload.pane_id.clone(),
@@ -8055,6 +8420,7 @@ fn terminal_prompt_submitted_source_is_authoritative(
     }
 
     match prompt_source {
+        "activity_hook_user_prompt_submit" | "cli_hook_user_prompt_submit" => true,
         "observed_input_gate" => observed_prompt
             .map(str::trim)
             .is_some_and(|value| !value.is_empty()),
@@ -10986,6 +11352,11 @@ mod terminal_tests {
             Some("what else is there"),
         ));
         assert!(terminal_prompt_submitted_source_is_authoritative(
+            "activity_hook_user_prompt_submit",
+            true,
+            None,
+        ));
+        assert!(terminal_prompt_submitted_source_is_authoritative(
             "parked_resume_backend_submit",
             true,
             None,
@@ -11013,7 +11384,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn cli_activity_hooks_map_turn_start_and_stop_only() {
+    fn cli_activity_hooks_map_lifecycle_tool_and_subagent_events() {
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("UserPromptSubmit"),
             Some((
@@ -11034,13 +11405,135 @@ mod terminal_tests {
                 true
             ))
         );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("Interrupt"),
+            Some((
+                "provider-turn-interrupted",
+                "idle",
+                "active",
+                "interrupted",
+                true
+            ))
+        );
         assert_eq!(terminal_activity_hook_lifecycle_kind("SubagentStop"), None);
-        assert_eq!(terminal_activity_hook_lifecycle_kind("PostToolUse"), None);
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PreToolUse", &json!({})),
+            Some((
+                "provider-tool-started",
+                "tool_running",
+                "active",
+                "tool_running",
+                false,
+                "cli_hook_tool_start"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "Bash" })),
+            Some((
+                "provider-tool-started",
+                "shell",
+                "active",
+                "tool_running",
+                false,
+                "cli_hook_tool_start"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "apply_patch" })),
+            Some((
+                "provider-tool-started",
+                "editing",
+                "active",
+                "tool_running",
+                false,
+                "cli_hook_tool_start"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "mcp__github__get_issue" })),
+            Some((
+                "provider-tool-started",
+                "mcp",
+                "active",
+                "tool_running",
+                false,
+                "cli_hook_tool_start"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PostToolUse", &json!({})),
+            Some((
+                "provider-tool-completed",
+                "thinking",
+                "active",
+                "tool_completed",
+                false,
+                "cli_hook_tool_complete"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("SubagentStart", &json!({})),
+            Some((
+                "provider-subagent-started",
+                "subagent_running",
+                "active",
+                "subagent_running",
+                false,
+                "cli_hook_subagent_start"
+            ))
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("SubagentStop", &json!({})),
+            Some((
+                "provider-subagent-completed",
+                "thinking",
+                "active",
+                "subagent_completed",
+                false,
+                "cli_hook_subagent_complete"
+            ))
+        );
         assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStop"));
         assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStart"));
         assert!(terminal_activity_hook_non_lifecycle_is_expected("PreToolUse"));
         assert!(terminal_activity_hook_non_lifecycle_is_expected("PostToolUse"));
         assert!(!terminal_activity_hook_non_lifecycle_is_expected("Stop"));
+    }
+
+    #[test]
+    fn cli_activity_hook_manual_prompt_requires_explicit_pending_evidence() {
+        let prompt = terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hookEventName": "PreToolUse",
+                "manualApprovalRequired": true,
+                "toolUseId": "tool-1",
+                "promptingUserKind": "approval",
+                "description": "Approve this edit?"
+            }),
+        )
+        .unwrap();
+        assert_eq!(prompt.kind, "approval");
+        assert_eq!(prompt.text.as_deref(), Some("Approve this edit?"));
+
+        assert!(terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "toolUseId": "tool-auto",
+                "promptingUserKind": "approval"
+            }),
+        )
+        .is_none());
+        assert!(terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hookEventName": "PreToolUse",
+                "toolUseId": "tool-observed"
+            }),
+        )
+        .is_none());
     }
 
     #[test]
@@ -11409,6 +11902,12 @@ mod terminal_tests {
         assert!(hooks.contains("--diff-forge-activity-hook"));
         assert!(hooks.contains("UserPromptSubmit"));
         assert!(hooks.contains("Stop"));
+        assert!(hooks.contains("Error"));
+        assert!(hooks.contains("Interrupt"));
+        assert!(hooks.contains("PreToolUse"));
+        assert!(hooks.contains("PostToolUse"));
+        assert!(hooks.contains("SubagentStart"));
+        assert!(hooks.contains("SubagentStop"));
         assert!(hooks.contains("--pane-id"));
         assert!(hooks.contains("workspace-terminal/workspace-1-0-codex"));
         assert!(hooks.contains("--instance-id"));
@@ -11419,13 +11918,16 @@ mod terminal_tests {
         assert!(hooks.contains("--events-path"));
         assert!(hooks.contains("--debug-path"));
         assert!(hooks.contains("--diff-forge-write-guard"));
-        assert!(!hooks.contains("PostToolUse"));
-        assert_eq!(hooks.matches("--pane-id").count(), 2);
+        assert_eq!(hooks.matches("--pane-id").count(), 8);
         let profile_config = fs::read_to_string(&profile_path).unwrap();
         assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
         assert!(profile_config.contains("[[hooks.Stop]]"));
+        assert!(profile_config.contains("[[hooks.Error]]"));
+        assert!(profile_config.contains("[[hooks.Interrupt]]"));
         assert!(profile_config.contains("[[hooks.PreToolUse]]"));
-        assert!(!profile_config.contains("[[hooks.PostToolUse]]"));
+        assert!(profile_config.contains("[[hooks.PostToolUse]]"));
+        assert!(profile_config.contains("[[hooks.SubagentStart]]"));
+        assert!(profile_config.contains("[[hooks.SubagentStop]]"));
         assert!(profile_config.contains("--diff-forge-activity-hook"));
         assert!(profile_config.contains("--pane-id"));
         assert!(profile_config.contains("workspace-terminal/workspace-1-0-codex"));
@@ -11615,8 +12117,18 @@ mod terminal_tests {
             settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
             Some(worktree_path.as_str())
         );
-        let guard_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
+        let guard_command = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| {
+                entry["hooks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|hook| hook["command"].as_str())
+            })
+            .find(|command| command.contains("--diff-forge-write-guard"))
             .unwrap_or_default();
         assert!(guard_command.contains("--diff-forge-write-guard"));
         assert!(!guard_command.contains("--claude-worktree-guard"));

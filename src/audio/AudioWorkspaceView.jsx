@@ -426,8 +426,6 @@ const AUDIO_HISTORY_ROW_HEIGHT = 124;
 const AUDIO_HISTORY_VIEWPORT_HEIGHT = 420;
 const AUDIO_HISTORY_OVERSCAN = 5;
 
-function writeAudioWidgetTelemetry(_phase, _fields = {}) {}
-
 function isMacPlatform() {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform || "");
 }

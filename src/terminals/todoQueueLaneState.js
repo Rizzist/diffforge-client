@@ -298,7 +298,8 @@ export function evaluateTodoQueueInFlightPrompt({
       || "",
   );
   const sessionAcceptedByThread = Boolean(
-    !promptAccepted
+    !hookManaged
+      && !promptAccepted
       && providerSessionId
       && latestUserPromptMatches
       && (
@@ -318,7 +319,8 @@ export function evaluateTodoQueueInFlightPrompt({
   const transcriptCompletionAfterPrompt = false;
   const exactPromptTranscriptFinished = false;
   const promptAcceptedByCompletedThread = Boolean(
-    !promptAccepted
+    !hookManaged
+      && !promptAccepted
       && false
   );
   const effectivePromptAccepted = Boolean(

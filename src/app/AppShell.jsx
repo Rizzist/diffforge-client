@@ -498,7 +498,6 @@ import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceVie
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
-import { WORKSPACE_WEB_CLOSE_REQUESTED_EVENT } from "../web/WebWorkspaceView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
 
 
@@ -538,7 +537,7 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture", "web", "mcps"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture", "mcps"]);
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -1101,51 +1100,51 @@ function normalizeTerminalPromptSource(value) {
     .replace(/[_\s]+/g, "-");
 }
 
-function terminalPromptPermissionToken(event = {}, options = {}) {
-  const sourceEvent = event && typeof event === "object" ? event : {};
-  const sourceOptions = options && typeof options === "object" ? options : {};
-  return String(
-    sourceOptions.approvalId
-      || sourceOptions.approval_id
-      || sourceOptions.permissionPromptId
-      || sourceOptions.permission_prompt_id
-      || sourceOptions.permissionRequestId
-      || sourceOptions.permission_request_id
-      || sourceOptions.sourceEventId
-      || sourceOptions.source_event_id
-      || sourceOptions.toolUseId
-      || sourceOptions.tool_use_id
-      || sourceEvent.approvalId
-      || sourceEvent.approval_id
-      || sourceEvent.permissionPromptId
-      || sourceEvent.permission_prompt_id
-      || sourceEvent.permissionRequestId
-      || sourceEvent.permission_request_id
-      || sourceEvent.sourceEventId
-      || sourceEvent.source_event_id
-      || sourceEvent.toolUseId
-      || sourceEvent.tool_use_id
-      || "",
-  ).trim();
-}
+const TERMINAL_HOOK_MANUAL_PROMPT_TYPES = new Set([
+  "provider-manual-approval-required",
+  "provider-user-input-required",
+  "provider-user-prompt-started",
+]);
+
+const TERMINAL_HOOK_MANUAL_PROMPT_SOURCE_PARTS = [
+  "cli-hook:manual-prompt",
+  "cli-hook:provider-user-input-required",
+  "cli-hook:provider-user-prompt-started",
+  "hook-manual-prompt",
+  "manual-prompt-hook",
+  "provider-hook:manual-prompt",
+];
+
+const TERMINAL_RESOLVED_MANUAL_PROMPT_DECISIONS = new Set([
+  "allow",
+  "allowed",
+  "approve",
+  "approved",
+  "auto",
+  "auto-allow",
+  "auto-allowed",
+  "auto-approve",
+  "auto-approved",
+  "auto-denied",
+  "auto-deny",
+  "autoallow",
+  "autoallowed",
+  "autoapprove",
+  "autoapproved",
+  "autodenied",
+  "autodeny",
+  "deny",
+  "denied",
+  "reject",
+  "rejected",
+  "resolved",
+]);
 
 function terminalPromptSourceLooksExplicitPermission(source) {
   const normalized = normalizeTerminalPromptSource(source);
   return Boolean(
     normalized
-      && [
-        "approval",
-        "claude-hook",
-        "claude-permission",
-        "codex-hook",
-        "codex-permission",
-        "coordination",
-        "permission",
-        "pre-tool-use",
-        "pretooluse",
-        "provider-permission",
-        "tool-permission",
-      ].some((part) => normalized.includes(part))
+      && TERMINAL_HOOK_MANUAL_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
       && !normalized.includes("terminal-output")
   );
 }
@@ -1153,7 +1152,71 @@ function terminalPromptSourceLooksExplicitPermission(source) {
 function terminalStatusEventHasExplicitPermissionPrompt(event = {}, options = {}) {
   const sourceEvent = event && typeof event === "object" ? event : {};
   const sourceOptions = options && typeof options === "object" ? options : {};
-  const active = sourceEvent.terminalIsPromptingUser === true
+  const eventType = normalizeTerminalPromptSource(
+    sourceOptions.type
+      || sourceOptions.eventType
+      || sourceOptions.event_type
+      || sourceEvent.type
+      || sourceEvent.eventType
+      || sourceEvent.event_type,
+  );
+  const source = sourceOptions.promptingUserSource
+    || sourceOptions.prompting_user_source
+    || sourceOptions.promptingSource
+    || sourceOptions.prompting_source
+    || sourceOptions.manualPromptSource
+    || sourceOptions.manual_prompt_source
+    || sourceOptions.source
+    || sourceOptions.type
+    || sourceEvent.promptingUserSource
+    || sourceEvent.prompting_user_source
+    || sourceEvent.promptingSource
+    || sourceEvent.prompting_source
+    || sourceEvent.manualPromptSource
+    || sourceEvent.manual_prompt_source
+    || sourceEvent.source
+    || sourceEvent.type;
+  const hookOwned = terminalPromptSourceLooksExplicitPermission(source)
+    || normalizeTerminalPromptSource(sourceOptions.manualPromptSource || sourceOptions.manual_prompt_source) === "hook"
+    || normalizeTerminalPromptSource(sourceEvent.manualPromptSource || sourceEvent.manual_prompt_source) === "hook";
+  if (!hookOwned) {
+    return false;
+  }
+  const resolvedDecision = [
+    sourceOptions.permissionDecision,
+    sourceOptions.permission_decision,
+    sourceOptions.decision,
+    sourceOptions.approvalDecision,
+    sourceOptions.approval_decision,
+    sourceOptions.permissionStatus,
+    sourceOptions.permission_status,
+    sourceOptions.approvalStatus,
+    sourceOptions.approval_status,
+    sourceEvent.permissionDecision,
+    sourceEvent.permission_decision,
+    sourceEvent.decision,
+    sourceEvent.approvalDecision,
+    sourceEvent.approval_decision,
+    sourceEvent.permissionStatus,
+    sourceEvent.permission_status,
+    sourceEvent.approvalStatus,
+    sourceEvent.approval_status,
+  ].some((value) => TERMINAL_RESOLVED_MANUAL_PROMPT_DECISIONS.has(normalizeTerminalPromptSource(value)));
+  if (resolvedDecision) {
+    return false;
+  }
+
+  const hookManualPromptType = TERMINAL_HOOK_MANUAL_PROMPT_TYPES.has(eventType);
+  const active = hookManualPromptType
+    || sourceEvent.manualApprovalRequired === true
+    || sourceEvent.manual_approval_required === true
+    || sourceEvent.providerBlockedForUser === true
+    || sourceEvent.provider_blocked_for_user === true
+    || sourceOptions.manualApprovalRequired === true
+    || sourceOptions.manual_approval_required === true
+    || sourceOptions.providerBlockedForUser === true
+    || sourceOptions.provider_blocked_for_user === true
+    || sourceEvent.terminalIsPromptingUser === true
     || sourceEvent.terminal_is_prompting_user === true
     || sourceEvent.promptingUser === true
     || sourceEvent.prompting_user === true
@@ -1178,30 +1241,23 @@ function terminalStatusEventHasExplicitPermissionPrompt(event = {}, options = {}
       || sourceEvent.prompting_kind
       || "",
   ).trim().toLowerCase().replace(/[_\s]+/g, "-");
-  const source = sourceOptions.promptingUserSource
-    || sourceOptions.prompting_user_source
-    || sourceOptions.promptingSource
-    || sourceOptions.prompting_source
-    || sourceOptions.source
-    || sourceOptions.type
-    || sourceEvent.promptingUserSource
-    || sourceEvent.prompting_user_source
-    || sourceEvent.promptingSource
-    || sourceEvent.prompting_source
-    || sourceEvent.source
-    || sourceEvent.type;
   return Boolean(
-    (
-      kind === "approval"
+    hookManualPromptType
+      || (
+        kind === "approval"
         || kind === "permission"
+        || sourceEvent.manualApprovalRequired === true
+        || sourceEvent.manual_approval_required === true
+        || sourceEvent.providerBlockedForUser === true
+        || sourceEvent.provider_blocked_for_user === true
+        || sourceOptions.manualApprovalRequired === true
+        || sourceOptions.manual_approval_required === true
+        || sourceOptions.providerBlockedForUser === true
+        || sourceOptions.provider_blocked_for_user === true
         || sourceEvent.requiresUserInput === true
         || sourceEvent.requires_user_input === true
         || sourceOptions.requiresUserInput === true
         || sourceOptions.requires_user_input === true
-    )
-      && (
-        terminalPromptPermissionToken(sourceEvent, sourceOptions)
-          || terminalPromptSourceLooksExplicitPermission(source)
       )
   );
 }
@@ -1388,6 +1444,46 @@ function getPromptEventIdFromRunningThread(thread) {
     return "";
   }
   return latestUserMessageId;
+}
+
+function getVoicePlanPromptEventIdCandidate(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return "";
+  }
+  if (text.startsWith("voice-plan-")) {
+    return text;
+  }
+  return text.match(/voice-plan-[^\s/]+-s\d+-(?:execution|revision)-t\d+/)?.[0] || "";
+}
+
+function resolveVoicePlanPromptEventIdFromThreadLifecycle(event = {}, thread = null) {
+  const latestTurn = thread?.latestTurn || null;
+  const latestUserMessage = getLatestWorkspaceThreadUserMessage(thread);
+  const candidates = [
+    event.promptEventId,
+    event.pendingPromptId,
+    event.promptId,
+    event.messageId,
+    event.turnId,
+    event.providerTurnId,
+    thread?.pendingPrompt?.id,
+    thread?.pendingPrompt?.promptEventId,
+    latestTurn?.messageId,
+    latestTurn?.turnId,
+    latestTurn?.id,
+    getPromptEventIdFromRunningThread(thread),
+    latestUserMessage?.id,
+  ];
+
+  for (const candidate of candidates) {
+    const promptEventId = getVoicePlanPromptEventIdCandidate(candidate);
+    if (promptEventId) {
+      return promptEventId;
+    }
+  }
+
+  return "";
 }
 
 function getWorkspaceThreadRunningPromptMessage(thread, promptEventId = "") {
@@ -1593,6 +1689,40 @@ function buildTerminalCompletedProjectionEvents(thread, event = {}) {
     status: "completed",
     turnId,
     type: "thread.turn.completed",
+  }];
+}
+
+function buildTerminalErroredProjectionEvents(thread, event = {}) {
+  const latestTurn = thread?.latestTurn || null;
+  const latestTurnState = String(latestTurn?.state || "").trim().toLowerCase();
+  const turnId = String(latestTurn?.turnId || latestTurn?.id || "").trim();
+  if (latestTurnState !== "running" || !turnId) {
+    return [];
+  }
+
+  const completedAt = String(
+    event.completedAt
+      || event.inputReadyAt
+      || new Date().toISOString(),
+  ).trim();
+  const eventKey = workspaceThreadProjectionIdPart(
+    event.promptEventId || event.pendingPromptId || turnId,
+    "provider-turn-error",
+  );
+  const promptEpoch = getWorkspaceThreadPromptEpoch(event);
+  return [{
+    agentId: event.agentId || event.currentAgent || thread?.currentAgent || "",
+    completedAt,
+    createdAt: completedAt,
+    id: `projection-provider-turn-error-${workspaceThreadProjectionIdPart(turnId, "turn")}-${eventKey}`,
+    messageId: latestTurn.messageId || "",
+    promptEpoch: promptEpoch || latestTurn.promptEpoch || 0,
+    prompt_epoch: promptEpoch || latestTurn.promptEpoch || 0,
+    source: event.source || event.type || "provider-turn-error",
+    status: "error",
+    text: event.error || event.message || "Provider turn failed.",
+    turnId,
+    type: "thread.turn.error",
   }];
 }
 
@@ -1902,7 +2032,6 @@ const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
-const WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS = 1800;
 const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
 function unwrapCloudCommandData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
@@ -2860,25 +2989,7 @@ function appCloseTerminalRiskLabel(risk) {
   return "Idle";
 }
 
-function requestWorkspaceWebClose(reason = "app_close") {
-  try {
-    window.dispatchEvent(new CustomEvent(WORKSPACE_WEB_CLOSE_REQUESTED_EVENT, {
-      detail: { reason },
-    }));
-  } catch {
-    // The backend close command below is the shutdown backstop.
-  }
-
-  return invoke("workspace_web_close_all").catch(() => 0);
-}
-
 async function closeWorkspaceWindowAfterTerminalShutdown() {
-  await withTimeout(
-    requestWorkspaceWebClose("native_app_close"),
-    WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS,
-    "Workspace browser close timed out.",
-  ).catch(() => {});
-
   await withTimeout(
     invoke("close_app_after_terminal_shutdown"),
     WORKSPACE_CLOSE_NATIVE_EXIT_TIMEOUT_MS,
@@ -4363,6 +4474,7 @@ export default function App() {
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
   const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
+  const [workspacePendingActivationId, setWorkspacePendingActivationId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
   const [authInitialized, setAuthInitialized] = useState(false);
   const [isLaunchScreenVisible, setLaunchScreenVisible] = useState(true);
@@ -4402,6 +4514,7 @@ export default function App() {
   const audioAutoOpenStartupKeyRef = useRef("");
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
+  const workspacePendingActivationIdRef = useRef("");
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const mainWindowFocusedRef = useRef(mainWindowFocused);
@@ -4431,6 +4544,14 @@ export default function App() {
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
+  const deferredWorkspaceActivationRef = useRef({
+    frame: 0,
+    idle: 0,
+    secondFrame: 0,
+    timeout: 0,
+    token: 0,
+    workspaceId: "",
+  });
   const preparedTerminalsRef = useRef(new Map());
   const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
@@ -4547,6 +4668,7 @@ export default function App() {
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
     : "";
+  const workspaceActivationDeferred = Boolean(workspacePendingActivationId);
   const workspaceHydrationKey = authState === "authenticated" && workspaceState === "ready"
     ? [
       activeAccountScopeKey,
@@ -4594,7 +4716,7 @@ export default function App() {
   }, [workspaceHydrationKey]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady) {
+    if (!workspaceHydrationReady || workspaceActivationDeferred) {
       return undefined;
     }
 
@@ -4632,7 +4754,12 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [workspaceCoordinationRootEntries, workspaceCoordinationRootKey, workspaceHydrationReady]);
+  }, [
+    workspaceActivationDeferred,
+    workspaceCoordinationRootEntries,
+    workspaceCoordinationRootKey,
+    workspaceHydrationReady,
+  ]);
 
   const workspaceNotificationRoots = useMemo(() => (
     workspaceCoordinationRootEntries.flatMap((entry) => (
@@ -4747,6 +4874,10 @@ export default function App() {
     const targets = workspaceThreadStoreTargets;
     const storeKey = workspaceThreadStoreKey;
 
+    if (workspaceActivationDeferred) {
+      return undefined;
+    }
+
     if (!workspaceHydrationReady) {
       workspaceThreadsHydratedKeyRef.current = "";
       workspaceThreadsPersistenceReadyRef.current = false;
@@ -4858,6 +4989,7 @@ export default function App() {
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
     workspaceHydrationReady,
+    workspaceActivationDeferred,
     workspaces,
   ]);
 
@@ -4917,6 +5049,10 @@ export default function App() {
   useEffect(() => {
     activatedWorkspaceIdRef.current = activatedWorkspaceId;
   }, [activatedWorkspaceId]);
+
+  useEffect(() => {
+    workspacePendingActivationIdRef.current = workspacePendingActivationId;
+  }, [workspacePendingActivationId]);
 
   useEffect(() => {
     activeViewRef.current = activeView;
@@ -5522,6 +5658,8 @@ export default function App() {
     setWorkspaceHydrationReady(false);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    setWorkspacePendingActivationId("");
+    workspacePendingActivationIdRef.current = "";
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
@@ -5552,10 +5690,19 @@ export default function App() {
     if (nextView === DEFAULT_WORKSPACE_VIEW && telemetryWorkspaceId) {
     }
     setActiveView(nextView);
-    setViewMotion("exiting");
+    activeViewRef.current = nextView;
 
+    if (options.immediate || options.skipTransition || options.transitionMs === 0) {
+      setVisibleView(nextView);
+      visibleViewRef.current = nextView;
+      setViewMotion("entered");
+      return;
+    }
+
+    setViewMotion("exiting");
     viewTransitionTimeoutRef.current = window.setTimeout(() => {
       setVisibleView(nextView);
+      visibleViewRef.current = nextView;
       window.requestAnimationFrame(() => {
         setViewMotion("entered");
       });
@@ -5733,15 +5880,41 @@ export default function App() {
     });
   }, []);
 
+  const cancelDeferredWorkspaceActivation = useCallback(() => {
+    const pending = deferredWorkspaceActivationRef.current;
+
+    if (pending.frame) {
+      window.cancelAnimationFrame(pending.frame);
+    }
+    if (pending.secondFrame) {
+      window.cancelAnimationFrame(pending.secondFrame);
+    }
+    if (pending.idle && typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(pending.idle);
+    }
+    if (pending.timeout) {
+      window.clearTimeout(pending.timeout);
+    }
+
+    deferredWorkspaceActivationRef.current = {
+      frame: 0,
+      idle: 0,
+      secondFrame: 0,
+      timeout: 0,
+      token: pending.token,
+      workspaceId: "",
+    };
+  }, []);
+
   const activateWorkspace = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
 
     if (workspaceDeactivationInFlightRef.current) {
-      return;
+      return false;
     }
 
     if (!workspace) {
-      return;
+      return false;
     }
 
     const previousActivatedWorkspaceId = activatedWorkspaceIdRef.current;
@@ -5750,7 +5923,11 @@ export default function App() {
     );
 
     setSelectedWorkspaceId(workspace.id);
+    selectedWorkspaceIdRef.current = workspace.id;
     setActivatedWorkspaceId(workspace.id);
+    activatedWorkspaceIdRef.current = workspace.id;
+    setWorkspacePendingActivationId("");
+    workspacePendingActivationIdRef.current = "";
     updateWorkspaceLifecycleSettings({
       enabledWorkspaceIds: enabledWorkspaceIds.includes(workspace.id)
         ? enabledWorkspaceIds
@@ -5763,16 +5940,125 @@ export default function App() {
       setWorkspaceAgentBatchSentKey("");
     }
 
-  }, [activeView, updateWorkspaceLifecycleSettings, visibleView, workspaces]);
+    return true;
+  }, [updateWorkspaceLifecycleSettings, workspaces]);
+
+  const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_click") => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return;
+    }
+
+    cancelDeferredWorkspaceActivation();
+
+    const token = deferredWorkspaceActivationRef.current.token + 1;
+    deferredWorkspaceActivationRef.current = {
+      frame: 0,
+      idle: 0,
+      secondFrame: 0,
+      timeout: 0,
+      token,
+      workspaceId: safeWorkspaceId,
+    };
+
+    const runActivation = () => {
+      const current = deferredWorkspaceActivationRef.current;
+      if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        return;
+      }
+      deferredWorkspaceActivationRef.current = {
+        frame: 0,
+        idle: 0,
+        secondFrame: 0,
+        timeout: 0,
+        token,
+        workspaceId: "",
+      };
+
+      setWorkspacePendingActivationId((currentPendingId) => (
+        currentPendingId === safeWorkspaceId ? "" : currentPendingId
+      ));
+      if (workspacePendingActivationIdRef.current === safeWorkspaceId) {
+        workspacePendingActivationIdRef.current = "";
+      }
+
+      if (selectedWorkspaceIdRef.current !== safeWorkspaceId) {
+        return;
+      }
+
+      activateWorkspace(safeWorkspaceId, source);
+    };
+
+    const scheduleIdleActivation = () => {
+      const current = deferredWorkspaceActivationRef.current;
+      if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        return;
+      }
+
+      if (typeof window.requestIdleCallback === "function") {
+        const idle = window.requestIdleCallback(runActivation, { timeout: 500 });
+        deferredWorkspaceActivationRef.current = {
+          ...current,
+          idle,
+          secondFrame: 0,
+        };
+        return;
+      }
+
+      const timeout = window.setTimeout(runActivation, 0);
+      deferredWorkspaceActivationRef.current = {
+        ...current,
+        secondFrame: 0,
+        timeout,
+      };
+    };
+
+    const frame = window.requestAnimationFrame(() => {
+      const current = deferredWorkspaceActivationRef.current;
+      if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        return;
+      }
+
+      const secondFrame = window.requestAnimationFrame(scheduleIdleActivation);
+      deferredWorkspaceActivationRef.current = {
+        ...current,
+        frame: 0,
+        secondFrame,
+      };
+    });
+
+    deferredWorkspaceActivationRef.current = {
+      ...deferredWorkspaceActivationRef.current,
+      frame,
+    };
+  }, [activateWorkspace, cancelDeferredWorkspaceActivation]);
 
   const activateWorkspaceFromRail = useCallback((workspaceId) => {
+    const workspace = findWorkspaceById(workspaces, workspaceId);
+    if (!workspace) {
+      return;
+    }
+
+    const workspaceAlreadyActive = activatedWorkspaceIdRef.current === workspace.id;
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
-    activateWorkspace(workspaceId, "workspace_click");
+    setSelectedWorkspaceId(workspace.id);
+    selectedWorkspaceIdRef.current = workspace.id;
+    setWorkspaceSettingsModalId("");
+    if (workspaceAlreadyActive) {
+      cancelDeferredWorkspaceActivation();
+      setWorkspacePendingActivationId("");
+      workspacePendingActivationIdRef.current = "";
+    } else {
+      setWorkspacePendingActivationId(workspace.id);
+      workspacePendingActivationIdRef.current = workspace.id;
+      scheduleWorkspaceActivationAfterPaint(workspace.id, "workspace_click");
+    }
     showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
       telemetrySource: "workspace_click_terminal_focus",
-      telemetryWorkspaceId: workspaceId,
+      telemetryWorkspaceId: workspace.id,
     });
-  }, [activateWorkspace, showView]);
+  }, [cancelDeferredWorkspaceActivation, scheduleWorkspaceActivationAfterPaint, showView, workspaces]);
 
   const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
@@ -8783,7 +9069,6 @@ export default function App() {
         expectedTerminalTotal: normalizeCloseCount(workspaceCloseExpectedTotalRef.current),
         reason: `${options.reason || "app_close"}_retry`,
       });
-      requestWorkspaceWebClose("app_close_retry");
       return;
     }
 
@@ -8796,7 +9081,6 @@ export default function App() {
       expectedTerminalTotal,
       reason: options.reason || "app_close",
     });
-    const browserClosePromise = requestWorkspaceWebClose("app_close");
     setWorkspaceCloseState({
       ...WORKSPACE_CLOSE_INITIAL_STATE,
       isActive: true,
@@ -8895,15 +9179,9 @@ export default function App() {
         })
         .catch(() => {
           // Phase events are UI-only; backend shutdown is still authoritative.
-        });
+      });
 
       try {
-        await withTimeout(
-          browserClosePromise,
-          WORKSPACE_CLOSE_BROWSER_TIMEOUT_MS,
-          "Workspace browser close timed out.",
-        ).catch(() => {});
-
         await closeWorkspaceWindowAfterTerminalShutdown();
         workspaceCloseAllowNativeRef.current = true;
       } catch (closeError) {
@@ -9167,7 +9445,8 @@ export default function App() {
 
   useEffect(() => () => {
     window.clearTimeout(viewTransitionTimeoutRef.current);
-  }, []);
+    cancelDeferredWorkspaceActivation();
+  }, [cancelDeferredWorkspaceActivation]);
 
   useEffect(() => {
     if (authState === "authenticated") {
@@ -9178,6 +9457,7 @@ export default function App() {
     setWorkspaces([]);
     setSelectedWorkspaceId("");
     setActivatedWorkspaceId("");
+    setWorkspacePendingActivationId("");
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
@@ -9193,6 +9473,7 @@ export default function App() {
     startupAgentSettingsPendingRef.current = false;
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
+    workspacePendingActivationIdRef.current = "";
     crashRecoveryScanRef.current = false;
     preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
@@ -10549,6 +10830,7 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
+      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -10682,6 +10964,7 @@ export default function App() {
     shouldShowWorkspaceSetup,
     user,
     workspaceHydrationReady,
+    workspaceActivationDeferred,
     workspaceMcpSyncTargetKey,
     workspaceMcpSyncTargets,
     workspaceSyncState,
@@ -10692,6 +10975,7 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
+      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -10828,6 +11112,7 @@ export default function App() {
     terminalPresenceWorkspaces,
     user,
     workspaceHydrationReady,
+    workspaceActivationDeferred,
     workspaceSyncState,
   ]);
 
@@ -10836,6 +11121,7 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
+      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
       || workspaceSyncState === "creating"
@@ -10982,6 +11268,7 @@ export default function App() {
     workspaceMcpSyncTargetKey,
     workspaceMcpSyncTargets,
     workspaceHydrationReady,
+    workspaceActivationDeferred,
     workspaceSyncState,
   ]);
 
@@ -11097,6 +11384,7 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !workspaceHydrationReady
+      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
     ) {
@@ -11168,11 +11456,12 @@ export default function App() {
     shouldShowWorkspaceSetup,
     user,
     workspaceHydrationReady,
+    workspaceActivationDeferred,
     workspaceSyncState,
   ]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady) {
+    if (!workspaceHydrationReady || workspaceActivationDeferred) {
       return;
     }
 
@@ -11241,7 +11530,7 @@ export default function App() {
         "Shared MCP deactivation timed out.",
       ).catch(() => {});
     });
-  }, [enabledWorkspaceRuntimeDescriptors, workspaceHydrationReady]);
+  }, [enabledWorkspaceRuntimeDescriptors, workspaceActivationDeferred, workspaceHydrationReady]);
   const isActivatedWorkspaceDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && activatedWorkspace
@@ -11249,7 +11538,9 @@ export default function App() {
   );
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && workspaceHydrationReady
+    && !workspaceActivationDeferred
     && Boolean(activatedWorkspace)
+    && selectedWorkspace?.id === activatedWorkspace?.id
     && workspaceThreadsHydrated
     && !isActivatedWorkspaceDeactivating
     && activatedWorkspaceAgentTerminalEntries.length > 0;
@@ -11308,17 +11599,29 @@ export default function App() {
   const shouldKeepWorkspaceTerminalMounted = Boolean(
     enabledWorkspaceRuntimeDescriptors.length > 0,
   );
+  const selectedWorkspaceIsActivated = Boolean(
+    selectedWorkspace?.id
+      && activatedWorkspace?.id
+      && selectedWorkspace.id === activatedWorkspace.id
+      && !workspaceActivationDeferred,
+  );
+  const shouldShowWorkspacePendingActivation = Boolean(
+    selectedWorkspace?.id
+      && workspacePendingActivationId === selectedWorkspace.id,
+  );
   const shouldRevealWorkspaceTerminal = Boolean(
     shouldKeepWorkspaceTerminalMounted
-      && hasSelectedWorkspace,
+      && selectedWorkspaceIsActivated,
   );
   const shouldShowDefaultWorkspaceIdle = Boolean(
     !shouldShowWorkspaceSetup
-      && (!hasSelectedWorkspace || !activatedWorkspace),
+      && (shouldShowWorkspacePendingActivation || !hasSelectedWorkspace || !selectedWorkspaceIsActivated),
   );
-  const defaultWorkspaceIdleDetail = hasSelectedWorkspace
-    ? "No active workspace."
-    : "No workspace selected.";
+  const defaultWorkspaceIdleDetail = shouldShowWorkspacePendingActivation
+    ? `Opening ${selectedWorkspace?.name || "workspace"}...`
+    : hasSelectedWorkspace
+      ? "No active workspace."
+      : "No workspace selected.";
   const shouldShowTerminalNav = hasSelectedWorkspace;
   const shouldShowWorkspaceDetailNav = hasSelectedWorkspace;
   const isSelectedWorkspaceActivated = Boolean(
@@ -11699,7 +12002,13 @@ export default function App() {
     const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
     const existingPreload = checkKey ? workspaceGitRepositoryPreloads[checkKey] : null;
 
-    if (authState !== "authenticated" || shouldShowWorkspaceSetup || !workspaceId || !rootDirectory) {
+    if (
+      authState !== "authenticated"
+      || shouldShowWorkspaceSetup
+      || workspaceActivationDeferred
+      || !workspaceId
+      || !rootDirectory
+    ) {
       workspaceGitPullPromptCheckRef.current = "";
       setWorkspaceGitPullPrompt(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
       return undefined;
@@ -11776,6 +12085,7 @@ export default function App() {
     selectedWorkspace?.name,
     selectedWorkspaceFileRoot,
     shouldShowWorkspaceSetup,
+    workspaceActivationDeferred,
     refreshWorkspaceGitRepositoryPreload,
     workspaceGitRepositoryPreloads,
   ]);
@@ -13048,7 +13358,9 @@ export default function App() {
     const currentReadinessCanSettleTurn = false;
 	    const terminalReadinessCanSettleTurn = false;
 	    const terminalLifecycleCanSettleTurn = false;
-	    const promptAccepted = transcriptPromptAccepted || terminalSubmitPromptAccepted;
+	    const promptAccepted = transcriptLifecycleUsesActivityHooks
+        ? terminalSubmitPromptAccepted
+        : transcriptPromptAccepted || terminalSubmitPromptAccepted;
     const rawTurnCompleteSeen = transcriptHasTurnCompletionForPromptEvidence(messages, {
       agentId,
       allowTimestampFallback,
@@ -13142,7 +13454,9 @@ export default function App() {
     if (promptAccepted && promptEventId) {
       rememberWorkspaceThreadPromptAcceptance(workspaceThreadAcceptedPromptsRef.current, {
         agentId,
-        matchedBy: transcriptPromptAccepted ? matchedBy : "terminal-submit",
+        matchedBy: transcriptPromptAccepted && !transcriptLifecycleUsesActivityHooks
+          ? matchedBy
+          : "terminal-submit",
         promptEventId,
         promptText: expectedUserMessage,
         sessionId,
@@ -13152,7 +13466,9 @@ export default function App() {
       window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
         detail: {
           agentId,
-          matchedBy: transcriptPromptAccepted ? matchedBy : "terminal-submit",
+          matchedBy: transcriptPromptAccepted && !transcriptLifecycleUsesActivityHooks
+            ? matchedBy
+            : "terminal-submit",
           promptEventId,
           promptText: expectedUserMessage,
           sessionId,
@@ -13740,8 +14056,10 @@ export default function App() {
           );
           const terminalSubmitPromptAcceptedForResult = terminalSubmitPromptAccepted
             || Boolean(latestTerminalSubmitAcceptance);
-          const promptAccepted = transcriptPromptAccepted || terminalSubmitPromptAcceptedForResult;
-          const promptAcceptedBy = transcriptPromptAccepted
+          const promptAccepted = requestUsesActivityHooks
+            ? terminalSubmitPromptAcceptedForResult
+            : transcriptPromptAccepted || terminalSubmitPromptAcceptedForResult;
+          const promptAcceptedBy = transcriptPromptAccepted && !requestUsesActivityHooks
             ? "transcript"
             : terminalSubmitPromptAcceptedForResult
               ? "terminal-submit"
@@ -14684,23 +15002,56 @@ export default function App() {
     const lifecycleStartsWork = (
       lifecycleEvent.type === "message-submitted"
       || lifecycleEvent.type === "provider-turn-started"
+      || lifecycleEvent.type === "provider-tool-started"
+      || lifecycleEvent.type === "provider-subagent-started"
       || lifecycleEvent.type === "thread-starting"
       || (
         lifecycleEvent.type === "agent-output"
-        && ["thinking", "running"].includes(String(
+        && ["delegating", "subagent", "subagent_running", "thinking", "tool", "tool_running", "running"].includes(String(
           lifecycleEvent.activityStatus || lifecycleEvent.status || "",
         ).trim().toLowerCase())
       )
     );
+    const lifecycleHasHookManualPrompt = terminalStatusEventHasExplicitPermissionPrompt(lifecycleEvent);
+    const lifecycleGroundTruthWorkState = String(
+      lifecycleGroundTruth.terminalWorkState || "",
+    ).trim().toLowerCase();
+    const lifecycleWorkState = lifecycleHasHookManualPrompt
+      ? "prompting_user"
+      : lifecycleStartsWork
+        ? "running"
+        : lifecycleGroundTruthWorkState === "prompting_user" || lifecycleGroundTruthWorkState === "prompting-user"
+          ? ""
+          : lifecycleGroundTruth.terminalWorkState || "";
     lifecycleEvent = {
       ...lifecycleEvent,
-      promptingUserConfidence: lifecycleGroundTruth.promptingUserConfidence || "",
-      promptingUserKind: lifecycleGroundTruth.promptingUserKind || "",
-      promptingUserSource: lifecycleGroundTruth.promptingUserSource || "",
-      promptingUserText: lifecycleGroundTruth.promptingUserText || "",
+      promptingUserConfidence: lifecycleHasHookManualPrompt
+        ? lifecycleEvent.promptingUserConfidence
+          || lifecycleEvent.prompting_user_confidence
+          || lifecycleEvent.completionEvidence
+          || "cli_hook_manual_prompt"
+        : "",
+      promptingUserKind: lifecycleHasHookManualPrompt
+        ? lifecycleEvent.promptingUserKind
+          || lifecycleEvent.prompting_user_kind
+          || "approval"
+        : "",
+      promptingUserSource: lifecycleHasHookManualPrompt
+        ? lifecycleEvent.promptingUserSource
+          || lifecycleEvent.prompting_user_source
+          || lifecycleEvent.source
+          || "cli-hook:manual-prompt"
+        : "",
+      promptingUserText: lifecycleHasHookManualPrompt
+        ? lifecycleEvent.promptingUserText
+          || lifecycleEvent.prompting_user_text
+          || lifecycleEvent.message
+          || lifecycleEvent.description
+          || ""
+        : "",
       terminalIsComplete: lifecycleStartsWork ? false : lifecycleGroundTruth.terminalIsComplete === true,
-      terminalIsPromptingUser: lifecycleStartsWork ? false : lifecycleGroundTruth.terminalIsPromptingUser === true,
-      terminalWorkState: lifecycleStartsWork ? "running" : lifecycleGroundTruth.terminalWorkState || "",
+      terminalIsPromptingUser: lifecycleHasHookManualPrompt,
+      terminalWorkState: lifecycleWorkState,
     };
     let lifecyclePromptEventId = String(
       lifecycleEvent.promptEventId
@@ -14709,6 +15060,41 @@ export default function App() {
         || "",
     ).trim();
     const lifecyclePromptEpoch = getWorkspaceThreadPromptEpoch(lifecycleEvent);
+    const lifecycleVoicePlanCompletionEvent = Boolean(
+      lifecycleEvent.type === "provider-turn-completed"
+        || lifecycleEvent.type === "provider-turn-error"
+        || lifecycleEvent.type === "provider-turn-interrupted"
+    );
+    if (
+      lifecycleVoicePlanCompletionEvent
+      && !getVoicePlanPromptEventIdCandidate(lifecyclePromptEventId)
+      && lifecycleWorkspaceId
+      && lifecycleThreadId
+    ) {
+      const lifecycleThreadForVoicePlan =
+        workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId] || null;
+      const resolvedVoicePlanPromptEventId = resolveVoicePlanPromptEventIdFromThreadLifecycle(
+        lifecycleEvent,
+        lifecycleThreadForVoicePlan,
+      );
+      if (resolvedVoicePlanPromptEventId) {
+        lifecyclePromptEventId = resolvedVoicePlanPromptEventId;
+        lifecycleEvent = {
+          ...lifecycleEvent,
+          pendingPromptId: lifecycleEvent.pendingPromptId || resolvedVoicePlanPromptEventId,
+          promptEventId: resolvedVoicePlanPromptEventId,
+        };
+        logTerminalStatus("frontend.voice_plan.lifecycle_prompt_resolved", {
+          lifecycleType: lifecycleEvent.type || "",
+          promptEventId: lifecyclePromptEventId,
+          reason: "provider_hook_completion_thread_latest_turn",
+          source: lifecycleEvent.source || "",
+          terminalIndex: lifecycleEvent.terminalIndex ?? "",
+          threadId: lifecycleThreadId,
+          workspaceId: lifecycleWorkspaceId,
+        });
+      }
+    }
     const lifecycleReadinessEvent = Boolean(
       lifecycleEvent.type === "terminal-prompt-ready"
         || lifecycleEvent.type === "terminal-input-ready"
@@ -14803,18 +15189,24 @@ export default function App() {
       }
     }
     if (
-      lifecyclePromptEventId.startsWith("voice-plan-")
+      getVoicePlanPromptEventIdCandidate(lifecyclePromptEventId)
       && (
         lifecycleEvent.type === "provider-turn-completed"
         || lifecycleEvent.type === "provider-turn-error"
+        || lifecycleEvent.type === "provider-turn-interrupted"
       )
     ) {
+      const voicePlanPromptEventId = getVoicePlanPromptEventIdCandidate(lifecyclePromptEventId);
       logTerminalStatus("frontend.voice_plan.lifecycle_dispatch", {
         completionInferred: lifecycleEvent.completionInferred === true,
         lifecycleType: lifecycleEvent.type,
-        promptEventId: lifecyclePromptEventId,
+        promptEventId: voicePlanPromptEventId,
         reason: "thread_terminal_lifecycle",
-        terminalGroundTruthStatus: lifecycleEvent.type === "provider-turn-error" ? "error" : "idle_or_done",
+        terminalGroundTruthStatus: lifecycleEvent.type === "provider-turn-error"
+          ? "error"
+          : lifecycleEvent.type === "provider-turn-interrupted"
+            ? "interrupted"
+            : "idle_or_done",
         threadId: lifecycleThreadId,
         workspaceId: lifecycleWorkspaceId,
       });
@@ -14822,7 +15214,7 @@ export default function App() {
         detail: {
           ...lifecycleEvent,
           completionInferred: lifecycleEvent.completionInferred === true,
-          promptEventId: lifecyclePromptEventId,
+          promptEventId: voicePlanPromptEventId,
           type: lifecycleEvent.type,
         },
       }));
@@ -15090,9 +15482,32 @@ export default function App() {
             status: lifecycleEvent.status || "active",
           });
         } else {
-          nextThreads = appendWorkspaceThreadProjectionEvents(threads, lifecycleEvent);
+          const existingThread = threads?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
+          const existingProjectionEvents = Array.isArray(lifecycleEvent.projectionEvents)
+            ? lifecycleEvent.projectionEvents
+            : Array.isArray(lifecycleEvent.events)
+              ? lifecycleEvent.events
+              : [];
+          const projectionEvents = existingProjectionEvents.length
+            ? existingProjectionEvents
+            : buildTerminalErroredProjectionEvents(existingThread, lifecycleEvent);
+          nextThreads = appendWorkspaceThreadProjectionEvents(threads, {
+            ...lifecycleEvent,
+            activityStatus: "error",
+            clearPendingPrompt: true,
+            inputReady: true,
+            projectionEvents,
+            status: lifecycleEvent.status || "error",
+          });
         }
-      } else if (lifecycleEvent.type === "agent-output") {
+      } else if (
+        lifecycleEvent.type === "agent-output"
+        || lifecycleEvent.type === "provider-user-prompt-started"
+        || lifecycleEvent.type === "provider-tool-started"
+        || lifecycleEvent.type === "provider-tool-completed"
+        || lifecycleEvent.type === "provider-subagent-started"
+        || lifecycleEvent.type === "provider-subagent-completed"
+      ) {
         operation = "mark_agent_activity";
         nextThreads = markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
       } else if (lifecycleEvent.type === "message-submitted" || lifecycleEvent.type === "thread-starting") {
@@ -15382,6 +15797,144 @@ export default function App() {
     workspaceNotificationReducerOptions,
   ]);
 
+  const acceptWorkspaceThreadPromptFromActivityHook = useCallback((event = {}) => {
+    const type = String(event.type || event.eventType || "").trim();
+    const hookEventName = String(event.hookEventName || event.hook_event_name || "").trim();
+    const source = String(event.source || "").trim();
+    const agentId = String(event.agentId || event.agentKind || "").trim().toLowerCase();
+    if (
+      type !== "provider-turn-started"
+      || !terminalAgentUsesActivityHooks(agentId)
+      || !(source.startsWith("cli-hook:") || hookEventName === "UserPromptSubmit")
+    ) {
+      return null;
+    }
+
+    const workspaceId = String(event.workspaceId || "").trim();
+    if (!workspaceId) {
+      return null;
+    }
+    let threadId = String(event.threadId || "").trim();
+    let thread = threadId
+      ? workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId] || null
+      : null;
+    if (!thread && event.terminalIndex != null) {
+      thread = getWorkspaceThreadForTerminalIndex(
+        workspaceThreadsRef.current,
+        workspaceId,
+        event.terminalIndex,
+      );
+      threadId = String(thread?.id || "").trim();
+    }
+    if (!thread || !threadId) {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_activity_hook.skip", {
+        agentId,
+        hookEventName,
+        reason: "thread_missing",
+        source,
+        terminalIndex: event.terminalIndex ?? "",
+        workspaceId,
+      });
+      return null;
+    }
+
+    const hookPromptText = String(
+      event.userMessage
+        || event.message
+        || event.prompt
+        || event.description
+        || "",
+    ).trim();
+    if (!hookPromptText || isTerminalControlHistoryPrompt(hookPromptText)) {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_activity_hook.skip", {
+        agentId,
+        hookEventName,
+        hasPrompt: Boolean(hookPromptText),
+        reason: hookPromptText ? "terminal_control_prompt" : "missing_prompt",
+        source,
+        threadId,
+        workspaceId,
+      });
+      return null;
+    }
+
+    const normalizedHookPrompt = normalizeWorkspaceThreadPromptAcceptanceText(hookPromptText);
+    const pendingPrompt = thread.pendingPrompt || null;
+    const pendingPromptId = String(
+      pendingPrompt?.id || pendingPrompt?.promptEventId || "",
+    ).trim();
+    const pendingPromptText = String(
+      pendingPrompt?.text || pendingPrompt?.message || pendingPrompt?.promptText || "",
+    ).trim();
+    const pendingPromptMatches = Boolean(
+      pendingPrompt
+        && pendingPromptText
+        && normalizeWorkspaceThreadPromptAcceptanceText(pendingPromptText) === normalizedHookPrompt
+    );
+    const runningPromptId = getPromptEventIdFromRunningThread(thread);
+    const runningPromptInfo = getWorkspaceThreadRunningPromptInfo(thread, runningPromptId);
+    const runningPromptMatches = Boolean(
+      runningPromptInfo.text
+        && normalizeWorkspaceThreadPromptAcceptanceText(runningPromptInfo.text) === normalizedHookPrompt
+    );
+    const promptEventId = String(
+      event.promptEventId
+        || event.pendingPromptId
+        || event.promptId
+        || (pendingPromptMatches ? pendingPromptId : "")
+        || (runningPromptMatches ? runningPromptId : "")
+        || "",
+    ).trim();
+    if (!promptEventId) {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_activity_hook.skip", {
+        agentId,
+        hookEventName,
+        pendingPromptPresent: Boolean(pendingPrompt),
+        reason: "prompt_event_id_unmatched",
+        source,
+        threadId,
+        workspaceId,
+      });
+      return null;
+    }
+
+    const providerSessionId = String(event.nativeSessionId || event.providerSessionId || "").trim();
+    const acceptedPromptDetail = {
+      agentId,
+      matchedBy: "activity-hook-user-prompt-submit",
+      promptEventId,
+      promptText: hookPromptText,
+      sessionId: providerSessionId,
+      threadId,
+      workspaceId,
+    };
+    rememberWorkspaceThreadPromptAcceptance(
+      workspaceThreadAcceptedPromptsRef.current,
+      acceptedPromptDetail,
+    );
+    setWorkspaceThreads((threads) => clearWorkspaceThreadPendingPrompt(threads, {
+      promptEventId,
+      threadId,
+      workspaceId,
+    }));
+    window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
+      detail: acceptedPromptDetail,
+    }));
+    logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_activity_hook.accepted", {
+      agentId,
+      hookEventName,
+      matchedBy: acceptedPromptDetail.matchedBy,
+      pendingPromptMatched: pendingPromptMatches,
+      promptEventId,
+      providerSessionPresent: Boolean(providerSessionId),
+      runningPromptMatched: runningPromptMatches,
+      source,
+      threadId,
+      workspaceId,
+    });
+    return acceptedPromptDetail;
+  }, []);
+
   useEffect(() => {
     terminalActivityHookHandlerRef.current = (hookEvent) => {
       const payload = hookEvent?.payload || {};
@@ -15404,15 +15957,7 @@ export default function App() {
       const activityStatus = payload.activityStatus
         || (inputReady ? "idle" : "thinking");
       const hookAgentId = payload.agentId || payload.agentKind || "";
-      const hookProjectionEvents = type === "provider-turn-started"
-        ? buildTerminalStartedProjectionEvents({
-          ...payload,
-          agentId: hookAgentId,
-          source: payload.source || `cli-hook:${type}`,
-          type,
-        })
-        : [];
-      const lifecycleEvent = {
+      let lifecycleEvent = {
         ...payload,
         activityStatus,
         agentId: hookAgentId,
@@ -15425,7 +15970,6 @@ export default function App() {
         nativeSessionId: payload.nativeSessionId || payload.providerSessionId || "",
         nativeSessionKind: payload.nativeSessionId || payload.providerSessionId ? "session" : "",
         nativeSessionSource: payload.nativeSessionId || payload.providerSessionId ? "cli-hook" : "",
-        projectionEvents: hookProjectionEvents,
         providerSessionId: payload.providerSessionId || payload.nativeSessionId || "",
         source: payload.source || `cli-hook:${type}`,
         status: payload.status || "active",
@@ -15435,9 +15979,33 @@ export default function App() {
         userMessage: payload.userMessage || payload.message || "",
         workspaceId,
       };
+      const acceptedPromptDetail = acceptWorkspaceThreadPromptFromActivityHook(lifecycleEvent);
+      if (acceptedPromptDetail?.promptEventId && !lifecycleEvent.promptEventId) {
+        lifecycleEvent = {
+          ...lifecycleEvent,
+          pendingPromptId: acceptedPromptDetail.promptEventId,
+          promptEventId: acceptedPromptDetail.promptEventId,
+        };
+      }
+      const hookProjectionEvents = type === "provider-turn-started"
+        ? buildTerminalStartedProjectionEvents({
+          ...lifecycleEvent,
+          agentId: hookAgentId,
+          source: payload.source || `cli-hook:${type}`,
+          type,
+        })
+        : [];
+      if (hookProjectionEvents.length > 0) {
+        lifecycleEvent = {
+          ...lifecycleEvent,
+          projectionEvents: hookProjectionEvents,
+        };
+      }
       logTerminalStatus("frontend.terminal_activity_hook.lifecycle", {
         activityStatus,
+        acceptedPromptMatched: Boolean(acceptedPromptDetail),
         hookEventName: payload.hookEventName || "",
+        hookHealthStatus: payload.hookHealthStatus || "",
         instanceId: payload.instanceId || "",
         inputReady,
         paneId: payload.paneId || "",
@@ -15449,7 +16017,7 @@ export default function App() {
       });
       handleThreadTerminalLifecycle(lifecycleEvent);
     };
-  }, [handleThreadTerminalLifecycle]);
+  }, [acceptWorkspaceThreadPromptFromActivityHook, handleThreadTerminalLifecycle]);
 
   useEffect(() => {
     let unlistenActivityHook = null;
@@ -15555,6 +16123,23 @@ export default function App() {
       if (!submittedAgentId) {
         submittedAgentId = String(submittedThread?.currentAgent || "").trim().toLowerCase();
       }
+      const submittedPromptSource = String(payload.promptSource || payload.prompt_source || "").trim();
+      const submittedByActivityHook = submittedPromptSource === "activity_hook_user_prompt_submit"
+        || submittedPromptSource === "cli_hook_user_prompt_submit";
+      if (terminalAgentUsesActivityHooks(submittedAgentId) && !submittedByActivityHook) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.skip", {
+          agentId: submittedAgentId,
+          instanceId: payload.instanceId || "",
+          paneId: payload.paneId || "",
+          promptEventIdPresent: Boolean(payload.promptEventId),
+          promptMatch: payload.promptMatch,
+          promptSource: submittedPromptSource,
+          reason: "activity_hook_owns_prompt_acceptance",
+          threadId: payload.threadId || "",
+          workspaceId,
+        });
+        return;
+      }
       const submittedProviderBinding = getWorkspaceThreadProviderBinding(
         submittedThread,
         submittedAgentId,
@@ -15576,7 +16161,7 @@ export default function App() {
         promptEventIdPresent: Boolean(payload.promptEventId),
         promptLength: userMessage.length,
         promptMatch: payload.promptMatch,
-        promptSource: payload.promptSource || "",
+        promptSource: submittedPromptSource,
         promptText: getBigViewTextDiagnosticFields(userMessage),
         source: "terminal-prompt-submitted",
         terminalIndex: payload.terminalIndex ?? "",
@@ -15585,9 +16170,12 @@ export default function App() {
       });
       if (submittedThreadId && userMessage) {
         let acceptedPromptEventId = String(payload.promptEventId || "").trim();
+        const acceptedMatchedBy = submittedByActivityHook
+          ? "activity-hook-user-prompt-submit"
+          : "terminal-submit";
         const acceptedPromptDetail = {
           agentId: submittedAgentId,
-          matchedBy: "terminal-submit",
+          matchedBy: acceptedMatchedBy,
           promptEventId: acceptedPromptEventId,
           promptText: userMessage,
           sessionId: submittedProviderSessionId,
@@ -15646,7 +16234,7 @@ export default function App() {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_prompt_submitted_event.accepted", {
           agentId: submittedAgentId,
           instanceId: payload.instanceId || "",
-          matchedBy: "terminal-submit",
+          matchedBy: acceptedMatchedBy,
           paneId: payload.paneId || "",
           promptEventId: acceptedPromptEventId,
           providerSessionPresent: Boolean(submittedProviderSessionId),
@@ -15657,7 +16245,7 @@ export default function App() {
           window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
             detail: {
               agentId: submittedAgentId,
-              matchedBy: "terminal-submit",
+              matchedBy: acceptedMatchedBy,
               promptEventId: acceptedPromptEventId,
               promptText: userMessage,
               sessionId: submittedProviderSessionId,
@@ -16676,6 +17264,7 @@ export default function App() {
                       const runtimeVisible = Boolean(
                         runtimeWorkspace?.id
                           && runtimeWorkspace.id === activatedWorkspace?.id
+                          && runtimeWorkspace.id === selectedWorkspace?.id
                           && shouldRevealWorkspaceTerminal,
                       );
                       const runtimeIsDeactivating = Boolean(
@@ -16683,8 +17272,10 @@ export default function App() {
                           && workspaceDeactivationState.workspaceId === runtimeWorkspace?.id,
                       );
                       const runtimeAgentLaunchReady = Boolean(
-                        workspaceState === "ready"
+                        runtimeVisible
+                          && workspaceState === "ready"
                           && workspaceHydrationReady
+                          && !workspaceActivationDeferred
                           && workspaceThreadsHydrated
                           && !runtimeIsDeactivating
                           && runtimeDescriptor.agentTerminalEntries.length > 0,
@@ -17354,10 +17945,6 @@ export default function App() {
                   {selectedWorkspace ? (
                     <ArchitectureWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
-                      isWorkspaceActive={Boolean(
-                        isSelectedWorkspaceActivated
-                        && !workspaceDeactivationState.isActive,
-                      )}
                       rootDirectory={selectedWorkspaceFileRoot}
                       architectureError={selectedWorkspaceGraphState.architectureError || ""}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
@@ -17407,7 +17994,6 @@ export default function App() {
                   {selectedWorkspace ? (
                     <McpsWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
-                      onOpenSettings={() => showView("settings")}
                       rootDirectory={selectedWorkspaceFileRoot}
                       workspace={selectedWorkspace}
                     />

@@ -73,6 +73,10 @@ test("visible terminal rail preserves exact activity status", () => {
   }), "thinking");
   assert.equal(terminalReadinessFromPresenceStatus("thinking"), "busy");
   assert.equal(terminalTurnStatusFromActivityStatus("thinking"), "running");
+  assert.equal(terminalRailStateFromActivityStatus("tool_running"), "tool_running");
+  assert.equal(terminalActivityStatusIsBusy("tool_running"), true);
+  assert.equal(terminalActivityStatusIsSendable("tool_running"), false);
+  assert.equal(terminalReadinessFromPresenceStatus("subagent_running"), "busy");
 });
 
 test("queue sendability is driven by idle activity status only", () => {

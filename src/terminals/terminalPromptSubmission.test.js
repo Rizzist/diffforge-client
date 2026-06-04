@@ -43,3 +43,11 @@ test("parked resume backend submit remains authoritative", () => {
     promptSource: "parked_resume_backend_submit",
   }), true);
 });
+
+test("activity hook user prompt submit is authoritative", () => {
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    prompt: "ship it",
+    promptMatch: true,
+    promptSource: "activity_hook_user_prompt_submit",
+  }), true);
+});

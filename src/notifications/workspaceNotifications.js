@@ -56,19 +56,43 @@ const MANUAL_ACCEPTANCE_PROMPT_KINDS = new Set([
   "approval",
   "permission",
 ]);
-const EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS = [
-  "approval",
-  "claude-hook",
-  "claude-permission",
-  "codex-hook",
-  "codex-permission",
-  "coordination",
-  "permission",
-  "pre-tool-use",
-  "pretooluse",
-  "provider-permission",
-  "tool-permission",
+const HOOK_MANUAL_PROMPT_TYPES = new Set([
+  "provider-manual-approval-required",
+  "provider-user-input-required",
+  "provider-user-prompt-started",
+]);
+const HOOK_MANUAL_PROMPT_SOURCE_PARTS = [
+  "cli-hook:manual-prompt",
+  "cli-hook:provider-user-input-required",
+  "cli-hook:provider-user-prompt-started",
+  "hook-manual-prompt",
+  "manual-prompt-hook",
+  "provider-hook:manual-prompt",
 ];
+const RESOLVED_MANUAL_PROMPT_DECISIONS = new Set([
+  "allow",
+  "allowed",
+  "approve",
+  "approved",
+  "auto",
+  "auto-allow",
+  "auto-allowed",
+  "auto-approve",
+  "auto-approved",
+  "auto-denied",
+  "auto-deny",
+  "autoallow",
+  "autoallowed",
+  "autoapprove",
+  "autoapproved",
+  "autodenied",
+  "autodeny",
+  "deny",
+  "denied",
+  "reject",
+  "rejected",
+  "resolved",
+]);
 
 function cleanText(value, fallback = "") {
   const text = String(value ?? "").trim();
@@ -152,8 +176,93 @@ function promptingSourceLooksExplicitPermission(source) {
   const normalized = normalizePromptingUserSource(source);
   return Boolean(
     normalized
-      && EXPLICIT_PERMISSION_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
+      && HOOK_MANUAL_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
       && !normalized.includes("terminal-output")
+  );
+}
+
+function lifecycleEventType(event = {}) {
+  return cleanText(event?.type || event?.eventType || event?.event_type)
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-");
+}
+
+function hookManualPromptSourceLooksOwned(source) {
+  const normalized = normalizePromptingUserSource(source);
+  return Boolean(
+    normalized === "hook"
+      || normalized === "cli-hook"
+      || HOOK_MANUAL_PROMPT_SOURCE_PARTS.some((part) => normalized.includes(part))
+  );
+}
+
+function lifecycleEventHasHookManualPromptSource(event = {}) {
+  return [
+    event?.manualPromptSource,
+    event?.manual_prompt_source,
+    event?.promptingUserSource,
+    event?.prompting_user_source,
+    event?.promptingSource,
+    event?.prompting_source,
+    event?.source,
+  ].some(hookManualPromptSourceLooksOwned);
+}
+
+function lifecycleEventHasResolvedManualPromptDecision(event = {}) {
+  return [
+    event?.permissionDecision,
+    event?.permission_decision,
+    event?.decision,
+    event?.approvalDecision,
+    event?.approval_decision,
+    event?.permissionStatus,
+    event?.permission_status,
+    event?.approvalStatus,
+    event?.approval_status,
+  ].some((value) => RESOLVED_MANUAL_PROMPT_DECISIONS.has(normalizePromptingUserSource(value)));
+}
+
+function lifecycleEventIsHookManualPrompt(event = {}) {
+  const type = lifecycleEventType(event);
+  const hasHookSource = lifecycleEventHasHookManualPromptSource(event);
+  if (!hasHookSource) {
+    return false;
+  }
+  if (lifecycleEventHasResolvedManualPromptDecision(event)) {
+    return false;
+  }
+
+  const hookManualPromptType = HOOK_MANUAL_PROMPT_TYPES.has(type);
+  const active = hookManualPromptType
+    || event?.manualApprovalRequired === true
+    || event?.manual_approval_required === true
+    || event?.providerBlockedForUser === true
+    || event?.provider_blocked_for_user === true
+    || event?.terminalIsPromptingUser === true
+    || event?.terminal_is_prompting_user === true
+    || event?.promptingUser === true
+    || event?.prompting_user === true
+    || event?.requiresUserInput === true
+    || event?.requires_user_input === true;
+  if (!active) {
+    return false;
+  }
+
+  const kind = normalizePromptingUserKind(
+    event?.promptingUserKind
+      || event?.prompting_user_kind
+      || event?.promptingKind
+      || event?.prompting_kind,
+  );
+  return Boolean(
+    hookManualPromptType
+      || MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
+      || event?.manualApprovalRequired === true
+      || event?.manual_approval_required === true
+      || event?.requiresUserInput === true
+      || event?.requires_user_input === true
+      || event?.providerBlockedForUser === true
+      || event?.provider_blocked_for_user === true
   );
 }
 
@@ -162,9 +271,14 @@ function notificationLooksExplicitPermissionPrompt(notification = {}) {
   const kind = normalizePromptingUserKind(
     sourceNotification.promptingUserKind || sourceNotification.prompting_user_kind,
   );
-  const source = sourceNotification.promptingUserSource || sourceNotification.prompting_user_source;
+  const source = sourceNotification.promptingUserSource
+    || sourceNotification.prompting_user_source
+    || sourceNotification.manualPromptSource
+    || sourceNotification.manual_prompt_source
+    || sourceNotification.source;
   return Boolean(
-    MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
+    hookManualPromptSourceLooksOwned(source)
+      && MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind)
       && (promptingPermissionToken(sourceNotification) || promptingSourceLooksExplicitPermission(source))
   );
 }
@@ -726,35 +840,7 @@ function lifecycleTerminalIsComplete(event) {
 }
 
 function lifecycleTerminalIsPromptingUser(event) {
-  const state = lifecycleTerminalWorkState(event);
-  const active = event?.terminalIsPromptingUser === true
-    || event?.terminal_is_prompting_user === true
-    || event?.promptingUser === true
-    || event?.prompting_user === true
-    || event?.requiresUserInput === true
-    || event?.requires_user_input === true
-    || state === "prompting_user"
-    || state === "prompting-user";
-  if (!active) {
-    return false;
-  }
-
-  const kind = normalizePromptingUserKind(
-    event?.promptingUserKind
-      || event?.prompting_user_kind
-      || event?.promptingKind
-      || event?.prompting_kind,
-  );
-  const source = event?.promptingUserSource
-    || event?.prompting_user_source
-    || event?.promptingSource
-    || event?.prompting_source
-    || event?.source
-    || event?.type;
-  return Boolean(
-    (MANUAL_ACCEPTANCE_PROMPT_KINDS.has(kind) || event?.requiresUserInput === true || event?.requires_user_input === true)
-      && (promptingPermissionToken(event) || promptingSourceLooksExplicitPermission(source))
-  );
+  return lifecycleEventIsHookManualPrompt(event);
 }
 
 function lifecycleResolvesPromptingNotification(event) {
