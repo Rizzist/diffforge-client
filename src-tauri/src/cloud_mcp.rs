@@ -5840,7 +5840,8 @@ fn cloud_mcp_voice_plan_status_for_terminal_lifecycle(status: &str) -> Option<&'
         "resume_requested" | "resuming" => Some("resume_requested"),
         "active" | "busy" | "running" | "starting" => Some("running"),
         "dispatched" | "redispatched" => Some("dispatched"),
-        "cancelled" | "canceled" | "interrupted" => Some("cancelled"),
+        "cancelled" | "canceled" => Some("cancelled"),
+        "interrupted" | "interrupt" | "stopped" => Some("interrupted"),
         _ => None,
     }
 }

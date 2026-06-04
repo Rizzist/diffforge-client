@@ -6729,8 +6729,7 @@ export default function App() {
     }
 
     const syncKey = JSON.stringify({
-      repoPath: target.repoPath,
-      workspaceId: target.workspaceId,
+      scope: "connected-device-agent-installations",
       agents: syncStatuses.map((status) => ({
         id: status.id,
         installed: Boolean(status.installed),

@@ -1528,7 +1528,11 @@ const VOICE_PLAN_FAILED_STATUSES = new Set([
 const VOICE_PLAN_CANCELLED_STATUSES = new Set([
   "cancelled",
   "canceled",
+]);
+const VOICE_PLAN_INTERRUPTED_STATUSES = new Set([
+  "interrupt",
   "interrupted",
+  "stopped",
 ]);
 const VOICE_PLAN_RUNNING_STATUSES = new Set([
   "active",
@@ -2537,7 +2541,7 @@ const OrchestratorHistoryPlan = styled.div`
 const OrchestratorHistoryPlanHeader = styled.div`
   display: grid;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 6px;
 `;
@@ -2560,47 +2564,6 @@ const OrchestratorHistoryPlanTitle = styled.div`
 
   html[data-forge-theme="light"] & {
     color: #20242b;
-  }
-`;
-
-const OrchestratorHistoryPlanStatus = styled.div`
-  flex: 0 0 auto;
-  min-width: 0;
-  padding: 4px 7px;
-  border: 1px solid rgba(125, 211, 252, 0.18);
-  border-radius: 999px;
-  color: #7dd3fc;
-  font-size: 10px;
-  font-weight: 820;
-  line-height: 1.2;
-  text-transform: uppercase;
-  white-space: nowrap;
-
-  &[data-status-tone="done"] {
-    border-color: rgba(52, 211, 153, 0.2);
-    color: #86efac;
-  }
-
-  &[data-status-tone="failed"],
-  &[data-status-tone="cancelled"] {
-    border-color: rgba(248, 113, 113, 0.2);
-    color: #fca5a5;
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(3, 105, 161, 0.14);
-    color: #0369a1;
-  }
-
-  html[data-forge-theme="light"] &[data-status-tone="done"] {
-    border-color: rgba(22, 163, 74, 0.16);
-    color: #15803d;
-  }
-
-  html[data-forge-theme="light"] &[data-status-tone="failed"],
-  html[data-forge-theme="light"] &[data-status-tone="cancelled"] {
-    border-color: rgba(220, 38, 38, 0.16);
-    color: #b91c1c;
   }
 `;
 
@@ -2690,31 +2653,6 @@ const OrchestratorHistoryPlanStage = styled.div`
   gap: 5px;
 `;
 
-const OrchestratorHistoryPlanStageHeader = styled.div`
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  color: #9fb0c7;
-  font-size: 10px;
-  font-weight: 820;
-  line-height: 1.2;
-  text-transform: uppercase;
-
-  &[data-active="true"] {
-    color: #5eead4;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #6b7280;
-  }
-
-  html[data-forge-theme="light"] &[data-active="true"] {
-    color: #0f766e;
-  }
-`;
-
 const OrchestratorHistoryPlanTaskList = styled.div`
   display: grid;
   min-width: 0;
@@ -2749,7 +2687,9 @@ const OrchestratorHistoryPlanTaskIcon = styled.span`
   display: inline-grid;
   width: 14px;
   height: 14px;
+  align-self: center;
   align-items: center;
+  justify-self: center;
   justify-items: center;
   border: 1px solid rgba(148, 163, 184, 0.28);
   border-radius: 999px;
@@ -2776,7 +2716,8 @@ const OrchestratorHistoryPlanTaskIcon = styled.span`
   }
 
   &[data-status-tone="failed"],
-  &[data-status-tone="cancelled"] {
+  &[data-status-tone="cancelled"],
+  &[data-status-tone="interrupted"] {
     border-color: rgba(248, 113, 113, 0.34);
     background: rgba(248, 113, 113, 0.1);
     color: #fca5a5;
@@ -2790,9 +2731,8 @@ const OrchestratorHistoryPlanTaskIcon = styled.span`
 
 const OrchestratorHistoryPlanTaskText = styled.div`
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 `;
 
 const OrchestratorHistoryPlanTaskStatus = styled.span`
@@ -2816,7 +2756,8 @@ const OrchestratorHistoryPlanTaskStatus = styled.span`
   }
 
   &[data-status-tone="failed"],
-  &[data-status-tone="cancelled"] {
+  &[data-status-tone="cancelled"],
+  &[data-status-tone="interrupted"] {
     color: #fca5a5;
   }
 
@@ -2831,6 +2772,10 @@ const OrchestratorHistoryPlanTaskActions = styled.div`
   align-items: center;
   justify-content: flex-end;
   gap: 4px;
+`;
+
+const OrchestratorHistoryPlanHeaderActions = styled(OrchestratorHistoryPlanTaskActions)`
+  align-self: start;
 `;
 
 const OrchestratorHistoryPlanActionButton = styled.button`
@@ -5329,6 +5274,9 @@ function getVoicePlanTaskStatusLabel(task) {
   if (!status || status === "draft") {
     return "waiting";
   }
+  if (status === "needs requeue") {
+    return "requeue";
+  }
   if (status === "sent to client") {
     return "queued";
   }
@@ -5409,7 +5357,7 @@ function getVoicePlanTaskLocalQueueState(planTask, items = [], pendingItems = {}
 }
 
 function getVoicePlanTaskUiStatus(task, planTask, items = [], pendingItems = {}) {
-  const { pendingItem, pendingPhase } = getVoicePlanTaskLocalQueueState(planTask, items, pendingItems);
+  const { item, pendingItem, pendingPhase } = getVoicePlanTaskLocalQueueState(planTask, items, pendingItems);
   if (pendingPhase === "queued") {
     return "queued";
   }
@@ -5417,8 +5365,16 @@ function getVoicePlanTaskUiStatus(task, planTask, items = [], pendingItems = {})
     return "dispatched";
   }
   const status = normalizeVoicePlanStatus(task?.status);
-  if (status === "sent_to_client") {
-    return pendingItem ? "queued" : "queued";
+  if (
+    !item
+    && !pendingItem
+    && (
+      VOICE_PLAN_QUEUEABLE_STATUSES.has(status)
+      || VOICE_PLAN_RUNNING_STATUSES.has(status)
+      || VOICE_PLAN_PARKED_STATUSES.has(status)
+    )
+  ) {
+    return "needs_requeue";
   }
   return status || "waiting";
 }
@@ -5433,6 +5389,12 @@ function getVoicePlanTaskTone(status) {
   }
   if (VOICE_PLAN_CANCELLED_STATUSES.has(normalized)) {
     return "cancelled";
+  }
+  if (VOICE_PLAN_INTERRUPTED_STATUSES.has(normalized)) {
+    return "interrupted";
+  }
+  if (normalized === "needs_requeue") {
+    return "waiting";
   }
   if (VOICE_PLAN_RUNNING_STATUSES.has(normalized) || VOICE_PLAN_PARKED_STATUSES.has(normalized)) {
     return "running";
@@ -5487,33 +5449,43 @@ function getVoicePlanTaskControlAvailability({
   };
 }
 
-function getVoicePlanProgressCounts(plan) {
+function getVoicePlanProgressCounts(plan, items = [], pendingItems = {}) {
   const tasks = [];
   (Array.isArray(plan?.steps) ? plan.steps : []).forEach((step) => {
     VOICE_PLAN_STAGE_ORDER.forEach((stageName) => {
-      getVoicePlanStageTasks(step, stageName).forEach((task) => tasks.push(task));
+      getVoicePlanStageTasks(step, stageName).forEach((task) => {
+        const planTask = getVoicePlanTaskControlPlanTask(plan, step, stageName, task);
+        tasks.push(getVoicePlanTaskControlAvailability({
+          items,
+          pendingItems,
+          plan,
+          planTask,
+          task,
+        }));
+      });
     });
   });
   const total = tasks.length;
-  const done = tasks.filter((task) => getVoicePlanTaskTone(task?.status) === "done").length;
-  const failed = tasks.filter((task) => getVoicePlanTaskTone(task?.status) === "failed").length;
-  const cancelled = tasks.filter((task) => getVoicePlanTaskTone(task?.status) === "cancelled").length;
-  const active = tasks.filter((task) => {
-    const tone = getVoicePlanTaskTone(task?.status);
-    return tone === "queued" || tone === "running";
-  }).length;
+  const done = tasks.filter((task) => task.tone === "done").length;
+  const failed = tasks.filter((task) => task.tone === "failed").length;
+  const interrupted = tasks.filter((task) => task.tone === "interrupted").length;
+  const cancelled = tasks.filter((task) => task.tone === "cancelled").length;
+  const active = tasks.filter((task) => task.tone === "queued" || task.tone === "running").length;
+  const needsRequeue = tasks.filter((task) => task.status === "needs_requeue").length;
   return {
     active,
     cancelled,
     done,
     failed,
+    interrupted,
+    needsRequeue,
     total,
   };
 }
 
 function voicePlanHasCancellableWork(plan, items = [], pendingItems = {}) {
   const planTone = getVoicePlanTaskTone(plan?.status);
-  if (planTone === "done" || planTone === "cancelled" || planTone === "failed") {
+  if (planTone === "done" || planTone === "cancelled" || planTone === "failed" || planTone === "interrupted") {
     return false;
   }
   return (Array.isArray(plan?.steps) ? plan.steps : []).some((step) => (
@@ -5532,16 +5504,21 @@ function voicePlanHasCancellableWork(plan, items = [], pendingItems = {}) {
   ));
 }
 
-function getVoicePlanStageLabel(stageLabel, policy, doneWhen = "") {
-  const normalizedPolicy = String(policy || "").trim().replace(/_/g, " ");
-  const normalizedDoneWhen = String(doneWhen || "").trim().replace(/_/g, " ");
-  if (!normalizedPolicy || normalizedPolicy === "parallel") {
-    return stageLabel;
-  }
-  if (normalizedDoneWhen && normalizedDoneWhen !== "stage tasks completed") {
-    return `${stageLabel} · ${normalizedPolicy} · ${normalizedDoneWhen}`;
-  }
-  return `${stageLabel} · ${normalizedPolicy}`;
+function voicePlanHasRequeueableWork(plan, items = [], pendingItems = {}) {
+  return (Array.isArray(plan?.steps) ? plan.steps : []).some((step) => (
+    VOICE_PLAN_STAGE_ORDER.some((stageName) => (
+      getVoicePlanStageTasks(step, stageName).some((task) => {
+        const planTask = getVoicePlanTaskControlPlanTask(plan, step, stageName, task);
+        return getVoicePlanTaskControlAvailability({
+          items,
+          pendingItems,
+          plan,
+          planTask,
+          task,
+        }).canRequeue;
+      })
+    ))
+  ));
 }
 
 function normalizeVoicePlanReleasedTask(value, snapshot = null) {
@@ -7524,6 +7501,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onMinimizePane,
   onOpenWorkspaceSettings,
   onQueueItem,
+  onVoicePlanNeedsRequeue,
+  onRequeueVoicePlanUnfinished,
   onRequeueVoicePlanTask,
   onRemoveItem,
   onReorderItem,
@@ -7874,6 +7853,67 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorVoiceHistoryItems,
     orchestratorVoiceHistoryStoreKey,
     rootDirectory,
+  ]);
+
+  useEffect(() => {
+    if (!orchestratorVoiceHistoryLoadedRef.current || !onVoicePlanNeedsRequeue) {
+      return undefined;
+    }
+
+    const reconcileTimer = window.setTimeout(() => {
+      if (!orchestratorVoiceHistoryLoadedRef.current) {
+        return;
+      }
+      orchestratorVoiceHistoryItems.forEach((item) => {
+        const plan = item?.plan;
+        if (!plan) {
+          return;
+        }
+        (Array.isArray(plan.steps) ? plan.steps : []).forEach((step) => {
+          VOICE_PLAN_STAGE_ORDER.forEach((stageName) => {
+            getVoicePlanStageTasks(step, stageName).forEach((task) => {
+              const rawStatus = normalizeVoicePlanStatus(task?.status);
+              if (
+                !rawStatus
+                || rawStatus === "needs_requeue"
+                || rawStatus === "draft"
+                || isVoicePlanCompletedStatus(rawStatus)
+                || VOICE_PLAN_FAILED_STATUSES.has(rawStatus)
+                || VOICE_PLAN_CANCELLED_STATUSES.has(rawStatus)
+                || VOICE_PLAN_INTERRUPTED_STATUSES.has(rawStatus)
+              ) {
+                return;
+              }
+              const planTask = getVoicePlanTaskControlPlanTask(plan, step, stageName, task);
+              const control = getVoicePlanTaskControlAvailability({
+                items: queueItems,
+                pendingItems,
+                plan,
+                planTask,
+                task,
+              });
+              if (control.status !== "needs_requeue") {
+                return;
+              }
+              onVoicePlanNeedsRequeue({
+                plan,
+                planTask,
+                task,
+              });
+            });
+          });
+        });
+      });
+    }, 350);
+
+    return () => {
+      window.clearTimeout(reconcileTimer);
+    };
+  }, [
+    onVoicePlanNeedsRequeue,
+    orchestratorVoiceHistoryItems,
+    pendingItems,
+    queueItems,
   ]);
 
   const recordVoiceHistoryTranscript = useCallback((event) => {
@@ -9603,7 +9643,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   <OrchestratorHistoryPlanHeaderMain>
                                     <OrchestratorHistoryPlanTitle>{item.plan.title}</OrchestratorHistoryPlanTitle>
                                     {(() => {
-                                      const progress = getVoicePlanProgressCounts(item.plan);
+                                      const progress = getVoicePlanProgressCounts(item.plan, queueItems, pendingItems);
                                       const progressPercent = progress.total
                                         ? Math.round((progress.done / progress.total) * 100)
                                         : 0;
@@ -9612,7 +9652,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                           <OrchestratorHistoryPlanMeta>
                                             <span>{progress.done}/{progress.total || 0}</span>
                                             {progress.active > 0 && <span>{progress.active} active</span>}
+                                            {progress.needsRequeue > 0 && <span>{progress.needsRequeue} requeue</span>}
                                             {progress.failed > 0 && <span>{progress.failed} failed</span>}
+                                            {progress.interrupted > 0 && <span>{progress.interrupted} interrupted</span>}
                                             {progress.cancelled > 0 && <span>{progress.cancelled} cancelled</span>}
                                           </OrchestratorHistoryPlanMeta>
                                           <OrchestratorHistoryPlanProgressTrack aria-hidden="true">
@@ -9624,34 +9666,54 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                       );
                                     })()}
                                   </OrchestratorHistoryPlanHeaderMain>
-                                  <OrchestratorHistoryPlanStatus data-status-tone={getVoicePlanTaskTone(item.plan.status)}>
-                                    {getVoicePlanStatusLabel(item.plan)}
-                                  </OrchestratorHistoryPlanStatus>
-                                  {voicePlanHasCancellableWork(item.plan, queueItems, pendingItems) ? (
-                                    <OrchestratorHistoryPlanActionButton
-                                      aria-label="Cancel plan"
-                                      data-action="cancel-plan"
-                                      data-todo-control="true"
-                                      onClick={(event) => {
-                                        event.preventDefault();
-                                        event.stopPropagation();
-                                        onCancelVoicePlan?.(item.plan);
-                                      }}
-                                      title="Cancel plan"
-                                      type="button"
-                                    >
-                                      <OrchestratorHistoryPlanTaskCancelIcon aria-hidden="true" />
-                                    </OrchestratorHistoryPlanActionButton>
-                                  ) : (
-                                    <OrchestratorHistoryPlanTaskHiddenAction aria-hidden="true" />
-                                  )}
+                                  {(() => {
+                                    const canCancelPlan = voicePlanHasCancellableWork(item.plan, queueItems, pendingItems);
+                                    const canResumePlan = voicePlanHasRequeueableWork(item.plan, queueItems, pendingItems);
+                                    if (!canCancelPlan && !canResumePlan) {
+                                      return <OrchestratorHistoryPlanTaskHiddenAction aria-hidden="true" />;
+                                    }
+                                    return (
+                                      <OrchestratorHistoryPlanHeaderActions>
+                                        {canResumePlan && (
+                                          <OrchestratorHistoryPlanActionButton
+                                            aria-label="Resume unfinished plan tasks"
+                                            data-action="resume-plan"
+                                            data-todo-control="true"
+                                            onClick={(event) => {
+                                              event.preventDefault();
+                                              event.stopPropagation();
+                                              onRequeueVoicePlanUnfinished?.(item.plan);
+                                            }}
+                                            title="Resume unfinished tasks"
+                                            type="button"
+                                          >
+                                            <OrchestratorHistoryPlanTaskQueueIcon aria-hidden="true" />
+                                          </OrchestratorHistoryPlanActionButton>
+                                        )}
+                                        {canCancelPlan && (
+                                          <OrchestratorHistoryPlanActionButton
+                                            aria-label="Cancel plan"
+                                            data-action="cancel-plan"
+                                            data-todo-control="true"
+                                            onClick={(event) => {
+                                              event.preventDefault();
+                                              event.stopPropagation();
+                                              onCancelVoicePlan?.(item.plan);
+                                            }}
+                                            title="Cancel plan"
+                                            type="button"
+                                          >
+                                            <OrchestratorHistoryPlanTaskCancelIcon aria-hidden="true" />
+                                          </OrchestratorHistoryPlanActionButton>
+                                        )}
+                                      </OrchestratorHistoryPlanHeaderActions>
+                                    );
+                                  })()}
                                 </OrchestratorHistoryPlanHeader>
                                 {item.plan.steps.length > 0 && (
                                   <OrchestratorHistoryPlanSteps>
                                     {item.plan.steps.map((step) => {
-                                      const isActiveStep = Number(step.ordinal) === Number(item.plan.currentStepOrdinal);
-                                      const activeStage = isActiveStep ? item.plan.currentStage : "";
-                                      const renderStage = (stageName, stageLabel, stageStatus, tasks, policy, doneWhen) => {
+                                      const renderStage = (stageName, stageStatus, tasks) => {
                                         const normalizedStageStatus = String(stageStatus || "").trim().toLowerCase();
                                         if (!tasks.length && !stageStatus) {
                                           return null;
@@ -9659,13 +9721,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                         if (!tasks.length && (normalizedStageStatus === "draft" || normalizedStageStatus === "planned")) {
                                           return null;
                                         }
-                                        const isActiveStage = isActiveStep && activeStage === stageName;
                                         return (
                                           <OrchestratorHistoryPlanStage key={stageName}>
-                                            <OrchestratorHistoryPlanStageHeader data-active={isActiveStage ? "true" : undefined}>
-                                              <span>{getVoicePlanStageLabel(stageLabel, policy, doneWhen)}</span>
-                                              <span>{stageStatus || "waiting"}</span>
-                                            </OrchestratorHistoryPlanStageHeader>
                                             {tasks.length > 0 && (
                                               <OrchestratorHistoryPlanTaskList>
                                                 {tasks.map((task) => {
@@ -9692,7 +9749,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                                           <OrchestratorHistoryPlanTaskDoneIcon />
                                                         ) : control.tone === "failed" ? (
                                                           <OrchestratorHistoryPlanTaskMark>!</OrchestratorHistoryPlanTaskMark>
-                                                        ) : control.tone === "cancelled" ? (
+                                                        ) : control.tone === "cancelled" || control.tone === "interrupted" ? (
                                                           <OrchestratorHistoryPlanTaskCancelIcon />
                                                         ) : control.tone === "queued" || control.tone === "running" ? (
                                                           <OrchestratorHistoryPlanTaskPulse />
@@ -9772,8 +9829,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                           <OrchestratorHistoryPlanStepTitle>
                                             {step.ordinal + 1}. {step.title}
                                           </OrchestratorHistoryPlanStepTitle>
-                                          {renderStage("execution", "Execution", step.executionStatus, step.executionTasks, step.executionPolicy, step.executionDoneWhen)}
-                                          {renderStage("revision", "Revision", step.revisionStatus, step.revisionTasks, step.revisionPolicy, step.revisionDoneWhen)}
+                                          {renderStage("execution", step.executionStatus, step.executionTasks)}
+                                          {renderStage("revision", step.revisionStatus, step.revisionTasks)}
                                         </OrchestratorHistoryPlanStep>
                                       );
                                     })}
@@ -10008,6 +10065,7 @@ function TerminalView({
   const voiceAgentToolCallIdsRef = useRef(new Set());
   const voicePlanClientCancelledTasksRef = useRef(new Set());
   const voicePlanDeferredTasksRef = useRef(new Map());
+  const voicePlanNeedsRequeueReportedRef = useRef(new Set());
   const voicePlanSnapshotsRef = useRef(new Map());
   const workspaceFileDragStateRef = useRef(null);
   const todoQueueStorageKeyRef = useRef("");
@@ -13936,6 +13994,62 @@ function TerminalView({
     terminalWorkspaceWorkingDirectory,
   ]);
 
+  const handleVoicePlanNeedsRequeue = useCallback(async ({
+    plan = null,
+    planTask,
+    task = null,
+  } = {}) => {
+    const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask || task);
+    if (!normalizedPlanTask) {
+      return null;
+    }
+    const hasLocalQueueItem = todoQueueItemsRef.current.some((item) => (
+      voicePlanTaskMatchesPlanTask(item, normalizedPlanTask)
+    ));
+    const hasLocalPendingItem = Boolean(todoQueuePendingItemsRef.current[normalizedPlanTask.taskId]);
+    const hasLocalInFlightPrompt = Array.from(todoQueueTerminalInFlightPromptsRef.current.values()).some((prompt) => {
+      const promptId = String(prompt?.promptId || "").trim();
+      const itemId = String(prompt?.itemId || "").trim();
+      return promptId === normalizedPlanTask.taskId || itemId === normalizedPlanTask.taskId;
+    });
+    if (hasLocalQueueItem || hasLocalPendingItem || hasLocalInFlightPrompt) {
+      logTerminalStatus("frontend.voice_plan.needs_requeue_reconcile_skip_local_state", {
+        hasLocalInFlightPrompt,
+        hasLocalPendingItem,
+        hasLocalQueueItem,
+        planRunId: normalizedPlanTask.runId,
+        planTask: getVoicePlanTaskStatusLogSummary(normalizedPlanTask),
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return null;
+    }
+    const taskKey = getVoicePlanReleasedTaskKey(normalizedPlanTask);
+    if (voicePlanNeedsRequeueReportedRef.current.has(taskKey)) {
+      return null;
+    }
+    voicePlanNeedsRequeueReportedRef.current.add(taskKey);
+    logTerminalStatus("frontend.voice_plan.needs_requeue_reconcile", {
+      planRunId: normalizedPlanTask.runId,
+      planStatus: plan?.status || "",
+      planTask: getVoicePlanTaskStatusLogSummary(normalizedPlanTask),
+      taskStatus: task?.status || "",
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    const result = await recordVoicePlanTaskStatus(normalizedPlanTask, "needs_requeue", {
+      controlAction: "startup_reconcile",
+      controlScope: "task",
+      reason: "missing_local_queue_after_startup",
+      source: "voice_history_startup_reconciliation",
+    });
+    if (!result) {
+      voicePlanNeedsRequeueReportedRef.current.delete(taskKey);
+    }
+    return result;
+  }, [
+    recordVoicePlanTaskStatus,
+    terminalWorkspace?.id,
+  ]);
+
   const findTodoQueueItemForVoicePlanTask = useCallback((planTask) => {
     const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
     if (!normalizedPlanTask?.taskId) {
@@ -13969,27 +14083,8 @@ function TerminalView({
       }
     }
 
-    const pendingItem = itemId ? todoQueuePendingItemsRef.current[itemId] || null : null;
-    if (pendingItem && getTodoQueuePendingPhase(pendingItem) === "sending") {
-      const terminalIndex = normalizeTodoTerminalIndex(pendingItem.targetTerminalIndex);
-      return {
-        inFlightPrompt: {
-          agentId: pendingItem.targetRole || "",
-          itemId,
-          paneId: pendingItem.paneId || "",
-          promptId: taskId || itemId,
-          source: pendingItem.source || "",
-          targetTerminalIndex: terminalIndex ?? "",
-          terminalInstanceId: "",
-          threadId: pendingItem.threadId || pendingItem.targetThreadId || "",
-          workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
-        },
-        terminalIndex,
-      };
-    }
-
     return null;
-  }, [terminalWorkspace?.id]);
+  }, []);
 
   const interruptVoicePlanTaskTerminal = useCallback(async ({
     inFlightPrompt = null,
@@ -14059,6 +14154,15 @@ function TerminalView({
     return result;
   }, [handleWorkspaceTerminalLifecycle, terminalWorkspace?.id]);
 
+  const voicePlanInterruptResultSucceeded = useCallback((result) => Boolean(
+    result
+      && (
+        result.interruptedActiveTask === true
+        || result.interrupted_active_task === true
+        || Number(result.interruptedParkedPromptCount ?? result.interrupted_parked_prompt_count ?? 0) > 0
+      )
+  ), []);
+
   const clearVoicePlanTaskLocalQueueState = useCallback((planTask, reason = "voice_plan_task_cancelled", fields = {}) => {
     const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
     if (!normalizedPlanTask?.taskId) {
@@ -14111,11 +14215,35 @@ function TerminalView({
     if (!normalizedPlanTask) {
       return;
     }
-    voicePlanClientCancelledTasksRef.current.add(normalizedPlanTask.taskId);
     const localState = clearVoicePlanTaskLocalQueueState(normalizedPlanTask, "voice_plan_task_cancelled", {
       controlAction: "cancel",
       controlScope: "task",
     });
+    let interruptResult = null;
+    if (localState.inFlight) {
+      voicePlanClientCancelledTasksRef.current.add(normalizedPlanTask.taskId);
+      interruptResult = await interruptVoicePlanTaskTerminal({
+        inFlightPrompt: localState.inFlight.inFlightPrompt,
+        planTask: normalizedPlanTask,
+        reason: "voice_plan_task_cancel",
+        terminalIndex: localState.inFlight.terminalIndex,
+      });
+      if (!voicePlanInterruptResultSucceeded(interruptResult)) {
+        voicePlanClientCancelledTasksRef.current.delete(normalizedPlanTask.taskId);
+        await recordVoicePlanTaskStatus(normalizedPlanTask, "needs_requeue", {
+          clientTodoId: localState.itemId || "",
+          controlAction: "interrupt_failed",
+          controlScope: "task",
+          reason: "voice_history_task_cancel_interrupt_failed",
+          source: "voice_history_control",
+          terminalId: localState.inFlight?.inFlightPrompt?.paneId || "",
+          terminalIndex: localState.inFlight?.terminalIndex ?? null,
+          threadId: localState.inFlight?.inFlightPrompt?.threadId || "",
+        });
+        return;
+      }
+    }
+    voicePlanClientCancelledTasksRef.current.add(normalizedPlanTask.taskId);
     await recordVoicePlanTaskStatus(normalizedPlanTask, "cancelled", {
       clientTodoId: localState.itemId || "",
       controlAction: "cancel",
@@ -14126,18 +14254,11 @@ function TerminalView({
       terminalIndex: localState.inFlight?.terminalIndex ?? null,
       threadId: localState.inFlight?.inFlightPrompt?.threadId || "",
     });
-    if (localState.inFlight) {
-      await interruptVoicePlanTaskTerminal({
-        inFlightPrompt: localState.inFlight.inFlightPrompt,
-        planTask: normalizedPlanTask,
-        reason: "voice_plan_task_cancel",
-        terminalIndex: localState.inFlight.terminalIndex,
-      });
-    }
   }, [
     clearVoicePlanTaskLocalQueueState,
     interruptVoicePlanTaskTerminal,
     recordVoicePlanTaskStatus,
+    voicePlanInterruptResultSucceeded,
   ]);
 
   const handleRequeueVoicePlanTask = useCallback(async ({
@@ -14166,9 +14287,68 @@ function TerminalView({
       return;
     }
     voicePlanClientCancelledTasksRef.current.delete(normalizedPlanTask.taskId);
+    voicePlanNeedsRequeueReportedRef.current.delete(getVoicePlanReleasedTaskKey(normalizedPlanTask));
     queueReleasedVoicePlanTasks([normalizedReleasedTask], plan, {
       force: true,
       source: "voice_plan_manual_requeue",
+    });
+  }, [
+    queueReleasedVoicePlanTasks,
+    recordVoicePlanTaskStatus,
+  ]);
+
+  const handleRequeueVoicePlanUnfinished = useCallback(async (plan) => {
+    const releasedTasks = [];
+    (Array.isArray(plan?.steps) ? plan.steps : []).forEach((step) => {
+      VOICE_PLAN_STAGE_ORDER.forEach((stageName) => {
+        getVoicePlanStageTasks(step, stageName).forEach((task) => {
+          const planTask = getVoicePlanTaskControlPlanTask(plan, step, stageName, task);
+          const control = getVoicePlanTaskControlAvailability({
+            items: todoQueueItemsRef.current,
+            pendingItems: todoQueuePendingItemsRef.current,
+            plan,
+            planTask,
+            task,
+          });
+          if (!control.canRequeue) {
+            return;
+          }
+          const releasedTask = getVoicePlanReleasedTaskFromControlTask(plan, step, stageName, task);
+          if (releasedTask) {
+            releasedTasks.push({
+              planTask,
+              releasedTask,
+            });
+          }
+        });
+      });
+    });
+    if (!releasedTasks.length) {
+      return;
+    }
+
+    const queuedTasks = [];
+    for (const { planTask, releasedTask } of releasedTasks) {
+      const result = await recordVoicePlanTaskStatus(planTask, "queued", {
+        clientTodoId: planTask.taskId,
+        controlAction: "resume_unfinished",
+        controlScope: "plan",
+        reason: "resume_unfinished_plan_tasks",
+        source: "voice_history_control",
+      });
+      if (!result) {
+        continue;
+      }
+      voicePlanClientCancelledTasksRef.current.delete(planTask.taskId);
+      voicePlanNeedsRequeueReportedRef.current.delete(getVoicePlanReleasedTaskKey(planTask));
+      queuedTasks.push(releasedTask);
+    }
+    if (!queuedTasks.length) {
+      return;
+    }
+    queueReleasedVoicePlanTasks(queuedTasks, plan, {
+      force: true,
+      source: "voice_plan_resume_unfinished",
     });
   }, [
     queueReleasedVoicePlanTasks,
@@ -14203,13 +14383,7 @@ function TerminalView({
       }),
       planTask: task,
     }));
-    await recordVoicePlanTaskStatus(tasks[0], "cancelled", {
-      controlAction: "cancel_plan",
-      controlScope: "plan",
-      reason: "voice_history_plan_cancel",
-      source: "voice_history_control",
-    });
-    await Promise.all(localStates
+    const interruptResults = await Promise.all(localStates
       .filter(({ localState }) => localState.inFlight)
       .map(({ localState, planTask: task }) => interruptVoicePlanTaskTerminal({
         inFlightPrompt: localState.inFlight.inFlightPrompt,
@@ -14217,10 +14391,33 @@ function TerminalView({
         reason: "voice_plan_cancel",
         terminalIndex: localState.inFlight.terminalIndex,
       })));
+    const activeLocalStates = localStates.filter(({ localState }) => localState.inFlight);
+    await Promise.all(activeLocalStates.map(({ localState, planTask: task }, index) => {
+      if (voicePlanInterruptResultSucceeded(interruptResults[index])) {
+        return null;
+      }
+      return recordVoicePlanTaskStatus(task, "needs_requeue", {
+        clientTodoId: localState.itemId || "",
+        controlAction: "interrupt_failed",
+        controlScope: "plan",
+        reason: "voice_history_plan_cancel_interrupt_failed",
+        source: "voice_history_control",
+        terminalId: localState.inFlight?.inFlightPrompt?.paneId || "",
+        terminalIndex: localState.inFlight?.terminalIndex ?? null,
+        threadId: localState.inFlight?.inFlightPrompt?.threadId || "",
+      });
+    }));
+    await recordVoicePlanTaskStatus(tasks[0], "cancelled", {
+      controlAction: "cancel_plan",
+      controlScope: "plan",
+      reason: "voice_history_plan_cancel",
+      source: "voice_history_control",
+    });
   }, [
     clearVoicePlanTaskLocalQueueState,
     interruptVoicePlanTaskTerminal,
     recordVoicePlanTaskStatus,
+    voicePlanInterruptResultSucceeded,
   ]);
 
   useEffect(() => {
@@ -14288,6 +14485,7 @@ function TerminalView({
         isVoicePlanCompletedStatus(snapshotTaskStatus)
         || VOICE_PLAN_FAILED_STATUSES.has(snapshotTaskStatus)
         || VOICE_PLAN_CANCELLED_STATUSES.has(snapshotTaskStatus)
+        || VOICE_PLAN_INTERRUPTED_STATUSES.has(snapshotTaskStatus)
       ) {
         logTerminalStatus("frontend.voice_plan.lifecycle_event_ignored", {
           eventType,
@@ -14333,10 +14531,12 @@ function TerminalView({
         eventType === "provider-turn-error"
           ? "failed"
           : eventType === "provider-turn-interrupted"
-            ? "cancelled"
+            ? "interrupted"
             : "done",
         {
           agentId: detail.agentId || detail.currentAgent || "",
+          controlAction: eventType === "provider-turn-interrupted" ? "provider_interrupted" : "",
+          controlScope: eventType === "provider-turn-interrupted" ? "task" : "",
           error: detail.error || "",
           outputTextLength: String(detail.outputText || detail.text || "").length,
           promptEventId,
@@ -18296,6 +18496,8 @@ function TerminalView({
                           onMinimizePane={minimizeTodoQueuePane}
                           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
                           onQueueItem={queueTodoQueueItem}
+                          onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}
+                          onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}
                           onRequeueVoicePlanTask={handleRequeueVoicePlanTask}
                           onRemoveItem={removeTodoQueueItem}
                           onReorderItem={reorderTodoQueueItem}
