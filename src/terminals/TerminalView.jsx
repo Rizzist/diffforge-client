@@ -8232,19 +8232,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [orchestratorPanelWorkspaceId, recordVoiceHistoryLlmFeedback]);
 
   const getCloudVoiceAgentRequestContext = useCallback(() => ({
-    agentStatuses: (Array.isArray(agentStatuses) ? agentStatuses : []).map((agent) => ({
-      activeModel: agent?.activeModel || "",
-      authenticated: Boolean(agent?.authenticated),
-      binary: agent?.binary || agent?.id || "",
-      id: agent?.id || "",
-      installed: Boolean(agent?.installed),
-      label: agent?.label || agent?.id || "",
-      version: agent?.version || "",
-    })),
     workspaceId: workspaceId || workspace?.id || "",
     workspaceName: workspace?.name || "",
     workspaceRoot: rootDirectory || defaultWorkingDirectory || "",
-  }), [agentStatuses, defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
+  }), [defaultWorkingDirectory, rootDirectory, workspace?.id, workspace?.name, workspaceId]);
 
   const stopOrchestratorVoiceMonitor = useCallback(async () => {
     if (orchestratorVoiceEventsActiveRef.current) {

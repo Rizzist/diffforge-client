@@ -1812,7 +1812,6 @@ struct DeepgramRealtimeStartStatus {
 #[serde(rename_all = "camelCase")]
 struct CloudVoiceAgentStartRequest {
     repo_id: Option<String>,
-    agent_statuses: Option<Value>,
     submission_mode: Option<String>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
@@ -1825,7 +1824,6 @@ struct CloudVoiceAgentTextMessageRequest {
     text: String,
     turn_index: Option<u64>,
     repo_id: Option<String>,
-    agent_statuses: Option<Value>,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     workspace_root: Option<String>,

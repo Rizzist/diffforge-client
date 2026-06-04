@@ -72,6 +72,31 @@ const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
 const ARCHITECTURE_TODO_QUEUE_MAX_ITEMS = 120;
+const ARCHITECTURE_AGENT_EDIT_MARKERS_STORAGE_PREFIX = "diffforge.architectureAgentEdits.v1";
+const ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS = 80;
+const ARCHITECTURE_AGENT_EDIT_MARKER_MAX_AGE_MS = 36 * 60 * 60 * 1000;
+const ARCHITECTURE_AGENT_EDIT_DONE_STATUSES = new Set([
+  "cancelled",
+  "done",
+  "failed",
+  "interrupted",
+  "rolled-back",
+  "skipped",
+]);
+const ARCHITECTURE_AGENT_EDIT_AGENT_COLORS = {
+  claude: "#f59e0b",
+  "claude-code": "#f59e0b",
+  codex: "#60a5fa",
+  opencode: "#34d399",
+};
+const ARCHITECTURE_AGENT_EDIT_FALLBACK_COLORS = [
+  "#60a5fa",
+  "#34d399",
+  "#f59e0b",
+  "#f472b6",
+  "#a78bfa",
+  "#2dd4bf",
+];
 const ARCHITECTURE_ROUTE_GRID_CELL = 48;
 const ARCHITECTURE_ROUTE_GRID_MAX_POINTS = 1600;
 const ARCHITECTURE_ROUTE_CACHE_MAX = 700;
@@ -2826,6 +2851,112 @@ function architectureWriteStoredTodoQueueItems(storageKey, items) {
   }
 }
 
+function architectureNormalizedIdentityText(value) {
+  return text(value).replace(/\\/g, "/").replace(/\/+$/u, "").toLowerCase();
+}
+
+function architectureGraphIdentity(graph) {
+  const graphId = text(graph?.id);
+  const graphTitle = text(graph?.title, "Architecture graph");
+  const graphFilePath = text(graph?.filePath || graph?.file_path);
+  return {
+    graphFilePath,
+    graphId,
+    graphKey: architectureNormalizedIdentityText(graphFilePath || graphId || graphTitle),
+    graphTitle,
+  };
+}
+
+function architectureAgentEditMarkersStorageKey(workspaceId, repoPath) {
+  const safeWorkspaceId = architectureNormalizedIdentityText(workspaceId || "local");
+  const safeRepoPath = architectureNormalizedIdentityText(repoPath);
+  if (!safeWorkspaceId && !safeRepoPath) return "";
+  return `${ARCHITECTURE_AGENT_EDIT_MARKERS_STORAGE_PREFIX}.${safeWorkspaceId || "local"}.${safeRepoPath || "repo"}`;
+}
+
+function architectureHashText(value) {
+  const raw = text(value);
+  let hash = 0;
+  for (let index = 0; index < raw.length; index += 1) {
+    hash = ((hash << 5) - hash + raw.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash);
+}
+
+function architectureAgentLabel(value) {
+  const raw = text(value);
+  const normalized = raw.toLowerCase().replace(/[_\s]+/gu, "-");
+  if (normalized.includes("claude")) return "Claude Code";
+  if (normalized.includes("opencode")) return "OpenCode";
+  if (normalized.includes("codex")) return "Codex";
+  return raw || "Coding agent";
+}
+
+function architectureAgentColor(value, fallback = "") {
+  const normalized = text(value).toLowerCase().replace(/[_\s]+/gu, "-");
+  const directColor = ARCHITECTURE_AGENT_EDIT_AGENT_COLORS[normalized];
+  if (directColor) return directColor;
+  const matchedKey = Object.keys(ARCHITECTURE_AGENT_EDIT_AGENT_COLORS)
+    .find((key) => normalized.includes(key));
+  if (matchedKey) return ARCHITECTURE_AGENT_EDIT_AGENT_COLORS[matchedKey];
+  const colors = ARCHITECTURE_AGENT_EDIT_FALLBACK_COLORS;
+  return colors[architectureHashText(value || fallback) % colors.length];
+}
+
+function architectureNormalizeAgentEditMarker(marker) {
+  if (!marker || typeof marker !== "object") return null;
+  const identity = architectureGraphIdentity({
+    filePath: marker.graphFilePath || marker.graph_file_path,
+    id: marker.graphId || marker.graph_id,
+    title: marker.graphTitle || marker.graph_title,
+  });
+  const commandId = text(marker.commandId || marker.command_id || marker.id);
+  const createdAt = text(marker.createdAt || marker.created_at, new Date().toISOString());
+  const status = text(marker.status || marker.state, "queued") === "editing" ? "editing" : "queued";
+  if (!commandId || !identity.graphKey) return null;
+  const agentId = text(marker.agentId || marker.agent_id || marker.codingAgent || marker.coding_agent);
+  const agentLabel = architectureAgentLabel(marker.agentLabel || marker.agent_label || agentId);
+  return {
+    agentColor: text(marker.agentColor || marker.agent_color, architectureAgentColor(agentId || agentLabel, commandId)),
+    agentId,
+    agentLabel,
+    commandId,
+    createdAt,
+    graphFilePath: identity.graphFilePath,
+    graphId: identity.graphId,
+    graphKey: identity.graphKey,
+    graphTitle: identity.graphTitle,
+    id: commandId,
+    repoPath: text(marker.repoPath || marker.repo_path),
+    status,
+    taskId: text(marker.taskId || marker.task_id),
+    updatedAt: text(marker.updatedAt || marker.updated_at, createdAt),
+    workspaceId: text(marker.workspaceId || marker.workspace_id),
+  };
+}
+
+function architectureReadStoredAgentEditMarkers(storageKey) {
+  if (!storageKey || typeof window === "undefined" || !window.localStorage) return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+    return jsonArray(parsed).map(architectureNormalizeAgentEditMarker).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function architectureWriteStoredAgentEditMarkers(storageKey, markers) {
+  if (!storageKey || typeof window === "undefined" || !window.localStorage) return;
+  try {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify(jsonArray(markers).slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS)),
+    );
+  } catch {
+    // Visual edit markers are best effort; the queued task still exists independently.
+  }
+}
+
 function architectureTodoCommandId() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -2834,18 +2965,18 @@ function architectureTodoCommandId() {
 }
 
 function architectureAgentTaskText({
+  commandId,
   graph,
   prompt,
   repoPath,
 }) {
-  const graphTitle = text(graph?.title, "Architecture graph");
-  const graphFilePath = text(graph?.filePath);
-  const graphId = text(graph?.id);
+  const identity = architectureGraphIdentity(graph);
   return [
     `Architecture graph request: ${prompt}`,
     "",
-    `Current graph: ${graphTitle}`,
-    graphFilePath ? `Graph file: ${graphFilePath}` : graphId ? `Graph id: ${graphId}` : "",
+    commandId ? `Command id: ${commandId}` : "",
+    `Current graph: ${identity.graphTitle}`,
+    identity.graphFilePath ? `Graph file: ${identity.graphFilePath}` : identity.graphId ? `Graph id: ${identity.graphId}` : "",
     repoPath ? `Repo: ${repoPath}` : "",
     "",
     "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
@@ -2865,7 +2996,16 @@ function architectureQueueAgentTodo({
   const safeWorkspaceId = text(workspaceId);
   const commandId = architectureTodoCommandId();
   const now = new Date().toISOString();
+  const identity = architectureGraphIdentity(graph);
+  const architectureGraph = {
+    filePath: identity.graphFilePath,
+    graphKey: identity.graphKey,
+    id: identity.graphId,
+    repoPath: text(repoPath),
+    title: identity.graphTitle,
+  };
   const item = {
+    architectureGraph,
     createdAt: now,
     id: commandId,
     kind: "todo",
@@ -2877,11 +3017,15 @@ function architectureQueueAgentTodo({
       updatedAt: now,
     },
     remoteCommand: {
+      architectureGraph,
       commandId,
+      graphFilePath: identity.graphFilePath,
+      graphId: identity.graphId,
+      graphTitle: identity.graphTitle,
       source: "architecture-tab",
     },
     source: ARCHITECTURE_TODO_QUEUE_SOURCE,
-    text: architectureAgentTaskText({ graph, prompt, repoPath }),
+    text: architectureAgentTaskText({ commandId, graph, prompt, repoPath }),
     workspaceId: safeWorkspaceId,
   };
   const storageKey = architectureTodoQueueStorageKey(safeWorkspaceId);
@@ -3058,6 +3202,246 @@ function taskBody(task) {
 
 function taskAgentLabel(task) {
   return text(task?.coding_agent || task?.agent_kind || task?.agent || task?.agent_id);
+}
+
+function architectureTaskAgentId(task) {
+  const terminalPlan = taskTerminalPlan(task);
+  return text(
+    taskAgentLabel(task)
+      || terminalPlan?.agent_kind
+      || terminalPlan?.agentKind
+      || terminalPlan?.agent_id
+      || terminalPlan?.agentId,
+  );
+}
+
+function architectureAgentEditMarkerFromQueueItem(item) {
+  const remoteCommand = jsonObject(item?.remoteCommand || item?.remote_command) || {};
+  const graphMetadata = jsonObject(
+    item?.architectureGraph
+      || item?.architecture_graph
+      || remoteCommand?.architectureGraph
+      || remoteCommand?.architecture_graph,
+  ) || {};
+  const identity = architectureGraphIdentity({
+    filePath: graphMetadata.filePath
+      || graphMetadata.file_path
+      || remoteCommand.graphFilePath
+      || remoteCommand.graph_file_path,
+    id: graphMetadata.id || graphMetadata.graphId || graphMetadata.graph_id || remoteCommand.graphId || remoteCommand.graph_id,
+    title: graphMetadata.title || graphMetadata.graphTitle || graphMetadata.graph_title || remoteCommand.graphTitle || remoteCommand.graph_title,
+  });
+  const commandId = text(remoteCommand.commandId || remoteCommand.command_id || item?.id);
+  if (!commandId || !identity.graphKey) return null;
+  const agentId = text(
+    item?.targetAgentId
+      || item?.target_agent_id
+      || remoteCommand.targetAgentId
+      || remoteCommand.target_agent_id,
+  );
+  return architectureNormalizeAgentEditMarker({
+    agentId,
+    agentLabel: item?.targetAgentLabel || item?.target_agent_label || architectureAgentLabel(agentId),
+    commandId,
+    createdAt: item?.createdAt || item?.created_at,
+    graphFilePath: identity.graphFilePath,
+    graphId: identity.graphId,
+    graphTitle: identity.graphTitle,
+    repoPath: graphMetadata.repoPath || graphMetadata.repo_path,
+    status: "queued",
+    updatedAt: item?.updatedAt || item?.updated_at || item?.createdAt || item?.created_at,
+    workspaceId: item?.workspaceId || item?.workspace_id,
+  });
+}
+
+function architectureAgentEditMarkersEqual(left, right) {
+  return JSON.stringify(jsonArray(left)) === JSON.stringify(jsonArray(right));
+}
+
+function architectureGraphMatchesAgentEditMarker(graph, marker) {
+  const identity = architectureGraphIdentity(graph);
+  const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
+  if (!identity.graphKey || !normalizedMarker) return false;
+  if (identity.graphKey === normalizedMarker.graphKey) return true;
+  if (identity.graphId && normalizedMarker.graphId && identity.graphId === normalizedMarker.graphId) return true;
+  if (
+    identity.graphFilePath
+    && normalizedMarker.graphFilePath
+    && architectureNormalizedIdentityText(identity.graphFilePath)
+      === architectureNormalizedIdentityText(normalizedMarker.graphFilePath)
+  ) {
+    return true;
+  }
+  return Boolean(
+    identity.graphTitle
+      && normalizedMarker.graphTitle
+      && architectureNormalizedIdentityText(identity.graphTitle)
+        === architectureNormalizedIdentityText(normalizedMarker.graphTitle),
+  );
+}
+
+function architectureAgentEditMarkersGraphMatch(left, right) {
+  const normalizedLeft = architectureNormalizeAgentEditMarker(left);
+  const normalizedRight = architectureNormalizeAgentEditMarker(right);
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft.graphKey && normalizedRight.graphKey && normalizedLeft.graphKey === normalizedRight.graphKey) return true;
+  if (normalizedLeft.graphId && normalizedRight.graphId && normalizedLeft.graphId === normalizedRight.graphId) return true;
+  if (
+    normalizedLeft.graphFilePath
+    && normalizedRight.graphFilePath
+    && architectureNormalizedIdentityText(normalizedLeft.graphFilePath)
+      === architectureNormalizedIdentityText(normalizedRight.graphFilePath)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function architectureTaskSearchText(task) {
+  const metadata = jsonObject(task?.metadata_json || task?.metadata);
+  const terminalPlan = taskTerminalPlan(task);
+  const parts = [
+    taskPlanTaskId(task),
+    taskDisplayTitle(task),
+    taskBody(task),
+    taskStatus(task),
+    architectureTaskAgentId(task),
+    task?.id,
+    task?.taskId,
+    task?.task_id,
+    task?.remote_command_id,
+    task?.remoteCommandId,
+    terminalPlan?.task_id,
+    terminalPlan?.taskId,
+    terminalPlan?.title,
+    terminalPlan?.description,
+    ...taskInputBlocks(task).map((block) => block.content),
+  ];
+  try {
+    if (metadata) parts.push(JSON.stringify(metadata));
+    if (terminalPlan) parts.push(JSON.stringify(terminalPlan));
+  } catch {
+    // Some task payloads may contain unserializable values; field-level matching above is enough.
+  }
+  return parts.map((part) => text(part)).filter(Boolean).join("\n").toLowerCase();
+}
+
+function architectureTaskMatchesAgentEditMarker(task, marker) {
+  const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
+  if (!task || !normalizedMarker) return false;
+  const haystack = architectureTaskSearchText(task);
+  const normalizedHaystack = architectureNormalizedIdentityText(haystack);
+  const commandId = text(normalizedMarker.commandId).toLowerCase();
+  if (commandId && haystack.includes(commandId)) return true;
+  const graphFilePath = architectureNormalizedIdentityText(normalizedMarker.graphFilePath);
+  if (graphFilePath && normalizedHaystack.includes(graphFilePath)) return true;
+  const graphId = text(normalizedMarker.graphId).toLowerCase();
+  if (graphId && haystack.includes(graphId)) return true;
+  const graphTitle = text(normalizedMarker.graphTitle).toLowerCase();
+  return Boolean(
+    graphTitle.length >= 8
+      && haystack.includes(graphTitle)
+      && (haystack.includes("architecture graph") || haystack.includes(".arch")),
+  );
+}
+
+function architectureFindAgentEditTask(marker, tasks) {
+  const commandId = text(marker?.commandId).toLowerCase();
+  return jsonArray(tasks)
+    .map((task, index) => {
+      if (!architectureTaskMatchesAgentEditMarker(task, marker)) return null;
+      const haystack = architectureTaskSearchText(task);
+      return {
+        commandMatch: commandId && haystack.includes(commandId) ? 1 : 0,
+        index,
+        task,
+        updatedMs: taskUpdatedMs(task),
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => (
+      right.commandMatch - left.commandMatch
+        || right.updatedMs - left.updatedMs
+        || right.index - left.index
+    ))[0]?.task || null;
+}
+
+function architectureGraphUpdatedAfterAgentEditMarker(graph, marker) {
+  const graphUpdatedMs = parseTimeMs(graph?.updatedAt || graph?.updated_at);
+  const markerCreatedMs = parseTimeMs(marker?.createdAt || marker?.created_at);
+  return Boolean(graphUpdatedMs && markerCreatedMs && graphUpdatedMs > markerCreatedMs + 500);
+}
+
+function architectureDeriveAgentEditMarker(marker, tasks, graphs) {
+  const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
+  if (!normalizedMarker) return null;
+  const createdMs = parseTimeMs(normalizedMarker.createdAt);
+  if (createdMs && Date.now() - createdMs > ARCHITECTURE_AGENT_EDIT_MARKER_MAX_AGE_MS) {
+    return null;
+  }
+  const task = architectureFindAgentEditTask(normalizedMarker, tasks);
+  if (task) {
+    const statusKind = taskStatusKind(task);
+    if (ARCHITECTURE_AGENT_EDIT_DONE_STATUSES.has(statusKind)) return null;
+    const agentId = architectureTaskAgentId(task) || normalizedMarker.agentId;
+    const agentLabel = architectureAgentLabel(agentId || normalizedMarker.agentLabel);
+    return {
+      ...normalizedMarker,
+      agentColor: architectureAgentColor(agentId || agentLabel, normalizedMarker.commandId),
+      agentId,
+      agentLabel,
+      status: statusKind === "queued" ? "queued" : "editing",
+      taskId: taskPlanTaskId(task, normalizedMarker.taskId),
+      updatedAt: taskUpdatedMs(task) ? new Date(taskUpdatedMs(task)).toISOString() : normalizedMarker.updatedAt,
+    };
+  }
+  const graph = jsonArray(graphs).find((candidate) => architectureGraphMatchesAgentEditMarker(candidate, normalizedMarker));
+  if (graph && architectureGraphUpdatedAfterAgentEditMarker(graph, normalizedMarker)) {
+    return {
+      ...normalizedMarker,
+      status: "editing",
+      updatedAt: text(graph.updatedAt || graph.updated_at, normalizedMarker.updatedAt),
+    };
+  }
+  return normalizedMarker;
+}
+
+function architectureVisibleAgentEditMarkers(markers, tasks, graphs) {
+  const nextMarkers = [];
+  jsonArray(markers).forEach((marker) => {
+    const nextMarker = architectureDeriveAgentEditMarker(marker, tasks, graphs);
+    if (!nextMarker) return;
+    const existingIndex = nextMarkers.findIndex((candidate) => candidate.commandId === nextMarker.commandId);
+    if (existingIndex >= 0) {
+      nextMarkers[existingIndex] = nextMarker;
+      return;
+    }
+    nextMarkers.push(nextMarker);
+  });
+  return nextMarkers
+    .sort((left, right) => parseTimeMs(left.createdAt) - parseTimeMs(right.createdAt))
+    .slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS);
+}
+
+function architectureAgentEditMarkerForGraph(graph, markers) {
+  return jsonArray(markers)
+    .filter((marker) => architectureGraphMatchesAgentEditMarker(graph, marker))
+    .sort((left, right) => (
+      parseTimeMs(right.updatedAt || right.createdAt) - parseTimeMs(left.updatedAt || left.createdAt)
+    ))[0] || null;
+}
+
+function architectureAgentEditMarkerBlurb(marker) {
+  const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
+  if (!normalizedMarker) return "";
+  const action = normalizedMarker.status === "editing" ? "editing" : "queued edit";
+  return `${normalizedMarker.agentLabel} ${action}`;
+}
+
+function architectureAgentEditMarkerTitle(marker) {
+  const normalizedMarker = architectureNormalizeAgentEditMarker(marker);
+  if (!normalizedMarker) return "";
+  return `${architectureAgentEditMarkerBlurb(normalizedMarker)} for ${normalizedMarker.graphTitle}`;
 }
 
 function taskRelativeStamp(item) {
@@ -3633,6 +4017,7 @@ export default function ArchitectureWorkspaceView({
           queueWorkspaceName={activeWorkspaceName}
           repoLabel={repoLabel}
           repoPath={repoPath}
+          tasks={visibleTasks}
         />
       ) : viewMode === "rawScan" ? (
         <RawScanPanel
@@ -3664,6 +4049,7 @@ function ArchitecturesPanel({
   queueWorkspaceName = "",
   repoLabel,
   repoPath,
+  tasks = [],
 }) {
   const [repositories, setRepositories] = useState([]);
   const [selectedRepoPath, setSelectedRepoPath] = useState("");
@@ -3680,6 +4066,7 @@ function ArchitecturesPanel({
   const [draftGraphTemplate, setDraftGraphTemplate] = useState("system");
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("idle");
+  const [agentEditMarkers, setAgentEditMarkers] = useState([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3817,6 +4204,18 @@ function ArchitecturesPanel({
   }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
 
   const selectedRepo = repositories.find((repo) => repo.path === selectedRepoPath) || null;
+  const agentEditMarkersStorageKey = useMemo(
+    () => architectureAgentEditMarkersStorageKey(queueWorkspaceId, selectedRepoPath || repoPath),
+    [queueWorkspaceId, repoPath, selectedRepoPath],
+  );
+  const visibleAgentEditMarkers = useMemo(
+    () => architectureVisibleAgentEditMarkers(agentEditMarkers, tasks, graphs),
+    [agentEditMarkers, graphs, tasks],
+  );
+  const selectedAgentEditMarker = useMemo(
+    () => architectureAgentEditMarkerForGraph(selectedGraph, visibleAgentEditMarkers),
+    [selectedGraph, visibleAgentEditMarkers],
+  );
   const isLoading = repoState === "loading" || graphState === "loading";
   const singleRepository = repositories.length <= 1;
   const treeRows = useMemo(() => architectureGraphTreeRows(graphs, singleRepository ? 0 : 1), [graphs, singleRepository]);
@@ -3824,6 +4223,38 @@ function ArchitecturesPanel({
     [...new Set(graphs.map((graph) => architectureFolderPathText(graph.groupPath)).filter(Boolean))]
       .sort((left, right) => left.localeCompare(right))
   ), [graphs]);
+
+  useEffect(() => {
+    if (!agentEditMarkersStorageKey) {
+      setAgentEditMarkers([]);
+      return;
+    }
+    setAgentEditMarkers(architectureReadStoredAgentEditMarkers(agentEditMarkersStorageKey));
+  }, [agentEditMarkersStorageKey]);
+
+  useEffect(() => {
+    if (!agentEditMarkersStorageKey) return;
+    if (architectureAgentEditMarkersEqual(agentEditMarkers, visibleAgentEditMarkers)) return;
+    setAgentEditMarkers(visibleAgentEditMarkers);
+    architectureWriteStoredAgentEditMarkers(agentEditMarkersStorageKey, visibleAgentEditMarkers);
+  }, [agentEditMarkers, agentEditMarkersStorageKey, visibleAgentEditMarkers]);
+
+  const recordAgentEditQueued = useCallback((queuedItem) => {
+    const marker = architectureAgentEditMarkerFromQueueItem(queuedItem);
+    if (!marker) return;
+    setAgentEditMarkers((currentMarkers) => {
+      const currentVisibleMarkers = architectureVisibleAgentEditMarkers(currentMarkers, tasks, graphs);
+      const nextMarkers = currentVisibleMarkers
+        .filter((candidate) => (
+          candidate.commandId !== marker.commandId
+            && !architectureAgentEditMarkersGraphMatch(candidate, marker)
+        ))
+        .concat([marker])
+        .slice(-ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS);
+      architectureWriteStoredAgentEditMarkers(agentEditMarkersStorageKey, nextMarkers);
+      return nextMarkers;
+    });
+  }, [agentEditMarkersStorageKey, graphs, tasks]);
 
   const beginCreateGraph = useCallback((folderPath = "") => {
     const nextFolderPath = text(folderPath);
@@ -3892,22 +4323,29 @@ function ArchitecturesPanel({
 
   const renderTreeRows = useCallback((emptyDepth = 0) => (
     <>
-      {treeRows.map((row) => (
-        row.kind === "folder" ? (
-          <ArchitectureTreeRow
-            data-kind="folder"
-            key={`folder-${row.id}`}
-            onClick={() => beginCreateGraph(row.path.join(" / "))}
-            style={{ "--tree-depth": row.depth }}
-            title={row.path.join(" / ")}
-            type="button"
-          >
-            <ArchitectureTreeGlyph data-kind="folder" aria-hidden="true" />
-            <span>{row.name}</span>
-          </ArchitectureTreeRow>
-        ) : (
+      {treeRows.map((row) => {
+        if (row.kind === "folder") {
+          return (
+            <ArchitectureTreeRow
+              data-kind="folder"
+              key={`folder-${row.id}`}
+              onClick={() => beginCreateGraph(row.path.join(" / "))}
+              style={{ "--tree-depth": row.depth }}
+              title={row.path.join(" / ")}
+              type="button"
+            >
+              <ArchitectureTreeGlyph data-kind="folder" aria-hidden="true" />
+              <span>{row.name}</span>
+            </ArchitectureTreeRow>
+          );
+        }
+
+        const rowMarker = architectureAgentEditMarkerForGraph(row.graph, visibleAgentEditMarkers);
+        const rowMarkerTitle = architectureAgentEditMarkerTitle(rowMarker);
+        return (
           <ArchitectureTreeRow
             data-active={row.graph.id === selectedGraphId && !creatingGraph ? "true" : "false"}
+            data-agent-edit={rowMarker ? rowMarker.status : undefined}
             data-kind="graph"
             key={`graph-${row.graph.id}`}
             onClick={() => {
@@ -3915,20 +4353,38 @@ function ArchitecturesPanel({
               setCreatingGraph(false);
             }}
             style={{ "--tree-depth": row.depth }}
-            title={row.graph.filePath}
+            title={[row.graph.filePath, rowMarkerTitle].filter(Boolean).join("\n")}
             type="button"
           >
             <ArchitectureTreeGlyph data-kind="graph" aria-hidden="true" />
             <span>{row.graph.title}</span>
+            {rowMarker && (
+              <ArchitectureTreeAgentMarker
+                aria-hidden="true"
+                style={{ "--agent-edit-color": rowMarker.agentColor }}
+                title={rowMarkerTitle}
+              >
+                <i />
+                <strong>{rowMarker.status === "editing" ? "editing" : "queued"}</strong>
+              </ArchitectureTreeAgentMarker>
+            )}
             <em>{row.graph.nodeCount}</em>
           </ArchitectureTreeRow>
-        )
-      ))}
+        );
+      })}
       {graphState === "ready" && !graphs.length && (
         <ArchitectureTreeEmpty style={{ "--tree-depth": emptyDepth }}>No graphs yet</ArchitectureTreeEmpty>
       )}
     </>
-  ), [beginCreateGraph, creatingGraph, graphState, graphs.length, selectedGraphId, treeRows]);
+  ), [
+    beginCreateGraph,
+    creatingGraph,
+    graphState,
+    graphs.length,
+    selectedGraphId,
+    treeRows,
+    visibleAgentEditMarkers,
+  ]);
 
   return (
     <ArchitecturesShell data-nav-collapsed={navCollapsed ? "true" : "false"}>
@@ -4030,7 +4486,9 @@ function ArchitecturesPanel({
             />
           ) : (
             <ArchitectureGraphEditor
+              agentEditMarker={selectedAgentEditMarker}
               graph={selectedGraph}
+              onAgentEditQueued={recordAgentEditQueued}
               onSave={saveGraph}
               queueWorkspaceId={queueWorkspaceId}
               queueWorkspaceName={queueWorkspaceName}
@@ -4157,7 +4615,9 @@ function ArchitectureCreateSurface({
 }
 
 function ArchitectureGraphEditor({
+  agentEditMarker = null,
   graph,
+  onAgentEditQueued = () => {},
   onSave,
   queueWorkspaceId = "",
   queueWorkspaceName = "",
@@ -4421,10 +4881,13 @@ function ArchitectureGraphEditor({
     });
     setAgentCommandDraft("");
     setAgentCommandNotice(queuedItem ? "Queued for coding agents" : "Queued locally");
+    if (queuedItem) onAgentEditQueued(queuedItem);
     setLocalError("");
-  }, [agentCommandDraft, draftGraph, selectedRepo?.path, queueWorkspaceId, queueWorkspaceName]);
+  }, [agentCommandDraft, draftGraph, onAgentEditQueued, selectedRepo?.path, queueWorkspaceId, queueWorkspaceName]);
   const agentCommandReady = Boolean(text(agentCommandDraft));
   const agentCommandStatus = localError || agentCommandNotice || (dirty ? "Unsaved changes" : "Press Enter to queue");
+  const agentEditBlurb = architectureAgentEditMarkerBlurb(agentEditMarker);
+  const agentEditTitle = architectureAgentEditMarkerTitle(agentEditMarker);
 
   return (
     <ArchitectureEditorShell>
@@ -4460,7 +4923,21 @@ function ArchitectureGraphEditor({
           >
             <Background color="rgba(148, 163, 184, 0.22)" gap={22} size={1} />
           </ReactFlow>
-          <ArchitectureSliceToolbar aria-label="Add architecture slice">
+          {agentEditMarker && (
+            <ArchitectureAgentEditStatus
+              aria-live="polite"
+              role="status"
+              style={{ "--agent-edit-color": agentEditMarker.agentColor }}
+              title={agentEditTitle}
+            >
+              <i aria-hidden="true" />
+              <span>{agentEditBlurb}</span>
+            </ArchitectureAgentEditStatus>
+          )}
+          <ArchitectureSliceToolbar
+            aria-label="Add architecture slice"
+            data-has-agent-marker={agentEditMarker ? "true" : "false"}
+          >
             {["api-pathway", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment"].map((intent) => (
               <ArchitectureSliceButton
                 key={intent}
@@ -6748,7 +7225,7 @@ const ArchitectureTreeBranch = styled.div`
 
 const ArchitectureTreeRow = styled.button`
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr) auto;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 6px;
   width: 100%;
@@ -6798,6 +7275,10 @@ const ArchitectureTreeRow = styled.button`
     color: rgba(226, 232, 240, 0.86);
   }
 
+  &[data-agent-edit] {
+    border-color: rgba(125, 211, 252, 0.16);
+  }
+
   &:hover,
   &[data-active="true"] {
     border-color: rgba(125, 211, 252, 0.14);
@@ -6808,6 +7289,35 @@ const ArchitectureTreeRow = styled.button`
     color: rgba(248, 250, 252, 0.96);
     background: rgba(14, 165, 233, 0.13);
     box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.72);
+  }
+`;
+
+const ArchitectureTreeAgentMarker = styled.span`
+  display: inline-flex;
+  max-width: 74px;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  color: rgba(226, 232, 240, 0.74);
+  font-size: 8px;
+  font-weight: 920;
+  line-height: 1;
+  text-transform: uppercase;
+
+  i {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--agent-edit-color, #60a5fa);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--agent-edit-color, #60a5fa) 18%, transparent);
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 `;
 
@@ -7510,6 +8020,53 @@ const ArchitectureFloatingActions = styled.div`
   }
 `;
 
+const ArchitectureAgentEditStatus = styled.div`
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 9;
+  display: inline-flex;
+  max-width: min(300px, calc(100% - 240px));
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid color-mix(in srgb, var(--agent-edit-color, #60a5fa) 28%, rgba(148, 163, 184, 0.16));
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.9);
+  background: rgba(15, 23, 42, 0.78);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(10px);
+  pointer-events: none;
+
+  i {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    border-radius: 999px;
+    background: var(--agent-edit-color, #60a5fa);
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--agent-edit-color, #60a5fa) 18%, transparent),
+      0 0 14px color-mix(in srgb, var(--agent-edit-color, #60a5fa) 32%, transparent);
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 10px;
+    font-weight: 860;
+    line-height: 1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 900px) {
+    right: 12px;
+    max-width: calc(100% - 24px);
+  }
+`;
+
 const ArchitectureSliceToolbar = styled.div`
   position: absolute;
   top: 12px;
@@ -7522,6 +8079,10 @@ const ArchitectureSliceToolbar = styled.div`
   pointer-events: auto;
   opacity: 0.74;
   transition: opacity 120ms ease;
+
+  &[data-has-agent-marker="true"] {
+    top: 48px;
+  }
 
   ${ArchitectureCanvasViewport}:hover &,
   &:focus-within {

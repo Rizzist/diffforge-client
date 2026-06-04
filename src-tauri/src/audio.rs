@@ -3275,7 +3275,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
             "browser_search",
             "file_search"
         ],
-        "allowed_tools": ["create_plan", "open_coding_agents"],
+        "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks"],
         "tool_choice": "auto",
         "response_contract": {
             "immediate_feedback_required": true,
@@ -3284,6 +3284,7 @@ fn cloud_voice_agent_llm_orchestrator_policy() -> Value {
             "regular_response_kind": "voice_agent_llm_feedback",
             "plan_tool_name": "create_plan",
             "agent_open_tool_name": "open_coding_agents",
+            "remote_dispatch_tool_name": "dispatch_remote_tasks",
             "plan_snapshot_kind": "voice_agent_plan_snapshot"
         }
     })
@@ -4412,7 +4413,6 @@ async fn start_cloud_voice_agent_stream(
     log_audio_diagnostic_event("audio.cloud_voice.start.command", json!({}));
     let CloudVoiceAgentStartRequest {
         repo_id,
-        agent_statuses,
         submission_mode,
         workspace_id,
         workspace_name,
@@ -4434,7 +4434,6 @@ async fn start_cloud_voice_agent_stream(
     } else {
         cloud_mcp_repo_id_for_root(&resolved_workspace_root)
     };
-    let agent_statuses = agent_statuses.unwrap_or_else(|| json!([]));
 
     let voice_session_id = format!("voice-{}", uuid::Uuid::new_v4());
     spawn_cloud_voice_agent_desktop_log(
@@ -4446,7 +4445,6 @@ async fn start_cloud_voice_agent_stream(
         &workspace_id,
         &repo_id,
         json!({
-            "agent_status_count": agent_statuses.as_array().map(|items| items.len()).unwrap_or(0),
             "submission_mode": submission_mode.clone(),
             "workspace_name": workspace_name.clone(),
             "workspace_root": workspace_root.clone(),
@@ -4583,7 +4581,6 @@ async fn start_cloud_voice_agent_stream(
             "repo_id": repo_id.clone(),
             "submission_mode": submission_mode.clone(),
             "input_mode": submission_mode.clone(),
-            "agent_statuses": agent_statuses.clone(),
             "turn_policy": {
                 "input_submission": submission_mode.clone(),
             },
@@ -4619,7 +4616,7 @@ async fn start_cloud_voice_agent_stream(
                     "browser_search",
                     "file_search"
                 ],
-                "allowed_tools": ["create_plan", "open_coding_agents"],
+                "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks"],
                 "tool_choice": "auto",
                 "response_contract": {
                     "immediate_feedback_required": true,
@@ -4628,6 +4625,7 @@ async fn start_cloud_voice_agent_stream(
                     "regular_response_kind": "voice_agent_llm_feedback",
                     "plan_tool_name": "create_plan",
                     "agent_open_tool_name": "open_coding_agents",
+                    "remote_dispatch_tool_name": "dispatch_remote_tasks",
                     "plan_snapshot_kind": "voice_agent_plan_snapshot"
                 }
             },
@@ -4740,7 +4738,6 @@ async fn send_cloud_voice_agent_text_message(
         text,
         turn_index,
         repo_id,
-        agent_statuses,
         workspace_id,
         workspace_name,
         workspace_root,
@@ -4764,7 +4761,6 @@ async fn send_cloud_voice_agent_text_message(
     } else {
         cloud_mcp_repo_id_for_root(&resolved_workspace_root)
     };
-    let agent_statuses = agent_statuses.unwrap_or_else(|| json!([]));
 
     let voice_session_id = format!("voice-{}", uuid::Uuid::new_v4());
     spawn_cloud_voice_agent_desktop_log(
@@ -4776,7 +4772,6 @@ async fn send_cloud_voice_agent_text_message(
         &workspace_id,
         &repo_id,
         json!({
-            "agent_status_count": agent_statuses.as_array().map(|items| items.len()).unwrap_or(0),
             "text_chars": text.chars().count(),
             "turn_index": turn_index.unwrap_or(0),
             "workspace_name": workspace_name.clone(),
@@ -4861,7 +4856,6 @@ async fn send_cloud_voice_agent_text_message(
         "workspace_name": workspace_name,
         "workspace_root": workspace_root,
         "repo_id": repo_id.clone(),
-        "agent_statuses": agent_statuses,
         "tts": {
             "enabled": true,
             "provider": "deepgram_aura",
