@@ -3161,7 +3161,10 @@ function getReadyAgent(agentStatuses, preferredAgentId = "codex") {
 }
 
 function normalizeManagedAgentProviderId(value) {
-  const providerId = String(value || "").trim();
+  const providerId = String(value || "").trim().toLowerCase();
+  if (providerId === "claude-code" || providerId === "claude_code") {
+    return "claude";
+  }
   return ["codex", "claude", "opencode"].includes(providerId) ? providerId : "";
 }
 
@@ -12561,7 +12564,7 @@ export default function App() {
           || payload.action
           || payload.command
           || "create_task",
-      ).trim().toLowerCase().replace(/[\s-]+/g, "_");
+      ).trim().toLowerCase().replace(/[.\s-]+/g, "_");
     };
     const remoteCommandIsCreateTask = (commandKind) => (
       !commandKind
@@ -12573,6 +12576,14 @@ export default function App() {
       || commandKind === "task_create"
       || commandKind === "todo.create"
       || commandKind === "todo_create"
+    );
+    const remoteCommandIsAgentPackageAction = (commandKind) => (
+      [
+        "agent_install",
+        "install_agent",
+        "agent_update",
+        "update_agent",
+      ].includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))
     );
     const recordRemoteCommandStatus = (event, status, message, details = null) => (
       invoke("cloud_mcp_record_remote_command_status", {
@@ -12794,6 +12805,95 @@ export default function App() {
         terminals,
       };
     };
+    const handleRemoteAgentPackageControl = async ({
+      agentId,
+      commandId,
+      commandKind,
+      event,
+    }) => {
+      const normalizedKind = String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_");
+      const provider = normalizeManagedAgentProviderId(
+        agentId
+          || remoteCommandStringField(event, [
+            "provider",
+            "agent_provider",
+            "agentProvider",
+            "agent_id",
+            "agentId",
+            "target_agent_id",
+            "targetAgentId",
+          ]),
+      );
+      const updating = normalizedKind === "agent_update" || normalizedKind === "update_agent";
+      const source = updating ? "npm-update" : "npm";
+      const label = provider ? getManagedAgentLabel(provider) : "coding agent";
+
+      if (!provider) {
+        await recordRemoteCommandStatus(event, "failed", "Remote agent package command did not include a supported provider.", {
+          commandId,
+          commandKind,
+        });
+        return;
+      }
+
+      setAgentInstallState((state) => ({ ...state, [provider]: updating ? "updating" : "installing" }));
+      setAgentInstallResults((results) => {
+        const nextResults = { ...results };
+        delete nextResults[provider];
+        return nextResults;
+      });
+
+      const runningVerb = updating ? "Updating" : "Installing";
+      await recordRemoteCommandStatus(event, "running", `${runningVerb} ${label} on this desktop.`, {
+        agentId: provider,
+        commandId,
+        commandKind,
+        source,
+      });
+
+      try {
+        const result = await invoke(updating ? "update_agent" : "install_agent", { provider });
+        setAgentInstallResults((results) => ({ ...results, [provider]: { ...result, source, remote: true } }));
+        const nextStatuses = await refreshAgentStatuses();
+        const completed = Boolean(result?.installed);
+        await recordRemoteCommandStatus(
+          event,
+          completed ? "completed" : "failed",
+          result?.message || (completed
+            ? `${label} ${updating ? "updated" : "installed"} on this desktop.`
+            : `${label} ${updating ? "update" : "install"} did not complete.`),
+          {
+            agentId: provider,
+            commandId,
+            commandKind,
+            result,
+            status: Array.isArray(nextStatuses)
+              ? nextStatuses.find((status) => status.id === provider) || null
+              : null,
+          },
+        );
+      } catch (error) {
+        const message = getErrorMessage(error, `Unable to ${updating ? "update" : "install"} terminal CLI.`);
+        setAgentInstallResults((results) => ({
+          ...results,
+          [provider]: {
+            source,
+            remote: true,
+            installed: false,
+            permissionDenied: false,
+            message,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "failed", message, {
+          agentId: provider,
+          commandId,
+          commandKind,
+          source,
+        });
+      } finally {
+        setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+      }
+    };
     const handleRemoteLifecycleControl = async ({
       commandId,
       commandKind,
@@ -12985,7 +13085,9 @@ export default function App() {
           const targetTerminalColor = hasTerminalTarget
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
-          if (!workspaceId) {
+          const agentPackageAction = remoteCommandIsAgentPackageAction(commandKind);
+          const receiptWorkspaceId = workspaceId || (agentPackageAction ? "device" : "");
+          if (!workspaceId && !agentPackageAction) {
             await recordRemoteCommandStatus(
               event,
               "failed",
@@ -12994,18 +13096,35 @@ export default function App() {
             );
             return;
           }
-          if (!claimRemoteCommandReceipt(event, commandId, workspaceId)) {
+          if (!claimRemoteCommandReceipt(event, commandId, receiptWorkspaceId)) {
             logBigViewSyncDiagnosticEvent("remote_control.duplicate_ignored", {
               commandId,
               source: "app_shell",
               surface: "remote_command_listener",
-              workspaceId,
+              workspaceId: receiptWorkspaceId,
             });
             await recordRemoteCommandStatus(event, "duplicate_ignored", "Duplicate remote command ignored by desktop UI.", {
               commandId,
               commandKind,
-              workspaceId,
+              workspaceId: receiptWorkspaceId,
             });
+            return;
+          }
+          if (agentPackageAction) {
+            try {
+              await handleRemoteAgentPackageControl({
+                agentId,
+                commandId,
+                commandKind,
+                event,
+              });
+            } catch (error) {
+              await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Remote agent package command failed."), {
+                agentId,
+                commandId,
+                commandKind,
+              });
+            }
             return;
           }
           if (!remoteCommandIsCreateTask(commandKind)) {
@@ -13125,7 +13244,7 @@ export default function App() {
         unlistenCreditWallet();
       }
     };
-  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, workspaces]);
+  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, refreshAgentStatuses, workspaces]);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
