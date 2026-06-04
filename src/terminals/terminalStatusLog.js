@@ -5,7 +5,7 @@ import {
   withDiagnosticIpcDropCount,
 } from "../diagnostics/diagnosticIpcBudget.js";
 
-const TERMINAL_STATUS_LOGGING_ENABLED = true;
+const TERMINAL_STATUS_LOGGING_ENABLED = false;
 const TERMINAL_STATUS_LOG_SAMPLE_MS = 1000;
 const TERMINAL_STATUS_LOG_MAX_TEXT = 900;
 const TERMINAL_STATUS_LOG_MAX_ARRAY = 60;
