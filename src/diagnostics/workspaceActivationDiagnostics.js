@@ -7,7 +7,13 @@ import {
 
 export const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED = true;
 
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_FLUSH_MS = 32;
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_MAX_QUEUED_EVENTS = 256;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_MAX_TEXT = 512;
+
+let pendingDiagnosticEvents = [];
+let pendingDiagnosticFlushHandle = null;
+let pendingDiagnosticDropCount = 0;
 
 export function getWorkspaceActivationDiagnosticNowMs() {
   return typeof performance !== "undefined" && typeof performance.now === "function"
@@ -67,21 +73,89 @@ function cleanDiagnosticFields(fields) {
   return cleanDiagnosticValue(fields);
 }
 
+function getDiagnosticTimerApi() {
+  if (typeof window !== "undefined" && window.setTimeout && window.clearTimeout) {
+    return window;
+  }
+  return {
+    clearTimeout,
+    setTimeout,
+  };
+}
+
+function scheduleWorkspaceActivationDiagnosticFlush() {
+  if (pendingDiagnosticFlushHandle !== null) {
+    return;
+  }
+
+  const timerApi = getDiagnosticTimerApi();
+  pendingDiagnosticFlushHandle = timerApi.setTimeout(() => {
+    pendingDiagnosticFlushHandle = null;
+    flushWorkspaceActivationDiagnosticEvents();
+  }, WORKSPACE_ACTIVATION_DIAGNOSTIC_FLUSH_MS);
+}
+
+function flushWorkspaceActivationDiagnosticEvents({ force = false } = {}) {
+  if (pendingDiagnosticFlushHandle !== null) {
+    const timerApi = getDiagnosticTimerApi();
+    timerApi.clearTimeout(pendingDiagnosticFlushHandle);
+    pendingDiagnosticFlushHandle = null;
+  }
+
+  if (!pendingDiagnosticEvents.length) {
+    return;
+  }
+
+  const events = pendingDiagnosticEvents;
+  pendingDiagnosticEvents = [];
+
+  const budget = takeDiagnosticIpcBudget({
+    force: force || events.some((event) => event.force),
+  });
+  if (budget.skip) {
+    pendingDiagnosticDropCount += events.length;
+    return;
+  }
+
+  const dropped = pendingDiagnosticDropCount + budget.dropped;
+  pendingDiagnosticDropCount = 0;
+
+  const batchedEvents = events.map(({ fields, phase }) => ({ fields, phase }));
+  if (dropped && batchedEvents.length) {
+    batchedEvents[0] = {
+      ...batchedEvents[0],
+      fields: withDiagnosticIpcDropCount(batchedEvents[0].fields, dropped),
+    };
+  }
+
+  invoke("workspace_activation_diagnostic_log_many", {
+    events: batchedEvents,
+  }).catch(() => {});
+}
+
 export function logWorkspaceActivationDiagnosticEvent(phase, fields = {}, options = {}) {
   if (!WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED) {
     return;
   }
 
-  const budget = takeDiagnosticIpcBudget({ force: Boolean(options.force) });
-  if (budget.skip) {
+  if (pendingDiagnosticEvents.length >= WORKSPACE_ACTIVATION_DIAGNOSTIC_MAX_QUEUED_EVENTS) {
+    pendingDiagnosticDropCount += 1;
     return;
   }
 
-  invoke("workspace_activation_diagnostic_log", {
+  pendingDiagnosticEvents.push({
+    force: Boolean(options.force),
     phase: cleanDiagnosticText(phase),
     fields: {
       source: "frontend",
-      ...withDiagnosticIpcDropCount(cleanDiagnosticFields(fields), budget.dropped),
+      ...cleanDiagnosticFields(fields),
     },
-  }).catch(() => {});
+  });
+
+  if (options.force) {
+    flushWorkspaceActivationDiagnosticEvents({ force: true });
+    return;
+  }
+
+  scheduleWorkspaceActivationDiagnosticFlush();
 }

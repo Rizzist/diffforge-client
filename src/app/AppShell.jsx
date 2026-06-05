@@ -214,6 +214,7 @@ import {
   PlanFeatureList,
   AuthenticatedWorkspaceFrame,
   WorkspaceStartupOverlay,
+  WorkspaceStartupDetails,
   DashboardShell,
   WorkspaceRail,
   RailHeader,
@@ -2378,6 +2379,14 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
 const CLOUD_WORKSPACE_CONNECT_ATTEMPTS = 8;
 const CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS = 2200;
 const CLOUD_WORKSPACE_STATUS_POLL_MS = 650;
+const CLOUD_WORKSPACE_STAGE_ORDER = Object.freeze({
+  idle: 0,
+  desktop_session: 1,
+  cloud_auth: 2,
+  cloud_route: 3,
+  cloud_instance: 4,
+  workspace_socket: 5,
+});
 const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
@@ -2971,6 +2980,10 @@ function stepStateFor(steps, currentStage, status, index) {
   return index === currentIndex ? "active" : "pending";
 }
 
+function cloudWorkspaceStageRank(stage) {
+  return CLOUD_WORKSPACE_STAGE_ORDER[String(stage || "").trim()] ?? 0;
+}
+
 function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const globalStatus = String(status?.globalWsStatus || status?.global_ws_status || "").toLowerCase();
   const runtimeStatus = String(status?.status || "").toLowerCase();
@@ -3024,10 +3037,10 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (["blocked", "auth_missing", "websocket_auth_missing"].includes(statusKey)) {
     return {
-      detail: status?.globalWsLastError || status?.global_ws_last_error || status?.lastError || status?.last_error || "The cloud workspace is retrying.",
+      detail: "The live workspace connection is being re-established.",
       stage: "workspace_socket",
-      status: "warn",
-      title: "Cloud workspace is retrying",
+      status: "active",
+      title: "Linking the live workspace",
     };
   }
 
@@ -3042,6 +3055,25 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE) {
   const nextStage = String(progress?.stage || previous.stage || "idle");
   const nextStatus = String(progress?.status || previous.status || "idle");
+  const previousStatus = String(previous?.status || "idle").toLowerCase();
+  const previousRank = cloudWorkspaceStageRank(previous?.stage);
+  const nextRank = cloudWorkspaceStageRank(nextStage);
+
+  if (previousStatus === "connected" && nextStatus !== "error") {
+    return previous;
+  }
+
+  if (!["connected", "error"].includes(nextStatus) && nextRank < previousRank) {
+    return {
+      ...previous,
+      attempt: Math.max(
+        Number(progress?.attempt ?? 0) || 0,
+        Number(previous?.attempt ?? 0) || 0,
+      ),
+      updatedAt: Date.now(),
+    };
+  }
+
   return {
     attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
     detail: String(progress?.detail || previous.detail || ""),
@@ -3080,7 +3112,9 @@ function startCloudWorkspaceStatusPolling(onProgress) {
   const poll = async () => {
     try {
       const status = await invoke("cloud_mcp_get_status");
-      onProgress(cloudWorkspaceProgressFromRuntimeStatus(status));
+      if (!stopped) {
+        onProgress(cloudWorkspaceProgressFromRuntimeStatus(status));
+      }
     } catch {
       // The connect command is authoritative; polling only improves UI copy.
     }
@@ -6536,7 +6570,7 @@ export default function App() {
       }
 
       if (typeof window.requestIdleCallback === "function") {
-        const idle = window.requestIdleCallback(runActivation, { timeout: 500 });
+        const idle = window.requestIdleCallback(runActivation, { timeout: 80 });
         deferredWorkspaceActivationRef.current = {
           ...current,
           idle,
@@ -10229,7 +10263,6 @@ export default function App() {
       || isLaunchScreenVisible
       || !workspaceListHydrated
       || (isPaidUser(user) && !isCloudWorkspaceProgressReady(cloudWorkspaceProgress))
-      || (isPaidUser(user) && startupAgentGateState !== "complete")
     ) {
       return undefined;
     }
@@ -10242,14 +10275,18 @@ export default function App() {
     authState,
     cloudWorkspaceProgress,
     isLaunchScreenVisible,
-    startupAgentGateState,
     user,
     workspaceListHydrated,
     workspaceState,
   ]);
 
   useEffect(() => {
-    if (authState !== "authenticated" || !isPaidUser(user) || workspaceState !== "initializing") {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !["initializing", "ready"].includes(workspaceState)
+      || !isCloudWorkspaceProgressReady(cloudWorkspaceProgress)
+    ) {
       return undefined;
     }
 
@@ -10291,6 +10328,7 @@ export default function App() {
     agentStatuses,
     activeAccountScopeKey,
     authState,
+    cloudWorkspaceProgress,
     finishStartupAgentGate,
     loadWorkspaces,
     refreshAgentStatuses,
@@ -10388,6 +10426,8 @@ export default function App() {
   const cloudWorkspaceStatusState = cloudWorkspaceLaunchState(cloudWorkspaceProgress);
   const cloudWorkspaceTitle = cloudWorkspaceProgress.title || "Preparing cloud workspace";
   const cloudWorkspaceDetail = cloudWorkspaceProgress.detail || "Waiting for the assigned cloud workspace.";
+  const shouldShowCloudWorkspaceSetup = userIsPaid && !cloudWorkspaceReady;
+  const shouldShowStartupAgentSetup = userIsPaid && cloudWorkspaceReady;
   const planLabel = billingPlanLabelFromStatus(billingStatus, user);
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
@@ -10418,21 +10458,27 @@ export default function App() {
       ? startupAgentUpdateMessage || "Updating terminal CLIs..."
       : startupAgentGateState === "checking"
         ? "Checking terminal CLIs..."
-        : "Terminal readiness checked";
+        : startupAgentGateState === "complete"
+          ? "Terminal readiness checked"
+          : "Preparing terminal CLI check...";
   const startupAgentStatusDetail = startupAgentGateState === "choice"
     ? `${getAgentUpdateSummary(startupAgentUpdates)} Choose whether to update now or enter the workspace without updating.`
     : startupAgentGateState === "updating"
       ? "The workspace will open when the selected updates finish."
       : startupAgentGateState === "checking"
         ? "Terminal CLI readiness is being checked while the workspace loads."
-        : connectedAgentCount > 0
-          ? `${connectedAgentCount} terminal CLI${connectedAgentCount === 1 ? "" : "s"} ready. ${optionalAgentCount} optional provider${optionalAgentCount === 1 ? "" : "s"} unavailable.`
-          : "No ready terminal CLIs found. Settings will open so you can install or connect one.";
+        : startupAgentGateState === "complete"
+          ? connectedAgentCount > 0
+            ? `${connectedAgentCount} terminal CLI${connectedAgentCount === 1 ? "" : "s"} ready. ${optionalAgentCount} optional provider${optionalAgentCount === 1 ? "" : "s"} unavailable.`
+            : "No ready terminal CLIs found. Settings will open so you can install or connect one."
+          : "Waiting for the live workspace connection to finish first.";
   const startupAgentStatusState = startupAgentGateState === "choice"
     ? "update"
     : startupAgentGateState === "updating"
       ? "checking"
-      : connectedAgentCount > 0
+      : startupAgentGateState !== "complete"
+        ? "checking"
+        : connectedAgentCount > 0
         ? "ready"
         : "warning";
   const selectedWorkspaceRootDirectory = selectedWorkspace
@@ -10445,7 +10491,7 @@ export default function App() {
     ? getWorkspaceRootWasEmptyAtSelection(workspaceSettings, activatedWorkspace.id)
     : false;
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
-  const shouldPrewarmWorkspaceTerminals = false;
+  const shouldPrewarmWorkspaceTerminals = true;
   const selectedWorkspaceTerminalCount = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
@@ -10610,6 +10656,35 @@ export default function App() {
 
     return ids;
   }, [activatedWorkspaceId, workspaceLifecycleSettings.enabledWorkspaceIds, workspaces]);
+  const workspaceRuntimeThreadSignature = useMemo(() => (
+    enabledRuntimeWorkspaceIds.map((workspaceId) => {
+      const workspaceThreadState = workspaceThreads?.[workspaceId] || {};
+      const terminalSignature = Object.values(workspaceThreadState.terminals || {})
+        .map((terminal) => [
+          Number(terminal?.terminalIndex ?? -1),
+          terminal?.threadId || terminal?.id || "",
+          terminal?.status || "",
+          terminal?.activityStatus || "",
+          terminal?.paneId || "",
+        ].join(":"))
+        .sort()
+        .join(",");
+      const threadSignature = Object.values(workspaceThreadState.threads || {})
+        .map((thread) => [
+          thread?.id || "",
+          thread?.terminalIndex ?? "",
+          thread?.activityStatus || "",
+          thread?.currentAgent || "",
+          thread?.transcriptSessionId || "",
+          thread?.latestTurn?.state || "",
+          thread?.updatedAt || "",
+        ].join(":"))
+        .sort()
+        .join(",");
+
+      return `${workspaceId}[${terminalSignature}][${threadSignature}]`;
+    }).join("|")
+  ), [enabledRuntimeWorkspaceIds, workspaceThreads]);
   const enabledWorkspaceRuntimeDescriptors = useMemo(() => {
     const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
     if (shouldShowWorkspaceSetup) {
@@ -10738,7 +10813,7 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
-    workspaceThreads,
+    workspaceRuntimeThreadSignature,
     workspaces,
   ]);
   useEffect(() => {
@@ -12147,7 +12222,7 @@ export default function App() {
         });
       });
     };
-    const hotDelayMs = getTerminalInputHotDelayMs(1600);
+    const hotDelayMs = getTerminalInputHotDelayMs(250);
     logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.scheduled", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
       hotDelayMs,
       targetCount: targets.length,
@@ -19562,73 +19637,81 @@ export default function App() {
                     <LoadingTrack aria-hidden="true">
                       <LoadingFill />
                     </LoadingTrack>
-                    {userIsPaid && (
-                      <>
-                        <LaunchStatusPanel data-state={cloudWorkspaceStatusState}>
-                          <LaunchStatusIcon aria-hidden="true" data-state={cloudWorkspaceStatusState}>
-                            {cloudWorkspaceReady ? (
-                              <ConnectedIcon />
-                            ) : cloudWorkspaceStatusState === "warning" ? (
-                              <ErrorIcon />
-                            ) : (
-                              <PendingIcon />
-                            )}
-                          </LaunchStatusIcon>
-                          <LaunchStatusCopy>
-                            <LoadingText>{cloudWorkspaceTitle}</LoadingText>
-                            <LoadingDetail>{cloudWorkspaceDetail}</LoadingDetail>
-                          </LaunchStatusCopy>
-                        </LaunchStatusPanel>
-                        <AuthStepRail aria-label="Cloud workspace setup checkpoints" data-compact="true">
-                          {CLOUD_WORKSPACE_STEPS.map((step, index) => {
-                            const stepState = stepStateFor(
-                              CLOUD_WORKSPACE_STEPS,
-                              cloudWorkspaceProgress.stage,
-                              cloudWorkspaceProgress.status,
-                              index,
-                            );
+                    {(shouldShowCloudWorkspaceSetup || shouldShowStartupAgentSetup) && (
+                      <WorkspaceStartupDetails data-phase={shouldShowStartupAgentSetup ? "agents" : "cloud"}>
+                        {shouldShowCloudWorkspaceSetup && (
+                          <>
+                            <LaunchStatusPanel data-state={cloudWorkspaceStatusState}>
+                              <LaunchStatusIcon aria-hidden="true" data-state={cloudWorkspaceStatusState}>
+                                {cloudWorkspaceReady ? (
+                                  <ConnectedIcon />
+                                ) : cloudWorkspaceStatusState === "warning" ? (
+                                  <ErrorIcon />
+                                ) : (
+                                  <PendingIcon />
+                                )}
+                              </LaunchStatusIcon>
+                              <LaunchStatusCopy>
+                                <LoadingText>{cloudWorkspaceTitle}</LoadingText>
+                                <LoadingDetail>{cloudWorkspaceDetail}</LoadingDetail>
+                              </LaunchStatusCopy>
+                            </LaunchStatusPanel>
+                            <AuthStepRail aria-label="Cloud workspace setup checkpoints" data-compact="true">
+                              {CLOUD_WORKSPACE_STEPS.map((step, index) => {
+                                const stepState = stepStateFor(
+                                  CLOUD_WORKSPACE_STEPS,
+                                  cloudWorkspaceProgress.stage,
+                                  cloudWorkspaceProgress.status,
+                                  index,
+                                );
 
-                            return (
-                              <AuthStep data-state={stepState} key={step.id}>
-                                <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
-                                <strong>{step.label}</strong>
-                                <small>
-                                  {step.id === cloudWorkspaceProgress.stage ? cloudWorkspaceDetail : step.detail}
-                                </small>
-                              </AuthStep>
-                            );
-                          })}
-                        </AuthStepRail>
-                      </>
-                    )}
-                    <LaunchStatusPanel data-state={startupAgentStatusState}>
-                      <LaunchStatusIcon aria-hidden="true" data-state={startupAgentStatusState}>
-                        {startupAgentGateState === "choice" ? (
-                          <ButtonRefreshIcon />
-                        ) : startupAgentGateState === "checking" || startupAgentGateState === "updating" ? (
-                          <PendingIcon />
-                        ) : connectedAgentCount > 0 ? (
-                          <ConnectedIcon />
-                        ) : (
-                          <ErrorIcon />
+                                return (
+                                  <AuthStep data-state={stepState} key={step.id}>
+                                    <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
+                                    <strong>{step.label}</strong>
+                                    <small>
+                                      {step.id === cloudWorkspaceProgress.stage ? cloudWorkspaceDetail : step.detail}
+                                    </small>
+                                  </AuthStep>
+                                );
+                              })}
+                            </AuthStepRail>
+                          </>
                         )}
-                      </LaunchStatusIcon>
-                      <LaunchStatusCopy>
-                        <LoadingText>{startupAgentStatusTitle}</LoadingText>
-                        <LoadingDetail>{startupAgentStatusDetail}</LoadingDetail>
-                      </LaunchStatusCopy>
-                    </LaunchStatusPanel>
-                    {startupAgentGateState === "choice" && (
-                      <LaunchActions data-layout="split">
-                        <PrimaryButton onClick={updateStartupAgents} type="button">
-                          <ButtonRefreshIcon aria-hidden="true" />
-                          <span>Update first</span>
-                        </PrimaryButton>
-                        <SecondaryButton onClick={enterWorkspaceAfterAgentCheck} type="button">
-                          <ConnectedIcon aria-hidden="true" />
-                          <span>Enter workspace</span>
-                        </SecondaryButton>
-                      </LaunchActions>
+                        {shouldShowStartupAgentSetup && (
+                          <>
+                            <LaunchStatusPanel data-state={startupAgentStatusState}>
+                              <LaunchStatusIcon aria-hidden="true" data-state={startupAgentStatusState}>
+                                {startupAgentGateState === "choice" ? (
+                                  <ButtonRefreshIcon />
+                                ) : startupAgentGateState === "checking" || startupAgentGateState === "updating" || startupAgentGateState === "idle" ? (
+                                  <PendingIcon />
+                                ) : connectedAgentCount > 0 ? (
+                                  <ConnectedIcon />
+                                ) : (
+                                  <ErrorIcon />
+                                )}
+                              </LaunchStatusIcon>
+                              <LaunchStatusCopy>
+                                <LoadingText>{startupAgentStatusTitle}</LoadingText>
+                                <LoadingDetail>{startupAgentStatusDetail}</LoadingDetail>
+                              </LaunchStatusCopy>
+                            </LaunchStatusPanel>
+                            {startupAgentGateState === "choice" && (
+                              <LaunchActions data-layout="split">
+                                <PrimaryButton onClick={updateStartupAgents} type="button">
+                                  <ButtonRefreshIcon aria-hidden="true" />
+                                  <span>Update first</span>
+                                </PrimaryButton>
+                                <SecondaryButton onClick={enterWorkspaceAfterAgentCheck} type="button">
+                                  <ConnectedIcon aria-hidden="true" />
+                                  <span>Enter workspace</span>
+                                </SecondaryButton>
+                              </LaunchActions>
+                            )}
+                          </>
+                        )}
+                      </WorkspaceStartupDetails>
                     )}
                   </SplashCenter>
                 </WorkspaceStartupOverlay>

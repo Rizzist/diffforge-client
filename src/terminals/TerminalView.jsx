@@ -9984,7 +9984,7 @@ function TerminalView({
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
   const terminalStartupReady = Boolean(
-    workspaceThreadRestoreReady
+    (workspaceThreadRestoreReady || shouldPrewarmWorkspaceTerminals)
       && isWorkspaceRuntimeVisible
       && !isAppClosing
       && !isWorkspaceRuntimeDeactivating,

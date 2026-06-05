@@ -2054,8 +2054,8 @@ fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
     let _ = writeln!(file, "{entry}");
 }
 
-fn write_workspace_activation_diagnostic_log_entry(entry: Value) {
-    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED {
+fn write_workspace_activation_diagnostic_log_entries(entries: Vec<Value>) {
+    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED || entries.is_empty() {
         return;
     }
 
@@ -2081,7 +2081,13 @@ fn write_workspace_activation_diagnostic_log_entry(entry: Value) {
         return;
     };
 
-    let _ = writeln!(file, "{entry}");
+    for entry in entries {
+        let _ = writeln!(file, "{entry}");
+    }
+}
+
+fn write_workspace_activation_diagnostic_log_entry(entry: Value) {
+    write_workspace_activation_diagnostic_log_entries(vec![entry]);
 }
 
 fn write_voice_orchestrator_diagnostic_log_entry(entry: Value) {
@@ -2358,6 +2364,12 @@ fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), Strin
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct WorkspaceActivationDiagnosticEvent {
+    phase: String,
+    fields: Value,
+}
+
 #[tauri::command]
 fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_workspace_activation_diagnostic_log_entry(json!({
@@ -2368,6 +2380,28 @@ fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(
         "thread": terminal_diagnostic_thread_label(),
         "fields": fields,
     }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn workspace_activation_diagnostic_log_many(
+    events: Vec<WorkspaceActivationDiagnosticEvent>,
+) -> Result<(), String> {
+    let entries = events
+        .into_iter()
+        .take(256)
+        .map(|event| json!({
+            "ts_ms": current_time_ms(),
+            "phase": clean_terminal_diagnostic_log_text(&event.phase),
+            "source": "frontend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": event.fields,
+        }))
+        .collect();
+
+    write_workspace_activation_diagnostic_log_entries(entries);
 
     Ok(())
 }
@@ -3564,6 +3598,7 @@ pub fn run() {
             thread_bridge_diagnostic_log,
             bigview_sync_diagnostic_log,
             workspace_activation_diagnostic_log,
+            workspace_activation_diagnostic_log_many,
             terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,

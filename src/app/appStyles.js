@@ -2131,6 +2131,76 @@ export const WorkspaceStartupOverlay = styled(SplashScreen).attrs({ as: "section
   min-height: 0;
 `;
 
+export const WorkspaceStartupDetails = styled.div`
+  position: relative;
+  z-index: 2;
+  display: grid;
+  width: min(520px, 92%);
+  justify-items: stretch;
+  overflow: visible;
+
+  > * {
+    width: 100%;
+  }
+
+  > * + * {
+    position: absolute;
+    top: calc(100% + 10px);
+    left: 0;
+  }
+
+  && > [data-compact="true"] {
+    width: 100%;
+  }
+
+  ${LaunchStatusPanel},
+  ${LaunchActions} {
+    width: 100%;
+  }
+
+  ${LaunchStatusPanel} {
+    gap: 10px;
+    padding: 10px 12px;
+  }
+
+  ${LaunchStatusIcon} {
+    width: 30px;
+    height: 30px;
+  }
+
+  ${LoadingText} {
+    overflow: hidden;
+    font-size: 14px;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  ${LoadingDetail} {
+    display: -webkit-box;
+    max-height: 34px;
+    overflow: hidden;
+    font-size: 12px;
+    line-height: 1.35;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  @media (max-height: 620px) {
+    ${LaunchStatusPanel} {
+      padding: 8px 10px;
+    }
+
+    ${LoadingDetail} {
+      display: none;
+    }
+
+    > [data-compact="true"] {
+      padding: 6px;
+    }
+  }
+`;
+
 export const DashboardShell = styled.main`
   --workspace-rail-width: 192px;
   --workspace-rail-collapsed-width: 56px;
@@ -11278,6 +11348,9 @@ export const AuthStepRail = styled.div`
 
   &[data-compact="true"] {
     width: min(520px, 92%);
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 6px;
+    padding: 8px;
   }
 `;
 
@@ -11363,6 +11436,31 @@ export const AuthStep = styled.div`
     font-weight: 650;
     line-height: 1.25;
     overflow-wrap: anywhere;
+  }
+
+  ${AuthStepRail}[data-compact="true"] & {
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    row-gap: 4px;
+    text-align: center;
+  }
+
+  ${AuthStepRail}[data-compact="true"] & span {
+    width: 22px;
+    height: 22px;
+    grid-row: auto;
+  }
+
+  ${AuthStepRail}[data-compact="true"] & strong {
+    grid-column: 1;
+    font-size: 10px;
+    line-height: 1.15;
+    white-space: normal;
+  }
+
+  ${AuthStepRail}[data-compact="true"] & small {
+    display: none;
   }
 
   html[data-forge-theme="light"] & small {
