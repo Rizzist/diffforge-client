@@ -1,6 +1,6 @@
 const CLOUD_MCP_DEFAULT_BASE_URL: &str = "https://balancer.diffforge.ai";
 const CLOUD_MCP_ALLOW_LOCAL_OVERRIDE_ENV: &str = "RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP";
-const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = true;
+const CLOUD_MCP_LOCAL_DOCKER_APP_WS_OVERRIDE_ENABLED: bool = false;
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_APP_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_VOICE_WS_URL_ENV: &str = "RUST_DIFFFORGE_LOCAL_DOCKER_VOICE_WS_URL";
 const CLOUD_MCP_LOCAL_DOCKER_APP_WS_URL: &str = "ws://127.0.0.1:8080/v1/app/ws";
@@ -8,6 +8,7 @@ const CLOUD_MCP_LOCAL_DOCKER_PROBE_TIMEOUT_MS: u64 = 180;
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
+const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
 const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
@@ -1592,9 +1593,18 @@ async fn cloud_mcp_open_global_ws(
         runtime.global_ws_message_token = None;
     }
 
+    let ready_timeout = sleep(Duration::from_secs(CLOUD_MCP_WS_READY_TIMEOUT_SECS));
+    tokio::pin!(ready_timeout);
+    let mut ready_seen = false;
     let result: Result<(), String> = loop {
         tokio::select! {
             biased;
+            _ = &mut ready_timeout, if !ready_seen => {
+                break Err(format!(
+                    "Cloud MCP app websocket did not send a ready frame within {} seconds.",
+                    CLOUD_MCP_WS_READY_TIMEOUT_SECS
+                ));
+            }
             incoming = read.next() => {
                 let Some(incoming) = incoming else {
                     break Err("Cloud MCP app websocket closed by server.".to_string());
@@ -1617,6 +1627,12 @@ async fn cloud_mcp_open_global_ws(
                     Ok(Message::Close(_)) => break Err("Cloud MCP app websocket closed.".to_string()),
                     Err(error) => break Err(format!("Cloud MCP app websocket read failed: {error}")),
                     _ => {}
+                }
+                if !ready_seen {
+                    let runtime = state.inner.lock().await;
+                    ready_seen = runtime.global_ws_connected
+                        && runtime.global_ws_connection_id.is_some()
+                        && runtime.global_ws_message_token.is_some();
                 }
             }
             outgoing = rx.recv() => {
@@ -3290,7 +3306,16 @@ async fn cloud_mcp_wait_for_ws_sender(
             }
         }
         if started.elapsed() >= Duration::from_secs(CLOUD_MCP_CONNECT_TIMEOUT_SECS) {
-            return Err("Cloud MCP app websocket is not connected yet.".to_string());
+            let runtime = state.inner.lock().await;
+            let detail = [
+                runtime.global_ws_last_error.as_str(),
+                runtime.last_error.as_str(),
+            ]
+            .into_iter()
+            .map(str::trim)
+            .find(|value| !value.is_empty())
+            .unwrap_or("Cloud MCP app websocket is not connected yet.");
+            return Err(detail.to_string());
         }
         sleep(Duration::from_millis(80)).await;
     }

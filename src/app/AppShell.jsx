@@ -6436,31 +6436,37 @@ export default function App() {
         return;
       }
 
-      authStore.setChecking("Connecting cloud workspace...");
-      await recordCloudSigninDiagnostic(token, {
-        flowId: `restore-${validationFlowId}`,
-        step: "desktop_restore.cloud_workspace",
-        status: "start",
-        message: "starting Cloud MCP connection from saved desktop session",
-        details: {},
-      });
-      await syncCloudMcpDesktopSessionToken(token, {
-        flowId: `restore-${validationFlowId}`,
-        requireConnected: true,
-      });
-      await recordCloudSigninDiagnostic(token, {
-        flowId: `restore-${validationFlowId}`,
-        step: "desktop_restore.cloud_workspace",
-        status: "ok",
-        message: "Cloud MCP connection completed from saved desktop session",
-        details: {},
-      });
-
-      if (validationFlowId !== authFlowIdRef.current) {
-        return;
-      }
-
       setAuthenticated(session.user);
+      void (async () => {
+        await recordCloudSigninDiagnostic(token, {
+          flowId: `restore-${validationFlowId}`,
+          step: "desktop_restore.cloud_workspace",
+          status: "start",
+          message: "starting Cloud MCP connection from saved desktop session",
+          details: {},
+        });
+        try {
+          await syncCloudMcpDesktopSessionToken(token, {
+            flowId: `restore-${validationFlowId}`,
+            requireConnected: true,
+          });
+          await recordCloudSigninDiagnostic(token, {
+            flowId: `restore-${validationFlowId}`,
+            step: "desktop_restore.cloud_workspace",
+            status: "ok",
+            message: "Cloud MCP connection completed from saved desktop session",
+            details: {},
+          });
+        } catch (cloudError) {
+          await recordCloudSigninDiagnostic(token, {
+            flowId: `restore-${validationFlowId}`,
+            step: "desktop_restore.cloud_workspace",
+            status: "error",
+            message: getErrorMessage(cloudError, "Cloud workspace connection is retrying."),
+            details: {},
+          });
+        }
+      })();
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -6468,26 +6474,20 @@ export default function App() {
 
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
-      const didCloudMcpFail =
-        restoreError === CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE ||
-        restoreError.includes("Cloud MCP") ||
-        restoreError.includes("Cloud workspace");
-      const signedOutMessage = didCloudMcpFail
-        ? "Cloud workspace is not ready yet. Try again in a moment."
-        : didTimeout
-          ? "Secure session check timed out. Sign in with the web app."
-          : "Your desktop session expired. Sign in again with the web app.";
+      const signedOutMessage = didTimeout
+        ? "Secure session check timed out. Sign in with the web app."
+        : "Your desktop session expired. Sign in again with the web app.";
       await recordCloudSigninDiagnostic(token, {
         flowId: `restore-${validationFlowId}`,
-        step: didCloudMcpFail ? "desktop_restore.cloud_workspace" : "desktop_session.restore",
+        step: "desktop_session.restore",
         status: "error",
         message: restoreError,
-        details: { didCloudMcpFail, didTimeout },
+        details: { didTimeout },
       });
 
       setSignedOut(signedOutMessage, restoreError, {
         clearPending: true,
-        clearSession: !didCloudMcpFail,
+        clearSession: true,
       });
     }
   }, [setAuthenticated, setSignedOut]);
@@ -6541,39 +6541,45 @@ export default function App() {
         return true;
       }
 
-      authStore.setExchanging("Connecting cloud workspace...");
-      await recordCloudSigninDiagnostic(diagnosticToken, {
-        flowId: callback.state,
-        step: "desktop_signin.cloud_workspace",
-        status: "start",
-        message: "starting Cloud MCP connection after deeplink",
-        details: {},
-      });
-      await syncCloudMcpDesktopSessionToken(session.token, {
-        accountScope: {
-          id: "personal",
-          type: "personal",
-          label: "Personal",
-          teamId: null,
-        },
-        flowId: callback.state,
-        requireConnected: true,
-      });
-      await recordCloudSigninDiagnostic(diagnosticToken, {
-        flowId: callback.state,
-        step: "desktop_signin.cloud_workspace",
-        status: "ok",
-        message: "Cloud MCP connection completed after deeplink",
-        details: {},
-      });
-
-      if (loginFlowId !== authFlowIdRef.current) {
-        return true;
-      }
-
       authStore.saveAuthenticatedSession(session);
       authStore.clearPending();
       setAuthenticated(session.user);
+      void (async () => {
+        await recordCloudSigninDiagnostic(diagnosticToken, {
+          flowId: callback.state,
+          step: "desktop_signin.cloud_workspace",
+          status: "start",
+          message: "starting Cloud MCP connection after deeplink",
+          details: {},
+        });
+        try {
+          await syncCloudMcpDesktopSessionToken(session.token, {
+            accountScope: {
+              id: "personal",
+              type: "personal",
+              label: "Personal",
+              teamId: null,
+            },
+            flowId: callback.state,
+            requireConnected: true,
+          });
+          await recordCloudSigninDiagnostic(diagnosticToken, {
+            flowId: callback.state,
+            step: "desktop_signin.cloud_workspace",
+            status: "ok",
+            message: "Cloud MCP connection completed after deeplink",
+            details: {},
+          });
+        } catch (cloudError) {
+          await recordCloudSigninDiagnostic(diagnosticToken, {
+            flowId: callback.state,
+            step: "desktop_signin.cloud_workspace",
+            status: "error",
+            message: getErrorMessage(cloudError, "Cloud workspace connection is retrying."),
+            details: {},
+          });
+        }
+      })();
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
