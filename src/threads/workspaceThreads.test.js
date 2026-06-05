@@ -11,7 +11,7 @@ import {
   normalizeWorkspaceThreads,
 } from "./workspaceThreads.js";
 
-test("session transcript completion hydrates content without settling the active running turn", () => {
+test("session transcript completion settles the exact active running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -126,9 +126,15 @@ test("session transcript completion hydrates content without settling the active
   });
 
   const nextThread = nextState[workspaceId].threads[threadId];
-  assert.equal(nextThread.latestTurn.state, "running");
-  assert.equal(nextThread.activityStatus, "thinking");
+  assert.equal(nextThread.latestTurn.state, "completed");
+  assert.equal(nextThread.activityStatus, "idle");
   assert.equal(nextThread.providerBindings.codex.inputReady, false);
+  assert.equal(
+    nextThread.projectionEvents.some((event) => (
+      event.type === "thread.turn.completed" && event.turnId === turnId
+    )),
+    true,
+  );
   assert.equal(nextThread.messages.some((message) => message.id === "assistant-final"), true);
 });
 
@@ -929,7 +935,7 @@ test("normalization only preserves explicit permission prompting fields", () => 
   assert.equal(normalized[workspaceId].threads[threadId].providerBindings.codex.terminalIsPromptingUser, false);
 });
 
-test("detached session transcript completion hydrates content without settling matching idle running turn", () => {
+test("detached session transcript completion settles matching idle running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "prompt-test";
@@ -1055,13 +1061,13 @@ test("detached session transcript completion hydrates content without settling m
 
   const hydratedThread = hydrated[workspaceId].threads[threadId];
   assert.equal(hydratedThread.status, "exited");
-  assert.equal(hydratedThread.latestTurn.state, "running");
+  assert.equal(hydratedThread.latestTurn.state, "completed");
   assert.equal(hydratedThread.activityStatus, "idle");
   assert.equal(hydratedThread.providerBindings.codex.activityStatus, "idle");
   assert.equal(hydratedThread.providerBindings.codex.inputReady, false);
 });
 
-test("timestamp recovered transcript hydrates content without settling queued running turn", () => {
+test("timestamp recovered transcript settles queued running turn after prompt acceptance", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";
   const promptId = "todo-drop-prompt-test";
@@ -1159,7 +1165,7 @@ test("timestamp recovered transcript hydrates content without settling queued ru
   });
 
   const thread = hydrated[workspaceId].threads[threadId];
-  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(thread.latestTurn.state, "completed");
   assert.equal(thread.latestTurn.turnId, turnId);
   assert.equal(thread.activityStatus, "idle");
   assert.equal(thread.messages[0].text, "i need your help");

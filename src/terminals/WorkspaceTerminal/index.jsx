@@ -3262,6 +3262,7 @@ function WorkspaceTerminal({
       : "";
     const syncData = buildTerminalComposerDraftInput(previousDraft, text, true);
     const terminalSubmitSequence = getTerminalSubmitSequence(agentId, isGenericTerminal);
+    const terminalDirectSubmitData = `${buildTerminalComposerDraftInput("", text, true)}${terminalSubmitSequence}`;
 
     if (!terminalSubmitSequence) {
       logThreadBridgeDiagnostic("frontend.thread_submit.blocked", {
@@ -3380,31 +3381,43 @@ function WorkspaceTerminal({
       workspaceId,
     });
 
-    const waiter = await createTerminalPromptSubmittedWaiter({
-      agentId,
-      expectedPrompt: text,
-      instanceId: binding.instanceId,
-      paneId: binding.paneId,
-      promptId,
-      threadId: latestThread.id,
-      workspaceId,
-    });
     const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
       agentId,
       expectedPrompt: text,
       promptId,
       threadId: latestThread.id,
+      timeoutMs: terminalAgentUsesActivityHooks(agentId) ? 3000 : undefined,
       workspaceId,
     });
     let acceptedDetail = null;
+    let submitWaiter = null;
+    let directSubmitRetried = false;
     let terminalSubmitted = false;
-    try {
+    const writeDirectTerminalSubmit = async ({
+      promptEventSource = "bigview-submit",
+      promptEventSubmittedAt = startedAt,
+      timeoutMs = 1500,
+    } = {}) => {
+      submitWaiter = await createTerminalPromptSubmittedWaiter({
+        agentId,
+        allowObservedInputGateForHookManaged: true,
+        expectedPrompt: text,
+        instanceId: binding.instanceId,
+        paneId: binding.paneId,
+        promptId,
+        threadId: latestThread.id,
+        timeoutMs,
+        workspaceId,
+      });
       logThreadBridgeDiagnostic("frontend.thread_submit.enter_write", {
         agentId,
         bindingInstanceId: binding.instanceId,
         bindingPaneId: binding.paneId,
+        directSubmitDataLength: terminalDirectSubmitData.length,
         latestThreadId: latestThread.id,
+        promptEventSource,
         promptId,
+        submitSequenceLength: terminalSubmitSequence.length,
         textLength: text.length,
         workspaceId,
       });
@@ -3413,8 +3426,10 @@ function WorkspaceTerminal({
           agentId,
           bindingInstanceId: binding.instanceId,
           bindingPaneId: binding.paneId,
+          directSubmitDataLength: terminalDirectSubmitData.length,
           latestThreadId: latestThread.id,
           messageLength: text.length,
+          promptEventSource,
           promptId,
           syncKey,
           terminalSubmitSequenceLength: terminalSubmitSequence.length,
@@ -3422,16 +3437,46 @@ function WorkspaceTerminal({
         });
       }
       await invoke("terminal_write", {
-        data: terminalSubmitSequence,
+        data: terminalDirectSubmitData,
         instanceId: binding.instanceId,
         paneId: binding.paneId,
         promptEventId: promptId,
-        promptEventSource: "bigview-submit",
-        promptEventSubmittedAt: startedAt,
+        promptEventSource,
+        promptEventSubmittedAt,
         promptEventText: text,
         threadId: latestThread.id,
       });
-      await waiter.promise;
+      const submittedPayload = await submitWaiter.promise;
+      submitWaiter = null;
+      return submittedPayload;
+    };
+    try {
+      try {
+        await writeDirectTerminalSubmit();
+      } catch (submitError) {
+        const isSubmitObservationTimeout = String(submitError?.message || submitError || "")
+          .includes("Timed out waiting for the prompt to be observed in the terminal.");
+        const latestDraft = String(threadComposerDraftsRef.current.get(syncKey) || "").trim();
+        if (!isSubmitObservationTimeout || latestDraft !== text) {
+          throw submitError;
+        }
+        logThreadBridgeDiagnostic("frontend.thread_submit.enter_retry", {
+          agentId,
+          bindingInstanceId: binding.instanceId,
+          bindingPaneId: binding.paneId,
+          latestThreadId: latestThread.id,
+          promptId,
+          reason: "submit_observation_timeout_after_direct_enter",
+          textLength: text.length,
+          workspaceId,
+        });
+        directSubmitRetried = true;
+        await writeDirectTerminalSubmit({
+          promptEventSource: "bigview-submit-enter-retry",
+          promptEventSubmittedAt: new Date().toISOString(),
+          timeoutMs: 6000,
+        });
+      }
       terminalSubmitted = true;
       logThreadBridgeDiagnostic("frontend.thread_submit.await_session_acceptance", {
         agentId,
@@ -3451,8 +3496,10 @@ function WorkspaceTerminal({
           expectedPrompt: text,
           getDraftValue: () => threadComposerDraftsRef.current.get(syncKey) || "",
           isGenericTerminal,
+          allowEnterRetry: !directSubmitRetried,
           logPrefix: "frontend.thread_submit",
           promptId,
+          retryDelaysMs: [1000],
           submitSequence: terminalSubmitSequence,
           threadId: latestThread.id,
           workspaceId,
@@ -3495,7 +3542,7 @@ function WorkspaceTerminal({
         });
       }
     } catch (error) {
-      waiter.cancel();
+      submitWaiter?.cancel?.();
       acceptedWaiter.cancel();
       if (!terminalSubmitted) {
         const messageText = getErrorMessage(error, "Unable to submit prompt through the terminal.");

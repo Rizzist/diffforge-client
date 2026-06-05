@@ -78,3 +78,63 @@ test("completion evidence keeps explicit timestamp recovery behavior", () => {
     true,
   );
 });
+
+test("completion evidence stops at the next user turn", () => {
+  const submittedAt = "2026-05-31T06:42:20.800Z";
+  const messages = [{
+    createdAt: submittedAt,
+    id: "current-user",
+    role: "user",
+    text: "interesting",
+  }, {
+    createdAt: "2026-05-31T06:42:21.000Z",
+    id: "later-user",
+    role: "user",
+    text: "new task",
+  }, {
+    createdAt: "2026-05-31T06:42:22.100Z",
+    id: "task-complete",
+    kind: "task_complete",
+    role: "assistant",
+    text: "Done.",
+  }];
+
+  assert.equal(
+    transcriptHasTurnCompletionForPrompt(messages, {
+      expectedUserMessage: "interesting",
+      matchedBy: "sessionId",
+      submittedAt,
+    }),
+    false,
+  );
+});
+
+test("completion evidence ignores duplicate prompts before submitted timestamp", () => {
+  const submittedAt = "2026-05-31T06:42:20.800Z";
+  const messages = [{
+    createdAt: "2026-05-31T06:40:00.000Z",
+    id: "old-user",
+    role: "user",
+    text: "Make proposal",
+  }, {
+    createdAt: "2026-05-31T06:40:04.000Z",
+    id: "old-complete",
+    kind: "task_complete",
+    role: "assistant",
+    text: "Old answer.",
+  }, {
+    createdAt: submittedAt,
+    id: "current-user",
+    role: "user",
+    text: "Make proposal",
+  }];
+
+  assert.equal(
+    transcriptHasTurnCompletionForPrompt(messages, {
+      expectedUserMessage: "Make proposal",
+      matchedBy: "sessionId",
+      submittedAt,
+    }),
+    false,
+  );
+});

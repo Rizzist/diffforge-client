@@ -126,7 +126,7 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
-const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
@@ -2115,6 +2115,10 @@ fn terminal_diagnostic_thread_label() -> String {
 }
 
 fn write_terminal_diagnostic_log_entry(entry: Value) {
+    if !TERMINAL_DIAGNOSTIC_LOGGING_ENABLED {
+        return;
+    }
+
     let log_path = terminal_diagnostic_log_path();
     let Some(log_dir) = log_path.parent() else {
         return;
@@ -2345,6 +2349,10 @@ fn write_terminal_crash_forensics_log_entry(entry: Value) {
 }
 
 fn write_windows_terminal_diagnostic_log_entry(entry: Value) {
+    if !WINDOWS_TERMINAL_DIAGNOSTIC_LOGGING_ENABLED {
+        return;
+    }
+
     let log_path = windows_terminal_diagnostic_log_path();
     let Some(log_dir) = log_path.parent() else {
         return;

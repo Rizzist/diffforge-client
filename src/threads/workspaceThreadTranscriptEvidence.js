@@ -29,6 +29,10 @@ function transcriptMessageIndicatesTurnComplete(message) {
     || title === "task complete";
 }
 
+function transcriptMessageStartsUserTurn(message) {
+  return String(message?.role || "").trim().toLowerCase() === "user";
+}
+
 export function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
   const promptText = normalizeWorkspaceThreadProjectionText(
     event.expectedUserMessage || event.userMessage || event.message,
@@ -46,9 +50,15 @@ export function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
   if (promptText) {
     transcriptMessages.forEach((message, index) => {
       const role = String(message?.role || "").trim().toLowerCase();
+      const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
       if (
         role === "user"
         && normalizeWorkspaceThreadProjectionText(message?.text || message?.message) === promptText
+        && (
+          !submittedAtMs
+          || !messageTimestampMs
+          || messageTimestampMs >= submittedAtMs - 30000
+        )
       ) {
         userIndex = index;
       }
@@ -69,12 +79,19 @@ export function transcriptHasTurnCompletionForPrompt(messages, event = {}) {
     return false;
   }
 
+  const turnEndIndex = userIndex >= 0
+    ? transcriptMessages.findIndex((message, index) => (
+      index > userIndex && transcriptMessageStartsUserTurn(message)
+    ))
+    : -1;
+  const searchEndIndex = turnEndIndex >= 0 ? turnEndIndex : transcriptMessages.length;
+
   return transcriptMessages.some((message, index) => {
-    if (!transcriptMessageIndicatesTurnComplete(message)) {
+    if (userIndex >= 0 && (index <= userIndex || index >= searchEndIndex)) {
       return false;
     }
-    if (userIndex >= 0) {
-      return index > userIndex;
+    if (!transcriptMessageIndicatesTurnComplete(message)) {
+      return false;
     }
     const messageTimestampMs = workspaceThreadMessageTimestampMs(message);
     return submittedAtMs

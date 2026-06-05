@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use super::db::process_path_text;
 
-pub const COORDINATION_ALIGNMENT_LOGGING_ENABLED: bool = true;
+pub const COORDINATION_ALIGNMENT_LOGGING_ENABLED: bool = false;
 
 static ALIGNMENT_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 

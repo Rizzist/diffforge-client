@@ -2538,35 +2538,6 @@ impl CoordinationKernel {
                             |row| row.get::<_, i64>(0),
                         )
                         .ok();
-                    let log_dir = self.paths.repo_path.join("logs");
-                    if fs::create_dir_all(&log_dir).is_ok() {
-                        if let Ok(mut file) = fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(log_dir.join("coordination-events.jsonl"))
-                        {
-                            let _ = writeln!(
-                                file,
-                                "{}",
-                                json!({
-                                    "id": id.clone(),
-                                    "event_type": event_type,
-                                    "actor_type": actor_type,
-                                    "actor_id": actor_id,
-                                    "task_id": task_id,
-                                    "agent_id": agent_id,
-                                    "agent_slot_id": agent_slot_id,
-                                    "session_id": session_id,
-                                    "resource_id": resource_id,
-                                    "artifact_id": artifact_id,
-                                    "context_run_id": context_run_id,
-                                    "seq": event_seq,
-                                    "payload": payload.clone(),
-                                    "created_at": created_at,
-                                })
-                            );
-                        }
-                    }
                     crate::observe_terminal_coordination_event(
                         self.paths.repo_path.clone(),
                         self.paths.db_path.clone(),

@@ -1021,24 +1021,43 @@ function valueLooksLikeWorkingThreadState(value) {
   );
 }
 
-function getThreadIsWorking({ mappedTerminal = null, providerBinding = null, thread = null, turnState = "" } = {}) {
-  return Boolean(
-    turnState === "running"
-      || thread?.pendingPrompt
-      || valueLooksLikeWorkingThreadState(thread?.activityStatus)
-      || valueLooksLikeWorkingThreadState(thread?.latestTurn?.state || thread?.latestTurn?.status)
-      || valueLooksLikeWorkingThreadState(thread?.status)
-      || valueLooksLikeWorkingThreadState(providerBinding?.activityStatus)
+function getThreadIsWorking({
+  isActiveTerminal = false,
+  mappedTerminal = null,
+  providerBinding = null,
+  thread = null,
+  turnState = "",
+} = {}) {
+  const providerLooksBusy = Boolean(
+    valueLooksLikeWorkingThreadState(providerBinding?.activityStatus)
       || valueLooksLikeWorkingThreadState(providerBinding?.commandPhase || providerBinding?.command_phase)
       || valueLooksLikeWorkingThreadState(providerBinding?.executionPhase || providerBinding?.execution_phase)
       || valueLooksLikeWorkingThreadState(providerBinding?.status)
       || valueLooksLikeWorkingThreadState(providerBinding?.turnStatus || providerBinding?.turn_status)
-      || valueLooksLikeWorkingThreadState(mappedTerminal?.activityStatus || mappedTerminal?.activity_status)
+  );
+  const terminalLooksBusy = Boolean(
+    valueLooksLikeWorkingThreadState(mappedTerminal?.activityStatus || mappedTerminal?.activity_status)
       || valueLooksLikeWorkingThreadState(mappedTerminal?.commandPhase || mappedTerminal?.command_phase)
       || valueLooksLikeWorkingThreadState(mappedTerminal?.executionPhase || mappedTerminal?.execution_phase)
       || valueLooksLikeWorkingThreadState(mappedTerminal?.nativeRailState || mappedTerminal?.native_rail_state)
       || valueLooksLikeWorkingThreadState(mappedTerminal?.turnStatus || mappedTerminal?.turn_status)
       || valueLooksLikeWorkingThreadState(mappedTerminal?.status)
+  );
+  const lifecycleLooksBusy = Boolean(
+    turnState === "running"
+      || thread?.pendingPrompt
+      || valueLooksLikeWorkingThreadState(thread?.latestTurn?.state || thread?.latestTurn?.status)
+  );
+  const threadLooksBusy = Boolean(
+    valueLooksLikeWorkingThreadState(thread?.activityStatus)
+      || valueLooksLikeWorkingThreadState(thread?.status)
+  );
+  const hasLiveWorkAuthority = Boolean(isActiveTerminal || providerLooksBusy || terminalLooksBusy);
+
+  return Boolean(
+    providerLooksBusy
+      || terminalLooksBusy
+      || (hasLiveWorkAuthority && (lifecycleLooksBusy || threadLooksBusy))
   );
 }
 
@@ -1069,25 +1088,26 @@ function getThreadState(thread, entry) {
   }
 
   const inactiveNoSession = threadViewState === THREAD_VIEW_STATE.INACTIVE_NO_SESSION;
+  const isWorking = inactiveNoSession
+    ? false
+    : getThreadIsWorking({
+      isActiveTerminal,
+      mappedTerminal,
+      providerBinding,
+      thread,
+      turnState,
+    });
   const dotState = isActiveTerminal
     ? String(thread?.status || mappedTerminal?.status || "active").toLowerCase()
     : inactiveNoSession
       ? "idle"
       : turnState === "error"
       ? "error"
-      : turnState === "running"
+      : isWorking && turnState === "running"
         ? "running"
         : turnState === "interrupted"
           ? "interrupted"
           : "idle";
-  const isWorking = inactiveNoSession
-    ? false
-    : getThreadIsWorking({
-      mappedTerminal,
-      providerBinding,
-      thread,
-      turnState,
-    });
 
   return {
     canArchive: getWorkspaceThreadCanArchive(thread),

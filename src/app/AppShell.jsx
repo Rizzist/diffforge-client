@@ -1438,7 +1438,13 @@ function transcriptLatestPostPromptMessage(messages, event = {}) {
   }
 
   const transcriptMessages = Array.isArray(messages) ? messages : [];
-  for (let index = transcriptMessages.length - 1; index > userIndex; index -= 1) {
+  const nextUserIndex = transcriptMessages.findIndex((message, index) => (
+    index > userIndex
+      && String(message?.role || "").trim().toLowerCase() === "user"
+      && !isTerminalControlHistoryPrompt(message?.text || message?.message)
+  ));
+  const searchEndIndex = nextUserIndex >= 0 ? nextUserIndex : transcriptMessages.length;
+  for (let index = searchEndIndex - 1; index > userIndex; index -= 1) {
     const message = transcriptMessages[index];
     const role = String(message?.role || "").trim().toLowerCase();
     const kind = String(message?.kind || "").trim().toLowerCase();
@@ -1944,7 +1950,6 @@ function transcriptSubmittedPromptIndex(messages, event = {}) {
   const allowTimestampFallback = event.allowTimestampFallback === true
     || matchedBy.includes("timestamp")
     || matchedBy.includes("recovery");
-  const sessionMatchedByProviderId = matchedBy === "sessionid";
   const requireTimestampForCwdMatch = matchedBy && matchedBy !== "sessionid";
   const transcriptMessages = Array.isArray(messages) ? messages : [];
   let userIndex = -1;
@@ -1964,7 +1969,6 @@ function transcriptSubmittedPromptIndex(messages, event = {}) {
         submittedAtMs
         && messageTimestampMs
         && messageTimestampMs < submittedAtMs - 30000
-        && !sessionMatchedByProviderId
       ) {
         return;
       }
@@ -15099,21 +15103,31 @@ export default function App() {
         || expectedUserMessageIsControlPrompt
         || transcriptPromptAccepted
     );
-	    const turnCompleteSeen = false;
-	    const assistantResponseCompletesTurn = false;
-		    const terminalFinishSignal = false;
-		    const transcriptCompletionCanSettleTurn = false;
-	    const transcriptCompletionBlockers = [
-		      "transcript_hydration_content_only",
-		      transcriptLifecycleUsesActivityHooks ? "activity_hooks_own_lifecycle" : "",
-		      rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
-		      transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
-		      promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
-		      activeRunningTurn && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
-			      promptTurnIdentityRequired && !terminalFinishSignal ? "no_terminal_lifecycle_finish_signal" : "",
-			      activeRunningTurn && !promptTurnIdentityRequired && !terminalFinishSignal ? "no_terminal_lifecycle_finish_signal" : "",
-			      settledAssistantResponseSeen && !promptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
-		    ].filter(Boolean);
+		    const transcriptCompletionTargetsTurn = Boolean(
+		      transcriptTargetsRequestedTurn
+		        && (
+		          !activeRunningTurn
+		          || transcriptTargetsLatestRunningTurn
+		          || !promptTurnIdentityRequired
+		        ),
+		    );
+		    const transcriptCompletionCanSettleTurn = Boolean(
+		      rawTurnCompleteSeen
+		        && transcriptCompletionHasPromptEvidence
+		        && transcriptCompletionTargetsTurn
+		    );
+		    const turnCompleteSeen = Boolean(rawTurnCompleteSeen && transcriptCompletionCanSettleTurn);
+		    const assistantResponseCompletesTurn = Boolean(
+		      settledAssistantResponseSeen && transcriptCompletionCanSettleTurn,
+		    );
+			    const terminalFinishSignal = transcriptCompletionCanSettleTurn;
+		    const transcriptCompletionBlockers = [
+			      rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
+			      transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
+			      promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
+			      activeRunningTurn && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
+				      settledAssistantResponseSeen && !promptAccepted && !transcriptPromptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
+			    ].filter(Boolean);
 
     logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_result", {
       agentId,
@@ -15203,8 +15217,8 @@ export default function App() {
         agentId,
       );
       const hydrateEvent = {
-        agentId,
-	        allowTranscriptTurnCompletion: false,
+	        agentId,
+		        allowTranscriptTurnCompletion: transcriptCompletionCanSettleTurn,
         assistantResponseCompletesTurn,
         expectedMessageCreatedAt,
         expectedUserMessage,
@@ -15223,11 +15237,12 @@ export default function App() {
         source: `${agentId}-session-watch`,
         sourcePath: result.rolloutPath || "",
         submittedAt,
-	        transcriptExplicitCompletionCanSettleTurn: false,
-        threadId,
-        turnCompleteSeen: false,
-        workspaceId,
-      };
+		        transcriptCompletionCanSettleTurn,
+		        transcriptExplicitCompletionCanSettleTurn: transcriptCompletionCanSettleTurn,
+	        threadId,
+	        turnCompleteSeen,
+	        workspaceId,
+	      };
       const hydrationDiagnostics = getWorkspaceThreadHydrationDiagnosticsForLog(
         threads,
         hydrateEvent,
@@ -15796,7 +15811,10 @@ export default function App() {
             messageCreatedAt: expectedMessageCreatedAt,
             submittedAt,
           });
-          const transcriptRequestCanSettleTurn = false;
+	          const transcriptRequestCanSettleTurn = Boolean(
+	            pollUntilTurnComplete
+	              || workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId }),
+	          );
           const threadAtTranscriptResult = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId];
           const currentReadinessCanSettleTurn = false;
           const terminalReadinessCanSettleTurn = false;
@@ -15837,27 +15855,48 @@ export default function App() {
 	          const transcriptTargetsRequestedTurn = Boolean(
 	            !promptTurnIdentityRequired || transcriptTargetsLatestTurn,
 	          );
-	          const terminalFinishSignal = false;
-	          const staleTranscriptCompletionBlocked = false;
-	          const authoritativeTranscriptCompletionCanSettleTurn = false;
-	          const matchedTranscriptCompletionCanSettleTurn = false;
-	          const sessionTranscriptCanSettleTurn = false;
-          const transcriptExplicitCompletionCanSettleTurn = false;
-	          const assistantResponseCompletesTurn = false;
-          const turnCompleteSeen = false;
-		          const allowTranscriptTurnCompletion = false;
-		          const transcriptCompletionCanSettleTurn = false;
-          const transcriptCompletionBlockers = [
-            "transcript_hydration_content_only",
-            requestUsesActivityHooks ? "activity_hooks_own_lifecycle" : "",
-	            transcriptRequestCanSettleTurn ? "" : "request_not_allowed_to_settle_turn",
-	            rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
-	            transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
-	            promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
-	            activeRunningTurnAtTranscriptResult && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
-	            terminalFinishSignal ? "" : "no_terminal_lifecycle_finish_signal",
-	            settledAssistantResponseSeen && !transcriptPromptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
-	          ].filter(Boolean);
+		          const terminalFinishSignal = rawTurnCompleteSeen;
+		          const staleTranscriptCompletionBlocked = Boolean(
+		            rawTurnCompleteSeen
+		              && promptTurnIdentityRequired
+		              && !transcriptTargetsLatestTurn
+		          );
+		          const matchedTranscriptCompletionCanSettleTurn = Boolean(
+		            transcriptRequestCanSettleTurn
+		              && rawTurnCompleteSeen
+		              && transcriptCompletionHasPromptEvidence
+		              && transcriptTargetsRequestedTurn
+		              && (
+		                !activeRunningTurnAtTranscriptResult
+		                || transcriptTargetsLatestRunningTurn
+		                || !promptTurnIdentityRequired
+		              )
+		          );
+		          const authoritativeTranscriptCompletionCanSettleTurn = Boolean(
+		            matchedTranscriptCompletionCanSettleTurn
+		              && (promptAccepted || transcriptPromptAccepted)
+		          );
+		          const sessionTranscriptCanSettleTurn = Boolean(
+		            authoritativeTranscriptCompletionCanSettleTurn
+		              && (matchedBy === "sessionid" || !providerSessionId)
+		          );
+	          const transcriptExplicitCompletionCanSettleTurn = authoritativeTranscriptCompletionCanSettleTurn;
+		          const assistantResponseCompletesTurn = Boolean(
+		            settledAssistantResponseSeen && authoritativeTranscriptCompletionCanSettleTurn,
+		          );
+	          const turnCompleteSeen = Boolean(
+	            rawTurnCompleteSeen && authoritativeTranscriptCompletionCanSettleTurn,
+	          );
+			          const allowTranscriptTurnCompletion = authoritativeTranscriptCompletionCanSettleTurn;
+			          const transcriptCompletionCanSettleTurn = authoritativeTranscriptCompletionCanSettleTurn;
+	          const transcriptCompletionBlockers = [
+		            transcriptRequestCanSettleTurn ? "" : "request_not_allowed_to_settle_turn",
+		            rawTurnCompleteSeen ? "" : "no_task_complete_evidence",
+		            transcriptCompletionHasPromptEvidence ? "" : "missing_prompt_acceptance_evidence",
+		            promptTurnIdentityRequired && !transcriptTargetsLatestTurn ? "completion_not_latest_prompt_turn" : "",
+		            activeRunningTurnAtTranscriptResult && !transcriptTargetsLatestRunningTurn ? "completion_not_latest_running_turn" : "",
+		            settledAssistantResponseSeen && !promptAccepted && !transcriptPromptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
+		          ].filter(Boolean);
           const transcriptMessageDiagnostics = THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED
             ? messages.slice(-4).map((message) => ({
               createdAtPresent: Boolean(String(message?.createdAt || message?.created_at || "").trim()),
@@ -16135,9 +16174,10 @@ export default function App() {
           );
           if (
             (staleVoicePlanCompletionWithoutPrompt || requiresExactPromptEvidence)
-            && !promptAccepted
-            && !trustedVoicePlanTerminalFinish
-          ) {
+	            && !promptAccepted
+	            && !transcriptPromptAccepted
+	            && !trustedVoicePlanTerminalFinish
+	          ) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = elapsedMs < transcriptPollTimeoutMs;
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -16192,8 +16232,9 @@ export default function App() {
             pollUntilTurnComplete
               && expectedUserMessage
               && !expectedUserMessageIsControlPrompt
-              && !promptAccepted
-          );
+	              && !promptAccepted
+	              && !transcriptPromptAccepted
+	          );
           if (expectedPromptAcceptancePending) {
             const elapsedMs = Date.now() - pollStartedAt;
             const shouldContinuePolling = elapsedMs < transcriptPollTimeoutMs;
@@ -16381,12 +16422,12 @@ export default function App() {
               source: `${agentId}-session`,
               sourcePath: result?.rolloutPath || "",
               submittedAt,
-	              allowTranscriptTurnCompletion: false,
-	              assistantResponseCompletesTurn: false,
-	              transcriptCompletionCanSettleTurn: false,
-	              transcriptExplicitCompletionCanSettleTurn: false,
-	              threadId,
-	              turnCompleteSeen: false,
+		              allowTranscriptTurnCompletion,
+		              assistantResponseCompletesTurn,
+		              transcriptCompletionCanSettleTurn,
+		              transcriptExplicitCompletionCanSettleTurn,
+		              threadId,
+		              turnCompleteSeen,
               workspaceId,
             };
             const hydrationDiagnostics = getWorkspaceThreadHydrationDiagnosticsForLog(

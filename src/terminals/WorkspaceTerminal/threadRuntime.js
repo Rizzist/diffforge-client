@@ -1281,6 +1281,7 @@ function delayThreadBridgeMs(delayMs) {
 }
 
 export function createTerminalPromptSubmittedWaiter({
+  allowObservedInputGateForHookManaged = false,
   agentId = "",
   expectedPrompt = "",
   instanceId,
@@ -1385,17 +1386,26 @@ export function createTerminalPromptSubmittedWaiter({
     const submittedPromptMatchesExpected = payload.promptMatch !== false;
     const promptSource = String(payload.promptSource || "").trim();
     const submittedPromptIsAuthoritative = terminalPromptSubmittedPayloadIsAuthoritative(payload);
+    const submittedByActivityHook = promptSource === "activity_hook_user_prompt_submit"
+      || promptSource === "cli_hook_user_prompt_submit";
+    const observedInputGateCanConfirmHookManagedSubmit = Boolean(
+      allowObservedInputGateForHookManaged
+        && promptSource === "observed_input_gate"
+        && submittedPromptIsAuthoritative
+        && submittedPromptMatchesExpected,
+    );
 
     if (!promptMatches || !paneMatches || !threadMatches || !instanceMatches || settled) {
       return;
     }
     if (
       hookManagedAgent
-      && promptSource !== "activity_hook_user_prompt_submit"
-      && promptSource !== "cli_hook_user_prompt_submit"
+      && !submittedByActivityHook
+      && !observedInputGateCanConfirmHookManagedSubmit
     ) {
       logThreadBridgeDiagnostic("frontend.bridge.submit.hook_managed_source_ignored", {
         agentId,
+        allowObservedInputGateForHookManaged,
         instanceId: eventInstanceId,
         paneId: eventPaneId,
         promptId: eventPromptId,
@@ -1444,6 +1454,7 @@ export function createTerminalPromptSubmittedWaiter({
       instanceId: eventInstanceId,
       observedPromptLength: String(payload.prompt || "").trim().length,
       paneId: eventPaneId,
+      promptConfirmedByObservedInputGate: observedInputGateCanConfirmHookManagedSubmit,
       promptMatch: payload.promptMatch !== false,
       promptId: eventPromptId,
       promptSource: payload.promptSource || "",
