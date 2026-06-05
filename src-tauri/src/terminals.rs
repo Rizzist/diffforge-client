@@ -3418,7 +3418,9 @@ fn spawn_terminal_reader(
                 forensics_total_frames += 1;
                 forensics_total_source_chunks += source_chunks;
                 forensics_total_bytes += frame_bytes as u64;
-                if forensics_started_at.elapsed() >= Duration::from_secs(2) {
+                if terminal_diagnostics_enabled_for_app(&output_app)
+                    && forensics_started_at.elapsed() >= Duration::from_secs(2)
+                {
                     log_terminal_crash_forensics_event(
                         "backend.terminal_reader.output_window",
                         json!({
@@ -3584,7 +3586,9 @@ fn spawn_terminal_reader(
                     forensics_bytes += bytes_read as u64;
                     forensics_total_chunks += 1;
                     forensics_total_bytes += bytes_read as u64;
-                    if forensics_started_at.elapsed() >= Duration::from_secs(2) {
+                    if terminal_diagnostics_enabled_for_app(&app)
+                        && forensics_started_at.elapsed() >= Duration::from_secs(2)
+                    {
                         log_terminal_crash_forensics_event(
                             "backend.terminal_reader.read_window",
                             json!({

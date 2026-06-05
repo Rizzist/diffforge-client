@@ -2,9 +2,9 @@ import { createCoreRepoNameDisplayMasker } from "../coreRepoNameDisplay.js";
 import { stripLiveViewControlSequences } from "../liveViewSanitizer.js";
 
 const ACTIVE_FLUSH_MS = 8;
-const BACKGROUND_FLUSH_MS = 32;
+const BACKGROUND_FLUSH_MS = 120;
 const ACTIVE_FRAME_BYTES = 16 * 1024;
-const BACKGROUND_FRAME_BYTES = 8 * 1024;
+const BACKGROUND_FRAME_BYTES = ACTIVE_FRAME_BYTES;
 const INSPECTION_TEXT_LIMIT = 2400;
 const INITIAL_INSPECTION_CHUNKS = 80;
 
@@ -13,7 +13,7 @@ const sessions = new Map();
 function createSession(id, options = {}) {
   return {
     active: false,
-    decoder: new TextDecoder("utf-8", { fatal: false }),
+    decoder: null,
     flushTimer: 0,
     id,
     inspectChunks: 0,
@@ -74,6 +74,9 @@ function takeInspectionText(session, data, shouldInspect) {
     return "";
   }
   session.inspectChunks += 1;
+  if (!session.decoder) {
+    session.decoder = new TextDecoder("utf-8", { fatal: false });
+  }
   const decoded = session.decoder.decode(data, { stream: true });
   const visible = stripLiveViewControlSequences(decoded);
   return visible.length > INSPECTION_TEXT_LIMIT
@@ -126,11 +129,11 @@ function flushSession(session) {
     batch.push(head);
     batchBytes += head.byteLength;
     inputBytes += Math.round(next.inputBytes * splitRatio);
-    visibleChars += visibleByteEstimate(head, Number.POSITIVE_INFINITY);
+    visibleChars += visibleByteEstimate(head, 1);
     sourceChunks += 1;
     next.data = tail;
     next.inputBytes = Math.max(0, next.inputBytes - Math.round(next.inputBytes * splitRatio));
-    next.visibleChars = visibleByteEstimate(tail, Number.POSITIVE_INFINITY);
+    next.visibleChars = visibleByteEstimate(tail, 1);
     next.inspectionText = "";
   }
 
@@ -185,7 +188,7 @@ function enqueueChunk(id, rawData, options = {}) {
   session.outputChunks += 1;
   const shouldInspect = options.inspect === true;
   const inspectionText = takeInspectionText(session, masked, shouldInspect);
-  const visibleChars = visibleByteEstimate(masked, Number.POSITIVE_INFINITY);
+  const visibleChars = visibleByteEstimate(masked, 1);
   session.queue.push({
     data: masked,
     inputBytes: rawBytes,
@@ -350,6 +353,13 @@ self.onmessage = (event) => {
   if (message.type === "priority") {
     const session = getSession(message.id);
     session.active = message.active === true;
+    if (session.active && session.queue.length) {
+      if (session.flushTimer) {
+        clearTimeout(session.flushTimer);
+        session.flushTimer = 0;
+      }
+      flushSession(session);
+    }
     return;
   }
 

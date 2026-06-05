@@ -343,15 +343,10 @@ import {
   patchTerminalMetrics,
 } from "../terminalTelemetry.jsx";
 import {
-  TERMINAL_IS_MACOS_HOST,
   TERMINAL_IS_WINDOWS_HOST,
-  TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER,
   TERMINAL_WINDOWS_INTERESTING_DEC_PRIVATE_MODES,
   TERMINAL_WINDOWS_PTY_BACKEND,
   buildWindowsPtyOptions,
-  createTerminalOutputNormalizer,
-  getTerminalAgentScrollStabilityMode,
-  normalizeTerminalOutputBytes,
 } from "../terminalScrollStabilityStrategies.jsx";
 import {
   stripLiveViewControlSequences,
@@ -423,6 +418,8 @@ import {
   TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES,
   TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
   TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS,
+  TERMINAL_OUTPUT_WRITE_MIN_BYTES,
+  TERMINAL_OUTPUT_WRITE_TARGET_MS,
   TERMINAL_PARKED_PROMPT_EVENT,
   TERMINAL_SHIFT_ENTER_SEQUENCE,
   TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS,
@@ -1656,6 +1653,7 @@ function WorkspaceTerminal({
   });
   const attachDeferredWebglRef = useRef(null);
   const terminalOutputWorkerSessionRef = useRef(null);
+  const terminalOutputFlushNowRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -2083,15 +2081,7 @@ function WorkspaceTerminal({
     agentKind: terminalAgentKind,
     isGenericTerminal,
   }), [isGenericTerminal, terminalAgentKind]);
-  const terminalScrollStabilityMode = getTerminalAgentScrollStabilityMode({
-    agentKind: terminalAgentKind,
-    isMacHost: TERMINAL_IS_MACOS_HOST,
-    isWindowsHost: TERMINAL_IS_WINDOWS_HOST,
-  });
-  const useNormalizerAgentScrollStability = terminalScrollStabilityMode
-    === TERMINAL_SCROLL_STABILITY_MODE_NORMALIZER
-    && terminalStabilityFeatures.normalizerPipeline
-    && !isGenericTerminal;
+  const useNormalizerAgentScrollStability = false;
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
     : `${agent?.label || "Agent"} terminal`;
@@ -2330,6 +2320,9 @@ function WorkspaceTerminal({
     const disableStdin = Boolean(parked);
     const previousState = terminalInteractiveStateRef.current;
     terminalOutputWorkerSessionRef.current?.setActive(Boolean(active));
+    if (active) {
+      terminalOutputFlushNowRef.current?.("terminal_activated");
+    }
     terminalInteractiveStateRef.current = {
       acceptsInteractiveInput,
       cursorBlink: acceptsInteractiveInput,
@@ -4619,6 +4612,7 @@ function WorkspaceTerminal({
     let pendingOutputBytes = 0;
     let outputBatchQueuedAt = 0;
     let outputWriteInFlight = false;
+    let outputAdaptiveFlushMaxBytes = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
     let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
@@ -4845,17 +4839,13 @@ function WorkspaceTerminal({
       startupWatchTimers.add(timer);
     };
 
-    const terminalOutputNormalizer = createTerminalOutputNormalizer({
-      dropEraseDisplay2OutsideSync: terminalStabilityFeatures.dropEraseDisplay2OutsideSync,
-      enabled: useNormalizerAgentScrollStability && terminalStabilityFeatures.outputNormalizer,
-    });
     const isTerminalStabilityRuntimeActive = () => isTerminalStabilityRuntimeEnabled();
-    const isTerminalOutputNormalizerActive = () => (
-      terminalOutputNormalizer.enabled
-      && isTerminalStabilityRuntimeActive()
-    );
-    syncTerminalDiagnosticLogging();
-    syncWindowsTerminalDiagnosticLogging();
+    if (terminalDiagnosticsEnabled) {
+      syncTerminalDiagnosticLogging();
+    }
+    if (windowsTerminalDiagnosticsEnabled) {
+      syncWindowsTerminalDiagnosticLogging();
+    }
     startTerminalDiagnosticHeartbeat();
     warmTerminalPromptSubmittedListener();
     let terminalRendererOpened = false;
@@ -5000,7 +4990,7 @@ function WorkspaceTerminal({
         paneId,
         rendererMode,
         scrollbarPlatform: TERMINAL_SCROLLBAR_PLATFORM,
-        scrollStabilityMode: terminalScrollStabilityMode || "off",
+        scrollStabilityMode: "off",
         scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
         scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
         terminalStabilityFeatures,
@@ -5236,7 +5226,7 @@ function WorkspaceTerminal({
           bufferType: activeBufferType,
           params: allParams.length > 0 ? allParams : [actionParam],
           scrollOnEraseInDisplay: terminal.options.scrollOnEraseInDisplay === true,
-          scrollStabilityMode: terminalScrollStabilityMode || "off",
+          scrollStabilityMode: "off",
         });
 
         return false;
@@ -5980,8 +5970,31 @@ function WorkspaceTerminal({
 
       return Math.max(
         TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
-        Math.floor(baseBudget),
+        Math.min(Math.floor(baseBudget), Math.floor(outputAdaptiveFlushMaxBytes)),
       );
+    };
+
+    const recordTerminalOutputWriteTiming = (writeCallbackMs, batchBytes) => {
+      const elapsedMs = Math.max(0, Number(writeCallbackMs || 0));
+      const bytes = Math.max(0, Number(batchBytes || 0));
+      const active = terminalActiveRef.current;
+      const maxBudget = active
+        ? TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES
+        : TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES;
+      if (elapsedMs >= TERMINAL_OUTPUT_WRITE_TARGET_MS && bytes > TERMINAL_OUTPUT_WRITE_MIN_BYTES) {
+        outputAdaptiveFlushMaxBytes = Math.max(
+          TERMINAL_OUTPUT_WRITE_MIN_BYTES,
+          Math.floor(Math.min(outputAdaptiveFlushMaxBytes, bytes) * 0.65),
+        );
+        return;
+      }
+
+      if (elapsedMs <= TERMINAL_OUTPUT_WRITE_TARGET_MS / 2) {
+        outputAdaptiveFlushMaxBytes = Math.min(
+          maxBudget,
+          Math.max(TERMINAL_OUTPUT_WRITE_MIN_BYTES, Math.ceil(outputAdaptiveFlushMaxBytes * 1.2)),
+        );
+      }
     };
 
     const splitTerminalOutputWrite = (write, byteCount) => {
@@ -6161,6 +6174,7 @@ function WorkspaceTerminal({
           writes: writes.length,
         });
         const writeCallbackMs = performance.now() - writeStartedAt;
+        recordTerminalOutputWriteTiming(writeCallbackMs, batchBytes);
         const elapsedMs = performance.now() - flushStartedAt;
         if (terminalDiagnosticsEnabled) {
           outputDiagnosticWriteCallbackMs += writeCallbackMs;
@@ -6361,12 +6375,18 @@ function WorkspaceTerminal({
     const scheduleTerminalOutputBatchFlush = () => {
       terminalGlobalRenderScheduler.request(renderSchedulerId);
     };
+    const flushCurrentOutputNow = () => {
+      if (pendingOutputWrites.length) {
+        terminalGlobalRenderScheduler.request(renderSchedulerId);
+      }
+    };
+    terminalOutputFlushNowRef.current = flushCurrentOutputNow;
 
     terminalGlobalRenderScheduler.register({
       flush: (reason) => flushTerminalOutputBatch(reason),
       getPendingBytes: () => pendingOutputBytes,
       getQueuedAt: () => outputBatchQueuedAt,
-      hasPriorityPending: () => pendingOutputWrites.some((write) => (
+      hasPriorityPending: () => terminalActiveRef.current && pendingOutputWrites.some((write) => (
         write?.isFirstOutputChunk === true
         || write?.isFirstVisibleOutputChunk === true
       )),
@@ -6374,7 +6394,12 @@ function WorkspaceTerminal({
       id: renderSchedulerId,
       isActive: () => terminalActiveRef.current,
     });
-    disposables.push(() => terminalGlobalRenderScheduler.unregister(renderSchedulerId));
+    disposables.push(() => {
+      if (terminalOutputFlushNowRef.current === flushCurrentOutputNow) {
+        terminalOutputFlushNowRef.current = null;
+      }
+      terminalGlobalRenderScheduler.unregister(renderSchedulerId);
+    });
 
     const enqueueTerminalOutputWrite = (data, options = {}) => {
       if (isDisposed || !data?.byteLength) {
@@ -6415,11 +6440,7 @@ function WorkspaceTerminal({
     };
 
     const codexResizeGate = createCodexResizeGateState();
-    const isCodexResizeGateEnabled = () => (
-      terminalStabilityFeatures.resizeGate
-      && terminalOutputNormalizer.enabled
-      && !isGenericTerminal
-    );
+    const isCodexResizeGateEnabled = () => false;
     const claudeResizeBlankFrameGuard = {
       droppedDuplicateRepaints: 0,
       droppedFrames: 0,
@@ -8220,55 +8241,16 @@ function WorkspaceTerminal({
       const combinedData = concatTerminalByteArrays(queuedWrites.map((write) => write.data));
       const coalesced = coalesceCodexResizeRepaintBytes(combinedData);
       const queuedRawChunks = queuedWrites.filter((write) => write.rawCodexResizeGateData === true).length;
-      const resizeNormalizerBefore = isTerminalOutputNormalizerActive()
-        ? {
-          droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
-          droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
-          droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
-          passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
-          pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
-          syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
-          syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
-        }
-        : null;
-	      const normalizedCoalescedData = isTerminalOutputNormalizerActive() && coalesced.data?.byteLength
-	        ? normalizeTerminalOutputBytes(terminalOutputNormalizer, coalesced.data)
-	        : coalesced.data;
-      const resizeNormalizerStats = resizeNormalizerBefore
-        ? {
-          deltaDroppedEraseDisplay2OutsideSync:
-            terminalOutputNormalizer.droppedEraseDisplay2OutsideSync
-            - resizeNormalizerBefore.droppedEraseDisplay2OutsideSync,
-          deltaDroppedEraseScrollback3:
-            terminalOutputNormalizer.droppedEraseScrollback3 - resizeNormalizerBefore.droppedEraseScrollback3,
-          deltaDroppedSyncEraseDisplay2:
-            terminalOutputNormalizer.droppedSyncEraseDisplay2 - resizeNormalizerBefore.droppedSyncEraseDisplay2,
-          deltaPassedEraseDisplay2:
-            terminalOutputNormalizer.passedEraseDisplay2 - resizeNormalizerBefore.passedEraseDisplay2,
-          deltaPendingEscapeBytes:
-            terminalOutputNormalizer.pendingEscape.byteLength - resizeNormalizerBefore.pendingEscapeBytes,
-          deltaSyncBlocksEnded:
-            terminalOutputNormalizer.syncBlocksEnded - resizeNormalizerBefore.syncBlocksEnded,
-          deltaSyncBlocksSeen:
-            terminalOutputNormalizer.syncBlocksSeen - resizeNormalizerBefore.syncBlocksSeen,
-        }
-        : null;
+      const coalescedData = coalesced.data;
       scheduleCodexResizePaintProbe("codex_resize_gate_flush", "before_coalesced_write", {
         coalescedBytes: Number(coalesced.data?.byteLength || 0),
         droppedBytes: coalesced.droppedBytes,
         framesDropped: coalesced.framesDropped,
         framesSeen: coalesced.framesSeen,
-        normalizedCoalescedBytes: Number(normalizedCoalescedData?.byteLength || 0),
+        outputBytes: Number(coalescedData?.byteLength || 0),
         queuedBytes,
         queuedChunks: queuedWrites.length,
         queuedRawChunks,
-        resizeDeltaDroppedEraseDisplay2OutsideSync:
-          resizeNormalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
-        resizeDeltaDroppedEraseScrollback3: resizeNormalizerStats?.deltaDroppedEraseScrollback3 || 0,
-        resizeDeltaDroppedSyncEraseDisplay2: resizeNormalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
-        resizeDeltaPassedEraseDisplay2: resizeNormalizerStats?.deltaPassedEraseDisplay2 || 0,
-        resizeDeltaSyncBlocksEnded: resizeNormalizerStats?.deltaSyncBlocksEnded || 0,
-        resizeDeltaSyncBlocksSeen: resizeNormalizerStats?.deltaSyncBlocksSeen || 0,
         scrollToBottomAfterWrite: startedAtBottom,
       }, [0]);
       scheduleCodexResizeLiveTailCleanup("before_coalesced_write", {
@@ -8279,18 +8261,18 @@ function WorkspaceTerminal({
         queuedBytes,
         queuedChunks: queuedWrites.length,
       }, [180, 360]);
-      if (normalizedCoalescedData?.byteLength) {
+      if (coalescedData?.byteLength) {
         const isFirstOutputChunk = queuedWrites.some((write) => write.isFirstOutputChunk);
         const isFirstVisibleOutputChunk = queuedWrites.some((write) => write.isFirstVisibleOutputChunk);
-        const visibleChars = getTerminalOutputVisibleCharCount(normalizedCoalescedData);
-        enqueueTerminalOutputWrite(normalizedCoalescedData, {
+        const visibleChars = getTerminalOutputVisibleCharCount(coalescedData);
+        enqueueTerminalOutputWrite(coalescedData, {
           afterWriteRefreshReason: "codex_resize_gate_flush",
-	          isFirstOutputChunk,
-	          isFirstVisibleOutputChunk,
-	          outputDebug: { visibleChars },
-	          scrollToBottomBeforeWrite: true,
-	          scrollToBottomAfterWrite: startedAtBottom,
-	        });
+          isFirstOutputChunk,
+          isFirstVisibleOutputChunk,
+          outputDebug: { visibleChars },
+          scrollToBottomAfterWrite: startedAtBottom,
+          scrollToBottomBeforeWrite: true,
+        });
       }
 
       logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
@@ -8304,7 +8286,7 @@ function WorkspaceTerminal({
         framesSeen: coalesced.framesSeen,
         geometrySettled,
         hitMaxDeadline,
-        normalizedCoalescedBytes: Number(normalizedCoalescedData?.byteLength || 0),
+        outputBytes: Number(coalescedData?.byteLength || 0),
         previousBaseY: Number(startState?.baseY || 0),
         previousCols: previousSize?.cols || 0,
         previousRows: previousSize?.rows || 0,
@@ -8313,14 +8295,6 @@ function WorkspaceTerminal({
         queuedChunks: queuedWrites.length,
         queuedRawChunks,
         reason,
-        resizeDeltaDroppedEraseDisplay2OutsideSync:
-          resizeNormalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
-        resizeDeltaDroppedEraseScrollback3: resizeNormalizerStats?.deltaDroppedEraseScrollback3 || 0,
-        resizeDeltaDroppedSyncEraseDisplay2: resizeNormalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
-        resizeDeltaPassedEraseDisplay2: resizeNormalizerStats?.deltaPassedEraseDisplay2 || 0,
-        resizeDeltaPendingEscapeBytes: resizeNormalizerStats?.deltaPendingEscapeBytes || 0,
-        resizeDeltaSyncBlocksEnded: resizeNormalizerStats?.deltaSyncBlocksEnded || 0,
-        resizeDeltaSyncBlocksSeen: resizeNormalizerStats?.deltaSyncBlocksSeen || 0,
         scrollToBottomAfterWrite: startedAtBottom,
         targetCols: targetSize?.cols || 0,
         targetRows: targetSize?.rows || 0,
@@ -8446,13 +8420,7 @@ function WorkspaceTerminal({
         allowLater: true,
       });
     };
-    const isCodexSlashMenuCloseCleanupEnabled = () => (
-      isTerminalStabilityRuntimeActive()
-      && terminalStabilityFeatures.slashMenuCloseResize
-      && terminalOutputNormalizer.enabled
-      && !isGenericTerminal
-      && !isDisposed
-    );
+    const isCodexSlashMenuCloseCleanupEnabled = () => false;
     const isCodexSlashMenuCloseCleanupActive = () => (
       isCodexSlashMenuCloseCleanupEnabled()
       && codexSlashMenuCloseCleanupState.active
@@ -8841,7 +8809,10 @@ function WorkspaceTerminal({
         const outputDisplayMasker = createCoreRepoNameDisplayMasker({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
-        const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
+        const outputSessionInspectionEnabled = !terminalUsesActivityHooks && !isGenericTerminal;
+        const outputTextDecoder = outputSessionInspectionEnabled
+          ? new TextDecoder("utf-8", { fatal: false })
+          : null;
         const processPreparedTerminalOutput = (payload = {}) => {
           if (isDisposed) {
             return;
@@ -8881,7 +8852,7 @@ function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += sourceChunks;
           outputBytes += terminalData.byteLength;
-          const shouldInspectTerminalText = !isGenericTerminal && (
+          const shouldInspectTerminalText = outputSessionInspectionEnabled && (
             isFirstOutputChunk
             || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
           );
@@ -9050,102 +9021,14 @@ function WorkspaceTerminal({
             return;
           }
 
-          const outputNormalizerActive = isTerminalOutputNormalizerActive();
-          const deferCodexResizeNormalization = outputNormalizerActive
-            && isCodexResizeGateEnabled()
-            && codexResizeGate.active;
-          const normalizerBefore = outputNormalizerActive && !deferCodexResizeNormalization
-            ? {
-              droppedEraseDisplay2OutsideSync: terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
-              droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
-              droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
-              passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
-              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
-              syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
-              syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
-            }
-            : null;
-          const terminalData = deferCodexResizeNormalization
-            ? displayData
-            : (
-              outputNormalizerActive
-                ? normalizeTerminalOutputBytes(terminalOutputNormalizer, displayData)
-                : displayData
-            );
-          const normalizerChanged = normalizerBefore
-            ? (
-              terminalOutputNormalizer.droppedEraseDisplay2OutsideSync !== normalizerBefore.droppedEraseDisplay2OutsideSync
-              || terminalOutputNormalizer.droppedEraseScrollback3 !== normalizerBefore.droppedEraseScrollback3
-              || terminalOutputNormalizer.droppedSyncEraseDisplay2 !== normalizerBefore.droppedSyncEraseDisplay2
-              || terminalOutputNormalizer.passedEraseDisplay2 !== normalizerBefore.passedEraseDisplay2
-              || terminalOutputNormalizer.pendingEscape.byteLength !== normalizerBefore.pendingEscapeBytes
-              || terminalOutputNormalizer.syncBlocksEnded !== normalizerBefore.syncBlocksEnded
-              || terminalOutputNormalizer.syncBlocksSeen !== normalizerBefore.syncBlocksSeen
-            )
-            : false;
-          const normalizerStats = normalizerBefore
-            ? {
-              changed: normalizerChanged,
-              deltaDroppedEraseDisplay2OutsideSync:
-                terminalOutputNormalizer.droppedEraseDisplay2OutsideSync
-                - normalizerBefore.droppedEraseDisplay2OutsideSync,
-              deltaDroppedEraseScrollback3:
-                terminalOutputNormalizer.droppedEraseScrollback3 - normalizerBefore.droppedEraseScrollback3,
-              deltaDroppedSyncEraseDisplay2:
-                terminalOutputNormalizer.droppedSyncEraseDisplay2 - normalizerBefore.droppedSyncEraseDisplay2,
-              deltaPassedEraseDisplay2:
-                terminalOutputNormalizer.passedEraseDisplay2 - normalizerBefore.passedEraseDisplay2,
-              deltaPendingEscapeBytes:
-                terminalOutputNormalizer.pendingEscape.byteLength - normalizerBefore.pendingEscapeBytes,
-              deltaSyncBlocksEnded:
-                terminalOutputNormalizer.syncBlocksEnded - normalizerBefore.syncBlocksEnded,
-              deltaSyncBlocksSeen:
-                terminalOutputNormalizer.syncBlocksSeen - normalizerBefore.syncBlocksSeen,
-              displayBytes: displayData.byteLength,
-              outputBytes: terminalData.byteLength,
-            }
-            : null;
-
-          if (deferCodexResizeNormalization) {
-            logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.output_normalized", {
-              action: "defer_codex_resize_gate",
-              displayBytes: displayData.byteLength,
-              outputBytes: terminalData.byteLength,
-              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
-            });
-          }
-
-          if (normalizerChanged) {
-            logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.output_normalized", {
-              displayBytes: displayData.byteLength,
-              deltaDroppedEraseDisplay2OutsideSync:
-                normalizerStats?.deltaDroppedEraseDisplay2OutsideSync || 0,
-              deltaDroppedEraseScrollback3: normalizerStats?.deltaDroppedEraseScrollback3 || 0,
-              deltaDroppedSyncEraseDisplay2: normalizerStats?.deltaDroppedSyncEraseDisplay2 || 0,
-              deltaPassedEraseDisplay2: normalizerStats?.deltaPassedEraseDisplay2 || 0,
-              deltaPendingEscapeBytes: normalizerStats?.deltaPendingEscapeBytes || 0,
-              deltaSyncBlocksEnded: normalizerStats?.deltaSyncBlocksEnded || 0,
-              deltaSyncBlocksSeen: normalizerStats?.deltaSyncBlocksSeen || 0,
-              dropEraseDisplay2OutsideSync: terminalOutputNormalizer.dropEraseDisplay2OutsideSync,
-              droppedEraseDisplay2OutsideSync:
-                terminalOutputNormalizer.droppedEraseDisplay2OutsideSync,
-              droppedEraseScrollback3: terminalOutputNormalizer.droppedEraseScrollback3,
-              droppedSyncEraseDisplay2: terminalOutputNormalizer.droppedSyncEraseDisplay2,
-              inSyncOutput: terminalOutputNormalizer.inSyncOutput,
-              outputBytes: terminalData.byteLength,
-              passedEraseDisplay2: terminalOutputNormalizer.passedEraseDisplay2,
-              pendingEscapeBytes: terminalOutputNormalizer.pendingEscape.byteLength,
-              syncBlocksEnded: terminalOutputNormalizer.syncBlocksEnded,
-              syncBlocksSeen: terminalOutputNormalizer.syncBlocksSeen,
-            });
-          }
+          const terminalData = displayData;
 
           if (!terminalData.byteLength) {
             return;
           }
 
           const isFirstOutputChunk = !sawFirstOutput;
-          const shouldInspectTerminalText = !isGenericTerminal && (
+          const shouldInspectTerminalText = outputSessionInspectionEnabled && (
             isFirstOutputChunk
             || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
           );
@@ -9159,7 +9042,7 @@ function WorkspaceTerminal({
             inputBytes: data.byteLength,
             inspectionText,
             maskMs,
-            rawCodexResizeGateData: deferCodexResizeNormalization,
+            rawCodexResizeGateData: false,
             sourceChunks: 1,
           });
         };
@@ -9187,7 +9070,7 @@ function WorkspaceTerminal({
           outputTransportPreferred = true;
           terminalOutputWorkerSession.prepareTransport({
             active: terminalActiveRef.current === true,
-            inspect: !isGenericTerminal,
+            inspect: outputSessionInspectionEnabled,
             instanceId: terminalInstanceId,
             paneId,
             timeoutMs: 1600,
@@ -9226,10 +9109,9 @@ function WorkspaceTerminal({
             return;
           }
 
-          const outputNormalizerActive = isTerminalOutputNormalizerActive();
-          if (!outputNormalizerActive && terminalOutputWorkerSession?.enqueue(data, {
+          if (terminalOutputWorkerSession?.enqueue(data, {
             active: terminalActiveRef.current === true,
-            inspect: !isGenericTerminal,
+            inspect: outputSessionInspectionEnabled,
           })) {
             return;
           }
@@ -9285,7 +9167,7 @@ function WorkspaceTerminal({
             initialHeadlessOutputReplayDone = true;
             if (terminalOutputWorkerSession?.enqueue(bytes, {
               active: terminalActiveRef.current === true,
-              inspect: !isGenericTerminal,
+              inspect: outputSessionInspectionEnabled,
             })) {
               return;
             }
