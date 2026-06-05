@@ -121,6 +121,7 @@ struct CloudMcpRuntime {
     global_ws_last_connected_ms: Option<u64>,
     global_ws_connection_id: Option<String>,
     global_ws_message_token: Option<String>,
+    live_runtime_status: Option<Value>,
     registered_workspaces: HashMap<String, CloudMcpWorkspaceStatus>,
     terminal_contexts: HashMap<String, CloudMcpTerminalContextState>,
 }
@@ -204,6 +205,7 @@ struct CloudMcpStatus {
     global_ws_last_error: String,
     global_ws_last_connected_ms: Option<u64>,
     connection_contract: String,
+    live_runtime_status: Option<Value>,
     registered_workspace_count: usize,
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
 }
@@ -279,6 +281,7 @@ impl CloudMcpState {
                 global_ws_last_connected_ms: None,
                 global_ws_connection_id: None,
                 global_ws_message_token: None,
+                live_runtime_status: None,
                 registered_workspaces: HashMap::new(),
                 terminal_contexts: HashMap::new(),
             })),
@@ -1202,6 +1205,7 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         global_ws_last_error: runtime.global_ws_last_error.clone(),
         global_ws_last_connected_ms: runtime.global_ws_last_connected_ms,
         connection_contract: "diffforge.app_ws.v1".to_string(),
+        live_runtime_status: runtime.live_runtime_status.clone(),
         registered_workspace_count: registered_workspaces.len(),
         registered_workspaces,
     }
@@ -1221,6 +1225,7 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
     runtime.global_ws_status = "blocked".to_string();
     runtime.global_ws_connection_id = None;
     runtime.global_ws_message_token = None;
+    runtime.live_runtime_status = None;
     cloud_mcp_snapshot(&runtime)
 }
 
@@ -1361,6 +1366,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                     runtime.global_ws_last_error = clean_terminal_telemetry_text(&error);
                     runtime.global_ws_connection_id = None;
                     runtime.global_ws_message_token = None;
+                    runtime.live_runtime_status = None;
                 }
                 cloud_mcp_mark_global_ws_disconnected(&state, &error).await;
             }
@@ -1632,6 +1638,7 @@ async fn cloud_mcp_open_global_ws(
         runtime.global_ws_status = "handshaking".to_string();
         runtime.global_ws_connection_id = None;
         runtime.global_ws_message_token = None;
+        runtime.live_runtime_status = None;
     }
 
     let ready_timeout = sleep(Duration::from_secs(CLOUD_MCP_WS_READY_TIMEOUT_SECS));
@@ -1772,6 +1779,7 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         runtime.global_ws_last_error = message.clone();
         runtime.global_ws_connection_id = None;
         runtime.global_ws_message_token = None;
+        runtime.live_runtime_status = None;
     }
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
 }
@@ -1789,6 +1797,7 @@ async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &st
         runtime.global_ws_last_error = message.clone();
         runtime.global_ws_connection_id = None;
         runtime.global_ws_message_token = None;
+        runtime.live_runtime_status = None;
     }
     let _ = state.global_ws_tx.lock().await.take();
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
@@ -1849,6 +1858,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
             runtime.global_ws_connection_id = Some(connection_id.clone());
             runtime.global_ws_message_token = Some(message_token.clone());
+            runtime.live_runtime_status = message
+                .get("initial_live_runtime")
+                .cloned()
+                .filter(|value| !value.is_null());
         }
         cloud_mcp_record_signin_diagnostic(
             state,
@@ -1932,11 +1945,17 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .or_else(|| event.get("eventKind"))
             .or_else(|| event.get("kind"))
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
+        let live_runtime_snapshot = if event_kind == "live_runtime_snapshot" {
+            event.get("data").cloned().filter(|value| !value.is_null())
+        } else {
+            None
+        };
         if event_kind.starts_with("voice_agent_") {
             cloud_mcp_log_voice_shared_ws(
                 "voice_agent.shared_ws.event_received",
-                event_kind,
+                &event_kind,
                 "received",
                 "Rust websocket reader received a voice event from cloud.",
                 json!({
@@ -1947,7 +1966,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             );
         }
         if matches!(
-            event_kind,
+            event_kind.as_str(),
             "client_liveness_ping" | "dashboard_liveness_ping"
         ) {
             let _ = cloud_mcp_send_liveness_pong_event(state, &event).await;
@@ -1959,6 +1978,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         runtime.global_ws_connected = true;
         runtime.global_ws_status = "connected".to_string();
         runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
+        if let Some(data) = live_runtime_snapshot {
+            runtime.live_runtime_status = Some(data);
+        }
     }
 }
 

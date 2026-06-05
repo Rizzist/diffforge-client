@@ -1691,7 +1691,6 @@ function WorkspaceTerminal({
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
-  const [terminalUiViewMounted, setTerminalUiViewMounted] = useState(false);
   const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
   const terminalUiViewActiveRef = useRef(false);
   useEffect(() => {
@@ -4016,7 +4015,7 @@ function WorkspaceTerminal({
       return;
     }
 
-    activateTerminalPane("terminal_focus");
+    activateTerminalPane("terminal_focus", { focusKeyboard: false });
   }, [activateTerminalPane, terminalSelectsOnPointerDown]);
 
   const handleTerminalSurfacePointerDownCapture = useCallback((event) => {
@@ -4037,7 +4036,7 @@ function WorkspaceTerminal({
       return;
     }
 
-    activateTerminalPane("terminal_pointer");
+    activateTerminalPane("terminal_pointer", { focusKeyboard: false });
   }, [
     activateTerminalPane,
     beginBreakoutSurfaceDragGesture,
@@ -5586,9 +5585,9 @@ function WorkspaceTerminal({
         return;
       }
 
-      activateTerminalPane(detail.reason || "terminal_focus_request", {
-        focusKeyboard: detail.focusKeyboard !== false,
-      });
+	      activateTerminalPane(detail.reason || "terminal_focus_request", {
+	        focusKeyboard: detail.focusKeyboard === true,
+	      });
     };
     window.addEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
     disposables.push(() => {
@@ -12983,10 +12982,6 @@ function WorkspaceTerminal({
     }
 
     const nextUiViewActive = !terminalUiViewActive;
-    if (nextUiViewActive) {
-      setTerminalUiViewMounted(true);
-    }
-
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
     terminalUiViewActiveRef.current = nextUiViewActive;
     setTerminalUiViewActive(nextUiViewActive);
@@ -13005,7 +13000,6 @@ function WorkspaceTerminal({
         return false;
       }
 
-      setTerminalUiViewMounted(true);
       activateTerminalPane("terminal_ui_view_arrow_shortcut", { focusKeyboard: false });
     } else {
       if (!terminalUiViewActiveRef.current) {
@@ -13025,15 +13019,6 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
-  ]);
-  useEffect(() => {
-    if (isActive && canOpenTerminalUiView && !terminalUiViewMounted) {
-      setTerminalUiViewMounted(true);
-    }
-  }, [
-    canOpenTerminalUiView,
-    isActive,
-    terminalUiViewMounted,
   ]);
   useEffect(() => {
     if (terminalClosed || terminalClosing) {
@@ -13085,7 +13070,6 @@ function WorkspaceTerminal({
   useEffect(() => {
     if (!thread || terminalClosed || terminalClosing) {
       setTerminalUiViewActive(false);
-      setTerminalUiViewMounted(false);
     }
   }, [terminalClosed, terminalClosing, thread]);
   const splitTerminal = useCallback((direction) => {
@@ -13241,11 +13225,7 @@ function WorkspaceTerminal({
   const terminalUiViewShouldRender = Boolean(thread)
     && !terminalClosed
     && !terminalClosing
-    && (
-      terminalUiViewActive
-      || terminalUiViewMounted
-      || (isActive && canOpenTerminalUiView)
-    );
+    && terminalUiViewActive;
   const restartMenuAgentKind = terminalAgentKind;
   const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
 
@@ -13425,8 +13405,9 @@ function WorkspaceTerminal({
                   thread={thread}
                   todoDropActive={todoDropActive}
                   todoDropTarget={todoDropTarget}
-                  todoDropUnsupportedMessage={todoDropUnsupportedMessage}
-                  workspace={workspace}
+	                  todoDropUnsupportedMessage={todoDropUnsupportedMessage}
+	                  visible={terminalUiViewActive}
+	                  workspace={workspace}
                   workspaceRoot={workingDirectory}
                   workspaceThreadEntry={workspaceThreadEntry}
                 />

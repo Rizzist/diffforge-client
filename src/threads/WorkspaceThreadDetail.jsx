@@ -58,6 +58,7 @@ import {
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
+  setWorkspaceThreadDetailVisibility,
 } from "./workspaceThreads";
 
 const thinkingPulse = keyframes`
@@ -4764,7 +4765,12 @@ function WorkspaceThreadDetail({
   const copyResetTimeoutRef = useRef(null);
   const detailRenderDiagnosticRef = useRef("");
   const lastComposerFocusTokenRef = useRef(0);
-  const messages = Array.isArray(thread?.messages)
+  const visibilityTokenRef = useRef("");
+  if (!visibilityTokenRef.current) {
+    visibilityTokenRef.current = `thread-detail-${Math.random().toString(36).slice(2)}`;
+  }
+  const detailVisible = visible !== false;
+  const messages = detailVisible && Array.isArray(thread?.messages)
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
@@ -5127,6 +5133,45 @@ function WorkspaceThreadDetail({
     : "";
   const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
   const detailDensity = density === "compact" ? "compact" : undefined;
+
+  useEffect(() => {
+    const workspaceId = workspace?.id || thread?.workspaceId || "";
+    const threadId = thread?.id || "";
+    if (!detailVisible || newChatActive || !workspaceId || !threadId) {
+      return undefined;
+    }
+
+    const visibilityDetail = {
+      agentId: activeAgentId,
+      density,
+      instanceId: activeTerminalBinding?.instanceId || "",
+      paneId: activeTerminalBinding?.paneId || "",
+      surface: density === "compact" ? "terminal-inline-ui" : "threads-overlay",
+      terminalIndex: activeTerminalBinding?.terminalIndex ?? null,
+      threadId,
+      token: visibilityTokenRef.current,
+      visible: true,
+      workspaceId,
+    };
+    setWorkspaceThreadDetailVisibility(visibilityDetail);
+    return () => {
+      setWorkspaceThreadDetailVisibility({
+        ...visibilityDetail,
+        visible: false,
+      });
+    };
+  }, [
+    activeAgentId,
+    activeTerminalBinding?.instanceId,
+    activeTerminalBinding?.paneId,
+    activeTerminalBinding?.terminalIndex,
+    density,
+    detailVisible,
+    newChatActive,
+    thread?.id,
+    thread?.workspaceId,
+    workspace?.id,
+  ]);
 
   useEffect(() => {
     setSelectedModel(modelOptions[0]?.value || "");
@@ -6272,6 +6317,10 @@ function WorkspaceThreadDetail({
       setSending(false);
     }
   };
+
+  if (!detailVisible) {
+    return null;
+  }
 
   if (newChatActive) {
     return (

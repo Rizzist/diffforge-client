@@ -1766,6 +1766,7 @@ function WorkspaceThreadsOverlay({
           workspace={newChatActive ? newChatWorkspace : activeWorkspace}
           workspaceRoot={(newChatActive ? newChatWorkspace?.rootDirectory : activeWorkspace?.rootDirectory) || workspaceRoot || ""}
           workspaceThreadEntry={workspaceThreads?.[newChatActive ? newChatWorkspace?.id || "" : activeWorkspaceId]}
+          visible={open}
         />
       </OverlayPanel>
     </OverlayRoot>

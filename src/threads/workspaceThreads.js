@@ -8,6 +8,8 @@ import {
 } from "./terminalControlPrompts.js";
 
 const WORKSPACE_THREADS_STORAGE_KEY = "diffforge.workspaceThreads.v1";
+const WORKSPACE_THREAD_DETAIL_VISIBILITY_REGISTRY_KEY = "__diffforgeWorkspaceThreadDetailVisibility";
+export const WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT = "diffforge:workspace-thread-detail-visibility";
 const MAX_THREAD_PROJECTION_EVENTS = 900;
 const MAX_THREAD_MESSAGES = 360;
 const MAX_PERSISTED_THREAD_PROJECTION_EVENTS = 24;
@@ -90,6 +92,92 @@ function cleanText(value, fallback = "") {
     .trim();
 
   return text || fallback;
+}
+
+export function getWorkspaceThreadDetailVisibilityKey({ workspaceId = "", threadId = "" } = {}) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  const safeThreadId = cleanText(threadId);
+  return safeWorkspaceId && safeThreadId ? `${safeWorkspaceId}::${safeThreadId}` : "";
+}
+
+function getWorkspaceThreadDetailVisibilityRegistry() {
+  if (typeof window === "undefined") {
+    return null;
+  }
+
+  const existing = window[WORKSPACE_THREAD_DETAIL_VISIBILITY_REGISTRY_KEY];
+  if (existing instanceof Map) {
+    return existing;
+  }
+
+  const registry = new Map();
+  window[WORKSPACE_THREAD_DETAIL_VISIBILITY_REGISTRY_KEY] = registry;
+  return registry;
+}
+
+export function setWorkspaceThreadDetailVisibility(detail = {}) {
+  const workspaceId = cleanText(detail.workspaceId || detail.workspace_id);
+  const threadId = cleanText(detail.threadId || detail.thread_id);
+  const key = getWorkspaceThreadDetailVisibilityKey({ workspaceId, threadId });
+  if (!key) {
+    return "";
+  }
+
+  const registry = getWorkspaceThreadDetailVisibilityRegistry();
+  const token = cleanText(detail.token, "default");
+  const visible = detail.visible !== false;
+  if (registry) {
+    let entry = registry.get(key);
+    if (visible) {
+      if (!(entry instanceof Map)) {
+        entry = new Map();
+        registry.set(key, entry);
+      }
+      entry.set(token, {
+        ...detail,
+        threadId,
+        visible: true,
+        workspaceId,
+      });
+    } else if (entry instanceof Map) {
+      if (token) {
+        entry.delete(token);
+      } else {
+        entry.clear();
+      }
+      if (entry.size === 0) {
+        registry.delete(key);
+      }
+    }
+  }
+
+  if (
+    typeof window !== "undefined"
+    && typeof window.dispatchEvent === "function"
+    && typeof CustomEvent === "function"
+  ) {
+    window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT, {
+      detail: {
+        ...detail,
+        threadId,
+        visible,
+        workspaceId,
+      },
+    }));
+  }
+
+  return key;
+}
+
+export function workspaceThreadDetailIsVisible({ workspaceId = "", threadId = "" } = {}) {
+  const registry = getWorkspaceThreadDetailVisibilityRegistry();
+  const key = getWorkspaceThreadDetailVisibilityKey({ workspaceId, threadId });
+  if (!registry || !key) {
+    return false;
+  }
+
+  const entry = registry.get(key);
+  return entry instanceof Map && entry.size > 0;
 }
 
 function promptIdSuffixCanMatch(value) {
@@ -1354,11 +1442,18 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
   };
 }
 
-function normalizeThreadProjectionEvents(events) {
+function normalizeThreadProjectionEvents(events, options = {}) {
+  const sourceEvents = Array.isArray(events) ? events : [];
+  if (options.alreadyNormalized === true) {
+    return sourceEvents
+      .slice(-MAX_THREAD_PROJECTION_EVENTS)
+      .map((event, index) => (event.sequence === index ? event : { ...event, sequence: index }));
+  }
+
   const normalized = [];
   const seen = new Set();
 
-  (Array.isArray(events) ? events : []).forEach((event, index) => {
+  sourceEvents.forEach((event, index) => {
     const normalizedEvent = normalizeThreadProjectionEvent(event, index);
     if (!normalizedEvent || seen.has(normalizedEvent.id)) {
       return;
@@ -1434,8 +1529,7 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
   });
 }
 
-function projectThreadProjectionMessages(events, fallbackMessages = []) {
-  const projectionEvents = normalizeThreadProjectionEvents(events);
+function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, fallbackMessages = []) {
   if (!projectionEvents.length) {
     return normalizeThreadMessages(fallbackMessages);
   }
@@ -1549,6 +1643,13 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
     .slice(-MAX_THREAD_MESSAGES);
 }
 
+function projectThreadProjectionMessages(events, fallbackMessages = []) {
+  return projectThreadProjectionMessagesFromNormalizedEvents(
+    normalizeThreadProjectionEvents(events),
+    fallbackMessages,
+  );
+}
+
 function threadMessageProjectionEventId(prefix, message, suffix = "") {
   const id = cleanText(message?.id, createRandomId("message"));
   const text = cleanMessageText(message?.text);
@@ -1645,7 +1746,7 @@ function appendThreadProjectionEvents(existingEvents, nextEvents) {
     nextSequence += 1;
   });
 
-  return normalizeThreadProjectionEvents(events);
+  return normalizeThreadProjectionEvents(events, { alreadyNormalized: true });
 }
 
 function projectionHasTurnEvent(events, type, turnId) {
@@ -1746,11 +1847,11 @@ function isTranscriptTurnErrorMessage(message) {
   return kind === "error" || status === "error";
 }
 
-function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
+function projectLatestTurnFromNormalizedEvents(projectionEvents, fallbackLatestTurn = null) {
   let latestTurn = normalizeThreadLatestTurn(fallbackLatestTurn);
   const closedTurnIds = new Set();
 
-  normalizeThreadProjectionEvents(events).forEach((event) => {
+  projectionEvents.forEach((event) => {
     const turnId = cleanText(event.turnId);
     if (!turnId) {
       return;
@@ -1847,6 +1948,13 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
   });
 
   return latestTurn;
+}
+
+function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
+  return projectLatestTurnFromNormalizedEvents(
+    normalizeThreadProjectionEvents(events),
+    fallbackLatestTurn,
+  );
 }
 
 function findMatchingProjectedMessage(projectedMessages, message) {
@@ -1954,7 +2062,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     expectedUserMessage,
   );
   let projectionEvents = ensureThreadProjectionEvents(thread);
-  let projectedMessages = projectThreadProjectionMessages(
+  let projectedMessages = projectThreadProjectionMessagesFromNormalizedEvents(
     projectionEvents.filter(isTranscriptHistoryProjectionEvent),
     [],
   );
@@ -2183,7 +2291,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
 
     if (events.length > eventStartCount) {
       projectionEvents = appendThreadProjectionEvents(projectionEvents, events.slice(eventStartCount));
-      projectedMessages = projectThreadProjectionMessages(projectionEvents, projectedMessages);
+      projectedMessages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, projectedMessages);
     }
   });
 
@@ -2528,14 +2636,14 @@ function normalizeThread(thread, workspaceId, options = {}) {
       ? compactPersistedThreadMessages(thread.messages)
       : (
         projectionEvents.length
-          ? projectThreadProjectionMessages(projectionEvents, thread.messages)
+          ? projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, thread.messages)
           : normalizeThreadMessages(thread.messages)
       );
   const projectedLatestTurn = options.stripMessages
     ? normalizeThreadLatestTurn(thread.latestTurn)
     : options.compactPersistence
       ? normalizeThreadLatestTurn(thread.latestTurn)
-      : projectLatestTurnFromEvents(projectionEvents, thread.latestTurn);
+      : projectLatestTurnFromNormalizedEvents(projectionEvents, thread.latestTurn);
   const messageCount = Math.max(normalizeMessageCount(thread.messageCount), messages.length);
   const materialized = thread.materialized === true || messageCount > 0;
   const status = cleanText(thread.status, "idle").toLowerCase();
@@ -2884,6 +2992,53 @@ export function normalizeWorkspaceThreads(value, options = {}) {
   );
 }
 
+function getWorkspaceThreadsStateObject(state) {
+  return state && typeof state === "object" && !Array.isArray(state) ? state : {};
+}
+
+function getWorkspaceThreadUpdateTarget(state, workspaceId, threadId) {
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = currentState?.[workspaceId];
+  const threads = entry?.threads && typeof entry.threads === "object" && !Array.isArray(entry.threads)
+    ? entry.threads
+    : null;
+  const existing = threads?.[threadId];
+  if (!entry || !threads || !existing || typeof existing !== "object" || Array.isArray(existing)) {
+    return null;
+  }
+
+  return {
+    currentState,
+    entry,
+    existing,
+  };
+}
+
+function cloneRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+}
+
+function cloneWorkspaceEntryForMutation(entry, workspaceId) {
+  const source = entry && typeof entry === "object" && !Array.isArray(entry) ? entry : {};
+  const activeThreadId = cleanText(source.activeThreadId);
+  return {
+    activeThreadId,
+    archivedThreadOrder: Array.isArray(source.archivedThreadOrder) ? source.archivedThreadOrder.slice() : [],
+    archivedThreads: cloneRecord(source.archivedThreads),
+    terminalOrder: Array.isArray(source.terminalOrder) ? source.terminalOrder.slice() : [],
+    terminalThreadIds: cloneRecord(source.terminalThreadIds),
+    terminals: cloneRecord(source.terminals),
+    threadOrder: Array.isArray(source.threadOrder) ? source.threadOrder.slice() : [],
+    threads: cloneRecord(source.threads),
+    threadsView: {
+      ...normalizeThreadsViewState(source.threadsView, {
+        selectedThreadId: activeThreadId,
+        selectedWorkspaceId: workspaceId,
+      }),
+    },
+  };
+}
+
 export function readWorkspaceThreads() {
   return {};
 }
@@ -3056,8 +3211,8 @@ export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
     : [];
   const rolesByIndex = options.rolesByIndex || {};
   const fallbackAgent = cleanAgentId(options.fallbackAgent, DEFAULT_AGENT_ID);
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   let changed = !currentState[workspaceId];
 
   terminalIndexes.forEach((terminalIndex) => {
@@ -3170,10 +3325,9 @@ export function ensureWorkspaceThreadsForTerminalIndexes(state, options = {}) {
 export function selectWorkspaceThread(state, workspaceId, threadId) {
   const safeWorkspaceId = cleanText(workspaceId);
   const safeThreadId = cleanText(threadId);
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[safeWorkspaceId]
-    ? ensureWorkspaceEntry(currentState, safeWorkspaceId)
-    : null;
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[safeWorkspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, safeWorkspaceId) : null;
 
   if (!entry || !entry.threads[safeThreadId]) {
     return state || {};
@@ -3211,10 +3365,9 @@ export function updateWorkspaceThreadsViewState(state, workspaceId, patch = {}) 
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[safeWorkspaceId]
-    ? ensureWorkspaceEntry(currentState, safeWorkspaceId)
-    : null;
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[safeWorkspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, safeWorkspaceId) : null;
   if (!entry) {
     return state || {};
   }
@@ -3616,8 +3769,8 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   const eventAgentId = cleanAgentId(event.agentId || event.currentAgent, "");
   const eventNativeSessionId = cleanText(event.nativeSessionId || event.providerSessionId);
   if (eventNativeSessionId && workspaceEntryHasArchivedSession(entry, eventAgentId, eventNativeSessionId)) {
@@ -3710,8 +3863,8 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   const terminalKey = terminalSessionKey(terminalIndex);
   const existingTerminal = terminalKey ? entry.terminals[terminalKey] : null;
   const existingThreadId = cleanText(event.threadId || existingTerminal?.threadId);
@@ -3817,9 +3970,9 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       ensureThreadProjectionEvents(entry.threads[threadId]),
       submittedEvents,
     );
-    const messages = projectThreadProjectionMessages(projectionEvents, entry.threads[threadId].messages);
+    const messages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, entry.threads[threadId].messages);
     const messageAdded = submittedEvents.length > 0 && messages.length > previousMessages.length;
-    const projectedLatestTurn = projectLatestTurnFromEvents(
+    const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(
       projectionEvents,
       entry.threads[threadId].latestTurn,
     );
@@ -3902,8 +4055,8 @@ export function bindWorkspaceThreadTerminal(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   if (!entry.threads[threadId]) {
     return state || {};
   }
@@ -3926,8 +4079,8 @@ export function markWorkspaceThreadTerminalDetached(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, workspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const entry = cloneWorkspaceEntryForMutation(currentState[workspaceId], workspaceId);
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminal = terminalKey ? entry.terminals[terminalKey] : null;
   const threadId = cleanText(event.threadId || terminal?.threadId);
@@ -4033,10 +4186,9 @@ export function updateWorkspaceThreadAgent(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId]
-    ? ensureWorkspaceEntry(currentState, workspaceId)
-    : null;
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[workspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, workspaceId) : null;
   const existing = entry?.threads?.[threadId];
   if (!existing) {
     return state || {};
@@ -4437,7 +4589,7 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
     projectionEventsToAdd,
   );
   const messagesBefore = normalizeThreadMessages(existing?.messages);
-  const messagesAfter = projectThreadProjectionMessages(projectionEventsAfter, existing?.messages);
+  const messagesAfter = projectThreadProjectionMessagesFromNormalizedEvents(projectionEventsAfter, existing?.messages);
   const latestTurnBefore = normalizeThreadLatestTurn(existing?.latestTurn);
   const latestTurnAfter = latestTurnBefore;
   const lastBefore = messagesBefore[messagesBefore.length - 1] || null;
@@ -4610,7 +4762,7 @@ export function workspaceThreadSessionIsArchived(state, workspaceId, agentId, se
     return false;
   }
 
-  const entry = normalizeWorkspaceThreads(state)[safeWorkspaceId];
+  const entry = getWorkspaceThreadsStateObject(state)[safeWorkspaceId];
   return workspaceEntryHasArchivedSession(entry, agentId, safeSessionId);
 }
 
@@ -4621,7 +4773,7 @@ export function workspaceThreadIdIsArchived(state, workspaceId, threadId) {
     return false;
   }
 
-  const entry = normalizeWorkspaceThreads(state)[safeWorkspaceId];
+  const entry = getWorkspaceThreadsStateObject(state)[safeWorkspaceId];
   return workspaceEntryHasArchivedThreadId(entry, safeThreadId);
 }
 
@@ -4648,9 +4800,12 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  let entry = currentState[workspaceId];
-  let existing = entry?.threads?.[threadId];
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
+    return state || {};
+  }
+  const { currentState } = target;
+  let { entry, existing } = target;
   if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId)) {
     return state || {};
   }
@@ -4751,9 +4906,11 @@ export function invalidateWorkspaceThreadProviderSession(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
+    return state || {};
+  }
+  const { currentState, entry, existing } = target;
   if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId)) {
     return state || {};
   }
@@ -4865,12 +5022,11 @@ export function updateWorkspaceThreadProviderModel(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
     return state || {};
   }
+  const { currentState, entry, existing } = target;
 
   const now = nowIso();
   const providerBindings = normalizeProviderBindings(
@@ -4925,9 +5081,11 @@ export function clearWorkspaceThreadPendingPrompt(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
+    return state || {};
+  }
+  const { currentState, entry, existing } = target;
   if (!existing?.pendingPrompt) {
     return state || {};
   }
@@ -4982,11 +5140,13 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     return state || {};
   }
 
-  const rawState = state || {};
-  const rawExisting = rawState?.[workspaceId]?.threads?.[threadId] || null;
-  const currentState = normalizeWorkspaceThreads(state);
-  let entry = currentState[workspaceId];
-  let existing = entry?.threads?.[threadId];
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
+    return state || {};
+  }
+  const { currentState } = target;
+  const rawExisting = target.existing;
+  let { entry, existing } = target;
   if (!existing || workspaceEntryHasArchivedThreadId(entry, threadId) || existing.archivedAt) {
     return state || {};
   }
@@ -5051,7 +5211,7 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     ensureThreadProjectionEvents(existing),
     projectionEventsToAdd,
   );
-  const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
+  const messages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, existing.messages);
   const lifecycleExisting = rawExisting || existing;
   const existingLatestTurn = normalizeThreadLatestTurn(lifecycleExisting.latestTurn);
   const latestTurn = existingLatestTurn;
@@ -5141,20 +5301,19 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
     return state || {};
   }
+  const { currentState, entry, existing } = target;
 
   const now = nowIso();
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
     event.projectionEvents || event.events || [],
   );
-  const messages = projectThreadProjectionMessages(projectionEvents, existing.messages);
-  const projectedLatestTurn = projectLatestTurnFromEvents(projectionEvents, existing.latestTurn);
+  const messages = projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, existing.messages);
+  const projectedLatestTurn = projectLatestTurnFromNormalizedEvents(projectionEvents, existing.latestTurn);
   const shouldClearOrphanRunning = isOrphanRunningThreadState({
     latestTurn: projectedLatestTurn,
     messageCount: messages.length,
@@ -5305,12 +5464,11 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
+  const target = getWorkspaceThreadUpdateTarget(state, workspaceId, threadId);
+  if (!target) {
     return state || {};
   }
+  const { currentState, entry, existing } = target;
 
   const now = nowIso();
   const hasExplicitActivityStatus = cleanText(event.activityStatus) !== "";
@@ -5423,8 +5581,7 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   };
 }
 
-export function getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalIndex) {
-  const entry = normalizeWorkspaceThreads(state)[workspaceId];
+function getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex) {
   if (!entry) {
     return null;
   }
@@ -5456,8 +5613,13 @@ export function getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalI
     .sort((left, right) => getThreadRestoreTimestamp(right) - getThreadRestoreTimestamp(left))[0] || null;
 }
 
+export function getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalIndex) {
+  const entry = getWorkspaceThreadsStateObject(state)[workspaceId];
+  return getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex);
+}
+
 export function getWorkspaceThreadsByTerminalIndex(state, workspaceId, terminalIndexes = []) {
-  const entry = normalizeWorkspaceThreads(state)[workspaceId];
+  const entry = getWorkspaceThreadsStateObject(state)[workspaceId];
   const byIndex = {};
 
   if (!entry) {
@@ -5465,7 +5627,7 @@ export function getWorkspaceThreadsByTerminalIndex(state, workspaceId, terminalI
   }
 
   terminalIndexes.forEach((terminalIndex) => {
-    const thread = getWorkspaceThreadForTerminalIndex(state, workspaceId, terminalIndex);
+    const thread = getWorkspaceThreadForTerminalIndexFromEntry(entry, terminalIndex);
     if (thread) {
       byIndex[terminalIndex] = thread;
     }
@@ -5481,8 +5643,12 @@ export function archiveWorkspaceThread(state, workspaceId, threadId) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = ensureWorkspaceEntry(currentState, safeWorkspaceId);
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[safeWorkspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, safeWorkspaceId) : null;
+  if (!entry) {
+    return state || {};
+  }
   const existing = entry.threads[safeThreadId];
   if (!existing) {
     return state || {};
@@ -5537,10 +5703,9 @@ export function toggleWorkspaceThreadPinned(state, workspaceId, threadId) {
     return state || {};
   }
 
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[safeWorkspaceId]
-    ? ensureWorkspaceEntry(currentState, safeWorkspaceId)
-    : null;
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[safeWorkspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, safeWorkspaceId) : null;
   const existing = entry?.threads?.[safeThreadId];
   if (!entry || !existing || !getWorkspaceThreadCanPin(existing)) {
     return state || {};

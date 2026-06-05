@@ -1,12 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
+import { Linux as DeviceLinuxIcon } from "@styled-icons/fa-brands/Linux";
+import { Windows as DeviceWindowsIcon } from "@styled-icons/fa-brands/Windows";
 import { AddToQueue } from "@styled-icons/material-rounded/AddToQueue";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { Computer as DeviceComputerIcon } from "@styled-icons/material-rounded/Computer";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
+import { Devices as DeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
+import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
 import { North } from "@styled-icons/material-rounded/North";
+import { Smartphone as DeviceSmartphoneIcon } from "@styled-icons/material-rounded/Smartphone";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
@@ -1809,7 +1816,7 @@ const OrchestratorView = styled.div`
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
 `;
 
 const OrchestratorVoiceArea = styled.div`
@@ -2122,6 +2129,114 @@ const OrchestratorSectionButton = styled.button`
     color: #0066cc;
     background: rgba(0, 102, 204, 0.08);
   }
+`;
+
+const OrchestratorConnectedDevices = styled.div`
+  display: grid;
+  min-width: 0;
+  max-height: min(180px, 32vh);
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  background: rgba(2, 4, 8, 0.48);
+  overflow: auto;
+  overscroll-behavior: contain;
+
+  &[data-empty="true"] {
+    max-height: 0;
+    border-bottom: 0;
+    overflow: hidden;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.08);
+    background: #ffffff;
+  }
+`;
+
+const OrchestratorConnectedDeviceRow = styled.div`
+  display: grid;
+  min-width: 0;
+  min-height: 36px;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.055);
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(0, 0, 0, 0.06);
+  }
+`;
+
+const OrchestratorConnectedDeviceIcon = styled.span`
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid rgba(100, 160, 255, 0.2);
+  border-radius: 7px;
+  color: #dce9ff;
+  background: rgba(47, 128, 255, 0.1);
+  line-height: 0;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.16);
+    color: #0066cc;
+    background: rgba(0, 102, 204, 0.08);
+  }
+`;
+
+const OrchestratorConnectedDeviceCopy = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+`;
+
+const OrchestratorConnectedDeviceName = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #edf4ff;
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+  }
+`;
+
+const OrchestratorConnectedDeviceMeta = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: #8492a6;
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: #737780;
+  }
+`;
+
+const OrchestratorConnectedDeviceStatus = styled.span`
+  display: inline-flex;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #57d489;
+  box-shadow: 0 0 0 3px rgba(87, 212, 137, 0.12);
 `;
 
 const OrchestratorContent = styled.div`
@@ -7592,6 +7707,87 @@ async function writeOrchestratorVoiceHistoryItemsToAgents({
   }
 }
 
+function normalizeConnectedDeviceText(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+function connectedDeviceIconFor(device) {
+  const icon = normalizeConnectedDeviceText(
+    device?.platformIcon || device?.platform_icon || device?.deviceIcon || device?.device_icon || device?.icon,
+  );
+  if (icon === "apple") return DeviceAppleIcon;
+  if (icon === "windows") return DeviceWindowsIcon;
+  if (icon === "linux") return DeviceLinuxIcon;
+  if (icon === "mobile") return DeviceSmartphoneIcon;
+  if (icon === "web") return DeviceWebIcon;
+  if (icon === "desktop") return DeviceComputerIcon;
+
+  const platform = normalizeConnectedDeviceText(device?.platform || device?.os);
+  const formFactor = normalizeConnectedDeviceText(device?.formFactor || device?.form_factor || device?.deviceType || device?.device_type);
+  if (
+    ["mobile", "phone", "tablet", "ios", "android"].some((item) => (
+      formFactor.includes(item) || platform.includes(item)
+    ))
+  ) {
+    return DeviceSmartphoneIcon;
+  }
+  if (platform.includes("mac") || platform.includes("darwin")) return DeviceAppleIcon;
+  if (platform.includes("win")) return DeviceWindowsIcon;
+  if (platform.includes("linux")) return DeviceLinuxIcon;
+  if (["pc", "desktop", "laptop", "macbook", "computer"].some((item) => formFactor.includes(item))) return DeviceComputerIcon;
+  return DeviceGenericIcon;
+}
+
+function normalizeOrchestratorConnectedDevice(device, index = 0) {
+  if (!device || typeof device !== "object") {
+    return null;
+  }
+  const connected = device.connected ?? device.online ?? device.nativeConnected ?? device.native_connected ?? device.webConnected ?? device.web_connected ?? true;
+  if (!connected) {
+    return null;
+  }
+  const displayName = String(
+    device.displayName
+      || device.display_name
+      || device.label
+      || device.deviceName
+      || device.device_name
+      || device.machineName
+      || device.machine_name
+      || device.hostname
+      || device.name
+      || (index === 0 ? "Diff Forge client" : `Device ${index + 1}`),
+  ).trim();
+  const deviceId = String(device.deviceId || device.device_id || device.machineId || device.machine_id || device.id || displayName || `device-${index}`)
+    .trim()
+    .toLowerCase();
+  const platformLabel = String(
+    device.platformLabel || device.platform_label || device.platform || device.os || "Unknown OS",
+  ).trim();
+  const formFactorLabel = String(
+    device.formFactorLabel || device.form_factor_label || device.formFactor || device.form_factor || device.deviceType || device.device_type || "Device",
+  ).trim();
+  return {
+    deviceId: deviceId || `device-${index}`,
+    displayName: displayName || `Device ${index + 1}`,
+    formFactorLabel,
+    icon: connectedDeviceIconFor(device),
+    platformLabel,
+  };
+}
+
+function normalizeOrchestratorConnectedDevices(devices) {
+  const byId = new Map();
+  (Array.isArray(devices) ? devices : []).forEach((device, index) => {
+    const normalized = normalizeOrchestratorConnectedDevice(device, index);
+    if (!normalized) {
+      return;
+    }
+    byId.set(normalized.deviceId, normalized);
+  });
+  return Array.from(byId.values()).slice(0, 12);
+}
+
 function OrchestratorVoiceCanvasRing({
   active = false,
   hasSignal = false,
@@ -7766,6 +7962,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   accountKey = "",
   activeDragItemId = "",
   billingStatus = null,
+  connectedDevices = [],
   defaultWorkingDirectory = "",
   draft,
   dropError = "",
@@ -9485,6 +9682,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
     return count + 1;
   }, 0);
+  const orchestratorConnectedDevices = useMemo(
+    () => normalizeOrchestratorConnectedDevices(connectedDevices),
+    [connectedDevices],
+  );
 
   return (
     <TodoQueueSurface
@@ -9624,6 +9825,30 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               Voice History
             </OrchestratorSectionButton>
           </OrchestratorSectionTabs>
+          <OrchestratorConnectedDevices
+            aria-label="Connected devices"
+            data-empty={orchestratorConnectedDevices.length ? undefined : "true"}
+          >
+            {orchestratorConnectedDevices.map((device) => {
+              const DeviceIcon = device.icon;
+              return (
+                <OrchestratorConnectedDeviceRow key={device.deviceId}>
+                  <OrchestratorConnectedDeviceIcon aria-hidden="true">
+                    <DeviceIcon />
+                  </OrchestratorConnectedDeviceIcon>
+                  <OrchestratorConnectedDeviceCopy>
+                    <OrchestratorConnectedDeviceName title={device.displayName}>
+                      {device.displayName}
+                    </OrchestratorConnectedDeviceName>
+                    <OrchestratorConnectedDeviceMeta>
+                      {device.platformLabel} · {device.formFactorLabel}
+                    </OrchestratorConnectedDeviceMeta>
+                  </OrchestratorConnectedDeviceCopy>
+                  <OrchestratorConnectedDeviceStatus aria-hidden="true" />
+                </OrchestratorConnectedDeviceRow>
+              );
+            })}
+          </OrchestratorConnectedDevices>
           <OrchestratorContent>
             {activeOrchestratorSection === "todo" ? (
               <TodoQueueBoard
@@ -10163,6 +10388,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 function TerminalView({
   accountKey = "",
   billingStatus = null,
+  connectedDevices = [],
   defaultWorkingDirectory = "",
   terminalWorkspace,
   terminalAgentsByIndex = {},
@@ -18879,6 +19105,7 @@ function TerminalView({
                           activeDragItemId={todoDragState?.itemId || ""}
                           agentStatuses={agentStatuses}
                           billingStatus={billingStatus}
+                          connectedDevices={connectedDevices}
                           coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
                           defaultWorkingDirectory={defaultWorkingDirectory}
                           draft={todoQueueDraft}

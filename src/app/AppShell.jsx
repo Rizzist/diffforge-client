@@ -39,7 +39,10 @@ import {
   getProviderTurnCompletionIntent,
   shouldReconcileProviderTurnCompletion,
 } from "../terminals/providerTurnIntent.js";
-import { logThreadBridgeDiagnosticEvent } from "../terminals/terminalDiagnostics";
+import {
+  THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED,
+  logThreadBridgeDiagnosticEvent,
+} from "../terminals/terminalDiagnostics";
 import {
   terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
@@ -103,6 +106,7 @@ import {
   ensureWorkspaceThreadsForTerminalIndexes,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadCanArchive,
+  getWorkspaceThreadDetailVisibilityKey,
   getWorkspaceThreadProviderBinding,
   getWorkspaceThreadsByTerminalIndex,
   hydrateWorkspaceThreadSessionTranscript,
@@ -120,7 +124,9 @@ import {
   updateWorkspaceThreadProviderModel,
   updateWorkspaceThreadProviderSession,
   updateWorkspaceThreadsViewState,
+  WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT,
   workspaceThreadIdIsArchived,
+  workspaceThreadDetailIsVisible,
   workspaceThreadSessionIsArchived,
 } from "../threads/workspaceThreads";
 import {
@@ -1030,6 +1036,7 @@ const WORKSPACE_THREAD_UNACCEPTED_PROMPT_TRANSCRIPT_POLL_TIMEOUT_MS = 6_000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_TTL_MS = 2 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_CACHE_MAX = 512;
 const WORKSPACE_THREAD_PROMPT_READY_TRANSCRIPT_DELAY_MS = 120;
+const WORKSPACE_THREAD_DETAIL_VISIBILITY_TRANSCRIPT_REQUEST_DEDUP_MS = 3000;
 const TERMINAL_INPUT_HOT_BACKGROUND_GRACE_MS = 700;
 const TERMINAL_INPUT_HOT_FALLBACK_MS = 2500;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
@@ -2094,8 +2101,32 @@ function getWorkspaceThreadDiagnosticSnapshot(workspaceThreads, workspaceId, thr
   };
 }
 
+function getWorkspaceThreadDiagnosticSnapshotForLog(workspaceThreads, workspaceId, threadId, agentId = "") {
+  return THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED
+    ? getWorkspaceThreadDiagnosticSnapshot(workspaceThreads, workspaceId, threadId, agentId)
+    : null;
+}
+
+function getWorkspaceThreadHydrationDiagnosticsForLog(workspaceThreads, event) {
+  return THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED
+    ? diagnoseWorkspaceThreadSessionTranscriptHydration(workspaceThreads, event)
+    : null;
+}
+
+function getTranscriptPromptMatchDiagnosticsForLog(messages, event = {}) {
+  return THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED
+    ? getTranscriptPromptMatchDiagnostics(messages, event)
+    : null;
+}
+
 function logWorkspaceThreadDiagnosticEvent(phase, fields = {}) {
-  logThreadBridgeDiagnosticEvent(phase, fields);
+  if (!THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED) {
+    return;
+  }
+  logThreadBridgeDiagnosticEvent(
+    phase,
+    typeof fields === "function" ? fields() : fields,
+  );
 }
 const MCP_REGISTRY_STORAGE_KEY = "diffforge.mcpRegistry.v1";
 const MCP_TEXT_LIMIT = 12000;
@@ -2157,6 +2188,158 @@ function safeCloudMcpBool(value, fallback = false) {
     if (["0", "false", "no", "off"].includes(normalized)) return false;
   }
   return fallback;
+}
+
+function normalizeCloudDeviceText(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+}
+
+function cloudDevicePlatformLabel(platform) {
+  const normalized = normalizeCloudDeviceText(platform);
+  if (normalized.includes("mac") || normalized.includes("darwin")) return "macOS";
+  if (normalized.includes("win")) return "Windows";
+  if (normalized.includes("linux")) return "Linux";
+  if (normalized.includes("ios")) return "iOS";
+  if (normalized.includes("android")) return "Android";
+  return "Unknown OS";
+}
+
+function cloudDeviceFormFactorLabel(formFactor, platform) {
+  const type = normalizeCloudDeviceText(formFactor);
+  const normalizedPlatform = normalizeCloudDeviceText(platform);
+  if (
+    ["mobile", "phone", "tablet", "ios", "android"].some((item) => (
+      type.includes(item) || normalizedPlatform.includes(item)
+    ))
+  ) {
+    return "Mobile";
+  }
+  if (["web", "browser"].some((item) => type.includes(item))) return "Web";
+  if (["pc", "desktop", "laptop", "macbook", "computer"].some((item) => type.includes(item))) return "PC";
+  return "Device";
+}
+
+function cloudDevicePlatformIcon(device) {
+  const explicit = normalizeCloudDeviceText(
+    device?.platform_icon || device?.platformIcon || device?.device_icon || device?.deviceIcon,
+  );
+  if (["apple", "windows", "linux", "mobile", "web", "desktop", "device"].includes(explicit)) {
+    return explicit;
+  }
+  const platform = normalizeCloudDeviceText(device?.platform || device?.os || device?.system);
+  const formFactor = normalizeCloudDeviceText(
+    device?.form_factor || device?.formFactor || device?.device_type || device?.deviceType,
+  );
+  const source = normalizeCloudDeviceText(
+    device?.connection_source
+      || device?.connectionSource
+      || device?.client_kind
+      || device?.clientKind
+      || device?.source,
+  );
+  if (
+    ["mobile", "phone", "tablet", "ios", "android"].some((item) => (
+      formFactor.includes(item) || platform.includes(item)
+    ))
+  ) {
+    return "mobile";
+  }
+  if (platform.includes("mac") || platform.includes("darwin")) return "apple";
+  if (platform.includes("win")) return "windows";
+  if (platform.includes("linux")) return "linux";
+  if (
+    ["web", "browser", "next", "dashboard"].some((item) => (
+      formFactor.includes(item) || source.includes(item)
+    ))
+  ) {
+    return "web";
+  }
+  if (["pc", "desktop", "laptop", "macbook", "computer"].some((item) => formFactor.includes(item))) return "desktop";
+  return "device";
+}
+
+function normalizeCloudConnectedDevice(device, index = 0) {
+  if (!device || typeof device !== "object") {
+    return null;
+  }
+  const deviceId = safeCloudMcpText(
+    device.device_id || device.deviceId || device.machine_id || device.machineId || device.id,
+    "",
+  ).toLowerCase();
+  const displayName = safeCloudMcpText(
+    device.display_name
+      || device.displayName
+      || device.label
+      || device.device_name
+      || device.deviceName
+      || device.machine_name
+      || device.machineName
+      || device.hostname
+      || device.name
+      || device.device_model
+      || device.deviceModel,
+    index === 0 ? "Diff Forge client" : `Device ${index + 1}`,
+  );
+  const connected = safeCloudMcpBool(
+    device.connected
+      ?? device.online
+      ?? device.native_connected
+      ?? device.nativeConnected
+      ?? device.web_connected
+      ?? device.webConnected,
+    true,
+  );
+  if (!connected) {
+    return null;
+  }
+  const platform = safeCloudMcpText(device.platform || device.os || device.system, "");
+  const formFactor = safeCloudMcpText(
+    device.form_factor || device.formFactor || device.device_type || device.deviceType,
+    "",
+  );
+  const icon = cloudDevicePlatformIcon(device);
+  return {
+    connected,
+    deviceId: deviceId || `${normalizeCloudDeviceText(displayName) || "device"}:${index}`,
+    displayName,
+    formFactor,
+    formFactorLabel: safeCloudMcpText(
+      device.form_factor_label || device.formFactorLabel,
+      "",
+    ) || cloudDeviceFormFactorLabel(formFactor, platform),
+    icon,
+    platform,
+    platformIcon: icon,
+    platformLabel: safeCloudMcpText(
+      device.platform_label || device.platformLabel,
+      "",
+    ) || cloudDevicePlatformLabel(platform),
+  };
+}
+
+function cloudConnectedDevicesFromRuntimeStatus(status) {
+  const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
+  const clientConnection = liveRuntime?.client_connection || liveRuntime?.clientConnection || {};
+  const machineSource = liveRuntime?.machines?.items
+    || liveRuntime?.machines?.devices
+    || liveRuntime?.machines
+    || [];
+  const candidates = [
+    ...safeCloudMcpArray(liveRuntime?.devices),
+    ...safeCloudMcpArray(machineSource),
+    ...safeCloudMcpArray(
+      clientConnection?.active_desktop_devices || clientConnection?.activeDesktopDevices,
+    ),
+  ];
+  const byId = new Map();
+  candidates.forEach((candidate, index) => {
+    const device = normalizeCloudConnectedDevice(candidate, index);
+    if (!device) {
+      return;
+    }
+    byId.set(device.deviceId, { ...(byId.get(device.deviceId) || {}), ...device });
+  });
+  return Array.from(byId.values()).slice(0, 12);
 }
 
 function sanitizeWorkspaceMcpServerForCloud(server) {
@@ -2372,6 +2555,7 @@ const CLOUD_WORKSPACE_STEPS = [
 ];
 const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   attempt: 0,
+  connectedDevices: [],
   detail: "Waiting for web sign-in.",
   stage: "idle",
   status: "idle",
@@ -2991,9 +3175,11 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const runtimeStatus = String(status?.status || "").toLowerCase();
   const connected = Boolean(status?.connected && (status?.globalWsConnected || status?.global_ws_connected));
   const statusKey = globalStatus || runtimeStatus;
+  const connectedDevices = cloudConnectedDevicesFromRuntimeStatus(status);
 
   if (connected || statusKey === "connected") {
     return {
+      connectedDevices,
       detail: "Your cloud workspace is connected and ready for live work.",
       stage: "workspace_socket",
       status: "connected",
@@ -3003,6 +3189,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (statusKey === "authenticating") {
     return {
+      connectedDevices,
       detail: "Minting a short-lived Appwrite token for the desktop runtime.",
       stage: "cloud_auth",
       status: "active",
@@ -3012,6 +3199,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (statusKey === "resolving_route") {
     return {
+      connectedDevices,
       detail: "Finding the personal or team backend assigned to this account.",
       stage: "cloud_route",
       status: "active",
@@ -3021,6 +3209,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (["connecting", "opening_websocket", "websocket_retrying", "retrying"].includes(statusKey)) {
     return {
+      connectedDevices,
       detail: "The backend is reachable; waiting for the workspace process to accept the live connection.",
       stage: "cloud_instance",
       status: "active",
@@ -3030,6 +3219,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (["handshaking", "websocket_handshaking"].includes(statusKey)) {
     return {
+      connectedDevices,
       detail: "The websocket is open; waiting for the cloud workspace ready frame.",
       stage: "workspace_socket",
       status: "active",
@@ -3039,6 +3229,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
 
   if (["blocked", "auth_missing", "websocket_auth_missing"].includes(statusKey)) {
     return {
+      connectedDevices,
       detail: "The live workspace connection is being re-established.",
       stage: "workspace_socket",
       status: "active",
@@ -3047,6 +3238,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   }
 
   return {
+    connectedDevices,
     detail: "Requesting the assigned cloud workspace and waiting for it to become ready.",
     stage: "cloud_route",
     status: "active",
@@ -3060,6 +3252,11 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
   const previousStatus = String(previous?.status || "idle").toLowerCase();
   const previousRank = cloudWorkspaceStageRank(previous?.stage);
   const nextRank = cloudWorkspaceStageRank(nextStage);
+  const connectedDevices = Array.isArray(progress?.connectedDevices)
+    ? progress.connectedDevices
+    : Array.isArray(previous?.connectedDevices)
+      ? previous.connectedDevices
+      : [];
 
   if (previousStatus === "connected" && nextStatus !== "error") {
     return previous;
@@ -3072,12 +3269,14 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
         Number(progress?.attempt ?? 0) || 0,
         Number(previous?.attempt ?? 0) || 0,
       ),
+      connectedDevices,
       updatedAt: Date.now(),
     };
   }
 
   return {
     attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
+    connectedDevices,
     detail: String(progress?.detail || previous.detail || ""),
     stage: nextStage,
     status: nextStatus,
@@ -5121,6 +5320,7 @@ export default function App() {
   const workspaceThreadTranscriptRequestsRef = useRef(new Map());
   const workspaceThreadTranscriptWatchKeysRef = useRef(new Set());
   const workspaceThreadAcceptedPromptsRef = useRef(new Map());
+  const workspaceThreadDetailVisibilityRequestKeysRef = useRef(new Map());
   const workspaceThreadTranscriptEventHandlerRef = useRef(null);
   const terminalPromptSubmittedHandlerRef = useRef(null);
   const terminalActivityHookHandlerRef = useRef(null);
@@ -5188,6 +5388,15 @@ export default function App() {
       : Number(window.__diffforgeTerminalInputHotUntil || 0);
     const hotUntil = Math.max(Number(terminalInputHotUntilRef.current || 0), globalHotUntil);
     return Math.max(0, hotUntil + Math.max(0, Number(extraMs) || 0) - Date.now());
+  }, []);
+
+  const workspaceThreadTranscriptHydrationIsVisible = useCallback((event = {}) => {
+    const workspaceId = String(event.workspaceId || event.workspace_id || "").trim();
+    const threadId = String(event.threadId || event.thread_id || "").trim();
+    return Boolean(
+      getWorkspaceThreadDetailVisibilityKey({ workspaceId, threadId })
+        && workspaceThreadDetailIsVisible({ workspaceId, threadId }),
+    );
   }, []);
 
   useEffect(() => {
@@ -14750,6 +14959,15 @@ export default function App() {
       });
       return;
     }
+    if (!workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId })) {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_skip", {
+        agentId,
+        reason: "thread_detail_not_visible",
+        threadId,
+        workspaceId,
+      });
+      return;
+    }
 
     const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
     const sessionId = String(
@@ -14974,12 +15192,11 @@ export default function App() {
 	        transcriptTargetsLatestRunningTurn,
 	        transcriptTargetsLatestTurn,
 	        workspaceId,
-	      });
-      return;
-    }
-
-    setWorkspaceThreads((threads) => {
-      const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+	            });
+	            return;
+	          }
+	          setWorkspaceThreads((threads) => {
+	            const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshotForLog(
         threads,
         workspaceId,
         threadId,
@@ -15011,14 +15228,14 @@ export default function App() {
         turnCompleteSeen: false,
         workspaceId,
       };
-      const hydrationDiagnostics = diagnoseWorkspaceThreadSessionTranscriptHydration(
+      const hydrationDiagnostics = getWorkspaceThreadHydrationDiagnosticsForLog(
         threads,
         hydrateEvent,
       );
       const nextThreads = hydrateWorkspaceThreadSessionTranscript(threads, hydrateEvent);
       const stateChanged = nextThreads !== threads;
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.event_apply", {
-        after: getWorkspaceThreadDiagnosticSnapshot(nextThreads, workspaceId, threadId, agentId),
+        after: getWorkspaceThreadDiagnosticSnapshotForLog(nextThreads, workspaceId, threadId, agentId),
         agentId,
         before: beforeSnapshot,
         completionFallbackApplied: false,
@@ -15032,7 +15249,7 @@ export default function App() {
       return nextThreads;
     });
 
-  }, []);
+  }, [workspaceThreadTranscriptHydrationIsVisible]);
 
   const requestWorkspaceThreadTranscript = useCallback((event = {}) => {
     const workspaceId = String(event.workspaceId || "").trim();
@@ -15044,6 +15261,15 @@ export default function App() {
         hasThreadId: Boolean(threadId),
         hasWorkspaceId: Boolean(workspaceId),
         type: event.type || "",
+      });
+      return;
+    }
+    if (!workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId })) {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.request_skip", {
+        agentId,
+        reason: "thread_detail_not_visible",
+        threadId,
+        workspaceId,
       });
       return;
     }
@@ -15176,7 +15402,7 @@ export default function App() {
         requestKey,
         requestedCwdPresent: Boolean(requestedCwd),
         requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
-        snapshot: getWorkspaceThreadDiagnosticSnapshot(
+        snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
           workspaceThreadsRef.current,
           workspaceId,
           threadId,
@@ -15216,7 +15442,7 @@ export default function App() {
         requestedCwdPresent: Boolean(requestedCwd),
         requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
         requestedRepoPathPresent: Boolean(requestedRepoPath),
-        snapshot: getWorkspaceThreadDiagnosticSnapshot(
+        snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
           workspaceThreadsRef.current,
           workspaceId,
           threadId,
@@ -15240,6 +15466,17 @@ export default function App() {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
           agentId,
           reason: "thread_archived",
+          requestKey,
+          threadId,
+          workspaceId,
+        });
+        workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
+        return;
+      }
+      if (!workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId })) {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
+          agentId,
+          reason: "thread_detail_not_visible",
           requestKey,
           threadId,
           workspaceId,
@@ -15301,7 +15538,7 @@ export default function App() {
           promptEventIdPresent: Boolean(promptEventId),
           reason: "session_only_pending_provider_session",
           requestKey,
-          snapshot: getWorkspaceThreadDiagnosticSnapshot(
+          snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
             workspaceThreadsRef.current,
             workspaceId,
             threadId,
@@ -15380,7 +15617,7 @@ export default function App() {
           promptEventIdPresent: Boolean(promptEventId),
           reason: "session_required",
           requestKey,
-          snapshot: getWorkspaceThreadDiagnosticSnapshot(
+          snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
             workspaceThreadsRef.current,
             workspaceId,
             threadId,
@@ -15501,7 +15738,7 @@ export default function App() {
         requestKey,
         requestedCwdPresent: Boolean(requestedCwd),
         requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
-        snapshot: getWorkspaceThreadDiagnosticSnapshot(
+        snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
           workspaceThreadsRef.current,
           workspaceId,
           threadId,
@@ -15621,16 +15858,18 @@ export default function App() {
 	            terminalFinishSignal ? "" : "no_terminal_lifecycle_finish_signal",
 	            settledAssistantResponseSeen && !transcriptPromptAccepted ? "assistant_seen_without_prompt_acceptance" : "",
 	          ].filter(Boolean);
-          const transcriptMessageDiagnostics = messages.slice(-4).map((message) => ({
-            createdAtPresent: Boolean(String(message?.createdAt || message?.created_at || "").trim()),
-            idPresent: Boolean(String(message?.id || "").trim()),
-            kind: String(message?.kind || "").trim(),
-            role: String(message?.role || "").trim(),
-            source: String(message?.source || "").trim(),
-            status: String(message?.status || "").trim(),
-            textLength: String(message?.text || message?.message || "").length,
-            turnIdPresent: Boolean(String(message?.turnId || message?.turn_id || "").trim()),
-          }));
+          const transcriptMessageDiagnostics = THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED
+            ? messages.slice(-4).map((message) => ({
+              createdAtPresent: Boolean(String(message?.createdAt || message?.created_at || "").trim()),
+              idPresent: Boolean(String(message?.id || "").trim()),
+              kind: String(message?.kind || "").trim(),
+              role: String(message?.role || "").trim(),
+              source: String(message?.source || "").trim(),
+              status: String(message?.status || "").trim(),
+              textLength: String(message?.text || message?.message || "").length,
+              turnIdPresent: Boolean(String(message?.turnId || message?.turn_id || "").trim()),
+            }))
+            : null;
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.result", {
             agentId,
             activeRunningTurnAtTranscriptResult,
@@ -15651,7 +15890,7 @@ export default function App() {
             rolloutPathPresent: Boolean(result?.rolloutPath),
             sessionIdPresent: Boolean(sessionId),
             sessionTitlePresent: Boolean(result?.sessionTitle),
-            snapshot: getWorkspaceThreadDiagnosticSnapshot(
+            snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
               workspaceThreadsRef.current,
               workspaceId,
               threadId,
@@ -15720,7 +15959,7 @@ export default function App() {
           if (expectedUserMessage && !promptAccepted && (agentId === "codex" || promptEventId)) {
             logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_mismatch", {
               agentId,
-              diagnostics: getTranscriptPromptMatchDiagnostics(messages, {
+              diagnostics: getTranscriptPromptMatchDiagnosticsForLog(messages, {
                 allowTimestampFallback,
                 expectedUserMessage,
                 matchedBy,
@@ -15805,7 +16044,7 @@ export default function App() {
               && elapsedMs < transcriptPollTimeoutMs;
             if (discoveredByPrompt && sessionId) {
               setWorkspaceThreads((threads) => {
-                const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+                  const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshotForLog(
                   threads,
                   workspaceId,
                   threadId,
@@ -15822,7 +16061,7 @@ export default function App() {
                 const stateChanged = nextThreads !== threads;
                 if (stateChanged) {
                   logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.rejected_discovery_invalidated", {
-                    after: getWorkspaceThreadDiagnosticSnapshot(
+                    after: getWorkspaceThreadDiagnosticSnapshotForLog(
                       nextThreads,
                       workspaceId,
                       threadId,
@@ -16100,11 +16339,24 @@ export default function App() {
 	              transcriptTargetsLatestRunningTurn,
 	              workspaceId,
 	            });
-            return;
-          }
+	            return;
+	          }
+	          if (!workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId })) {
+	            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
+	              agentId,
+	              matchedBy,
+	              messageCount: messages.length,
+	              reason: "thread_detail_not_visible",
+	              requestKey,
+	              sessionIdPresent: Boolean(sessionId),
+	              threadId,
+	              workspaceId,
+	            });
+	            return;
+	          }
 
-          setWorkspaceThreads((threads) => {
-            const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+	          setWorkspaceThreads((threads) => {
+            const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshotForLog(
               threads,
               workspaceId,
               threadId,
@@ -16137,12 +16389,12 @@ export default function App() {
 	              turnCompleteSeen: false,
               workspaceId,
             };
-            const hydrationDiagnostics = diagnoseWorkspaceThreadSessionTranscriptHydration(
+            const hydrationDiagnostics = getWorkspaceThreadHydrationDiagnosticsForLog(
               threads,
               hydrateEvent,
             );
             const nextThreads = hydrateWorkspaceThreadSessionTranscript(threads, hydrateEvent);
-            const afterSnapshot = getWorkspaceThreadDiagnosticSnapshot(
+            const afterSnapshot = getWorkspaceThreadDiagnosticSnapshotForLog(
               nextThreads,
               workspaceId,
               threadId,
@@ -16266,7 +16518,7 @@ export default function App() {
             requestKey,
             requestedCwdPresent: Boolean(requestedCwd),
             requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
-            snapshot: getWorkspaceThreadDiagnosticSnapshot(
+            snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
               workspaceThreadsRef.current,
               workspaceId,
               threadId,
@@ -16324,7 +16576,7 @@ export default function App() {
       requestedCwdPresent: Boolean(requestedCwd),
       requestedProviderSessionPresent: Boolean(requestedProviderSessionId),
       requestedRepoPathPresent: Boolean(requestedRepoPath),
-      snapshot: getWorkspaceThreadDiagnosticSnapshot(
+      snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
         workspaceThreadsRef.current,
         workspaceId,
         threadId,
@@ -16334,6 +16586,82 @@ export default function App() {
       workspaceId,
     });
   }, []);
+
+  useEffect(() => {
+    const handleWorkspaceThreadDetailVisibility = (visibilityEvent) => {
+      const detail = visibilityEvent?.detail || {};
+      if (detail.visible !== true) {
+        return;
+      }
+
+      const workspaceId = String(detail.workspaceId || detail.workspace_id || "").trim();
+      const threadId = String(detail.threadId || detail.thread_id || "").trim();
+      if (!workspaceId || !threadId) {
+        return;
+      }
+
+      const thread = workspaceThreadsRef.current?.[workspaceId]?.threads?.[threadId] || null;
+      if (!thread || thread.archivedAt) {
+        return;
+      }
+
+      const agentId = String(
+        detail.agentId
+          || detail.agent_id
+          || thread.currentAgent
+          || "codex",
+      ).trim().toLowerCase();
+      if (!["claude", "codex", "opencode"].includes(agentId)) {
+        return;
+      }
+
+      const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+      const terminalBinding = providerBinding?.terminalBinding || thread.terminalBinding || {};
+      const sessionId = String(
+        detail.providerSessionId
+          || detail.provider_session_id
+          || detail.nativeSessionId
+          || detail.native_session_id
+          || thread.transcriptSessionId
+          || providerBinding?.nativeSessionId
+          || "",
+      ).trim();
+      const visibilityKey = getWorkspaceThreadDetailVisibilityKey({ threadId, workspaceId });
+      const requestKey = [
+        visibilityKey,
+        agentId,
+        sessionId,
+        detail.paneId || terminalBinding?.paneId || "",
+        detail.instanceId || terminalBinding?.instanceId || "",
+      ].join("::");
+      const now = Date.now();
+      const previousRequestAt = Number(
+        workspaceThreadDetailVisibilityRequestKeysRef.current.get(requestKey) || 0,
+      );
+      if (previousRequestAt && now - previousRequestAt < WORKSPACE_THREAD_DETAIL_VISIBILITY_TRANSCRIPT_REQUEST_DEDUP_MS) {
+        return;
+      }
+      workspaceThreadDetailVisibilityRequestKeysRef.current.set(requestKey, now);
+
+      requestWorkspaceThreadTranscript({
+        agentId,
+        delayMs: 0,
+        instanceId: detail.instanceId || terminalBinding?.instanceId || "",
+        nativeSessionId: sessionId,
+        paneId: detail.paneId || terminalBinding?.paneId || "",
+        providerSessionId: sessionId,
+        source: "thread-detail-visible",
+        terminalIndex: detail.terminalIndex ?? terminalBinding?.terminalIndex ?? thread.terminalIndex,
+        threadId,
+        workspaceId,
+      });
+    };
+
+    window.addEventListener(WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT, handleWorkspaceThreadDetailVisibility);
+    return () => {
+      window.removeEventListener(WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT, handleWorkspaceThreadDetailVisibility);
+    };
+  }, [requestWorkspaceThreadTranscript]);
 
   useEffect(() => {
     workspaceThreadTranscriptEventHandlerRef.current = (transcriptEvent) => {
@@ -16723,7 +17051,7 @@ export default function App() {
         lifecycleEvent.userMessage || lifecycleEvent.message || "",
       ),
       workspaceId: lifecycleWorkspaceId,
-      snapshot: getWorkspaceThreadDiagnosticSnapshot(
+      snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
         workspaceThreadsRef.current,
         lifecycleWorkspaceId,
         lifecycleThreadId,
@@ -16744,7 +17072,7 @@ export default function App() {
         nativeSessionSource: lifecycleEvent.nativeSessionSource || lifecycleEvent.source || "",
         paneId: lifecycleEvent.paneId || "",
         providerSessionIdPresent: Boolean(lifecycleEvent.providerSessionId),
-        snapshot: getWorkspaceThreadDiagnosticSnapshot(
+        snapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
           workspaceThreadsRef.current,
           lifecycleWorkspaceId,
           lifecycleThreadId,
@@ -16774,7 +17102,7 @@ export default function App() {
       ));
       logWorkspaceThreadDiagnosticEvent("frontend.thread_projection.input", {
         agentId: lifecycleAgentId,
-        existingSnapshot: getWorkspaceThreadDiagnosticSnapshot(
+        existingSnapshot: getWorkspaceThreadDiagnosticSnapshotForLog(
           workspaceThreadsRef.current,
           lifecycleWorkspaceId,
           lifecycleThreadId,
@@ -18895,6 +19223,7 @@ export default function App() {
                           <TerminalView
                             accountKey={user?.id || user?.email || ""}
                             billingStatus={billingStatus}
+                            connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
