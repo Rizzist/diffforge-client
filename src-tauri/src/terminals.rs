@@ -855,6 +855,7 @@ fn cleanup_terminal_instance_with_context(
         master,
         writer,
         size,
+        headless_output: _,
         working_directory,
         agent_started,
         input_gate,
@@ -3168,6 +3169,7 @@ fn spawn_terminal_reader(
     cleanup_tracker: Arc<TerminalCleanupTracker>,
     pane_id: String,
     instance_id: u64,
+    headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     cloud_mcp_state: CloudMcpState,
     output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
@@ -3258,6 +3260,9 @@ fn spawn_terminal_reader(
                 }
                 Ok(bytes_read) => {
                     let chunk = &buffer[..bytes_read];
+                    if let Ok(mut headless_output) = headless_output.lock() {
+                        headless_output.append(chunk);
+                    }
 
                     let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
                         &app,
@@ -4395,6 +4400,7 @@ async fn terminal_open(
         effective_session_mode,
         terminal_metadata,
     );
+    let headless_output = Arc::clone(&instance.headless_output);
 
     let displaced_instance = state
         .terminals
@@ -4426,6 +4432,7 @@ async fn terminal_open(
         Arc::clone(&state.cleanup_tracker),
         pane_id.clone(),
         instance_id,
+        headless_output,
         cloud_mcp_state.inner().clone(),
         output_channel,
         reader,
@@ -10324,6 +10331,57 @@ async fn terminal_close_all(
     let closed = close_all_terminal_sessions(app, &state, cloud_mcp_state.inner(), None).await?;
 
     Ok(TerminalCloseAllResult { closed })
+}
+
+#[tauri::command]
+async fn terminal_headless_output_snapshot(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+) -> Result<TerminalHeadlessOutputSnapshot, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let instance = {
+        let terminals = state.terminals.read().await;
+        terminals
+            .get(&pane_id)
+            .cloned()
+            .ok_or_else(|| "Terminal session not found.".to_string())?
+    };
+    if instance_id.is_some_and(|expected| expected != instance.id) {
+        return Err("Terminal session is stale.".to_string());
+    }
+
+    let output = instance
+        .headless_output
+        .lock()
+        .map_err(|_| "Terminal output snapshot lock poisoned.".to_string())?;
+    Ok(output.snapshot(&pane_id, instance.id))
+}
+
+#[tauri::command]
+async fn terminal_headless_output_delta(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+    since_total_bytes: Option<u64>,
+) -> Result<TerminalHeadlessOutputDelta, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let instance = {
+        let terminals = state.terminals.read().await;
+        terminals
+            .get(&pane_id)
+            .cloned()
+            .ok_or_else(|| "Terminal session not found.".to_string())?
+    };
+    if instance_id.is_some_and(|expected| expected != instance.id) {
+        return Err("Terminal session is stale.".to_string());
+    }
+
+    let output = instance
+        .headless_output
+        .lock()
+        .map_err(|_| "Terminal output delta lock poisoned.".to_string())?;
+    Ok(output.delta_since(&pane_id, instance.id, since_total_bytes.unwrap_or(0)))
 }
 
 #[tauri::command]

@@ -69,19 +69,19 @@ export const TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT = "diffforge:term
 export const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 export const WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-archive-terminal-reset";
 export const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
-export const TERMINAL_OUTPUT_BATCH_MAX_MS = 33;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MS = 16;
-export const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 32 * 1024;
+export const TERMINAL_OUTPUT_BATCH_MAX_MS = 8;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MS = 80;
+export const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 16 * 1024;
 export const TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
-export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
-export const TERMINAL_OUTPUT_FLUSH_MIN_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
+export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = 4 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_MIN_BYTES = 512;
 export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
-export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
-export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 180;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = 120;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = 260;
 export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS = 900;
-export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = MAX_WORKSPACE_TERMINAL_COUNT;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = MAX_WORKSPACE_TERMINAL_COUNT;
+export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 4;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = 2;
 export const TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS = TERMINAL_OUTPUT_BATCH_MAX_MS;
 export const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
 export const TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS = 16;
@@ -217,6 +217,41 @@ export function sanitizeTerminalDiagnosticText(value, maxLength = 140) {
 export function getTerminalOutputVisibleCharCount(data, fallback = 0) {
   const text = stripLiveViewControlSequences(decodeTerminalDiagnosticBytes(data));
   return text.length || fallback;
+}
+
+export function getTerminalOutputVisibleByteEstimate(data, fallback = 0) {
+  const bytes = data instanceof Uint8Array
+    ? data
+    : data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : ArrayBuffer.isView(data)
+        ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : null;
+
+  if (!bytes?.byteLength) {
+    return fallback;
+  }
+
+  let visible = 0;
+  let escapeUntilFinal = false;
+  for (let index = 0; index < bytes.byteLength; index += 1) {
+    const byte = bytes[index];
+    if (escapeUntilFinal) {
+      if (byte >= 0x40 && byte <= 0x7e) {
+        escapeUntilFinal = false;
+      }
+      continue;
+    }
+    if (byte === 0x1b) {
+      escapeUntilFinal = true;
+      continue;
+    }
+    if (byte >= 0x20 && byte !== 0x7f) {
+      visible += 1;
+    }
+  }
+
+  return visible || fallback;
 }
 
 export function getTerminalOutputByteStats(data) {

@@ -5142,6 +5142,7 @@ export default function App() {
   const preparedTerminalsRef = useRef(new Map());
   const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
+  const workspaceAgentBatchWaitLogKeyRef = useRef("");
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
@@ -17708,7 +17709,9 @@ export default function App() {
     if (session.ready) {
       preparedTerminalsRef.current.set(key, {
         agentId: session.agentId || "",
+        agentStarted: session.agentStarted === true,
         instanceId: session.instanceId,
+        needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId,
         threadId: session.threadId || "",
         terminalIndex: session.terminalIndex,
@@ -17716,7 +17719,9 @@ export default function App() {
       });
       logWorkspaceActivationTrace("workspace.open.prepared_terminal.ready", session.workspaceId || "", {
         agentId: session.agentId || "",
+        agentStarted: session.agentStarted === true,
         instanceId: session.instanceId || "",
+        needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId || "",
         preparedCount: preparedTerminalsRef.current.size,
         terminalIndex: session.terminalIndex,
@@ -17737,7 +17742,7 @@ export default function App() {
     setPreparedTerminalVersion((version) => version + 1);
   }, [logWorkspaceActivationTrace]);
 
-  const preparedWorkspaceTerminalRequests = useMemo(() => {
+  const preparedWorkspaceTerminalSessions = useMemo(() => {
     if (!activatedWorkspace || activatedWorkspaceAgentTerminalEntries.length === 0) {
       return [];
     }
@@ -17763,7 +17768,9 @@ export default function App() {
 
         return {
           instanceId: session.instanceId,
+          agentStarted: session.agentStarted === true,
           model,
+          needsAgentStart: session.needsAgentStart === true,
           paneId: session.paneId,
           provider: session.agentId,
           providerSessionId,
@@ -17780,7 +17787,12 @@ export default function App() {
     preparedTerminalVersion,
     workspaceThreads,
   ]);
-  const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.length;
+  const preparedWorkspaceTerminalRequests = useMemo(
+    () => preparedWorkspaceTerminalSessions.filter((session) => session.needsAgentStart),
+    [preparedWorkspaceTerminalSessions],
+  );
+  const preparedWorkspaceTerminalCount = preparedWorkspaceTerminalSessions.length;
+  const preparedWorkspaceTerminalAgentStartCount = preparedWorkspaceTerminalRequests.length;
 
   useEffect(() => {
     if (workspaceDeactivationInFlightRef.current) {
@@ -17796,10 +17808,12 @@ export default function App() {
         agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
         preparedWorkspaceTerminalCount,
         reason: "launch_key_empty",
+        preparedWorkspaceTerminalAgentStartCount,
         workspaceTerminalAgentLaunchReady,
       });
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
+      workspaceAgentBatchWaitLogKeyRef.current = "";
       setWorkspaceAgentBatchSentKey("");
       return;
     }
@@ -17817,19 +17831,50 @@ export default function App() {
           : preparedWorkspaceTerminalCount === 0
             ? "no_prepared_terminals"
             : "waiting_for_all_prepared_terminals";
-      logWorkspaceActivationTrace("workspace.open.agent_batch.wait", activatedWorkspace?.id || "", {
+      const waitLogKey = `${workspaceAgentLaunchKey}:${waitReason}:${preparedWorkspaceTerminalCount}`;
+      if (workspaceAgentBatchWaitLogKeyRef.current !== waitLogKey) {
+        workspaceAgentBatchWaitLogKeyRef.current = waitLogKey;
+        logWorkspaceActivationTrace("workspace.open.agent_batch.wait", activatedWorkspace?.id || "", {
+          agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+          inFlightLaunchKey: workspaceAgentBatchInFlightKeyRef.current,
+          launchKey: workspaceAgentLaunchKey,
+          preparedWorkspaceTerminalAgentStartCount,
+          preparedWorkspaceTerminalCount,
+          reason: waitReason,
+          sentLaunchKey: workspaceAgentBatchSentKey,
+        });
+      }
+      return;
+    }
+
+    if (preparedWorkspaceTerminalAgentStartCount === 0) {
+      workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
+      workspaceAgentBatchInFlightKeyRef.current = "";
+      workspaceAgentBatchWaitLogKeyRef.current = "";
+      setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+      setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+      logWorkspaceActivationTrace("workspace.open.agent_batch.direct_ready", activatedWorkspace.id, {
         agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
-        inFlightLaunchKey: workspaceAgentBatchInFlightKeyRef.current,
         launchKey: workspaceAgentLaunchKey,
+        preparedWorkspaceTerminalAgentStartCount,
         preparedWorkspaceTerminalCount,
-        reason: waitReason,
-        sentLaunchKey: workspaceAgentBatchSentKey,
+        sessions: preparedWorkspaceTerminalSessions.map((session) => ({
+          agentStarted: session.agentStarted === true,
+          instanceId: session.instanceId || "",
+          needsAgentStart: session.needsAgentStart === true,
+          paneId: session.paneId || "",
+          provider: session.provider || "",
+          terminalIndex: session.terminalIndex ?? "",
+          threadId: session.threadId || "",
+          workspaceId: session.workspaceId || "",
+        })),
       });
       return;
     }
 
     workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
+    workspaceAgentBatchWaitLogKeyRef.current = "";
     const batchStartedAt = performance.now();
 
     logWorkspaceActivationTrace("workspace.open.agent_batch.start", activatedWorkspace.id, {
@@ -18042,8 +18087,10 @@ export default function App() {
     activatedWorkspaceAgentTerminalEntries.length,
     activatedWorkspaceLogicalTerminalIndexes,
     activatedWorkspaceLogicalTerminalCount,
+    preparedWorkspaceTerminalAgentStartCount,
     preparedWorkspaceTerminalCount,
     preparedWorkspaceTerminalRequests,
+    preparedWorkspaceTerminalSessions,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
     workspaceTerminalAgentLaunchReady,

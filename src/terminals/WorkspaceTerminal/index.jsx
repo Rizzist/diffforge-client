@@ -9,6 +9,7 @@ import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
+import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
 import {
   GlobalStyle,
   AppFrame,
@@ -480,6 +481,7 @@ import {
   getTerminalOutputByteStats,
   getTerminalOutputControlProfile,
   getTerminalOutputDebugFields,
+  getTerminalOutputVisibleByteEstimate,
   getTerminalOutputVisibleCharCount,
   getTerminalRendererPaintDiagnostics,
   getTerminalSlashCommandInputSummary,
@@ -6352,7 +6354,11 @@ function WorkspaceTerminal({
         visibleChars: getTerminalOutputVisibleCharCount(data),
       };
 
-      const queuedData = typeof data.slice === "function" ? data.slice() : new Uint8Array(data);
+      const queuedData = data instanceof Uint8Array
+        ? data
+        : typeof data.slice === "function"
+          ? data.slice()
+          : new Uint8Array(data);
       if (!pendingOutputWrites.length) {
         outputBatchQueuedAt = performance.now();
       }
@@ -8803,28 +8809,207 @@ function WorkspaceTerminal({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
         const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
-        const outputChannel = new Channel((message) => {
+        const processPreparedTerminalOutput = (payload = {}) => {
           if (isDisposed) {
             return;
           }
 
-          const chunkStartedAt = performance.now();
-          const data = message instanceof ArrayBuffer
-            ? new Uint8Array(message)
-            : ArrayBuffer.isView(message)
-              ? new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
-              : null;
-
-          if (!data?.byteLength) {
+          const chunkStartedAt = Number.isFinite(payload.chunkStartedAt)
+            ? payload.chunkStartedAt
+            : performance.now();
+          const terminalData = payload.data instanceof Uint8Array
+            ? payload.data
+            : payload.data instanceof ArrayBuffer
+              ? new Uint8Array(payload.data)
+              : ArrayBuffer.isView(payload.data)
+                ? new Uint8Array(payload.data.buffer, payload.data.byteOffset, payload.data.byteLength)
+                : new Uint8Array(0);
+          if (!terminalData.byteLength) {
             return;
           }
 
+          const inputBytes = Number.isFinite(payload.inputBytes)
+            ? payload.inputBytes
+            : terminalData.byteLength;
+          const sourceChunks = Number.isFinite(payload.sourceChunks)
+            ? Math.max(1, payload.sourceChunks)
+            : 1;
+          const maskMs = Number.isFinite(payload.maskMs) ? payload.maskMs : 0;
+          const debugExtraMs = Number.isFinite(payload.workerScheduledDelayMs)
+            ? Math.max(0, payload.workerScheduledDelayMs)
+            : 0;
+
           addTerminalMetrics({
-            ipcEvents: 1,
-            ipcBytes: data.byteLength,
+            ipcEvents: sourceChunks,
+            ipcBytes: inputBytes,
           });
           patchTerminalMetrics({ outputLagMs: 0 });
 
+          const isFirstOutputChunk = !sawFirstOutput;
+          outputChunks += sourceChunks;
+          outputBytes += terminalData.byteLength;
+          const shouldInspectTerminalText = !isGenericTerminal && (
+            isFirstOutputChunk
+            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
+          );
+          const visibleTerminalText = shouldInspectTerminalText
+            ? String(payload.inspectionText || "")
+            : "";
+          if (visibleTerminalText) {
+            providerSessionErrorBuffer = `${providerSessionErrorBuffer}${visibleTerminalText}`.slice(-2000);
+            const missingSavedSessionId = extractCodexMissingSavedSessionId(providerSessionErrorBuffer);
+            if (missingSavedSessionId) {
+              emitInvalidProviderSession(
+                missingSavedSessionId,
+                providerSessionErrorBuffer,
+                "codex-resume-output",
+              );
+            }
+            if (!capturedProviderSessionId && terminalThreadIdRef.current) {
+              providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${visibleTerminalText}`.slice(-2400);
+              const nativeSessionId = extractNativeSessionIdFromOutput(
+                terminalAgentKind,
+                providerSessionCaptureBuffer,
+              );
+              if (nativeSessionId) {
+                capturedProviderSessionId = nativeSessionId;
+                logThreadBridgeDiagnostic("frontend.thread_provider_session.capture", {
+                  agentId: terminalAgentKind,
+                  bufferLength: providerSessionCaptureBuffer.length,
+                  instanceId: terminalInstanceId,
+                  nativeSessionIdPresent: true,
+                  paneId,
+                  terminalIndex,
+                  threadId: terminalThreadIdRef.current || "",
+                  workspaceId: workspace?.id || "",
+                });
+                onThreadTerminalLifecycle?.({
+                  agentId: terminalAgentKind,
+                  instanceId: terminalInstanceId,
+                  nativeSessionId,
+                  nativeSessionKind: "session",
+                  nativeSessionSource: "terminal-output",
+                  paneId,
+                  terminalIndex,
+                  threadId: terminalThreadIdRef.current,
+                  type: "provider-session",
+                  workspaceId: workspace?.id || "",
+                });
+              } else if (providerSessionCaptureMissesLogged < 8 && providerSessionCaptureBuffer.trim()) {
+                providerSessionCaptureMissesLogged += 1;
+                logThreadBridgeDiagnostic("frontend.thread_provider_session.capture_miss", {
+                  agentId: terminalAgentKind,
+                  bufferLength: providerSessionCaptureBuffer.length,
+                  instanceId: terminalInstanceId,
+                  paneId,
+                  preview: sanitizeTerminalDiagnosticText(providerSessionCaptureBuffer, 200),
+                  terminalIndex,
+                  threadId: terminalThreadIdRef.current || "",
+                  workspaceId: workspace?.id || "",
+                });
+              }
+            }
+          }
+
+          const estimatedVisibleChars = Number.isFinite(payload.visibleChars)
+            ? payload.visibleChars
+            : getTerminalOutputVisibleByteEstimate(terminalData, 1);
+          const outputByteStats = terminalDiagnosticsEnabled
+            ? getTerminalOutputByteStats(terminalData)
+            : null;
+          const visibleChars = outputByteStats
+            ? outputByteStats.visibleChars
+            : estimatedVisibleChars;
+          const hasVisibleOutput = visibleChars > 0;
+          if (hasVisibleOutput && !terminalFirstVisibleOutputAtRef.current) {
+            terminalFirstVisibleOutputAtRef.current = performance.now();
+            logThreadBridgeDiagnostic("frontend.pending_prompt.terminal_visible_output_ready", {
+              agentId: terminalAgentKind,
+              instanceId: terminalInstanceId,
+              paneId,
+              terminalIndex,
+              threadId: terminalThreadIdRef.current || "",
+              visibleChars,
+              workspaceId: workspace?.id || "",
+            });
+          }
+          const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
+          const shouldCollectOutputDebug = isFirstOutputChunk
+            || isFirstVisibleOutputChunk;
+          const debugStartedAt = shouldCollectOutputDebug ? performance.now() : 0;
+          const outputDebug = shouldCollectOutputDebug
+            ? getTerminalOutputDebugFields(terminalData)
+            : { visibleChars };
+          const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
+          if (terminalDiagnosticsEnabled) {
+            outputDiagnosticChunks += sourceChunks;
+            outputDiagnosticInputBytes += inputBytes;
+            outputDiagnosticDisplayBytes += terminalData.byteLength;
+            outputDiagnosticVisibleChars += visibleChars;
+            outputDiagnosticEscapeBytes += outputByteStats?.escapeBytes || 0;
+            outputDiagnosticControlBytes += outputByteStats?.controlBytes || 0;
+            outputDiagnosticMaskMs += maskMs;
+            outputDiagnosticMaskMaxMs = Math.max(outputDiagnosticMaskMaxMs, maskMs);
+            outputDiagnosticDebugMs += debugMs;
+            outputDiagnosticDebugMaxMs = Math.max(outputDiagnosticDebugMaxMs, debugMs);
+            if (hasVisibleOutput) {
+              outputDiagnosticVisibleChunks += 1;
+            }
+            if (performance.now() - outputDiagnosticWindowStartedAt >= TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS) {
+              flushOutputDiagnosticWindow("chunk");
+            }
+          }
+
+          if (hasVisibleOutput) {
+            visibleOutputBytes += terminalData.byteLength;
+            visibleOutputChunks += 1;
+          }
+
+          if (isFirstOutputChunk) {
+            sawFirstOutput = true;
+            scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
+          }
+
+          if (isFirstVisibleOutputChunk) {
+            sawFirstVisibleOutput = true;
+          }
+
+          markCodexSlashMenuOutputActivity(terminalData.byteLength, {
+            hasVisibleOutput,
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            visibleChars,
+          });
+
+          logTerminalDiagnosticEvent(
+            "frontend.output_chunk.slow",
+            {
+              debugMs,
+              displayBytes: terminalData.byteLength,
+              elapsedMs: performance.now() - chunkStartedAt,
+              inputBytes,
+              isFirstOutputChunk,
+              isFirstVisibleOutputChunk,
+              maskMs,
+              outputChunks,
+              paneId,
+              rendererMode,
+              terminalIndex,
+              visibleChars: outputDebug.visibleChars,
+              workerScheduledDelayMs: debugExtraMs,
+            },
+            { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
+          );
+
+          writeTerminalOutput(terminalData, {
+            isFirstOutputChunk,
+            isFirstVisibleOutputChunk,
+            outputDebug,
+            rawCodexResizeGateData: payload.rawCodexResizeGateData === true,
+          });
+        };
+
+        const processTerminalOutputInline = (data, chunkStartedAt = performance.now()) => {
           const maskStartedAt = performance.now();
           const displayData = outputDisplayMasker.maskBytes(data);
           const maskMs = performance.now() - maskStartedAt;
@@ -8926,160 +9111,60 @@ function WorkspaceTerminal({
             return;
           }
 
-          const decodedTerminalText = outputTextDecoder.decode(terminalData, { stream: true });
-          const visibleTerminalText = stripLiveViewControlSequences(decodedTerminalText);
-          providerSessionErrorBuffer = `${providerSessionErrorBuffer}${visibleTerminalText}`.slice(-2000);
-          const missingSavedSessionId = extractCodexMissingSavedSessionId(providerSessionErrorBuffer);
-          if (missingSavedSessionId) {
-            emitInvalidProviderSession(
-              missingSavedSessionId,
-              providerSessionErrorBuffer,
-              "codex-resume-output",
-            );
-          }
-          if (!capturedProviderSessionId && !isGenericTerminal && terminalThreadIdRef.current) {
-            const captureText = visibleTerminalText;
-            providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${captureText}`.slice(-2400);
-            const nativeSessionId = extractNativeSessionIdFromOutput(
-              terminalAgentKind,
-              providerSessionCaptureBuffer,
-            );
-            if (nativeSessionId) {
-              capturedProviderSessionId = nativeSessionId;
-              logThreadBridgeDiagnostic("frontend.thread_provider_session.capture", {
-                agentId: terminalAgentKind,
-                bufferLength: providerSessionCaptureBuffer.length,
-                instanceId: terminalInstanceId,
-                nativeSessionIdPresent: true,
-                paneId,
-                terminalIndex,
-                threadId: terminalThreadIdRef.current || "",
-                workspaceId: workspace?.id || "",
-              });
-              onThreadTerminalLifecycle?.({
-                agentId: terminalAgentKind,
-                instanceId: terminalInstanceId,
-                nativeSessionId,
-                nativeSessionKind: "session",
-                nativeSessionSource: "terminal-output",
-                paneId,
-                terminalIndex,
-                threadId: terminalThreadIdRef.current,
-                type: "provider-session",
-                workspaceId: workspace?.id || "",
-              });
-            } else if (providerSessionCaptureMissesLogged < 8 && providerSessionCaptureBuffer.trim()) {
-              providerSessionCaptureMissesLogged += 1;
-              logThreadBridgeDiagnostic("frontend.thread_provider_session.capture_miss", {
-                agentId: terminalAgentKind,
-                bufferLength: providerSessionCaptureBuffer.length,
-                instanceId: terminalInstanceId,
-                paneId,
-                preview: sanitizeTerminalDiagnosticText(providerSessionCaptureBuffer, 200),
-                terminalIndex,
-                threadId: terminalThreadIdRef.current || "",
-                workspaceId: workspace?.id || "",
-              });
-            }
-          }
           const isFirstOutputChunk = !sawFirstOutput;
-          outputChunks += 1;
-          outputBytes += terminalData.byteLength;
-          const outputByteStats = terminalDiagnosticsEnabled
-            ? getTerminalOutputByteStats(terminalData)
-            : null;
-          const visibleChars = outputByteStats
-            ? outputByteStats.visibleChars
-            : getTerminalOutputVisibleCharCount(terminalData, 1);
-          const hasVisibleOutput = visibleChars > 0;
-          if (hasVisibleOutput && !terminalFirstVisibleOutputAtRef.current) {
-            terminalFirstVisibleOutputAtRef.current = performance.now();
-            logThreadBridgeDiagnostic("frontend.pending_prompt.terminal_visible_output_ready", {
-              agentId: terminalAgentKind,
-              instanceId: terminalInstanceId,
-              paneId,
-              terminalIndex,
-              threadId: terminalThreadIdRef.current || "",
-              visibleChars,
-              workspaceId: workspace?.id || "",
-            });
-          }
-          const isFirstVisibleOutputChunk = hasVisibleOutput && !sawFirstVisibleOutput;
-          const shouldCollectOutputDebug = isFirstOutputChunk
-            || isFirstVisibleOutputChunk;
-          const debugStartedAt = shouldCollectOutputDebug ? performance.now() : 0;
-          const outputDebug = shouldCollectOutputDebug
-            ? getTerminalOutputDebugFields(terminalData)
-            : { visibleChars };
-          const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
-          if (terminalDiagnosticsEnabled) {
-            outputDiagnosticChunks += 1;
-            outputDiagnosticInputBytes += data.byteLength;
-            outputDiagnosticDisplayBytes += terminalData.byteLength;
-            outputDiagnosticVisibleChars += outputByteStats.visibleChars;
-            outputDiagnosticEscapeBytes += outputByteStats.escapeBytes;
-            outputDiagnosticControlBytes += outputByteStats.controlBytes;
-            outputDiagnosticMaskMs += maskMs;
-            outputDiagnosticMaskMaxMs = Math.max(outputDiagnosticMaskMaxMs, maskMs);
-            outputDiagnosticDebugMs += debugMs;
-            outputDiagnosticDebugMaxMs = Math.max(outputDiagnosticDebugMaxMs, debugMs);
-            if (hasVisibleOutput) {
-              outputDiagnosticVisibleChunks += 1;
-            }
-            if (performance.now() - outputDiagnosticWindowStartedAt >= TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS) {
-              flushOutputDiagnosticWindow("chunk");
-            }
-          }
-
-          if (hasVisibleOutput) {
-            visibleOutputBytes += terminalData.byteLength;
-            visibleOutputChunks += 1;
-          }
-
-          if (isFirstOutputChunk) {
-            sawFirstOutput = true;
-            scheduleWebglAttach("first_output", TERMINAL_WEBGL_FIRST_OUTPUT_DELAY_MS);
-          }
-
-          if (outputChunks <= 10) {
-          }
-
-          if (isFirstVisibleOutputChunk) {
-            sawFirstVisibleOutput = true;
-          }
-
-          markCodexSlashMenuOutputActivity(terminalData.byteLength, {
-            hasVisibleOutput,
-            isFirstOutputChunk,
-            isFirstVisibleOutputChunk,
-            visibleChars,
-          });
-
-          logTerminalDiagnosticEvent(
-            "frontend.output_chunk.slow",
-            {
-              debugMs,
-              displayBytes: terminalData.byteLength,
-              elapsedMs: performance.now() - chunkStartedAt,
-              inputBytes: data.byteLength,
-              isFirstOutputChunk,
-              isFirstVisibleOutputChunk,
-              maskMs,
-              outputChunks,
-              paneId,
-              rendererMode,
-              terminalIndex,
-              visibleChars: outputDebug.visibleChars,
-            },
-            { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
+          const shouldInspectTerminalText = !isGenericTerminal && (
+            isFirstOutputChunk
+            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
           );
+          const inspectionText = shouldInspectTerminalText
+            ? stripLiveViewControlSequences(outputTextDecoder.decode(terminalData, { stream: true }))
+            : "";
 
-          writeTerminalOutput(terminalData, {
-            isFirstOutputChunk,
-            isFirstVisibleOutputChunk,
-            outputDebug,
+          processPreparedTerminalOutput({
+            chunkStartedAt,
+            data: terminalData,
+            inputBytes: data.byteLength,
+            inspectionText,
+            maskMs,
             rawCodexResizeGateData: deferCodexResizeNormalization,
+            sourceChunks: 1,
           });
+        };
+
+        const terminalOutputWorkerSession = createTerminalOutputWorkerSession({
+          coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
+          id: `${paneId}:${terminalInstanceId}:output`,
+          onOutput: processPreparedTerminalOutput,
+        });
+        if (terminalOutputWorkerSession) {
+          disposables.push(() => terminalOutputWorkerSession.dispose());
+        }
+
+        const outputChannel = new Channel((message) => {
+          if (isDisposed) {
+            return;
+          }
+
+          const chunkStartedAt = performance.now();
+          const data = message instanceof ArrayBuffer
+            ? new Uint8Array(message)
+            : ArrayBuffer.isView(message)
+              ? new Uint8Array(message.buffer, message.byteOffset, message.byteLength)
+              : null;
+
+          if (!data?.byteLength) {
+            return;
+          }
+
+          const outputNormalizerActive = isTerminalOutputNormalizerActive();
+          if (!outputNormalizerActive && terminalOutputWorkerSession?.enqueue(data, {
+            active: terminalActiveRef.current === true,
+            inspect: !isGenericTerminal,
+          })) {
+            return;
+          }
+
+          processTerminalOutputInline(data, chunkStartedAt);
         });
         disposables.push(await listen("forge-terminal-exit", (event) => {
           if (
@@ -10020,12 +10105,14 @@ function WorkspaceTerminal({
           const expectedNeedle = expected.slice(Math.max(0, expected.length - 96));
           const startedAt = Date.now();
           const timeoutMs = 900;
+          const maxBacklogTimeoutMs = 8000;
           const pollMs = 25;
 
           logBigViewSyncDiagnosticEvent("tui.image.submit_wait_observed_start", {
             ...fields,
             expectedLength: expected.length,
             expectedNeedleLength: expectedNeedle.length,
+            maxBacklogTimeoutMs,
             timeoutMs,
           });
 
@@ -10035,22 +10122,29 @@ function WorkspaceTerminal({
               const observed = normalizeTerminalComposerObservation(observedText);
               const matched = Boolean(expectedNeedle) && observed.includes(expectedNeedle);
               const elapsedMs = Date.now() - startedAt;
+              const outputBacklogActive = pendingOutputBytes > 0 || outputWriteInFlight;
+              const timedOut = elapsedMs >= timeoutMs
+                && (!outputBacklogActive || elapsedMs >= maxBacklogTimeoutMs);
 
-              if (matched || elapsedMs >= timeoutMs || isDisposed) {
+              if (matched || timedOut || isDisposed) {
                 logBigViewSyncDiagnosticEvent("tui.image.submit_wait_observed_done", {
                   ...fields,
                   elapsedMs,
                   expectedLength: expected.length,
                   expectedNeedleLength: expectedNeedle.length,
+                  maxBacklogTimeoutMs,
                   matched,
                   observedLength: observed.length,
-                  timedOut: !matched && elapsedMs >= timeoutMs,
+                  outputBacklogActive,
+                  pendingOutputBytes,
+                  pendingOutputWrites: pendingOutputWrites.length,
+                  timedOut: !matched && timedOut,
                 });
                 resolve(matched);
                 return;
               }
 
-              window.setTimeout(poll, pollMs);
+              window.setTimeout(poll, outputBacklogActive ? Math.max(pollMs, 50) : pollMs);
             };
 
             poll();
@@ -11315,6 +11409,12 @@ function WorkspaceTerminal({
           ),
           functionalRepoPath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
         });
+        terminalOutputWorkerSession?.updatePaths({
+          coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(
+            openResult?.projectRoot || openResult?.workingDirectory || workingDirectory || "",
+          ),
+          functionalRepoPath: openResult?.agentBranchRoot || openResult?.workingDirectory || "",
+        });
         hasOpenPty = true;
         startupControlReplyBridgeOpen = false;
         setTerminalLaunchInfo(openResult || null);
@@ -11387,6 +11487,17 @@ function WorkspaceTerminal({
           rendererMode,
           startupMs,
           terminalIndex,
+        });
+        onPreparedTerminalChange?.({
+          agentId: agent?.id || terminalAgentKind,
+          agentStarted: !shouldPrewarmShell,
+          instanceId: terminalInstanceId,
+          needsAgentStart: shouldPrewarmShell,
+          paneId,
+          ready: true,
+          terminalIndex,
+          threadId: startupThreadId,
+          workspaceId: workspace?.id || "",
         });
         resizeController?.resizeNow("terminal_open_done");
 
@@ -11503,16 +11614,6 @@ function WorkspaceTerminal({
         }
 
         if (shouldPrewarmShell) {
-          onPreparedTerminalChange?.({
-            agentId: agent.id,
-            instanceId: terminalInstanceId,
-            paneId,
-            ready: true,
-            terminalIndex,
-            threadId: startupThreadId,
-            workspaceId: workspace?.id || "",
-          });
-
           if (agentLaunchReadyRef.current && agentLaunchEpochRef.current > 0) {
             lastAgentLaunchEpochRef.current = agentLaunchEpochRef.current;
             startAgentInCurrentPty("prewarm_ready_after_gate", agentLaunchEpochRef.current);

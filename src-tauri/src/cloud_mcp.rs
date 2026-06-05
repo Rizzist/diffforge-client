@@ -43,7 +43,7 @@ struct CloudMcpBackgroundSync {
     tokenomics_pending: Arc<Mutex<Option<CloudMcpTokenomicsSyncJob>>>,
     tokenomics_notify: Arc<tokio::sync::Notify>,
     tokenomics_started: Arc<AtomicBool>,
-    tokenomics_cursor: Arc<Mutex<String>>,
+    tokenomics_cursor: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Clone)]
@@ -301,18 +301,13 @@ impl CloudMcpState {
                 tokenomics_pending: Arc::new(Mutex::new(None)),
                 tokenomics_notify: Arc::new(tokio::sync::Notify::new()),
                 tokenomics_started: Arc::new(AtomicBool::new(false)),
-                tokenomics_cursor: Arc::new(Mutex::new(String::new())),
+                tokenomics_cursor: Arc::new(Mutex::new(HashMap::new())),
             },
         }
     }
 }
 
-fn cloud_mcp_background_sync_ack(
-    kind: &str,
-    key: &str,
-    reason: &str,
-    extra: Value,
-) -> Value {
+fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Value) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("ok".to_string(), json!(true));
     object.insert("queued".to_string(), json!(true));
@@ -330,11 +325,7 @@ fn cloud_mcp_background_sync_ack(
 }
 
 fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
-    if state
-        .background_sync
-        .started
-        .swap(true, Ordering::SeqCst)
-    {
+    if state.background_sync.started.swap(true, Ordering::SeqCst) {
         return;
     }
 
@@ -425,7 +416,10 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                     }
                 }
 
-                sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS)).await;
+                sleep(Duration::from_millis(
+                    CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
+                ))
+                .await;
             }
         }
     }
@@ -530,20 +524,33 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let force_resync = job.force_resync;
     let force_full = job.force_full;
     let reason_for_worker = job.reason.clone();
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
+    let tokenomics_scope = tokenomics_billing_scope_from_parts(
+        Some(billing_scope_type.as_str()),
+        team_id.as_deref(),
+        "cloud_sync_active_scope",
+    );
+    let tokenomics_scope_key = tokenomics_billing_scope_key(
+        tokenomics_scope.scope_type.as_str(),
+        tokenomics_scope.team_id.as_deref(),
+    );
+    let tokenomics_scope_key_for_summary = tokenomics_scope_key.clone();
     let summary_result = tauri::async_runtime::spawn_blocking(move || {
         if force_resync {
             tokenomics_scan_usage_for(&app, false, true)?;
-            tokenomics_summary_for(&app, true, false)
+            tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
         } else if force_full {
             tokenomics_scan_usage_for(&app, false, false)?;
-            tokenomics_summary_for(&app, true, false)
+            tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
         } else {
             tokenomics_scan_usage_for(&app, false, false)?;
             let cursor = worker_state_for_summary
                 .background_sync
                 .tokenomics_cursor
                 .blocking_lock()
-                .clone();
+                .get(&tokenomics_scope_key_for_summary)
+                .cloned()
+                .unwrap_or_default();
             let conn = tokenomics_open_db(&app)?;
             tokenomics_reconcile_current_provider_accounts(&conn)?;
             tokenomics_sync_delta_from_conn(
@@ -553,6 +560,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 } else {
                     Some(cursor.as_str())
                 },
+                Some(&tokenomics_scope),
             )
         }
     })
@@ -576,7 +584,6 @@ async fn cloud_mcp_run_tokenomics_sync_job(
 
     let device_profile = cloud_mcp_desktop_device_profile();
     cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
-    let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
     let hourly_count = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -592,6 +599,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         "event_kind": event_kind,
         "scope": "account",
         "billing_scope_type": billing_scope_type,
+        "billing_scope_key": tokenomics_scope_key.as_str(),
         "team_id": team_id,
         "account_scoped": true,
         "device": device_profile.clone(),
@@ -617,7 +625,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
 
     if let Some(cursor) = cloud_mcp_tokenomics_cursor_from_summary(&summary) {
         let mut tokenomics_cursor = worker_state.background_sync.tokenomics_cursor.lock().await;
-        *tokenomics_cursor = cursor;
+        tokenomics_cursor.insert(tokenomics_scope_key, cursor);
     }
 
     cloud_mcp_enqueue_background_sync(
@@ -1002,7 +1010,23 @@ fn cloud_mcp_process_account_scope() -> (String, Option<String>) {
     let Ok(cache) = cloud_mcp_process_auth_cache().lock() else {
         return ("personal".to_string(), None);
     };
-    cloud_mcp_account_scope_from_values(Some(cache.billing_scope_type.clone()), cache.team_id.clone())
+    cloud_mcp_account_scope_from_values(
+        Some(cache.billing_scope_type.clone()),
+        cache.team_id.clone(),
+    )
+}
+
+fn cloud_mcp_process_known_account_scope() -> Option<(String, Option<String>)> {
+    let Ok(cache) = cloud_mcp_process_auth_cache().lock() else {
+        return None;
+    };
+    if cache.desktop_session_token.is_none() && cache.appwrite_jwt.is_none() {
+        return None;
+    }
+    Some(cloud_mcp_account_scope_from_values(
+        Some(cache.billing_scope_type.clone()),
+        cache.team_id.clone(),
+    ))
 }
 
 async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<String>, String> {
@@ -2120,7 +2144,12 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]))
         .unwrap_or_default();
-    Some(format!("{}::{}::{}", client_id.trim(), workspace_id.trim(), command_id))
+    Some(format!(
+        "{}::{}::{}",
+        client_id.trim(),
+        workspace_id.trim(),
+        command_id
+    ))
 }
 
 async fn cloud_mcp_claim_remote_command_receipt(state: &CloudMcpState, event: &Value) -> bool {
@@ -2343,9 +2372,14 @@ async fn cloud_mcp_start_remote_command_listener(
                     "Desktop UI was not available for the remote command.",
                 )
             };
-            let _ =
-                cloud_mcp_send_remote_command_status_event(&state_clone, &event, status, message, None)
-                    .await;
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state_clone,
+                &event,
+                status,
+                message,
+                None,
+            )
+            .await;
         }
     });
     Ok(json!({"ok": true, "started": true}))
@@ -2607,10 +2641,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
     workspaces
 }
 
-async fn cloud_mcp_device_workspace_snapshot_payload(
-    state: &CloudMcpState,
-    reason: &str,
-) -> Value {
+async fn cloud_mcp_device_workspace_snapshot_payload(state: &CloudMcpState, reason: &str) -> Value {
     let device_profile = cloud_mcp_desktop_device_profile();
     let workspaces = cloud_mcp_lifecycle_workspaces(state).await;
     json!({
@@ -4933,11 +4964,7 @@ fn cloud_mcp_terminal_context_missing_backed_off(
     }
 }
 
-fn cloud_mcp_mark_terminal_context_missing(
-    state: &CloudMcpState,
-    terminal_key: &str,
-    now_ms: u64,
-) {
+fn cloud_mcp_mark_terminal_context_missing(state: &CloudMcpState, terminal_key: &str, now_ms: u64) {
     let Ok(mut cache) = state.terminal_context_missing_until_ms.lock() else {
         return;
     };
@@ -5544,7 +5571,8 @@ async fn cloud_mcp_claim_terminal_lane(
     if lane.trim().is_empty() {
         return;
     }
-    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
+    let status_working_directory =
+        cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let agent_label = cloud_mcp_short_agent_label(agent_id);
     let agent_label = agent_label.as_deref();
     let payload = json!({
@@ -5575,7 +5603,8 @@ async fn cloud_mcp_release_terminal_lane(
     instance_id: u64,
     reason: &str,
 ) {
-    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
+    let status_working_directory =
+        cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let agent_label = cloud_mcp_short_agent_label(agent_id);
     let agent_label = agent_label.as_deref();
     let payload = json!({
@@ -5617,7 +5646,8 @@ async fn cloud_mcp_sync_terminal_agent_status(
     session_mode: Option<&str>,
     reason: &str,
 ) {
-    let status_working_directory = cloud_mcp_terminal_repo_root_path(working_directory, coordination);
+    let status_working_directory =
+        cloud_mcp_terminal_repo_root_path(working_directory, coordination);
     let claimed_paths = cloud_mcp_terminal_claimed_paths(coordination, local_task_id);
     let has_claimed_paths = !claimed_paths.is_empty();
     let agent_label = cloud_mcp_short_agent_label(agent_id);
@@ -6532,35 +6562,34 @@ async fn cloud_mcp_observe_terminal_output(
                     None
                 };
                 let old_enough = cloud_mcp_now_ms().saturating_sub(entry.created_ms) >= 5_000;
-                let completion =
-                    if !hooks_own_turn_state
-                        && entry.saw_agent_activity
-                        && !entry.done_reported
-                        && old_enough
-                        && looks_ready
-                    {
-                        entry.done_reported = true;
-                        Some((
-                            entry.local_task_id.clone(),
-                            entry.repo_id.clone(),
-                            entry.agent_id.clone(),
-                            entry.lane.clone(),
-                            entry.last_prompt.clone(),
-                            entry.work_brief.clone(),
-                            entry.working_directory.clone(),
-                            entry.repo_root.clone(),
-                            entry.prompt_event_id.clone(),
-                            entry.prompt_event_source.clone(),
-                            entry.prompt_event_submitted_at.clone(),
-                            entry.terminal_index,
-                            entry.thread_id.clone(),
-                            entry.workspace_id.clone(),
-                            entry.workspace_name.clone(),
-                            entry.session_mode.clone(),
-                        ))
-                    } else {
-                        None
-                    };
+                let completion = if !hooks_own_turn_state
+                    && entry.saw_agent_activity
+                    && !entry.done_reported
+                    && old_enough
+                    && looks_ready
+                {
+                    entry.done_reported = true;
+                    Some((
+                        entry.local_task_id.clone(),
+                        entry.repo_id.clone(),
+                        entry.agent_id.clone(),
+                        entry.lane.clone(),
+                        entry.last_prompt.clone(),
+                        entry.work_brief.clone(),
+                        entry.working_directory.clone(),
+                        entry.repo_root.clone(),
+                        entry.prompt_event_id.clone(),
+                        entry.prompt_event_source.clone(),
+                        entry.prompt_event_submitted_at.clone(),
+                        entry.terminal_index,
+                        entry.thread_id.clone(),
+                        entry.workspace_id.clone(),
+                        entry.workspace_name.clone(),
+                        entry.session_mode.clone(),
+                    ))
+                } else {
+                    None
+                };
                 if hooks_own_turn_state && (looks_active || looks_ready) {
                     log_terminal_status_event(
                         "backend.terminal.ground_truth.output_hook_managed_ignored",
@@ -6987,7 +7016,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
             "active",
             payload["prompt"].as_str(),
             "Terminal activity is running outside managed patch mode.",
-        &status_working_directory,
+            &status_working_directory,
             &pane_id,
             instance_id,
             coordination.as_ref(),
@@ -7013,7 +7042,7 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 .map(Vec::len)
                 .unwrap_or(0);
             let _ = cloud_mcp_workspace_log(
-            &status_working_directory,
+                &status_working_directory,
                 "cloud_mcp.context_pack.prompt_started",
                 "",
                 "",
@@ -7537,8 +7566,7 @@ async fn cloud_mcp_sync_agent_installations(
     let workspace_id = clean_option(workspace_id);
     let workspace_name = clean_option(workspace_name);
     let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
-    let req =
-        cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let snapshot_id = format!(
         "agent-installations-{}-{}",
         cloud_mcp_now_ms(),
@@ -7723,11 +7751,7 @@ async fn cloud_mcp_sync_terminal_presence(
                 "deactivated".to_string()
             }
         });
-        let req = cloud_mcp_repo_request(
-            repo_path,
-            workspace_id.clone(),
-            workspace_name.clone(),
-        );
+        let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
         let terminal_items = cloud_mcp_workspace_terminal_items(workspace);
         let terminals = terminal_items
             .iter()
@@ -8045,12 +8069,9 @@ async fn cloud_mcp_sync_terminal_status_event(
         ],
     )
     .unwrap_or_else(|| "terminal.status".to_string());
-    let command_phase =
-        cloud_mcp_payload_text(&terminal, &["command_phase", "commandPhase"]);
-    let display_status =
-        cloud_mcp_payload_text(&terminal, &["display_status", "displayStatus"]);
-    let execution_phase =
-        cloud_mcp_payload_text(&terminal, &["execution_phase", "executionPhase"]);
+    let command_phase = cloud_mcp_payload_text(&terminal, &["command_phase", "commandPhase"]);
+    let display_status = cloud_mcp_payload_text(&terminal, &["display_status", "displayStatus"]);
+    let execution_phase = cloud_mcp_payload_text(&terminal, &["execution_phase", "executionPhase"]);
     let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
     let terminal_id = cloud_mcp_payload_text(&terminal, &["terminal_id", "terminalId"])
         .or_else(|| pane_id.clone());
@@ -8283,11 +8304,7 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
                 "deactivated".to_string()
             }
         });
-        let req = cloud_mcp_repo_request(
-            repo_path,
-            workspace_id.clone(),
-            workspace_name.clone(),
-        );
+        let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
         let server_items = cloud_mcp_workspace_server_items(workspace);
         let servers = server_items
             .iter()
@@ -8626,7 +8643,8 @@ async fn cloud_mcp_delete_workspace(
         Ok(response) => json!({"ok": true, "response": response}),
         Err(error) => json!({"ok": false, "error": error}),
     };
-    let _ = cloud_mcp_send_device_workspace_snapshot_event(state.inner(), "workspace_deleted").await;
+    let _ =
+        cloud_mcp_send_device_workspace_snapshot_event(state.inner(), "workspace_deleted").await;
 
     let response =
         cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
@@ -8784,9 +8802,10 @@ fn cloud_mcp_tokenomics_cursor_from_summary(summary: &Value) -> Option<String> {
 }
 
 fn cloud_mcp_tag_tokenomics_summary_device(summary: &mut Value, device_profile: &Value) {
-    let Some(device_id) =
-        cloud_mcp_payload_text(device_profile, &["device_id", "deviceId", "machine_id", "machineId"])
-    else {
+    let Some(device_id) = cloud_mcp_payload_text(
+        device_profile,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    ) else {
         return;
     };
     let device_name = cloud_mcp_payload_text(device_profile, &["device_name", "deviceName"]);
@@ -9236,7 +9255,6 @@ fn cloud_mcp_container_project_mounts(root: &Path) -> Vec<WorkspaceProjectMount>
     let workspace_kind = workspace_kind_for_mounts(root, &mounts);
     cloud_mcp_project_mounts_for_workspace_sync(root, &workspace_kind, &mounts)
 }
-
 
 pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
     let identity = CloudMcpProxyIdentity::from_args(&args);

@@ -480,6 +480,34 @@ export function createCoreRepoNameDisplayMasker(options = {}) {
     },
 
     maskBytes(data) {
+      if (
+        !carry
+        && !lastWriteEndedWithCoreRepoReplacement
+        && !coreRepoPath
+        && !functionalRepoPath
+      ) {
+        return data;
+      }
+
+      if (!carry && !lastWriteEndedWithCoreRepoReplacement) {
+        let hasPathCandidateByte = false;
+        for (let index = 0; index < data.byteLength; index += 1) {
+          const byte = data[index];
+          if (
+            byte === 0x2f
+            || byte === 0x5c
+            || byte === 0x2e
+            || byte === 0xe2
+          ) {
+            hasPathCandidateByte = true;
+            break;
+          }
+        }
+        if (!hasPathCandidateByte) {
+          return data;
+        }
+      }
+
       let text = `${carry}${decoder.decode(data, { stream: true })}`;
       carry = "";
 

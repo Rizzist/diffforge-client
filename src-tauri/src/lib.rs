@@ -79,6 +79,7 @@ const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
+const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
 const TERMINAL_ACTIVITY_HOOK_POLL_MS: u64 = 50;
@@ -730,6 +731,7 @@ struct TerminalInstance {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     size: Arc<Mutex<PtySize>>,
+    headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     working_directory: Arc<PathBuf>,
     agent_started: Arc<Mutex<bool>>,
     input_gate: Arc<Mutex<TerminalInputGate>>,
@@ -738,6 +740,103 @@ struct TerminalInstance {
     coordination: Option<TerminalCoordinationSession>,
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
+}
+
+#[derive(Default)]
+struct TerminalHeadlessOutputBuffer {
+    epoch: u64,
+    total_bytes: u64,
+    tail: VecDeque<u8>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalHeadlessOutputSnapshot {
+    bytes_base64: String,
+    epoch: u64,
+    instance_id: u64,
+    pane_id: String,
+    tail_bytes: usize,
+    total_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalHeadlessOutputDelta {
+    bytes_base64: String,
+    epoch: u64,
+    from_total_bytes: u64,
+    instance_id: u64,
+    pane_id: String,
+    tail_bytes: usize,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+impl TerminalHeadlessOutputBuffer {
+    fn append(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+
+        self.epoch = self.epoch.saturating_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
+        if data.len() >= TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend(data[data.len() - TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES..].iter().copied());
+            return;
+        }
+
+        self.tail.extend(data.iter().copied());
+        let overflow = self.tail.len().saturating_sub(TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+    }
+
+    fn snapshot(&self, pane_id: &str, instance_id: u64) -> TerminalHeadlessOutputSnapshot {
+        let bytes = self.tail.iter().copied().collect::<Vec<_>>();
+        TerminalHeadlessOutputSnapshot {
+            bytes_base64: general_purpose::STANDARD.encode(bytes),
+            epoch: self.epoch,
+            instance_id,
+            pane_id: pane_id.to_string(),
+            tail_bytes: self.tail.len(),
+            total_bytes: self.total_bytes,
+        }
+    }
+
+    fn delta_since(
+        &self,
+        pane_id: &str,
+        instance_id: u64,
+        since_total_bytes: u64,
+    ) -> TerminalHeadlessOutputDelta {
+        let tail_start_total_bytes = self
+            .total_bytes
+            .saturating_sub(self.tail.len() as u64);
+        let truncated = since_total_bytes < tail_start_total_bytes;
+        let from_total_bytes = if truncated {
+            tail_start_total_bytes
+        } else {
+            since_total_bytes.min(self.total_bytes)
+        };
+        let start_index = from_total_bytes
+            .saturating_sub(tail_start_total_bytes)
+            .min(self.tail.len() as u64) as usize;
+        let bytes = self.tail.iter().skip(start_index).copied().collect::<Vec<_>>();
+        TerminalHeadlessOutputDelta {
+            bytes_base64: general_purpose::STANDARD.encode(bytes),
+            epoch: self.epoch,
+            from_total_bytes,
+            instance_id,
+            pane_id: pane_id.to_string(),
+            tail_bytes: self.tail.len(),
+            total_bytes: self.total_bytes,
+            truncated,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -963,6 +1062,7 @@ impl TerminalInstance {
                 master: Arc::new(Mutex::new(master)),
                 writer: Arc::new(Mutex::new(writer)),
                 size: Arc::new(Mutex::new(size)),
+                headless_output: Arc::new(StdMutex::new(TerminalHeadlessOutputBuffer::default())),
                 working_directory: Arc::new(working_directory),
                 agent_started: Arc::new(Mutex::new(agent_started)),
                 input_gate: Arc::new(Mutex::new(TerminalInputGate::default())),
@@ -3610,6 +3710,8 @@ pub fn run() {
             terminal_resize,
             terminal_close,
             terminal_close_all,
+            terminal_headless_output_delta,
+            terminal_headless_output_snapshot,
             terminal_live_sessions,
             coordination::tauri_commands::coordination_init,
             coordination::tauri_commands::coordination_workspace_targets,

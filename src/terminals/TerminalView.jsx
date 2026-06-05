@@ -3095,39 +3095,54 @@ const WorkspaceToolSurface = styled.div`
 `;
 
 const TodoQueueComposer = styled.form`
+  position: relative;
+  display: block;
   width: 100%;
-  height: 100%;
   min-width: 0;
-  min-height: 0;
+  min-height: 35px;
+  flex: 0 0 auto;
 `;
 
 const TodoQueueBoard = styled.div`
   position: relative;
+  display: grid;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
+  grid-template-rows: minmax(0, 1fr) auto;
+  background: rgba(2, 4, 8, 0.76);
+  overflow: hidden;
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 `;
 
 const TodoQueueTextArea = styled.textarea`
-  position: absolute;
-  inset: 0;
+  box-sizing: border-box;
+  display: block;
   width: 100%;
-  height: 100%;
-  min-height: 0;
+  min-width: 0;
+  min-height: 35px;
+  max-height: 180px;
+  field-sizing: content;
   resize: none;
-  padding: calc(8px + var(--todo-list-offset, 0px)) 36px 8px 32px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 36px 8px 32px;
   border: 0;
   border-radius: 0;
   color: #f7fafc;
-  background: rgba(2, 4, 8, 0.76);
+  background: transparent;
   font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   outline: none;
+  appearance: none;
+  -webkit-appearance: none;
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease,
-    background 150ms ease,
-    padding 150ms ease;
+    background 150ms ease;
 
   &::placeholder {
     color: rgba(166, 178, 194, 0.58);
@@ -3135,15 +3150,13 @@ const TodoQueueTextArea = styled.textarea`
 
   &:focus {
     border-color: rgba(98, 160, 255, 0.46);
-    background: rgba(2, 5, 10, 0.94);
-    box-shadow:
-      0 0 0 1px rgba(98, 160, 255, 0.12),
-      0 0 22px rgba(47, 128, 255, 0.08);
+    background: transparent;
+    box-shadow: none;
   }
 
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
-    background: #ffffff;
+    background: transparent;
   }
 
   html[data-forge-theme="light"] &::placeholder {
@@ -3151,23 +3164,25 @@ const TodoQueueTextArea = styled.textarea`
   }
 
   html[data-forge-theme="light"] &:focus {
-    background: #ffffff;
-    box-shadow: inset 0 0 0 1px rgba(0, 102, 204, 0.2);
+    background: transparent;
+    box-shadow: none;
   }
 `;
 
 const TodoQueueList = styled.div`
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 0;
+  position: relative;
   z-index: 2;
-  display: grid;
-  align-content: start;
-  max-height: calc(100% - 42px);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  align-items: stretch;
+  justify-content: flex-start;
   gap: 0;
   overflow-x: hidden;
   overflow-y: auto;
+  padding-bottom: 18px;
+  scroll-padding-bottom: 18px;
 `;
 
 const TodoQueueItemCard = styled.article`
@@ -3179,7 +3194,10 @@ const TodoQueueItemCard = styled.article`
   --todo-spinner-size: 16px;
 
   position: relative;
+  box-sizing: border-box;
   display: grid;
+  width: 100%;
+  flex: 0 0 auto;
   min-height: 35px;
   grid-template-columns: 20px minmax(0, 1fr);
   align-items: start;
@@ -3209,7 +3227,7 @@ const TodoQueueItemCard = styled.article`
   }
 
   &:hover {
-    background: rgba(47, 128, 255, 0.1);
+    background: transparent;
   }
 
   &:hover::before,
@@ -3226,7 +3244,7 @@ const TodoQueueItemCard = styled.article`
   }
 
   html[data-forge-theme="light"] &:hover {
-    background: rgba(0, 102, 204, 0.06);
+    background: transparent;
   }
 
   &:active {
@@ -3265,9 +3283,12 @@ const TodoQueueItemCard = styled.article`
   }
 
   &[data-todo-editing="true"] {
-    padding-right: 12px;
     cursor: text;
     user-select: text;
+  }
+
+  &[data-todo-editing="true"]::before {
+    opacity: 1;
   }
 
   &[data-todo-reordering="true"] {
@@ -3529,16 +3550,26 @@ const TodoQueueItemText = styled.p`
 `;
 
 const TodoQueueItemEditor = styled.textarea`
+  box-sizing: border-box;
+  display: block;
   width: 100%;
-  min-height: 86px;
-  max-height: 240px;
-  resize: vertical;
+  min-width: 0;
+  min-height: 0;
+  field-sizing: content;
+  resize: none;
+  overflow: hidden;
   padding: 0;
   border: 0;
+  margin: 0;
   color: #f7fafc;
   background: transparent;
   outline: none;
+  appearance: none;
+  -webkit-appearance: none;
   font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
 
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
@@ -3547,7 +3578,7 @@ const TodoQueueItemEditor = styled.textarea`
 
 const TodoQueueDraftBullet = styled.span`
   position: absolute;
-  top: calc(16px + var(--todo-list-offset, 0px));
+  top: 16px;
   left: 16px;
   z-index: 1;
   width: 6px;
@@ -3555,7 +3586,6 @@ const TodoQueueDraftBullet = styled.span`
   border-radius: 999px;
   background: ${TODO_QUEUE_DEFAULT_DOT_COLOR};
   pointer-events: none;
-  transition: top 150ms ease;
 
   &::before {
     content: "";
@@ -3563,6 +3593,87 @@ const TodoQueueDraftBullet = styled.span`
 
   html[data-forge-theme="light"] & {
     background: #0066cc;
+  }
+`;
+
+const TodoQueueFooterActions = styled.div`
+  display: flex;
+  min-width: 0;
+  min-height: 40px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 6px 8px 8px 32px;
+  border-top: 1px solid rgba(230, 236, 245, 0.07);
+  background: rgba(2, 4, 8, 0.84);
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(0, 0, 0, 0.07);
+    background: #ffffff;
+  }
+`;
+
+const TodoQueueAutoQueueAllButton = styled.button`
+  display: inline-flex;
+  min-width: 0;
+  height: 26px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: rgba(216, 232, 255, 0.78);
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 820;
+  line-height: 1;
+  outline: none;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+  }
+
+  span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:not(:disabled):hover,
+  &:not(:disabled):focus-visible {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.055);
+  }
+
+  &:not(:disabled):active {
+    transform: translateY(1px);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.46;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0056b3;
+    background: transparent;
+  }
+
+  html[data-forge-theme="light"] &:not(:disabled):hover,
+  html[data-forge-theme="light"] &:not(:disabled):focus-visible {
+    color: #003f82;
+    background: rgba(0, 102, 204, 0.07);
   }
 `;
 
@@ -4841,6 +4952,15 @@ function normalizeTodoQueueMultilineText(value, maxLength = TODO_QUEUE_MAX_NOTE_
 function getTodoQueueLineCount(value) {
   const text = normalizeTodoQueueMultilineText(value);
   return text ? text.split("\n").length : 0;
+}
+
+function resizeTodoQueueTextAreaToContent(element) {
+  if (!element) {
+    return;
+  }
+
+  element.style.height = "auto";
+  element.style.height = `${Math.ceil(element.scrollHeight || 0)}px`;
 }
 
 function getTodoQueuePastedLinesLabel(lineCount) {
@@ -7627,6 +7747,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onDraftChange,
   onMinimizePane,
   onOpenWorkspaceSettings,
+  onQueueAllItems,
   onQueueItem,
   onVoicePlanNeedsRequeue,
   onRequeueVoicePlanUnfinished,
@@ -7669,7 +7790,6 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const [orchestratorChatSubmitting, setOrchestratorChatSubmitting] = useState(false);
   const [orchestratorHistoryCopiedKey, setOrchestratorHistoryCopiedKey] = useState("");
   const [reorderingItemId, setReorderingItemId] = useState("");
-  const [todoListOffset, setTodoListOffset] = useState(0);
   const orchestratorVoiceEventsActiveRef = useRef(false);
   const orchestratorVoiceInputFinishRequestedRef = useRef(false);
   const orchestratorVoiceMonitorRef = useRef(null);
@@ -8933,39 +9053,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     element?.setSelectionRange?.(editingDraft.length, editingDraft.length);
   }, [editingItemId]);
 
+  useLayoutEffect(() => {
+    resizeTodoQueueTextAreaToContent(draftTextAreaRef.current);
+  }, [activeOrchestratorSection, draft]);
+
+  useLayoutEffect(() => {
+    if (!editingItemId) {
+      return;
+    }
+
+    resizeTodoQueueTextAreaToContent(editingTextAreaRef.current);
+  }, [editingDraft, editingItemId]);
+
   useEffect(() => {
     if (editingItemId && !items.some((item) => item.id === editingItemId)) {
       clearItemEdit();
     }
   }, [clearItemEdit, editingItemId, items]);
-
-  useLayoutEffect(() => {
-    const listElement = todoListRef.current;
-
-    if (!listElement || !items.length) {
-      setTodoListOffset(0);
-      return undefined;
-    }
-
-    const updateOffset = () => {
-      const nextOffset = Math.ceil(listElement.getBoundingClientRect().height || 0);
-      setTodoListOffset((currentOffset) => (
-        currentOffset === nextOffset ? currentOffset : nextOffset
-      ));
-    };
-
-    updateOffset();
-
-    if (typeof ResizeObserver === "undefined") {
-      window.addEventListener("resize", updateOffset);
-      return () => window.removeEventListener("resize", updateOffset);
-    }
-
-    const observer = new ResizeObserver(updateOffset);
-    observer.observe(listElement);
-
-    return () => observer.disconnect();
-  }, [activeOrchestratorSection, items.length]);
 
   useEffect(() => {
     if (activeWorkspaceTool !== "orchestrator") {
@@ -9329,6 +9433,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     || orchestratorVoiceState === "listening"
     || orchestratorVoiceState === "processing";
   const orchestratorChatCanSend = Boolean(orchestratorChatDraft.trim()) && !orchestratorChatBusy;
+  const autoQueueAllEligibleCount = items.reduce((count, item) => {
+    if (
+      pendingItems[item.id]
+      || !(
+        getTodoQueueItemTerminalText(item)
+        || getTodoQueueItemImage(item)
+        || getTodoQueueItemNote(item)
+      )
+    ) {
+      return count;
+    }
+
+    return count + 1;
+  }, 0);
 
   return (
     <TodoQueueSurface
@@ -9470,182 +9588,184 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           </OrchestratorSectionTabs>
           <OrchestratorContent>
             {activeOrchestratorSection === "todo" ? (
-              <TodoQueueComposer onSubmit={handleSubmit}>
-                <TodoQueueBoard
-                  onPointerDown={handleBoardPointerDown}
-                  ref={todoBoardRef}
-                  style={{ "--todo-list-offset": `${todoListOffset}px` }}
-                >
-                  <TodoQueueTextArea
-                    aria-label="New todo"
-                    maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
-                    onChange={(event) => onDraftChange(event.target.value)}
-                    onKeyDown={handleDraftKeyDown}
-                    onPaste={handleDraftPaste}
-                    placeholder="Type a todo..."
-                    ref={draftTextAreaRef}
-                    spellCheck="true"
-                    value={draft}
-                  />
-                  <TodoQueueDraftBullet aria-hidden="true" />
+              <TodoQueueBoard
+                onPointerDown={handleBoardPointerDown}
+                ref={todoBoardRef}
+              >
+                <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
+                  {items.map((item) => {
+                    const isEditing = editingItemId === item.id;
+                    const pendingItem = pendingItems[item.id] || null;
+                    const isPending = Boolean(pendingItem);
+                    const pendingPhase = getTodoQueuePendingPhase(pendingItem);
+                    const isQueued = pendingPhase === "queued";
+                    const isSending = isPending && !isQueued;
+                    const actionLabel = isQueued ? "Cancel queued todo" : "Queue todo";
+                    const actionTitle = isQueued ? "Cancel queued send" : "Send when an agent is available";
+                    const image = getTodoQueueItemImage(item);
+                    const note = getTodoQueueItemNote(item);
+                    const hasPreview = Boolean(image || note);
+                    const targetAgentId = getTodoQueueTargetAgentId(item);
+                    const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+                    const hasTerminalTarget = Number.isInteger(targetTerminalIndex)
+                      || Boolean(getTodoQueueTargetTerminalId(item))
+                      || Boolean(getTodoQueueTargetThreadId(item));
+                    const todoAccentColor = typeof getItemAccentColor === "function"
+                      ? getItemAccentColor(item)
+                      : targetAgentId
+                        ? getTodoQueueAgentAccentColor(targetAgentId)
+                        : "";
 
-                  {items.length > 0 && (
-                    <TodoQueueList aria-label="Todo objects" ref={todoListRef} role="list">
-                      {items.map((item) => {
-                        const isEditing = editingItemId === item.id;
-                        const pendingItem = pendingItems[item.id] || null;
-                        const isPending = Boolean(pendingItem);
-                        const pendingPhase = getTodoQueuePendingPhase(pendingItem);
-                        const isQueued = pendingPhase === "queued";
-                        const isSending = isPending && !isQueued;
-                        const actionLabel = isQueued ? "Cancel queued todo" : "Queue todo";
-                        const actionTitle = isQueued ? "Cancel queued send" : "Send when an agent is available";
-                        const image = getTodoQueueItemImage(item);
-                        const note = getTodoQueueItemNote(item);
-                        const hasPreview = Boolean(image || note);
-                        const targetAgentId = getTodoQueueTargetAgentId(item);
-                        const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
-                        const hasTerminalTarget = Number.isInteger(targetTerminalIndex)
-                          || Boolean(getTodoQueueTargetTerminalId(item))
-                          || Boolean(getTodoQueueTargetThreadId(item));
-                        const todoAccentColor = typeof getItemAccentColor === "function"
-                          ? getItemAccentColor(item)
-                          : targetAgentId
-                            ? getTodoQueueAgentAccentColor(targetAgentId)
-                            : "";
-
-                        return (
-                          <TodoQueueItemCard
-                            data-todo-card="true"
-                            data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
-                            data-todo-editing={isEditing ? "true" : undefined}
-                            data-todo-pending={isPending ? "true" : undefined}
-                            data-todo-queued={isQueued ? "true" : undefined}
-                            data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
-                            data-todo-targeted={targetAgentId || hasTerminalTarget ? "true" : undefined}
-                            data-todo-cancellable={isQueued ? "true" : undefined}
-                            data-todo-sending={isSending ? "true" : undefined}
-                            key={item.id}
-                            onDoubleClick={(event) => {
+                    return (
+                      <TodoQueueItemCard
+                        data-todo-card="true"
+                        data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
+                        data-todo-editing={isEditing ? "true" : undefined}
+                        data-todo-pending={isPending ? "true" : undefined}
+                        data-todo-queued={isQueued ? "true" : undefined}
+                        data-todo-reordering={reorderingItemId === item.id ? "true" : undefined}
+                        data-todo-targeted={targetAgentId || hasTerminalTarget ? "true" : undefined}
+                        data-todo-cancellable={isQueued ? "true" : undefined}
+                        data-todo-sending={isSending ? "true" : undefined}
+                        key={item.id}
+                        onDoubleClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          if (isPending) {
+                            return;
+                          }
+                          beginItemEdit(item);
+                        }}
+	                        onPointerDown={(event) => handlePointerDown(event, item)}
+	                        ref={(element) => setTodoItemElement(item.id, element)}
+	                        role="listitem"
+	                        style={todoAccentColor ? { "--todo-agent-color": todoAccentColor } : undefined}
+	                      >
+                        {!isEditing && (
+                          <TodoQueueItemActionButton
+                            aria-label={actionLabel}
+                            data-action={isQueued ? "cancel" : "queue"}
+                            data-todo-control="true"
+                            data-visible={!isSending ? "true" : undefined}
+                            onClick={(event) => {
                               event.preventDefault();
                               event.stopPropagation();
-                              if (isPending) {
+                              if (isQueued) {
+                                onCancelQueuedItem?.(item.id);
                                 return;
                               }
-                              beginItemEdit(item);
+                              if (!isPending) {
+                                onQueueItem?.(item.id);
+                              }
                             }}
-                            onPointerDown={(event) => handlePointerDown(event, item)}
-                            ref={(element) => setTodoItemElement(item.id, element)}
-                            role="listitem"
-                            style={todoAccentColor ? { "--todo-agent-color": todoAccentColor } : undefined}
-                            title={
-                              isQueued
-                                ? hasTerminalTarget
-                                  ? Number.isInteger(targetTerminalIndex)
-                                    ? `Queued for terminal ${targetTerminalIndex + 1}.`
-                                    : "Queued for the selected terminal."
-                                  : targetAgentId
-                                    ? `Queued for ${item.targetAgentLabel || targetAgentId}.`
-                                    : "Queued for the next available agent."
-                                : isSending
-                                  ? "Sending to terminal."
-                                  : "Drag into an agent terminal. Double-click to edit."
-                            }
+                            onPointerDown={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                            }}
+                            title={actionTitle}
+                            type="button"
                           >
-                            {!isEditing && (
-                              <TodoQueueItemActionButton
-                                aria-label={actionLabel}
-                                data-action={isQueued ? "cancel" : "queue"}
-                                data-todo-control="true"
-                                data-visible={!isSending ? "true" : undefined}
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  if (isQueued) {
-                                    onCancelQueuedItem?.(item.id);
-                                    return;
-                                  }
-                                  if (!isPending) {
-                                    onQueueItem?.(item.id);
-                                  }
-                                }}
-                                onPointerDown={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                }}
-                                title={actionTitle}
-                                type="button"
-                              >
-                                {isQueued ? <Close aria-hidden="true" /> : <AddToQueue aria-hidden="true" />}
-                              </TodoQueueItemActionButton>
-                            )}
-                            {isPending && (
-                              <TodoQueueItemPendingSpinner aria-label="Sending todo" role="img">
-                                {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
-                                  <span
-                                    aria-hidden="true"
-                                    key={spoke}
-                                    style={{ "--todo-spinner-index": spoke }}
-                                  />
-                                ))}
-                              </TodoQueueItemPendingSpinner>
-                            )}
-                            <TodoQueueItemContent data-has-preview={hasPreview ? "true" : "false"}>
-                              {image && (
-                                <TodoQueueItemImageFrame>
-                                  <TodoQueueItemImage alt="" src={image.src} />
-                                </TodoQueueItemImageFrame>
-                              )}
-                              {!image && note && (
-                                <TodoQueueItemNoteFrame>
-                                  <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
-                                  <TodoQueueItemNoteIcon aria-hidden="true" />
-                                </TodoQueueItemNoteFrame>
-                              )}
-                              {isEditing && !isPending ? (
-                                <TodoQueueItemEditor
-                                  aria-label="Edit todo"
-                                  data-todo-control="true"
-                                  maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
-                                  onBlur={handleItemEditBlur}
-                                  onChange={(event) => setEditingDraft(event.target.value)}
-                                  onKeyDown={handleItemEditKeyDown}
-                                  ref={editingTextAreaRef}
-                                  spellCheck="true"
-                                  value={editingDraft}
-                                />
-                              ) : (
-                                <TodoQueueItemText>{item.text}</TodoQueueItemText>
-                              )}
-                            </TodoQueueItemContent>
-                            {!isEditing && !isPending && (
-                              <TodoQueueDeleteButton
-                                aria-label="Delete todo"
-                                data-todo-control="true"
-                                data-todo-delete="true"
-                                onClick={(event) => {
-                                  event.preventDefault();
-                                  event.stopPropagation();
-                                  onRemoveItem?.(item.id);
-                                }}
-                                onPointerDown={(event) => {
-                                  event.stopPropagation();
-                                }}
-                                title="Delete"
-                                type="button"
-                              >
-                                x
-                              </TodoQueueDeleteButton>
-                            )}
-                          </TodoQueueItemCard>
-                        );
-                      })}
-                    </TodoQueueList>
-                  )}
+                            {isQueued ? <Close aria-hidden="true" /> : <AddToQueue aria-hidden="true" />}
+                          </TodoQueueItemActionButton>
+                        )}
+                        {isPending && (
+                          <TodoQueueItemPendingSpinner aria-label="Sending todo" role="img">
+                            {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
+                              <span
+                                aria-hidden="true"
+                                key={spoke}
+                                style={{ "--todo-spinner-index": spoke }}
+                              />
+                            ))}
+                          </TodoQueueItemPendingSpinner>
+                        )}
+                        <TodoQueueItemContent data-has-preview={hasPreview ? "true" : "false"}>
+                          {image && (
+                            <TodoQueueItemImageFrame>
+                              <TodoQueueItemImage alt="" src={image.src} />
+                            </TodoQueueItemImageFrame>
+                          )}
+                          {!image && note && (
+                            <TodoQueueItemNoteFrame>
+                              <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
+                              <TodoQueueItemNoteIcon aria-hidden="true" />
+                            </TodoQueueItemNoteFrame>
+                          )}
+                          {isEditing && !isPending ? (
+                            <TodoQueueItemEditor
+                              aria-label="Edit todo"
+                              data-todo-control="true"
+                              maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+                              onBlur={handleItemEditBlur}
+                              onChange={(event) => setEditingDraft(event.target.value)}
+                              onKeyDown={handleItemEditKeyDown}
+                              ref={editingTextAreaRef}
+                              rows={1}
+                              spellCheck="true"
+                              value={editingDraft}
+                            />
+                          ) : (
+                            <TodoQueueItemText>{item.text}</TodoQueueItemText>
+                          )}
+                        </TodoQueueItemContent>
+                        {!isEditing && !isPending && (
+                          <TodoQueueDeleteButton
+                            aria-label="Delete todo"
+                            data-todo-control="true"
+                            data-todo-delete="true"
+                            onClick={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              onRemoveItem?.(item.id);
+                            }}
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                            }}
+                            title="Delete"
+                            type="button"
+                          >
+                            x
+                          </TodoQueueDeleteButton>
+                        )}
+                      </TodoQueueItemCard>
+                    );
+                  })}
+                  <TodoQueueComposer data-todo-composer="true" onSubmit={handleSubmit}>
+                    <TodoQueueTextArea
+                      aria-label="New todo"
+                      maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
+                      onChange={(event) => onDraftChange(event.target.value)}
+                      onKeyDown={handleDraftKeyDown}
+                      onPaste={handleDraftPaste}
+                      placeholder="Type a todo..."
+                      ref={draftTextAreaRef}
+                      rows={1}
+                      spellCheck="true"
+                      value={draft}
+	                    />
+	                    <TodoQueueDraftBullet aria-hidden="true" />
+	                  </TodoQueueComposer>
+	                </TodoQueueList>
+	                <TodoQueueFooterActions>
+	                  <TodoQueueAutoQueueAllButton
+	                    aria-label="Autoqueue all todos"
+	                    data-todo-control="true"
+	                    disabled={!autoQueueAllEligibleCount}
+	                    onClick={(event) => {
+	                      event.preventDefault();
+	                      event.stopPropagation();
+	                      onQueueAllItems?.();
+	                    }}
+	                    title={autoQueueAllEligibleCount ? "Queue all unqueued todos" : "No unqueued todos"}
+	                    type="button"
+	                  >
+	                    <AddToQueue aria-hidden="true" />
+	                    <span>Autoqueue all</span>
+	                  </TodoQueueAutoQueueAllButton>
+	                </TodoQueueFooterActions>
 
-                  {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
-                </TodoQueueBoard>
-              </TodoQueueComposer>
+	                {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
+	              </TodoQueueBoard>
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
                 <OrchestratorHistoryScroll ref={orchestratorHistoryScrollRef}>
@@ -16059,6 +16179,60 @@ function TerminalView({
     todoQueueItems,
   ]);
 
+  const queueAllTodoQueueItems = useCallback(() => {
+    const pendingItems = todoQueuePendingItemsRef.current || {};
+    const queueableItems = todoQueueItems.filter((item) => {
+      const safeItemId = String(item?.id || "").trim();
+      if (!safeItemId || pendingItems[safeItemId]) {
+        return false;
+      }
+
+      return Boolean(
+        getTodoQueueItemTerminalText(item)
+        || getTodoQueueItemImage(item)
+        || getTodoQueueItemNote(item)
+      );
+    });
+
+    if (!queueableItems.length) {
+      logTerminalStatus("frontend.todo_queue.manual_queue_all_skip", {
+        pendingCount: Object.keys(pendingItems).length,
+        queueItemCount: todoQueueItems.length,
+        reason: "no_unqueued_items",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+      return;
+    }
+
+    setTodoDropError("");
+    logTerminalStatus("frontend.todo_queue.manual_queue_all", {
+      itemCount: queueableItems.length,
+      items: getTodoQueueItemLogSummary(queueableItems),
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    queueableItems.forEach((item) => {
+      const source = getTodoQueueItemAutoQueueSource(item);
+      setTodoQueueItemPending(item.id, {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        phase: "queued",
+        source,
+        workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+      });
+      const planTask = getTodoQueueItemPlanTask(item);
+      if (planTask) {
+        void recordVoicePlanTaskStatus(planTask, "queued", {
+          clientTodoId: item.id || "",
+        });
+      }
+    });
+    setTodoQueueDispatchRevision((revision) => revision + 1);
+  }, [
+    recordVoicePlanTaskStatus,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    todoQueueItems,
+  ]);
+
   const claimVoiceAgentToolCall = useCallback((toolCall) => {
     const toolCallSignature = getVoiceAgentToolCallSignature(toolCall);
     if (toolCallSignature) {
@@ -18627,6 +18801,7 @@ function TerminalView({
                           onDraftChange={setTodoQueueDraft}
                           onMinimizePane={minimizeTodoQueuePane}
                           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+                          onQueueAllItems={queueAllTodoQueueItems}
                           onQueueItem={queueTodoQueueItem}
                           onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}
                           onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}

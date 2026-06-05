@@ -479,7 +479,7 @@ function dailyBarHeight(value, maxValue) {
   const total = numeric(value);
   if (total <= 0) return 5;
   const max = Math.max(1, numeric(maxValue));
-  return Math.max(11, Math.round((total / max) * 78));
+  return Math.max(11, Math.round((total / max) * 94));
 }
 
 function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
