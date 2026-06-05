@@ -6208,6 +6208,21 @@ const TODO_QUEUE_PROVIDER_HOOK_COMPLETION_EVENT_TYPES = new Set([
   "provider-turn-interrupted",
 ]);
 
+const TODO_QUEUE_PROVIDER_HOOK_PROMPT_SUBMIT_EVENT_TYPES = new Set([
+  "provider-turn-started",
+]);
+
+const TODO_QUEUE_PROVIDER_HOOK_PROMPT_SUBMIT_NAMES = new Set([
+  "prompt-submit",
+  "prompt-submitted",
+  "promptsubmit",
+  "promptsubmitted",
+  "user-prompt-submit",
+  "user-prompt-submitted",
+  "userpromptsubmit",
+  "userpromptsubmitted",
+]);
+
 function todoQueueAgentUsesActivityHooks(value) {
   return terminalAgentUsesActivityHooks(normalizeTodoTerminalAgentId(value));
 }
@@ -6222,6 +6237,29 @@ function todoQueueLifecycleEventIsIgnoredReadiness(eventType) {
 
 function todoQueueLifecycleEventIsProviderHookCompletion(eventType) {
   return TODO_QUEUE_PROVIDER_HOOK_COMPLETION_EVENT_TYPES.has(todoQueueLifecycleEventType(eventType));
+}
+
+function todoQueueLifecycleEventIsProviderHookPromptSubmit(eventType, payload = {}) {
+  const normalizedEventType = todoQueueLifecycleEventType(eventType);
+  if (TODO_QUEUE_PROVIDER_HOOK_PROMPT_SUBMIT_EVENT_TYPES.has(normalizedEventType)) {
+    return true;
+  }
+
+  const completionEvidence = normalizeTodoTerminalAgentId(
+    payload.completionEvidence
+      || payload.completion_evidence
+      || "",
+  );
+  if (completionEvidence === "cli-hook-prompt-submit") {
+    return true;
+  }
+
+  const hookEventName = normalizeTodoTerminalAgentId(
+    payload.hookEventName
+      || payload.hook_event_name
+      || "",
+  );
+  return TODO_QUEUE_PROVIDER_HOOK_PROMPT_SUBMIT_NAMES.has(hookEventName);
 }
 
 function todoQueueInFlightPromptUsesActivityHooks(inFlightPrompt, fallbackAgentId = "") {
@@ -12708,7 +12746,9 @@ function TerminalView({
 
       const payload = hookEvent?.payload || {};
       const eventType = todoQueueLifecycleEventType(payload.eventType || payload.type);
-      if (!todoQueueLifecycleEventIsProviderHookCompletion(eventType)) {
+      const promptSubmitHook = todoQueueLifecycleEventIsProviderHookPromptSubmit(eventType, payload);
+      const completionHook = todoQueueLifecycleEventIsProviderHookCompletion(eventType);
+      if (!promptSubmitHook && !completionHook) {
         return;
       }
 
@@ -12815,18 +12855,72 @@ function TerminalView({
         return;
       }
 
+      let currentInFlightPrompt = inFlightPrompt;
+      if (promptSubmitHook && inFlightPrompt?.accepted !== true) {
+        const acceptedAt = new Date().toISOString();
+        const providerSessionId = String(
+          payload.providerSessionId
+            || payload.nativeSessionId
+            || inFlightPrompt?.sessionId
+            || "",
+        ).trim();
+        const acceptedMatchedBy = "activity-hook-user-prompt-submit";
+        currentInFlightPrompt = {
+          ...inFlightPrompt,
+          accepted: true,
+          acceptedAt,
+          acceptedAtMs: Date.parse(acceptedAt) || Date.now(),
+          acceptedMatchedBy,
+          sessionId: providerSessionId,
+        };
+        todoQueueTerminalInFlightPromptsRef.current.set(terminalIndex, currentInFlightPrompt);
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+        logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
+          agentId: eventAgentId,
+          completionEvidence: payload.completionEvidence || payload.completion_evidence || "",
+          eventType,
+          hookEventName: payload.hookEventName || payload.hook_event_name || "",
+          hookTimestampMs: Number.isFinite(hookTimestampMs) ? hookTimestampMs : 0,
+          matchedBy: acceptedMatchedBy,
+          paneId: payloadPaneId,
+          promptEventId: inFlightPrompt?.promptId || "",
+          reason: "activity_hook_prompt_submit",
+          sessionIdPresent: Boolean(providerSessionId),
+          source: inFlightPrompt?.source || "",
+          submittedAtMs,
+          targetTerminalIndex: terminalIndex,
+          threadId: payload.threadId || inFlightPrompt?.threadId || "",
+          workspaceId: eventWorkspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+        });
+        window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
+          detail: {
+            agentId: eventAgentId,
+            matchedBy: acceptedMatchedBy,
+            promptEventId: inFlightPrompt?.promptId || "",
+            promptText: inFlightPrompt?.promptText || inFlightPrompt?.terminalText || "",
+            sessionId: providerSessionId,
+            threadId: payload.threadId || inFlightPrompt?.threadId || "",
+            workspaceId: eventWorkspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+          },
+        }));
+      }
+
+      if (!completionHook) {
+        return;
+      }
+
       const completedAt = payload.completedAt || payload.inputReadyAt || new Date().toISOString();
       const completedInFlightPrompt = {
-        ...inFlightPrompt,
-        accepted: inFlightPrompt?.accepted === true,
-        acceptedAt: inFlightPrompt?.acceptedAt || "",
-        acceptedAtMs: inFlightPrompt?.acceptedAtMs || 0,
-        acceptedMatchedBy: inFlightPrompt?.acceptedMatchedBy || "",
+        ...currentInFlightPrompt,
+        accepted: currentInFlightPrompt?.accepted === true,
+        acceptedAt: currentInFlightPrompt?.acceptedAt || "",
+        acceptedAtMs: currentInFlightPrompt?.acceptedAtMs || 0,
+        acceptedMatchedBy: currentInFlightPrompt?.acceptedMatchedBy || "",
         completedAt,
         completedAtMs: Date.parse(completedAt) || Date.now(),
         sessionId: payload.providerSessionId
           || payload.nativeSessionId
-          || inFlightPrompt?.sessionId
+          || currentInFlightPrompt?.sessionId
           || "",
       };
       const settleReason = eventType === "provider-turn-completed"
@@ -13144,7 +13238,9 @@ function TerminalView({
 
   const handleActivateTerminalPane = useCallback(({ paneId }) => {
     if (paneId) {
-      setActiveTerminalPaneId(paneId);
+      setActiveTerminalPaneId((currentPaneId) => (
+        currentPaneId === paneId ? currentPaneId : paneId
+      ));
     }
   }, []);
 

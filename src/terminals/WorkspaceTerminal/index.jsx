@@ -1648,7 +1648,14 @@ function WorkspaceTerminal({
   const terminalFirstVisibleOutputAtRef = useRef(0);
   const terminalRunningSinceRef = useRef(0);
   const terminalActiveRef = useRef(Boolean(isActive));
+  const terminalActivePropRef = useRef(Boolean(isActive));
+  const terminalInteractiveStateRef = useRef({
+    acceptsInteractiveInput: null,
+    cursorBlink: null,
+    disableStdin: null,
+  });
   const attachDeferredWebglRef = useRef(null);
+  const terminalOutputWorkerSessionRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1685,7 +1692,6 @@ function WorkspaceTerminal({
   const [restartRoleMenuOpen, setRestartRoleMenuOpen] = useState(false);
   const [terminalLaunchInfo, setTerminalLaunchInfo] = useState(null);
   const [parkedPrompt, setParkedPrompt] = useState(null);
-  const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
   const [terminalUiViewMounted, setTerminalUiViewMounted] = useState(false);
   const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
@@ -2320,16 +2326,29 @@ function WorkspaceTerminal({
     });
   }, [paneId, terminalAgentKind, terminalIndex, workingDirectory, workspace?.id]);
   const updateTerminalInteractiveState = useCallback((active, parked = parkedPromptRef.current) => {
+    const acceptsInteractiveInput = Boolean(active) && !parked;
+    const disableStdin = Boolean(parked);
+    const previousState = terminalInteractiveStateRef.current;
+    terminalOutputWorkerSessionRef.current?.setActive(Boolean(active));
+    terminalInteractiveStateRef.current = {
+      acceptsInteractiveInput,
+      cursorBlink: acceptsInteractiveInput,
+      disableStdin,
+    };
+
     const terminal = xtermRef.current;
     if (!terminal) {
       return;
     }
 
-    const acceptsInteractiveInput = Boolean(active) && !parked;
-    terminal.options.disableStdin = Boolean(parked);
-    terminal.options.cursorBlink = acceptsInteractiveInput;
+    if (previousState.disableStdin !== disableStdin) {
+      terminal.options.disableStdin = disableStdin;
+    }
+    if (previousState.cursorBlink !== acceptsInteractiveInput) {
+      terminal.options.cursorBlink = acceptsInteractiveInput;
+    }
 
-    if (!acceptsInteractiveInput) {
+    if (!acceptsInteractiveInput && previousState.acceptsInteractiveInput !== false) {
       terminal.blur?.();
     }
   }, []);
@@ -3896,17 +3915,23 @@ function WorkspaceTerminal({
   const activateTerminalPane = useCallback((source = "terminal_activation", options = {}) => {
     const focusKeyboard = options?.focusKeyboard !== false;
     const instanceId = terminalInstanceIdRef.current || 0;
-    terminalActiveRef.current = true;
-    setActiveTerminalKeyboardTarget(paneId, instanceId);
-    setTerminalFocused(true);
-    updateTerminalInteractiveState(true);
-    onActivateTerminal?.({
-      instanceId,
-      paneId,
-      source,
-      terminalIndex,
-      workspaceId: workspace?.id || "",
-    });
+    const alreadyActive = terminalActiveRef.current === true;
+
+    if (!alreadyActive) {
+      terminalActiveRef.current = true;
+      setActiveTerminalKeyboardTarget(paneId, instanceId);
+      updateTerminalInteractiveState(true);
+      onActivateTerminal?.({
+        instanceId,
+        paneId,
+        source,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+    } else if (focusKeyboard) {
+      setActiveTerminalKeyboardTarget(paneId, instanceId);
+    }
+
     if (focusKeyboard) {
       focusTerminalKeyboardInput(true);
     }
@@ -3939,7 +3964,10 @@ function WorkspaceTerminal({
     event.preventDefault();
     event.stopPropagation();
 
-    activateTerminalPane(breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag");
+    activateTerminalPane(
+      breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag",
+      { focusKeyboard: false },
+    );
 
     onBeginTerminalDrag?.({
       clientX: event.clientX,
@@ -4049,20 +4077,23 @@ function WorkspaceTerminal({
   }, [activateTerminalPane]);
 
   useEffect(() => {
-    terminalActiveRef.current = Boolean(isActive);
-    setTerminalFocused(Boolean(isActive));
-    updateTerminalInteractiveState(Boolean(isActive));
+    const nextActive = Boolean(isActive);
+    const wasActiveProp = terminalActivePropRef.current === true;
+    terminalActivePropRef.current = nextActive;
+    terminalActiveRef.current = nextActive;
+    updateTerminalInteractiveState(nextActive);
 
-    if (isActive) {
+    if (nextActive) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
-      attachDeferredWebglRef.current?.("terminal_activated");
-      focusTerminalKeyboardInput(true);
+      if (!wasActiveProp) {
+        attachDeferredWebglRef.current?.("terminal_activated");
+      }
       return undefined;
     }
 
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
     return undefined;
-  }, [focusTerminalKeyboardInput, isActive, paneId, updateTerminalInteractiveState]);
+  }, [isActive, paneId, updateTerminalInteractiveState]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -5565,7 +5596,9 @@ function WorkspaceTerminal({
         return;
       }
 
-      activateTerminalPane(detail.reason || "terminal_focus_request");
+      activateTerminalPane(detail.reason || "terminal_focus_request", {
+        focusKeyboard: detail.focusKeyboard !== false,
+      });
     };
     window.addEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
     disposables.push(() => {
@@ -9136,8 +9169,15 @@ function WorkspaceTerminal({
           id: `${paneId}:${terminalInstanceId}:output`,
           onOutput: processPreparedTerminalOutput,
         });
+        terminalOutputWorkerSessionRef.current = terminalOutputWorkerSession;
+        terminalOutputWorkerSession?.setActive(terminalActiveRef.current === true);
         if (terminalOutputWorkerSession) {
-          disposables.push(() => terminalOutputWorkerSession.dispose());
+          disposables.push(() => {
+            if (terminalOutputWorkerSessionRef.current === terminalOutputWorkerSession) {
+              terminalOutputWorkerSessionRef.current = null;
+            }
+            terminalOutputWorkerSession.dispose();
+          });
         }
 
         const outputChannel = new Channel((message) => {
@@ -13199,7 +13239,7 @@ function WorkspaceTerminal({
 
   const xtermSurface = (
     <XtermSurface
-      data-active={terminalFocused ? "true" : "false"}
+      data-active={isActive ? "true" : "false"}
       data-terminal-breakout={terminalBreakoutActive ? "true" : undefined}
       data-scrollbar-platform={TERMINAL_SCROLLBAR_PLATFORM}
       data-parked={parkedPrompt ? "true" : "false"}
@@ -13227,7 +13267,7 @@ function WorkspaceTerminal({
 
   return (
     <TerminalWorkspaceSurface
-      data-focused={terminalFocused ? "true" : "false"}
+      data-focused={isActive ? "true" : "false"}
       data-pane-id={paneId}
       data-terminal-fullscreen={isFullscreen ? "true" : undefined}
       data-terminal-fullscreen-state={isFullscreen ? fullscreenState : undefined}

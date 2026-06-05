@@ -3603,27 +3603,26 @@ export const TerminalWorkspaceSurface = styled.section`
     inset: var(--terminal-focus-outline-inset);
     z-index: 120;
     box-sizing: border-box;
-    border: 0 solid transparent;
+    opacity: 0;
     box-shadow: none;
     pointer-events: none;
     content: "";
     transition:
-      border-color 140ms ease,
+      opacity 140ms ease,
       box-shadow 140ms ease;
   }
 
   &[data-focused="true"]::after {
-    border-width: 2px;
-    border-color: rgba(132, 157, 190, 0.58);
+    opacity: 1;
     box-shadow:
+      inset 0 0 0 2px rgba(132, 157, 190, 0.58),
       inset 0 0 0 1px rgba(226, 232, 240, 0.18),
       inset 0 0 14px rgba(132, 157, 190, 0.06),
       0 0 12px rgba(132, 157, 190, 0.14);
   }
 
   &[data-threads-view="true"]::after {
-    border-width: 0;
-    border-color: transparent;
+    opacity: 0;
     box-shadow: none;
   }
 `;

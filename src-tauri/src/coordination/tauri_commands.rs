@@ -1,12 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+    thread,
+};
 
 use serde_json::{json, Map, Value};
 
 use super::{
-    db::StoragePaths,
-    kernel::{api_ok, CoordinationKernel},
+    db::{StoragePaths, REPO_ID},
+    kernel::{api_ok, CoordinationKernel, EventRefs},
     mcp, watcher,
 };
+
+const WORKSPACE_MCP_BACKGROUND_JOB_EVENT: &str = "workspace-mcp-background-job";
 
 #[derive(Clone, Debug)]
 struct CoordinationWorkspaceTarget {
@@ -386,6 +393,190 @@ fn result(value: Result<Value, String>) -> Result<Value, String> {
     value
 }
 
+fn coordination_background_mcp_jobs() -> &'static Mutex<HashSet<String>> {
+    static JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    JOBS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn claim_coordination_background_mcp_job(job_key: &str) -> bool {
+    coordination_background_mcp_jobs()
+        .lock()
+        .map(|mut jobs| jobs.insert(job_key.to_string()))
+        .unwrap_or(false)
+}
+
+fn release_coordination_background_mcp_job(job_key: &str) {
+    if let Ok(mut jobs) = coordination_background_mcp_jobs().lock() {
+        jobs.remove(job_key);
+    }
+}
+
+fn background_mcp_job_payload(
+    job_key: &str,
+    job_type: &str,
+    status: &str,
+    repo_path: &str,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    extra: Value,
+) -> Value {
+    json!({
+        "jobKey": job_key,
+        "job_key": job_key,
+        "jobType": job_type,
+        "job_type": job_type,
+        "status": status,
+        "repoPath": repo_path,
+        "repo_path": repo_path,
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "workspace_id": workspace_id.unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "workspace_name": workspace_name.unwrap_or_default(),
+        "extra": extra,
+    })
+}
+
+fn emit_background_mcp_job_event(
+    app: &tauri::AppHandle,
+    kernel: Option<&CoordinationKernel>,
+    job_key: &str,
+    job_type: &str,
+    status: &str,
+    repo_path: &str,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    extra: Value,
+) {
+    let payload = background_mcp_job_payload(
+        job_key,
+        job_type,
+        status,
+        repo_path,
+        workspace_id,
+        workspace_name,
+        extra,
+    );
+    let _ = tauri::Emitter::emit(app, WORKSPACE_MCP_BACKGROUND_JOB_EVENT, payload.clone());
+    if let Some(kernel) = kernel {
+        let event_type = match status {
+            "completed" => "workspace_mcp_registry_changed",
+            "failed" => "workspace_mcp_background_job_failed",
+            _ => "workspace_mcp_background_job_started",
+        };
+        let _ = kernel.emit_event(event_type, "kernel", REPO_ID, EventRefs::default(), payload);
+    }
+}
+
+fn spawn_coordination_background_mcp_job<F>(
+    app: tauri::AppHandle,
+    target: CoordinationWorkspaceTarget,
+    job_key: String,
+    job_type: &'static str,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    job: F,
+) -> Value
+where
+    F: FnOnce(&CoordinationKernel, Option<&str>, Option<&str>) -> Result<Value, String>
+        + Send
+        + 'static,
+{
+    let repo_path_text = crate::workspace_path_display(&target.repo_path);
+    let queued = claim_coordination_background_mcp_job(&job_key);
+    let workspace_id_text = workspace_id.clone().unwrap_or_default();
+    let workspace_name_text = workspace_name.clone().unwrap_or_default();
+
+    if !queued {
+        return api_ok(json!({
+            "mode": "background",
+            "queued": false,
+            "in_flight": true,
+            "job_key": job_key,
+            "jobKey": job_key,
+            "job_type": job_type,
+            "jobType": job_type,
+            "repo_path": repo_path_text,
+            "repoPath": repo_path_text,
+            "workspace_id": workspace_id_text,
+            "workspaceId": workspace_id_text,
+            "workspace_name": workspace_name_text,
+            "workspaceName": workspace_name_text,
+        }));
+    }
+
+    let repo_path = target.repo_path.clone();
+    let db_path = target.db_path.clone();
+    let thread_job_key = job_key.clone();
+    let thread_repo_path_text = repo_path_text.clone();
+    let thread_workspace_id = workspace_id.clone();
+    let thread_workspace_name = workspace_name.clone();
+    thread::spawn(move || {
+        let result: Result<(), String> = (|| {
+            let kernel = CoordinationKernel::open(repo_path.clone(), db_path.clone())?;
+            emit_background_mcp_job_event(
+                &app,
+                Some(&kernel),
+                &thread_job_key,
+                job_type,
+                "started",
+                &thread_repo_path_text,
+                thread_workspace_id.as_deref(),
+                thread_workspace_name.as_deref(),
+                json!({}),
+            );
+            let output = job(
+                &kernel,
+                thread_workspace_id.as_deref(),
+                thread_workspace_name.as_deref(),
+            )?;
+            emit_background_mcp_job_event(
+                &app,
+                Some(&kernel),
+                &thread_job_key,
+                job_type,
+                "completed",
+                &thread_repo_path_text,
+                thread_workspace_id.as_deref(),
+                thread_workspace_name.as_deref(),
+                json!({ "result": output }),
+            );
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let kernel = CoordinationKernel::open(repo_path, db_path).ok();
+            emit_background_mcp_job_event(
+                &app,
+                kernel.as_ref(),
+                &thread_job_key,
+                job_type,
+                "failed",
+                &thread_repo_path_text,
+                thread_workspace_id.as_deref(),
+                thread_workspace_name.as_deref(),
+                json!({ "error": error }),
+            );
+        }
+        release_coordination_background_mcp_job(&thread_job_key);
+    });
+
+    api_ok(json!({
+        "mode": "background",
+        "queued": true,
+        "in_flight": false,
+        "job_key": job_key,
+        "jobKey": job_key,
+        "job_type": job_type,
+        "jobType": job_type,
+        "repo_path": repo_path_text,
+        "repoPath": repo_path_text,
+        "workspace_id": workspace_id_text,
+        "workspaceId": workspace_id_text,
+        "workspace_name": workspace_name_text,
+        "workspaceName": workspace_name_text,
+    }))
+}
+
 #[tauri::command]
 pub fn coordination_init(
     repo_path: Option<String>,
@@ -714,6 +905,37 @@ pub fn coordination_workspace_mcp_registry(
 }
 
 #[tauri::command]
+pub fn coordination_workspace_mcp_registry_background(
+    app: tauri::AppHandle,
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let target = coordination_single_workspace_target(repo_path, db_path)?;
+    let workspace_id = req_text(&workspace_id, "workspace_id")?.to_string();
+    let repo_key = crate::workspace_path_display(&target.repo_path).to_lowercase();
+    let job_key = format!("workspace_mcp:registry:{repo_key}:{workspace_id}");
+
+    Ok(spawn_coordination_background_mcp_job(
+        app,
+        target,
+        job_key,
+        "workspace_mcp_registry",
+        Some(workspace_id),
+        workspace_name,
+        |kernel, workspace_id, workspace_name| {
+            let workspace_id =
+                workspace_id.ok_or_else(|| "workspace_id is required.".to_string())?;
+            let registry = kernel.workspace_mcp_registry(workspace_id, workspace_name)?;
+            Ok(json!({
+                "summary": registry["summary"].clone(),
+            }))
+        },
+    ))
+}
+
+#[tauri::command]
 pub fn coordination_add_workspace_mcp_marketplace(
     repo_path: Option<String>,
     db_path: Option<String>,
@@ -830,6 +1052,48 @@ pub fn coordination_activate_shared_mcp_daemon(
     };
 
     Ok(api_ok_from_data(data))
+}
+
+#[tauri::command]
+pub fn coordination_activate_shared_mcp_daemon_background(
+    app: tauri::AppHandle,
+    repo_path: Option<String>,
+    db_path: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let target = coordination_single_workspace_target(repo_path, db_path)?;
+    let workspace_id = workspace_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let workspace_name = workspace_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let repo_key = crate::workspace_path_display(&target.repo_path).to_lowercase();
+    let workspace_key = workspace_id.as_deref().unwrap_or("repo");
+    let job_key = format!("workspace_mcp:shared_daemon:{repo_key}:{workspace_key}");
+
+    Ok(spawn_coordination_background_mcp_job(
+        app,
+        target,
+        job_key,
+        "activate_shared_mcp_daemon",
+        workspace_id,
+        workspace_name,
+        |kernel, workspace_id, workspace_name| {
+            let data = if let Some(workspace_id) = workspace_id {
+                kernel.get_workspace_mcp_status(Some(workspace_id), workspace_name)?
+            } else {
+                mcp::ensure_shared_daemon_for_paths(&kernel.paths.repo_path, &kernel.paths.db_path)?
+            };
+            Ok(json!({
+                "daemon": data["daemon"].clone(),
+                "health": data["health"].clone(),
+                "repo_path": data["repo_path"].clone(),
+                "workspace_id": data["workspace_id"].clone(),
+            }))
+        },
+    ))
 }
 
 #[tauri::command]

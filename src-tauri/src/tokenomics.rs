@@ -194,33 +194,9 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
            received_at TEXT NOT NULL
          );
          DROP VIEW IF EXISTS tokenomics_display_rollups;
-	         CREATE VIEW tokenomics_display_rollups AS
-	           SELECT id, device_id, provider, agent_kind, model, subscription_key,
-	                  provider_account_key, provider_account_label,
-	                  billing_scope_type, billing_team_id, billing_scope_source,
-	                  workspace_id, repo_path,
-	                  bucket_width, bucket_start, input_tokens, output_tokens,
-	                  cache_read_tokens, cache_write_tokens, total_tokens,
-	                  estimated_cost_microusd, event_count, updated_at
-	           FROM tokenomics_rollups
-	           UNION ALL
-	           SELECT id, device_id, provider, agent_kind, model, subscription_key,
-	                  provider_account_key, provider_account_label,
-	                  billing_scope_type, billing_team_id, billing_scope_source,
-	                  workspace_id, repo_path,
-	                  bucket_width, bucket_start, input_tokens, output_tokens,
-	                  cache_read_tokens, cache_write_tokens, total_tokens,
-	                  estimated_cost_microusd, event_count, updated_at
-	           FROM tokenomics_cloud_rollups;
-         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_provider ON tokenomics_rollups(provider, agent_kind, bucket_width, bucket_start);
-         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_workspace ON tokenomics_rollups(workspace_id, bucket_width, bucket_start);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_device ON tokenomics_cloud_rollups(device_id, bucket_width, bucket_start);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_account ON tokenomics_cloud_rollups(provider, agent_kind, provider_account_key, device_id, bucket_width, bucket_start);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_scope ON tokenomics_cloud_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_observed ON tokenomics_usage_events(observed_at);
-	         CREATE TABLE IF NOT EXISTS tokenomics_meta(
-	           key TEXT PRIMARY KEY,
-	           value TEXT NOT NULL
+		         CREATE TABLE IF NOT EXISTS tokenomics_meta(
+		           key TEXT PRIMARY KEY,
+		           value TEXT NOT NULL
 	         );
          CREATE TABLE IF NOT EXISTS tokenomics_scan_state(
            provider TEXT NOT NULL,
@@ -249,37 +225,20 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);",
     )
     .map_err(|error| format!("Unable to prepare Tokenomics database: {error}"))?;
-    tokenomics_ensure_column(
-        conn,
-        "tokenomics_usage_events",
-        "provider_account_key",
-        "TEXT",
-    )?;
-    tokenomics_ensure_column(
-        conn,
-        "tokenomics_usage_events",
-        "device_id",
-        "TEXT NOT NULL DEFAULT 'desktop-primary'",
-    )?;
-    tokenomics_ensure_column(
-        conn,
-        "tokenomics_usage_events",
-        "provider_account_label",
-        "TEXT",
-    )?;
-    tokenomics_ensure_column(conn, "tokenomics_rollups", "provider_account_key", "TEXT")?;
-    tokenomics_ensure_column(
-        conn,
-        "tokenomics_rollups",
-        "device_id",
-        "TEXT NOT NULL DEFAULT 'desktop-primary'",
-    )?;
-    tokenomics_ensure_column(conn, "tokenomics_rollups", "provider_account_label", "TEXT")?;
     for table in [
         "tokenomics_usage_events",
         "tokenomics_rollups",
         "tokenomics_cloud_rollups",
     ] {
+        tokenomics_ensure_column(
+            conn,
+            table,
+            "device_id",
+            "TEXT NOT NULL DEFAULT 'desktop-primary'",
+        )?;
+        tokenomics_ensure_column(conn, table, "subscription_key", "TEXT")?;
+        tokenomics_ensure_column(conn, table, "provider_account_key", "TEXT")?;
+        tokenomics_ensure_column(conn, table, "provider_account_label", "TEXT")?;
         tokenomics_ensure_column(
             conn,
             table,
@@ -293,29 +252,15 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
             "billing_scope_source",
             "TEXT NOT NULL DEFAULT 'unknown'",
         )?;
+        tokenomics_ensure_column(conn, table, "workspace_id", "TEXT")?;
+        tokenomics_ensure_column(conn, table, "repo_path", "TEXT")?;
     }
-    conn.execute(
-	        "CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_account ON tokenomics_rollups(provider, agent_kind, provider_account_key, bucket_width, bucket_start)",
-	        [],
-    )
-    .map_err(|error| format!("Unable to create Tokenomics account index: {error}"))?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device ON tokenomics_rollups(device_id, bucket_width, bucket_start)",
-        [],
-    )
-    .map_err(|error| format!("Unable to create Tokenomics device index: {error}"))?;
-    conn.execute(
-	        "CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device_account ON tokenomics_rollups(device_id, provider, agent_kind, provider_account_key, bucket_width, bucket_start)",
-	        [],
-	    )
-	    .map_err(|error| format!("Unable to create Tokenomics device account index: {error}"))?;
-    conn.execute(
-	        "CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_scope ON tokenomics_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start)",
-	        [],
-	    )
-	    .map_err(|error| format!("Unable to create Tokenomics scope index: {error}"))?;
     let device_id = tokenomics_local_device_id();
-    for table in ["tokenomics_usage_events", "tokenomics_rollups"] {
+    for table in [
+        "tokenomics_usage_events",
+        "tokenomics_rollups",
+        "tokenomics_cloud_rollups",
+    ] {
         conn.execute(
             &format!(
                 "UPDATE {table}
@@ -350,6 +295,40 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Unable to backfill Tokenomics billing scope source: {error}"))?;
     }
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS tokenomics_display_rollups;
+         CREATE VIEW tokenomics_display_rollups AS
+           SELECT id, device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, provider_account_label,
+                  billing_scope_type, billing_team_id, billing_scope_source,
+                  workspace_id, repo_path,
+                  bucket_width, bucket_start, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, total_tokens,
+                  estimated_cost_microusd, event_count, updated_at
+           FROM tokenomics_rollups
+           UNION ALL
+           SELECT id, device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, provider_account_label,
+                  billing_scope_type, billing_team_id, billing_scope_source,
+                  workspace_id, repo_path,
+                  bucket_width, bucket_start, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, total_tokens,
+                  estimated_cost_microusd, event_count, updated_at
+           FROM tokenomics_cloud_rollups;
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_provider ON tokenomics_rollups(provider, agent_kind, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_workspace ON tokenomics_rollups(workspace_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_account ON tokenomics_rollups(provider, agent_kind, provider_account_key, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device ON tokenomics_rollups(device_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device_account ON tokenomics_rollups(device_id, provider, agent_kind, provider_account_key, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_scope ON tokenomics_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_device ON tokenomics_cloud_rollups(device_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_account ON tokenomics_cloud_rollups(provider, agent_kind, provider_account_key, device_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_scope ON tokenomics_cloud_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_observed ON tokenomics_usage_events(observed_at);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);",
+    )
+    .map_err(|error| format!("Unable to finalize Tokenomics database schema: {error}"))?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
     Ok(())
 }
@@ -4334,6 +4313,86 @@ fn tokenomics_query_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<V
 #[cfg(test)]
 mod tokenomics_tests {
     use super::*;
+
+    #[test]
+    fn tokenomics_prepare_db_migrates_legacy_cloud_rollups_before_indexes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tokenomics_cloud_rollups(
+               id TEXT PRIMARY KEY,
+               device_id TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               agent_kind TEXT NOT NULL,
+               model TEXT,
+               bucket_width TEXT NOT NULL,
+               bucket_start TEXT NOT NULL,
+               input_tokens INTEGER NOT NULL DEFAULT 0,
+               output_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+               cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+               total_tokens INTEGER NOT NULL DEFAULT 0,
+               estimated_cost_microusd INTEGER NOT NULL DEFAULT 0,
+               event_count INTEGER NOT NULL DEFAULT 0,
+               updated_at TEXT NOT NULL,
+               received_at TEXT NOT NULL
+             );
+             INSERT INTO tokenomics_cloud_rollups(
+               id, device_id, provider, agent_kind, model, bucket_width, bucket_start,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               total_tokens, estimated_cost_microusd, event_count, updated_at, received_at
+             ) VALUES(
+               'legacy-cloud', 'remote-device', 'openai', 'codex', 'gpt-5.5',
+               'hour', '2026-05-30T05', 1, 2, 0, 0, 3, 0, 1,
+               '2026-05-30T05:00:00Z', '2026-05-30T05:00:00Z'
+             );",
+        )
+        .unwrap();
+
+        tokenomics_prepare_db(&conn).unwrap();
+
+        let mut statement = conn
+            .prepare("PRAGMA table_info(tokenomics_cloud_rollups)")
+            .unwrap();
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert!(columns.iter().any(|column| column == "billing_scope_type"));
+        assert!(columns
+            .iter()
+            .any(|column| column == "provider_account_key"));
+        assert!(columns.iter().any(|column| column == "workspace_id"));
+
+        let (scope_type, provider_account_key, workspace_id): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT billing_scope_type, provider_account_key, workspace_id
+                 FROM tokenomics_display_rollups
+                 WHERE id='legacy-cloud'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(scope_type, "unknown");
+        assert!(provider_account_key.is_none());
+        assert!(workspace_id.is_none());
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_master
+                 WHERE type='index'
+                   AND name='idx_tokenomics_cloud_rollups_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+    }
 
     #[test]
     fn tokenomics_reconcile_preserves_completed_codex_state_scan() {

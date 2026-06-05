@@ -79,6 +79,9 @@ const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
+const TERMINAL_OUTPUT_COALESCE_WINDOW_MS: u64 = 6;
+const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 16 * 1024;
+const TERMINAL_OUTPUT_COALESCE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
@@ -783,13 +786,19 @@ impl TerminalHeadlessOutputBuffer {
         self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
         if data.len() >= TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES {
             self.tail.clear();
-            self.tail
-                .extend(data[data.len() - TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES..].iter().copied());
+            self.tail.extend(
+                data[data.len() - TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES..]
+                    .iter()
+                    .copied(),
+            );
             return;
         }
 
         self.tail.extend(data.iter().copied());
-        let overflow = self.tail.len().saturating_sub(TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES);
+        let overflow = self
+            .tail
+            .len()
+            .saturating_sub(TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES);
         if overflow > 0 {
             self.tail.drain(..overflow);
         }
@@ -813,9 +822,7 @@ impl TerminalHeadlessOutputBuffer {
         instance_id: u64,
         since_total_bytes: u64,
     ) -> TerminalHeadlessOutputDelta {
-        let tail_start_total_bytes = self
-            .total_bytes
-            .saturating_sub(self.tail.len() as u64);
+        let tail_start_total_bytes = self.total_bytes.saturating_sub(self.tail.len() as u64);
         let truncated = since_total_bytes < tail_start_total_bytes;
         let from_total_bytes = if truncated {
             tail_start_total_bytes
@@ -825,7 +832,12 @@ impl TerminalHeadlessOutputBuffer {
         let start_index = from_total_bytes
             .saturating_sub(tail_start_total_bytes)
             .min(self.tail.len() as u64) as usize;
-        let bytes = self.tail.iter().skip(start_index).copied().collect::<Vec<_>>();
+        let bytes = self
+            .tail
+            .iter()
+            .skip(start_index)
+            .copied()
+            .collect::<Vec<_>>();
         TerminalHeadlessOutputDelta {
             bytes_base64: general_purpose::STANDARD.encode(bytes),
             epoch: self.epoch,
@@ -2491,14 +2503,16 @@ fn workspace_activation_diagnostic_log_many(
     let entries = events
         .into_iter()
         .take(256)
-        .map(|event| json!({
-            "ts_ms": current_time_ms(),
-            "phase": clean_terminal_diagnostic_log_text(&event.phase),
-            "source": "frontend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": event.fields,
-        }))
+        .map(|event| {
+            json!({
+                "ts_ms": current_time_ms(),
+                "phase": clean_terminal_diagnostic_log_text(&event.phase),
+                "source": "frontend",
+                "app_pid": std::process::id(),
+                "thread": terminal_diagnostic_thread_label(),
+                "fields": event.fields,
+            })
+        })
         .collect();
 
     write_workspace_activation_diagnostic_log_entries(entries);
@@ -3727,6 +3741,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_get_alignment_report,
             coordination::tauri_commands::coordination_get_workspace_mcp_status,
             coordination::tauri_commands::coordination_workspace_mcp_registry,
+            coordination::tauri_commands::coordination_workspace_mcp_registry_background,
             coordination::tauri_commands::coordination_add_workspace_mcp_marketplace,
             coordination::tauri_commands::coordination_remove_workspace_mcp_marketplace,
             coordination::tauri_commands::coordination_index_workspace_mcp_marketplace,
@@ -3734,6 +3749,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_update_workspace_mcp_server,
             coordination::tauri_commands::coordination_uninstall_workspace_mcp_server,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon,
+            coordination::tauri_commands::coordination_activate_shared_mcp_daemon_background,
             coordination::tauri_commands::coordination_deactivate_shared_mcp_daemon,
             coordination::tauri_commands::coordination_stop_all_shared_mcp_daemons,
             coordination::tauri_commands::coordination_create_session,

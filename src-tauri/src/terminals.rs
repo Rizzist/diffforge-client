@@ -3229,22 +3229,253 @@ fn spawn_terminal_reader(
                 "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
             }),
         );
+        let (output_frame_tx, output_frame_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(TERMINAL_OUTPUT_COALESCE_QUEUE_CAPACITY);
+        let output_channel_closed = Arc::new(AtomicBool::new(false));
+        let output_sender_closed = Arc::clone(&output_channel_closed);
+        let output_app = app.clone();
+        let output_cloud_mcp_state = cloud_mcp_state.clone();
+        let output_pane_id = reader_pane_id.clone();
+        let output_sender_handle = thread::spawn(move || {
+            let coalesce_window = Duration::from_millis(TERMINAL_OUTPUT_COALESCE_WINDOW_MS);
+            let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
+            let mut pending_started_at: Option<Instant> = None;
+            let mut pending_source_chunks: u64 = 0;
+            let mut stats_started_at = Instant::now();
+            let mut stats_frames: u64 = 0;
+            let mut stats_source_chunks: u64 = 0;
+            let mut stats_bytes: u64 = 0;
+            let mut stats_slow_sends: u64 = 0;
+            let mut stats_total_send_ms = 0.0f64;
+            let mut stats_max_send_ms = 0.0f64;
+            let mut stats_slow_observer_schedules: u64 = 0;
+            let mut stats_total_observer_schedule_ms = 0.0f64;
+            let mut stats_max_observer_schedule_ms = 0.0f64;
+            let mut forensics_started_at = Instant::now();
+            let mut forensics_frames: u64 = 0;
+            let mut forensics_source_chunks: u64 = 0;
+            let mut forensics_bytes: u64 = 0;
+            let mut forensics_total_frames: u64 = 0;
+            let mut forensics_total_source_chunks: u64 = 0;
+            let mut forensics_total_bytes: u64 = 0;
+
+            let exit_reason = loop {
+                let mut input_closed_after_flush = false;
+                let receive_result = if pending.is_empty() {
+                    output_frame_rx
+                        .recv()
+                        .map(Some)
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                } else {
+                    let elapsed = pending_started_at
+                        .map(|started_at| started_at.elapsed())
+                        .unwrap_or_default();
+                    let remaining = coalesce_window
+                        .checked_sub(elapsed)
+                        .unwrap_or_else(|| Duration::from_millis(0));
+                    if remaining.as_millis() == 0 {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    } else {
+                        output_frame_rx.recv_timeout(remaining).map(Some)
+                    }
+                };
+
+                match receive_result {
+                    Ok(Some(chunk)) => {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        if pending.is_empty() {
+                            pending_started_at = Some(Instant::now());
+                        }
+                        pending_source_chunks += 1;
+                        pending.extend_from_slice(&chunk);
+                        if pending.len() < TERMINAL_OUTPUT_COALESCE_MAX_BYTES {
+                            continue;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if pending.is_empty() {
+                            continue;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if pending.is_empty() {
+                            break "input_closed";
+                        }
+                        input_closed_after_flush = true;
+                    }
+                    Ok(None) => continue,
+                }
+
+                let frame_started_at = pending_started_at.unwrap_or_else(Instant::now);
+                let frame = std::mem::replace(
+                    &mut pending,
+                    Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES),
+                );
+                let source_chunks = pending_source_chunks;
+                let frame_bytes = frame.len();
+                pending_started_at = None;
+                pending_source_chunks = 0;
+
+                let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
+                    &output_app,
+                    frame,
+                    &output_pane_id,
+                    instance_id,
+                    &output_cloud_mcp_state,
+                    &output_channel,
+                );
+                let coalesced_ms = terminal_diagnostic_elapsed_ms(frame_started_at);
+                forensics_frames += 1;
+                forensics_source_chunks += source_chunks;
+                forensics_bytes += frame_bytes as u64;
+                forensics_total_frames += 1;
+                forensics_total_source_chunks += source_chunks;
+                forensics_total_bytes += frame_bytes as u64;
+                if forensics_started_at.elapsed() >= Duration::from_secs(2) {
+                    log_terminal_crash_forensics_event(
+                        "backend.terminal_reader.output_window",
+                        json!({
+                            "bytes": forensics_bytes,
+                            "coalesce_window_ms": TERMINAL_OUTPUT_COALESCE_WINDOW_MS,
+                            "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
+                            "frames": forensics_frames,
+                            "instance_id": instance_id,
+                            "last_coalesced_ms": coalesced_ms,
+                            "last_observer_schedule_ms": observer_schedule_ms,
+                            "last_send_ms": send_ms,
+                            "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                            "source_chunks": forensics_source_chunks,
+                            "total_bytes": forensics_total_bytes,
+                            "total_frames": forensics_total_frames,
+                            "total_source_chunks": forensics_total_source_chunks,
+                        }),
+                    );
+                    forensics_started_at = Instant::now();
+                    forensics_frames = 0;
+                    forensics_source_chunks = 0;
+                    forensics_bytes = 0;
+                }
+                if terminal_diagnostics_enabled_for_app(&output_app) {
+                    stats_frames += 1;
+                    stats_source_chunks += source_chunks;
+                    stats_bytes += frame_bytes as u64;
+                    stats_total_send_ms += send_ms;
+                    stats_max_send_ms = stats_max_send_ms.max(send_ms);
+                    stats_total_observer_schedule_ms += observer_schedule_ms;
+                    stats_max_observer_schedule_ms =
+                        stats_max_observer_schedule_ms.max(observer_schedule_ms);
+                    if send_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+                        stats_slow_sends += 1;
+                        log_terminal_diagnostic_event(
+                            &output_app,
+                            "backend.output_channel_send.slow",
+                            json!({
+                                "bytes": frame_bytes,
+                                "elapsed_ms": send_ms,
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                                "source_chunks": source_chunks,
+                            }),
+                        );
+                    }
+                    if observer_schedule_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
+                        stats_slow_observer_schedules += 1;
+                        log_terminal_diagnostic_event(
+                            &output_app,
+                            "backend.output_observer_schedule.slow",
+                            json!({
+                                "bytes": frame_bytes,
+                                "elapsed_ms": observer_schedule_ms,
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                                "source_chunks": source_chunks,
+                            }),
+                        );
+                    }
+
+                    if stats_started_at.elapsed() >= Duration::from_secs(1) {
+                        log_terminal_diagnostic_event(
+                            &output_app,
+                            "backend.output_window",
+                            json!({
+                                "bytes": stats_bytes,
+                                "elapsed_ms": terminal_diagnostic_elapsed_ms(stats_started_at),
+                                "frames": stats_frames,
+                                "instance_id": instance_id,
+                                "max_observer_schedule_ms": stats_max_observer_schedule_ms,
+                                "max_send_ms": stats_max_send_ms,
+                                "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                                "slow_observer_schedules": stats_slow_observer_schedules,
+                                "slow_sends": stats_slow_sends,
+                                "source_chunks": stats_source_chunks,
+                                "total_observer_schedule_ms": stats_total_observer_schedule_ms,
+                                "total_send_ms": stats_total_send_ms,
+                            }),
+                        );
+                        stats_started_at = Instant::now();
+                        stats_frames = 0;
+                        stats_source_chunks = 0;
+                        stats_bytes = 0;
+                        stats_slow_sends = 0;
+                        stats_total_send_ms = 0.0;
+                        stats_max_send_ms = 0.0;
+                        stats_slow_observer_schedules = 0;
+                        stats_total_observer_schedule_ms = 0.0;
+                        stats_max_observer_schedule_ms = 0.0;
+                    }
+                }
+
+                if !sent {
+                    output_sender_closed.store(true, Ordering::SeqCst);
+                    log_terminal_crash_forensics_event(
+                        "backend.terminal_reader.output_channel_closed",
+                        json!({
+                            "bytes": frame_bytes,
+                            "frames": forensics_total_frames,
+                            "instance_id": instance_id,
+                            "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                            "source_chunks": source_chunks,
+                            "total_bytes": forensics_total_bytes,
+                            "total_source_chunks": forensics_total_source_chunks,
+                        }),
+                    );
+                    break "output_channel_closed";
+                }
+
+                if input_closed_after_flush {
+                    break "input_closed";
+                }
+            };
+
+            log_terminal_crash_forensics_event(
+                "backend.terminal_reader.output_sender_exit",
+                json!({
+                    "exit_reason": exit_reason,
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&output_pane_id),
+                    "trailing_window_bytes": forensics_bytes,
+                    "trailing_window_frames": forensics_frames,
+                    "trailing_window_source_chunks": forensics_source_chunks,
+                    "total_bytes": forensics_total_bytes,
+                    "total_frames": forensics_total_frames,
+                    "total_source_chunks": forensics_total_source_chunks,
+                }),
+            );
+        });
+
         let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
-        let mut stats_started_at = Instant::now();
-        let mut stats_chunks: u64 = 0;
-        let mut stats_bytes: u64 = 0;
-        let mut stats_slow_sends: u64 = 0;
-        let mut stats_total_send_ms = 0.0f64;
-        let mut stats_max_send_ms = 0.0f64;
-        let mut stats_slow_observer_schedules: u64 = 0;
-        let mut stats_total_observer_schedule_ms = 0.0f64;
-        let mut stats_max_observer_schedule_ms = 0.0f64;
         let mut forensics_started_at = Instant::now();
         let mut forensics_chunks: u64 = 0;
         let mut forensics_bytes: u64 = 0;
         let mut forensics_total_chunks: u64 = 0;
         let mut forensics_total_bytes: u64 = 0;
         let exit_reason = loop {
+            if output_channel_closed.load(Ordering::SeqCst) {
+                break "output_channel_closed";
+            }
+
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     log_terminal_crash_forensics_event(
@@ -3264,28 +3495,18 @@ fn spawn_terminal_reader(
                         headless_output.append(chunk);
                     }
 
-                    let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
-                        &app,
-                        chunk.to_vec(),
-                        &reader_pane_id,
-                        instance_id,
-                        &cloud_mcp_state,
-                        &output_channel,
-                    );
                     forensics_chunks += 1;
                     forensics_bytes += bytes_read as u64;
                     forensics_total_chunks += 1;
                     forensics_total_bytes += bytes_read as u64;
                     if forensics_started_at.elapsed() >= Duration::from_secs(2) {
                         log_terminal_crash_forensics_event(
-                            "backend.terminal_reader.output_window",
+                            "backend.terminal_reader.read_window",
                             json!({
                                 "bytes": forensics_bytes,
                                 "chunks": forensics_chunks,
                                 "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
                                 "instance_id": instance_id,
-                                "last_send_ms": send_ms,
-                                "last_observer_schedule_ms": observer_schedule_ms,
                                 "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
                                 "total_bytes": forensics_total_bytes,
                                 "total_chunks": forensics_total_chunks,
@@ -3295,74 +3516,10 @@ fn spawn_terminal_reader(
                         forensics_chunks = 0;
                         forensics_bytes = 0;
                     }
-                    if terminal_diagnostics_enabled_for_app(&app) {
-                        stats_chunks += 1;
-                        stats_bytes += bytes_read as u64;
-                        stats_total_send_ms += send_ms;
-                        stats_max_send_ms = stats_max_send_ms.max(send_ms);
-                        stats_total_observer_schedule_ms += observer_schedule_ms;
-                        stats_max_observer_schedule_ms =
-                            stats_max_observer_schedule_ms.max(observer_schedule_ms);
-                        if send_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
-                            stats_slow_sends += 1;
-                            log_terminal_diagnostic_event(
-                                &app,
-                                "backend.output_channel_send.slow",
-                                json!({
-                                    "bytes": bytes_read,
-                                    "elapsed_ms": send_ms,
-                                    "instance_id": instance_id,
-                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                                }),
-                            );
-                        }
-                        if observer_schedule_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
-                            stats_slow_observer_schedules += 1;
-                            log_terminal_diagnostic_event(
-                                &app,
-                                "backend.output_observer_schedule.slow",
-                                json!({
-                                    "bytes": bytes_read,
-                                    "elapsed_ms": observer_schedule_ms,
-                                    "instance_id": instance_id,
-                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                                }),
-                            );
-                        }
 
-                        if stats_started_at.elapsed() >= Duration::from_secs(1) {
-                            log_terminal_diagnostic_event(
-                                &app,
-                                "backend.output_window",
-                                json!({
-                                    "bytes": stats_bytes,
-                                    "chunks": stats_chunks,
-                                    "elapsed_ms": terminal_diagnostic_elapsed_ms(stats_started_at),
-                                    "instance_id": instance_id,
-                                    "max_send_ms": stats_max_send_ms,
-                                    "max_observer_schedule_ms": stats_max_observer_schedule_ms,
-                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                                    "slow_observer_schedules": stats_slow_observer_schedules,
-                                    "slow_sends": stats_slow_sends,
-                                    "total_observer_schedule_ms": stats_total_observer_schedule_ms,
-                                    "total_send_ms": stats_total_send_ms,
-                                }),
-                            );
-                            stats_started_at = Instant::now();
-                            stats_chunks = 0;
-                            stats_bytes = 0;
-                            stats_slow_sends = 0;
-                            stats_total_send_ms = 0.0;
-                            stats_max_send_ms = 0.0;
-                            stats_slow_observer_schedules = 0;
-                            stats_total_observer_schedule_ms = 0.0;
-                            stats_max_observer_schedule_ms = 0.0;
-                        }
-                    }
-
-                    if !sent {
+                    if output_frame_tx.send(chunk.to_vec()).is_err() {
                         log_terminal_crash_forensics_event(
-                            "backend.terminal_reader.output_channel_closed",
+                            "backend.terminal_reader.output_sender_closed",
                             json!({
                                 "bytes": bytes_read,
                                 "instance_id": instance_id,
@@ -3371,6 +3528,10 @@ fn spawn_terminal_reader(
                                 "total_chunks": forensics_total_chunks,
                             }),
                         );
+                        break "output_sender_closed";
+                    }
+
+                    if output_channel_closed.load(Ordering::SeqCst) {
                         break "output_channel_closed";
                     }
                 }
@@ -3389,6 +3550,8 @@ fn spawn_terminal_reader(
                 }
             }
         };
+        drop(output_frame_tx);
+        let _ = output_sender_handle.join();
         log_terminal_crash_forensics_event(
             "backend.terminal_reader.exit",
             json!({

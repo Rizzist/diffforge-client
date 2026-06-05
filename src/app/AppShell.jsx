@@ -2127,6 +2127,8 @@ const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
 const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
+const WORKSPACE_MCP_BACKGROUND_JOB_EVENT = "workspace-mcp-background-job";
+const WORKSPACE_MCP_REGISTRY_UPDATED_EVENT = "diffforge:workspace-mcp-registry-updated";
 function unwrapCloudCommandData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
     return fallback;
@@ -5147,7 +5149,9 @@ export default function App() {
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
   const sharedMcpActiveRuntimeTargetsRef = useRef(new Map());
+  const sharedMcpBackgroundJobsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
+  const workspaceMcpStartupIndexJobsRef = useRef(new Map());
   const workspaceDeactivationInFlightRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
   const terminalPresenceSyncKeyRef = useRef("");
@@ -5253,6 +5257,147 @@ export default function App() {
       workspaceId: String(workspaceId || fields.workspaceId || "").trim(),
     }, options);
   }, [workspaceActivationTraceFields]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+
+    const emitWorkspaceMcpRegistryUpdated = (detail) => {
+      if (typeof window === "undefined") {
+        return;
+      }
+      window.dispatchEvent(new CustomEvent(WORKSPACE_MCP_REGISTRY_UPDATED_EVENT, {
+        detail,
+      }));
+    };
+
+    listen(WORKSPACE_MCP_BACKGROUND_JOB_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const payload = event?.payload || {};
+      const jobType = String(payload.jobType || payload.job_type || "").trim();
+      const status = String(payload.status || "").trim();
+      const jobKey = String(payload.jobKey || payload.job_key || "").trim();
+      const repoPath = String(payload.repoPath || payload.repo_path || "").trim();
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const workspaceName = String(payload.workspaceName || payload.workspace_name || "").trim();
+      const error = payload?.extra?.error || payload?.error || "";
+
+      if (jobType === "workspace_mcp_registry") {
+        const job = workspaceMcpStartupIndexJobsRef.current.get(jobKey) || null;
+        if (status === "completed") {
+          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.done", workspaceId, {
+            elapsedMs: job?.startedAtMs
+              ? Math.max(0, getWorkspaceActivationDiagnosticNowMs() - job.startedAtMs)
+              : 0,
+            mode: "background",
+            repoPath,
+            workspaceName,
+          });
+          workspaceMcpStartupIndexJobsRef.current.delete(jobKey);
+          emitWorkspaceMcpRegistryUpdated({
+            jobKey,
+            jobType,
+            repoPath,
+            status,
+            workspaceId,
+            workspaceName,
+          });
+        } else if (status === "failed") {
+          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.error", workspaceId, {
+            elapsedMs: job?.startedAtMs
+              ? Math.max(0, getWorkspaceActivationDiagnosticNowMs() - job.startedAtMs)
+              : 0,
+            message: error || "Unable to index workspace MCP registry.",
+            mode: "background",
+            repoPath,
+            workspaceName,
+          });
+          if (job?.targetKey) {
+            workspaceMcpStartupIndexKeysRef.current.delete(job.targetKey);
+          }
+          workspaceMcpStartupIndexJobsRef.current.delete(jobKey);
+        }
+        return;
+      }
+
+      if (jobType !== "activate_shared_mcp_daemon") {
+        return;
+      }
+
+      const job = sharedMcpBackgroundJobsRef.current.get(jobKey) || null;
+      const runtimeKey = job?.runtimeKey || workspaceRuntimeActivationKey(workspaceId, repoPath);
+
+      if (status === "completed") {
+        const stillDesired = Boolean(runtimeKey && sharedMcpActiveRuntimeTargetsRef.current.has(runtimeKey));
+        logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_done", workspaceId, {
+          elapsedMs: job?.startedAtMs
+            ? Math.max(0, getWorkspaceActivationDiagnosticNowMs() - job.startedAtMs)
+            : 0,
+          mode: "background",
+          repoPath,
+          runtimeKey,
+          stale: !stillDesired,
+          workspaceName,
+        });
+        sharedMcpBackgroundJobsRef.current.delete(jobKey);
+        emitWorkspaceMcpRegistryUpdated({
+          jobKey,
+          jobType,
+          repoPath,
+          status,
+          workspaceId,
+          workspaceName,
+        });
+
+        if (!stillDesired && repoPath) {
+          invoke("coordination_deactivate_shared_mcp_daemon", {
+            repoPath,
+            reason: "workspace_activation_disposed",
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      if (status === "failed") {
+        logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_error", workspaceId, {
+          elapsedMs: job?.startedAtMs
+            ? Math.max(0, getWorkspaceActivationDiagnosticNowMs() - job.startedAtMs)
+            : 0,
+          message: error || "Unable to activate shared MCP daemon.",
+          mode: "background",
+          repoPath,
+          runtimeKey,
+          workspaceName,
+        });
+        if (runtimeKey && sharedMcpActiveRuntimeTargetsRef.current.get(runtimeKey) === job?.target) {
+          sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
+        }
+        sharedMcpBackgroundJobsRef.current.delete(jobKey);
+      }
+    })
+      .then((handler) => {
+        if (disposed) {
+          handler();
+        } else {
+          unlisten = handler;
+        }
+      })
+      .catch((error) => {
+        logBigViewSyncDiagnosticEvent("workspace_mcp.background_listener.failed", {
+          message: getErrorMessage(error, "Unable to listen for workspace MCP background jobs."),
+        });
+      });
+
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, [logWorkspaceActivationTrace]);
 
   const activeAccountScope = useMemo(() => {
     const requestedKey = accountScopeKey(activeScope);
@@ -12233,7 +12378,7 @@ export default function App() {
       scheduleWorkspaceMcpSync("workspace_mcp_registry_updated", 250);
     };
     window.addEventListener(
-      "diffforge:workspace-mcp-registry-updated",
+      WORKSPACE_MCP_REGISTRY_UPDATED_EVENT,
       handleWorkspaceMcpRegistryUpdated,
     );
     const intervalId = window.setInterval(
@@ -12247,7 +12392,7 @@ export default function App() {
         window.clearTimeout(syncTimer);
       }
       window.removeEventListener(
-        "diffforge:workspace-mcp-registry-updated",
+        WORKSPACE_MCP_REGISTRY_UPDATED_EVENT,
         handleWorkspaceMcpRegistryUpdated,
       );
       window.clearInterval(intervalId);
@@ -12439,13 +12584,24 @@ export default function App() {
           targetCount: targets.length,
           workspaceName: target.workspaceName,
         });
-        invoke("coordination_workspace_mcp_registry", {
+        invoke("coordination_workspace_mcp_registry_background", {
           repoPath: target.repoPath,
           workspaceId: target.workspaceId,
           workspaceName: target.workspaceName,
-        }).then(() => {
-          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.done", target.workspaceId, {
-            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+        }).then((response) => {
+          const responseData = response?.data || response || {};
+          const jobKey = String(responseData.jobKey || responseData.job_key || target.key).trim();
+          if (jobKey) {
+            workspaceMcpStartupIndexJobsRef.current.set(jobKey, {
+              startedAtMs,
+              targetKey: target.key,
+            });
+          }
+          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.queued", target.workspaceId, {
+            inFlight: responseData.inFlight ?? responseData.in_flight ?? false,
+            jobKey,
+            mode: "background",
+            queued: responseData.queued !== false,
             repoPath: target.repoPath,
             targetCount: targets.length,
             workspaceName: target.workspaceName,
@@ -12532,31 +12688,39 @@ export default function App() {
       });
 
       withTimeout(
-        invoke("coordination_activate_shared_mcp_daemon", {
+        invoke("coordination_activate_shared_mcp_daemon_background", {
           repoPath: target.repoPath,
           workspaceId: target.workspaceId,
           workspaceName: target.workspaceName,
         }),
         WORKSPACE_SHARED_MCP_TIMEOUT_MS,
-        "Shared MCP activation timed out.",
+        "Shared MCP activation queue timed out.",
       )
-        .then(() => {
-          logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_done", target.workspaceId, {
-            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+        .then((response) => {
+          const responseData = response?.data || response || {};
+          const jobKey = String(responseData.jobKey || responseData.job_key || runtimeKey).trim();
+          if (jobKey) {
+            sharedMcpBackgroundJobsRef.current.set(jobKey, {
+              runtimeKey,
+              startedAtMs,
+              target,
+            });
+          }
+          logWorkspaceActivationTrace("workspace.open.shared_mcp.queued", target.workspaceId, {
+            inFlight: responseData.inFlight ?? responseData.in_flight ?? false,
+            jobKey,
+            mode: "background",
+            queued: responseData.queued !== false,
             repoPath: target.repoPath,
             runtimeKey,
             workspaceName: target.workspaceName,
           });
-          if (!sharedMcpActiveRuntimeTargetsRef.current.has(runtimeKey)) {
-            invoke("coordination_deactivate_shared_mcp_daemon", {
-              repoPath: target.repoPath,
-              reason: "workspace_activation_disposed",
-            }).catch(() => {});
-          }
         })
-        .catch(() => {
+        .catch((error) => {
           logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_error", target.workspaceId, {
             elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            message: getErrorMessage(error, "Unable to queue shared MCP activation."),
+            mode: "background",
             repoPath: target.repoPath,
             runtimeKey,
             workspaceName: target.workspaceName,
