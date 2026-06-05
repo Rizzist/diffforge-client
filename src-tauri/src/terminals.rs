@@ -1220,8 +1220,8 @@ struct WorkspaceGitBootstrapFlight {
     future: Shared<BoxFuture<'static, WorkspaceGitBootstrapResult>>,
 }
 
-fn workspace_git_bootstrap_flights(
-) -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
+fn workspace_git_bootstrap_flights()
+-> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
     static FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>>> =
         OnceLock::new();
     FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -1535,11 +1535,15 @@ fn terminal_raw_scan_cached_folder_trace(
     )];
 
     for mount in mounts {
-        let relative_path = child_relative_path(&workspace_root, &mount.root_path).unwrap_or_default();
+        let relative_path =
+            child_relative_path(&workspace_root, &mount.root_path).unwrap_or_default();
         if relative_path.is_empty() {
             continue;
         }
-        let depth = relative_path.split('/').filter(|part| !part.is_empty()).count();
+        let depth = relative_path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .count();
         entries.push(terminal_raw_scan_folder_row(
             &workspace_root,
             &mount.root_path,
@@ -1580,11 +1584,11 @@ fn terminal_raw_scan_launch_targets(
         match terminal_coordination_launch_target_with_mounts(
             workspace_root,
             Some(mounts),
-                None,
-                None,
-                selected_root_empty_for_git_bootstrap,
-                mode,
-            ) {
+            None,
+            None,
+            selected_root_empty_for_git_bootstrap,
+            mode,
+        ) {
             Ok(target) => json!({
                 "sessionMode": mode.as_str(),
                 "fileAuthority": mode.file_authority(),
@@ -1624,8 +1628,10 @@ async fn terminal_workspace_raw_scan(
     .await;
     let workspace_kind = workspace_kind_for_mounts(&workspace_root, &topology.mounts);
     let active_project_root = workspace_active_project_root_for_mounts(&topology.mounts);
-    let workspace_mounts = workspace_mount_manifest_from_projects(&workspace_root, &topology.mounts);
-    let selected_root_mount = workspace_selected_root_mount(&workspace_root, &topology.mounts).cloned();
+    let workspace_mounts =
+        workspace_mount_manifest_from_projects(&workspace_root, &topology.mounts);
+    let selected_root_mount =
+        workspace_selected_root_mount(&workspace_root, &topology.mounts).cloned();
     let selected_project_kind = selected_root_mount
         .as_ref()
         .map(|mount| mount.project_kind.as_str())
@@ -1642,12 +1648,17 @@ async fn terminal_workspace_raw_scan(
     let launch_targets = terminal_raw_scan_launch_targets(&workspace_root, &topology.mounts, false);
     let folder_trace_root = workspace_root.clone();
     let folder_trace_mounts = topology.mounts.clone();
-    let folder_trace = terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts);
+    let folder_trace =
+        terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts);
     let generated_at_ms = terminal_now_ms();
     let cache_age_ms = generated_at_ms.saturating_sub(topology.scanned_ms);
     let cache_reason = match topology.cache_status {
-        "missing" => "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan; it only displays the cached topology captured during terminal launch.",
-        "stale_cached" => "The cached startup topology is older than the freshness window. Raw Scan is showing that stale cached topology without rescanning.",
+        "missing" => {
+            "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan; it only displays the cached topology captured during terminal launch."
+        }
+        "stale_cached" => {
+            "The cached startup topology is older than the freshness window. Raw Scan is showing that stale cached topology without rescanning."
+        }
         "hit" => "Fresh startup topology cache captured during terminal launch.",
         _ => "Raw Scan is showing the current workspace topology cache without rescanning.",
     };
@@ -1902,9 +1913,7 @@ fn workspace_git_status_kind(code: &str) -> &'static str {
     if code == "??" {
         return "untracked";
     }
-    if [index, worktree]
-        .iter()
-        .any(|value| matches!(*value, b'U'))
+    if [index, worktree].iter().any(|value| matches!(*value, b'U'))
         || matches!((index, worktree), (b'A', b'A') | (b'D', b'D'))
     {
         return "conflicted";
@@ -2071,7 +2080,10 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
                     if status.is_empty() || path.is_empty() {
                         return None;
                     }
-                    let old_path = parts.next().map(str::trim).filter(|value| !value.is_empty());
+                    let old_path = parts
+                        .next()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
                     Some(json!({
                         "status": status,
                         "path": normalize_git_status_path(path),
@@ -2122,7 +2134,10 @@ fn workspace_git_discovered_repositories(
     repos.sort_by(|left, right| {
         child_relative_path(workspace_root, left)
             .unwrap_or_else(|| workspace_path_display(left))
-            .cmp(&child_relative_path(workspace_root, right).unwrap_or_else(|| workspace_path_display(right)))
+            .cmp(
+                &child_relative_path(workspace_root, right)
+                    .unwrap_or_else(|| workspace_path_display(right)),
+            )
     });
     repos
 }
@@ -2168,7 +2183,10 @@ fn workspace_git_fetch(root: &Path) -> Result<String, String> {
         Duration::from_secs(60),
     )?;
     if capture.exit_code == Some(0) {
-        return Ok(workspace_git_limited_output(&capture.stdout, &capture.stderr));
+        return Ok(workspace_git_limited_output(
+            &capture.stdout,
+            &capture.stderr,
+        ));
     }
     let output = workspace_git_limited_output(&capture.stdout, &capture.stderr);
     if output.trim().is_empty() {
@@ -2206,7 +2224,9 @@ fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> V
     } else if !operation_clean {
         format!(
             "Repository is in {} state.",
-            operation_state["state"].as_str().unwrap_or("an active operation")
+            operation_state["state"]
+                .as_str()
+                .unwrap_or("an active operation")
         )
     } else if dirty {
         "Working tree has local changes.".to_string()
@@ -2223,7 +2243,10 @@ fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> V
     } else if behind == 0 {
         "Already up to date.".to_string()
     } else {
-        format!("Behind upstream by {behind} commit{}.", if behind == 1 { "" } else { "s" })
+        format!(
+            "Behind upstream by {behind} commit{}.",
+            if behind == 1 { "" } else { "s" }
+        )
     };
 
     json!({
@@ -2407,7 +2430,9 @@ fn workspace_git_generated_commit_message(root: &Path) -> Value {
     }
     let added = files
         .iter()
-        .filter(|file| file["kind"].as_str() == Some("added") || file["kind"].as_str() == Some("untracked"))
+        .filter(|file| {
+            file["kind"].as_str() == Some("added") || file["kind"].as_str() == Some("untracked")
+        })
         .count();
     let deleted = files
         .iter()
@@ -2484,7 +2509,8 @@ async fn workspace_git_pull_candidates(
         .await
     };
     if !force_refresh && topology.cache_status == "missing" {
-        topology = terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
+        topology =
+            terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
     }
     let cache = json!({
         "key": topology.cache_key,
@@ -2510,8 +2536,7 @@ async fn workspace_git_pull_candidates(
     let blocked_count = repositories
         .iter()
         .filter(|repo| {
-            repo["behind"].as_u64().unwrap_or(0) > 0
-                && !repo["pullable"].as_bool().unwrap_or(false)
+            repo["behind"].as_u64().unwrap_or(0) > 0 && !repo["pullable"].as_bool().unwrap_or(false)
         })
         .count();
     let repository_count = repositories.len();
@@ -2617,11 +2642,8 @@ async fn workspace_git_file_diff(
         }
         args.push("--".to_string());
         args.push(relative_path.clone());
-        let capture = workspace_git_run_owned(
-            &root,
-            args,
-            Duration::from_secs(GIT_DIFF_TIMEOUT_SECS),
-        )?;
+        let capture =
+            workspace_git_run_owned(&root, args, Duration::from_secs(GIT_DIFF_TIMEOUT_SECS))?;
         ensure_git_success(&capture, "git diff")?;
         let (diff, truncated) = truncate_workspace_diff(capture.stdout);
         Ok(json!({
@@ -2672,7 +2694,9 @@ async fn workspace_git_commit_and_push(
         if !operation_state["clean"].as_bool().unwrap_or(false) {
             return Err(format!(
                 "Cannot commit while repository is in {} state.",
-                operation_state["state"].as_str().unwrap_or("an active operation")
+                operation_state["state"]
+                    .as_str()
+                    .unwrap_or("an active operation")
             ));
         }
         let before_files = workspace_git_status_files(&root);
@@ -2715,7 +2739,11 @@ async fn workspace_git_commit_and_push(
                     .iter()
                     .any(|remote| remote["name"].as_str() == Some("origin"));
                 if has_origin {
-                    run_git_for_workspace(&root, &["push", "-u", "origin", "HEAD"], Duration::from_secs(120))
+                    run_git_for_workspace(
+                        &root,
+                        &["push", "-u", "origin", "HEAD"],
+                        Duration::from_secs(120),
+                    )
                 } else {
                     Err("No upstream branch or origin remote is configured.".to_string())
                 }
@@ -2810,7 +2838,8 @@ fn terminal_coordination_launch_target_with_mounts(
         )?,
         TerminalSessionMode::General => {
             if !requested_target {
-                let selected_root = workspace_selected_root_mount(&workspace_root_canonical, mounts);
+                let selected_root =
+                    workspace_selected_root_mount(&workspace_root_canonical, mounts);
                 let project_count = mounts
                     .iter()
                     .filter(|mount| mount.mount_kind == "project")
@@ -3149,8 +3178,10 @@ async fn prepare_terminal_coordination_launch(
                         "slotKey": context.slot_key.clone(),
                     })
                 };
-                let process_working_directory =
-                    terminal_process_working_directory_for_context(&context, &discovery_working_directory);
+                let process_working_directory = terminal_process_working_directory_for_context(
+                    &context,
+                    &discovery_working_directory,
+                );
                 Ok((context, launch_worktree, process_working_directory))
             }
             Err(error) => Err(format!(
@@ -3163,15 +3194,53 @@ async fn prepare_terminal_coordination_launch(
     task_result
 }
 
+fn terminal_output_transport_key(pane_id: &str, instance_id: u64) -> String {
+    format!("{pane_id}:{instance_id}")
+}
+
+fn send_terminal_output_transport_frame(
+    subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    pane_id: &str,
+    instance_id: u64,
+    chunk: &[u8],
+) -> bool {
+    if chunk.is_empty() {
+        return true;
+    }
+
+    let key = terminal_output_transport_key(pane_id, instance_id);
+    let mut sent = false;
+    let Ok(mut subscribers_by_terminal) = subscribers.lock() else {
+        return false;
+    };
+    let Some(terminal_subscribers) = subscribers_by_terminal.get_mut(&key) else {
+        return false;
+    };
+
+    terminal_subscribers.retain(|subscriber| {
+        let ok = subscriber.sender.send(chunk.to_vec()).is_ok();
+        sent = sent || ok;
+        ok
+    });
+    if terminal_subscribers.is_empty() {
+        subscribers_by_terminal.remove(&key);
+    }
+
+    sent
+}
+
 fn spawn_terminal_reader(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     cleanup_tracker: Arc<TerminalCleanupTracker>,
+    output_subscribers: Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     pane_id: String,
     instance_id: u64,
     headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     cloud_mcp_state: CloudMcpState,
     output_channel: Channel<InvokeResponseBody>,
+    prefer_output_transport: bool,
+    cloud_output_observer_enabled: bool,
     mut reader: Box<dyn Read + Send>,
 ) {
     fn send_terminal_output_frame(
@@ -3181,30 +3250,42 @@ fn spawn_terminal_reader(
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
         output_channel: &Channel<InvokeResponseBody>,
+        output_subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+        prefer_output_transport: bool,
+        cloud_output_observer_enabled: bool,
     ) -> (bool, f64, f64) {
         if chunk.is_empty() {
             return (true, 0.0, 0.0);
         }
 
         let observe_started_at = Instant::now();
-        let observer_app = app.clone();
-        let observer_state = cloud_mcp_state.clone();
-        let observer_pane_id = pane_id.to_string();
-        let observer_chunk = chunk.clone();
-        tauri::async_runtime::spawn(async move {
-            cloud_mcp_observe_terminal_output(
-                observer_app,
-                observer_state,
-                &observer_pane_id,
-                instance_id,
-                &observer_chunk,
-            )
-            .await;
-        });
+        if cloud_output_observer_enabled {
+            let observer_app = app.clone();
+            let observer_state = cloud_mcp_state.clone();
+            let observer_pane_id = pane_id.to_string();
+            let observer_chunk = chunk.clone();
+            tauri::async_runtime::spawn(async move {
+                cloud_mcp_observe_terminal_output(
+                    observer_app,
+                    observer_state,
+                    &observer_pane_id,
+                    instance_id,
+                    &observer_chunk,
+                )
+                .await;
+            });
+        }
         let observe_schedule_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
 
         let send_started_at = Instant::now();
-        let sent = output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok();
+        let transport_sent =
+            send_terminal_output_transport_frame(output_subscribers, pane_id, instance_id, &chunk);
+        let channel_sent = if prefer_output_transport && transport_sent {
+            true
+        } else {
+            output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
+        };
+        let sent = transport_sent || channel_sent;
         (
             sent,
             terminal_diagnostic_elapsed_ms(send_started_at),
@@ -3236,6 +3317,7 @@ fn spawn_terminal_reader(
         let output_app = app.clone();
         let output_cloud_mcp_state = cloud_mcp_state.clone();
         let output_pane_id = reader_pane_id.clone();
+        let output_subscribers = Arc::clone(&output_subscribers);
         let output_sender_handle = thread::spawn(move || {
             let coalesce_window = Duration::from_millis(TERMINAL_OUTPUT_COALESCE_WINDOW_MS);
             let mut pending = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
@@ -3325,6 +3407,9 @@ fn spawn_terminal_reader(
                     instance_id,
                     &output_cloud_mcp_state,
                     &output_channel,
+                    &output_subscribers,
+                    prefer_output_transport,
+                    cloud_output_observer_enabled,
                 );
                 let coalesced_ms = terminal_diagnostic_elapsed_ms(frame_started_at);
                 forensics_frames += 1;
@@ -4249,6 +4334,7 @@ async fn terminal_open(
     let terminal_index = request.terminal_index;
     let thread_id = request.thread_id;
     let requested_slot_key = request.slot_key;
+    let prefer_output_transport = request.output_transport.unwrap_or(false);
     let terminal_slot_key =
         terminal_slot_key_from_request(&pane_id, terminal_index, requested_slot_key.as_deref())?;
     let is_prewarm_pty = is_terminal_prewarm_kind(&kind);
@@ -4283,6 +4369,7 @@ async fn terminal_open(
                 .as_deref()
                 .map(clean_terminal_diagnostic_log_text),
             "workspace_root_was_empty_at_selection": workspace_root_was_empty_at_selection,
+            "output_transport": prefer_output_transport,
         }),
     );
 
@@ -4589,20 +4676,27 @@ async fn terminal_open(
         );
     }
 
+    let cloud_output_observer_enabled = !cloud_mcp_agent_uses_activity_hooks(
+        &terminal_metadata_for_log.agent_id,
+    ) && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
         Arc::clone(&state.cleanup_tracker),
+        Arc::clone(&state.terminal_output_transport_subscribers),
         pane_id.clone(),
         instance_id,
         headless_output,
         cloud_mcp_state.inner().clone(),
         output_channel,
+        prefer_output_transport,
+        cloud_output_observer_enabled,
         reader,
     );
     spawn_terminal_activity_hook_watcher(
         app.clone(),
         Arc::clone(&state.terminals),
+        cloud_mcp_state.inner().clone(),
         pane_id.clone(),
         instance_id,
     );
@@ -7895,8 +7989,7 @@ fn terminal_activity_hook_bool(event: &Value, keys: &[&str]) -> bool {
 }
 
 fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
-    terminal_activity_hook_string(event, keys)
-        .map(|value| terminal_activity_hook_name_key(&value))
+    terminal_activity_hook_string(event, keys).map(|value| terminal_activity_hook_name_key(&value))
 }
 
 #[derive(Debug, Clone)]
@@ -7925,13 +8018,16 @@ fn terminal_activity_hook_manual_prompt(
             | "userpromptrequired"
             | "userpromptstarted"
     );
-    let resolved_decision = terminal_activity_hook_status_key(event, &[
-        "permissionDecision",
-        "permission_decision",
-        "decision",
-        "approvalDecision",
-        "approval_decision",
-    ])
+    let resolved_decision = terminal_activity_hook_status_key(
+        event,
+        &[
+            "permissionDecision",
+            "permission_decision",
+            "decision",
+            "approvalDecision",
+            "approval_decision",
+        ],
+    )
     .is_some_and(|status| {
         matches!(
             status.as_str(),
@@ -7952,13 +8048,16 @@ fn terminal_activity_hook_manual_prompt(
                 | "rejected"
         )
     });
-    let resolved_status = terminal_activity_hook_status_key(event, &[
-        "permissionStatus",
-        "permission_status",
-        "approvalStatus",
-        "approval_status",
-        "status",
-    ])
+    let resolved_status = terminal_activity_hook_status_key(
+        event,
+        &[
+            "permissionStatus",
+            "permission_status",
+            "approvalStatus",
+            "approval_status",
+            "status",
+        ],
+    )
     .is_some_and(|status| {
         matches!(
             status.as_str(),
@@ -7984,13 +8083,16 @@ fn terminal_activity_hook_manual_prompt(
         return None;
     }
 
-    let pending_status = terminal_activity_hook_status_key(event, &[
-        "permissionStatus",
-        "permission_status",
-        "approvalStatus",
-        "approval_status",
-        "status",
-    ])
+    let pending_status = terminal_activity_hook_status_key(
+        event,
+        &[
+            "permissionStatus",
+            "permission_status",
+            "approvalStatus",
+            "approval_status",
+            "status",
+        ],
+    )
     .is_some_and(|status| {
         matches!(
             status.as_str(),
@@ -8013,31 +8115,30 @@ fn terminal_activity_hook_manual_prompt(
     });
     let explicit_pending = manual_event
         || pending_status
-        || terminal_activity_hook_bool(event, &[
-            "manualApprovalRequired",
-            "manual_approval_required",
-            "providerBlockedForUser",
-            "provider_blocked_for_user",
-            "requiresUserInput",
-            "requires_user_input",
-            "terminalIsPromptingUser",
-            "terminal_is_prompting_user",
-            "promptingUser",
-            "prompting_user",
-        ]);
+        || terminal_activity_hook_bool(
+            event,
+            &[
+                "manualApprovalRequired",
+                "manual_approval_required",
+                "providerBlockedForUser",
+                "provider_blocked_for_user",
+                "requiresUserInput",
+                "requires_user_input",
+                "terminalIsPromptingUser",
+                "terminal_is_prompting_user",
+                "promptingUser",
+                "prompting_user",
+            ],
+        );
     if !explicit_pending {
         return None;
     }
 
     let approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
-    let permission_prompt_id = terminal_activity_hook_string(event, &[
-        "permissionPromptId",
-        "permission_prompt_id",
-    ]);
-    let permission_request_id = terminal_activity_hook_string(event, &[
-        "permissionRequestId",
-        "permission_request_id",
-    ]);
+    let permission_prompt_id =
+        terminal_activity_hook_string(event, &["permissionPromptId", "permission_prompt_id"]);
+    let permission_request_id =
+        terminal_activity_hook_string(event, &["permissionRequestId", "permission_request_id"]);
     let tool_use_id = terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]);
     let has_action_token = approval_id.is_some()
         || permission_prompt_id.is_some()
@@ -8047,34 +8148,42 @@ fn terminal_activity_hook_manual_prompt(
         return None;
     }
 
-    let kind = terminal_activity_hook_string(event, &[
-        "promptingUserKind",
-        "prompting_user_kind",
-        "promptingKind",
-        "prompting_kind",
-    ])
+    let kind = terminal_activity_hook_string(
+        event,
+        &[
+            "promptingUserKind",
+            "prompting_user_kind",
+            "promptingKind",
+            "prompting_kind",
+        ],
+    )
     .map(|value| terminal_activity_hook_name_key(&value))
     .filter(|value| matches!(value.as_str(), "approval" | "permission"))
     .unwrap_or_else(|| {
-        if terminal_activity_hook_bool(event, &["manualApprovalRequired", "manual_approval_required"])
-            || hook_key.contains("approval")
+        if terminal_activity_hook_bool(
+            event,
+            &["manualApprovalRequired", "manual_approval_required"],
+        ) || hook_key.contains("approval")
         {
             "approval".to_string()
         } else {
             "permission".to_string()
         }
     });
-    let text = terminal_activity_hook_string(event, &[
-        "promptingUserText",
-        "prompting_user_text",
-        "promptingText",
-        "prompting_text",
-        "description",
-        "message",
-        "prompt",
-        "lastMessage",
-        "last_message",
-    ]);
+    let text = terminal_activity_hook_string(
+        event,
+        &[
+            "promptingUserText",
+            "prompting_user_text",
+            "promptingText",
+            "prompting_text",
+            "description",
+            "message",
+            "prompt",
+            "lastMessage",
+            "last_message",
+        ],
+    );
 
     Some(TerminalActivityHookManualPrompt {
         kind,
@@ -8085,7 +8194,9 @@ fn terminal_activity_hook_manual_prompt(
     })
 }
 
-fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
+fn terminal_activity_hook_lifecycle_kind(
+    hook_event_name: &str,
+) -> Option<(&'static str, &'static str, &'static str, &'static str, bool)> {
     match terminal_activity_hook_name_key(hook_event_name).as_str() {
         "userpromptsubmit" | "userpromptsubmitted" | "promptsubmit" | "promptsubmitted" => Some((
             "provider-turn-started",
@@ -8101,13 +8212,9 @@ fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'sta
             "completed",
             true,
         )),
-        "error" | "turnerror" | "assistantturnerror" => Some((
-            "provider-turn-error",
-            "error",
-            "error",
-            "failed",
-            true,
-        )),
+        "error" | "turnerror" | "assistantturnerror" => {
+            Some(("provider-turn-error", "error", "error", "failed", true))
+        }
         "interrupt"
         | "interrupted"
         | "turninterrupt"
@@ -8127,8 +8234,8 @@ fn terminal_activity_hook_lifecycle_kind(hook_event_name: &str) -> Option<(&'sta
 }
 
 fn terminal_activity_hook_tool_activity_status(event: &Value) -> &'static str {
-    let tool_name = terminal_activity_hook_string(event, &["toolName", "tool_name"])
-        .unwrap_or_default();
+    let tool_name =
+        terminal_activity_hook_string(event, &["toolName", "tool_name"]).unwrap_or_default();
     let tool_key = terminal_activity_hook_name_key(&tool_name);
     if tool_key.contains("mcp") {
         return "mcp";
@@ -8213,7 +8320,15 @@ fn terminal_activity_hook_payload(
     instance: &TerminalInstance,
     event: &Value,
 ) -> Option<TerminalActivityHookPayload> {
-    let hook_event_name = terminal_activity_hook_string(event, &["hookEventName", "hook_event_name", "eventName", "event_name"])?;
+    let hook_event_name = terminal_activity_hook_string(
+        event,
+        &[
+            "hookEventName",
+            "hook_event_name",
+            "eventName",
+            "event_name",
+        ],
+    )?;
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
     let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
         if manual_prompt.is_some() {
@@ -8266,29 +8381,41 @@ fn terminal_activity_hook_payload(
         .unwrap_or_else(|| metadata.agent_kind.clone());
     let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"]);
     let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
-    let user_message = terminal_activity_hook_string(event, &[
-        "prompt",
-        "userPrompt",
-        "user_prompt",
-        "message",
-        "description",
-        "lastMessage",
-        "last_message",
-    ]);
+    let user_message = terminal_activity_hook_string(
+        event,
+        &[
+            "prompt",
+            "userPrompt",
+            "user_prompt",
+            "message",
+            "description",
+            "lastMessage",
+            "last_message",
+        ],
+    );
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
-    let permission_mode = terminal_activity_hook_string(event, &["permissionMode", "permission_mode"]);
+    let permission_mode =
+        terminal_activity_hook_string(event, &["permissionMode", "permission_mode"]);
     let manual_prompt_source = manual_prompt.as_ref().map(|_| "hook".to_string());
     let manual_approval_required = manual_prompt
         .as_ref()
         .is_some_and(|prompt| prompt.kind == "approval")
-        || terminal_activity_hook_bool(event, &["manualApprovalRequired", "manual_approval_required"]);
+        || terminal_activity_hook_bool(
+            event,
+            &["manualApprovalRequired", "manual_approval_required"],
+        );
     let provider_blocked_for_user = manual_prompt.is_some()
-        || terminal_activity_hook_bool(event, &["providerBlockedForUser", "provider_blocked_for_user"]);
+        || terminal_activity_hook_bool(
+            event,
+            &["providerBlockedForUser", "provider_blocked_for_user"],
+        );
     let terminal_is_prompting_user = manual_prompt.is_some();
     let prompting_user_kind = manual_prompt.as_ref().map(|prompt| prompt.kind.clone());
-    let prompting_user_text = manual_prompt.as_ref().and_then(|prompt| prompt.text.clone());
+    let prompting_user_text = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.text.clone());
     let approval_id = manual_prompt
         .as_ref()
         .and_then(|prompt| prompt.approval_id.clone());
@@ -8327,7 +8454,10 @@ fn terminal_activity_hook_payload(
         native_session_id: provider_session_id,
         provider_turn_id: provider_turn_id.clone(),
         turn_id: provider_turn_id,
-        transcript_path: terminal_activity_hook_string(event, &["transcriptPath", "transcript_path"]),
+        transcript_path: terminal_activity_hook_string(
+            event,
+            &["transcriptPath", "transcript_path"],
+        ),
         cwd: terminal_activity_hook_string(event, &["cwd"]),
         user_message: user_message.clone(),
         message: user_message,
@@ -8402,6 +8532,7 @@ async fn read_terminal_activity_hook_chunk(
 fn spawn_terminal_activity_hook_watcher(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: CloudMcpState,
     pane_id: String,
     instance_id: u64,
 ) {
@@ -8450,15 +8581,24 @@ fn spawn_terminal_activity_hook_watcher(
                             else {
                                 let hook_event_name = terminal_activity_hook_string(
                                     &event,
-                                    &["hookEventName", "hook_event_name", "eventName", "event_name"],
+                                    &[
+                                        "hookEventName",
+                                        "hook_event_name",
+                                        "eventName",
+                                        "event_name",
+                                    ],
                                 )
                                 .unwrap_or_default();
-                                if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
+                                if terminal_activity_hook_non_lifecycle_is_expected(
+                                    &hook_event_name,
+                                ) {
                                     continue;
                                 }
                                 let event_keys = event
                                     .as_object()
-                                    .map(|object| object.keys().take(16).cloned().collect::<Vec<_>>())
+                                    .map(|object| {
+                                        object.keys().take(16).cloned().collect::<Vec<_>>()
+                                    })
                                     .unwrap_or_default();
                                 log_terminal_status_event(
                                     "backend.terminal_activity_hook.unmapped",
@@ -8491,6 +8631,15 @@ fn spawn_terminal_activity_hook_watcher(
                                     "workspace_id": payload.workspace_id.clone(),
                                 }),
                             );
+                            let cloud_payload = payload.clone();
+                            let cloud_state = cloud_mcp_state.clone();
+                            tauri::async_runtime::spawn(async move {
+                                cloud_mcp_sync_terminal_activity_hook_delta(
+                                    &cloud_state,
+                                    &cloud_payload,
+                                )
+                                .await;
+                            });
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
                         }
                     }
@@ -8708,12 +8857,7 @@ fn enqueue_terminal_input_queue_item(
 
     if payload.data.len() > MAX_TERMINAL_WRITE_BYTES {
         let error = "Terminal input chunk is too large.".to_string();
-        emit_terminal_input_error(
-            app,
-            pane_id,
-            instance_id,
-            error.clone(),
-        );
+        emit_terminal_input_error(app, pane_id, instance_id, error.clone());
         send_terminal_input_queue_ack(ack, Err(error));
         return;
     }
@@ -8747,12 +8891,7 @@ fn enqueue_terminal_input_queue_item(
             }
             Err(_) => {
                 let error = "Unable to queue terminal input.".to_string();
-                emit_terminal_input_error(
-                    app,
-                    pane_id,
-                    instance_id,
-                    error.clone(),
-                );
+                emit_terminal_input_error(app, pane_id, instance_id, error.clone());
                 send_terminal_input_queue_ack(item.ack, Err(error));
                 return;
             }
@@ -8762,12 +8901,7 @@ fn enqueue_terminal_input_queue_item(
             Ok(()) => return,
             Err(mpsc::error::TrySendError::Full(returned_item)) => {
                 let error = "Terminal input queue is full.".to_string();
-                emit_terminal_input_error(
-                    app,
-                    pane_id,
-                    instance_id,
-                    error.clone(),
-                );
+                emit_terminal_input_error(app, pane_id, instance_id, error.clone());
                 send_terminal_input_queue_ack(returned_item.ack, Err(error));
                 return;
             }
@@ -8826,6 +8960,46 @@ async fn terminal_input_transport_endpoint(
     Ok(endpoint)
 }
 
+#[tauri::command]
+async fn terminal_output_transport_endpoint(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+) -> Result<TerminalOutputTransportEndpoint, String> {
+    if let Ok(transport) = state.terminal_output_transport.lock() {
+        if let Some(endpoint) = transport.clone() {
+            return Ok(endpoint);
+        }
+    } else {
+        return Err("Unable to read terminal output transport.".to_string());
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("Unable to start terminal output transport: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Unable to read terminal output transport address: {error}"))?
+        .port();
+    let endpoint = TerminalOutputTransportEndpoint {
+        url: format!("ws://127.0.0.1:{port}/terminal-output"),
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+
+    {
+        let mut transport = state
+            .terminal_output_transport
+            .lock()
+            .map_err(|_| "Unable to save terminal output transport.".to_string())?;
+        if let Some(existing) = transport.clone() {
+            return Ok(existing);
+        }
+        *transport = Some(endpoint.clone());
+    }
+
+    spawn_terminal_output_transport_listener(app, listener, endpoint.token.clone());
+    Ok(endpoint)
+}
+
 fn spawn_terminal_input_transport_listener(
     app: AppHandle,
     listener: TcpListener,
@@ -8840,6 +9014,25 @@ fn spawn_terminal_input_transport_listener(
             let token = expected_token.clone();
             tauri::async_runtime::spawn(async move {
                 handle_terminal_input_transport_connection(app_handle, stream, token).await;
+            });
+        }
+    });
+}
+
+fn spawn_terminal_output_transport_listener(
+    app: AppHandle,
+    listener: TcpListener,
+    expected_token: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let app_handle = app.clone();
+            let token = expected_token.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_terminal_output_transport_connection(app_handle, stream, token).await;
             });
         }
     });
@@ -8905,6 +9098,128 @@ async fn handle_terminal_input_transport_connection(
             Ok(_) => {}
             Err(_) => break,
         }
+    }
+}
+
+async fn handle_terminal_output_transport_connection(
+    app: AppHandle,
+    stream: TcpStream,
+    expected_token: String,
+) {
+    let Ok(mut socket) = accept_async(stream).await else {
+        return;
+    };
+
+    let subscribe_text = loop {
+        let Some(message) = socket.next().await else {
+            return;
+        };
+        match message {
+            Ok(Message::Text(text)) => break text.to_string(),
+            Ok(Message::Binary(bytes)) => {
+                let Ok(text) = std::str::from_utf8(bytes.as_ref()) else {
+                    continue;
+                };
+                break text.to_string();
+            }
+            Ok(Message::Ping(payload)) => {
+                let _ = socket.send(Message::Pong(payload)).await;
+            }
+            Ok(Message::Close(_)) | Err(_) => return,
+            Ok(_) => {}
+        }
+    };
+
+    if subscribe_text.len() > MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES {
+        let _ = socket.close(None).await;
+        return;
+    }
+
+    let Ok(subscribe) = serde_json::from_str::<TerminalOutputTransportSubscribe>(&subscribe_text)
+    else {
+        let _ = socket.close(None).await;
+        return;
+    };
+
+    if subscribe.token != expected_token || subscribe.r#type != "subscribe" {
+        let _ = socket.close(None).await;
+        return;
+    }
+    if validate_terminal_pane_id(&subscribe.pane_id).is_err() || subscribe.instance_id == 0 {
+        let _ = socket.close(None).await;
+        return;
+    }
+
+    let state = app.state::<TerminalState>();
+    let subscriber_id = state
+        .next_terminal_output_subscriber_id
+        .fetch_add(1, Ordering::Relaxed);
+    let key = terminal_output_transport_key(&subscribe.pane_id, subscribe.instance_id);
+    let (sender, mut receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    {
+        let Ok(mut subscribers) = state.terminal_output_transport_subscribers.lock() else {
+            let _ = socket.close(None).await;
+            return;
+        };
+        subscribers
+            .entry(key.clone())
+            .or_default()
+            .push(TerminalOutputTransportSubscriber {
+                id: subscriber_id,
+                sender,
+            });
+    }
+
+    let ready_message = json!({
+        "type": "ready",
+        "id": subscribe.id.as_deref().unwrap_or_default(),
+        "paneId": subscribe.pane_id,
+        "instanceId": subscribe.instance_id,
+    });
+    if socket
+        .send(Message::Text(ready_message.to_string().into()))
+        .await
+        .is_err()
+    {
+        remove_terminal_output_transport_subscriber(&state, &key, subscriber_id);
+        return;
+    }
+
+    let (mut writer, mut reader) = socket.split();
+    let writer_task = tauri::async_runtime::spawn(async move {
+        while let Some(bytes) = receiver.recv().await {
+            if writer.send(Message::Binary(bytes.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+
+    writer_task.abort();
+    remove_terminal_output_transport_subscriber(&state, &key, subscriber_id);
+}
+
+fn remove_terminal_output_transport_subscriber(
+    state: &TerminalState,
+    key: &str,
+    subscriber_id: u64,
+) {
+    let Ok(mut subscribers) = state.terminal_output_transport_subscribers.lock() else {
+        return;
+    };
+    let Some(terminal_subscribers) = subscribers.get_mut(key) else {
+        return;
+    };
+    terminal_subscribers.retain(|subscriber| subscriber.id != subscriber_id);
+    if terminal_subscribers.is_empty() {
+        subscribers.remove(key);
     }
 }
 
@@ -10657,8 +10972,12 @@ mod terminal_tests {
     #[test]
     fn provider_turn_completion_reconciliation_requires_explicit_opt_in() {
         assert!(!terminal_provider_turn_should_reconcile_coordination(None));
-        assert!(!terminal_provider_turn_should_reconcile_coordination(Some(false)));
-        assert!(terminal_provider_turn_should_reconcile_coordination(Some(true)));
+        assert!(!terminal_provider_turn_should_reconcile_coordination(Some(
+            false
+        )));
+        assert!(terminal_provider_turn_should_reconcile_coordination(Some(
+            true
+        )));
     }
 
     fn terminal_test_repo(name: &str) -> PathBuf {
@@ -11169,8 +11488,8 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected(
-    ) {
+    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected()
+     {
         let container = terminal_test_directory("general_multi_repo_container");
         let frontend = container.join("frontend");
         let backend = container.join("backend");
@@ -11660,7 +11979,10 @@ mod terminal_tests {
             ))
         );
         assert_eq!(
-            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "apply_patch" })),
+            terminal_activity_hook_activity_kind(
+                "PreToolUse",
+                &json!({ "toolName": "apply_patch" })
+            ),
             Some((
                 "provider-tool-started",
                 "editing",
@@ -11671,7 +11993,10 @@ mod terminal_tests {
             ))
         );
         assert_eq!(
-            terminal_activity_hook_activity_kind("PreToolUse", &json!({ "toolName": "mcp__github__get_issue" })),
+            terminal_activity_hook_activity_kind(
+                "PreToolUse",
+                &json!({ "toolName": "mcp__github__get_issue" })
+            ),
             Some((
                 "provider-tool-started",
                 "mcp",
@@ -11714,10 +12039,18 @@ mod terminal_tests {
                 "cli_hook_subagent_complete"
             ))
         );
-        assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStop"));
-        assert!(terminal_activity_hook_non_lifecycle_is_expected("SubagentStart"));
-        assert!(terminal_activity_hook_non_lifecycle_is_expected("PreToolUse"));
-        assert!(terminal_activity_hook_non_lifecycle_is_expected("PostToolUse"));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected(
+            "SubagentStop"
+        ));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected(
+            "SubagentStart"
+        ));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected(
+            "PreToolUse"
+        ));
+        assert!(terminal_activity_hook_non_lifecycle_is_expected(
+            "PostToolUse"
+        ));
         assert!(!terminal_activity_hook_non_lifecycle_is_expected("Stop"));
     }
 
@@ -11737,24 +12070,28 @@ mod terminal_tests {
         assert_eq!(prompt.kind, "approval");
         assert_eq!(prompt.text.as_deref(), Some("Approve this edit?"));
 
-        assert!(terminal_activity_hook_manual_prompt(
-            "PreToolUse",
-            &json!({
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "toolUseId": "tool-auto",
-                "promptingUserKind": "approval"
-            }),
-        )
-        .is_none());
-        assert!(terminal_activity_hook_manual_prompt(
-            "PreToolUse",
-            &json!({
-                "hookEventName": "PreToolUse",
-                "toolUseId": "tool-observed"
-            }),
-        )
-        .is_none());
+        assert!(
+            terminal_activity_hook_manual_prompt(
+                "PreToolUse",
+                &json!({
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "toolUseId": "tool-auto",
+                    "promptingUserKind": "approval"
+                }),
+            )
+            .is_none()
+        );
+        assert!(
+            terminal_activity_hook_manual_prompt(
+                "PreToolUse",
+                &json!({
+                    "hookEventName": "PreToolUse",
+                    "toolUseId": "tool-observed"
+                }),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -11951,41 +12288,51 @@ mod terminal_tests {
             42,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--ask-for-approval", "never"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--profile", "diffforge-test-profile"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-hook-trust")
+        );
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
         assert!(!args.iter().any(|arg| arg == "--cd"));
-        assert!(args
-            .iter()
-            .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") }));
-        assert!(args
-            .iter()
-            .any(|arg| arg.contains("--coordination-mcp-proxy")));
+        assert!(
+            args.iter()
+                .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") })
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.contains("--coordination-mcp-proxy"))
+        );
         assert!(!args.iter().any(|arg| arg.contains("--coordination-mcp''")));
-        assert!(args
-            .iter()
-            .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.command=") }));
+        assert!(
+            args.iter()
+                .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.command=") })
+        );
         assert!(args.iter().any(|arg| {
             arg.starts_with("mcp_servers.coordination-kernel.tools.start_task.approval_mode=")
         }));
-        assert!(args
-            .iter()
-            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.command=") }));
-        assert!(args
-            .iter()
-            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.args=") }));
-        assert!(args
-            .iter()
-            .any(|arg| { arg.contains("--workspace-mcp-gateway") }));
+        assert!(
+            args.iter()
+                .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.command=") })
+        );
+        assert!(
+            args.iter()
+                .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.args=") })
+        );
+        assert!(
+            args.iter()
+                .any(|arg| { arg.contains("--workspace-mcp-gateway") })
+        );
         assert!(args.iter().any(|arg| {
             arg.starts_with(
                 "mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__sync_manifest.approval_mode="
@@ -11996,12 +12343,16 @@ mod terminal_tests {
                 "mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools.approval_mode="
             )
         }));
-        assert!(!args
-            .iter()
-            .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") })
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("mcp_servers.codex_apps."))
+        );
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "--no-alt-screen")
@@ -12034,9 +12385,10 @@ mod terminal_tests {
             42,
         );
 
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-bypass-hook-trust")
+        );
     }
 
     #[test]
@@ -12103,10 +12455,9 @@ mod terminal_tests {
         coordination
             .env_vars
             .push(("CODEX_HOME".to_string(), home_text));
-        coordination.env_vars.push((
-            "DIFFFORGE_CODEX_PROFILE".to_string(),
-            profile.to_string(),
-        ));
+        coordination
+            .env_vars
+            .push(("DIFFFORGE_CODEX_PROFILE".to_string(), profile.to_string()));
 
         let updated = refresh_codex_activity_hook_profile_for_terminal(
             Some(&coordination),
@@ -12171,16 +12522,20 @@ mod terminal_tests {
         assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(!args.iter().any(|arg| arg.starts_with("plugins.")));
         assert!(!args.iter().any(|arg| arg.contains("computer-use")));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.contains("browser@openai-bundled")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("browser@openai-bundled"))
+        );
         assert!(!args.iter().any(|arg| arg.contains("codex_apps")));
-        assert!(args
-            .iter()
-            .any(|arg| arg.starts_with("mcp_servers.coordination-kernel.")));
-        assert!(args
-            .iter()
-            .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway.")));
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("mcp_servers.coordination-kernel."))
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway."))
+        );
     }
 
     #[test]
@@ -12253,15 +12608,19 @@ mod terminal_tests {
             42,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--add-dir", worktree_path.as_str()]));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--add-dir", "/tmp/repo-root-override"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--add-dir", worktree_path.as_str()])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--add-dir", "/tmp/repo-root-override"])
+        );
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -12283,9 +12642,11 @@ mod terminal_tests {
         ] {
             assert!(allowed_tools.split(',').any(|allowed| allowed == tool));
         }
-        assert!(allowed_tools
-            .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+        assert!(
+            allowed_tools
+                .split(',')
+                .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)"))
+        );
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Write"));
         let mcp_config = args
@@ -12293,24 +12654,33 @@ mod terminal_tests {
             .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
             .unwrap();
         assert_eq!(mcp_config, claude_config_path);
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--mcp-config", "/tmp/unsafe-claude-mcp.json"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--mcp-config", "/tmp/unsafe-claude-mcp.json"])
+        );
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(!mcp_config.contains("\"coordination-kernel\""));
         assert!(!mcp_config.contains("terminal_launch_args"));
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--dangerously-skip-permissions"));
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--allow-dangerously-skip-permissions"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--allow-dangerously-skip-permissions")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+        );
         let settings_arg = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
@@ -12324,11 +12694,13 @@ mod terminal_tests {
             settings["permissions"]["defaultMode"].as_str(),
             Some("acceptEdits")
         );
-        assert!(settings["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
+        assert!(
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit"))
+        );
         assert_eq!(settings["sandbox"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             settings["sandbox"]["allowUnsandboxedCommands"].as_bool(),
@@ -12386,25 +12758,31 @@ mod terminal_tests {
             43,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--add-dir", direct_root_text.as_str()]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--add-dir", direct_root_text.as_str()])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+        );
         let settings_arg = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
             .unwrap();
         let settings: Value = serde_json::from_str(settings_arg).unwrap();
-        assert!(settings["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
+        assert!(
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit"))
+        );
         assert!(settings_arg.contains("--diff-forge-write-guard"));
         let allowed_tools = args
             .windows(2)
@@ -12413,12 +12791,16 @@ mod terminal_tests {
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(allowed_tools
-            .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
-        assert!(allowed_tools
-            .split(',')
-            .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)")));
+        assert!(
+            allowed_tools
+                .split(',')
+                .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)"))
+        );
+        assert!(
+            allowed_tools
+                .split(',')
+                .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)"))
+        );
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
     }
 
@@ -12469,18 +12851,24 @@ mod terminal_tests {
             44,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1")));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--add-dir", repo_text.as_str()])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1"))
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
+        );
         assert!(!args.windows(2).any(|pair| pair[0] == "--settings"));
         let allowed_tools = args
             .windows(2)
@@ -12489,12 +12877,16 @@ mod terminal_tests {
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(!allowed_tools
-            .split(',')
-            .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//")));
-        assert!(!allowed_tools
-            .split(',')
-            .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));
+        assert!(
+            !allowed_tools
+                .split(',')
+                .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//"))
+        );
+        assert!(
+            !allowed_tools
+                .split(',')
+                .any(|allowed| allowed.contains(&format!("{}/**", repo_text)))
+        );
     }
 
     #[test]
@@ -12717,7 +13109,11 @@ mod terminal_tests {
         .unwrap_err();
 
         assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains("apply_patch must target this terminal's assigned worktree path explicitly"));
+        assert!(
+            error.contains(
+                "apply_patch must target this terminal's assigned worktree path explicitly"
+            )
+        );
     }
 
     #[test]
@@ -13194,9 +13590,11 @@ mod terminal_tests {
                 .count(),
             1
         );
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("mcp_servers.codex_apps."))
+        );
     }
 
     #[test]
@@ -13213,9 +13611,11 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert!(env_vars
-            .iter()
-            .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1"));
+        assert!(
+            env_vars
+                .iter()
+                .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1")
+        );
         let config_paths = env_vars
             .iter()
             .filter_map(|(key, value)| (key == OPENCODE_TUI_CONFIG_ENV).then_some(value))
@@ -13315,23 +13715,31 @@ mod terminal_tests {
                 .count(),
             1
         );
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--ask-for-approval", "never"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--profile", "diffforge-test-profile"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
-        assert!(!args
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-hook-trust")
+        );
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
-        assert!(!args
-            .windows(2)
-            .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--cd", "/tmp/custom-cwd"])
+        );
     }
 
     #[test]
@@ -13362,12 +13770,14 @@ mod terminal_tests {
             7,
         );
 
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--ask-for-approval", "never"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--profile", "diffforge-activity-profile"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--ask-for-approval", "never"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--profile", "diffforge-activity-profile"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
     }

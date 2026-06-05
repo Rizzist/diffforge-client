@@ -69,6 +69,7 @@ struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
     auth: Arc<Mutex<CloudMcpAuthRuntime>>,
     runtime_snapshots: Arc<Mutex<CloudMcpRuntimeSnapshots>>,
+    terminal_lifecycle_seq: Arc<AtomicU64>,
     global_ws_started: Arc<AtomicBool>,
     global_ws_epoch: Arc<AtomicU64>,
     global_ws_reconnect: Arc<tokio::sync::Notify>,
@@ -283,6 +284,7 @@ impl CloudMcpState {
             })),
             auth: Arc::new(Mutex::new(CloudMcpAuthRuntime::default())),
             runtime_snapshots: Arc::new(Mutex::new(CloudMcpRuntimeSnapshots::default())),
+            terminal_lifecycle_seq: Arc::new(AtomicU64::new(0)),
             global_ws_started: Arc::new(AtomicBool::new(false)),
             global_ws_epoch: Arc::new(AtomicU64::new(0)),
             global_ws_reconnect: Arc::new(tokio::sync::Notify::new()),
@@ -4565,17 +4567,39 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn cloud_mcp_payload_u64(payload: &Value, path: &[&str]) -> Option<u64> {
+    for key in path {
+        if let Some(value) = payload.get(*key) {
+            if let Some(number) = value.as_u64() {
+                return Some(number);
+            }
+            if let Some(number) = value.as_i64().and_then(|number| u64::try_from(number).ok()) {
+                return Some(number);
+            }
+            if let Some(number) = value
+                .as_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+            {
+                return Some(number);
+            }
+        }
+    }
+
     let mut current = payload;
     for key in path {
         current = current.get(*key)?;
     }
-    current.as_u64().or_else(|| {
-        current
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| value.parse::<u64>().ok())
-    })
+    current
+        .as_u64()
+        .or_else(|| {
+            current
+                .as_i64()
+                .and_then(|number| u64::try_from(number).ok())
+        })
+        .or_else(|| {
+            current
+                .as_str()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        })
 }
 
 fn cloud_mcp_payload_bool(payload: &Value, path: &[&str], fallback: bool) -> bool {
@@ -5012,11 +5036,7 @@ fn cloud_mcp_short_agent_label(agent_id: &str) -> Option<String> {
         .filter(|character| character.is_ascii_alphanumeric())
         .take(3)
         .collect::<String>();
-    if label.is_empty() {
-        None
-    } else {
-        Some(label)
-    }
+    if label.is_empty() { None } else { Some(label) }
 }
 
 fn cloud_mcp_terminal_claimed_paths(
@@ -6464,6 +6484,17 @@ async fn cloud_mcp_observe_terminal_output(
     chunk: &[u8],
 ) {
     let observe_started_at = Instant::now();
+    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
+    let hooks_own_turn_state = {
+        let runtime = state.inner.lock().await;
+        runtime
+            .terminal_contexts
+            .get(&terminal_key)
+            .is_some_and(|entry| cloud_mcp_agent_uses_activity_hooks(&entry.agent_id))
+    };
+    if hooks_own_turn_state {
+        return;
+    }
     let decode_started_at = Instant::now();
     let text = String::from_utf8_lossy(chunk);
     let decode_ms = terminal_diagnostic_elapsed_ms(decode_started_at);
@@ -6490,7 +6521,6 @@ async fn cloud_mcp_observe_terminal_output(
         return;
     }
 
-    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
     let now_ms = cloud_mcp_now_ms();
     let context_missing_backed_off =
         cloud_mcp_terminal_context_missing_backed_off(&state, &terminal_key, now_ms);
@@ -7938,6 +7968,242 @@ async fn cloud_mcp_sync_terminal_presence(
     ))
 }
 
+fn cloud_mcp_lifecycle_status_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '-'], "_")
+}
+
+fn cloud_mcp_terminal_lifecycle_state(
+    event_type: &str,
+    status: &str,
+    activity_status: &str,
+    readiness: &str,
+    execution_phase: &str,
+    turn_status: &str,
+) -> &'static str {
+    let event_type = cloud_mcp_lifecycle_status_key(event_type);
+    let status = cloud_mcp_lifecycle_status_key(status);
+    let activity_status = cloud_mcp_lifecycle_status_key(activity_status);
+    let readiness = cloud_mcp_lifecycle_status_key(readiness);
+    let execution_phase = cloud_mcp_lifecycle_status_key(execution_phase);
+    let turn_status = cloud_mcp_lifecycle_status_key(turn_status);
+    let values = [
+        event_type.as_str(),
+        status.as_str(),
+        activity_status.as_str(),
+        readiness.as_str(),
+        execution_phase.as_str(),
+        turn_status.as_str(),
+    ];
+
+    if values
+        .iter()
+        .any(|value| matches!(*value, "closed" | "closing" | "exited" | "offline"))
+    {
+        return "closed";
+    }
+    if values
+        .iter()
+        .any(|value| matches!(*value, "error" | "failed" | "failure"))
+    {
+        return "error";
+    }
+    if values.iter().any(|value| {
+        matches!(
+            *value,
+            "paused"
+                | "parked"
+                | "needs_input"
+                | "awaiting_input"
+                | "awaiting_user"
+                | "provider_user_prompt_started"
+                | "resume_ready"
+        )
+    }) {
+        return "paused";
+    }
+    if values.iter().any(|value| {
+        matches!(
+            *value,
+            "complete"
+                | "completed"
+                | "done"
+                | "idle"
+                | "input_ready"
+                | "interrupted"
+                | "interrupt"
+                | "cancelled"
+                | "canceled"
+                | "ready"
+                | "provider_turn_completed"
+                | "provider_turn_interrupted"
+        )
+    }) {
+        return "idle";
+    }
+
+    "thinking"
+}
+
+fn cloud_mcp_terminal_lifecycle_turn_status(
+    event_type: &str,
+    turn_status: &str,
+    state: &str,
+) -> &'static str {
+    let event_type = cloud_mcp_lifecycle_status_key(event_type);
+    let turn_status = cloud_mcp_lifecycle_status_key(turn_status);
+    match turn_status.as_str() {
+        "complete" | "completed" | "done" => "completed",
+        "cancelled" | "canceled" => "cancelled",
+        "interrupted" | "interrupt" => "interrupted",
+        "failed" | "error" => "failed",
+        "queued" | "submitted" | "pending" => "queued",
+        "running" | "thinking" | "working" | "reasoning" => "running",
+        _ => match event_type.as_str() {
+            "provider_turn_completed" => "completed",
+            "provider_turn_error" => "failed",
+            "provider_turn_interrupted" => "interrupted",
+            "remote_control_close" | "closed" | "exited" => "interrupted",
+            _ => match state {
+                "idle" => "completed",
+                "error" => "failed",
+                "closed" => "interrupted",
+                _ => "running",
+            },
+        },
+    }
+}
+
+fn cloud_mcp_terminal_lifecycle_readiness(state: &str, input_ready: Option<bool>) -> &'static str {
+    if input_ready.unwrap_or(false) {
+        return "ready";
+    }
+    match state {
+        "idle" => "ready",
+        "closed" => "closed",
+        "error" => "error",
+        "paused" => "needs_input",
+        _ => "busy",
+    }
+}
+
+fn cloud_mcp_next_terminal_lifecycle_seq(state: &CloudMcpState, candidate: Option<u64>) -> u64 {
+    let now = cloud_mcp_now_ms();
+    let candidate = candidate.unwrap_or(0).max(now);
+    let mut previous = state.terminal_lifecycle_seq.load(Ordering::SeqCst);
+    loop {
+        let next = previous.saturating_add(1).max(candidate);
+        match state.terminal_lifecycle_seq.compare_exchange(
+            previous,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
+}
+
+async fn cloud_mcp_enqueue_terminal_lifecycle_delta(
+    state: &CloudMcpState,
+    payload: Value,
+    terminal_id: &str,
+    reason: &str,
+    priority: u8,
+) {
+    let workspace_id = cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
+        .unwrap_or_else(|| "workspace".to_string());
+    let instance_id =
+        cloud_mcp_payload_text(&payload, &["terminal_instance_id", "terminalInstanceId"])
+            .unwrap_or_else(|| "0".to_string());
+    let sync_key = format!("terminal_lifecycle:{workspace_id}:{terminal_id}:{instance_id}");
+    cloud_mcp_enqueue_background_sync(
+        state,
+        sync_key,
+        "terminal_lifecycle_delta",
+        payload,
+        priority,
+        reason.to_string(),
+    )
+    .await;
+}
+
+pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
+    state: &CloudMcpState,
+    payload: &TerminalActivityHookPayload,
+) {
+    let terminal_id = payload.pane_id.as_str();
+    let terminal_key = cloud_mcp_terminal_key(terminal_id, payload.instance_id);
+    let context_entry = {
+        let runtime = state.inner.lock().await;
+        runtime.terminal_contexts.get(&terminal_key).cloned()
+    };
+    let repo_id = context_entry
+        .as_ref()
+        .map(|entry| entry.repo_id.clone())
+        .filter(|value| !value.trim().is_empty());
+    let workspace_root = context_entry
+        .as_ref()
+        .map(|entry| workspace_path_display(&entry.repo_root))
+        .or_else(|| payload.cwd.clone())
+        .unwrap_or_default();
+    let state_value = cloud_mcp_terminal_lifecycle_state(
+        &payload.event_type,
+        &payload.status,
+        &payload.activity_status,
+        "",
+        &payload.command_phase,
+        "",
+    );
+    let turn_status =
+        cloud_mcp_terminal_lifecycle_turn_status(&payload.event_type, "", state_value);
+    let readiness = cloud_mcp_terminal_lifecycle_readiness(state_value, Some(payload.input_ready));
+    let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
+    let reason = payload.source.as_str();
+    let delta = json!({
+        "source": "rust-diffforge-activity-hook",
+        "event_kind": "terminal_lifecycle_delta",
+        "v": 1,
+        "repo_id": repo_id,
+        "workspace_root": workspace_root,
+        "workspace_id": payload.workspace_id,
+        "workspace_name": payload.workspace_name,
+        "terminal_id": terminal_id,
+        "pane_id": terminal_id,
+        "terminal_instance_id": payload.instance_id,
+        "terminal_index": payload.terminal_index,
+        "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
+        "agent_kind": payload.agent_kind,
+        "provider": payload.provider,
+        "event_type": payload.event_type,
+        "hook_event_name": payload.hook_event_name,
+        "state": state_value,
+        "status": state_value,
+        "activity_status": state_value,
+        "readiness": readiness,
+        "turn_status": turn_status,
+        "command_phase": payload.command_phase,
+        "input_ready": payload.input_ready,
+        "status_seq": status_seq,
+        "observed_at_ms": payload.observed_at_ms,
+        "hook_timestamp_ms": payload.hook_timestamp_ms,
+        "turn_id": payload.turn_id,
+        "provider_turn_id": payload.provider_turn_id,
+        "provider_session_id": payload.provider_session_id,
+        "native_session_id": payload.native_session_id,
+        "thread_id": payload.thread_id,
+        "reason": reason,
+        "summary": format!("Terminal {}.", state_value),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let priority = if matches!(state_value, "idle" | "paused" | "error" | "closed") {
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
+    } else {
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
+    };
+    cloud_mcp_enqueue_terminal_lifecycle_delta(state, delta, terminal_id, reason, priority).await;
+}
+
 #[tauri::command]
 async fn cloud_mcp_sync_terminal_status_event(
     state: State<'_, CloudMcpState>,
@@ -8029,13 +8295,23 @@ async fn cloud_mcp_sync_terminal_status_event(
         ],
     )
     .unwrap_or_else(|| "terminal".to_string());
-    let agent_label = cloud_mcp_payload_text(&terminal, &["agent_label", "agentLabel", "label"])
-        .unwrap_or_else(|| agent_kind.clone());
     let status = cloud_mcp_payload_text(
         &terminal,
         &["status_after", "statusAfter", "status", "state"],
     )
     .unwrap_or_else(|| "idle".to_string());
+    let activity_status = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "activity_status",
+            "activityStatus",
+            "display_status",
+            "displayStatus",
+            "native_rail_state",
+            "nativeRailState",
+        ],
+    )
+    .unwrap_or_else(|| status.clone());
     let readiness = cloud_mcp_payload_text(
         &terminal,
         &[
@@ -8046,18 +8322,6 @@ async fn cloud_mcp_sync_terminal_status_event(
             "terminalReadiness",
         ],
     );
-    let session_state = cloud_mcp_payload_text(&terminal, &["session_state", "sessionState"])
-        .unwrap_or_else(|| "session_attached".to_string());
-    let status_seq = terminal
-        .get("status_seq")
-        .or_else(|| terminal.get("statusSeq"))
-        .cloned()
-        .unwrap_or_else(|| json!(cloud_mcp_now_ms()));
-    let observed_at_ms = terminal
-        .get("observed_at_ms")
-        .or_else(|| terminal.get("observedAtMs"))
-        .cloned()
-        .unwrap_or_else(|| json!(cloud_mcp_now_ms()));
     let event_type = cloud_mcp_payload_text(
         &terminal,
         &[
@@ -8070,167 +8334,118 @@ async fn cloud_mcp_sync_terminal_status_event(
     )
     .unwrap_or_else(|| "terminal.status".to_string());
     let command_phase = cloud_mcp_payload_text(&terminal, &["command_phase", "commandPhase"]);
-    let display_status = cloud_mcp_payload_text(&terminal, &["display_status", "displayStatus"]);
     let execution_phase = cloud_mcp_payload_text(&terminal, &["execution_phase", "executionPhase"]);
     let pane_id = cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]);
     let terminal_id = cloud_mcp_payload_text(&terminal, &["terminal_id", "terminalId"])
-        .or_else(|| pane_id.clone());
-    let terminal_instance_id = terminal
-        .get("terminal_instance_id")
-        .or_else(|| terminal.get("terminalInstanceId"))
-        .or_else(|| terminal.get("instance_id"))
-        .or_else(|| terminal.get("instanceId"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let terminal_epoch = cloud_mcp_payload_text(&terminal, &["terminal_epoch", "terminalEpoch"])
-        .or_else(|| {
-            terminal_id
-                .as_ref()
-                .map(|terminal_id| format!("{}:{}", terminal_id, terminal_instance_id))
-        });
-    let status_for_priority = status.clone();
-    let event_type_for_priority = event_type.clone();
-    let normalized_terminal = json!({
-        "device": device_profile.clone(),
-        "device_id": device_profile["device_id"].clone(),
-        "machine_id": device_profile["device_id"].clone(),
-        "presence_agent_id": cloud_mcp_payload_text(&terminal, &["presence_agent_id", "presenceAgentId", "id"]),
-        "agent_kind": agent_kind,
-        "agent_label": agent_label,
-        "status": status,
-        "status_after": status,
-        "command_phase": command_phase,
-        "display_status": display_status,
-        "execution_phase": execution_phase,
-        "session_state": session_state,
-        "terminal_index": terminal_index,
-        "terminal_epoch": terminal_epoch,
-        "terminal_instance_id": terminal_instance_id,
-        "terminal_lifecycle": cloud_mcp_payload_text(&terminal, &["terminal_lifecycle", "terminalLifecycle", "lifecycle"]),
-        "native_rail_state": cloud_mcp_payload_text(&terminal, &["native_rail_state", "nativeRailState", "rail_state", "railState", "top_rail_state", "topRailState"]),
-        "native_rail_label": cloud_mcp_payload_text(&terminal, &["native_rail_label", "nativeRailLabel", "rail_label", "railLabel", "top_rail_label", "topRailLabel"]),
-        "readiness": readiness,
-        "readiness_after": readiness,
-        "turn_id": cloud_mcp_payload_text(&terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId", "active_turn_id", "activeTurnId"]),
-        "turn_status": cloud_mcp_payload_text(&terminal, &["turn_status", "turnStatus", "latest_turn_status", "latestTurnStatus"]),
-        "status_seq": status_seq,
-        "observed_at_ms": observed_at_ms,
-        "event_type": event_type,
-        "event_id": cloud_mcp_payload_text(&terminal, &["event_id", "eventId"]),
-        "input_ready": terminal
-            .get("input_ready")
-            .or_else(|| terminal.get("inputReady"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "parked": terminal
-            .get("parked")
-            .or_else(|| terminal.get("terminal_parked"))
-            .or_else(|| terminal.get("terminalParked"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "parked_prompt_title": cloud_mcp_payload_text(
-            &terminal,
-            &[
-                "parked_prompt_title",
-                "parkedPromptTitle",
-                "parked_title",
-                "parkedTitle",
-            ],
-        ),
-        "pane_id": pane_id,
-        "terminal_id": terminal_id,
-        "thread_id": cloud_mcp_payload_text(&terminal, &["thread_id", "threadId"]),
-        "color": cloud_mcp_payload_text(&terminal, &["color", "accent", "accentColor"]),
-        "color_slot": cloud_mcp_payload_text(&terminal, &["color_slot", "colorSlot", "color_index", "colorIndex", "slot"]),
-        "waiting_on": terminal
-            .get("waiting_on")
-            .or_else(|| terminal.get("waitingOn"))
-            .cloned()
-            .unwrap_or(Value::Null),
+        .or_else(|| pane_id.clone())
+        .unwrap_or_else(|| "terminal".to_string());
+    let terminal_instance_id = cloud_mcp_payload_u64(
+        &terminal,
+        &[
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    )
+    .unwrap_or(0);
+    let turn_status = cloud_mcp_payload_text(
+        &terminal,
+        &[
+            "turn_status",
+            "turnStatus",
+            "latest_turn_status",
+            "latestTurnStatus",
+        ],
+    )
+    .unwrap_or_default();
+    let input_ready = terminal
+        .get("input_ready")
+        .or_else(|| terminal.get("inputReady"))
+        .and_then(Value::as_bool);
+    let state_value = cloud_mcp_terminal_lifecycle_state(
+        &event_type,
+        &status,
+        &activity_status,
+        readiness.as_deref().unwrap_or_default(),
+        execution_phase.as_deref().unwrap_or_default(),
+        &turn_status,
+    );
+    let turn_status =
+        cloud_mcp_terminal_lifecycle_turn_status(&event_type, &turn_status, state_value);
+    let readiness = readiness.unwrap_or_else(|| {
+        cloud_mcp_terminal_lifecycle_readiness(state_value, input_ready).to_string()
     });
-    let workspace_payload = json!({
-        "device": device_profile.clone(),
+    let status_seq = cloud_mcp_next_terminal_lifecycle_seq(
+        state.inner(),
+        cloud_mcp_payload_u64(&terminal, &["status_seq", "statusSeq"]),
+    );
+    let observed_at_ms = cloud_mcp_payload_u64(&terminal, &["observed_at_ms", "observedAtMs"])
+        .unwrap_or_else(cloud_mcp_now_ms);
+    let terminal_epoch = cloud_mcp_payload_text(&terminal, &["terminal_epoch", "terminalEpoch"])
+        .unwrap_or_else(|| format!("{terminal_id}:{terminal_instance_id}"));
+    let payload = json!({
+        "source": "rust-diffforge-terminal-lifecycle-delta",
+        "event_kind": "terminal_lifecycle_delta",
+        "v": 1,
         "device_id": device_profile["device_id"].clone(),
-        "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
-        "machine_name": device_profile["machine_name"].clone(),
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
         "repo_id": req.repo_id,
         "workspace_root": req.root_display,
         "workspace_active": workspace_active,
         "workspace_id": req.workspace_id,
         "workspace_name": req.workspace_name,
         "workspace_status": workspace_status,
-        "terminal_count": 1,
-        "terminals": [normalized_terminal.clone()],
+        "terminal_id": terminal_id,
+        "pane_id": pane_id,
+        "terminal_instance_id": terminal_instance_id,
+        "terminal_index": terminal_index,
+        "terminal_epoch": terminal_epoch,
+        "agent_kind": agent_kind,
+        "provider": cloud_mcp_payload_text(&terminal, &["provider", "agentKind", "agent_kind"]),
+        "event_type": event_type,
+        "state": state_value,
+        "status": state_value,
+        "activity_status": state_value,
+        "readiness": readiness,
+        "turn_status": turn_status,
+        "command_phase": command_phase,
+        "execution_phase": execution_phase,
+        "input_ready": input_ready,
+        "turn_id": cloud_mcp_payload_text(&terminal, &["turn_id", "turnId", "latest_turn_id", "latestTurnId", "active_turn_id", "activeTurnId"]),
+        "thread_id": cloud_mcp_payload_text(&terminal, &["thread_id", "threadId"]),
+        "status_seq": status_seq,
+        "observed_at_ms": observed_at_ms,
+        "reason": reason.clone(),
+        "ts_ms": cloud_mcp_now_ms(),
     });
     let reason_for_ack = reason.clone();
-    let workspace_id_for_key = workspace_payload
-        .get("workspace_id")
-        .and_then(Value::as_str)
-        .unwrap_or("workspace");
-    let terminal_id_for_key = normalized_terminal
-        .get("terminal_id")
-        .or_else(|| normalized_terminal.get("pane_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("terminal");
-    let sync_key = format!("terminal_status:{workspace_id_for_key}:{terminal_id_for_key}");
-    let priority = if matches!(
-        status_for_priority.as_str(),
-        "closed" | "closing" | "error" | "exited" | "offline"
-    ) || event_type_for_priority.contains("closed")
-        || event_type_for_priority.contains("error")
-    {
+    let priority = if matches!(state_value, "closed" | "error" | "idle" | "paused") {
         CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
     } else {
         CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
     };
-    let payload = json!({
-        "source": "rust-diffforge-terminal-status-event",
-        "event_kind": "terminal_status_event",
-        "snapshot_scope": "device_workspace_terminal",
-        "device": device_profile.clone(),
-        "device_id": device_profile["device_id"].clone(),
-        "device_name": device_profile["device_name"].clone(),
-        "machine_id": device_profile["device_id"].clone(),
-        "machine_name": device_profile["machine_name"].clone(),
-        "platform": device_profile["platform"].clone(),
-        "form_factor": device_profile["form_factor"].clone(),
-        "client_kind": device_profile["client_kind"].clone(),
-        "agent_id": "rust-diffforge",
-        "agent_label": "Diff Forge Desktop",
-        "reason": reason,
-        "repo_id": workspace_payload["repo_id"].clone(),
-        "workspace_id": workspace_payload["workspace_id"].clone(),
-        "workspace_count": 1,
-        "terminal_count": 1,
-        "terminal": normalized_terminal,
-        "workspaces": [workspace_payload],
-        "summary": "Desktop terminal status event synced.",
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-
     log_terminal_status_event(
-        "backend.cloud_mcp.terminal_status_event.send",
+        "backend.cloud_mcp.terminal_lifecycle_delta.queue",
         json!({
-            "payload": payload.clone(),
+            "event_type": payload["event_type"].clone(),
             "reason": reason,
+            "state": payload["state"].clone(),
+            "terminal_id": payload["terminal_id"].clone(),
+            "workspace_id": payload["workspace_id"].clone(),
         }),
     );
-    cloud_mcp_enqueue_background_sync(
+    cloud_mcp_enqueue_terminal_lifecycle_delta(
         state.inner(),
-        sync_key.clone(),
-        "terminal_status_event",
         payload,
+        &terminal_id,
+        &reason_for_ack,
         priority,
-        reason_for_ack.clone(),
     )
     .await;
     Ok(cloud_mcp_background_sync_ack(
-        "terminal_status_event",
-        &sync_key,
+        "terminal_lifecycle_delta",
+        &format!("terminal_lifecycle:{}", terminal_id),
         &reason_for_ack,
         json!({
             "stored": {
@@ -9430,8 +9645,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn terminal_output_classifier_keeps_codex_working_screen_active() {
-        let working_screen =
-            "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m \u{1b}[2m(10s • esc to interrupt)\u{1b}[39m\
+        let working_screen = "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m \u{1b}[2m(10s • esc to interrupt)\u{1b}[39m\
 \u{1b}[47;1H\u{1b}[22m\u{1b}[1m›\u{1b}[47;3H\u{1b}[22m\u{1b}[2mExplain this codebase";
 
         assert!(!cloud_mcp_terminal_output_looks_ready(working_screen));
@@ -9484,10 +9698,12 @@ mod cloud_mcp_tests {
         assert!(primary_paths.contains("backend"));
         assert!(primary_paths.contains("frontend"));
         assert!(!primary_paths.contains("README.md"));
-        assert!(bundle
-            .children
-            .iter()
-            .all(|child| child.workspace_kind == "project"));
+        assert!(
+            bundle
+                .children
+                .iter()
+                .all(|child| child.workspace_kind == "project")
+        );
         assert!(bundle.children.iter().all(|child| {
             child
                 .filetree
@@ -9540,13 +9756,17 @@ mod cloud_mcp_tests {
         assert!(primary_paths.contains(&("src/root.rs", "file")));
         assert!(primary_paths.contains(&("packages", "container")));
         assert!(primary_paths.contains(&("packages/mobile", "project")));
-        assert!(!primary_paths
-            .iter()
-            .any(|(path, _)| *path == "packages/mobile/src/app.js"));
-        assert!(bundle.children[0]
-            .filetree
-            .iter()
-            .any(|entry| entry.relative_path == "src/app.js"));
+        assert!(
+            !primary_paths
+                .iter()
+                .any(|(path, _)| *path == "packages/mobile/src/app.js")
+        );
+        assert!(
+            bundle.children[0]
+                .filetree
+                .iter()
+                .any(|entry| entry.relative_path == "src/app.js")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

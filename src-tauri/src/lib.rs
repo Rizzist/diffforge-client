@@ -413,6 +413,9 @@ struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     terminal_input_queues: Arc<StdMutex<HashMap<String, TerminalInputQueueHandle>>>,
     terminal_input_transport: Arc<StdMutex<Option<TerminalInputTransportEndpoint>>>,
+    terminal_output_transport: Arc<StdMutex<Option<TerminalOutputTransportEndpoint>>>,
+    terminal_output_transport_subscribers:
+        Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
@@ -421,6 +424,7 @@ struct TerminalState {
     workspace_topology_cache: Arc<RwLock<HashMap<String, TerminalWorkspaceTopologySnapshot>>>,
     next_terminal_instance_id: AtomicU64,
     next_terminal_input_queue_id: AtomicU64,
+    next_terminal_output_subscriber_id: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -456,6 +460,29 @@ struct TerminalInputTransportAck {
     message_id: String,
     ok: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputTransportEndpoint {
+    url: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputTransportSubscribe {
+    r#type: String,
+    token: String,
+    id: Option<String>,
+    pane_id: String,
+    instance_id: u64,
+}
+
+#[derive(Clone)]
+struct TerminalOutputTransportSubscriber {
+    id: u64,
+    sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 struct TerminalCleanupTracker {
@@ -661,6 +688,12 @@ impl Drop for TerminalState {
         }
         if let Ok(mut transport) = self.terminal_input_transport.lock() {
             *transport = None;
+        }
+        if let Ok(mut transport) = self.terminal_output_transport.lock() {
+            *transport = None;
+        }
+        if let Ok(mut subscribers) = self.terminal_output_transport_subscribers.lock() {
+            subscribers.clear();
         }
         let warm_ptys = self.pty_pool.drain_for_shutdown();
 
@@ -1546,6 +1579,7 @@ struct TerminalOpenRequest {
     workspace_name: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    output_transport: Option<bool>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -3527,6 +3561,8 @@ pub fn run() {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
             terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
@@ -3535,6 +3571,7 @@ pub fn run() {
             workspace_topology_cache: Arc::new(RwLock::new(HashMap::new())),
             next_terminal_instance_id: AtomicU64::new(1),
             next_terminal_input_queue_id: AtomicU64::new(1),
+            next_terminal_output_subscriber_id: AtomicU64::new(1),
         })
         .manage(TerminalDiagnosticState::new())
         .manage(WindowsTerminalDiagnosticState::new())
@@ -3704,6 +3741,7 @@ pub fn run() {
             terminal_write_to_audio_input_target,
             terminal_write,
             terminal_input_transport_endpoint,
+            terminal_output_transport_endpoint,
             terminal_write_realtime,
             terminal_refresh_theme,
             terminal_windows_pty_info,

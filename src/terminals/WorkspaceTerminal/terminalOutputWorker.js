@@ -25,6 +25,8 @@ function createSession(id, options = {}) {
     queue: [],
     queuedBytes: 0,
     scheduledAt: 0,
+    transportInspect: false,
+    transportSocket: null,
   };
 }
 
@@ -207,6 +209,117 @@ function enqueueChunk(id, rawData, options = {}) {
   }
 }
 
+function closeSessionTransport(session) {
+  if (!session?.transportSocket) {
+    return;
+  }
+  try {
+    session.transportSocket.onclose = null;
+    session.transportSocket.onerror = null;
+    session.transportSocket.onmessage = null;
+    session.transportSocket.onopen = null;
+    session.transportSocket.close();
+  } catch (_error) {
+    // Best effort only.
+  }
+  session.transportSocket = null;
+}
+
+function connectTransport(message = {}) {
+  const id = String(message.id || "");
+  const endpoint = message.endpoint || {};
+  if (!id || !endpoint.url || !endpoint.token || !message.paneId || !message.instanceId) {
+    postMessage({
+      error: "Terminal output transport connection request is incomplete.",
+      id,
+      type: "transport-error",
+    });
+    return;
+  }
+
+  const session = getSession(id);
+  closeSessionTransport(session);
+  session.active = message.active === true;
+  session.transportInspect = message.inspect === true;
+
+  let socket = null;
+  try {
+    socket = new WebSocket(endpoint.url);
+    socket.binaryType = "arraybuffer";
+  } catch (error) {
+    postMessage({
+      error: error?.message || String(error || "Unable to create terminal output transport."),
+      id,
+      type: "transport-error",
+    });
+    return;
+  }
+
+  session.transportSocket = socket;
+
+  socket.onopen = () => {
+    try {
+      socket.send(JSON.stringify({
+        id,
+        instanceId: message.instanceId,
+        paneId: message.paneId,
+        token: endpoint.token,
+        type: "subscribe",
+      }));
+    } catch (error) {
+      postMessage({
+        error: error?.message || String(error || "Unable to subscribe terminal output transport."),
+        id,
+        type: "transport-error",
+      });
+    }
+  };
+
+  socket.onmessage = (event) => {
+    if (typeof event.data === "string") {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload?.type === "ready") {
+          postMessage({ id, type: "transport-ready" });
+        }
+      } catch (_error) {
+        // Non-control text is ignored; terminal bytes are sent as binary frames.
+      }
+      return;
+    }
+
+    const data = event.data instanceof ArrayBuffer
+      ? new Uint8Array(event.data)
+      : ArrayBuffer.isView(event.data)
+        ? new Uint8Array(event.data.buffer, event.data.byteOffset, event.data.byteLength)
+        : new Uint8Array(0);
+    if (!data.byteLength) {
+      return;
+    }
+    enqueueChunk(id, data, {
+      active: session.active === true,
+      inspect: session.transportInspect === true,
+    });
+  };
+
+  socket.onerror = () => {
+    if (session.transportSocket === socket) {
+      postMessage({
+        error: "Terminal output transport socket failed.",
+        id,
+        type: "transport-error",
+      });
+    }
+  };
+
+  socket.onclose = () => {
+    if (session.transportSocket === socket) {
+      session.transportSocket = null;
+      postMessage({ id, type: "transport-closed" });
+    }
+  };
+}
+
 self.onmessage = (event) => {
   const message = event.data || {};
   if (message.type === "register") {
@@ -220,6 +333,7 @@ self.onmessage = (event) => {
     if (session?.flushTimer) {
       clearTimeout(session.flushTimer);
     }
+    closeSessionTransport(session);
     sessions.delete(message.id);
     return;
   }
@@ -236,6 +350,11 @@ self.onmessage = (event) => {
   if (message.type === "priority") {
     const session = getSession(message.id);
     session.active = message.active === true;
+    return;
+  }
+
+  if (message.type === "connectTransport") {
+    connectTransport(message);
     return;
   }
 

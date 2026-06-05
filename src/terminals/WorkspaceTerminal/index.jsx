@@ -9167,10 +9167,36 @@ function WorkspaceTerminal({
         const terminalOutputWorkerSession = createTerminalOutputWorkerSession({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
           id: `${paneId}:${terminalInstanceId}:output`,
+          onTransportStatus: (event) => {
+            if (event?.type === "transport-ready") {
+              outputTransportReady = true;
+              return;
+            }
+            if (event?.type === "transport-error" || event?.type === "transport-closed") {
+              outputTransportFallback = true;
+            }
+          },
           onOutput: processPreparedTerminalOutput,
         });
+        let outputTransportPreferred = false;
+        let outputTransportReady = false;
+        let outputTransportFallback = false;
         terminalOutputWorkerSessionRef.current = terminalOutputWorkerSession;
         terminalOutputWorkerSession?.setActive(terminalActiveRef.current === true);
+        if (typeof terminalOutputWorkerSession?.prepareTransport === "function") {
+          outputTransportPreferred = true;
+          terminalOutputWorkerSession.prepareTransport({
+            active: terminalActiveRef.current === true,
+            inspect: !isGenericTerminal,
+            instanceId: terminalInstanceId,
+            paneId,
+            timeoutMs: 1600,
+          }).then(() => {
+            outputTransportReady = true;
+          }).catch(() => {
+            outputTransportFallback = true;
+          });
+        }
         if (terminalOutputWorkerSession) {
           disposables.push(() => {
             if (terminalOutputWorkerSessionRef.current === terminalOutputWorkerSession) {
@@ -9196,6 +9222,10 @@ function WorkspaceTerminal({
             return;
           }
 
+          if (outputTransportReady && !outputTransportFallback) {
+            return;
+          }
+
           const outputNormalizerActive = isTerminalOutputNormalizerActive();
           if (!outputNormalizerActive && terminalOutputWorkerSession?.enqueue(data, {
             active: terminalActiveRef.current === true,
@@ -9206,6 +9236,76 @@ function WorkspaceTerminal({
 
           processTerminalOutputInline(data, chunkStartedAt);
         });
+
+        let initialHeadlessOutputReplayInFlight = false;
+        let initialHeadlessOutputReplayDone = false;
+        const decodeHeadlessOutputBase64 = (value) => {
+          try {
+            const binary = window.atob(String(value || ""));
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+            return bytes;
+          } catch (_error) {
+            return new Uint8Array(0);
+          }
+        };
+        const requestInitialHeadlessOutputReplay = (reason = "initial_headless_output_replay") => {
+          if (
+            isDisposed
+            || !hasOpenPty
+            || initialHeadlessOutputReplayDone
+            || initialHeadlessOutputReplayInFlight
+            || outputBytes > 0
+            || visibleOutputChunks > 0
+          ) {
+            return;
+          }
+
+          initialHeadlessOutputReplayInFlight = true;
+          invoke("terminal_headless_output_snapshot", {
+            paneId,
+            instanceId: terminalInstanceId,
+          }).then((snapshot) => {
+            if (
+              isDisposed
+              || outputBytes > 0
+              || visibleOutputChunks > 0
+              || Number(snapshot?.instanceId || 0) !== terminalInstanceId
+            ) {
+              return;
+            }
+
+            const bytes = decodeHeadlessOutputBase64(snapshot?.bytesBase64);
+            if (!bytes.byteLength) {
+              return;
+            }
+
+            initialHeadlessOutputReplayDone = true;
+            if (terminalOutputWorkerSession?.enqueue(bytes, {
+              active: terminalActiveRef.current === true,
+              inspect: !isGenericTerminal,
+            })) {
+              return;
+            }
+
+            processTerminalOutputInline(bytes, performance.now());
+          }).catch(() => {
+            // The live output path remains authoritative; this is only a startup catch-up probe.
+          }).finally(() => {
+            initialHeadlessOutputReplayInFlight = false;
+          });
+        };
+        const scheduleInitialHeadlessOutputReplay = (reason, delays = [260, 900]) => {
+          delays.forEach((delayMs) => {
+            const timer = window.setTimeout(() => {
+              startupWatchTimers.delete(timer);
+              requestInitialHeadlessOutputReplay(reason);
+            }, delayMs);
+            startupWatchTimers.add(timer);
+          });
+        };
         disposables.push(await listen("forge-terminal-exit", (event) => {
           if (
             event.payload?.paneId === paneId
@@ -11412,6 +11512,7 @@ function WorkspaceTerminal({
               workspaceName: workspace?.name || "",
               cols: initialSize.cols,
               rows: initialSize.rows,
+              outputTransport: outputTransportPreferred,
             },
             outputChannel,
           });
@@ -11540,6 +11641,7 @@ function WorkspaceTerminal({
           workspaceId: workspace?.id || "",
         });
         resizeController?.resizeNow("terminal_open_done");
+        scheduleInitialHeadlessOutputReplay("terminal_open_done");
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);
 

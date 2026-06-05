@@ -1,6 +1,37 @@
+import { invoke } from "@tauri-apps/api/core";
+
 const callbacks = new Map();
+const transportStatusCallbacks = new Map();
+const transportHandshakes = new Map();
 let worker = null;
 let workerFailed = false;
+let outputTransportEndpointPromise = null;
+
+function terminalOutputTransportEndpoint() {
+  if (!outputTransportEndpointPromise) {
+    outputTransportEndpointPromise = invoke("terminal_output_transport_endpoint").catch((error) => {
+      outputTransportEndpointPromise = null;
+      throw error;
+    });
+  }
+  return outputTransportEndpointPromise;
+}
+
+function settleTransportHandshake(id, ok, payload = {}) {
+  const handshake = transportHandshakes.get(id);
+  if (!handshake) {
+    return;
+  }
+  transportHandshakes.delete(id);
+  if (handshake.timer) {
+    window.clearTimeout(handshake.timer);
+  }
+  if (ok) {
+    handshake.resolve(payload);
+  } else {
+    handshake.reject(new Error(payload.error || "Terminal output transport failed."));
+  }
+}
 
 function createWorker() {
   if (worker || workerFailed) {
@@ -20,6 +51,23 @@ function createWorker() {
 
   worker.onmessage = (event) => {
     const message = event.data || {};
+    if (message.type === "transport-ready") {
+      transportStatusCallbacks.get(message.id)?.(message);
+      settleTransportHandshake(message.id, true, message);
+      return;
+    }
+    if (message.type === "transport-error") {
+      transportStatusCallbacks.get(message.id)?.(message);
+      settleTransportHandshake(message.id, false, message);
+      return;
+    }
+    if (message.type === "transport-closed") {
+      transportStatusCallbacks.get(message.id)?.(message);
+      settleTransportHandshake(message.id, false, {
+        error: "Terminal output transport socket closed.",
+      });
+      return;
+    }
     if (message.type !== "output") {
       return;
     }
@@ -35,7 +83,22 @@ function createWorker() {
 
   worker.onerror = () => {
     workerFailed = true;
+    transportStatusCallbacks.forEach((callback, id) => {
+      callback({
+        error: "Terminal output worker crashed.",
+        id,
+        type: "transport-error",
+      });
+    });
     callbacks.clear();
+    transportStatusCallbacks.clear();
+    transportHandshakes.forEach((handshake) => {
+      if (handshake.timer) {
+        window.clearTimeout(handshake.timer);
+      }
+      handshake.reject(new Error("Terminal output worker crashed."));
+    });
+    transportHandshakes.clear();
     try {
       worker?.terminate();
     } catch (_error) {
@@ -71,6 +134,9 @@ export function createTerminalOutputWorkerSession(options = {}) {
   }
 
   callbacks.set(id, options.onOutput);
+  if (typeof options.onTransportStatus === "function") {
+    transportStatusCallbacks.set(id, options.onTransportStatus);
+  }
   outputWorker.postMessage({
     coreRepoPath: options.coreRepoPath || "",
     functionalRepoPath: options.functionalRepoPath || "",
@@ -81,6 +147,10 @@ export function createTerminalOutputWorkerSession(options = {}) {
   return {
     dispose() {
       callbacks.delete(id);
+      transportStatusCallbacks.delete(id);
+      settleTransportHandshake(id, false, {
+        error: "Terminal output worker session was disposed.",
+      });
       try {
         outputWorker.postMessage({ id, type: "dispose" });
       } catch (_error) {
@@ -105,6 +175,61 @@ export function createTerminalOutputWorkerSession(options = {}) {
       } catch (_error) {
         return false;
       }
+    },
+
+    prepareTransport(metadata = {}) {
+      if (!metadata.paneId || !metadata.instanceId) {
+        return Promise.reject(new Error("Terminal output transport is missing terminal identity."));
+      }
+      const existing = transportHandshakes.get(id);
+      if (existing?.promise) {
+        return existing.promise;
+      }
+
+      const timeoutMs = Number.isFinite(metadata.timeoutMs)
+        ? Math.max(200, metadata.timeoutMs)
+        : 1200;
+      let promise = null;
+      promise = terminalOutputTransportEndpoint().then((endpoint) => (
+        new Promise((resolve, reject) => {
+          const timer = window.setTimeout(() => {
+            transportHandshakes.delete(id);
+            reject(new Error("Timed out connecting terminal output transport."));
+          }, timeoutMs);
+          transportHandshakes.set(id, {
+            promise,
+            reject,
+            resolve,
+            timer,
+          });
+          try {
+            outputWorker.postMessage({
+              active: metadata.active === true,
+              endpoint,
+              id,
+              inspect: metadata.inspect === true,
+              instanceId: metadata.instanceId,
+              paneId: metadata.paneId,
+              type: "connectTransport",
+            });
+          } catch (error) {
+            window.clearTimeout(timer);
+            transportHandshakes.delete(id);
+            reject(error);
+          }
+        })
+      )).catch((error) => {
+        transportHandshakes.delete(id);
+        throw error;
+      });
+
+      transportHandshakes.set(id, {
+        promise,
+        reject: () => {},
+        resolve: () => {},
+        timer: 0,
+      });
+      return promise;
     },
 
     setActive(active) {

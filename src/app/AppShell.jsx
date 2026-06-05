@@ -11430,7 +11430,6 @@ export default function App() {
         scheduleTerminalStatusEventSyncFlush(syncKey, 1000);
       }
     };
-    window.setTimeout(releaseStatusSyncGate, 0);
     void invoke("cloud_mcp_sync_terminal_status_event", {
       workspace: item.workspacePayload,
       terminal: item.terminalPayload,
@@ -11532,6 +11531,24 @@ export default function App() {
     if (!workspaceId) {
       return;
     }
+    const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
+    const statusSyncReason = options.reason || event.source || eventType;
+    const hookStatusSyncedByRust = Boolean(
+      options.cloudStatusSyncedByRust === true
+        || event.cloudStatusSyncedByRust === true
+        || String(statusSyncReason || "").trim().startsWith("cli-hook:")
+    );
+    if (hookStatusSyncedByRust) {
+      logTerminalStatus("frontend.terminal_status.event_sync.skip", {
+        eventType,
+        paneId: options.paneId || event.paneId || "",
+        reason: "hook_lifecycle_synced_by_rust",
+        source: statusSyncReason,
+        threadId: options.threadId || event.threadId || "",
+        workspaceId,
+      });
+      return;
+    }
 
     const requestedTerminalIndex = Number.parseInt(
       options.terminalIndex ?? event.terminalIndex ?? "",
@@ -11574,7 +11591,6 @@ export default function App() {
       return;
     }
 
-    const eventType = String(options.eventType || event.eventType || event.type || "terminal.status").trim();
     const rawStatus = String(options.status || options.statusAfter || event.status || event.activityStatus || "").trim().toLowerCase();
     const parkedStatusEvent = terminalStatusEventIndicatesParked(event, options);
     const permissionPromptStatusEvent = terminalStatusEventHasExplicitPermissionPrompt(event, options);
@@ -11821,7 +11837,6 @@ export default function App() {
     };
 
     const diagnosticToken = authStore.getToken();
-    const statusSyncReason = options.reason || event.source || eventType;
     const statusSyncKey = terminalKey;
     if (eventType === "provider-turn-completed") {
       logTerminalStatus("frontend.terminal_status.event_sync.completion_decision", {
