@@ -6163,29 +6163,41 @@ function getTodoQueueTargetAgentId(item) {
 
 function getTodoQueueTargetTerminalId(item) {
   const queueState = getTodoQueueRawQueueState(item);
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
+  const directTargetTerminalId = readDirectTarget
+    ? normalizeTodoTerminalIdentity(
+      item?.targetTerminalId
+        || item?.target_terminal_id
+        || item?.terminalId
+        || item?.terminal_id
+        || item?.paneId
+        || item?.pane_id
+        || item?.remoteCommand?.targetTerminalId
+        || item?.remoteCommand?.target_terminal_id
+        || item?.remoteCommand?.terminalId
+        || item?.remoteCommand?.terminal_id
+        || item?.remoteCommand?.paneId
+        || item?.remoteCommand?.pane_id
+        || item?.remote_command?.target_terminal_id
+        || item?.remote_command?.terminal_id
+        || item?.remote_command?.pane_id
+        || "",
+    )
+    : "";
+  const queueTargetTerminalId = queueTargetExplicit
+    ? normalizeTodoTerminalIdentity(
+      queueState?.targetTerminalId
+        || queueState?.target_terminal_id
+        || queueState?.terminalId
+        || queueState?.terminal_id
+        || queueState?.paneId
+        || queueState?.pane_id
+        || "",
+    )
+    : "";
   const targetTerminalId = normalizeTodoTerminalIdentity(
-    item?.targetTerminalId
-      || item?.target_terminal_id
-      || item?.terminalId
-      || item?.terminal_id
-      || item?.paneId
-      || item?.pane_id
-      || queueState?.targetTerminalId
-      || queueState?.target_terminal_id
-      || queueState?.terminalId
-      || queueState?.terminal_id
-      || queueState?.paneId
-      || queueState?.pane_id
-      || item?.remoteCommand?.targetTerminalId
-      || item?.remoteCommand?.target_terminal_id
-      || item?.remoteCommand?.terminalId
-      || item?.remoteCommand?.terminal_id
-      || item?.remoteCommand?.paneId
-      || item?.remoteCommand?.pane_id
-      || item?.remote_command?.target_terminal_id
-      || item?.remote_command?.terminal_id
-      || item?.remote_command?.pane_id
-      || "",
+    directTargetTerminalId || queueTargetTerminalId,
   );
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
   return todoQueueTerminalIdentityConflictsWithIndex(targetTerminalId, targetTerminalIndex)
@@ -6195,133 +6207,178 @@ function getTodoQueueTargetTerminalId(item) {
 
 function getTodoQueueTargetThreadId(item) {
   const queueState = getTodoQueueRawQueueState(item);
-  return normalizeTodoTerminalIdentity(
-    item?.targetThreadId
-      || item?.target_thread_id
-      || item?.threadId
-      || item?.thread_id
-      || queueState?.targetThreadId
-      || queueState?.target_thread_id
-      || queueState?.threadId
-      || queueState?.thread_id
-      || item?.remoteCommand?.targetThreadId
-      || item?.remoteCommand?.target_thread_id
-      || item?.remoteCommand?.threadId
-      || item?.remoteCommand?.thread_id
-      || item?.remote_command?.target_thread_id
-      || item?.remote_command?.thread_id
-      || "",
-  );
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
+  const directTargetThreadId = readDirectTarget
+    ? normalizeTodoTerminalIdentity(
+      item?.targetThreadId
+        || item?.target_thread_id
+        || item?.threadId
+        || item?.thread_id
+        || item?.remoteCommand?.targetThreadId
+        || item?.remoteCommand?.target_thread_id
+        || item?.remoteCommand?.threadId
+        || item?.remoteCommand?.thread_id
+        || item?.remote_command?.target_thread_id
+        || item?.remote_command?.thread_id
+        || "",
+    )
+    : "";
+  const queueTargetThreadId = queueTargetExplicit
+    ? normalizeTodoTerminalIdentity(
+      queueState?.targetThreadId
+        || queueState?.target_thread_id
+        || queueState?.threadId
+        || queueState?.thread_id
+        || "",
+    )
+    : "";
+  return normalizeTodoTerminalIdentity(directTargetThreadId || queueTargetThreadId);
 }
 
 function getTodoQueueTargetTerminalIndex(item) {
   const queueState = getTodoQueueRawQueueState(item);
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
   const directIndex = normalizeTodoTerminalIndex(
-    item?.targetTerminalIndex
-      ?? item?.target_terminal_index
-      ?? item?.terminalIndex
-      ?? item?.terminal_index
-      ?? queueState?.targetTerminalIndex
-      ?? queueState?.target_terminal_index
-      ?? queueState?.terminalIndex
-      ?? queueState?.terminal_index
-      ?? item?.remoteCommand?.targetTerminalIndex
-      ?? item?.remoteCommand?.target_terminal_index
-      ?? item?.remoteCommand?.terminalIndex
-      ?? item?.remoteCommand?.terminal_index
-      ?? item?.remote_command?.target_terminal_index
-      ?? item?.remote_command?.terminal_index,
+    readDirectTarget
+      ? item?.targetTerminalIndex
+        ?? item?.target_terminal_index
+        ?? item?.terminalIndex
+        ?? item?.terminal_index
+        ?? item?.remoteCommand?.targetTerminalIndex
+        ?? item?.remoteCommand?.target_terminal_index
+        ?? item?.remoteCommand?.terminalIndex
+        ?? item?.remoteCommand?.terminal_index
+        ?? item?.remote_command?.target_terminal_index
+        ?? item?.remote_command?.terminal_index
+      : undefined,
   );
   if (directIndex !== null) {
     return directIndex;
   }
+  const queueIndex = queueTargetExplicit
+    ? normalizeTodoTerminalIndex(
+      queueState?.targetTerminalIndex
+        ?? queueState?.target_terminal_index
+        ?? queueState?.terminalIndex
+        ?? queueState?.terminal_index,
+    )
+    : null;
+  if (queueIndex !== null) {
+    return queueIndex;
+  }
 
   const colorSlot = normalizeTerminalColorSlot(
-    item?.targetColorSlot
-      ?? item?.target_color_slot
-      ?? item?.terminalColorSlot
-      ?? item?.terminal_color_slot
-      ?? item?.colorSlot
-      ?? item?.color_slot
-      ?? queueState?.targetColorSlot
-      ?? queueState?.target_color_slot
-      ?? queueState?.terminalColorSlot
-      ?? queueState?.terminal_color_slot
-      ?? queueState?.colorSlot
-      ?? queueState?.color_slot
-      ?? item?.remoteCommand?.targetColorSlot
-      ?? item?.remoteCommand?.target_color_slot
-      ?? item?.remoteCommand?.terminalColorSlot
-      ?? item?.remoteCommand?.terminal_color_slot
-      ?? item?.remoteCommand?.colorSlot
-      ?? item?.remoteCommand?.color_slot
-      ?? item?.remote_command?.target_color_slot
-      ?? item?.remote_command?.terminal_color_slot
-      ?? item?.remote_command?.color_slot,
+    readDirectTarget
+      ? item?.targetColorSlot
+        ?? item?.target_color_slot
+        ?? item?.terminalColorSlot
+        ?? item?.terminal_color_slot
+        ?? item?.colorSlot
+        ?? item?.color_slot
+        ?? item?.remoteCommand?.targetColorSlot
+        ?? item?.remoteCommand?.target_color_slot
+        ?? item?.remoteCommand?.terminalColorSlot
+        ?? item?.remoteCommand?.terminal_color_slot
+        ?? item?.remoteCommand?.colorSlot
+        ?? item?.remoteCommand?.color_slot
+        ?? item?.remote_command?.target_color_slot
+        ?? item?.remote_command?.terminal_color_slot
+        ?? item?.remote_command?.color_slot
+      : queueTargetExplicit
+        ? queueState?.targetColorSlot
+          ?? queueState?.target_color_slot
+          ?? queueState?.terminalColorSlot
+          ?? queueState?.terminal_color_slot
+          ?? queueState?.colorSlot
+          ?? queueState?.color_slot
+        : undefined,
   );
   const hasTerminalColor = Boolean(normalizeTerminalHexColor(
-    item?.targetTerminalColor
-      || item?.target_terminal_color
-      || item?.terminalColor
-      || item?.terminal_color
-      || queueState?.targetTerminalColor
-      || queueState?.target_terminal_color
-      || queueState?.terminalColor
-      || queueState?.terminal_color
-      || item?.remoteCommand?.targetTerminalColor
-      || item?.remoteCommand?.target_terminal_color
-      || item?.remoteCommand?.terminalColor
-      || item?.remoteCommand?.terminal_color
-      || item?.remote_command?.target_terminal_color
-      || item?.remote_command?.terminal_color,
+    readDirectTarget
+      ? item?.targetTerminalColor
+        || item?.target_terminal_color
+        || item?.terminalColor
+        || item?.terminal_color
+        || item?.remoteCommand?.targetTerminalColor
+        || item?.remoteCommand?.target_terminal_color
+        || item?.remoteCommand?.terminalColor
+        || item?.remoteCommand?.terminal_color
+        || item?.remote_command?.target_terminal_color
+        || item?.remote_command?.terminal_color
+      : queueTargetExplicit
+        ? queueState?.targetTerminalColor
+          || queueState?.target_terminal_color
+          || queueState?.terminalColor
+          || queueState?.terminal_color
+        : "",
   ));
   return hasTerminalColor ? colorSlot : null;
 }
 
 function getTodoQueueTargetColorSlot(item) {
   const queueState = getTodoQueueRawQueueState(item);
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
+  const directColorSlot = readDirectTarget
+    ? normalizeTerminalColorSlot(
+      item?.targetColorSlot
+        ?? item?.target_color_slot
+        ?? item?.terminalColorSlot
+        ?? item?.terminal_color_slot
+        ?? item?.colorSlot
+        ?? item?.color_slot
+        ?? item?.remoteCommand?.targetColorSlot
+        ?? item?.remoteCommand?.target_color_slot
+        ?? item?.remoteCommand?.terminalColorSlot
+        ?? item?.remoteCommand?.terminal_color_slot
+        ?? item?.remoteCommand?.colorSlot
+        ?? item?.remoteCommand?.color_slot
+        ?? item?.remote_command?.target_color_slot
+        ?? item?.remote_command?.terminal_color_slot
+        ?? item?.remote_command?.color_slot,
+    )
+    : null;
+  if (directColorSlot !== null) {
+    return directColorSlot;
+  }
+  if (!queueTargetExplicit) {
+    return null;
+  }
   return normalizeTerminalColorSlot(
-    item?.targetColorSlot
-      ?? item?.target_color_slot
-      ?? item?.terminalColorSlot
-      ?? item?.terminal_color_slot
-      ?? item?.colorSlot
-      ?? item?.color_slot
-      ?? queueState?.targetColorSlot
+    queueState?.targetColorSlot
       ?? queueState?.target_color_slot
       ?? queueState?.terminalColorSlot
       ?? queueState?.terminal_color_slot
       ?? queueState?.colorSlot
-      ?? queueState?.color_slot
-      ?? item?.remoteCommand?.targetColorSlot
-      ?? item?.remoteCommand?.target_color_slot
-      ?? item?.remoteCommand?.terminalColorSlot
-      ?? item?.remoteCommand?.terminal_color_slot
-      ?? item?.remoteCommand?.colorSlot
-      ?? item?.remoteCommand?.color_slot
-      ?? item?.remote_command?.target_color_slot
-      ?? item?.remote_command?.terminal_color_slot
-      ?? item?.remote_command?.color_slot,
+      ?? queueState?.color_slot,
   );
 }
 
 function getTodoQueueTargetTerminalColor(item) {
   const queueState = getTodoQueueRawQueueState(item);
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
   const candidates = [
-    item?.targetTerminalColor,
-    item?.target_terminal_color,
-    item?.terminalColor,
-    item?.terminal_color,
-    queueState?.targetTerminalColor,
-    queueState?.target_terminal_color,
-    queueState?.terminalColor,
-    queueState?.terminal_color,
-    item?.remoteCommand?.targetTerminalColor,
-    item?.remoteCommand?.target_terminal_color,
-    item?.remoteCommand?.terminalColor,
-    item?.remoteCommand?.terminal_color,
-    item?.remote_command?.target_terminal_color,
-    item?.remote_command?.terminal_color,
+    ...(readDirectTarget ? [
+      item?.targetTerminalColor,
+      item?.target_terminal_color,
+      item?.terminalColor,
+      item?.terminal_color,
+      item?.remoteCommand?.targetTerminalColor,
+      item?.remoteCommand?.target_terminal_color,
+      item?.remoteCommand?.terminalColor,
+      item?.remoteCommand?.terminal_color,
+      item?.remote_command?.target_terminal_color,
+      item?.remote_command?.terminal_color,
+    ] : []),
+    ...(queueTargetExplicit ? [
+      queueState?.targetTerminalColor,
+      queueState?.target_terminal_color,
+      queueState?.terminalColor,
+      queueState?.terminal_color,
+    ] : []),
   ];
   for (const candidate of candidates) {
     const color = normalizeTerminalHexColor(candidate);
@@ -6373,24 +6430,27 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
   const queueState = getTodoQueueRawQueueState(item);
   const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
   const queueStateHasIndexTarget = queueTargetExplicit && todoQueueQueueStateHasIndexTarget(queueState);
-  const directTargetTerminalId = normalizeTodoTerminalIdentity(
-    item?.targetTerminalId
-      || item?.target_terminal_id
-      || item?.terminalId
-      || item?.terminal_id
-      || item?.paneId
-      || item?.pane_id
-      || item?.remoteCommand?.targetTerminalId
-      || item?.remoteCommand?.target_terminal_id
-      || item?.remoteCommand?.terminalId
-      || item?.remoteCommand?.terminal_id
-      || item?.remoteCommand?.paneId
-      || item?.remoteCommand?.pane_id
-      || item?.remote_command?.target_terminal_id
-      || item?.remote_command?.terminal_id
-      || item?.remote_command?.pane_id
-      || "",
-  );
+  const readDirectTarget = !queueState || queueTargetExplicit;
+  const directTargetTerminalId = readDirectTarget
+    ? normalizeTodoTerminalIdentity(
+      item?.targetTerminalId
+        || item?.target_terminal_id
+        || item?.terminalId
+        || item?.terminal_id
+        || item?.paneId
+        || item?.pane_id
+        || item?.remoteCommand?.targetTerminalId
+        || item?.remoteCommand?.target_terminal_id
+        || item?.remoteCommand?.terminalId
+        || item?.remoteCommand?.terminal_id
+        || item?.remoteCommand?.paneId
+        || item?.remoteCommand?.pane_id
+        || item?.remote_command?.target_terminal_id
+        || item?.remote_command?.terminal_id
+        || item?.remote_command?.pane_id
+        || "",
+    )
+    : "";
   const queueTargetTerminalId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
       queueState?.targetTerminalId
@@ -6402,19 +6462,21 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
         || "",
     )
     : "";
-  const directTargetThreadId = normalizeTodoTerminalIdentity(
-    item?.targetThreadId
-      || item?.target_thread_id
-      || item?.threadId
-      || item?.thread_id
-      || item?.remoteCommand?.targetThreadId
-      || item?.remoteCommand?.target_thread_id
-      || item?.remoteCommand?.threadId
-      || item?.remoteCommand?.thread_id
-      || item?.remote_command?.target_thread_id
-      || item?.remote_command?.thread_id
-      || "",
-  );
+  const directTargetThreadId = readDirectTarget
+    ? normalizeTodoTerminalIdentity(
+      item?.targetThreadId
+        || item?.target_thread_id
+        || item?.threadId
+        || item?.thread_id
+        || item?.remoteCommand?.targetThreadId
+        || item?.remoteCommand?.target_thread_id
+        || item?.remoteCommand?.threadId
+        || item?.remoteCommand?.thread_id
+        || item?.remote_command?.target_thread_id
+        || item?.remote_command?.thread_id
+        || "",
+    )
+    : "";
   const queueTargetThreadId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
       queueState?.targetThreadId
@@ -6424,18 +6486,20 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
         || "",
     )
     : "";
-  const directTargetTerminalIndex = normalizeTodoTerminalIndex(
-    item?.targetTerminalIndex
-      ?? item?.target_terminal_index
-      ?? item?.terminalIndex
-      ?? item?.terminal_index
-      ?? item?.remoteCommand?.targetTerminalIndex
-      ?? item?.remoteCommand?.target_terminal_index
-      ?? item?.remoteCommand?.terminalIndex
-      ?? item?.remoteCommand?.terminal_index
-      ?? item?.remote_command?.target_terminal_index
-      ?? item?.remote_command?.terminal_index,
-  );
+  const directTargetTerminalIndex = readDirectTarget
+    ? normalizeTodoTerminalIndex(
+      item?.targetTerminalIndex
+        ?? item?.target_terminal_index
+        ?? item?.terminalIndex
+        ?? item?.terminal_index
+        ?? item?.remoteCommand?.targetTerminalIndex
+        ?? item?.remoteCommand?.target_terminal_index
+        ?? item?.remoteCommand?.terminalIndex
+        ?? item?.remoteCommand?.terminal_index
+        ?? item?.remote_command?.target_terminal_index
+        ?? item?.remote_command?.terminal_index,
+    )
+    : null;
   const queueTargetTerminalIndex = queueTargetExplicit
     ? normalizeTodoTerminalIndex(
       queueState?.targetTerminalIndex
@@ -6444,23 +6508,25 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
         ?? queueState?.terminal_index,
     )
     : null;
-  const directTargetColorSlot = normalizeTerminalColorSlot(
-    item?.targetColorSlot
-      ?? item?.target_color_slot
-      ?? item?.terminalColorSlot
-      ?? item?.terminal_color_slot
-      ?? item?.colorSlot
-      ?? item?.color_slot
-      ?? item?.remoteCommand?.targetColorSlot
-      ?? item?.remoteCommand?.target_color_slot
-      ?? item?.remoteCommand?.terminalColorSlot
-      ?? item?.remoteCommand?.terminal_color_slot
-      ?? item?.remoteCommand?.colorSlot
-      ?? item?.remoteCommand?.color_slot
-      ?? item?.remote_command?.target_color_slot
-      ?? item?.remote_command?.terminal_color_slot
-      ?? item?.remote_command?.color_slot,
-  );
+  const directTargetColorSlot = readDirectTarget
+    ? normalizeTerminalColorSlot(
+      item?.targetColorSlot
+        ?? item?.target_color_slot
+        ?? item?.terminalColorSlot
+        ?? item?.terminal_color_slot
+        ?? item?.colorSlot
+        ?? item?.color_slot
+        ?? item?.remoteCommand?.targetColorSlot
+        ?? item?.remoteCommand?.target_color_slot
+        ?? item?.remoteCommand?.terminalColorSlot
+        ?? item?.remoteCommand?.terminal_color_slot
+        ?? item?.remoteCommand?.colorSlot
+        ?? item?.remoteCommand?.color_slot
+        ?? item?.remote_command?.target_color_slot
+        ?? item?.remote_command?.terminal_color_slot
+        ?? item?.remote_command?.color_slot,
+    )
+    : null;
   const queueTargetColorSlot = queueTargetExplicit
     ? normalizeTerminalColorSlot(
       queueState?.targetColorSlot
@@ -6471,18 +6537,20 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
         ?? queueState?.color_slot,
     )
     : null;
-  const directTargetTerminalColor = normalizeTerminalHexColor(
-    item?.targetTerminalColor
-      || item?.target_terminal_color
-      || item?.terminalColor
-      || item?.terminal_color
-      || item?.remoteCommand?.targetTerminalColor
-      || item?.remoteCommand?.target_terminal_color
-      || item?.remoteCommand?.terminalColor
-      || item?.remoteCommand?.terminal_color
-      || item?.remote_command?.target_terminal_color
-      || item?.remote_command?.terminal_color,
-  );
+  const directTargetTerminalColor = readDirectTarget
+    ? normalizeTerminalHexColor(
+      item?.targetTerminalColor
+        || item?.target_terminal_color
+        || item?.terminalColor
+        || item?.terminal_color
+        || item?.remoteCommand?.targetTerminalColor
+        || item?.remoteCommand?.target_terminal_color
+        || item?.remoteCommand?.terminalColor
+        || item?.remoteCommand?.terminal_color
+        || item?.remote_command?.target_terminal_color
+        || item?.remote_command?.terminal_color,
+    )
+    : "";
   const queueTargetTerminalColor = queueTargetExplicit
     ? normalizeTerminalHexColor(
       queueState?.targetTerminalColor
@@ -6645,16 +6713,26 @@ function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
       phase: safePhase,
       state: safePhase,
       source: fields.source || existingState.source || item.source || "",
-      targetAgentId: fields.targetAgentId || fields.targetRole || existingState.targetAgentId || existingState.targetRole || getTodoQueueTargetAgentId(item),
-      targetColorSlot: fieldTargetColorSlot ?? existingTargetColorSlot ?? getTodoQueueTargetColorSlot(item),
-      targetTerminalColor: fieldTargetTerminalColor || existingState.targetTerminalColor || existingState.target_terminal_color || getTodoQueueTargetTerminalColor(item),
-      targetTerminalId: clearStaleIdentityForIndexTarget
-        ? (fieldTargetTerminalIdConflicts ? "" : fieldTargetTerminalId)
-        : fields.targetTerminalId || existingState.targetTerminalId || existingState.target_terminal_id || getTodoQueueTargetTerminalId(item),
-      targetTerminalIndex: fieldTargetTerminalIndex ?? existingTargetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
-      targetThreadId: clearStaleIdentityForIndexTarget
-        ? fieldTargetThreadId
-        : fields.targetThreadId || existingState.targetThreadId || existingState.target_thread_id || getTodoQueueTargetThreadId(item),
+      targetAgentId: fields.targetAgentId || existingState.targetAgentId || existingState.target_agent_id || getTodoQueueTargetAgentId(item),
+      targetColorSlot: targetExplicit
+        ? fieldTargetColorSlot ?? existingTargetColorSlot ?? getTodoQueueTargetColorSlot(item)
+        : null,
+      targetTerminalColor: targetExplicit
+        ? fieldTargetTerminalColor || existingState.targetTerminalColor || existingState.target_terminal_color || getTodoQueueTargetTerminalColor(item)
+        : "",
+      targetTerminalId: targetExplicit
+        ? clearStaleIdentityForIndexTarget
+          ? (fieldTargetTerminalIdConflicts ? "" : fieldTargetTerminalId)
+          : fields.targetTerminalId || existingState.targetTerminalId || existingState.target_terminal_id || getTodoQueueTargetTerminalId(item)
+        : "",
+      targetTerminalIndex: targetExplicit
+        ? fieldTargetTerminalIndex ?? existingTargetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item)
+        : null,
+      targetThreadId: targetExplicit
+        ? clearStaleIdentityForIndexTarget
+          ? fieldTargetThreadId
+          : fields.targetThreadId || existingState.targetThreadId || existingState.target_thread_id || getTodoQueueTargetThreadId(item)
+        : "",
       targetExplicit,
       queuedAt: existingState.queuedAt || existingState.queued_at || nowIso,
       updatedAt: nowIso,
@@ -10095,7 +10173,6 @@ function TerminalView({
   const terminalPanelsRef = useRef(null);
   const todoQueuePanelRef = useRef(null);
   const todoDragStateRef = useRef(null);
-  const todoQueueDispatchingRef = useRef(false);
   const todoQueueItemsRef = useRef([]);
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
@@ -16382,14 +16459,6 @@ function TerminalView({
   }, [updateTodoQueueItems]);
 
   const dispatchQueuedTodoItems = useCallback(() => {
-    if (todoQueueDispatchingRef.current) {
-      logTerminalStatus("frontend.todo_queue.dispatch_skip", {
-        reason: "dispatch_already_in_progress",
-        workspaceId: terminalWorkspace?.id || "",
-      });
-      return;
-    }
-
     const queuedItems = todoQueueItems.filter((item) => {
       const pendingItem = todoQueuePendingItemsRef.current[item.id] || null;
       return pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued";
@@ -16599,7 +16668,6 @@ function TerminalView({
 
     const source = getTodoQueueItemAutoQueueSource(queuedItem);
     const targetTerminalIndex = target.targetTerminalIndex;
-    todoQueueDispatchingRef.current = true;
     recordTodoQueueRemoteCommandReceipt(queuedItem, "sending", {
       workspaceId: target.workspaceId || queuedItem.workspaceId || terminalWorkspace?.id || "",
     });
@@ -16694,7 +16762,7 @@ function TerminalView({
                       ? "session_accepted_waiting_for_completion"
                       : "terminal_submit_confirmed_waiting_for_session_acceptance",
                     source,
-                    targetAgentId: target.targetRole,
+                    targetAgentId: requestedTargetAgentId,
                     targetTerminalId: target.paneId,
                     targetTerminalIndex,
                     targetExplicit: queuedItemHasExplicitTerminalTarget,
@@ -16795,7 +16863,6 @@ function TerminalView({
         if (String(reservation?.itemId || "") === queuedItem.id) {
           todoQueueTerminalReservationsRef.current.delete(targetTerminalIndex);
         }
-        todoQueueDispatchingRef.current = false;
         setTodoQueueDispatchRevision((revision) => revision + 1);
       });
   }, [
