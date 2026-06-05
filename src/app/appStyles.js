@@ -11275,14 +11275,19 @@ export const AuthStepRail = styled.div`
     border-color: var(--forge-border);
     background: var(--forge-surface-control);
   }
+
+  &[data-compact="true"] {
+    width: min(520px, 92%);
+  }
 `;
 
 export const AuthStep = styled.div`
   display: grid;
-  min-height: clamp(30px, 5vh, 38px);
+  min-height: 38px;
   grid-template-columns: 24px minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
+  align-items: start;
+  column-gap: 10px;
+  row-gap: 2px;
   color: #a7b2c2;
   font-size: 12px;
   font-weight: 800;
@@ -11305,10 +11310,19 @@ export const AuthStep = styled.div`
     animation-delay: 240ms;
   }
 
+  &:nth-child(4) {
+    animation-delay: 275ms;
+  }
+
+  &:nth-child(5) {
+    animation-delay: 310ms;
+  }
+
   span {
     display: grid;
     width: 24px;
     height: 24px;
+    grid-row: 1 / span 2;
     place-items: center;
     border: 1px solid rgba(255, 255, 255, 0.12);
     border-radius: 8px;
@@ -11323,24 +11337,81 @@ export const AuthStep = styled.div`
     background: var(--forge-surface);
   }
 
-  &[data-active="true"] {
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  strong,
+  small {
+    min-width: 0;
+    grid-column: 2;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  strong {
+    color: inherit;
+    font-size: 12px;
+    line-height: 1.2;
+    white-space: nowrap;
+  }
+
+  small {
+    color: #7f8a9b;
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+  }
+
+  html[data-forge-theme="light"] & small {
+    color: var(--forge-text-muted);
+  }
+
+  &[data-active="true"],
+  &[data-state="active"],
+  &[data-state="complete"] {
     color: #f7f9ff;
   }
 
-  html[data-forge-theme="light"] &[data-active="true"] {
+  html[data-forge-theme="light"] &[data-active="true"],
+  html[data-forge-theme="light"] &[data-state="active"],
+  html[data-forge-theme="light"] &[data-state="complete"] {
     color: var(--forge-text);
   }
 
-  &[data-active="true"] span {
+  &[data-active="true"] span,
+  &[data-state="active"] span,
+  &[data-state="complete"] span {
     border-color: rgba(47, 128, 255, 0.42);
     color: #62a0ff;
     background: rgba(47, 128, 255, 0.14);
   }
 
-  html[data-forge-theme="light"] &[data-active="true"] span {
+  html[data-forge-theme="light"] &[data-active="true"] span,
+  html[data-forge-theme="light"] &[data-state="active"] span,
+  html[data-forge-theme="light"] &[data-state="complete"] span {
     border-color: rgba(0, 102, 204, 0.24);
     color: var(--forge-blue);
     background: rgba(0, 102, 204, 0.08);
+  }
+
+  &[data-state="warning"] span,
+  &[data-state="error"] span {
+    border-color: rgba(255, 122, 24, 0.42);
+    color: #ffb269;
+    background: rgba(255, 122, 24, 0.14);
+  }
+
+  &[data-state="error"] {
+    color: #ffd0d0;
+  }
+
+  &[data-state="error"] span {
+    border-color: rgba(255, 107, 107, 0.42);
+    color: #ffb1b1;
+    background: rgba(255, 107, 107, 0.14);
   }
 `;
 

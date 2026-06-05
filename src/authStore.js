@@ -126,6 +126,7 @@ function readStoredScope(user = readStoredUser()) {
 
 let snapshot = {
   status: "signedOut",
+  stage: "idle",
   message: DEFAULT_AUTH_MESSAGE,
   error: "",
   user: readStoredUser(),
@@ -181,6 +182,7 @@ function syncFromStorage() {
 
   if (snapshot.status === "authenticated" && !token) {
     next.status = "signedOut";
+    next.stage = "idle";
     next.message = "Your desktop session expired. Sign in again with the web app.";
     next.error = "";
   }
@@ -217,6 +219,7 @@ export const authStore = {
   setChecking(message) {
     emitAuthChange({
       status: "signedOut",
+      stage: "session_restore",
       message,
       error: "",
       user: readStoredUser(),
@@ -229,6 +232,7 @@ export const authStore = {
     writeStorageValue(PENDING_STATE_KEY, pendingState);
     emitAuthChange({
       status: "waiting",
+      stage: "browser_handoff",
       message,
       error: "",
       pendingState,
@@ -237,8 +241,15 @@ export const authStore = {
   setExchanging(message = "Finishing desktop sign in...") {
     emitAuthChange({
       status: "exchanging",
+      stage: "session_exchange",
       message,
       error: "",
+    });
+  },
+  setStage(stage, message) {
+    emitAuthChange({
+      stage,
+      ...(typeof message === "string" ? { message } : {}),
     });
   },
   setAuthenticated(sessionUser, message) {
@@ -252,6 +263,7 @@ export const authStore = {
 
     emitAuthChange({
       status: "authenticated",
+      stage: "authenticated",
       message: message ?? snapshot.message,
       error: "",
       user: sessionUser,
@@ -271,6 +283,7 @@ export const authStore = {
     writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
     emitAuthChange({
       status: "authenticated",
+      stage: "authenticated",
       message: message ?? snapshot.message,
       error: "",
       user: session.user,
@@ -302,6 +315,7 @@ export const authStore = {
 
     emitAuthChange({
       status: "signedOut",
+      stage: "idle",
       message,
       error,
       user: clearSession ? null : readStoredUser(),

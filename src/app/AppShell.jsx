@@ -59,6 +59,10 @@ import {
   logBigViewSyncDiagnosticEvent,
 } from "../threads/bigViewSyncDiagnostics";
 import {
+  getWorkspaceActivationDiagnosticNowMs,
+  logWorkspaceActivationDiagnosticEvent,
+} from "../diagnostics/workspaceActivationDiagnostics.js";
+import {
   getLiveTerminalForThread,
   getThreadTerminalGroundTruth,
   terminalPromptingUserBlocksShutdown,
@@ -514,7 +518,7 @@ const AUTH_EXCHANGE_TIMEOUT_MESSAGE = "Desktop sign in timed out. Try again.";
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS = 25000;
 const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed out. Try again.";
 const CLOUD_MCP_SIGNIN_DIAGNOSTICS_ENABLED = false;
-const CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED = true;
+const CLOUD_MCP_CONNECTION_DIAGNOSTICS_ENABLED = false;
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
@@ -770,9 +774,29 @@ async function recordCloudConnectionDiagnostic(token, event) {
 }
 
 async function syncCloudMcpDesktopSessionToken(token, options = {}) {
+  const emitProgress = (progress) => {
+    if (typeof options.onProgress !== "function") {
+      return;
+    }
+
+    try {
+      options.onProgress(progress);
+    } catch {
+      // Progress callbacks are visual only.
+    }
+  };
+
   try {
     const safeToken = isSafeAuthValue(token) ? token : null;
     const flowId = options.flowId || "desktop-cloud-connect";
+    if (safeToken) {
+      emitProgress({
+        detail: "Passing your web session into the native cloud runtime.",
+        stage: "desktop_session",
+        status: "active",
+        title: "Securing desktop session",
+      });
+    }
     await recordCloudConnectionDiagnostic(safeToken, {
       channel: "rust-client-auth",
       flowId,
@@ -817,45 +841,114 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
       details: status,
     });
 
+    if (safeToken) {
+      emitProgress({
+        detail: "The native runtime accepted your signed-in desktop session.",
+        stage: "desktop_session",
+        status: "complete",
+        title: "Desktop session accepted",
+      });
+    }
+
     if (!options.requireConnected || !safeToken) {
       return status;
     }
 
-    await recordCloudSigninDiagnostic(safeToken, {
-      flowId,
-      step: "cloud_mcp.connect.invoke",
-      status: "start",
-      message: "requesting Cloud MCP websocket connection",
-      details: { timeoutMs: CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS },
-    });
-    const connectedStatus = await withTimeout(
-      invoke("cloud_mcp_connect"),
-      CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
-      CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
-    );
-    await recordCloudConnectionDiagnostic(safeToken, {
-      channel: "rust-client-auth",
-      flowId,
-      step: "rust.cloud_mcp.connect",
-      status: connectedStatus?.connected && connectedStatus?.globalWsConnected ? "ok" : "warn",
-      message: "Rust client Cloud MCP websocket connect command returned.",
-      details: connectedStatus,
-    });
-    await recordCloudSigninDiagnostic(safeToken, {
-      flowId,
-      step: "cloud_mcp.connect.invoke",
-      status: "ok",
-      message: "Cloud MCP websocket connect command returned",
-      details: connectedStatus,
-    });
+    const connectAttempts = Math.max(1, Math.floor(Number(options.connectAttempts || 1)));
+    const retryDelayMs = Math.max(0, Number(options.connectRetryDelayMs || 0));
+    let lastConnectError = null;
 
-    if (!connectedStatus?.connected || !connectedStatus?.globalWsConnected) {
-      throw new Error("Cloud workspace websocket is not connected yet.");
+    for (let attempt = 1; attempt <= connectAttempts; attempt += 1) {
+      emitProgress({
+        attempt,
+        detail: attempt === 1
+          ? "Preparing short-lived cloud auth and requesting the assigned workspace route."
+          : `The workspace is still coming online. Retrying connection ${attempt} of ${connectAttempts}.`,
+        stage: attempt === 1 ? "cloud_auth" : "cloud_instance",
+        status: "active",
+        title: attempt === 1 ? "Preparing cloud auth" : "Still setting up your instance",
+      });
+      await recordCloudSigninDiagnostic(safeToken, {
+        flowId,
+        step: "cloud_mcp.connect.invoke",
+        status: "start",
+        message: "requesting Cloud MCP websocket connection",
+        details: {
+          attempt,
+          attempts: connectAttempts,
+          timeoutMs: CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
+        },
+      });
+
+      const stopStatusPolling = startCloudWorkspaceStatusPolling(emitProgress);
+      try {
+        const connectedStatus = await withTimeout(
+          invoke("cloud_mcp_connect"),
+          CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MS,
+          CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE,
+        );
+        stopStatusPolling();
+        await recordCloudConnectionDiagnostic(safeToken, {
+          channel: "rust-client-auth",
+          flowId,
+          step: "rust.cloud_mcp.connect",
+          status: connectedStatus?.connected && connectedStatus?.globalWsConnected ? "ok" : "warn",
+          message: "Rust client Cloud MCP websocket connect command returned.",
+          details: connectedStatus,
+        });
+        await recordCloudSigninDiagnostic(safeToken, {
+          flowId,
+          step: "cloud_mcp.connect.invoke",
+          status: "ok",
+          message: "Cloud MCP websocket connect command returned",
+          details: connectedStatus,
+        });
+
+        if (!connectedStatus?.connected || !connectedStatus?.globalWsConnected) {
+          throw new Error("Cloud workspace websocket is not connected yet.");
+        }
+
+        emitProgress({
+          ...cloudWorkspaceProgressFromRuntimeStatus(connectedStatus),
+          attempt,
+          detail: "Your assigned cloud workspace is live and ready.",
+          status: "connected",
+          title: "Cloud workspace ready",
+        });
+
+        return connectedStatus;
+      } catch (connectError) {
+        stopStatusPolling();
+        lastConnectError = connectError;
+
+        if (attempt < connectAttempts) {
+          emitProgress({
+            attempt,
+            detail: "The cloud route is still warming. The desktop app will keep waiting automatically.",
+            stage: "cloud_instance",
+            status: "active",
+            title: "Still setting up your instance",
+          });
+
+          if (retryDelayMs > 0) {
+            await waitMs(retryDelayMs);
+          }
+          continue;
+        }
+
+        throw connectError;
+      }
     }
 
-    return connectedStatus;
+    throw lastConnectError || new Error("Cloud workspace websocket is not connected yet.");
   } catch (error) {
     if (options.requireConnected) {
+      emitProgress({
+        detail: getErrorMessage(error, "The cloud workspace did not finish connecting."),
+        stage: "workspace_socket",
+        status: "error",
+        title: "Cloud workspace still unavailable",
+      });
       await recordCloudConnectionDiagnostic(token, {
         channel: "rust-client-auth",
         flowId: options.flowId || "desktop-cloud-connect",
@@ -2230,7 +2323,61 @@ const WORKSPACE_DEACTIVATION_INITIAL_STATE = {
   closed: 0,
   total: 0,
 };
-const AUTH_STEPS = ["Browser sign in", "State match", "Desktop session"];
+const AUTH_STEPS = [
+  {
+    detail: "Opening secure web sign-in.",
+    id: "browser_handoff",
+    label: "Browser sign in",
+  },
+  {
+    detail: "Matching the signed callback.",
+    id: "deep_link",
+    label: "Deep-link callback",
+  },
+  {
+    detail: "Creating the native session.",
+    id: "session_exchange",
+    label: "Desktop session",
+  },
+];
+const CLOUD_WORKSPACE_STEPS = [
+  {
+    detail: "Passing your web session into the native runtime.",
+    id: "desktop_session",
+    label: "Desktop session",
+  },
+  {
+    detail: "Preparing short-lived cloud auth.",
+    id: "cloud_auth",
+    label: "Cloud auth",
+  },
+  {
+    detail: "Finding the assigned backend for this account.",
+    id: "cloud_route",
+    label: "Cloud route",
+  },
+  {
+    detail: "Starting the backend or container if needed.",
+    id: "cloud_instance",
+    label: "Instance setup",
+  },
+  {
+    detail: "Completing the live websocket handshake.",
+    id: "workspace_socket",
+    label: "Live socket",
+  },
+];
+const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
+  attempt: 0,
+  detail: "Waiting for web sign-in.",
+  stage: "idle",
+  status: "idle",
+  title: "Cloud workspace",
+  updatedAt: 0,
+});
+const CLOUD_WORKSPACE_CONNECT_ATTEMPTS = 8;
+const CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS = 2200;
+const CLOUD_WORKSPACE_STATUS_POLL_MS = 650;
 const AGENT_PROVIDERS = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
@@ -2793,6 +2940,164 @@ function withTimeout(promise, timeoutMs, message) {
       },
     );
   });
+}
+
+function waitMs(delayMs) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+  });
+}
+
+function stepStateFor(steps, currentStage, status, index) {
+  const currentIndex = Math.max(0, steps.findIndex((step) => step.id === currentStage));
+  const normalizedStatus = String(status || "").toLowerCase();
+
+  if (normalizedStatus === "error" && index === currentIndex) {
+    return "error";
+  }
+
+  if (normalizedStatus === "warn" && index === currentIndex) {
+    return "warning";
+  }
+
+  if (normalizedStatus === "connected" || normalizedStatus === "complete") {
+    return index <= currentIndex ? "complete" : "pending";
+  }
+
+  if (index < currentIndex) {
+    return "complete";
+  }
+
+  return index === currentIndex ? "active" : "pending";
+}
+
+function cloudWorkspaceProgressFromRuntimeStatus(status) {
+  const globalStatus = String(status?.globalWsStatus || status?.global_ws_status || "").toLowerCase();
+  const runtimeStatus = String(status?.status || "").toLowerCase();
+  const connected = Boolean(status?.connected && (status?.globalWsConnected || status?.global_ws_connected));
+  const statusKey = globalStatus || runtimeStatus;
+
+  if (connected || statusKey === "connected") {
+    return {
+      detail: "Your cloud workspace is connected and ready for live work.",
+      stage: "workspace_socket",
+      status: "connected",
+      title: "Cloud workspace ready",
+    };
+  }
+
+  if (statusKey === "authenticating") {
+    return {
+      detail: "Minting a short-lived Appwrite token for the desktop runtime.",
+      stage: "cloud_auth",
+      status: "active",
+      title: "Preparing cloud auth",
+    };
+  }
+
+  if (statusKey === "resolving_route") {
+    return {
+      detail: "Finding the personal or team backend assigned to this account.",
+      stage: "cloud_route",
+      status: "active",
+      title: "Finding your cloud route",
+    };
+  }
+
+  if (["connecting", "opening_websocket", "websocket_retrying", "retrying"].includes(statusKey)) {
+    return {
+      detail: "The backend is reachable; waiting for the workspace process to accept the live connection.",
+      stage: "cloud_instance",
+      status: "active",
+      title: "Setting up your instance",
+    };
+  }
+
+  if (["handshaking", "websocket_handshaking"].includes(statusKey)) {
+    return {
+      detail: "The websocket is open; waiting for the cloud workspace ready frame.",
+      stage: "workspace_socket",
+      status: "active",
+      title: "Linking the live workspace",
+    };
+  }
+
+  if (["blocked", "auth_missing", "websocket_auth_missing"].includes(statusKey)) {
+    return {
+      detail: status?.globalWsLastError || status?.global_ws_last_error || status?.lastError || status?.last_error || "The cloud workspace is retrying.",
+      stage: "workspace_socket",
+      status: "warn",
+      title: "Cloud workspace is retrying",
+    };
+  }
+
+  return {
+    detail: "Requesting the assigned cloud workspace and waiting for it to become ready.",
+    stage: "cloud_route",
+    status: "active",
+    title: "Preparing your cloud workspace",
+  };
+}
+
+function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE) {
+  const nextStage = String(progress?.stage || previous.stage || "idle");
+  const nextStatus = String(progress?.status || previous.status || "idle");
+  return {
+    attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
+    detail: String(progress?.detail || previous.detail || ""),
+    stage: nextStage,
+    status: nextStatus,
+    title: String(progress?.title || previous.title || "Cloud workspace"),
+    updatedAt: Date.now(),
+  };
+}
+
+function isCloudWorkspaceProgressReady(progress) {
+  return String(progress?.status || "").toLowerCase() === "connected";
+}
+
+function cloudWorkspaceLaunchState(progress) {
+  const status = String(progress?.status || "").toLowerCase();
+
+  if (status === "connected") {
+    return "ready";
+  }
+
+  if (status === "error" || status === "warn") {
+    return "warning";
+  }
+
+  return "checking";
+}
+
+function startCloudWorkspaceStatusPolling(onProgress) {
+  if (typeof onProgress !== "function" || typeof window === "undefined") {
+    return () => {};
+  }
+
+  let stopped = false;
+  let timerId = null;
+  const poll = async () => {
+    try {
+      const status = await invoke("cloud_mcp_get_status");
+      onProgress(cloudWorkspaceProgressFromRuntimeStatus(status));
+    } catch {
+      // The connect command is authoritative; polling only improves UI copy.
+    }
+
+    if (!stopped) {
+      timerId = window.setTimeout(poll, CLOUD_WORKSPACE_STATUS_POLL_MS);
+    }
+  };
+
+  void poll();
+
+  return () => {
+    stopped = true;
+    if (timerId != null) {
+      window.clearTimeout(timerId);
+    }
+  };
 }
 
 function hasTauriWindowMetadata() {
@@ -4417,6 +4722,7 @@ export default function App() {
 
   const {
     status: authState,
+    stage: authStage,
     message: authMessage,
     error: authError,
     user,
@@ -4497,6 +4803,7 @@ export default function App() {
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
   const [cloudSqliteResetSelectedRepoPath, setCloudSqliteResetSelectedRepoPath] = useState("");
+  const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
   );
@@ -4547,6 +4854,10 @@ export default function App() {
   const workspaceTerminalDisplayLayoutsRef = useRef(workspaceTerminalDisplayLayouts);
   const workspaceLifecycleSettingsRef = useRef(workspaceLifecycleSettings);
   const workspaceAgentLaunchKeyRef = useRef("");
+  const workspaceActivationSequenceRef = useRef(0);
+  const workspaceActivationStartedAtRef = useRef(new Map());
+  const workspaceActivationStateLogKeyRef = useRef("");
+  const workspaceRuntimeDescriptorBuildRef = useRef(null);
   const deferredWorkspaceActivationRef = useRef({
     frame: 0,
     idle: 0,
@@ -4621,6 +4932,54 @@ export default function App() {
       window.removeEventListener(TERMINAL_INPUT_HOT_EVENT, handleTerminalInputHot);
     };
   }, []);
+
+  const beginWorkspaceActivationTrace = useCallback((workspaceId, source = "manual") => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return { activationSeq: 0, activationSource: source, startedAtMs: 0 };
+    }
+
+    const activationSeq = workspaceActivationSequenceRef.current + 1;
+    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
+    workspaceActivationSequenceRef.current = activationSeq;
+    workspaceActivationStartedAtRef.current.set(safeWorkspaceId, {
+      activationSeq,
+      source,
+      startedAtMs,
+    });
+
+    return { activationSeq, activationSource: source, startedAtMs };
+  }, []);
+
+  const workspaceActivationTraceFields = useCallback((workspaceId, fallback = {}) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    const trace = safeWorkspaceId
+      ? workspaceActivationStartedAtRef.current.get(safeWorkspaceId)
+      : null;
+    const startedAtMs = Number(trace?.startedAtMs || fallback.startedAtMs || 0);
+    const fields = {
+      activationSeq: Number(trace?.activationSeq || fallback.activationSeq || 0),
+      activationSource: trace?.source || fallback.activationSource || fallback.source || "",
+    };
+
+    if (startedAtMs > 0) {
+      fields.activationElapsedMs = Math.max(
+        0,
+        getWorkspaceActivationDiagnosticNowMs() - startedAtMs,
+      );
+    }
+
+    return fields;
+  }, []);
+
+  const logWorkspaceActivationTrace = useCallback((phase, workspaceId, fields = {}, options = {}) => {
+    logWorkspaceActivationDiagnosticEvent(phase, {
+      ...workspaceActivationTraceFields(workspaceId, options.trace || {}),
+      ...fields,
+      workspaceId: String(workspaceId || fields.workspaceId || "").trim(),
+    }, options);
+  }, [workspaceActivationTraceFields]);
+
   const activeAccountScope = useMemo(() => {
     const requestedKey = accountScopeKey(activeScope);
     return accountScopes.find((scope) => accountScopeKey(scope) === requestedKey)
@@ -4715,20 +5074,56 @@ export default function App() {
   );
 
   useEffect(() => {
-    setWorkspaceHydrationReady(Boolean(workspaceHydrationKey));
-  }, [workspaceHydrationKey]);
+    const ready = Boolean(workspaceHydrationKey);
+    setWorkspaceHydrationReady(ready);
+    logWorkspaceActivationTrace("workspace.open.hydration_key", activatedWorkspaceId || selectedWorkspaceId, {
+      activatedWorkspaceId,
+      activeAccountScopeKey,
+      ready,
+      rootDirectory: activeWorkspaceHydrationRoot,
+      rootIdentity: getWorkspaceRootIdentity(activeWorkspaceHydrationRoot),
+      selectedWorkspaceId,
+      workspaceActivationDeferred,
+      workspaceState,
+    });
+  }, [
+    activatedWorkspaceId,
+    activeAccountScopeKey,
+    activeWorkspaceHydrationRoot,
+    logWorkspaceActivationTrace,
+    selectedWorkspaceId,
+    workspaceActivationDeferred,
+    workspaceHydrationKey,
+    workspaceState,
+  ]);
 
   useEffect(() => {
     if (!workspaceHydrationReady || workspaceActivationDeferred) {
+      logWorkspaceActivationTrace("workspace.open.coordination_targets.skip", activatedWorkspaceId || selectedWorkspaceId, {
+        reason: !workspaceHydrationReady ? "hydration_not_ready" : "activation_deferred",
+        workspaceActivationDeferred,
+        workspaceHydrationReady,
+      });
       return undefined;
     }
 
     if (!workspaceCoordinationRootEntries.length) {
+      logWorkspaceActivationTrace("workspace.open.coordination_targets.empty", activatedWorkspaceId || selectedWorkspaceId, {
+        workspaceHydrationReady,
+      });
       setWorkspaceCoordinationTargetsByRoot({});
       return undefined;
     }
 
     let cancelled = false;
+    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
+    logWorkspaceActivationTrace("workspace.open.coordination_targets.start", activatedWorkspaceId || selectedWorkspaceId, {
+      rootCount: workspaceCoordinationRootEntries.length,
+      roots: workspaceCoordinationRootEntries.map((entry) => ({
+        rootDirectory: entry.rootDirectory,
+        workspaceId: entry.workspaceId,
+      })),
+    });
     Promise.all(
       workspaceCoordinationRootEntries.map(async (entry) => {
         const key = getWorkspaceRootIdentity(entry.rootDirectory);
@@ -4751,6 +5146,13 @@ export default function App() {
       if (cancelled) {
         return;
       }
+      logWorkspaceActivationTrace("workspace.open.coordination_targets.done", activatedWorkspaceId || selectedWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+        rootCount: entries.length,
+        targetCount: entries.reduce((sum, [, targets]) => (
+          sum + (Array.isArray(targets) ? targets.length : 0)
+        ), 0),
+      });
       setWorkspaceCoordinationTargetsByRoot(Object.fromEntries(entries));
     });
 
@@ -4759,6 +5161,9 @@ export default function App() {
     };
   }, [
     workspaceActivationDeferred,
+    activatedWorkspaceId,
+    logWorkspaceActivationTrace,
+    selectedWorkspaceId,
     workspaceCoordinationRootEntries,
     workspaceCoordinationRootKey,
     workspaceHydrationReady,
@@ -4878,10 +5283,20 @@ export default function App() {
     const storeKey = workspaceThreadStoreKey;
 
     if (workspaceActivationDeferred) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        reason: "activation_deferred",
+        targetCount: targets.length,
+        workspaceActivationDeferred,
+      });
       return undefined;
     }
 
     if (!workspaceHydrationReady) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        reason: "hydration_not_ready",
+        targetCount: targets.length,
+        workspaceHydrationReady,
+      });
       workspaceThreadsHydratedKeyRef.current = "";
       workspaceThreadsPersistenceReadyRef.current = false;
       workspaceThreadsLastPersistedRef.current = {};
@@ -4890,6 +5305,9 @@ export default function App() {
     }
 
     if (!targets.length) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+      });
       workspaceThreadsHydratedKeyRef.current = storeKey;
       workspaceThreadsPersistenceReadyRef.current = Boolean(workspaces.length === 0);
       workspaceThreadsLastPersistedRef.current = {};
@@ -4898,14 +5316,28 @@ export default function App() {
     }
 
     if (workspaceThreadsHydratedKeyRef.current === storeKey) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.cached", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+        targetCount: targets.length,
+      });
       workspaceThreadsPersistenceReadyRef.current = true;
       setWorkspaceThreadsHydratedKey(storeKey);
       return undefined;
     }
 
     let disposed = false;
+    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
     workspaceThreadsPersistenceReadyRef.current = false;
     setWorkspaceThreadsHydratedKey((currentKey) => (currentKey === storeKey ? currentKey : ""));
+    logWorkspaceActivationTrace("workspace.open.threads_hydration.start", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+      storeKey,
+      targetCount: targets.length,
+      targets: targets.map((target) => ({
+        rootDirectory: target.rootDirectory,
+        terminalCount: target.terminalCount,
+        workspaceId: target.workspaceId,
+      })),
+    });
 
     invoke("workspace_threads_read", {
       request: { workspaces: targets },
@@ -4918,6 +5350,12 @@ export default function App() {
           stripLiveBindings: true,
         });
         workspaceThreadsLastPersistedRef.current = persistWorkspaceThreads(loadedThreads);
+        logWorkspaceActivationTrace("workspace.open.threads_hydration.done", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+          elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+          loadedWorkspaceCount: Object.keys(loadedThreads).length,
+          storeKey,
+          targetCount: targets.length,
+        });
         const targetIds = new Set(targets.map((target) => target.workspaceId));
         setWorkspaceThreads((currentThreads) => {
           const normalizedCurrent = normalizeWorkspaceThreads(currentThreads);
@@ -4975,6 +5413,12 @@ export default function App() {
         workspaceThreadsHydratedKeyRef.current = storeKey;
         workspaceThreadsPersistenceReadyRef.current = true;
         setWorkspaceThreadsHydratedKey(storeKey);
+        logWorkspaceActivationTrace("workspace.open.threads_hydration.error", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+          elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+          message: getErrorMessage(error, "Unable to load workspace threads from SQLite."),
+          storeKey,
+          targetCount: targets.length,
+        });
         logThreadBridgeDiagnosticEvent("frontend.workspace_threads_sqlite_read.failed", {
           message: getErrorMessage(error, "Unable to load workspace threads from SQLite."),
           workspaceCount: targets.length,
@@ -4993,6 +5437,7 @@ export default function App() {
     workspaceTerminalRoleOptions,
     workspaceHydrationReady,
     workspaceActivationDeferred,
+    logWorkspaceActivationTrace,
     workspaces,
   ]);
 
@@ -5579,6 +6024,10 @@ export default function App() {
     }
   }, [applyWindowFrameState]);
 
+  const updateCloudWorkspaceProgress = useCallback((progress) => {
+    setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress(progress, current));
+  }, []);
+
   const setSignedOut = useCallback((
     message = DEFAULT_AUTH_MESSAGE,
     error = "",
@@ -5614,6 +6063,7 @@ export default function App() {
     setWorkspaceSettingsModalId("");
     setWorkspaceTerminalLogicalIndexes({});
     setWorkspaceTerminalDisplayLayouts({});
+    setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
     agentInitialStatusUserRef.current = "";
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
@@ -5644,7 +6094,19 @@ export default function App() {
       sessionUser,
       isPaid ? "Initializing workspace..." : "Upgrade to unlock the desktop workspace.",
     );
-    void syncCloudMcpDesktopSessionToken(authStore.getToken());
+    if (isPaid) {
+      updateCloudWorkspaceProgress({
+        detail: "Passing your signed-in session to the cloud runtime.",
+        stage: "desktop_session",
+        status: "active",
+        title: "Preparing cloud workspace",
+      });
+    } else {
+      setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
+    }
+    void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
+      onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
+    });
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCloudSyncKeyRef.current = "";
@@ -5678,7 +6140,7 @@ export default function App() {
     setStartupAgentGateState(isPaid ? "checking" : "idle");
     setStartupAgentUpdateMessage("");
     setWorkspaceError("");
-  }, []);
+  }, [updateCloudWorkspaceProgress]);
 
   const showView = useCallback((nextView, options = {}) => {
     if (nextView === activeView && nextView === visibleView) {
@@ -5886,6 +6348,16 @@ export default function App() {
   const cancelDeferredWorkspaceActivation = useCallback(() => {
     const pending = deferredWorkspaceActivationRef.current;
 
+    if (pending.workspaceId) {
+      logWorkspaceActivationTrace("workspace.open.deferred_cancel", pending.workspaceId, {
+        hasFrame: Boolean(pending.frame),
+        hasIdle: Boolean(pending.idle),
+        hasSecondFrame: Boolean(pending.secondFrame),
+        hasTimeout: Boolean(pending.timeout),
+        token: pending.token,
+      });
+    }
+
     if (pending.frame) {
       window.cancelAnimationFrame(pending.frame);
     }
@@ -5907,23 +6379,45 @@ export default function App() {
       token: pending.token,
       workspaceId: "",
     };
-  }, []);
+  }, [logWorkspaceActivationTrace]);
 
-  const activateWorkspace = useCallback((workspaceId, source = "manual") => {
+  const activateWorkspace = useCallback((workspaceId, source = "manual", trace = null) => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
+    const safeWorkspaceId = String(workspaceId || "").trim();
 
     if (workspaceDeactivationInFlightRef.current) {
+      logWorkspaceActivationTrace("workspace.open.activate.blocked", safeWorkspaceId, {
+        reason: "workspace_deactivation_in_flight",
+        source,
+        workspaceDeactivationInFlight: workspaceDeactivationInFlightRef.current,
+      }, { trace });
       return false;
     }
 
     if (!workspace) {
+      logWorkspaceActivationTrace("workspace.open.activate.blocked", safeWorkspaceId, {
+        availableWorkspaceCount: workspaces.length,
+        reason: "workspace_not_found",
+        source,
+      }, { trace });
       return false;
     }
 
+    const activeTrace = workspaceActivationStartedAtRef.current.get(workspace.id)
+      ? null
+      : beginWorkspaceActivationTrace(workspace.id, source);
+    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
     const previousActivatedWorkspaceId = activatedWorkspaceIdRef.current;
     const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(
       workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
     );
+
+    logWorkspaceActivationTrace("workspace.open.activate.begin", workspace.id, {
+      enabledWorkspaceCount: enabledWorkspaceIds.length,
+      previousActivatedWorkspaceId,
+      source,
+      workspaceName: workspace.name || "",
+    }, { trace: trace || activeTrace });
 
     setSelectedWorkspaceId(workspace.id);
     selectedWorkspaceIdRef.current = workspace.id;
@@ -5943,10 +6437,25 @@ export default function App() {
       setWorkspaceAgentBatchSentKey("");
     }
 
-    return true;
-  }, [updateWorkspaceLifecycleSettings, workspaces]);
+    logWorkspaceActivationTrace("workspace.open.activate.committed", workspace.id, {
+      elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+      enabledWorkspaceCountAfter: enabledWorkspaceIds.includes(workspace.id)
+        ? enabledWorkspaceIds.length
+        : enabledWorkspaceIds.length + 1,
+      previousActivatedWorkspaceId,
+      source,
+      workspaceName: workspace.name || "",
+    }, { trace: trace || activeTrace });
 
-  const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_click") => {
+    return true;
+  }, [
+    beginWorkspaceActivationTrace,
+    logWorkspaceActivationTrace,
+    updateWorkspaceLifecycleSettings,
+    workspaces,
+  ]);
+
+  const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_click", trace = null) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
     if (!safeWorkspaceId) {
       return;
@@ -5955,6 +6464,7 @@ export default function App() {
     cancelDeferredWorkspaceActivation();
 
     const token = deferredWorkspaceActivationRef.current.token + 1;
+    const scheduledAtMs = getWorkspaceActivationDiagnosticNowMs();
     deferredWorkspaceActivationRef.current = {
       frame: 0,
       idle: 0,
@@ -5963,10 +6473,20 @@ export default function App() {
       token,
       workspaceId: safeWorkspaceId,
     };
+    logWorkspaceActivationTrace("workspace.open.deferred_schedule", safeWorkspaceId, {
+      source,
+      token,
+    }, { trace });
 
     const runActivation = () => {
       const current = deferredWorkspaceActivationRef.current;
       if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.deferred_stale", safeWorkspaceId, {
+          currentToken: current.token,
+          currentWorkspaceId: current.workspaceId,
+          expectedToken: token,
+          source,
+        }, { trace });
         return;
       }
       deferredWorkspaceActivationRef.current = {
@@ -5986,15 +6506,32 @@ export default function App() {
       }
 
       if (selectedWorkspaceIdRef.current !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.deferred_selection_changed", safeWorkspaceId, {
+          elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+          selectedWorkspaceId: selectedWorkspaceIdRef.current,
+          source,
+          token,
+        }, { trace });
         return;
       }
 
-      activateWorkspace(safeWorkspaceId, source);
+      logWorkspaceActivationTrace("workspace.open.deferred_run", safeWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+        source,
+        token,
+      }, { trace });
+      activateWorkspace(safeWorkspaceId, source, trace);
     };
 
     const scheduleIdleActivation = () => {
       const current = deferredWorkspaceActivationRef.current;
       if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.deferred_idle_stale", safeWorkspaceId, {
+          currentToken: current.token,
+          currentWorkspaceId: current.workspaceId,
+          expectedToken: token,
+          source,
+        }, { trace });
         return;
       }
 
@@ -6005,6 +6542,12 @@ export default function App() {
           idle,
           secondFrame: 0,
         };
+        logWorkspaceActivationTrace("workspace.open.deferred_idle_scheduled", safeWorkspaceId, {
+          elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+          source,
+          strategy: "requestIdleCallback",
+          token,
+        }, { trace });
         return;
       }
 
@@ -6014,14 +6557,31 @@ export default function App() {
         secondFrame: 0,
         timeout,
       };
+      logWorkspaceActivationTrace("workspace.open.deferred_idle_scheduled", safeWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+        source,
+        strategy: "setTimeout",
+        token,
+      }, { trace });
     };
 
     const frame = window.requestAnimationFrame(() => {
       const current = deferredWorkspaceActivationRef.current;
       if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.deferred_frame_stale", safeWorkspaceId, {
+          currentToken: current.token,
+          currentWorkspaceId: current.workspaceId,
+          expectedToken: token,
+          source,
+        }, { trace });
         return;
       }
 
+      logWorkspaceActivationTrace("workspace.open.deferred_first_frame", safeWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+        source,
+        token,
+      }, { trace });
       const secondFrame = window.requestAnimationFrame(scheduleIdleActivation);
       deferredWorkspaceActivationRef.current = {
         ...current,
@@ -6034,15 +6594,28 @@ export default function App() {
       ...deferredWorkspaceActivationRef.current,
       frame,
     };
-  }, [activateWorkspace, cancelDeferredWorkspaceActivation]);
+  }, [activateWorkspace, cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
 
   const activateWorkspaceFromRail = useCallback((workspaceId) => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
     if (!workspace) {
+      logWorkspaceActivationTrace("workspace.open.rail_click_missing", workspaceId, {
+        availableWorkspaceCount: workspaces.length,
+      });
       return;
     }
 
+    const trace = beginWorkspaceActivationTrace(workspace.id, "workspace_click");
     const workspaceAlreadyActive = activatedWorkspaceIdRef.current === workspace.id;
+    const workspaceRoot = getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace.id)
+      || defaultWorkingDirectoryRef.current
+      || "";
+    logWorkspaceActivationTrace("workspace.open.rail_click", workspace.id, {
+      alreadyActive: workspaceAlreadyActive,
+      rootDirectory: workspaceRoot,
+      selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      workspaceName: workspace.name || "",
+    }, { trace });
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
     setSelectedWorkspaceId(workspace.id);
     selectedWorkspaceIdRef.current = workspace.id;
@@ -6054,14 +6627,24 @@ export default function App() {
     } else {
       setWorkspacePendingActivationId(workspace.id);
       workspacePendingActivationIdRef.current = workspace.id;
-      scheduleWorkspaceActivationAfterPaint(workspace.id, "workspace_click");
+      logWorkspaceActivationTrace("workspace.open.pending_activation_set", workspace.id, {
+        source: "workspace_click",
+      }, { trace });
+      scheduleWorkspaceActivationAfterPaint(workspace.id, "workspace_click", trace);
     }
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
       telemetrySource: "workspace_click_terminal_focus",
       telemetryWorkspaceId: workspace.id,
     });
-  }, [cancelDeferredWorkspaceActivation, scheduleWorkspaceActivationAfterPaint, showView, workspaces]);
+  }, [
+    beginWorkspaceActivationTrace,
+    cancelDeferredWorkspaceActivation,
+    logWorkspaceActivationTrace,
+    scheduleWorkspaceActivationAfterPaint,
+    showView,
+    workspaces,
+  ]);
 
   const deactivateWorkspace = useCallback(async (workspaceId, source = "manual") => {
     const targetWorkspaceId = workspaceId || activatedWorkspaceIdRef.current;
@@ -6447,7 +7030,10 @@ export default function App() {
         });
         try {
           await syncCloudMcpDesktopSessionToken(token, {
+            connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
+            connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
             flowId: `restore-${validationFlowId}`,
+            onProgress: updateCloudWorkspaceProgress,
             requireConnected: true,
           });
           await recordCloudSigninDiagnostic(token, {
@@ -6490,7 +7076,7 @@ export default function App() {
         clearSession: true,
       });
     }
-  }, [setAuthenticated, setSignedOut]);
+  }, [setAuthenticated, setSignedOut, updateCloudWorkspaceProgress]);
 
   const completeDesktopLogin = useCallback(async (callbackUrl) => {
     const callback = parseAuthCallback(callbackUrl);
@@ -6512,7 +7098,7 @@ export default function App() {
       return true;
     }
 
-    authStore.setExchanging();
+    authStore.setExchanging("Browser callback matched. Creating your desktop session...");
     let diagnosticToken = "";
 
     try {
@@ -6560,7 +7146,10 @@ export default function App() {
               label: "Personal",
               teamId: null,
             },
+            connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
+            connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
             flowId: callback.state,
+            onProgress: updateCloudWorkspaceProgress,
             requireConnected: true,
           });
           await recordCloudSigninDiagnostic(diagnosticToken, {
@@ -6600,12 +7189,12 @@ export default function App() {
     }
 
     return true;
-  }, [setAuthenticated, setSignedOut]);
+  }, [setAuthenticated, setSignedOut, updateCloudWorkspaceProgress]);
 
   const startWebLogin = useCallback(async () => {
     authFlowIdRef.current += 1;
     const state = createAuthState();
-    authStore.setWaiting(state);
+    authStore.setWaiting(state, "Opening secure web sign-in in your browser...");
 
     try {
       const loginUrl = await desktopLoginUrlWithDevice(state);
@@ -6613,6 +7202,10 @@ export default function App() {
         openUrl(loginUrl),
         OPEN_BROWSER_TIMEOUT_MS,
         "Unable to open the web login.",
+      );
+      authStore.setStage(
+        "deep_link",
+        "Finish sign-in in your browser. This app is waiting for the secure callback.",
       );
     } catch (error) {
       setSignedOut(
@@ -9495,6 +10088,7 @@ export default function App() {
     setWorkspaceAgentLaunchEpoch(0);
     setWorkspaceAgentBatchSentKey("");
     setPreparedTerminalVersion((version) => version + 1);
+    setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   }, [authState]);
 
   useEffect(() => {
@@ -9634,6 +10228,7 @@ export default function App() {
       || workspaceState !== "initializing"
       || isLaunchScreenVisible
       || !workspaceListHydrated
+      || (isPaidUser(user) && !isCloudWorkspaceProgressReady(cloudWorkspaceProgress))
       || (isPaidUser(user) && startupAgentGateState !== "complete")
     ) {
       return undefined;
@@ -9643,7 +10238,15 @@ export default function App() {
     authStore.setMessage("Workspace ready.");
 
     return undefined;
-  }, [authState, isLaunchScreenVisible, startupAgentGateState, user, workspaceListHydrated, workspaceState]);
+  }, [
+    authState,
+    cloudWorkspaceProgress,
+    isLaunchScreenVisible,
+    startupAgentGateState,
+    user,
+    workspaceListHydrated,
+    workspaceState,
+  ]);
 
   useEffect(() => {
     if (authState !== "authenticated" || !isPaidUser(user) || workspaceState !== "initializing") {
@@ -9758,7 +10361,13 @@ export default function App() {
   }, [activeView, authState, refreshAudioModelStatus]);
 
   const isAuthBusy = authState === "waiting" || authState === "exchanging";
+  const authCurrentStage = isAuthBusy && authStage !== "idle"
+    ? authStage
+    : "browser_handoff";
   const authPanelTitle = {
+    deep_link: "Waiting for browser callback",
+    session_exchange: "Creating desktop session",
+  }[authCurrentStage] || {
     waiting: "Waiting for web sign in",
     exchanging: "Finishing desktop sign in",
     signedOut: "Continue in browser",
@@ -9775,6 +10384,10 @@ export default function App() {
   }[authState] || "ready";
   const displayName = user?.name || user?.email || "there";
   const userIsPaid = isPaidUser(user);
+  const cloudWorkspaceReady = isCloudWorkspaceProgressReady(cloudWorkspaceProgress);
+  const cloudWorkspaceStatusState = cloudWorkspaceLaunchState(cloudWorkspaceProgress);
+  const cloudWorkspaceTitle = cloudWorkspaceProgress.title || "Preparing cloud workspace";
+  const cloudWorkspaceDetail = cloudWorkspaceProgress.detail || "Waiting for the assigned cloud workspace.";
   const planLabel = billingPlanLabelFromStatus(billingStatus, user);
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
@@ -9998,11 +10611,19 @@ export default function App() {
     return ids;
   }, [activatedWorkspaceId, workspaceLifecycleSettings.enabledWorkspaceIds, workspaces]);
   const enabledWorkspaceRuntimeDescriptors = useMemo(() => {
+    const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
     if (shouldShowWorkspaceSetup) {
+      workspaceRuntimeDescriptorBuildRef.current = {
+        descriptorCount: 0,
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+        enabledRuntimeWorkspaceIds,
+        logicalTerminalCount: 0,
+        reason: "workspace_setup",
+      };
       return [];
     }
 
-    return enabledRuntimeWorkspaceIds
+    const descriptors = enabledRuntimeWorkspaceIds
       .map((workspaceId) => findWorkspaceById(workspaces, workspaceId))
       .filter(Boolean)
       .map((runtimeWorkspace) => {
@@ -10086,6 +10707,27 @@ export default function App() {
           workspace: runtimeWorkspace,
         };
       });
+
+    workspaceRuntimeDescriptorBuildRef.current = {
+      descriptorCount: descriptors.length,
+      descriptors: descriptors.map((descriptor) => ({
+        agentTerminalCount: descriptor.agentTerminalEntries.length,
+        logicalTerminalCount: descriptor.logicalTerminalCount,
+        rootWasEmptyAtSelection: descriptor.rootWasEmptyAtSelection,
+        terminalIndexes: descriptor.logicalTerminalIndexes,
+        workingDirectory: descriptor.workingDirectory,
+        workspaceId: descriptor.workspace?.id || "",
+        workspaceName: descriptor.workspace?.name || "",
+      })),
+      elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+      enabledRuntimeWorkspaceIds,
+      logicalTerminalCount: descriptors.reduce((sum, descriptor) => (
+        sum + Number(descriptor.logicalTerminalCount || 0)
+      ), 0),
+      reason: "built",
+    };
+
+    return descriptors;
   }, [
     agentStatuses,
     defaultWorkingDirectory,
@@ -10098,6 +10740,27 @@ export default function App() {
     workspaceTerminalRoleOptions,
     workspaceThreads,
     workspaces,
+  ]);
+  useEffect(() => {
+    const snapshot = workspaceRuntimeDescriptorBuildRef.current;
+    if (!snapshot) {
+      return;
+    }
+
+    logWorkspaceActivationTrace("workspace.open.runtime_descriptors", activatedWorkspaceId || selectedWorkspaceId, {
+      ...snapshot,
+      activatedWorkspaceId,
+      selectedWorkspaceId,
+      workspaceActivationDeferred,
+      workspaceHydrationReady,
+    });
+  }, [
+    activatedWorkspaceId,
+    enabledWorkspaceRuntimeDescriptors,
+    logWorkspaceActivationTrace,
+    selectedWorkspaceId,
+    workspaceActivationDeferred,
+    workspaceHydrationReady,
   ]);
   const terminalPresenceWorkspaces = useMemo(() => (
     enabledWorkspaceRuntimeDescriptors
@@ -11402,6 +12065,15 @@ export default function App() {
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
     ) {
+      logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        authState,
+        isPaidUser: isPaidUser(user),
+        reason: "gate_not_ready",
+        shouldShowWorkspaceSetup,
+        workspaceActivationDeferred,
+        workspaceHydrationReady,
+        workspaceSyncState,
+      });
       return;
     }
 
@@ -11432,6 +12104,9 @@ export default function App() {
     });
 
     if (!targets.length) {
+      logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        selectedWorkspaceId: selectedWorkspace?.id || "",
+      });
       return undefined;
     }
 
@@ -11443,16 +12118,40 @@ export default function App() {
       }
       targets.forEach((target) => {
         workspaceMcpStartupIndexKeysRef.current.add(target.key);
+        const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
+        logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.start", target.workspaceId, {
+          repoPath: target.repoPath,
+          targetCount: targets.length,
+          workspaceName: target.workspaceName,
+        });
         invoke("coordination_workspace_mcp_registry", {
           repoPath: target.repoPath,
           workspaceId: target.workspaceId,
           workspaceName: target.workspaceName,
-        }).catch(() => {
+        }).then(() => {
+          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.done", target.workspaceId, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            repoPath: target.repoPath,
+            targetCount: targets.length,
+            workspaceName: target.workspaceName,
+          });
+        }).catch((error) => {
+          logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.error", target.workspaceId, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            message: getErrorMessage(error, "Unable to index workspace MCP registry."),
+            repoPath: target.repoPath,
+            targetCount: targets.length,
+            workspaceName: target.workspaceName,
+          });
           workspaceMcpStartupIndexKeysRef.current.delete(target.key);
         });
       });
     };
     const hotDelayMs = getTerminalInputHotDelayMs(1600);
+    logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.scheduled", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+      hotDelayMs,
+      targetCount: targets.length,
+    });
     timer = window.setTimeout(indexTargets, hotDelayMs);
     return () => {
       disposed = true;
@@ -11465,6 +12164,7 @@ export default function App() {
     defaultWorkingDirectory,
     enabledWorkspaceRuntimeDescriptors,
     getTerminalInputHotDelayMs,
+    logWorkspaceActivationTrace,
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
@@ -11476,6 +12176,11 @@ export default function App() {
 
   useEffect(() => {
     if (!workspaceHydrationReady || workspaceActivationDeferred) {
+      logWorkspaceActivationTrace("workspace.open.shared_mcp.skip", activatedWorkspaceId || selectedWorkspaceId, {
+        reason: !workspaceHydrationReady ? "hydration_not_ready" : "activation_deferred",
+        workspaceActivationDeferred,
+        workspaceHydrationReady,
+      });
       return;
     }
 
@@ -11504,6 +12209,13 @@ export default function App() {
 
       sharedMcpActiveRuntimeTargetsRef.current.set(runtimeKey, target);
 
+      const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
+      logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_start", target.workspaceId, {
+        repoPath: target.repoPath,
+        runtimeKey,
+        workspaceName: target.workspaceName,
+      });
+
       withTimeout(
         invoke("coordination_activate_shared_mcp_daemon", {
           repoPath: target.repoPath,
@@ -11514,6 +12226,12 @@ export default function App() {
         "Shared MCP activation timed out.",
       )
         .then(() => {
+          logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_done", target.workspaceId, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            repoPath: target.repoPath,
+            runtimeKey,
+            workspaceName: target.workspaceName,
+          });
           if (!sharedMcpActiveRuntimeTargetsRef.current.has(runtimeKey)) {
             invoke("coordination_deactivate_shared_mcp_daemon", {
               repoPath: target.repoPath,
@@ -11522,6 +12240,12 @@ export default function App() {
           }
         })
         .catch(() => {
+          logWorkspaceActivationTrace("workspace.open.shared_mcp.activate_error", target.workspaceId, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            repoPath: target.repoPath,
+            runtimeKey,
+            workspaceName: target.workspaceName,
+          });
           if (sharedMcpActiveRuntimeTargetsRef.current.get(runtimeKey) === target) {
             sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
           }
@@ -11535,6 +12259,11 @@ export default function App() {
 
       sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
 
+      logWorkspaceActivationTrace("workspace.open.shared_mcp.deactivate_start", target.workspaceId, {
+        repoPath: target.repoPath,
+        runtimeKey,
+        workspaceName: target.workspaceName,
+      });
       withTimeout(
         invoke("coordination_deactivate_shared_mcp_daemon", {
           repoPath: target.repoPath,
@@ -11542,9 +12271,30 @@ export default function App() {
         }),
         WORKSPACE_SHARED_MCP_TIMEOUT_MS,
         "Shared MCP deactivation timed out.",
-      ).catch(() => {});
+      )
+        .then(() => {
+          logWorkspaceActivationTrace("workspace.open.shared_mcp.deactivate_done", target.workspaceId, {
+            repoPath: target.repoPath,
+            runtimeKey,
+            workspaceName: target.workspaceName,
+          });
+        })
+        .catch(() => {
+          logWorkspaceActivationTrace("workspace.open.shared_mcp.deactivate_error", target.workspaceId, {
+            repoPath: target.repoPath,
+            runtimeKey,
+            workspaceName: target.workspaceName,
+          });
+        });
     });
-  }, [enabledWorkspaceRuntimeDescriptors, workspaceActivationDeferred, workspaceHydrationReady]);
+  }, [
+    activatedWorkspaceId,
+    enabledWorkspaceRuntimeDescriptors,
+    logWorkspaceActivationTrace,
+    selectedWorkspaceId,
+    workspaceActivationDeferred,
+    workspaceHydrationReady,
+  ]);
   const isActivatedWorkspaceDeactivating = Boolean(
     workspaceDeactivationState.isActive
       && activatedWorkspace
@@ -11565,6 +12315,44 @@ export default function App() {
       activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => `${terminalIndex}:${role}`).join(","),
     ].join(":")
     : "";
+  useEffect(() => {
+    const readinessSnapshot = {
+      activatedWorkspaceId: activatedWorkspace?.id || "",
+      agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+      isActivatedWorkspaceDeactivating,
+      selectedMatchesActivated: Boolean(selectedWorkspace?.id && selectedWorkspace.id === activatedWorkspace?.id),
+      selectedWorkspaceId: selectedWorkspace?.id || "",
+      workspaceActivationDeferred,
+      workspaceAgentLaunchKey,
+      workspaceHydrationReady,
+      workspaceState,
+      workspaceTerminalAgentLaunchReady,
+      workspaceThreadsHydrated,
+    };
+    const snapshotKey = JSON.stringify(readinessSnapshot);
+    if (workspaceActivationStateLogKeyRef.current === snapshotKey) {
+      return;
+    }
+
+    workspaceActivationStateLogKeyRef.current = snapshotKey;
+    logWorkspaceActivationTrace(
+      "workspace.open.terminal_launch_readiness",
+      activatedWorkspace?.id || selectedWorkspace?.id || "",
+      readinessSnapshot,
+    );
+  }, [
+    activatedWorkspace?.id,
+    activatedWorkspaceAgentTerminalEntries.length,
+    isActivatedWorkspaceDeactivating,
+    logWorkspaceActivationTrace,
+    selectedWorkspace?.id,
+    workspaceActivationDeferred,
+    workspaceAgentLaunchKey,
+    workspaceHydrationReady,
+    workspaceState,
+    workspaceTerminalAgentLaunchReady,
+    workspaceThreadsHydrated,
+  ]);
   const activatedWorkspaceDisplayTerminalRows = useMemo(
     () => (
       activatedWorkspaceLogicalTerminalIndexes.length
@@ -16544,12 +17332,28 @@ export default function App() {
         terminalIndex: session.terminalIndex,
         workspaceId: session.workspaceId || "",
       });
+      logWorkspaceActivationTrace("workspace.open.prepared_terminal.ready", session.workspaceId || "", {
+        agentId: session.agentId || "",
+        instanceId: session.instanceId || "",
+        paneId: session.paneId || "",
+        preparedCount: preparedTerminalsRef.current.size,
+        terminalIndex: session.terminalIndex,
+        threadId: session.threadId || "",
+      });
     } else {
       preparedTerminalsRef.current.delete(key);
+      logWorkspaceActivationTrace("workspace.open.prepared_terminal.removed", session.workspaceId || "", {
+        agentId: session.agentId || "",
+        instanceId: session.instanceId || "",
+        paneId: session.paneId || "",
+        preparedCount: preparedTerminalsRef.current.size,
+        terminalIndex: session.terminalIndex,
+        threadId: session.threadId || "",
+      });
     }
 
     setPreparedTerminalVersion((version) => version + 1);
-  }, []);
+  }, [logWorkspaceActivationTrace]);
 
   const preparedWorkspaceTerminalRequests = useMemo(() => {
     if (!activatedWorkspace || activatedWorkspaceAgentTerminalEntries.length === 0) {
@@ -16598,10 +17402,20 @@ export default function App() {
 
   useEffect(() => {
     if (workspaceDeactivationInFlightRef.current) {
+      logWorkspaceActivationTrace("workspace.open.agent_batch.skip", activatedWorkspace?.id || "", {
+        reason: "workspace_deactivation_in_flight",
+        workspaceDeactivationInFlight: workspaceDeactivationInFlightRef.current,
+      });
       return;
     }
 
     if (!workspaceAgentLaunchKey) {
+      logWorkspaceActivationTrace("workspace.open.agent_batch.reset", activatedWorkspace?.id || selectedWorkspaceIdRef.current, {
+        agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+        preparedWorkspaceTerminalCount,
+        reason: "launch_key_empty",
+        workspaceTerminalAgentLaunchReady,
+      });
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
       setWorkspaceAgentBatchSentKey("");
@@ -16614,6 +17428,21 @@ export default function App() {
       || preparedWorkspaceTerminalCount === 0
       || preparedWorkspaceTerminalCount < activatedWorkspaceAgentTerminalEntries.length
     ) {
+      const waitReason = workspaceAgentBatchSentKey === workspaceAgentLaunchKey
+        ? "already_sent"
+        : workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
+          ? "already_in_flight"
+          : preparedWorkspaceTerminalCount === 0
+            ? "no_prepared_terminals"
+            : "waiting_for_all_prepared_terminals";
+      logWorkspaceActivationTrace("workspace.open.agent_batch.wait", activatedWorkspace?.id || "", {
+        agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+        inFlightLaunchKey: workspaceAgentBatchInFlightKeyRef.current,
+        launchKey: workspaceAgentLaunchKey,
+        preparedWorkspaceTerminalCount,
+        reason: waitReason,
+        sentLaunchKey: workspaceAgentBatchSentKey,
+      });
       return;
     }
 
@@ -16621,6 +17450,20 @@ export default function App() {
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
     const batchStartedAt = performance.now();
 
+    logWorkspaceActivationTrace("workspace.open.agent_batch.start", activatedWorkspace.id, {
+      launchKey: workspaceAgentLaunchKey,
+      requestCount: preparedWorkspaceTerminalRequests.length,
+      requests: preparedWorkspaceTerminalRequests.map((request) => ({
+        hasProviderSessionId: Boolean(request.providerSessionId),
+        instanceId: request.instanceId || "",
+        model: request.model || "",
+        paneId: request.paneId || "",
+        provider: request.provider || "",
+        terminalIndex: request.terminalIndex ?? "",
+        threadId: request.threadId || "",
+        workspaceId: request.workspaceId || "",
+      })),
+    });
     logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_start", {
       launchKey: workspaceAgentLaunchKey,
       requestCount: preparedWorkspaceTerminalRequests.length,
@@ -16640,6 +17483,12 @@ export default function App() {
     invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
       .then((result) => {
         const results = Array.isArray(result?.results) ? result.results : [];
+        logWorkspaceActivationTrace("workspace.open.agent_batch.done", activatedWorkspace.id, {
+          elapsedMs: Math.max(0, performance.now() - batchStartedAt),
+          launchKey: workspaceAgentLaunchKey,
+          resultCount: results.length,
+          startedCount: results.filter((paneResult) => paneResult?.started).length,
+        });
         logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_result", {
           launchKey: workspaceAgentLaunchKey,
           resultCount: results.length,
@@ -16668,6 +17517,16 @@ export default function App() {
             terminalIndex: request.terminalIndex ?? "",
             threadId: request.threadId || "",
             workspaceId: request.workspaceId || "",
+          });
+          logWorkspaceActivationTrace("workspace.open.agent_batch.pane_started", request.workspaceId || activatedWorkspace.id, {
+            hasProviderSessionId: Boolean(request.providerSessionId),
+            instanceId: paneResult.instanceId || request.instanceId || "",
+            launchKey: workspaceAgentLaunchKey,
+            model: request.model || "",
+            paneId: paneResult.paneId || request.paneId || "",
+            provider: request.provider || "",
+            terminalIndex: request.terminalIndex ?? "",
+            threadId: request.threadId || "",
           });
 
           const terminalLifecycleEvent = {
@@ -16772,6 +17631,12 @@ export default function App() {
         setPreparedTerminalVersion((version) => version + 1);
       })
       .catch((error) => {
+        logWorkspaceActivationTrace("workspace.open.agent_batch.error", activatedWorkspace.id, {
+          elapsedMs: Math.max(0, performance.now() - batchStartedAt),
+          launchKey: workspaceAgentLaunchKey,
+          message: error?.message || String(error || ""),
+          requestCount: preparedWorkspaceTerminalRequests.length,
+        });
         logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_error", {
           launchKey: workspaceAgentLaunchKey,
           message: error?.message || String(error || ""),
@@ -16799,6 +17664,8 @@ export default function App() {
     preparedWorkspaceTerminalRequests,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
+    workspaceTerminalAgentLaunchReady,
+    logWorkspaceActivationTrace,
   ]);
 
   useEffect(() => {
@@ -18680,13 +19547,13 @@ export default function App() {
                 <WorkspaceStartupOverlay aria-label={`${BRAND_NAME} is initializing workspace`}>
                   <AmbientPanel data-position="left">
                     <span>&gt; workspace</span>
-                    <p>Syncing session...</p>
-                    <p>Preparing workspace...</p>
+                    <p>{cloudWorkspaceTitle}</p>
+                    <p>{cloudWorkspaceReady ? "Cloud connected" : "Waiting for live workspace"}</p>
                   </AmbientPanel>
                   <AmbientPanel data-position="right">
                     <span>{displayName}</span>
-                    <p>Terminals ready</p>
-                    <p>Workspace ready</p>
+                    <p>{cloudWorkspaceReady ? "Cloud connected" : "Cloud connecting"}</p>
+                    <p>{startupAgentGateState === "complete" ? "Terminals checked" : "Checking terminals"}</p>
                   </AmbientPanel>
                   <SplashCenter>
                     <SplashLogo src="/logo.webp" alt="" />
@@ -18695,6 +19562,45 @@ export default function App() {
                     <LoadingTrack aria-hidden="true">
                       <LoadingFill />
                     </LoadingTrack>
+                    {userIsPaid && (
+                      <>
+                        <LaunchStatusPanel data-state={cloudWorkspaceStatusState}>
+                          <LaunchStatusIcon aria-hidden="true" data-state={cloudWorkspaceStatusState}>
+                            {cloudWorkspaceReady ? (
+                              <ConnectedIcon />
+                            ) : cloudWorkspaceStatusState === "warning" ? (
+                              <ErrorIcon />
+                            ) : (
+                              <PendingIcon />
+                            )}
+                          </LaunchStatusIcon>
+                          <LaunchStatusCopy>
+                            <LoadingText>{cloudWorkspaceTitle}</LoadingText>
+                            <LoadingDetail>{cloudWorkspaceDetail}</LoadingDetail>
+                          </LaunchStatusCopy>
+                        </LaunchStatusPanel>
+                        <AuthStepRail aria-label="Cloud workspace setup checkpoints" data-compact="true">
+                          {CLOUD_WORKSPACE_STEPS.map((step, index) => {
+                            const stepState = stepStateFor(
+                              CLOUD_WORKSPACE_STEPS,
+                              cloudWorkspaceProgress.stage,
+                              cloudWorkspaceProgress.status,
+                              index,
+                            );
+
+                            return (
+                              <AuthStep data-state={stepState} key={step.id}>
+                                <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
+                                <strong>{step.label}</strong>
+                                <small>
+                                  {step.id === cloudWorkspaceProgress.stage ? cloudWorkspaceDetail : step.detail}
+                                </small>
+                              </AuthStep>
+                            );
+                          })}
+                        </AuthStepRail>
+                      </>
+                    )}
                     <LaunchStatusPanel data-state={startupAgentStatusState}>
                       <LaunchStatusIcon aria-hidden="true" data-state={startupAgentStatusState}>
                         {startupAgentGateState === "choice" ? (
@@ -18774,12 +19680,22 @@ export default function App() {
                     <SessionText>{authMessage}</SessionText>
                     {authError && <FormMessage $state="error">{authError}</FormMessage>}
                     <AuthStepRail aria-label="Desktop sign in checkpoints">
-                      {AUTH_STEPS.map((step, index) => (
-                        <AuthStep data-active={index === 0 || isAuthBusy} key={step}>
-                          <span>{index + 1}</span>
-                          <strong>{step}</strong>
-                        </AuthStep>
-                      ))}
+                      {AUTH_STEPS.map((step, index) => {
+                        const stepState = stepStateFor(
+                          AUTH_STEPS,
+                          authCurrentStage,
+                          authError ? "error" : "active",
+                          index,
+                        );
+
+                        return (
+                          <AuthStep data-state={stepState} key={step.id}>
+                            <span>{stepState === "complete" ? <ButtonCheckIcon aria-hidden="true" /> : index + 1}</span>
+                            <strong>{step.label}</strong>
+                            <small>{step.id === authCurrentStage ? authMessage : step.detail}</small>
+                          </AuthStep>
+                        );
+                      })}
                     </AuthStepRail>
                     <PrimaryButton disabled={isAuthBusy} onClick={startWebLogin} type="button">
                       <ButtonBrowserIcon aria-hidden="true" />

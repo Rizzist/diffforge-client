@@ -51,7 +51,7 @@ const AUTH_EXCHANGE_TIMEOUT_SECS: u64 = 10;
 const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
 const DESKTOP_SIGNIN_DIAGNOSTICS_ENABLED: bool = false;
-const DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED: bool = true;
+const DESKTOP_CONNECTION_DIAGNOSTICS_ENABLED: bool = false;
 const DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;
 const DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT: usize = 600;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
@@ -122,6 +122,8 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
 const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
@@ -172,6 +174,7 @@ static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -1929,6 +1932,10 @@ fn bigview_sync_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE)
 }
 
+fn workspace_activation_diagnostic_log_path() -> PathBuf {
+    diagnostic_log_path(WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE)
+}
+
 fn voice_orchestrator_diagnostic_log_path() -> PathBuf {
     diagnostic_log_path(VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE)
 }
@@ -2032,6 +2039,36 @@ fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
     }
 
     let lock = BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+
+    let _ = writeln!(file, "{entry}");
+}
+
+fn write_workspace_activation_diagnostic_log_entry(entry: Value) {
+    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED {
+        return;
+    }
+
+    let log_path = workspace_activation_diagnostic_log_path();
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+
+    let lock = WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
     let Ok(_guard) = lock.lock() else {
         return;
     };
@@ -2310,6 +2347,20 @@ fn thread_bridge_diagnostic_log(phase: String, fields: Value) -> Result<(), Stri
 #[tauri::command]
 fn bigview_sync_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
     write_bigview_sync_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(&phase),
+        "source": "frontend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+
+    Ok(())
+}
+
+#[tauri::command]
+fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
+    write_workspace_activation_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
         "source": "frontend",
@@ -3293,6 +3344,17 @@ pub fn run() {
             "log_file": whisper_local_audio_log_path().display().to_string(),
         }),
     );
+    write_workspace_activation_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": "backend.workspace_activation.process_start",
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": {
+            "enabled": WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED,
+            "log_file": workspace_activation_diagnostic_log_path().display().to_string(),
+        },
+    }));
     log_voice_orchestrator_diagnostic_event(
         "voice_agent.process_start",
         json!({
@@ -3501,6 +3563,7 @@ pub fn run() {
             terminal_diagnostic_log,
             thread_bridge_diagnostic_log,
             bigview_sync_diagnostic_log,
+            workspace_activation_diagnostic_log,
             terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,

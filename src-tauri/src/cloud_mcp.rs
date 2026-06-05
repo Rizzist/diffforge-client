@@ -1257,6 +1257,18 @@ async fn cloud_mcp_connected_or_connect(state: &CloudMcpState) -> Result<CloudMc
     cloud_mcp_connect_state(state).await
 }
 
+async fn cloud_mcp_set_global_ws_phase(
+    state: &CloudMcpState,
+    status: &str,
+    global_ws_status: &str,
+) {
+    let mut runtime = state.inner.lock().await;
+    runtime.connected = false;
+    runtime.status = status.to_string();
+    runtime.global_ws_connected = false;
+    runtime.global_ws_status = global_ws_status.to_string();
+}
+
 async fn require_cloud_mcp_connected_state(
     state: &CloudMcpState,
 ) -> Result<CloudMcpStatus, String> {
@@ -1297,6 +1309,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             let runtime = state.inner.lock().await;
             runtime.base_url.clone()
         };
+        cloud_mcp_set_global_ws_phase(&state, "resolving_route", "resolving_route").await;
         let target = cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await;
         {
             let mut runtime = state.inner.lock().await;
@@ -1386,6 +1399,7 @@ async fn cloud_mcp_open_global_ws(
         }),
     )
     .await;
+    cloud_mcp_set_global_ws_phase(state, "authenticating", "authenticating").await;
     let auth_bearer = cloud_mcp_authorization_bearer(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
@@ -1448,6 +1462,7 @@ async fn cloud_mcp_open_global_ws(
         Ok(request)
     };
 
+    cloud_mcp_set_global_ws_phase(state, "opening_websocket", "opening_websocket").await;
     let mut opened_target = target.clone();
     let request = build_request(&opened_target)?;
     let (stream, response) = match connect_async(request).await {
@@ -1844,6 +1859,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "platform": device_profile["platform"].clone(),
             "form_factor": device_profile["form_factor"].clone(),
             "client_kind": device_profile["client_kind"].clone(),
+            "client_type": device_profile["client_type"].clone(),
+            "connection_source": device_profile["connection_source"].clone(),
             "contract": "diffforge.app_ws.v1",
             "auth": {
                 "connection_id": connection_id.clone(),
@@ -1932,11 +1949,21 @@ async fn cloud_mcp_send_liveness_pong_event(
     let snapshot = cloud_mcp_status_snapshot(state).await;
     let sent_ms = cloud_mcp_now_ms();
     let auth = cloud_mcp_ws_auth_object(state).await?;
+    let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
         "source": "rust-diffforge-liveness",
         "event_kind": "desktop_liveness_pong",
         "agent_id": "rust-diffforge",
         "agent_label": "Diff Forge Desktop",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "client_type": device_profile["client_type"].clone(),
+        "connection_source": device_profile["connection_source"].clone(),
         "ping_id": ping_id,
         "repo_id": cloud_mcp_payload_text(event, &["repo_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["repoId"]))
@@ -2011,6 +2038,8 @@ async fn cloud_mcp_send_lifecycle_event(
         "platform": device_profile["platform"].clone(),
         "form_factor": device_profile["form_factor"].clone(),
         "client_kind": device_profile["client_kind"].clone(),
+        "client_type": device_profile["client_type"].clone(),
+        "connection_source": device_profile["connection_source"].clone(),
         "reason": reason.unwrap_or(status),
         "status": status,
         "connection_epoch": connection_epoch,
@@ -2709,6 +2738,7 @@ async fn cloud_mcp_resolve_ws_target(
     }
 
     let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
+    cloud_mcp_set_global_ws_phase(state, "authenticating", "authenticating").await;
     let bearer = match cloud_mcp_authorization_bearer(state).await {
         Ok(token) => token,
         Err(error) => {
@@ -2728,6 +2758,7 @@ async fn cloud_mcp_resolve_ws_target(
     };
 
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    cloud_mcp_set_global_ws_phase(state, "resolving_route", "resolving_route").await;
     match cloud_mcp_fetch_direct_route_async(
         base_url,
         endpoint_path,
