@@ -18,30 +18,141 @@ function normalizeTurnState(value) {
   return cleanText(value).toLowerCase();
 }
 
-function todoQueueSourceLooksTranscriptOwned(value) {
-  const source = cleanText(value).toLowerCase();
-  if (!source) {
-    return false;
+function messageText(message) {
+  if (!message || typeof message !== "object") {
+    return "";
   }
-  return source.endsWith("-session")
-    || source === "agent_thread_transcript"
-    || source === "codex-rollout"
-    || source.includes("transcript")
-    || source.includes("session-history");
+  if (typeof message.text === "string") return message.text;
+  if (typeof message.message === "string") return message.message;
+  if (typeof message.content === "string") return message.content;
+  if (Array.isArray(message.content)) {
+    return message.content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part?.text === "string") return part.text;
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
 }
 
-function todoQueueSourceLooksLifecycleOwned(value) {
-  const source = cleanText(value).toLowerCase();
-  if (!source || todoQueueSourceLooksTranscriptOwned(source)) {
+function messageCreatedAtMs(message) {
+  return parseTimestampMs(
+    message?.createdAt
+      || message?.created_at
+      || message?.timestamp
+      || message?.time
+      || "",
+  );
+}
+
+function isAssistantMessage(message) {
+  return cleanText(message?.role).toLowerCase() === "assistant";
+}
+
+function isAssistantCompletionMessage(message) {
+  if (!isAssistantMessage(message)) {
     return false;
   }
-  return source.startsWith("cli-hook:")
-    || source.startsWith("activity-hook:")
-    || source.includes("hook")
-    || source.startsWith("provider-turn-")
-    || source.includes("provider-turn")
-    || source === "provider-api"
-    || source === "terminal-status";
+  const kind = cleanText(message?.kind).toLowerCase();
+  const status = cleanText(message?.status).toLowerCase();
+  const title = cleanText(message?.title).toLowerCase();
+  const id = cleanText(message?.id).toLowerCase();
+  return kind === "task_complete"
+    || kind === "final_answer"
+    || status === "task_complete"
+    || status === "complete"
+    || title === "task complete"
+    || id.includes("task-complete");
+}
+
+export function normalizeTodoQueuePromptComparisonText(value) {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim()
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+export function getTodoQueueLatestUserMessage(thread) {
+  const messages = Array.isArray(thread?.messages) ? thread.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (cleanText(message?.role).toLowerCase() === "user") {
+      return message;
+    }
+  }
+  return null;
+}
+
+export function getTodoQueuePromptCompletionEvidence({
+  messages = [],
+  promptText = "",
+  readyGraceMs = 1000,
+  submittedAtMs = 0,
+} = {}) {
+  const normalizedPromptText = normalizeTodoQueuePromptComparisonText(promptText);
+  if (!normalizedPromptText) {
+    return {
+      assistantCompletionAfterPrompt: false,
+      assistantTextAfterPrompt: false,
+      promptUserMessageSeen: false,
+    };
+  }
+
+  const safeMessages = Array.isArray(messages) ? messages : [];
+  let matchedUserIndex = -1;
+  for (let index = safeMessages.length - 1; index >= 0; index -= 1) {
+    const message = safeMessages[index];
+    if (cleanText(message?.role).toLowerCase() !== "user") {
+      continue;
+    }
+    if (normalizeTodoQueuePromptComparisonText(messageText(message)) !== normalizedPromptText) {
+      continue;
+    }
+    const createdAtMs = messageCreatedAtMs(message);
+    if (
+      submittedAtMs
+      && createdAtMs
+      && createdAtMs < submittedAtMs - readyGraceMs
+    ) {
+      continue;
+    }
+    matchedUserIndex = index;
+    break;
+  }
+
+  if (matchedUserIndex < 0) {
+    return {
+      assistantCompletionAfterPrompt: false,
+      assistantTextAfterPrompt: false,
+      promptUserMessageSeen: false,
+    };
+  }
+
+  let assistantCompletionAfterPrompt = false;
+  let assistantTextAfterPrompt = false;
+  for (let index = matchedUserIndex + 1; index < safeMessages.length; index += 1) {
+    const message = safeMessages[index];
+    if (!isAssistantMessage(message)) {
+      continue;
+    }
+    assistantCompletionAfterPrompt = assistantCompletionAfterPrompt || isAssistantCompletionMessage(message);
+    assistantTextAfterPrompt = assistantTextAfterPrompt || Boolean(messageText(message).trim());
+    if (assistantCompletionAfterPrompt && assistantTextAfterPrompt) {
+      break;
+    }
+  }
+
+  return {
+    assistantCompletionAfterPrompt,
+    assistantTextAfterPrompt,
+    promptUserMessageSeen: true,
+  };
 }
 
 export function evaluateTodoQueueInFlightPrompt({
@@ -72,21 +183,15 @@ export function evaluateTodoQueueInFlightPrompt({
   const latestTurnId = cleanText(latestTurn?.turnId || latestTurn?.id);
   const latestMessageId = cleanText(latestTurn?.messageId);
   const latestTurnClosed = closedTurnStates.has(latestTurnState);
-  const latestTurnSource = cleanText(latestTurn?.source);
-  const latestTurnCompletedSource = cleanText(
-    latestTurn?.completedSource
-      || latestTurn?.completed_source
-      || latestTurnSource,
+  const latestUserMessage = getTodoQueueLatestUserMessage(targetThread);
+  const promptComparisonText = normalizeTodoQueuePromptComparisonText(promptText);
+  const latestUserPromptText = normalizeTodoQueuePromptComparisonText(messageText(latestUserMessage));
+  const latestUserPromptMatches = Boolean(
+    promptComparisonText
+      && latestUserPromptText
+      && promptComparisonText === latestUserPromptText,
   );
-  const latestTurnClosedByLifecycle = Boolean(
-    latestTurnClosed
-      && (
-        todoQueueSourceLooksLifecycleOwned(latestTurnCompletedSource)
-        || todoQueueSourceLooksLifecycleOwned(latestTurnSource)
-      ),
-  );
-  const promptComparisonText = cleanText(promptText);
-  const latestUserPromptMatches = false;
+  const latestUserCreatedAtMs = messageCreatedAtMs(latestUserMessage);
   const latestTurnStartedAtMs = parseTimestampMs(
     latestTurn?.startedAt
       || latestTurn?.requestedAt
@@ -175,68 +280,60 @@ export function evaluateTodoQueueInFlightPrompt({
       && normalizeTurnState(effectiveLatestTurnState || terminalGroundTruth?.effectiveLatestTurnState) !== "running"
       && !terminalActivityStatusIsBusy(normalizedActivityStatus)
       && (
-        !promptId
-        || !terminalReadinessPromptId
-        || terminalReadinessPromptMatches
-      )
-      && (
         terminalGroundTruth?.agentInputReady
           || terminalGroundTruth?.completedTurnLooksSendable
           || terminalGroundTruth?.runningTurnLooksIdle
           || freshInputReady
       )
   );
-  const terminalReadyCompletionSignal = Boolean(
-    terminalReadyForNextPrompt || terminalReadinessMatchesPrompt
-  );
   const promptAccepted = Boolean(
     inFlightPrompt?.accepted === true
       || inFlightPrompt?.acceptedAtMs
       || inFlightPrompt?.acceptedAt,
   );
-  const sessionAcceptedByThread = false;
-  const completionEvidence = {
-    assistantCompletionAfterPrompt: false,
-    assistantTextAfterPrompt: false,
-    promptUserMessageSeen: false,
-  };
+  const providerSessionId = cleanText(
+    targetThread?.transcriptSessionId
+      || providerBinding?.nativeSessionId
+      || inFlightPrompt?.sessionId
+      || "",
+  );
+  const sessionAcceptedByThread = Boolean(
+    !hookManaged
+      && !promptAccepted
+      && providerSessionId
+      && latestUserPromptMatches
+      && (
+        !submittedAtMs
+        || (
+          latestUserCreatedAtMs
+          && latestUserCreatedAtMs >= submittedAtMs - readyGraceMs
+        )
+      )
+  );
+  const completionEvidence = getTodoQueuePromptCompletionEvidence({
+    messages: targetThread?.messages,
+    promptText,
+    readyGraceMs,
+    submittedAtMs,
+  });
   const transcriptCompletionAfterPrompt = false;
   const exactPromptTranscriptFinished = false;
-  const promptAcceptedByCompletedThread = false;
+  const promptAcceptedByCompletedThread = Boolean(
+    !hookManaged
+      && !promptAccepted
+      && false
+  );
   const effectivePromptAccepted = Boolean(
     promptAccepted
       || sessionAcceptedByThread
       || promptAcceptedByCompletedThread
   );
-  const providerLifecycleCompleted = Boolean(
-    hookManaged
-      && (
-        inFlightPrompt?.lifecycleCompleted === true
-        || inFlightPrompt?.providerTurnCompleted === true
-        || inFlightPrompt?.completedAtMs
-        || inFlightPrompt?.completedAt
-      )
-  );
-  const providerLifecycleCompletionReason = cleanText(
-    inFlightPrompt?.lifecycleCompletionReason
-      || inFlightPrompt?.completionReason
-      || (providerLifecycleCompleted ? "provider_turn_closed" : ""),
-  );
   const completedMatchingTurn = Boolean(
     effectivePromptAccepted
       && promptTurnMatches
       && latestTurnClosed
-      && latestTurnClosedByLifecycle
-      && terminalReadyCompletionSignal
   );
-  const lifecycleCompletionReady = Boolean(
-    hookManaged
-      && effectivePromptAccepted
-      && providerLifecycleCompleted
-      && terminalReadyCompletionSignal
-      && (!promptId || promptTurnMatches || !latestTurnId)
-  );
-  const terminalConfirmedFinished = completedMatchingTurn || lifecycleCompletionReady;
+  const terminalConfirmedFinished = completedMatchingTurn;
   const promptInstanceId = Number.parseInt(inFlightPrompt?.terminalInstanceId, 10);
   const liveInstanceId = Number.parseInt(liveTerminal?.instanceId, 10);
   const terminalInstanceChanged = Boolean(
@@ -258,7 +355,7 @@ export function evaluateTodoQueueInFlightPrompt({
       && nowMs - Number(inFlightPrompt.startedAtMs || 0) > timeoutMs
   );
   const releaseReason = terminalConfirmedFinished
-    ? providerLifecycleCompletionReason || "provider_turn_closed"
+    ? "provider_turn_closed"
     : terminalClosed
       ? "terminal_closed"
       : terminalUnavailable
@@ -282,10 +379,7 @@ export function evaluateTodoQueueInFlightPrompt({
     latestMessageId,
     latestTurnAfterSubmit,
     latestTurnClosed,
-    latestTurnClosedByLifecycle,
-    latestTurnCompletedSource,
     latestTurnId,
-    latestTurnSource,
     latestTurnState,
     latestUserPromptMatches,
     hookManaged: Boolean(hookManaged),
@@ -296,8 +390,6 @@ export function evaluateTodoQueueInFlightPrompt({
     promptThreadId,
     promptTurnMatches,
     promptUserMessageSeen: completionEvidence.promptUserMessageSeen,
-    providerLifecycleCompleted,
-    providerLifecycleCompletionReason,
     recordedAgentInputReady: Boolean(recordedAgentInputReady),
     releaseReason,
     sessionAcceptedByThread,
@@ -310,7 +402,6 @@ export function evaluateTodoQueueInFlightPrompt({
     terminalReadinessMatchesPrompt,
     terminalReadinessPromptId,
     terminalReadinessPromptMatches,
-    terminalReadyCompletionSignal,
     terminalReadyForNextPrompt,
     terminalReadyActivityStatus: normalizedActivityStatus,
     terminalUnavailable,

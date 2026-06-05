@@ -60,8 +60,6 @@ import {
   getWorkspaceThreadProviderBinding,
 } from "./workspaceThreads";
 
-const THREAD_TRANSCRIPT_HISTORY_MAX_MESSAGES = 420;
-
 const thinkingPulse = keyframes`
   0%, 100% {
     opacity: 0.42;
@@ -224,39 +222,6 @@ const TranscriptInner = styled.div`
   padding: 42px 28px 26px;
   user-select: text;
   -webkit-user-select: text;
-`;
-
-const TranscriptHistoryButton = styled.button`
-  justify-self: center;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 30px;
-  margin: 0 0 14px;
-  padding: 0 10px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 7px;
-  color: var(--thread-muted);
-  background: rgba(255, 255, 255, 0.045);
-  font-size: var(--thread-detail-mini-font-size);
-  font-weight: 760;
-  cursor: pointer;
-
-  svg {
-    width: 15px;
-    height: 15px;
-  }
-
-  &:hover:not(:disabled) {
-    color: var(--thread-text);
-    border-color: rgba(148, 163, 184, 0.38);
-    background: rgba(255, 255, 255, 0.075);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.58;
-  }
 `;
 
 const EmptyThread = styled.div`
@@ -4769,7 +4734,6 @@ function WorkspaceThreadDetail({
   newChatActive = false,
   onCreateChat,
   onDraftInput,
-  onLoadOlderTranscript,
   onSelectModel,
   onSubmitMessage,
   thread,
@@ -4803,13 +4767,6 @@ function WorkspaceThreadDetail({
   const messages = Array.isArray(thread?.messages)
     ? thread.messages.filter(isChatProjectionMessage)
     : [];
-  const transcriptMaxMessages = Math.max(0, Number.parseInt(thread?.transcriptMaxMessages, 10) || 0);
-  const transcriptCanLoadOlder = Boolean(
-    typeof onLoadOlderTranscript === "function"
-      && messages.length >= 72
-      && (transcriptMaxMessages <= 0 || transcriptMaxMessages < THREAD_TRANSCRIPT_HISTORY_MAX_MESSAGES),
-  );
-  const transcriptHistoryLoading = thread?.transcriptStatus === "loading" && messages.length > 0;
   const transcriptItems = useMemo(() => buildTranscriptItems(messages), [messages]);
   const latestAssistantBlock = useMemo(() => {
     for (let index = transcriptItems.length - 1; index >= 0; index -= 1) {
@@ -6365,16 +6322,6 @@ function WorkspaceThreadDetail({
     >
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
-          {transcriptCanLoadOlder && (
-            <TranscriptHistoryButton
-              disabled={transcriptHistoryLoading}
-              onClick={onLoadOlderTranscript}
-              type="button"
-            >
-              <ExpandMore aria-hidden="true" />
-              {transcriptHistoryLoading ? "Loading" : "Older"}
-            </TranscriptHistoryButton>
-          )}
           {transcriptItems.map((item) => (
             item.type === "assistant-block" ? (() => {
               const blockTurnId = getAssistantBlockDiffTurnId(item);

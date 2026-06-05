@@ -43,15 +43,6 @@ struct AgentThreadTranscriptWatchRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentThreadTranscriptUnwatchRequest {
-    agent_id: Option<String>,
-    provider_session_id: Option<String>,
-    thread_id: Option<String>,
-    workspace_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CodexThreadSessionDiscoverRequest {
     allow_timestamp_fallback: Option<bool>,
     agent_id: Option<String>,
@@ -2402,40 +2393,6 @@ fn trim_agent_thread_transcript_watches(
     }
 }
 
-fn remove_agent_thread_transcript_watches(
-    request: &AgentThreadTranscriptUnwatchRequest,
-) -> usize {
-    let workspace_id = request.workspace_id.clone().unwrap_or_default();
-    let thread_id = request.thread_id.clone().unwrap_or_default();
-    let agent_id = clean_codex_id(request.agent_id.clone().unwrap_or_else(|| "codex".to_string()))
-        .to_lowercase();
-    let provider_session_id = clean_codex_id(request.provider_session_id.clone().unwrap_or_default());
-    let prefix = if provider_session_id.trim().is_empty() {
-        format!("{workspace_id}|{thread_id}|{agent_id}|")
-    } else {
-        format!("{workspace_id}|{thread_id}|{agent_id}|{provider_session_id}|")
-    };
-    if workspace_id.trim().is_empty() || thread_id.trim().is_empty() || agent_id.trim().is_empty() {
-        return 0;
-    }
-
-    let watches = AGENT_THREAD_TRANSCRIPT_WATCHES
-        .get_or_init(|| StdMutex::new(HashMap::new()));
-    let Ok(mut entries) = watches.lock() else {
-        return 0;
-    };
-    let keys: Vec<String> = entries
-        .keys()
-        .filter(|key| key.starts_with(&prefix))
-        .cloned()
-        .collect();
-    let removed = keys.len();
-    for key in keys {
-        entries.remove(&key);
-    }
-    removed
-}
-
 async fn emit_agent_thread_transcript_watch_update(
     app: AppHandle,
     key: String,
@@ -2692,12 +2649,4 @@ async fn agent_thread_transcript_watch(
     )?;
     let _ = register_agent_thread_transcript_watch(&app, &request, &result);
     Ok(result)
-}
-
-#[tauri::command]
-async fn agent_thread_transcript_unwatch(
-    request: AgentThreadTranscriptUnwatchRequest,
-) -> Result<Value, String> {
-    let removed = remove_agent_thread_transcript_watches(&request);
-    Ok(json!({ "removed": removed }))
 }

@@ -28,14 +28,6 @@ const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_CACHE_MAX: usize = 512;
-const CLOUD_MCP_TERMINAL_OUTPUT_STATE_MIN_EMIT_MS: u64 = 750;
-const CLOUD_MCP_TERMINAL_OUTPUT_STATE_CACHE_MAX: usize = 512;
-const CLOUD_MCP_TERMINAL_OUTPUT_STATE_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
-const CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_MIN_MS: u64 = 180;
-const CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_INITIAL_FRAMES: u64 = 2;
-const CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_PENDING_MAX_BYTES: usize = 64 * 1024;
-const CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_CACHE_MAX: usize = 512;
-const CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS: u64 = 180;
 const CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS: u64 = 20;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
@@ -72,30 +64,6 @@ struct CloudMcpTokenomicsSyncJob {
     reason: String,
 }
 
-#[derive(Clone, Default)]
-struct CloudMcpTerminalOutputStateEmitCache {
-    last_emitted_ms: u64,
-    looks_active: bool,
-    looks_ready: bool,
-    status_truth: String,
-}
-
-#[derive(Default)]
-struct CloudMcpTerminalOutputObserverSchedule {
-    last_observed_ms: u64,
-    observed_frames: u64,
-    pending_chunk: Vec<u8>,
-    pending_due_ms: u64,
-    pending_updated_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CloudMcpTerminalOutputObserverDecision {
-    Immediate,
-    Deferred(u64),
-    Pending,
-}
-
 #[derive(Clone)]
 struct CloudMcpState {
     inner: Arc<Mutex<CloudMcpRuntime>>,
@@ -110,10 +78,6 @@ struct CloudMcpState {
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
     terminal_context_missing_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
-    terminal_output_state_emit_cache:
-        Arc<StdMutex<HashMap<String, CloudMcpTerminalOutputStateEmitCache>>>,
-    terminal_output_observer_schedule:
-        Arc<StdMutex<HashMap<String, CloudMcpTerminalOutputObserverSchedule>>>,
     task_history_cache: Arc<Mutex<HashMap<String, Value>>>,
     task_history_refreshes: Arc<Mutex<HashSet<String>>>,
     background_sync: CloudMcpBackgroundSync,
@@ -328,8 +292,6 @@ impl CloudMcpState {
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
             terminal_context_missing_until_ms: Arc::new(StdMutex::new(HashMap::new())),
-            terminal_output_state_emit_cache: Arc::new(StdMutex::new(HashMap::new())),
-            terminal_output_observer_schedule: Arc::new(StdMutex::new(HashMap::new())),
             task_history_cache: Arc::new(Mutex::new(HashMap::new())),
             task_history_refreshes: Arc::new(Mutex::new(HashSet::new())),
             background_sync: CloudMcpBackgroundSync {
@@ -5022,193 +4984,6 @@ fn cloud_mcp_clear_terminal_context_missing(state: &CloudMcpState, terminal_key:
     cache.remove(terminal_key);
 }
 
-fn cloud_mcp_terminal_output_state_should_emit(
-    cache: &mut CloudMcpTerminalOutputStateEmitCache,
-    looks_active: bool,
-    looks_ready: bool,
-    status_truth: &str,
-    now_ms: u64,
-    min_emit_ms: u64,
-) -> bool {
-    let state_changed = cache.last_emitted_ms == 0
-        || cache.looks_active != looks_active
-        || cache.looks_ready != looks_ready
-        || cache.status_truth != status_truth;
-    let interval_elapsed = now_ms.saturating_sub(cache.last_emitted_ms) >= min_emit_ms;
-    if !state_changed && !interval_elapsed {
-        return false;
-    }
-
-    cache.last_emitted_ms = now_ms;
-    cache.looks_active = looks_active;
-    cache.looks_ready = looks_ready;
-    cache.status_truth = status_truth.to_string();
-    true
-}
-
-fn cloud_mcp_terminal_output_state_emit_allowed(
-    state: &CloudMcpState,
-    terminal_key: &str,
-    looks_active: bool,
-    looks_ready: bool,
-    status_truth: &str,
-    now_ms: u64,
-) -> bool {
-    let Ok(mut cache) = state.terminal_output_state_emit_cache.lock() else {
-        return true;
-    };
-
-    if cache.len() > CLOUD_MCP_TERMINAL_OUTPUT_STATE_CACHE_MAX {
-        cache.retain(|_, entry| {
-            now_ms.saturating_sub(entry.last_emitted_ms)
-                <= CLOUD_MCP_TERMINAL_OUTPUT_STATE_CACHE_TTL_MS
-        });
-        if cache.len() > CLOUD_MCP_TERMINAL_OUTPUT_STATE_CACHE_MAX {
-            cache.clear();
-        }
-    }
-
-    let entry = cache.entry(terminal_key.to_string()).or_default();
-    cloud_mcp_terminal_output_state_should_emit(
-        entry,
-        looks_active,
-        looks_ready,
-        status_truth,
-        now_ms,
-        CLOUD_MCP_TERMINAL_OUTPUT_STATE_MIN_EMIT_MS,
-    )
-}
-
-fn cloud_mcp_terminal_output_observer_append_pending(
-    cache: &mut CloudMcpTerminalOutputObserverSchedule,
-    chunk: &[u8],
-    now_ms: u64,
-    pending_max_bytes: usize,
-) {
-    if chunk.is_empty() || pending_max_bytes == 0 {
-        return;
-    }
-
-    if chunk.len() >= pending_max_bytes {
-        cache.pending_chunk.clear();
-        cache
-            .pending_chunk
-            .extend_from_slice(&chunk[chunk.len().saturating_sub(pending_max_bytes)..]);
-    } else {
-        cache.pending_chunk.extend_from_slice(chunk);
-        if cache.pending_chunk.len() > pending_max_bytes {
-            let excess = cache.pending_chunk.len() - pending_max_bytes;
-            cache.pending_chunk.drain(..excess);
-        }
-    }
-    cache.pending_updated_ms = now_ms;
-}
-
-fn cloud_mcp_terminal_output_observer_schedule_decision(
-    cache: &mut CloudMcpTerminalOutputObserverSchedule,
-    chunk: &[u8],
-    now_ms: u64,
-    min_observe_ms: u64,
-    initial_frames: u64,
-    pending_max_bytes: usize,
-) -> CloudMcpTerminalOutputObserverDecision {
-    if cache.observed_frames < initial_frames
-        || cache.last_observed_ms == 0
-        || now_ms.saturating_sub(cache.last_observed_ms) >= min_observe_ms
-    {
-        cache.last_observed_ms = now_ms;
-        cache.observed_frames = cache.observed_frames.saturating_add(1);
-        return CloudMcpTerminalOutputObserverDecision::Immediate;
-    }
-
-    cloud_mcp_terminal_output_observer_append_pending(
-        cache,
-        chunk,
-        now_ms,
-        pending_max_bytes,
-    );
-    if cache.pending_due_ms > now_ms {
-        return CloudMcpTerminalOutputObserverDecision::Pending;
-    }
-
-    let due_ms = cache.last_observed_ms.saturating_add(min_observe_ms);
-    cache.pending_due_ms = due_ms.max(now_ms.saturating_add(1));
-    CloudMcpTerminalOutputObserverDecision::Deferred(cache.pending_due_ms.saturating_sub(now_ms))
-}
-
-fn cloud_mcp_terminal_output_observer_take_pending(
-    cache: &mut CloudMcpTerminalOutputObserverSchedule,
-) -> Option<Vec<u8>> {
-    cache.pending_due_ms = 0;
-    if cache.pending_chunk.is_empty() {
-        return None;
-    }
-
-    Some(std::mem::take(&mut cache.pending_chunk))
-}
-
-fn cloud_mcp_terminal_output_observer_cache_fresh(
-    entry: &CloudMcpTerminalOutputObserverSchedule,
-    now_ms: u64,
-) -> bool {
-    let last_active_ms = entry
-        .pending_updated_ms
-        .max(entry.pending_due_ms)
-        .max(entry.last_observed_ms);
-    now_ms.saturating_sub(last_active_ms) <= CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_CACHE_TTL_MS
-}
-
-fn cloud_mcp_schedule_terminal_output_observer(
-    state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-    chunk: &[u8],
-) -> CloudMcpTerminalOutputObserverDecision {
-    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
-    let now_ms = cloud_mcp_now_ms();
-    let Ok(mut cache) = state.terminal_output_observer_schedule.lock() else {
-        return CloudMcpTerminalOutputObserverDecision::Immediate;
-    };
-
-    if cache.len() > CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_CACHE_MAX {
-        cache.retain(|_, entry| cloud_mcp_terminal_output_observer_cache_fresh(entry, now_ms));
-        if cache.len() > CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_CACHE_MAX {
-            cache.clear();
-        }
-    }
-
-    let entry = cache.entry(terminal_key).or_default();
-    cloud_mcp_terminal_output_observer_schedule_decision(
-        entry,
-        chunk,
-        now_ms,
-        CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_MIN_MS,
-        CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_INITIAL_FRAMES,
-        CLOUD_MCP_TERMINAL_OUTPUT_OBSERVER_PENDING_MAX_BYTES,
-    )
-}
-
-fn cloud_mcp_take_terminal_output_observer_pending(
-    state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
-) -> Option<Vec<u8>> {
-    let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
-    let now_ms = cloud_mcp_now_ms();
-    let Ok(mut cache) = state.terminal_output_observer_schedule.lock() else {
-        return None;
-    };
-
-    let pending = cache
-        .get_mut(&terminal_key)
-        .and_then(cloud_mcp_terminal_output_observer_take_pending);
-    if let Some(entry) = cache.get_mut(&terminal_key) {
-        entry.last_observed_ms = now_ms;
-        entry.observed_frames = entry.observed_frames.saturating_add(1);
-    }
-    pending
-}
-
 fn cloud_mcp_terminal_agent_id(
     pane_id: &str,
     instance_id: u64,
@@ -6717,22 +6492,9 @@ async fn cloud_mcp_observe_terminal_output(
 
     let terminal_key = cloud_mcp_terminal_key(pane_id, instance_id);
     let now_ms = cloud_mcp_now_ms();
-    let status_truth = if looks_active {
-        "processing_or_active"
-    } else {
-        "idle_or_prompt_ready"
-    };
-    let output_state_emit_allowed = cloud_mcp_terminal_output_state_emit_allowed(
-        &state,
-        &terminal_key,
-        looks_active,
-        looks_ready,
-        status_truth,
-        now_ms,
-    );
     let context_missing_backed_off =
         cloud_mcp_terminal_context_missing_backed_off(&state, &terminal_key, now_ms);
-    if output_state_emit_allowed && !context_missing_backed_off {
+    if !context_missing_backed_off {
         log_terminal_status_event(
             "backend.terminal.ground_truth.output_observed",
             json!({
@@ -6742,23 +6504,25 @@ async fn cloud_mcp_observe_terminal_output(
                 "looks_active": looks_active,
                 "looks_ready": looks_ready,
                 "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "status_truth": status_truth,
+                "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
             }),
         );
     }
-    if output_state_emit_allowed {
-        let _ = app.emit(
-            TERMINAL_OUTPUT_STATE_EVENT,
-            TerminalOutputStatePayload {
-                pane_id: pane_id.to_string(),
-                instance_id,
-                looks_active,
-                looks_ready,
-                status_truth: status_truth.to_string(),
-                output_preview: clean_terminal_diagnostic_log_text(&text),
+    let _ = app.emit(
+        TERMINAL_OUTPUT_STATE_EVENT,
+        TerminalOutputStatePayload {
+            pane_id: pane_id.to_string(),
+            instance_id,
+            looks_active,
+            looks_ready,
+            status_truth: if looks_active {
+                "processing_or_active".to_string()
+            } else {
+                "idle_or_prompt_ready".to_string()
             },
-        );
-    }
+            output_preview: clean_terminal_diagnostic_log_text(&text),
+        },
+    );
     if context_missing_backed_off {
         return;
     }
@@ -6826,8 +6590,7 @@ async fn cloud_mcp_observe_terminal_output(
                 } else {
                     None
                 };
-                if output_state_emit_allowed && hooks_own_turn_state && (looks_active || looks_ready)
-                {
+                if hooks_own_turn_state && (looks_active || looks_ready) {
                     log_terminal_status_event(
                         "backend.terminal.ground_truth.output_hook_managed_ignored",
                         json!({
@@ -6837,7 +6600,7 @@ async fn cloud_mcp_observe_terminal_output(
                             "looks_active": looks_active,
                             "looks_ready": looks_ready,
                             "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                            "status_truth": status_truth,
+                            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
                         }),
                     );
                 }
@@ -6868,19 +6631,17 @@ async fn cloud_mcp_observe_terminal_output(
     };
     if let Some(lock_ms) = missing_context_lock_ms {
         cloud_mcp_mark_terminal_context_missing(&state, &terminal_key, now_ms);
-        if output_state_emit_allowed {
-            log_terminal_status_event(
-                "backend.terminal.ground_truth.missing_context",
-                json!({
-                    "bytes": chunk.len(),
-                    "instance_id": instance_id,
-                    "looks_active": looks_active,
-                    "looks_ready": looks_ready,
-                    "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                    "status_truth": status_truth,
-                }),
-            );
-        }
+        log_terminal_status_event(
+            "backend.terminal.ground_truth.missing_context",
+            json!({
+                "bytes": chunk.len(),
+                "instance_id": instance_id,
+                "looks_active": looks_active,
+                "looks_ready": looks_ready,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
+            }),
+        );
         let elapsed_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
         if elapsed_ms >= TERMINAL_DIAGNOSTIC_SLOW_MS {
             log_terminal_diagnostic_event(
@@ -6902,21 +6663,19 @@ async fn cloud_mcp_observe_terminal_output(
         return;
     }
 
-    if output_state_emit_allowed || work_update.is_some() || completion.is_some() {
-        log_terminal_status_event(
-            "backend.terminal.ground_truth.output_decision",
-            json!({
-                "bytes": chunk.len(),
-                "instance_id": instance_id,
-                "looks_active": looks_active,
-                "looks_ready": looks_ready,
-                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "status_truth": status_truth,
-                "will_mark_done": completion.is_some(),
-                "will_send_active_update": work_update.is_some(),
-            }),
-        );
-    }
+    log_terminal_status_event(
+        "backend.terminal.ground_truth.output_decision",
+        json!({
+            "bytes": chunk.len(),
+            "instance_id": instance_id,
+            "looks_active": looks_active,
+            "looks_ready": looks_ready,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "status_truth": if looks_active { "processing_or_active" } else { "idle_or_prompt_ready" },
+            "will_mark_done": completion.is_some(),
+            "will_send_active_update": work_update.is_some(),
+        }),
+    );
 
     if let Some((
         repo_id,
@@ -9677,108 +9436,6 @@ mod cloud_mcp_tests {
 
         assert!(!cloud_mcp_terminal_output_looks_ready(working_screen));
         assert!(cloud_mcp_terminal_output_looks_active(working_screen));
-    }
-
-    #[test]
-    fn terminal_output_state_emit_cache_dedupes_until_interval_or_change() {
-        let mut cache = CloudMcpTerminalOutputStateEmitCache::default();
-
-        assert!(cloud_mcp_terminal_output_state_should_emit(
-            &mut cache,
-            false,
-            true,
-            "idle_or_prompt_ready",
-            1_000,
-            750,
-        ));
-        assert!(!cloud_mcp_terminal_output_state_should_emit(
-            &mut cache,
-            false,
-            true,
-            "idle_or_prompt_ready",
-            1_200,
-            750,
-        ));
-        assert!(cloud_mcp_terminal_output_state_should_emit(
-            &mut cache,
-            true,
-            false,
-            "processing_or_active",
-            1_300,
-            750,
-        ));
-        assert!(!cloud_mcp_terminal_output_state_should_emit(
-            &mut cache,
-            true,
-            false,
-            "processing_or_active",
-            1_900,
-            750,
-        ));
-        assert!(cloud_mcp_terminal_output_state_should_emit(
-            &mut cache,
-            true,
-            false,
-            "processing_or_active",
-            2_050,
-            750,
-        ));
-    }
-
-    #[test]
-    fn terminal_output_observer_scheduler_batches_trailing_frames() {
-        let mut cache = CloudMcpTerminalOutputObserverSchedule::default();
-
-        assert_eq!(
-            cloud_mcp_terminal_output_observer_schedule_decision(
-                &mut cache,
-                b"first",
-                1_000,
-                180,
-                2,
-                64,
-            ),
-            CloudMcpTerminalOutputObserverDecision::Immediate,
-        );
-        assert_eq!(
-            cloud_mcp_terminal_output_observer_schedule_decision(
-                &mut cache,
-                b"second",
-                1_010,
-                180,
-                2,
-                64,
-            ),
-            CloudMcpTerminalOutputObserverDecision::Immediate,
-        );
-        assert_eq!(
-            cloud_mcp_terminal_output_observer_schedule_decision(
-                &mut cache,
-                b"third",
-                1_020,
-                180,
-                2,
-                64,
-            ),
-            CloudMcpTerminalOutputObserverDecision::Deferred(170),
-        );
-        assert_eq!(
-            cloud_mcp_terminal_output_observer_schedule_decision(
-                &mut cache,
-                b"fourth",
-                1_030,
-                180,
-                2,
-                64,
-            ),
-            CloudMcpTerminalOutputObserverDecision::Pending,
-        );
-
-        assert_eq!(
-            cloud_mcp_terminal_output_observer_take_pending(&mut cache).as_deref(),
-            Some(&b"thirdfourth"[..]),
-        );
-        assert!(cloud_mcp_terminal_output_observer_take_pending(&mut cache).is_none());
     }
 
     #[test]

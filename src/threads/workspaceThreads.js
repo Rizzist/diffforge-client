@@ -1027,15 +1027,12 @@ function normalizeThreadLatestTurn(value) {
     agentId: cleanAgentId(value.agentId || value.agent_id, ""),
     assistantMessageId: cleanText(value.assistantMessageId || value.assistant_message_id),
     completedAt,
-    completedSource: cleanText(value.completedSource || value.completed_source),
     error: cleanText(value.error || value.message),
     messageId: cleanText(value.messageId || value.message_id),
     promptEpoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
     prompt_epoch: normalizeThreadPromptEpoch(value.promptEpoch || value.prompt_epoch),
     requestedAt,
-    source: cleanText(value.source),
     startedAt,
-    startedSource: cleanText(value.startedSource || value.started_source || value.source),
     state,
     turnId,
     updatedAt,
@@ -1778,9 +1775,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
         messageId: event.messageId,
         promptEpoch: event.promptEpoch || event.prompt_epoch,
         requestedAt: event.createdAt,
-        source: event.source,
         startedAt: event.createdAt,
-        startedSource: event.source,
         state: "running",
         turnId,
         updatedAt: event.createdAt,
@@ -1822,8 +1817,6 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
         ...latestTurn,
         assistantMessageId: event.assistantMessageId || latestTurn.assistantMessageId,
         completedAt: event.completedAt || event.createdAt,
-        completedSource: event.source || latestTurn.completedSource,
-        source: event.source || latestTurn.source,
         state: "completed",
         updatedAt: event.completedAt || event.createdAt,
       });
@@ -1835,9 +1828,7 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
         completedAt: event.completedAt || event.createdAt,
-        completedSource: event.source || latestTurn.completedSource,
         error: event.text || latestTurn.error,
-        source: event.source || latestTurn.source,
         state: "error",
         updatedAt: event.completedAt || event.createdAt,
       });
@@ -1849,8 +1840,6 @@ function projectLatestTurnFromEvents(events, fallbackLatestTurn = null) {
       latestTurn = normalizeThreadLatestTurn({
         ...latestTurn,
         completedAt: event.completedAt || event.createdAt,
-        completedSource: event.source || latestTurn.completedSource,
-        source: event.source || latestTurn.source,
         state: "interrupted",
         updatedAt: event.completedAt || event.createdAt,
       });
@@ -1973,6 +1962,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
   const latestTurn = normalizeThreadLatestTurn(thread?.latestTurn);
   const runningLatestTurnId = latestTurn?.state === "running" ? cleanText(latestTurn.turnId) : "";
   const expectedPromptTurnId = promptEventId ? createTurnIdForMessage(thread, promptEventId) : "";
+  const promptAccepted = event.promptAccepted === true;
   const latestUserMessage = [...normalizeThreadMessages(thread?.messages)]
     .reverse()
     .find((message) => message.role === "user") || null;
@@ -1995,7 +1985,11 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         || latestUserMessageMatchesExpectedPrompt
       )
   );
+  const allowTranscriptTurnCompletion = false;
+  const assistantResponseCompletesTurn = false;
+  const transcriptTurnCompleteSeen = false;
   let currentTurnId = "";
+  let transcriptAdvancedTurn = false;
 
   normalizedIncomingMessages.forEach((message) => {
     const eventStartCount = events.length;
@@ -2047,7 +2041,16 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           || incomingMessageTurnId
           || createTurnIdForMessage(thread, messageId),
       );
+      transcriptAdvancedTurn = true;
       eventBase.turnId = currentTurnId;
+      if (!projectionHasTurnEvent(projectionEvents, "thread.turn.started", currentTurnId)) {
+        events.push({
+          ...eventBase,
+          id: `projection-provider-turn-started-${stableProjectionKey(currentTurnId, "turn")}`,
+          status: "running",
+          type: "thread.turn.started",
+        });
+      }
       if (projectedMessage) {
         // Keep the provider turn lifecycle even when the local submit already projected the user.
       } else {
@@ -2064,6 +2067,20 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       const nextText = cleanMessageText(message.text);
       const turnComplete = isTranscriptTurnCompleteMessage(message);
       if (!nextText) {
+        if (
+          allowTranscriptTurnCompletion
+          && turnComplete
+          && messageTurnId
+          && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", messageTurnId)
+        ) {
+          events.push({
+            ...eventBase,
+            completedAt: createdAt,
+            id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
+            status: "completed",
+            type: "thread.turn.completed",
+          });
+        }
         return;
       }
 
@@ -2118,6 +2135,21 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           type: "thread.message.assistant.complete",
         });
       }
+      if (
+        allowTranscriptTurnCompletion
+        && turnComplete
+        && messageTurnId
+        && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", messageTurnId)
+      ) {
+        events.push({
+          ...eventBase,
+          assistantMessageId: duplicateFinalAssistant?.id || messageId,
+          completedAt: createdAt,
+          id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
+          status: "completed",
+          type: "thread.turn.completed",
+        });
+      }
     } else if (message.role === "activity") {
       if (projectedMessage && projectedMessage.text === message.text && projectedMessage.title === message.title) {
         return;
@@ -2155,7 +2187,73 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     }
   });
 
+  const shouldCompleteRunningTurnFromTranscript = Boolean(
+    allowTranscriptTurnCompletion
+      && runningLatestTurnId
+      && (
+        transcriptTurnCompleteSeen
+        || assistantResponseCompletesTurn
+      )
+      && (
+        promptAccepted
+        || (expectedPromptTurnId && expectedPromptTurnId === runningLatestTurnId)
+      ),
+  );
+  const completedTurnId = shouldCompleteRunningTurnFromTranscript
+    ? runningLatestTurnId
+    : transcriptAdvancedTurn
+      ? currentTurnId
+      : "";
+  if (
+    allowTranscriptTurnCompletion
+    && (transcriptTurnCompleteSeen || assistantResponseCompletesTurn)
+    && completedTurnId
+    && !projectionHasTurnEvent(projectionEvents, "thread.turn.completed", completedTurnId)
+  ) {
+    const completedAt = cleanText(event.latestTimestamp || event.completedAt, nowIso());
+    const assistantMessage = [...projectedMessages].reverse().find((message) => (
+      message?.role === "assistant"
+      && (!message.turnId || message.turnId === completedTurnId)
+    ));
+    events.push({
+      agentId,
+      assistantMessageId: assistantMessage?.id || "",
+      completedAt,
+      createdAt: completedAt,
+      id: [
+        "projection-provider-turn-completed",
+        stableProjectionKey(completedTurnId, "turn"),
+        "fallback",
+        stableProjectionHash(completedAt),
+      ].join("-"),
+      messageId: assistantMessage?.id || completedTurnId,
+      promptEpoch,
+      prompt_epoch: promptEpoch,
+      source,
+      status: "completed",
+      turnId: completedTurnId,
+      type: "thread.turn.completed",
+    });
+  }
+
   return events;
+}
+
+function preserveRunningLatestTurnWhenTranscriptCompletionBlocked(existingLatestTurn, projectedLatestTurn, event = {}) {
+  const normalizedExistingLatestTurn = normalizeThreadLatestTurn(existingLatestTurn);
+  const normalizedProjectedLatestTurn = normalizeThreadLatestTurn(projectedLatestTurn);
+  const blocked = Boolean(
+    event.allowTranscriptTurnCompletion !== true
+      && normalizedExistingLatestTurn?.state === "running"
+      && normalizedProjectedLatestTurn
+      && cleanText(normalizedProjectedLatestTurn.turnId) === cleanText(normalizedExistingLatestTurn.turnId)
+      && CLOSED_THREAD_TURN_STATES.has(normalizedProjectedLatestTurn.state)
+  );
+
+  return {
+    blocked,
+    latestTurn: blocked ? normalizedExistingLatestTurn : normalizedProjectedLatestTurn,
+  };
 }
 
 function defaultThreadTitle(terminalIndex, agentId) {
@@ -2794,54 +2892,7 @@ export function persistWorkspaceThreads(threads) {
   return normalizeWorkspaceThreads(threads, {
     compactPersistence: true,
     stripLiveBindings: true,
-    stripMessages: true,
   });
-}
-
-export function compactWorkspaceThreadTranscriptContent(state, event = {}) {
-  const workspaceId = cleanText(event.workspaceId);
-  const threadId = cleanText(event.threadId);
-  if (!workspaceId || !threadId) {
-    return state || {};
-  }
-
-  const currentState = normalizeWorkspaceThreads(state);
-  const entry = currentState[workspaceId];
-  const existing = entry?.threads?.[threadId];
-  if (!existing) {
-    return state || {};
-  }
-
-  const hasTranscriptContent = Boolean(
-    (Array.isArray(existing.messages) && existing.messages.length > 0)
-      || (Array.isArray(existing.projectionEvents) && existing.projectionEvents.length > 0)
-      || cleanText(existing.transcriptHydratedAt)
-      || cleanText(existing.transcriptHydrationMode)
-      || cleanText(existing.transcriptLatestTimestamp)
-      || cleanText(existing.transcriptSourcePath)
-      || cleanText(existing.transcriptStatus, "idle") !== "idle",
-  );
-  if (!hasTranscriptContent) {
-    return state || {};
-  }
-
-  const compactThread = normalizeThread(existing, workspaceId, {
-    stripMessages: true,
-  });
-  if (!compactThread) {
-    return state || {};
-  }
-
-  return {
-    ...currentState,
-    [workspaceId]: {
-      ...entry,
-      threads: {
-        ...entry.threads,
-        [threadId]: compactThread,
-      },
-    },
-  };
 }
 
 function workspaceThreadsPersistShell(entry) {
@@ -4361,6 +4412,7 @@ function diagnoseWorkspaceThreadSessionDuplicateClaims(entry, agentId, sessionId
 }
 
 function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
+  const transcriptExplicitCompletionCanSettleTurn = event.transcriptExplicitCompletionCanSettleTurn === true;
   const projectionEventsBefore = ensureThreadProjectionEvents(existing);
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
     agentId,
@@ -4375,6 +4427,10 @@ function createTranscriptHydrationProjectionPreview(existing, event, agentId) {
     promptEventSubmittedAt: event.promptEventSubmittedAt,
     source: cleanText(event.source, `${agentId}-session`),
     submittedAt: event.submittedAt,
+    allowTranscriptTurnCompletion: false,
+    assistantResponseCompletesTurn: false,
+    transcriptExplicitCompletionCanSettleTurn: false,
+    turnCompleteSeen: false,
   });
   const projectionEventsAfter = appendThreadProjectionEvents(
     projectionEventsBefore,
@@ -4972,7 +5028,6 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
   const sessionTitle = cleanRealThreadTitleCandidate(event.sessionTitle, existing);
   const existingTitle = cleanRealThreadTitleCandidate(existing.title, existing);
   const existingSessionName = cleanRealThreadTitleCandidate(existing.sessionName, existing);
-  const transcriptMaxMessages = Math.max(0, Number.parseInt(event.maxMessages, 10) || 0);
   const title = sessionTitle || existingTitle || existingSessionName || defaultThreadTitle(existing.terminalIndex, agentId);
   const projectionEventsToAdd = createProjectionEventsFromTranscript(existing, event.messages, {
     agentId,
@@ -4987,6 +5042,10 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
     promptEventSubmittedAt: event.promptEventSubmittedAt,
     source: cleanText(event.source, `${agentId}-session`),
     submittedAt: event.submittedAt,
+    allowTranscriptTurnCompletion: false,
+    assistantResponseCompletesTurn: false,
+    transcriptExplicitCompletionCanSettleTurn: false,
+    turnCompleteSeen: false,
   });
   const projectionEvents = appendThreadProjectionEvents(
     ensureThreadProjectionEvents(existing),
@@ -5062,10 +5121,9 @@ export function hydrateWorkspaceThreadSessionTranscript(state, event = {}) {
           providerBindings,
           sessionName: sessionTitle || existingSessionName || existingTitle || title,
           title,
-	          transcriptHydratedAt: now,
-	          transcriptLatestTimestamp: cleanText(event.latestTimestamp),
-          transcriptMaxMessages: transcriptMaxMessages || existing.transcriptMaxMessages || messages.length,
-	          transcriptSessionId: sessionId || existing.transcriptSessionId,
+          transcriptHydratedAt: now,
+          transcriptLatestTimestamp: cleanText(event.latestTimestamp),
+          transcriptSessionId: sessionId || existing.transcriptSessionId,
           transcriptSourcePath: cleanText(event.sourcePath || event.rolloutPath),
           transcriptStatus: "ready",
           updatedAt: now,
