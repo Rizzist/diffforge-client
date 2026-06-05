@@ -33,6 +33,9 @@ import {
 import {
   terminalAgentUsesActivityHooks,
 } from "../terminalActivityState.js";
+import {
+  sendTerminalInputPayload,
+} from "./terminalInputTransport.js";
 
 const terminalPromptSubmittedSubscribers = new Set();
 let terminalPromptSubmittedListenerPromise = null;
@@ -1731,7 +1734,7 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
     });
     const retryWriteStartedAt = Date.now();
     const retrySubmittedAt = new Date().toISOString();
-    await invoke("terminal_write", {
+    await sendTerminalInputPayload({
       data: safeSubmitSequence,
       instanceId: binding.instanceId,
       paneId: binding.paneId,
@@ -1740,7 +1743,7 @@ export async function waitForWorkspaceThreadPromptAcceptedWithEnterRetries({
       promptEventSubmittedAt: retrySubmittedAt,
       promptEventText: safePrompt,
       threadId: safeThreadId,
-    });
+    }, { waitForAck: true });
     logThreadBridgeDiagnostic(`${logPrefix}.enter_retry_write_done`, {
       agentId: safeAgentId,
       bindingInstanceId: binding.instanceId,

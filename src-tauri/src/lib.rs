@@ -73,12 +73,19 @@ const TERMINAL_MIN_ROWS: u16 = 6;
 const TERMINAL_MAX_COLS: u16 = 400;
 const TERMINAL_MAX_ROWS: u16 = 160;
 const MAX_TERMINAL_WRITE_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_WRITE_BATCH_ITEMS: usize = 64;
 const MAX_TERMINAL_INPUT_TRANSPORT_MESSAGE_BYTES: usize = 256 * 1024;
 const TERMINAL_INPUT_QUEUE_CAPACITY: usize = 1024;
 const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
+const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 32 * 1024;
+const TERMINAL_OUTPUT_COALESCE_FLUSH_MS: u64 = 6;
+const TERMINAL_OUTPUT_READER_QUEUE_CAPACITY: usize = 64;
+const TERMINAL_OUTPUT_TRANSPORT_QUEUE_CAPACITY: usize = 128;
+const TERMINAL_OUTPUT_TRANSPORT_BATCH_MAX_BYTES: usize = 128 * 1024;
+const TERMINAL_OUTPUT_TRANSPORT_PENDING_MAX_BYTES: usize = 1024 * 1024;
 const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
@@ -123,7 +130,7 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
-const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = true;
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
@@ -410,6 +417,10 @@ struct TerminalState {
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
     terminal_input_queues: Arc<StdMutex<HashMap<String, TerminalInputQueueHandle>>>,
     terminal_input_transport: Arc<StdMutex<Option<TerminalInputTransportEndpoint>>>,
+    terminal_output_transport: Arc<StdMutex<Option<TerminalOutputTransportEndpoint>>>,
+    terminal_output_subscribers:
+        Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    terminal_output_pending: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
     lifecycle_lock: Arc<Mutex<()>>,
@@ -429,6 +440,12 @@ struct TerminalInputQueueHandle {
 struct TerminalInputQueueItem {
     payload: TerminalInputEventPayload,
     ack: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+#[derive(Clone)]
+struct TerminalOutputTransportSubscriber {
+    sender: mpsc::Sender<()>,
+    buffer: Arc<StdMutex<Vec<u8>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -453,6 +470,21 @@ struct TerminalInputTransportAck {
     message_id: String,
     ok: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputTransportEndpoint {
+    url: String,
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutputTransportSubscribe {
+    token: String,
+    session_id: String,
+    r#type: Option<String>,
 }
 
 struct TerminalCleanupTracker {
@@ -659,6 +691,15 @@ impl Drop for TerminalState {
         if let Ok(mut transport) = self.terminal_input_transport.lock() {
             *transport = None;
         }
+        if let Ok(mut transport) = self.terminal_output_transport.lock() {
+            *transport = None;
+        }
+        if let Ok(mut subscribers) = self.terminal_output_subscribers.lock() {
+            subscribers.clear();
+        }
+        if let Ok(mut pending) = self.terminal_output_pending.lock() {
+            pending.clear();
+        }
         let warm_ptys = self.pty_pool.drain_for_shutdown();
 
         for (_, instance) in instances {
@@ -783,13 +824,19 @@ impl TerminalHeadlessOutputBuffer {
         self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
         if data.len() >= TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES {
             self.tail.clear();
-            self.tail
-                .extend(data[data.len() - TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES..].iter().copied());
+            self.tail.extend(
+                data[data.len() - TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES..]
+                    .iter()
+                    .copied(),
+            );
             return;
         }
 
         self.tail.extend(data.iter().copied());
-        let overflow = self.tail.len().saturating_sub(TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES);
+        let overflow = self
+            .tail
+            .len()
+            .saturating_sub(TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES);
         if overflow > 0 {
             self.tail.drain(..overflow);
         }
@@ -813,9 +860,7 @@ impl TerminalHeadlessOutputBuffer {
         instance_id: u64,
         since_total_bytes: u64,
     ) -> TerminalHeadlessOutputDelta {
-        let tail_start_total_bytes = self
-            .total_bytes
-            .saturating_sub(self.tail.len() as u64);
+        let tail_start_total_bytes = self.total_bytes.saturating_sub(self.tail.len() as u64);
         let truncated = since_total_bytes < tail_start_total_bytes;
         let from_total_bytes = if truncated {
             tail_start_total_bytes
@@ -825,7 +870,12 @@ impl TerminalHeadlessOutputBuffer {
         let start_index = from_total_bytes
             .saturating_sub(tail_start_total_bytes)
             .min(self.tail.len() as u64) as usize;
-        let bytes = self.tail.iter().skip(start_index).copied().collect::<Vec<_>>();
+        let bytes = self
+            .tail
+            .iter()
+            .skip(start_index)
+            .copied()
+            .collect::<Vec<_>>();
         TerminalHeadlessOutputDelta {
             bytes_base64: general_purpose::STANDARD.encode(bytes),
             epoch: self.epoch,
@@ -1534,6 +1584,7 @@ struct TerminalOpenRequest {
     workspace_name: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+    output_transport_session_id: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -2472,6 +2523,11 @@ struct WorkspaceActivationDiagnosticEvent {
 
 #[tauri::command]
 fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(), String> {
+    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED {
+        let _ = (phase, fields);
+        return Ok(());
+    }
+
     write_workspace_activation_diagnostic_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
@@ -2488,17 +2544,24 @@ fn workspace_activation_diagnostic_log(phase: String, fields: Value) -> Result<(
 fn workspace_activation_diagnostic_log_many(
     events: Vec<WorkspaceActivationDiagnosticEvent>,
 ) -> Result<(), String> {
+    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED {
+        let _ = events;
+        return Ok(());
+    }
+
     let entries = events
         .into_iter()
         .take(256)
-        .map(|event| json!({
-            "ts_ms": current_time_ms(),
-            "phase": clean_terminal_diagnostic_log_text(&event.phase),
-            "source": "frontend",
-            "app_pid": std::process::id(),
-            "thread": terminal_diagnostic_thread_label(),
-            "fields": event.fields,
-        }))
+        .map(|event| {
+            json!({
+                "ts_ms": current_time_ms(),
+                "phase": clean_terminal_diagnostic_log_text(&event.phase),
+                "source": "frontend",
+                "app_pid": std::process::id(),
+                "thread": terminal_diagnostic_thread_label(),
+                "fields": event.fields,
+            })
+        })
         .collect();
 
     write_workspace_activation_diagnostic_log_entries(entries);
@@ -3513,6 +3576,9 @@ pub fn run() {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
             terminal_input_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_transport: Arc::new(StdMutex::new(None)),
+            terminal_output_subscribers: Arc::new(StdMutex::new(HashMap::new())),
+            terminal_output_pending: Arc::new(StdMutex::new(HashMap::new())),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
             lifecycle_lock: Arc::new(Mutex::new(())),
@@ -3676,6 +3742,7 @@ pub fn run() {
             agent_thread_session_discover,
             agent_thread_transcript,
             agent_thread_transcript_watch,
+            agent_thread_transcript_unwatch,
             terminal_workspace_raw_scan,
             workspace_git_pull_candidates,
             workspace_git_pull_repositories,
@@ -3689,7 +3756,9 @@ pub fn run() {
             set_terminal_audio_input_target,
             terminal_write_to_audio_input_target,
             terminal_write,
+            terminal_write_batch,
             terminal_input_transport_endpoint,
+            terminal_output_transport_endpoint,
             terminal_write_realtime,
             terminal_refresh_theme,
             terminal_windows_pty_info,

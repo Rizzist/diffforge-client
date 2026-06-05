@@ -5,11 +5,180 @@ import {
   appendWorkspaceThreadProjectionEvents,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
+  compactWorkspaceThreadTranscriptContent,
   hydrateWorkspaceThreadSessionTranscript,
   markWorkspaceThreadAgentActivity,
   materializeWorkspaceThreadForTerminal,
   normalizeWorkspaceThreads,
 } from "./workspaceThreads.js";
+
+test("session transcript hydration is content-only and does not create turn lifecycle", () => {
+  const workspaceId = "workspace-content-only";
+  const threadId = "thread-content-only";
+  const sessionId = "session-content-only";
+  const userAt = "2026-06-05T14:00:00.000Z";
+  const assistantAt = "2026-06-05T14:00:03.000Z";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "idle",
+          currentAgent: "codex",
+          latestTurn: null,
+          materialized: true,
+          messages: [],
+          projectionEvents: [],
+          providerBindings: {
+            codex: {
+              activityStatus: "idle",
+              inputReady: true,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "idle",
+            },
+          },
+          status: "idle",
+          terminalBinding: {
+            instanceId: 1,
+            paneId: "pane-content-only",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          transcriptSessionId: sessionId,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    latestTimestamp: assistantAt,
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: userAt,
+      id: "transcript-user",
+      role: "user",
+      text: "Tell me what this project is.",
+    }, {
+      createdAt: assistantAt,
+      id: "transcript-assistant",
+      kind: "message",
+      role: "assistant",
+      text: "It is a clean workspace.",
+    }, {
+      createdAt: assistantAt,
+      id: "transcript-task-complete",
+      kind: "task_complete",
+      role: "assistant",
+      text: "It is a clean workspace.",
+    }],
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    threadId,
+    workspaceId,
+  });
+
+  const thread = hydrated[workspaceId].threads[threadId];
+  assert.equal(thread.latestTurn, null);
+  assert.equal(thread.activityStatus, "idle");
+  assert.equal(thread.messages.some((message) => (
+    message.role === "assistant"
+      && message.text === "It is a clean workspace."
+  )), true);
+  assert.equal(thread.projectionEvents.some((event) => String(event.type || "").startsWith("thread.turn.")), false);
+});
+
+test("compacting hidden transcript content preserves lifecycle and session shell", () => {
+  const workspaceId = "workspace-compact-transcript";
+  const threadId = "thread-compact-transcript";
+  const sessionId = "session-compact-transcript";
+  const promptId = "prompt-compact-transcript";
+  const turnId = `turn-${promptId}`;
+  const startedAt = "2026-06-05T15:00:00.000Z";
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            promptEpoch: 2,
+            startedAt,
+            state: "running",
+            turnId,
+          },
+          materialized: true,
+          messageCount: 2,
+          messages: [{
+            createdAt: startedAt,
+            id: promptId,
+            role: "user",
+            text: "Audit this repo",
+            turnId,
+          }, {
+            createdAt: "2026-06-05T15:00:04.000Z",
+            id: "assistant-compact",
+            role: "assistant",
+            text: "Working on it.",
+            turnId,
+          }],
+          projectionEvents: [{
+            createdAt: startedAt,
+            id: "turn-started",
+            messageId: promptId,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalIndex: 0,
+          transcriptHydratedAt: "2026-06-05T15:00:05.000Z",
+          transcriptHydrationMode: "session-only",
+          transcriptLatestTimestamp: "2026-06-05T15:00:04.000Z",
+          transcriptSessionId: sessionId,
+          transcriptSourcePath: "/tmp/session.jsonl",
+          transcriptStatus: "ready",
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const compacted = compactWorkspaceThreadTranscriptContent(state, {
+    threadId,
+    workspaceId,
+  });
+  const thread = compacted[workspaceId].threads[threadId];
+  assert.equal(thread.messages.length, 0);
+  assert.equal(thread.projectionEvents.length, 0);
+  assert.equal(thread.messageCount, 2);
+  assert.equal(thread.latestTurn.state, "running");
+  assert.equal(thread.latestTurn.turnId, turnId);
+  assert.equal(thread.activityStatus, "thinking");
+  assert.equal(thread.providerBindings.codex.nativeSessionId, sessionId);
+  assert.equal(thread.transcriptSessionId, sessionId);
+  assert.equal(thread.transcriptStatus, "idle");
+});
 
 test("session transcript completion hydrates content without settling the active running turn", () => {
   const workspaceId = "workspace-test";

@@ -3163,6 +3163,84 @@ async fn prepare_terminal_coordination_launch(
     task_result
 }
 
+fn send_terminal_output_transport_frame(
+    subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    pending_output: &Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+    session_id: Option<&str>,
+    chunk: &[u8],
+) -> bool {
+    let Some(session_id) = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if chunk.is_empty() {
+        return true;
+    }
+
+    let senders = match subscribers.lock() {
+        Ok(subscribers) => subscribers.get(session_id).cloned().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if senders.is_empty() {
+        if let Ok(mut pending_output) = pending_output.lock() {
+            let pending = pending_output
+                .entry(session_id.to_string())
+                .or_insert_with(Vec::new);
+            pending.extend_from_slice(chunk);
+            if pending.len() > TERMINAL_OUTPUT_TRANSPORT_PENDING_MAX_BYTES {
+                let overflow = pending.len() - TERMINAL_OUTPUT_TRANSPORT_PENDING_MAX_BYTES;
+                pending.drain(0..overflow);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    let mut delivered = false;
+    let mut closed = false;
+    for subscriber in senders {
+        let buffered = match subscriber.buffer.lock() {
+            Ok(mut buffer) => {
+                buffer.extend_from_slice(chunk);
+                if buffer.len() > TERMINAL_OUTPUT_TRANSPORT_PENDING_MAX_BYTES {
+                    let overflow = buffer.len() - TERMINAL_OUTPUT_TRANSPORT_PENDING_MAX_BYTES;
+                    buffer.drain(0..overflow);
+                }
+                true
+            }
+            Err(_) => false,
+        };
+        if !buffered {
+            closed = true;
+            continue;
+        }
+
+        match subscriber.sender.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {
+                delivered = true;
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                closed = true;
+            }
+        }
+    }
+
+    if closed {
+        if let Ok(mut subscribers) = subscribers.lock() {
+            if let Some(senders) = subscribers.get_mut(session_id) {
+                senders.retain(|subscriber| !subscriber.sender.is_closed());
+                if senders.is_empty() {
+                    subscribers.remove(session_id);
+                }
+            }
+        }
+    }
+
+    delivered
+}
+
 fn spawn_terminal_reader(
     app: AppHandle,
     terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -3171,15 +3249,34 @@ fn spawn_terminal_reader(
     instance_id: u64,
     headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
     cloud_mcp_state: CloudMcpState,
+    output_transport_subscribers:
+        Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    output_transport_pending: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+    output_transport_session_id: Option<String>,
     output_channel: Channel<InvokeResponseBody>,
     mut reader: Box<dyn Read + Send>,
 ) {
+    enum TerminalReaderMessage {
+        Chunk(Vec<u8>),
+        Exit {
+            reason: &'static str,
+            total_bytes: u64,
+            total_chunks: u64,
+            trailing_bytes: u64,
+            trailing_chunks: u64,
+        },
+    }
+
     fn send_terminal_output_frame(
         app: &AppHandle,
         chunk: Vec<u8>,
         pane_id: &str,
         instance_id: u64,
         cloud_mcp_state: &CloudMcpState,
+        output_transport_subscribers:
+            &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+        output_transport_pending: &Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        output_transport_session_id: Option<&str>,
         output_channel: &Channel<InvokeResponseBody>,
     ) -> (bool, f64, f64) {
         if chunk.is_empty() {
@@ -3187,29 +3284,108 @@ fn spawn_terminal_reader(
         }
 
         let observe_started_at = Instant::now();
-        let observer_app = app.clone();
-        let observer_state = cloud_mcp_state.clone();
-        let observer_pane_id = pane_id.to_string();
-        let observer_chunk = chunk.clone();
-        tauri::async_runtime::spawn(async move {
-            cloud_mcp_observe_terminal_output(
-                observer_app,
-                observer_state,
-                &observer_pane_id,
-                instance_id,
-                &observer_chunk,
-            )
-            .await;
-        });
+        let observe_decision = cloud_mcp_schedule_terminal_output_observer(
+            cloud_mcp_state,
+            pane_id,
+            instance_id,
+            &chunk,
+        );
+        match observe_decision {
+            CloudMcpTerminalOutputObserverDecision::Immediate => {
+                let observer_app = app.clone();
+                let observer_state = cloud_mcp_state.clone();
+                let observer_pane_id = pane_id.to_string();
+                let observer_chunk = chunk.clone();
+                tauri::async_runtime::spawn(async move {
+                    cloud_mcp_observe_terminal_output(
+                        observer_app,
+                        observer_state,
+                        &observer_pane_id,
+                        instance_id,
+                        &observer_chunk,
+                    )
+                    .await;
+                });
+            }
+            CloudMcpTerminalOutputObserverDecision::Deferred(delay_ms) => {
+                let observer_app = app.clone();
+                let observer_state = cloud_mcp_state.clone();
+                let observer_pane_id = pane_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    let Some(observer_chunk) = cloud_mcp_take_terminal_output_observer_pending(
+                        &observer_state,
+                        &observer_pane_id,
+                        instance_id,
+                    ) else {
+                        return;
+                    };
+                    cloud_mcp_observe_terminal_output(
+                        observer_app,
+                        observer_state,
+                        &observer_pane_id,
+                        instance_id,
+                        &observer_chunk,
+                    )
+                    .await;
+                });
+            }
+            CloudMcpTerminalOutputObserverDecision::Pending => {}
+        }
         let observe_schedule_ms = terminal_diagnostic_elapsed_ms(observe_started_at);
 
         let send_started_at = Instant::now();
-        let sent = output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok();
+        let transport_sent = send_terminal_output_transport_frame(
+            output_transport_subscribers,
+            output_transport_pending,
+            output_transport_session_id,
+            &chunk,
+        );
+        let sent = if transport_sent {
+            true
+        } else {
+            output_channel.send(InvokeResponseBody::Raw(chunk)).is_ok()
+        };
         (
             sent,
             terminal_diagnostic_elapsed_ms(send_started_at),
             observe_schedule_ms,
         )
+    }
+
+    fn flush_terminal_output_frame(
+        app: &AppHandle,
+        pending: &mut Vec<u8>,
+        pending_source_chunks: &mut u64,
+        pane_id: &str,
+        instance_id: u64,
+        cloud_mcp_state: &CloudMcpState,
+        output_transport_subscribers:
+            &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+        output_transport_pending: &Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        output_transport_session_id: Option<&str>,
+        output_channel: &Channel<InvokeResponseBody>,
+    ) -> (bool, f64, f64, usize, u64) {
+        if pending.is_empty() {
+            return (true, 0.0, 0.0, 0, 0);
+        }
+
+        let source_chunks = *pending_source_chunks;
+        let bytes = pending.len();
+        let chunk = std::mem::take(pending);
+        *pending_source_chunks = 0;
+        let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
+            app,
+            chunk,
+            pane_id,
+            instance_id,
+            cloud_mcp_state,
+            output_transport_subscribers,
+            output_transport_pending,
+            output_transport_session_id,
+            output_channel,
+        );
+        (sent, send_ms, observer_schedule_ms, bytes, source_chunks)
     }
 
     let reader_pane_id = pane_id.clone();
@@ -3229,9 +3405,110 @@ fn spawn_terminal_reader(
                 "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
             }),
         );
-        let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<TerminalReaderMessage>(
+            TERMINAL_OUTPUT_READER_QUEUE_CAPACITY,
+        );
+        let reader_thread_pane_id = reader_pane_id.clone();
+        let reader_thread_headless_output = Arc::clone(&headless_output);
+        let reader_thread_tx = output_tx.clone();
+        thread::spawn(move || {
+            let mut buffer = [0u8; TERMINAL_OUTPUT_READ_BUFFER_BYTES];
+            let mut forensics_started_at = Instant::now();
+            let mut forensics_chunks: u64 = 0;
+            let mut forensics_bytes: u64 = 0;
+            let mut forensics_total_chunks: u64 = 0;
+            let mut forensics_total_bytes: u64 = 0;
+            let exit_reason = loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => {
+                        log_terminal_crash_forensics_event(
+                            "backend.terminal_reader.eof",
+                            json!({
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&reader_thread_pane_id),
+                                "total_bytes": forensics_total_bytes,
+                                "total_chunks": forensics_total_chunks,
+                            }),
+                        );
+                        break "eof";
+                    }
+                    Ok(bytes_read) => {
+                        let chunk = &buffer[..bytes_read];
+                        if let Ok(mut headless_output) = reader_thread_headless_output.lock() {
+                            headless_output.append(chunk);
+                        }
+
+                        forensics_chunks += 1;
+                        forensics_bytes += bytes_read as u64;
+                        forensics_total_chunks += 1;
+                        forensics_total_bytes += bytes_read as u64;
+
+                        if reader_thread_tx
+                            .send(TerminalReaderMessage::Chunk(chunk.to_vec()))
+                            .is_err()
+                        {
+                            log_terminal_crash_forensics_event(
+                                "backend.terminal_reader.coalescer_closed",
+                                json!({
+                                    "bytes": bytes_read,
+                                    "instance_id": instance_id,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_thread_pane_id),
+                                    "total_bytes": forensics_total_bytes,
+                                    "total_chunks": forensics_total_chunks,
+                                }),
+                            );
+                            break "coalescer_closed";
+                        }
+
+                        if forensics_started_at.elapsed() >= Duration::from_secs(2) {
+                            log_terminal_crash_forensics_event(
+                                "backend.terminal_reader.raw_output_window",
+                                json!({
+                                    "bytes": forensics_bytes,
+                                    "chunks": forensics_chunks,
+                                    "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
+                                    "instance_id": instance_id,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&reader_thread_pane_id),
+                                    "total_bytes": forensics_total_bytes,
+                                    "total_chunks": forensics_total_chunks,
+                                }),
+                            );
+                            forensics_started_at = Instant::now();
+                            forensics_chunks = 0;
+                            forensics_bytes = 0;
+                        }
+                    }
+                    Err(error) => {
+                        log_terminal_crash_forensics_event(
+                            "backend.terminal_reader.read_error",
+                            json!({
+                                "error": clean_terminal_diagnostic_log_text(&error.to_string()),
+                                "instance_id": instance_id,
+                                "pane_id": clean_terminal_diagnostic_log_text(&reader_thread_pane_id),
+                                "total_bytes": forensics_total_bytes,
+                                "total_chunks": forensics_total_chunks,
+                            }),
+                        );
+                        break "read_error";
+                    }
+                }
+            };
+
+            let _ = reader_thread_tx.send(TerminalReaderMessage::Exit {
+                reason: exit_reason,
+                total_bytes: forensics_total_bytes,
+                total_chunks: forensics_total_chunks,
+                trailing_bytes: forensics_bytes,
+                trailing_chunks: forensics_chunks,
+            });
+        });
+        drop(output_tx);
+
+        let mut pending_output = Vec::with_capacity(TERMINAL_OUTPUT_COALESCE_MAX_BYTES);
+        let mut pending_source_chunks: u64 = 0;
         let mut stats_started_at = Instant::now();
-        let mut stats_chunks: u64 = 0;
+        let mut stats_frames: u64 = 0;
+        let mut stats_source_chunks: u64 = 0;
         let mut stats_bytes: u64 = 0;
         let mut stats_slow_sends: u64 = 0;
         let mut stats_total_send_ms = 0.0f64;
@@ -3240,64 +3517,66 @@ fn spawn_terminal_reader(
         let mut stats_total_observer_schedule_ms = 0.0f64;
         let mut stats_max_observer_schedule_ms = 0.0f64;
         let mut forensics_started_at = Instant::now();
-        let mut forensics_chunks: u64 = 0;
+        let mut forensics_frames: u64 = 0;
+        let mut forensics_source_chunks: u64 = 0;
         let mut forensics_bytes: u64 = 0;
-        let mut forensics_total_chunks: u64 = 0;
+        let mut forensics_total_frames: u64 = 0;
+        let mut forensics_total_source_chunks: u64 = 0;
         let mut forensics_total_bytes: u64 = 0;
-        let exit_reason = loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    log_terminal_crash_forensics_event(
-                        "backend.terminal_reader.eof",
-                        json!({
-                            "instance_id": instance_id,
-                            "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                            "total_bytes": forensics_total_bytes,
-                            "total_chunks": forensics_total_chunks,
-                        }),
-                    );
-                    break "eof";
-                }
-                Ok(bytes_read) => {
-                    let chunk = &buffer[..bytes_read];
-                    if let Ok(mut headless_output) = headless_output.lock() {
-                        headless_output.append(chunk);
+        let mut reader_total_chunks: u64 = 0;
+        let mut reader_total_bytes: u64 = 0;
+        let mut reader_trailing_chunks: u64 = 0;
+        let mut reader_trailing_bytes: u64 = 0;
+        let mut exit_reason = "coalescer_disconnected";
+
+        loop {
+            let received = if pending_output.is_empty() {
+                output_rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+            } else {
+                output_rx.recv_timeout(Duration::from_millis(
+                    TERMINAL_OUTPUT_COALESCE_FLUSH_MS,
+                ))
+            };
+
+            let mut record_frame =
+                |bytes: usize, source_chunks: u64, send_ms: f64, observer_schedule_ms: f64| {
+                    if bytes == 0 {
+                        return;
                     }
 
-                    let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
-                        &app,
-                        chunk.to_vec(),
-                        &reader_pane_id,
-                        instance_id,
-                        &cloud_mcp_state,
-                        &output_channel,
-                    );
-                    forensics_chunks += 1;
-                    forensics_bytes += bytes_read as u64;
-                    forensics_total_chunks += 1;
-                    forensics_total_bytes += bytes_read as u64;
+                    forensics_frames += 1;
+                    forensics_source_chunks += source_chunks;
+                    forensics_bytes += bytes as u64;
+                    forensics_total_frames += 1;
+                    forensics_total_source_chunks += source_chunks;
+                    forensics_total_bytes += bytes as u64;
                     if forensics_started_at.elapsed() >= Duration::from_secs(2) {
                         log_terminal_crash_forensics_event(
                             "backend.terminal_reader.output_window",
                             json!({
                                 "bytes": forensics_bytes,
-                                "chunks": forensics_chunks,
                                 "elapsed_ms": terminal_diagnostic_elapsed_ms(forensics_started_at),
+                                "frames": forensics_frames,
                                 "instance_id": instance_id,
-                                "last_send_ms": send_ms,
                                 "last_observer_schedule_ms": observer_schedule_ms,
+                                "last_send_ms": send_ms,
                                 "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                "source_chunks": forensics_source_chunks,
                                 "total_bytes": forensics_total_bytes,
-                                "total_chunks": forensics_total_chunks,
+                                "total_frames": forensics_total_frames,
+                                "total_source_chunks": forensics_total_source_chunks,
                             }),
                         );
                         forensics_started_at = Instant::now();
-                        forensics_chunks = 0;
+                        forensics_frames = 0;
+                        forensics_source_chunks = 0;
                         forensics_bytes = 0;
                     }
+
                     if terminal_diagnostics_enabled_for_app(&app) {
-                        stats_chunks += 1;
-                        stats_bytes += bytes_read as u64;
+                        stats_frames += 1;
+                        stats_source_chunks += source_chunks;
+                        stats_bytes += bytes as u64;
                         stats_total_send_ms += send_ms;
                         stats_max_send_ms = stats_max_send_ms.max(send_ms);
                         stats_total_observer_schedule_ms += observer_schedule_ms;
@@ -3309,10 +3588,11 @@ fn spawn_terminal_reader(
                                 &app,
                                 "backend.output_channel_send.slow",
                                 json!({
-                                    "bytes": bytes_read,
+                                    "bytes": bytes,
                                     "elapsed_ms": send_ms,
                                     "instance_id": instance_id,
                                     "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                    "source_chunks": source_chunks,
                                 }),
                             );
                         }
@@ -3322,10 +3602,11 @@ fn spawn_terminal_reader(
                                 &app,
                                 "backend.output_observer_schedule.slow",
                                 json!({
-                                    "bytes": bytes_read,
+                                    "bytes": bytes,
                                     "elapsed_ms": observer_schedule_ms,
                                     "instance_id": instance_id,
                                     "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                                    "source_chunks": source_chunks,
                                 }),
                             );
                         }
@@ -3336,20 +3617,22 @@ fn spawn_terminal_reader(
                                 "backend.output_window",
                                 json!({
                                     "bytes": stats_bytes,
-                                    "chunks": stats_chunks,
                                     "elapsed_ms": terminal_diagnostic_elapsed_ms(stats_started_at),
+                                    "frames": stats_frames,
                                     "instance_id": instance_id,
                                     "max_send_ms": stats_max_send_ms,
                                     "max_observer_schedule_ms": stats_max_observer_schedule_ms,
                                     "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
                                     "slow_observer_schedules": stats_slow_observer_schedules,
                                     "slow_sends": stats_slow_sends,
+                                    "source_chunks": stats_source_chunks,
                                     "total_observer_schedule_ms": stats_total_observer_schedule_ms,
                                     "total_send_ms": stats_total_send_ms,
                                 }),
                             );
                             stats_started_at = Instant::now();
-                            stats_chunks = 0;
+                            stats_frames = 0;
+                            stats_source_chunks = 0;
                             stats_bytes = 0;
                             stats_slow_sends = 0;
                             stats_total_send_ms = 0.0;
@@ -3359,46 +3642,91 @@ fn spawn_terminal_reader(
                             stats_max_observer_schedule_ms = 0.0;
                         }
                     }
+                };
 
-                    if !sent {
-                        log_terminal_crash_forensics_event(
-                            "backend.terminal_reader.output_channel_closed",
-                            json!({
-                                "bytes": bytes_read,
-                                "instance_id": instance_id,
-                                "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                                "total_bytes": forensics_total_bytes,
-                                "total_chunks": forensics_total_chunks,
-                            }),
-                        );
-                        break "output_channel_closed";
+            let mut flush_pending = |pending_output: &mut Vec<u8>, pending_source_chunks: &mut u64| {
+	                let (sent, send_ms, observer_schedule_ms, bytes, source_chunks) =
+	                    flush_terminal_output_frame(
+	                        &app,
+	                        pending_output,
+	                        pending_source_chunks,
+	                        &reader_pane_id,
+	                        instance_id,
+                        &cloud_mcp_state,
+                        &output_transport_subscribers,
+                        &output_transport_pending,
+                        output_transport_session_id.as_deref(),
+	                        &output_channel,
+	                    );
+                record_frame(bytes, source_chunks, send_ms, observer_schedule_ms);
+                sent
+            };
+
+            match received {
+                Ok(TerminalReaderMessage::Chunk(chunk)) => {
+                    if !pending_output.is_empty()
+                        && pending_output.len() + chunk.len() > TERMINAL_OUTPUT_COALESCE_MAX_BYTES
+                        && !flush_pending(&mut pending_output, &mut pending_source_chunks)
+                    {
+                        exit_reason = "output_channel_closed";
+                        break;
+                    }
+
+                    pending_output.extend_from_slice(&chunk);
+                    pending_source_chunks += 1;
+
+                    if pending_output.len() >= TERMINAL_OUTPUT_COALESCE_MAX_BYTES
+                        && !flush_pending(&mut pending_output, &mut pending_source_chunks)
+                    {
+                        exit_reason = "output_channel_closed";
+                        break;
                     }
                 }
-                Err(error) => {
-                    log_terminal_crash_forensics_event(
-                        "backend.terminal_reader.read_error",
-                        json!({
-                            "error": clean_terminal_diagnostic_log_text(&error.to_string()),
-                            "instance_id": instance_id,
-                            "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
-                            "total_bytes": forensics_total_bytes,
-                            "total_chunks": forensics_total_chunks,
-                        }),
-                    );
-                    break "read_error";
+                Ok(TerminalReaderMessage::Exit {
+                    reason,
+                    total_bytes,
+                    total_chunks,
+                    trailing_bytes,
+                    trailing_chunks,
+                }) => {
+                    if !flush_pending(&mut pending_output, &mut pending_source_chunks) {
+                        exit_reason = "output_channel_closed";
+                    } else {
+                        exit_reason = reason;
+                    }
+                    reader_total_bytes = total_bytes;
+                    reader_total_chunks = total_chunks;
+                    reader_trailing_bytes = trailing_bytes;
+                    reader_trailing_chunks = trailing_chunks;
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if !flush_pending(&mut pending_output, &mut pending_source_chunks) {
+                        exit_reason = "output_channel_closed";
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = flush_pending(&mut pending_output, &mut pending_source_chunks);
+                    break;
                 }
             }
-        };
+        }
         log_terminal_crash_forensics_event(
             "backend.terminal_reader.exit",
             json!({
                 "exit_reason": exit_reason,
+                "frames": forensics_total_frames,
                 "instance_id": instance_id,
                 "pane_id": clean_terminal_diagnostic_log_text(&reader_pane_id),
+                "reader_trailing_window_bytes": reader_trailing_bytes,
+                "reader_trailing_window_chunks": reader_trailing_chunks,
+                "reader_total_bytes": reader_total_bytes,
+                "reader_total_chunks": reader_total_chunks,
+                "source_chunks": forensics_total_source_chunks,
                 "trailing_window_bytes": forensics_bytes,
-                "trailing_window_chunks": forensics_chunks,
+                "trailing_window_frames": forensics_frames,
                 "total_bytes": forensics_total_bytes,
-                "total_chunks": forensics_total_chunks,
             }),
         );
 
@@ -4064,6 +4392,12 @@ async fn terminal_open(
     let _lifecycle_guard = lifecycle_lock.lock().await;
     ensure_app_not_shutting_down("terminal open")?;
     let pane_id = request.pane_id;
+    let output_transport_session_id = request
+        .output_transport_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let requested_cols = request.cols;
     let requested_rows = request.rows;
     let kind = request.kind;
@@ -4434,6 +4768,9 @@ async fn terminal_open(
         instance_id,
         headless_output,
         cloud_mcp_state.inner().clone(),
+        Arc::clone(&state.terminal_output_subscribers),
+        Arc::clone(&state.terminal_output_pending),
+        output_transport_session_id,
         output_channel,
         reader,
     );
@@ -8508,7 +8845,7 @@ fn spawn_terminal_input_queue_worker(
 }
 
 fn enqueue_terminal_input_event(app: &AppHandle, payload: TerminalInputEventPayload) {
-    enqueue_terminal_input_queue_item(app, payload, None);
+    let _ = enqueue_terminal_input_queue_item(app, payload, None);
 }
 
 fn enqueue_terminal_input_event_with_ack(
@@ -8516,7 +8853,7 @@ fn enqueue_terminal_input_event_with_ack(
     payload: TerminalInputEventPayload,
 ) -> oneshot::Receiver<Result<(), String>> {
     let (ack_sender, ack_receiver) = oneshot::channel();
-    enqueue_terminal_input_queue_item(app, payload, Some(ack_sender));
+    let _ = enqueue_terminal_input_queue_item(app, payload, Some(ack_sender));
     ack_receiver
 }
 
@@ -8533,14 +8870,14 @@ fn enqueue_terminal_input_queue_item(
     app: &AppHandle,
     payload: TerminalInputEventPayload,
     ack: Option<oneshot::Sender<Result<(), String>>>,
-) {
+) -> Result<(), String> {
     let pane_id = payload.pane_id.clone();
     let instance_id = payload.instance_id;
 
     if let Err(error) = validate_terminal_pane_id(&pane_id) {
         emit_terminal_input_error(app, pane_id, instance_id, error.clone());
-        send_terminal_input_queue_ack(ack, Err(error));
-        return;
+        send_terminal_input_queue_ack(ack, Err(error.clone()));
+        return Err(error);
     }
 
     if payload.data.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -8551,8 +8888,8 @@ fn enqueue_terminal_input_queue_item(
             instance_id,
             error.clone(),
         );
-        send_terminal_input_queue_ack(ack, Err(error));
-        return;
+        send_terminal_input_queue_ack(ack, Err(error.clone()));
+        return Err(error);
     }
 
     let state = app.state::<TerminalState>();
@@ -8590,13 +8927,13 @@ fn enqueue_terminal_input_queue_item(
                     instance_id,
                     error.clone(),
                 );
-                send_terminal_input_queue_ack(item.ack, Err(error));
-                return;
+                send_terminal_input_queue_ack(item.ack, Err(error.clone()));
+                return Err(error);
             }
         };
 
         match handle.sender.try_send(item) {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(mpsc::error::TrySendError::Full(returned_item)) => {
                 let error = "Terminal input queue is full.".to_string();
                 emit_terminal_input_error(
@@ -8605,8 +8942,8 @@ fn enqueue_terminal_input_queue_item(
                     instance_id,
                     error.clone(),
                 );
-                send_terminal_input_queue_ack(returned_item.ack, Err(error));
-                return;
+                send_terminal_input_queue_ack(returned_item.ack, Err(error.clone()));
+                return Err(error);
             }
             Err(mpsc::error::TrySendError::Closed(returned_item)) => {
                 if let Ok(mut queues) = state.terminal_input_queues.lock() {
@@ -8618,6 +8955,288 @@ fn enqueue_terminal_input_queue_item(
                     }
                 }
                 item = returned_item;
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn terminal_output_transport_endpoint(
+    state: State<'_, TerminalState>,
+) -> Result<TerminalOutputTransportEndpoint, String> {
+    if let Ok(transport) = state.terminal_output_transport.lock() {
+        if let Some(endpoint) = transport.clone() {
+            return Ok(endpoint);
+        }
+    } else {
+        return Err("Unable to read terminal output transport.".to_string());
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|error| format!("Unable to start terminal output transport: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("Unable to read terminal output transport address: {error}"))?
+        .port();
+    let endpoint = TerminalOutputTransportEndpoint {
+        url: format!("ws://127.0.0.1:{port}/terminal-output"),
+        token: uuid::Uuid::new_v4().to_string(),
+    };
+
+    {
+        let mut transport = state
+            .terminal_output_transport
+            .lock()
+            .map_err(|_| "Unable to save terminal output transport.".to_string())?;
+        if let Some(existing) = transport.clone() {
+            return Ok(existing);
+        }
+        *transport = Some(endpoint.clone());
+    }
+
+    spawn_terminal_output_transport_listener(
+        listener,
+        endpoint.token.clone(),
+        Arc::clone(&state.terminal_output_subscribers),
+        Arc::clone(&state.terminal_output_pending),
+    );
+    Ok(endpoint)
+}
+
+fn spawn_terminal_output_transport_listener(
+    listener: TcpListener,
+    expected_token: String,
+    subscribers: Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    pending_output: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let token = expected_token.clone();
+            let subscriber_map = Arc::clone(&subscribers);
+            let pending_map = Arc::clone(&pending_output);
+            tauri::async_runtime::spawn(async move {
+                handle_terminal_output_transport_connection(
+                    stream,
+                    token,
+                    subscriber_map,
+                    pending_map,
+                )
+                .await;
+            });
+        }
+    });
+}
+
+async fn read_terminal_output_transport_subscribe(
+    socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    expected_token: &str,
+) -> Option<TerminalOutputTransportSubscribe> {
+    loop {
+        let message = match timeout(Duration::from_secs(8), socket.next()).await {
+            Ok(Some(Ok(message))) => message,
+            _ => return None,
+        };
+
+        match message {
+            Message::Text(text) => {
+                let Ok(subscribe) =
+                    serde_json::from_str::<TerminalOutputTransportSubscribe>(text.as_ref())
+                else {
+                    return None;
+                };
+                let is_subscribe = subscribe
+                    .r#type
+                    .as_deref()
+                    .unwrap_or("subscribe")
+                    .eq_ignore_ascii_case("subscribe");
+                if !is_subscribe
+                    || subscribe.token != expected_token
+                    || subscribe.session_id.trim().is_empty()
+                {
+                    return None;
+                }
+                return Some(subscribe);
+            }
+            Message::Binary(bytes) => {
+                let Ok(text) = std::str::from_utf8(bytes.as_ref()) else {
+                    return None;
+                };
+                let Ok(subscribe) =
+                    serde_json::from_str::<TerminalOutputTransportSubscribe>(text)
+                else {
+                    return None;
+                };
+                let is_subscribe = subscribe
+                    .r#type
+                    .as_deref()
+                    .unwrap_or("subscribe")
+                    .eq_ignore_ascii_case("subscribe");
+                if !is_subscribe
+                    || subscribe.token != expected_token
+                    || subscribe.session_id.trim().is_empty()
+                {
+                    return None;
+                }
+                return Some(subscribe);
+            }
+            Message::Ping(payload) => {
+                let _ = socket.send(Message::Pong(payload)).await;
+            }
+            Message::Close(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+async fn handle_terminal_output_transport_connection(
+    stream: TcpStream,
+    expected_token: String,
+    subscribers: Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    pending_output: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+) {
+    let Ok(mut socket) = accept_async(stream).await else {
+        return;
+    };
+
+    let Some(subscribe) =
+        read_terminal_output_transport_subscribe(&mut socket, &expected_token).await
+    else {
+        let _ = socket.close(None).await;
+        return;
+    };
+    let session_id = subscribe.session_id.trim().to_string();
+    let (sender, mut receiver) = mpsc::channel::<()>(TERMINAL_OUTPUT_TRANSPORT_QUEUE_CAPACITY);
+    let subscriber = TerminalOutputTransportSubscriber {
+        sender: sender.clone(),
+        buffer: Arc::new(StdMutex::new(Vec::with_capacity(
+            TERMINAL_OUTPUT_TRANSPORT_BATCH_MAX_BYTES,
+        ))),
+    };
+
+    let registered = match subscribers.lock() {
+        Ok(mut subscribers) => {
+            subscribers
+                .entry(session_id.clone())
+                .or_insert_with(Vec::new)
+                .push(subscriber.clone());
+            true
+        }
+        Err(_) => false,
+    };
+    if !registered {
+        let _ = socket.close(None).await;
+        return;
+    }
+
+    if let Some(pending) = pending_output
+        .lock()
+        .ok()
+        .and_then(|mut pending_output| pending_output.remove(&session_id))
+        .filter(|pending| !pending.is_empty())
+    {
+        if let Ok(mut buffer) = subscriber.buffer.lock() {
+            buffer.extend_from_slice(&pending);
+            let _ = sender.try_send(());
+        }
+    }
+
+    let ready_message = json!({
+        "type": "terminal-output-ready",
+        "sessionId": session_id,
+    });
+    if socket
+        .send(Message::Text(ready_message.to_string().into()))
+        .await
+        .is_err()
+    {
+        remove_terminal_output_transport_subscriber(&subscribers, &session_id, &subscriber);
+        return;
+    }
+
+    let (mut socket_writer, mut socket_reader) = socket.split();
+    loop {
+        tokio::select! {
+            maybe_signal = receiver.recv() => {
+                let Some(()) = maybe_signal else {
+                    break;
+                };
+                let mut chunk = drain_terminal_output_transport_buffer(
+                    &subscriber,
+                    TERMINAL_OUTPUT_TRANSPORT_BATCH_MAX_BYTES,
+                );
+                while chunk.len() < TERMINAL_OUTPUT_TRANSPORT_BATCH_MAX_BYTES {
+                    while receiver.try_recv().is_ok() {}
+                    let next = drain_terminal_output_transport_buffer(
+                        &subscriber,
+                        TERMINAL_OUTPUT_TRANSPORT_BATCH_MAX_BYTES - chunk.len(),
+                    );
+                    if next.is_empty() {
+                        break;
+                    }
+                    chunk.extend_from_slice(&next);
+                }
+                if chunk.is_empty() {
+                    continue;
+                }
+                if socket_writer.send(Message::Binary(chunk.into())).await.is_err() {
+                    break;
+                }
+                let has_remaining_bytes = subscriber
+                    .buffer
+                    .lock()
+                    .map(|buffer| !buffer.is_empty())
+                    .unwrap_or(false);
+                if has_remaining_bytes {
+                    let _ = subscriber.sender.try_send(());
+                }
+            }
+            maybe_message = socket_reader.next() => {
+                match maybe_message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = socket_writer.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    remove_terminal_output_transport_subscriber(&subscribers, &session_id, &subscriber);
+}
+
+fn drain_terminal_output_transport_buffer(
+    subscriber: &TerminalOutputTransportSubscriber,
+    max_bytes: usize,
+) -> Vec<u8> {
+    let Ok(mut buffer) = subscriber.buffer.lock() else {
+        return Vec::new();
+    };
+    if buffer.is_empty() || max_bytes == 0 {
+        return Vec::new();
+    }
+    if buffer.len() <= max_bytes {
+        return std::mem::take(&mut *buffer);
+    }
+
+    let tail = buffer.split_off(max_bytes);
+    std::mem::replace(&mut *buffer, tail)
+}
+
+fn remove_terminal_output_transport_subscriber(
+    subscribers: &Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
+    session_id: &str,
+    subscriber: &TerminalOutputTransportSubscriber,
+) {
+    if let Ok(mut subscribers) = subscribers.lock() {
+        if let Some(senders) = subscribers.get_mut(session_id) {
+            senders.retain(|candidate| !candidate.sender.same_channel(&subscriber.sender));
+            if senders.is_empty() {
+                subscribers.remove(session_id);
             }
         }
     }
@@ -9522,6 +10141,140 @@ async fn terminal_write(
         false,
     )
     .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalWriteBatchItem {
+    pane_id: String,
+    instance_id: Option<u64>,
+    data: String,
+    delay_before_ms: Option<u64>,
+    queued: Option<bool>,
+    prompt_event_id: Option<String>,
+    prompt_event_revision: Option<u64>,
+    prompt_event_source: Option<String>,
+    prompt_event_submitted_at: Option<String>,
+    prompt_event_text: Option<String>,
+    thread_id: Option<String>,
+    client_item_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalWriteBatchItemResult {
+    client_item_id: String,
+    instance_id: Option<u64>,
+    ok: bool,
+    pane_id: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalWriteBatchResult {
+    failed: usize,
+    results: Vec<TerminalWriteBatchItemResult>,
+    submitted: usize,
+}
+
+#[tauri::command]
+async fn terminal_write_batch(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    items: Vec<TerminalWriteBatchItem>,
+) -> Result<TerminalWriteBatchResult, String> {
+    if items.is_empty() {
+        return Ok(TerminalWriteBatchResult {
+            failed: 0,
+            results: Vec::new(),
+            submitted: 0,
+        });
+    }
+
+    if items.len() > MAX_TERMINAL_WRITE_BATCH_ITEMS {
+        return Err(format!(
+            "Terminal write batch can include at most {MAX_TERMINAL_WRITE_BATCH_ITEMS} items."
+        ));
+    }
+
+    let mut results = Vec::with_capacity(items.len());
+    let mut submitted = 0usize;
+    let mut failed = 0usize;
+
+    for item in items {
+        let client_item_id = item.client_item_id.unwrap_or_default();
+        let pane_id = item.pane_id.clone();
+        let instance_id = item.instance_id;
+        let delay_before_ms = item.delay_before_ms.unwrap_or(0).min(500);
+        if delay_before_ms > 0 {
+            sleep(Duration::from_millis(delay_before_ms)).await;
+        }
+        let write_result = if item.queued.unwrap_or(false) {
+            enqueue_terminal_input_queue_item(
+                &app,
+                TerminalInputEventPayload {
+                    pane_id: item.pane_id,
+                    instance_id: item.instance_id,
+                    data: item.data,
+                    prompt_event_id: item.prompt_event_id,
+                    prompt_event_revision: item.prompt_event_revision,
+                    prompt_event_source: item.prompt_event_source,
+                    prompt_event_submitted_at: item.prompt_event_submitted_at,
+                    prompt_event_text: item.prompt_event_text,
+                    thread_id: item.thread_id,
+                },
+                None,
+            )
+        } else {
+            terminal_write_inner(
+                app.clone(),
+                state.inner(),
+                cloud_mcp_state.inner(),
+                item.pane_id,
+                item.instance_id,
+                item.data,
+                item.prompt_event_id,
+                item.prompt_event_revision,
+                item.prompt_event_source,
+                item.prompt_event_submitted_at,
+                item.prompt_event_text,
+                item.thread_id,
+                false,
+            )
+            .await
+        };
+
+        match write_result {
+            Ok(()) => {
+                submitted += 1;
+                results.push(TerminalWriteBatchItemResult {
+                    client_item_id,
+                    error: String::new(),
+                    instance_id,
+                    ok: true,
+                    pane_id,
+                });
+            }
+            Err(error) => {
+                failed += 1;
+                results.push(TerminalWriteBatchItemResult {
+                    client_item_id,
+                    error,
+                    instance_id,
+                    ok: false,
+                    pane_id,
+                });
+            }
+        }
+    }
+
+    Ok(TerminalWriteBatchResult {
+        failed,
+        results,
+        submitted,
+    })
 }
 
 #[tauri::command]

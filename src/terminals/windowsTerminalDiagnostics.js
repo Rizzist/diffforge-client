@@ -57,6 +57,12 @@ export function isWindowsTerminalDiagnosticLoggingEnabled() {
 export function syncWindowsTerminalDiagnosticLogging() {
   const enabled = isWindowsTerminalDiagnosticLoggingEnabled();
 
+  if (!enabled) {
+    backendLoggingSynced = false;
+    backendLoggingSyncInFlight = null;
+    return Promise.resolve(false);
+  }
+
   if (backendLoggingSynced === enabled) {
     return backendLoggingSyncInFlight || Promise.resolve(enabled);
   }

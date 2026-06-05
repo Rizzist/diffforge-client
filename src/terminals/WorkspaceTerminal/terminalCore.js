@@ -70,19 +70,25 @@ export const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
 export const WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT = "diffforge:workspace-thread-archive-terminal-reset";
 export const TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS = 1000;
 export const TERMINAL_OUTPUT_BATCH_MAX_MS = 8;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MS = 80;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MS = 520;
 export const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 16 * 1024;
 export const TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
-export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = 4 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_UI_HOT_ACTIVE_MAX_BYTES = 4 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = 1024;
+export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_SNAPSHOT_MAX_BYTES = 64 * 1024;
 export const TERMINAL_OUTPUT_FLUSH_MIN_BYTES = 512;
+export const TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_TRIGGER_BYTES = 32 * 1024;
+export const TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_INPUT_HOT_BYTES = 8 * 1024;
 export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 180;
-export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = 120;
-export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = 260;
-export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS = 900;
-export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 4;
-export const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = 2;
-export const TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS = TERMINAL_OUTPUT_BATCH_MAX_MS;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 1400;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = 900;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = 2400;
+export const TERMINAL_GLOBAL_RENDER_INPUT_HOT_DEFER_MAX_MS = 3600;
+export const TERMINAL_GLOBAL_RENDER_INPUT_HOT_DEFER_MAX_BYTES = 512 * 1024;
+export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS = 1200;
+export const TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME = 2;
+export const TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME = 1;
+export const TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS = 5;
 export const TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS = 8;
 export const TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS = 16;
 export const TERMINAL_INPUT_BATCH_MS = 8;
@@ -578,8 +584,33 @@ export const terminalGlobalRenderScheduler = (() => {
     && isInteractiveWindow()
   );
 
+  const shouldDeferEntryForGlobalInput = (entry, now = terminalRenderNow()) => {
+    if (!getGlobalInputHotRemainingMs()) {
+      return false;
+    }
+    if (isEntryInteractive(entry) || entryHasPriority(entry)) {
+      return false;
+    }
+    if (entry.shouldDeferForGlobalInput?.() === false) {
+      return false;
+    }
+
+    const age = entryAge(entry, now);
+    if (age >= TERMINAL_GLOBAL_RENDER_INPUT_HOT_DEFER_MAX_MS) {
+      return false;
+    }
+    if (entryBytes(entry) >= TERMINAL_GLOBAL_RENDER_INPUT_HOT_DEFER_MAX_BYTES) {
+      return false;
+    }
+    return true;
+  };
+
   const isEntryDue = (entry, now = terminalRenderNow()) => {
     if (!entry.hasPending?.()) {
+      return false;
+    }
+
+    if (shouldDeferEntryForGlobalInput(entry, now)) {
       return false;
     }
 
@@ -588,19 +619,22 @@ export const terminalGlobalRenderScheduler = (() => {
       return age >= 0;
     }
 
-    if (entryHasPriority(entry)) {
+    const backgroundMinMs = isInputHotWindow(now)
+      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
+      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+    const backgroundMaxMs = isInputHotWindow(now)
+      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+
+    if (age >= backgroundMaxMs) {
       return true;
     }
 
-    if (isInteractiveWindow(now)) {
-      return age >= TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS;
+    if (entryHasPriority(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      return age >= backgroundMinMs;
     }
 
-    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
-      return true;
-    }
-
-    return age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+    return age >= backgroundMinMs;
   };
 
   const nextDelayMs = (now = terminalRenderNow()) => {
@@ -611,17 +645,23 @@ export const terminalGlobalRenderScheduler = (() => {
         return;
       }
 
+      const age = entryAge(entry, now);
+      if (shouldDeferEntryForGlobalInput(entry, now)) {
+        const remainingHotMs = getGlobalInputHotRemainingMs();
+        const remainingStarveMs = Math.max(
+          0,
+          TERMINAL_GLOBAL_RENDER_INPUT_HOT_DEFER_MAX_MS - age,
+        );
+        const remaining = Math.max(16, Math.min(remainingHotMs || remainingStarveMs, remainingStarveMs || remainingHotMs));
+        delay = delay == null ? remaining : Math.min(delay, remaining);
+        return;
+      }
+
       if (isEntryActive(entry)) {
         delay = 0;
         return;
       }
 
-      if (entryHasPriority(entry)) {
-        delay = 0;
-        return;
-      }
-
-      const age = entryAge(entry, now);
       const backgroundMinMs = isInputHotWindow(now)
         ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
         : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
@@ -765,25 +805,23 @@ export const terminalGlobalRenderScheduler = (() => {
     for (const entry of candidates) {
       const active = isEntryActive(entry);
       const age = entryAge(entry, frameStartedAt);
-      const priority = entryHasPriority(entry);
       const starved = age >= (
         isInputHotWindow(frameStartedAt)
           ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
           : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
       );
+      const inputHotDeferred = shouldDeferEntryForGlobalInput(entry, frameStartedAt);
       const elapsedMs = terminalRenderNow() - frameStartedAt;
       const reachedPaneBudget = flushed >= TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME;
       const reachedBackgroundBudget = !active
         && backgroundFlushed >= TERMINAL_GLOBAL_RENDER_BACKGROUND_PANES_PER_FRAME
-        && !starved
-        && !priority;
+        && !starved;
       const reachedTimeBudget = !active
         && flushed > 0
         && elapsedMs >= TERMINAL_GLOBAL_RENDER_FRAME_BUDGET_MS
-        && !starved
-        && !priority;
+        && !starved;
 
-      if (reachedPaneBudget || reachedBackgroundBudget || reachedTimeBudget) {
+      if (inputHotDeferred || reachedPaneBudget || reachedBackgroundBudget || reachedTimeBudget) {
         deferred += 1;
         continue;
       }
@@ -836,7 +874,7 @@ export const terminalGlobalRenderScheduler = (() => {
         scheduleNext();
         return;
       }
-      if (isEntryActive(entry) || entryHasPriority(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      if (isEntryActive(entry) && !shouldDeferEntryForGlobalInput(entry)) {
         clearTimer();
         scheduleFrame();
       } else {
@@ -865,6 +903,13 @@ export const terminalGlobalRenderScheduler = (() => {
       const entryId = String(id || "").trim();
       return globalInputHotActive || !entryId || entryId === interactiveEntryId;
     },
+    isGlobalInputHot() {
+      return getGlobalInputHotRemainingMs() > 0;
+    },
+    isTerminalEntryInteractive(id = "") {
+      const entryId = String(id || "").trim();
+      return Boolean(entryId && entryId === interactiveEntryId && isInteractiveWindow());
+    },
     unregister(id) {
       entries.delete(id);
       if (interactiveEntryId === id) {
@@ -875,3 +920,16 @@ export const terminalGlobalRenderScheduler = (() => {
     },
   };
 })();
+
+export function markTerminalUiInputHot(durationMs = TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  const nextUntil = Date.now() + Math.max(0, Number(durationMs || 0));
+  window.__diffforgeTerminalInputHotUntil = Math.max(
+    Number(window.__diffforgeTerminalInputHotUntil || 0),
+    nextUntil,
+  );
+  terminalGlobalRenderScheduler.cancel?.();
+}

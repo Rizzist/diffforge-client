@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -10,6 +10,11 @@ import {
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
+import {
+  sendTerminalInputPayload,
+  terminalInputDataIsSubmit,
+  warmTerminalInputTransport,
+} from "./terminalInputTransport.js";
 import {
   GlobalStyle,
   AppFrame,
@@ -405,10 +410,8 @@ import {
   TERMINAL_DELETE_INPUT_BATCH_MS,
   TERMINAL_ENABLE_WEBGL_RENDERER,
   TERMINAL_ENTER_SEQUENCE,
-  TERMINAL_ENTER_SEQUENCE_MOD1,
   TERMINAL_INPUT_BATCH_MAX_CHARS,
   TERMINAL_INPUT_BATCH_MS,
-  TERMINAL_INPUT_EVENT,
   TERMINAL_INPUT_ERROR_EVENT,
   TERMINAL_INPUT_HOT_EVENT,
   TERMINAL_MAX_COLS,
@@ -421,8 +424,12 @@ import {
   TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS,
   TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES,
   TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES,
+  TERMINAL_OUTPUT_FLUSH_BACKGROUND_SNAPSHOT_MAX_BYTES,
   TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
+  TERMINAL_OUTPUT_FLUSH_UI_HOT_ACTIVE_MAX_BYTES,
   TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS,
+  TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_INPUT_HOT_BYTES,
+  TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_TRIGGER_BYTES,
   TERMINAL_PARKED_PROMPT_EVENT,
   TERMINAL_SHIFT_ENTER_SEQUENCE,
   TERMINAL_SLASH_COMMAND_MAX_LINE_CHARS,
@@ -493,6 +500,7 @@ import {
   isTerminalSlashCommandDiagnosticAgentKind,
   isWindowsTerminalGeometrySettled,
   logThreadBridgeDiagnostic,
+  markTerminalUiInputHot,
   normalizeCodexResizeGateSize,
   sanitizeTerminalDiagnosticText,
   setActiveTerminalKeyboardTarget,
@@ -580,371 +588,8 @@ export {
   normalizeWorkspaceTerminalIndexes,
 } from "./threadRuntime.js";
 
-function terminalInputDataIsSubmit(value) {
-  const text = String(value || "");
-  return text.includes("\r")
-    || text.includes("\n")
-    || text.includes(TERMINAL_ENTER_SEQUENCE)
-    || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
-}
-
-const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
-const TERMINAL_INPUT_TRANSPORT_QUEUE_LIMIT = 4096;
-const TERMINAL_INPUT_TRANSPORT_RETRY_MS = 4;
-
-let terminalInputTransportEndpoint = null;
-let terminalInputTransportSocket = null;
-let terminalInputTransportConnectPromise = null;
-let terminalInputTransportFlushTimer = 0;
-let terminalInputTransportFallbackPromise = null;
-let terminalInputTransportQueue = [];
-let terminalInputTransportNextMessageId = 1;
-const terminalInputTransportPendingAcks = new Map();
-
-function isTerminalInputTransportAvailable() {
-  return typeof WebSocket !== "undefined";
-}
-
-function isTerminalInputTransportOpen() {
-  return (
-    isTerminalInputTransportAvailable()
-    && terminalInputTransportSocket?.readyState === WebSocket.OPEN
-  );
-}
-
-function cleanTerminalInputTransportPayload(payload) {
-  const cleanPayload = {};
-  Object.entries(payload || {}).forEach(([key, value]) => {
-    if (value !== undefined) {
-      cleanPayload[key] = value;
-    }
-  });
-  return cleanPayload;
-}
-
-function getTerminalInputTransportLogFields(payload = {}, extra = {}) {
-  const data = String(payload?.data || "");
-  return {
-    data: getTerminalInputDebugFields(data),
-    hasPromptEventId: Boolean(String(payload?.promptEventId || "").trim()),
-    hasPromptEventText: Boolean(String(payload?.promptEventText || "").trim()),
-    instanceId: payload?.instanceId || "",
-    isSubmitInput: terminalInputDataIsSubmit(data),
-    paneId: payload?.paneId || "",
-    promptEventId: String(payload?.promptEventId || "").trim(),
-    promptEventSource: String(payload?.promptEventSource || "").trim(),
-    promptTextLength: String(payload?.promptEventText || "").trim().length,
-    threadId: payload?.threadId || "",
-    ...extra,
-  };
-}
-
-function logTerminalInputTransportSubmit(phase, payload, extra = {}) {
-  if (!payload?.promptEventId && !payload?.promptEventText) {
-    return;
-  }
-
-  logTerminalStatus(
-    phase,
-    getTerminalInputTransportLogFields(payload, extra),
-  );
-}
-
-function invokeTerminalInputPayload(payload) {
-  return invoke("terminal_write", {
-    data: payload?.data || "",
-    instanceId: payload?.instanceId,
-    paneId: payload?.paneId,
-    promptEventId: payload?.promptEventId,
-    promptEventRevision: payload?.promptEventRevision,
-    promptEventSource: payload?.promptEventSource,
-    promptEventSubmittedAt: payload?.promptEventSubmittedAt,
-    promptEventText: payload?.promptEventText,
-    threadId: payload?.threadId,
-  });
-}
-
-function scheduleTerminalInputTransportFlush(delayMs = 0) {
-  if (terminalInputTransportFlushTimer || typeof window === "undefined") {
-    return;
-  }
-  terminalInputTransportFlushTimer = window.setTimeout(() => {
-    terminalInputTransportFlushTimer = 0;
-    flushTerminalInputTransportQueue();
-  }, delayMs);
-}
-
-function fallbackTerminalInputTransportQueue() {
-  if (terminalInputTransportFallbackPromise) {
-    return terminalInputTransportFallbackPromise;
-  }
-
-  const queuedEntries = terminalInputTransportQueue.splice(0);
-  terminalInputTransportFallbackPromise = queuedEntries
-    .reduce(
-      (promise, entry) => promise
-        .then(() => {
-          logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit", entry.payload, {
-            messageId: entry.messageId,
-            reason: "transport_unavailable",
-          });
-          return entry.messageId
-            ? invokeTerminalInputPayload(entry.payload)
-            : emit(TERMINAL_INPUT_EVENT, entry.payload);
-        })
-        .then((result) => {
-          entry.resolveAck?.(result);
-          return result;
-        })
-        .catch((error) => {
-          entry.rejectAck?.(error);
-        }),
-      Promise.resolve(),
-    )
-    .finally(() => {
-      terminalInputTransportFallbackPromise = null;
-    });
-  return terminalInputTransportFallbackPromise;
-}
-
-function rejectTerminalInputTransportPendingAcks(error) {
-  Array.from(terminalInputTransportPendingAcks.values()).forEach((ack) => {
-    ack.reject(error);
-  });
-}
-
-function resetTerminalInputTransportSocket(socket) {
-  if (terminalInputTransportSocket === socket) {
-    terminalInputTransportSocket = null;
-  }
-}
-
-function handleTerminalInputTransportMessage(event) {
-  let message = null;
-  try {
-    message = JSON.parse(String(event?.data || ""));
-  } catch {
-    return;
-  }
-  if (message?.type !== "terminal-input-ack" || !message.messageId) {
-    return;
-  }
-
-  const ack = terminalInputTransportPendingAcks.get(message.messageId);
-  if (!ack) {
-    return;
-  }
-  logTerminalStatus("frontend.terminal_input_transport.ack", {
-    ...(ack.fields || {}),
-    error: message.ok ? "" : String(message.error || ""),
-    messageId: message.messageId,
-    ok: Boolean(message.ok),
-  });
-  if (message.ok) {
-    ack.resolve(message);
-  } else {
-    ack.reject(new Error(message.error || "Terminal input write failed."));
-  }
-}
-
-function createTerminalInputTransportEntry(payload, waitForAck = false) {
-  const entry = {
-    logFields: waitForAck ? getTerminalInputTransportLogFields(payload) : null,
-    messageId: "",
-    payload,
-    rejectAck: null,
-    resolveAck: null,
-    waitPromise: null,
-  };
-
-  if (!waitForAck) {
-    return entry;
-  }
-
-  const messageId = `terminal-input-${Date.now().toString(36)}-${terminalInputTransportNextMessageId.toString(36)}`;
-  terminalInputTransportNextMessageId += 1;
-  entry.messageId = messageId;
-  entry.waitPromise = new Promise((resolve, reject) => {
-    const finish = (callback, value) => {
-      const ack = terminalInputTransportPendingAcks.get(messageId);
-      if (ack?.timer) {
-        window.clearTimeout(ack.timer);
-      }
-      terminalInputTransportPendingAcks.delete(messageId);
-      callback(value);
-    };
-    entry.resolveAck = (value) => finish(resolve, value);
-    entry.rejectAck = (error) => finish(reject, error);
-    const timer = typeof window !== "undefined"
-      ? window.setTimeout(() => {
-        entry.rejectAck?.(new Error("Terminal input write acknowledgement timed out."));
-      }, 8000)
-      : 0;
-    terminalInputTransportPendingAcks.set(messageId, {
-      fields: entry.logFields,
-      reject: entry.rejectAck,
-      resolve: entry.resolveAck,
-      timer,
-    });
-  });
-  return entry;
-}
-
-function sendTerminalInputTransportEntry(socket, entry) {
-  socket.send(JSON.stringify({
-    token: terminalInputTransportEndpoint.token,
-    ...(entry.messageId ? { messageId: entry.messageId } : {}),
-    payload: entry.payload,
-  }));
-}
-
-function ensureTerminalInputTransport() {
-  if (!isTerminalInputTransportAvailable()) {
-    return Promise.reject(new Error("Terminal input WebSocket transport is unavailable."));
-  }
-  if (isTerminalInputTransportOpen()) {
-    return Promise.resolve(terminalInputTransportSocket);
-  }
-  if (terminalInputTransportConnectPromise) {
-    return terminalInputTransportConnectPromise;
-  }
-
-  terminalInputTransportConnectPromise = Promise.resolve(terminalInputTransportEndpoint)
-    .then((endpoint) => endpoint || invoke("terminal_input_transport_endpoint"))
-    .then((endpoint) => {
-      terminalInputTransportEndpoint = endpoint;
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        const socket = new WebSocket(endpoint.url);
-        socket.onopen = () => {
-          settled = true;
-          terminalInputTransportSocket = socket;
-          terminalInputTransportConnectPromise = null;
-          socket.onmessage = handleTerminalInputTransportMessage;
-          flushTerminalInputTransportQueue();
-          resolve(socket);
-        };
-        socket.onclose = () => {
-          resetTerminalInputTransportSocket(socket);
-          rejectTerminalInputTransportPendingAcks(new Error("Terminal input WebSocket transport closed."));
-          if (!settled) {
-            terminalInputTransportConnectPromise = null;
-            reject(new Error("Terminal input WebSocket transport closed before opening."));
-          }
-        };
-        socket.onerror = () => {
-          if (!settled) {
-            terminalInputTransportConnectPromise = null;
-            reject(new Error("Terminal input WebSocket transport failed."));
-          }
-        };
-      });
-    })
-    .catch((error) => {
-      terminalInputTransportConnectPromise = null;
-      throw error;
-    });
-
-  return terminalInputTransportConnectPromise;
-}
-
-function flushTerminalInputTransportQueue() {
-  if (!terminalInputTransportQueue.length) {
-    return;
-  }
-
-  if (!isTerminalInputTransportOpen() || !terminalInputTransportEndpoint?.token) {
-    ensureTerminalInputTransport().catch(() => {
-      fallbackTerminalInputTransportQueue();
-    });
-    return;
-  }
-
-  const socket = terminalInputTransportSocket;
-  while (
-    terminalInputTransportQueue.length
-    && socket.bufferedAmount < TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES
-  ) {
-    const entry = terminalInputTransportQueue.shift();
-    try {
-      sendTerminalInputTransportEntry(socket, entry);
-      logTerminalInputTransportSubmit("frontend.terminal_input_transport.sent", entry.payload, {
-        messageId: entry.messageId,
-        socketBufferedAmount: socket.bufferedAmount,
-        waitForAck: Boolean(entry.messageId),
-      });
-    } catch {
-      terminalInputTransportQueue.unshift(entry);
-      resetTerminalInputTransportSocket(socket);
-      ensureTerminalInputTransport().catch(() => {
-        fallbackTerminalInputTransportQueue();
-      });
-      return;
-    }
-  }
-
-  if (terminalInputTransportQueue.length) {
-    scheduleTerminalInputTransportFlush(TERMINAL_INPUT_TRANSPORT_RETRY_MS);
-  }
-}
-
-function warmTerminalInputTransport() {
-  ensureTerminalInputTransport().catch(() => {});
-}
-
-function sendTerminalInputPayload(payload, options = {}) {
-  const cleanPayload = cleanTerminalInputTransportPayload(payload);
-  const waitForAck = Boolean(options?.waitForAck);
-  if (!isTerminalInputTransportAvailable()) {
-    logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit_unavailable", cleanPayload, {
-      waitForAck,
-    });
-    return waitForAck
-      ? invokeTerminalInputPayload(cleanPayload)
-      : emit(TERMINAL_INPUT_EVENT, cleanPayload);
-  }
-
-  const entry = createTerminalInputTransportEntry(cleanPayload, waitForAck);
-
-  if (isTerminalInputTransportOpen() && terminalInputTransportEndpoint?.token) {
-    const socket = terminalInputTransportSocket;
-    if (socket.bufferedAmount < TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES) {
-      try {
-        sendTerminalInputTransportEntry(socket, entry);
-        logTerminalInputTransportSubmit("frontend.terminal_input_transport.sent", cleanPayload, {
-          messageId: entry.messageId,
-          socketBufferedAmount: socket.bufferedAmount,
-          waitForAck,
-        });
-        return entry.waitPromise || Promise.resolve({ queued: true, transport: "websocket" });
-      } catch {
-        resetTerminalInputTransportSocket(socket);
-      }
-    }
-  }
-
-  if (terminalInputTransportQueue.length >= TERMINAL_INPUT_TRANSPORT_QUEUE_LIMIT) {
-    logTerminalInputTransportSubmit("frontend.terminal_input_transport.fallback_emit_queue_full", cleanPayload, {
-      queueLength: terminalInputTransportQueue.length,
-      waitForAck,
-    });
-    return waitForAck
-      ? invokeTerminalInputPayload(cleanPayload)
-      : emit(TERMINAL_INPUT_EVENT, cleanPayload);
-  }
-
-  terminalInputTransportQueue.push(entry);
-  logTerminalInputTransportSubmit("frontend.terminal_input_transport.queued", cleanPayload, {
-    messageId: entry.messageId,
-    queueLength: terminalInputTransportQueue.length,
-    waitForAck,
-  });
-  ensureTerminalInputTransport().catch(() => {
-    fallbackTerminalInputTransportQueue();
-  });
-  scheduleTerminalInputTransportFlush();
-  return entry.waitPromise || Promise.resolve({ queued: true, transport: "websocket" });
-}
+const TERMINAL_UI_TRANSCRIPT_RECENT_MESSAGES = 80;
+const TERMINAL_UI_TRANSCRIPT_HISTORY_MESSAGES = 420;
 
 function getTerminalClipboardImageFiles(clipboardData) {
   const itemFiles = Array.from(clipboardData?.items || [])
@@ -1611,6 +1256,7 @@ function WorkspaceTerminal({
   onSelectWorkspaceThread,
   onToggleWorkspaceThreadPinned,
   onThreadTerminalLifecycle,
+  onWorkspaceThreadTranscriptViewState,
   onToggleFullscreenTerminal,
   prewarmShell = false,
   projectRoot = "",
@@ -1649,6 +1295,13 @@ function WorkspaceTerminal({
   const terminalRunningSinceRef = useRef(0);
   const terminalActiveRef = useRef(Boolean(isActive));
   const attachDeferredWebglRef = useRef(null);
+  const requestTerminalOutputRenderRef = useRef(null);
+  const requestTerminalHeadlessSnapshotRef = useRef(null);
+  const terminalHeadlessOutputStaleRef = useRef(false);
+  const terminalOutputWorkerSessionRef = useRef(null);
+  const terminalDeferredFocusTimerRef = useRef(0);
+  const terminalDeferredPromotionTimerRef = useRef(0);
+  const terminalPendingActivationFocusRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -1687,9 +1340,9 @@ function WorkspaceTerminal({
   const [parkedPrompt, setParkedPrompt] = useState(null);
   const [terminalFocused, setTerminalFocused] = useState(Boolean(isActive));
   const [terminalUiViewActive, setTerminalUiViewActive] = useState(false);
-  const [terminalUiViewMounted, setTerminalUiViewMounted] = useState(false);
   const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
   const terminalUiViewActiveRef = useRef(false);
+  const terminalUiViewTranscriptRegistrationRef = useRef(null);
   useEffect(() => {
     terminalUiViewActiveRef.current = terminalUiViewActive;
   }, [terminalUiViewActive]);
@@ -1764,6 +1417,76 @@ function WorkspaceTerminal({
     || (String(thread?.currentAgent || "").toLowerCase() === terminalAgentKind ? thread?.transcriptSessionId : "")
     || "";
   const threadProviderModel = threadProviderBinding?.modelId || "";
+  useEffect(() => {
+    if (typeof onWorkspaceThreadTranscriptViewState !== "function") {
+      return undefined;
+    }
+
+    const workspaceId = workspace?.id || "";
+    const threadId = terminalThreadId || "";
+    const agentId = terminalAgentKind || "";
+    const registrationKey = workspaceId && threadId && agentId
+      ? `${workspaceId}:${threadId}:${agentId}`
+      : "";
+    const previousRegistration = terminalUiViewTranscriptRegistrationRef.current;
+
+    if (
+      previousRegistration
+      && (
+        !terminalUiViewActive
+        || previousRegistration.key !== registrationKey
+      )
+    ) {
+      onWorkspaceThreadTranscriptViewState({
+        ...previousRegistration.payload,
+        active: false,
+        visible: false,
+      });
+      terminalUiViewTranscriptRegistrationRef.current = null;
+    }
+
+    if (!terminalUiViewActive || !registrationKey) {
+      return undefined;
+    }
+
+    const payload = {
+      active: true,
+      agentId,
+      nativeSessionId: threadProviderSessionId,
+      paneId,
+      providerSessionId: threadProviderSessionId,
+      terminalIndex,
+      threadId,
+      visible: true,
+      workspaceId,
+    };
+    terminalUiViewTranscriptRegistrationRef.current = {
+      key: registrationKey,
+      payload,
+    };
+    onWorkspaceThreadTranscriptViewState(payload);
+
+    return () => {
+      const currentRegistration = terminalUiViewTranscriptRegistrationRef.current;
+      if (currentRegistration?.key === registrationKey) {
+        onWorkspaceThreadTranscriptViewState({
+          ...currentRegistration.payload,
+          active: false,
+          visible: false,
+        });
+        terminalUiViewTranscriptRegistrationRef.current = null;
+      }
+    };
+  }, [
+    onWorkspaceThreadTranscriptViewState,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    terminalThreadId,
+    terminalUiViewActive,
+    threadProviderSessionId,
+    workspace?.id,
+  ]);
   const terminalThreadTurnStateRef = useRef({
     latestTurn: null,
     latestTurnState: "",
@@ -2333,6 +2056,17 @@ function WorkspaceTerminal({
       terminal.blur?.();
     }
   }, []);
+  const noteTerminalRenderInteraction = useCallback((reason = "terminal_interaction", durationMs = 0) => {
+    const instanceId = terminalInstanceIdRef.current || 0;
+    if (!instanceId) {
+      return;
+    }
+
+    terminalGlobalRenderScheduler.noteInteractiveInput?.(`${paneId}:${instanceId}`, {
+      durationMs,
+      reason,
+    });
+  }, [paneId]);
   const focusTerminalKeyboardInput = useCallback((force = false) => {
     if (!force && !terminalActiveRef.current) {
       return;
@@ -2368,6 +2102,59 @@ function WorkspaceTerminal({
       terminal.focus();
     } catch (_) {
       // Terminal may have been disposed between activation and the focus request.
+    }
+  }, []);
+  const scheduleTerminalKeyboardFocus = useCallback((reason = "terminal_focus", delayMs = 80) => {
+    if (typeof window === "undefined") {
+      focusTerminalKeyboardInput(true);
+      return;
+    }
+
+    if (terminalDeferredFocusTimerRef.current) {
+      window.clearTimeout(terminalDeferredFocusTimerRef.current);
+      terminalDeferredFocusTimerRef.current = 0;
+    }
+
+    terminalDeferredFocusTimerRef.current = window.setTimeout(() => {
+      terminalDeferredFocusTimerRef.current = 0;
+      if (!terminalActiveRef.current || parkedPromptRef.current) {
+        return;
+      }
+      markTerminalUiInputHot(600);
+      noteTerminalRenderInteraction(reason, 900);
+      focusTerminalKeyboardInput(true);
+    }, Math.max(0, Number(delayMs || 0)));
+  }, [focusTerminalKeyboardInput, noteTerminalRenderInteraction]);
+  const scheduleTerminalPromotion = useCallback((reason = "terminal_promoted", delayMs = 180) => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    if (terminalDeferredPromotionTimerRef.current) {
+      window.clearTimeout(terminalDeferredPromotionTimerRef.current);
+      terminalDeferredPromotionTimerRef.current = 0;
+    }
+
+    terminalDeferredPromotionTimerRef.current = window.setTimeout(() => {
+      terminalDeferredPromotionTimerRef.current = 0;
+      if (!terminalActiveRef.current) {
+        return;
+      }
+      attachDeferredWebglRef.current?.(reason);
+      requestTerminalOutputRenderRef.current?.(reason);
+      resizeControllerRef.current?.schedule?.(`${reason}_resize`, 80, {
+        nativeDelayMs: 120,
+      });
+    }, Math.max(0, Number(delayMs || 0)));
+  }, []);
+  useEffect(() => () => {
+    if (terminalDeferredFocusTimerRef.current) {
+      window.clearTimeout(terminalDeferredFocusTimerRef.current);
+      terminalDeferredFocusTimerRef.current = 0;
+    }
+    if (terminalDeferredPromotionTimerRef.current) {
+      window.clearTimeout(terminalDeferredPromotionTimerRef.current);
+      terminalDeferredPromotionTimerRef.current = 0;
     }
   }, []);
   const recordSubmittedAgentMessage = useCallback((instanceId, userMessage = "", options = {}) => {
@@ -2572,7 +2359,7 @@ function WorkspaceTerminal({
           terminalIndex: binding.terminalIndex ?? "",
           threadId: threadId || "",
         });
-        await invoke("terminal_write", {
+        await sendTerminalInputPayload({
           data,
           instanceId: binding.instanceId,
           paneId: binding.paneId,
@@ -2582,7 +2369,7 @@ function WorkspaceTerminal({
           promptEventSubmittedAt,
           promptEventText,
           threadId,
-        });
+        }, { waitForAck: true });
         logThreadBridgeDiagnostic("frontend.thread_composer_write.done", {
           inputDebug: getTerminalInputDebugFields(data),
           instanceId: binding.instanceId,
@@ -3410,7 +3197,7 @@ function WorkspaceTerminal({
           workspaceId,
         });
       }
-      await invoke("terminal_write", {
+      await sendTerminalInputPayload({
         data: terminalSubmitSequence,
         instanceId: binding.instanceId,
         paneId: binding.paneId,
@@ -3419,7 +3206,7 @@ function WorkspaceTerminal({
         promptEventSubmittedAt: startedAt,
         promptEventText: text,
         threadId: latestThread.id,
-      });
+      }, { waitForAck: true });
       await waiter.promise;
       terminalSubmitted = true;
       logThreadBridgeDiagnostic("frontend.thread_submit.await_session_acceptance", {
@@ -3814,13 +3601,13 @@ function WorkspaceTerminal({
       workspaceId: latestThread.workspaceId || workspace?.id || "",
     });
     try {
-      await invoke("terminal_write", {
+      await sendTerminalInputPayload({
         data: buildTerminalSubmittedInput(command, agentId),
         instanceId: binding.instanceId,
         paneId: binding.paneId,
         promptEventSource: "model-change",
         threadId: latestThread.id,
-      });
+      }, { waitForAck: true });
     } catch (error) {
       logBigViewSyncDiagnosticEvent("bigview.model_change.terminal_write_error", {
         agentId,
@@ -3895,7 +3682,15 @@ function WorkspaceTerminal({
   }, []);
   const activateTerminalPane = useCallback((source = "terminal_activation", options = {}) => {
     const focusKeyboard = options?.focusKeyboard !== false;
+    const focusDelayMs = Math.max(0, Number(options?.focusDelayMs ?? 80));
     const instanceId = terminalInstanceIdRef.current || 0;
+    markTerminalUiInputHot(900);
+    terminalPendingActivationFocusRef.current = focusKeyboard
+      ? {
+        delayMs: focusDelayMs,
+        reason: source,
+      }
+      : null;
     terminalActiveRef.current = true;
     setActiveTerminalKeyboardTarget(paneId, instanceId);
     setTerminalFocused(true);
@@ -3908,12 +3703,14 @@ function WorkspaceTerminal({
       workspaceId: workspace?.id || "",
     });
     if (focusKeyboard) {
-      focusTerminalKeyboardInput(true);
+      scheduleTerminalKeyboardFocus(source, focusDelayMs);
+      scheduleTerminalPromotion(source, Math.max(160, focusDelayMs + 80));
     }
   }, [
-    focusTerminalKeyboardInput,
     onActivateTerminal,
     paneId,
+    scheduleTerminalKeyboardFocus,
+    scheduleTerminalPromotion,
     terminalIndex,
     updateTerminalInteractiveState,
     workspace?.id,
@@ -3939,7 +3736,10 @@ function WorkspaceTerminal({
     event.preventDefault();
     event.stopPropagation();
 
-    activateTerminalPane(breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag");
+    activateTerminalPane(
+      breakoutSurfaceDrag ? "terminal_breakout_drag" : "terminal_drag",
+      { focusKeyboard: false },
+    );
 
     onBeginTerminalDrag?.({
       clientX: event.clientX,
@@ -3995,10 +3795,12 @@ function WorkspaceTerminal({
       return;
     }
 
-    activateTerminalPane("terminal_focus");
-  }, [activateTerminalPane, terminalSelectsOnPointerDown]);
+    noteTerminalRenderInteraction("terminal_focus", 1200);
+    activateTerminalPane("terminal_focus", { focusKeyboard: false });
+  }, [activateTerminalPane, noteTerminalRenderInteraction, terminalSelectsOnPointerDown]);
 
   const handleTerminalSurfacePointerDownCapture = useCallback((event) => {
+    markTerminalUiInputHot(1000);
     if (isTerminalControlEventTarget(event.target)) {
       return;
     }
@@ -4016,13 +3818,21 @@ function WorkspaceTerminal({
       return;
     }
 
-    activateTerminalPane("terminal_pointer");
+    noteTerminalRenderInteraction("terminal_pointer", 1400);
+    activateTerminalPane("terminal_pointer", { focusDelayMs: 90 });
   }, [
     activateTerminalPane,
     beginBreakoutSurfaceDragGesture,
+    noteTerminalRenderInteraction,
     terminalBreakoutActive,
     terminalSelectsOnPointerDown,
   ]);
+  const handleTerminalSurfaceWheelCapture = useCallback((event) => {
+    if (isTerminalControlEventTarget(event.target)) {
+      return;
+    }
+    noteTerminalRenderInteraction("terminal_wheel", 900);
+  }, [noteTerminalRenderInteraction]);
 
   useEffect(() => {
     if (terminalSelectsOnPointerDown) {
@@ -4055,14 +3865,44 @@ function WorkspaceTerminal({
 
     if (isActive) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
-      attachDeferredWebglRef.current?.("terminal_activated");
-      focusTerminalKeyboardInput(true);
+      terminalOutputWorkerSessionRef.current?.setActive?.(true);
+      if (terminalHeadlessOutputStaleRef.current) {
+        requestTerminalHeadlessSnapshotRef.current?.("terminal_activated");
+      }
+      const focusRequest = terminalPendingActivationFocusRef.current;
+      terminalPendingActivationFocusRef.current = null;
+      if (focusRequest) {
+        scheduleTerminalKeyboardFocus(
+          focusRequest.reason || "terminal_activated",
+          focusRequest.delayMs ?? 80,
+        );
+        scheduleTerminalPromotion(
+          focusRequest.reason || "terminal_activated",
+          Math.max(160, Number(focusRequest.delayMs ?? 80) + 80),
+        );
+      }
       return undefined;
     }
 
+    terminalPendingActivationFocusRef.current = null;
+    terminalOutputWorkerSessionRef.current?.setActive?.(false);
+    if (terminalDeferredFocusTimerRef.current) {
+      window.clearTimeout(terminalDeferredFocusTimerRef.current);
+      terminalDeferredFocusTimerRef.current = 0;
+    }
+    if (terminalDeferredPromotionTimerRef.current) {
+      window.clearTimeout(terminalDeferredPromotionTimerRef.current);
+      terminalDeferredPromotionTimerRef.current = 0;
+    }
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
     return undefined;
-  }, [focusTerminalKeyboardInput, isActive, paneId, updateTerminalInteractiveState]);
+  }, [
+    isActive,
+    paneId,
+    scheduleTerminalKeyboardFocus,
+    scheduleTerminalPromotion,
+    updateTerminalInteractiveState,
+  ]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -4588,6 +4428,14 @@ function WorkspaceTerminal({
     let pendingOutputBytes = 0;
     let outputBatchQueuedAt = 0;
     let outputWriteInFlight = false;
+    let workerOutputDirty = false;
+    let workerOutputDrainInFlight = false;
+    let workerOutputPendingBytes = 0;
+    let terminalOutputWorkerGeneration = 0;
+    let headlessOutputSnapshotInFlight = false;
+    let headlessOutputStaleGeneration = 0;
+    let inactiveOutputSkippedBytes = 0;
+    let inactiveOutputSkippedChunks = 0;
     let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
@@ -4823,9 +4671,13 @@ function WorkspaceTerminal({
       terminalOutputNormalizer.enabled
       && isTerminalStabilityRuntimeActive()
     );
-    syncTerminalDiagnosticLogging();
-    syncWindowsTerminalDiagnosticLogging();
-    startTerminalDiagnosticHeartbeat();
+    if (terminalDiagnosticsEnabled) {
+      syncTerminalDiagnosticLogging();
+      startTerminalDiagnosticHeartbeat();
+    }
+    if (windowsTerminalDiagnosticsEnabled) {
+      syncWindowsTerminalDiagnosticLogging();
+    }
     warmTerminalPromptSubmittedListener();
     let terminalRendererOpened = false;
     let windowsPtyOptions = TERMINAL_IS_WINDOWS_HOST ? buildWindowsPtyOptions() : null;
@@ -5400,6 +5252,10 @@ function WorkspaceTerminal({
 
     let windowsTerminalLastResizeLogAt = 0;
     disposables.push(terminal.onResize((event) => {
+      if (!terminalActiveRef.current) {
+        return;
+      }
+
       markTransientHeaderArtifactRedrawActivity("xterm_resize", {
         cols: Number(event?.cols || 0),
         rows: Number(event?.rows || 0),
@@ -5565,7 +5421,9 @@ function WorkspaceTerminal({
         return;
       }
 
-      activateTerminalPane(detail.reason || "terminal_focus_request");
+      activateTerminalPane(detail.reason || "terminal_focus_request", {
+        focusDelayMs: Math.max(0, Number(detail.focusDelayMs ?? 80)),
+      });
     };
     window.addEventListener(TERMINAL_FOCUS_REQUEST_EVENT, handleTerminalFocusRequest);
     disposables.push(() => {
@@ -5634,8 +5492,11 @@ function WorkspaceTerminal({
       if (!useWebglRenderer || isDisposed || webglAttachAttempted) {
         return;
       }
+      if (!terminalActiveRef.current) {
+        return;
+      }
 
-      const backgroundDelayMs = terminalActiveRef.current ? 0 : TERMINAL_WEBGL_BACKGROUND_DELAY_MS;
+      const backgroundDelayMs = 0;
       const staggerDelayMs = reason === "terminal_activated" ? 0 : terminalIndex * TERMINAL_WEBGL_STAGGER_MS;
       const delayMs = Math.min(
         TERMINAL_WEBGL_MAX_DELAY_MS,
@@ -5925,30 +5786,259 @@ function WorkspaceTerminal({
       terminalGlobalRenderScheduler.cancel(renderSchedulerId);
     };
 
-    const combineTerminalOutputWrites = (writes) => {
-      if (writes.length === 1) {
-        return writes[0].data;
-      }
+	    const combineTerminalOutputWrites = (writes) => {
+	      if (writes.length === 1) {
+	        return writes[0].data;
+	      }
 
       const combined = new Uint8Array(writes.reduce((total, write) => total + write.data.byteLength, 0));
       let offset = 0;
       writes.forEach((write) => {
         combined.set(write.data, offset);
         offset += write.data.byteLength;
+	      });
+	      return combined;
+	    };
+
+    const commitTerminalOutputWrites = (writes) => {
+      writes.forEach((write) => {
+        if (typeof write?.onCommitted !== "function") {
+          return;
+        }
+        try {
+          write.onCommitted();
+        } catch (_error) {
+          // Worker backpressure acknowledgements are best-effort.
+        }
       });
-      return combined;
     };
+
+    const markTerminalHeadlessOutputStale = (reason, bytes = 0, chunks = 1) => {
+      terminalHeadlessOutputStaleRef.current = true;
+      headlessOutputStaleGeneration += 1;
+      inactiveOutputSkippedBytes += Math.max(0, Number(bytes || 0));
+      inactiveOutputSkippedChunks += Math.max(1, Number(chunks || 1));
+      if (terminalDiagnosticsEnabled) {
+        logTerminalDiagnosticEvent("frontend.output_inactive_snapshot_stale", {
+          bytes: Math.max(0, Number(bytes || 0)),
+          chunks: Math.max(1, Number(chunks || 1)),
+          generation: headlessOutputStaleGeneration,
+          paneId,
+          reason,
+          skippedBytes: inactiveOutputSkippedBytes,
+          skippedChunks: inactiveOutputSkippedChunks,
+          terminalIndex,
+        });
+      }
+    };
+
+    const shouldUseInactiveHeadlessSnapshot = (nextBytes = 0) => {
+      if (
+        terminalActiveRef.current
+        || !sawFirstVisibleOutput
+        || !hasOpenPty
+        || isDisposed
+      ) {
+        return false;
+      }
+      const backlogBytes = Math.max(
+        0,
+        Number(nextBytes || 0) + pendingOutputBytes + workerOutputPendingBytes,
+      );
+      if (terminalGlobalRenderScheduler.isGlobalInputHot?.()) {
+        return backlogBytes >= TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_INPUT_HOT_BYTES;
+      }
+      return backlogBytes >= TERMINAL_INACTIVE_OUTPUT_SNAPSHOT_TRIGGER_BYTES;
+    };
+
+    const decodeTerminalHeadlessOutputBase64 = (value) => {
+      const binary = atob(String(value || ""));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    };
+
+    const discardPendingTerminalOutputWritesForSnapshot = () => {
+      if (pendingOutputWrites.length) {
+        commitTerminalOutputWrites(pendingOutputWrites.splice(0));
+      }
+      pendingOutputBytes = 0;
+      outputBatchQueuedAt = 0;
+      workerOutputDirty = false;
+      workerOutputDrainInFlight = false;
+      workerOutputPendingBytes = 0;
+      cancelTerminalOutputBatchTimers();
+    };
+
+    const requestTerminalHeadlessSnapshotReplay = async (reason = "terminal_activated") => {
+      if (
+        isDisposed
+        || !terminalActiveRef.current
+        || !hasOpenPty
+        || !terminalHeadlessOutputStaleRef.current
+      ) {
+        return false;
+      }
+      if (headlessOutputSnapshotInFlight) {
+        return false;
+      }
+      if (outputWriteInFlight) {
+        const timer = window.setTimeout(() => {
+          startupMetricTimers.delete(timer);
+          requestTerminalHeadlessSnapshotReplay(reason);
+        }, 16);
+        startupMetricTimers.add(timer);
+        return false;
+      }
+      const staleGenerationAtRequest = headlessOutputStaleGeneration;
+      headlessOutputSnapshotInFlight = true;
+      try {
+        const result = await invoke("terminal_headless_output_snapshot", {
+          instanceId: terminalInstanceId,
+          paneId,
+        });
+        if (
+          isDisposed
+          || !terminalActiveRef.current
+          || Number(terminalInstanceIdRef.current || 0) !== Number(terminalInstanceId)
+        ) {
+          return false;
+        }
+        const snapshotRawBytes = decodeTerminalHeadlessOutputBase64(result?.bytesBase64 || "");
+        const snapshotBytes = outputDisplayMasker.maskBytes(snapshotRawBytes);
+        const nextWorkerGeneration = terminalOutputWorkerSessionRef.current?.resetAfterSnapshotReplay?.();
+        if (Number.isFinite(Number(nextWorkerGeneration))) {
+          terminalOutputWorkerGeneration = Number(nextWorkerGeneration);
+        }
+        discardPendingTerminalOutputWritesForSnapshot();
+        if (!snapshotBytes.byteLength) {
+          if (headlessOutputStaleGeneration <= staleGenerationAtRequest) {
+            terminalHeadlessOutputStaleRef.current = false;
+          }
+          return true;
+        }
+        outputWriteInFlight = true;
+        try {
+          terminal.reset?.();
+        } catch (_error) {
+          // Snapshot replay can still continue when reset is unavailable.
+        }
+        try {
+          terminal.write(snapshotBytes, () => {
+            outputWriteInFlight = false;
+            headlessOutputSnapshotInFlight = false;
+            inactiveOutputSkippedBytes = 0;
+            inactiveOutputSkippedChunks = 0;
+            if (headlessOutputStaleGeneration <= staleGenerationAtRequest) {
+              terminalHeadlessOutputStaleRef.current = false;
+            }
+            refreshTerminalRenderer("headless_snapshot_replay", {
+              bytes: snapshotBytes.byteLength,
+              reason,
+              totalBytes: Number(result?.totalBytes || 0),
+            });
+            scheduleVisibleOutputRefresh("headless_snapshot_replay", {
+              bytes: snapshotBytes.byteLength,
+              reason,
+              transport: "headless_snapshot",
+              visibleChars: 1,
+            }, 48);
+            if (workerOutputDirty || pendingOutputWrites.length) {
+              scheduleTerminalOutputBatchFlush();
+            }
+          });
+        } catch (error) {
+          outputWriteInFlight = false;
+          headlessOutputSnapshotInFlight = false;
+          logTerminalDiagnosticEvent("frontend.output_headless_snapshot.write_error", {
+            bytes: snapshotBytes.byteLength,
+            message: error?.message || String(error || "Unable to write terminal snapshot."),
+            paneId,
+            reason,
+            terminalIndex,
+          });
+          return false;
+        }
+        return true;
+      } catch (error) {
+        logTerminalDiagnosticEvent("frontend.output_headless_snapshot.error", {
+          message: error?.message || String(error || "Unable to replay terminal snapshot."),
+          paneId,
+          reason,
+          terminalIndex,
+        });
+        return false;
+      } finally {
+        if (!outputWriteInFlight) {
+          headlessOutputSnapshotInFlight = false;
+        } else {
+          const timer = window.setTimeout(() => {
+            startupMetricTimers.delete(timer);
+            headlessOutputSnapshotInFlight = false;
+          }, 250);
+          startupMetricTimers.add(timer);
+        }
+      }
+    };
+
+    requestTerminalHeadlessSnapshotRef.current = requestTerminalHeadlessSnapshotReplay;
+    disposables.push(() => {
+      if (requestTerminalHeadlessSnapshotRef.current === requestTerminalHeadlessSnapshotReplay) {
+        requestTerminalHeadlessSnapshotRef.current = null;
+      }
+      if (terminalInstanceIdRef.current === terminalInstanceId) {
+        terminalHeadlessOutputStaleRef.current = false;
+      }
+    });
 
     const getTerminalOutputFlushByteBudget = () => {
       const active = terminalActiveRef.current;
-      const baseBudget = active
-        ? TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES
+      const uiHotActiveTerminal = Boolean(
+        active
+        && terminalGlobalRenderScheduler.isGlobalInputHot?.()
+        && !terminalGlobalRenderScheduler.isTerminalEntryInteractive?.(renderSchedulerId)
+      );
+      const snapshotBudget = !active && shouldUseInactiveHeadlessSnapshot(0);
+      const baseBudget = snapshotBudget
+        ? TERMINAL_OUTPUT_FLUSH_BACKGROUND_SNAPSHOT_MAX_BYTES
+        : active
+        ? uiHotActiveTerminal
+          ? TERMINAL_OUTPUT_FLUSH_UI_HOT_ACTIVE_MAX_BYTES
+          : TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES
         : TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES;
 
       return Math.max(
         TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
         Math.floor(baseBudget),
       );
+    };
+
+    const requestTerminalOutputWorkerDrain = (reason = "scheduler") => {
+      if (
+        isDisposed
+        || workerOutputDrainInFlight
+        || !workerOutputDirty
+      ) {
+        return false;
+      }
+      const workerSession = terminalOutputWorkerSessionRef.current;
+      if (typeof workerSession?.requestDrain !== "function") {
+        return false;
+      }
+	      const requested = workerSession.requestDrain({
+	        active: terminalActiveRef.current === true,
+	        maxBytes: getTerminalOutputFlushByteBudget(),
+	        reason,
+	        snapshot: shouldUseInactiveHeadlessSnapshot(workerOutputPendingBytes),
+	      });
+      if (!requested) {
+        return false;
+      }
+      workerOutputDirty = false;
+      workerOutputDrainInFlight = true;
+      return true;
     };
 
     const splitTerminalOutputWrite = (write, byteCount) => {
@@ -5963,9 +6053,9 @@ function WorkspaceTerminal({
       const remainingVisibleChars = Math.max(0, visibleChars - selectedVisibleChars);
 
       return {
-        remaining: {
-          ...write,
-          data: remainingData,
+	        remaining: {
+	          ...write,
+	          data: remainingData,
           isFirstOutputChunk: false,
           isFirstVisibleOutputChunk: false,
           outputDebug: {
@@ -5974,11 +6064,12 @@ function WorkspaceTerminal({
           },
           scrollToBottomBeforeWrite: false,
         },
-        selected: {
-          ...write,
-          afterWriteRefreshReason: "",
-          data: selectedData,
-          outputDebug: {
+	        selected: {
+	          ...write,
+	          afterWriteRefreshReason: "",
+	          data: selectedData,
+          onCommitted: remainingData.byteLength ? null : write.onCommitted,
+	          outputDebug: {
             ...(write.outputDebug || {}),
             visibleChars: selectedVisibleChars,
           },
@@ -6035,9 +6126,22 @@ function WorkspaceTerminal({
     };
 
     const flushTerminalOutputBatch = (reason) => {
-      if (isDisposed || !pendingOutputWrites.length) {
+      if (isDisposed) {
         cancelTerminalOutputBatchTimers();
         pendingOutputWrites.length = 0;
+        pendingOutputBytes = 0;
+        outputBatchQueuedAt = 0;
+        workerOutputDirty = false;
+        workerOutputDrainInFlight = false;
+        workerOutputPendingBytes = 0;
+        return;
+      }
+
+      if (!pendingOutputWrites.length) {
+        if (requestTerminalOutputWorkerDrain(reason)) {
+          return;
+        }
+        cancelTerminalOutputBatchTimers();
         pendingOutputBytes = 0;
         outputBatchQueuedAt = 0;
         return;
@@ -6082,25 +6186,46 @@ function WorkspaceTerminal({
       const outputDebug = shouldCollectOutputDebug
         ? getTerminalOutputDebugFields(batchData)
         : { visibleChars: batchVisibleChars };
-      const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
-      if (shouldDropClaudeResizeBlankFrame(batchData, {
-        outputDebug,
-        reason,
-        writes: writes.length,
-      })) {
-        if (pendingOutputWrites.length) {
+	      const debugMs = shouldCollectOutputDebug ? performance.now() - debugStartedAt : 0;
+      if (
+        batchVisibleChars > 0
+        && !isFirstOutputChunk
+        && !isFirstVisibleOutputChunk
+        && shouldUseInactiveHeadlessSnapshot(batchBytes)
+      ) {
+        markTerminalHeadlessOutputStale(
+          "inactive_pending_batch_skipped",
+          batchBytes,
+          writes.length,
+        );
+        commitTerminalOutputWrites(writes);
+        if (pendingOutputWrites.length || (workerOutputDirty && !workerOutputDrainInFlight)) {
           scheduleTerminalOutputBatchFlush();
         }
         return;
       }
-      if (shouldDropClaudeResizeDuplicateRepaint(batchData, {
-        outputDebug,
-        reason,
-        writes: writes.length,
-      })) {
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
+	      if (shouldDropClaudeResizeBlankFrame(batchData, {
+	        outputDebug,
+	        reason,
+	        writes: writes.length,
+	      })) {
+        commitTerminalOutputWrites(writes);
+	        if (pendingOutputWrites.length) {
+	          scheduleTerminalOutputBatchFlush();
+	        } else if (workerOutputDirty && !workerOutputDrainInFlight) {
+	          scheduleTerminalOutputBatchFlush();
+	        }
+        return;
+      }
+	      if (shouldDropClaudeResizeDuplicateRepaint(batchData, {
+	        outputDebug,
+	        reason,
+	        writes: writes.length,
+	      })) {
+        commitTerminalOutputWrites(writes);
+	        if (pendingOutputWrites.length) {
+	          scheduleTerminalOutputBatchFlush();
+	        }
         return;
       }
       if (terminalDiagnosticsEnabled) {
@@ -6116,9 +6241,10 @@ function WorkspaceTerminal({
       }
       const writeStartedAt = performance.now();
       outputWriteInFlight = true;
-      const handleTerminalWriteComplete = () => {
-        outputWriteInFlight = false;
-        markTransientHeaderArtifactOutputActivity(batchBytes, {
+	      const handleTerminalWriteComplete = () => {
+	        outputWriteInFlight = false;
+        commitTerminalOutputWrites(writes);
+	        markTransientHeaderArtifactOutputActivity(batchBytes, {
           reason,
           writes: writes.length,
         });
@@ -6308,9 +6434,10 @@ function WorkspaceTerminal({
 
       try {
         terminal.write(batchData, handleTerminalWriteComplete);
-      } catch (error) {
-        outputWriteInFlight = false;
-        logTerminalDiagnosticEvent("frontend.output_write.error", {
+	      } catch (error) {
+	        outputWriteInFlight = false;
+        commitTerminalOutputWrites(writes);
+	        logTerminalDiagnosticEvent("frontend.output_write.error", {
           batchBytes,
           message: error?.message || String(error || "terminal write failed"),
           paneId,
@@ -6319,27 +6446,42 @@ function WorkspaceTerminal({
           terminalIndex,
           writes: writes.length,
         });
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
-      }
+	        if (pendingOutputWrites.length) {
+	          scheduleTerminalOutputBatchFlush();
+	        } else if (workerOutputDirty && !workerOutputDrainInFlight) {
+	          scheduleTerminalOutputBatchFlush();
+	        }
+	      }
     };
 
     const scheduleTerminalOutputBatchFlush = () => {
       terminalGlobalRenderScheduler.request(renderSchedulerId);
     };
+    const requestTerminalOutputRender = () => {
+      terminalGlobalRenderScheduler.request(renderSchedulerId);
+    };
+    requestTerminalOutputRenderRef.current = requestTerminalOutputRender;
+    disposables.push(() => {
+      if (requestTerminalOutputRenderRef.current === requestTerminalOutputRender) {
+        requestTerminalOutputRenderRef.current = null;
+      }
+    });
 
     terminalGlobalRenderScheduler.register({
       flush: (reason) => flushTerminalOutputBatch(reason),
-      getPendingBytes: () => pendingOutputBytes,
+      getPendingBytes: () => pendingOutputBytes + workerOutputPendingBytes,
       getQueuedAt: () => outputBatchQueuedAt,
       hasPriorityPending: () => pendingOutputWrites.some((write) => (
         write?.isFirstOutputChunk === true
         || write?.isFirstVisibleOutputChunk === true
       )),
-      hasPending: () => !isDisposed && !outputWriteInFlight && pendingOutputWrites.length > 0,
+      hasPending: () => !isDisposed && !outputWriteInFlight && (
+        pendingOutputWrites.length > 0
+        || (workerOutputDirty && !workerOutputDrainInFlight)
+      ),
       id: renderSchedulerId,
       isActive: () => terminalActiveRef.current,
+      shouldDeferForGlobalInput: () => true,
     });
     disposables.push(() => terminalGlobalRenderScheduler.unregister(renderSchedulerId));
 
@@ -6363,11 +6505,12 @@ function WorkspaceTerminal({
         outputBatchQueuedAt = performance.now();
       }
       pendingOutputWrites.push({
-        afterWriteRefreshReason: options.afterWriteRefreshReason || "",
-        data: queuedData,
-	        isFirstOutputChunk,
-	        isFirstVisibleOutputChunk,
-	        outputDebug,
+	        afterWriteRefreshReason: options.afterWriteRefreshReason || "",
+	        data: queuedData,
+		        isFirstOutputChunk,
+		        isFirstVisibleOutputChunk,
+		        onCommitted: typeof options.onCommitted === "function" ? options.onCommitted : null,
+		        outputDebug,
 	        scrollToBottomBeforeWrite: options.scrollToBottomBeforeWrite === true,
 	        scrollToBottomAfterWrite: options.scrollToBottomAfterWrite === true,
 	      });
@@ -8246,19 +8389,22 @@ function WorkspaceTerminal({
         queuedBytes,
         queuedChunks: queuedWrites.length,
       }, [180, 360]);
-      if (normalizedCoalescedData?.byteLength) {
-        const isFirstOutputChunk = queuedWrites.some((write) => write.isFirstOutputChunk);
-        const isFirstVisibleOutputChunk = queuedWrites.some((write) => write.isFirstVisibleOutputChunk);
-        const visibleChars = getTerminalOutputVisibleCharCount(normalizedCoalescedData);
-        enqueueTerminalOutputWrite(normalizedCoalescedData, {
-          afterWriteRefreshReason: "codex_resize_gate_flush",
-	          isFirstOutputChunk,
-	          isFirstVisibleOutputChunk,
-	          outputDebug: { visibleChars },
-	          scrollToBottomBeforeWrite: true,
-	          scrollToBottomAfterWrite: startedAtBottom,
-	        });
-      }
+	      if (normalizedCoalescedData?.byteLength) {
+	        const isFirstOutputChunk = queuedWrites.some((write) => write.isFirstOutputChunk);
+	        const isFirstVisibleOutputChunk = queuedWrites.some((write) => write.isFirstVisibleOutputChunk);
+	        const visibleChars = getTerminalOutputVisibleCharCount(normalizedCoalescedData);
+	        enqueueTerminalOutputWrite(normalizedCoalescedData, {
+	          afterWriteRefreshReason: "codex_resize_gate_flush",
+		          isFirstOutputChunk,
+		          isFirstVisibleOutputChunk,
+		          onCommitted: () => commitTerminalOutputWrites(queuedWrites),
+		          outputDebug: { visibleChars },
+		          scrollToBottomBeforeWrite: true,
+		          scrollToBottomAfterWrite: startedAtBottom,
+		        });
+      } else {
+        commitTerminalOutputWrites(queuedWrites);
+	      }
 
       logWindowsTerminalCompactDiagnostic("frontend.windows_terminal.codex_resize_gate", {
         action: "flush",
@@ -8685,12 +8831,13 @@ function WorkspaceTerminal({
         }
 
         if (codexResizeGate.active) {
-          codexResizeGate.queuedWrites.push({
-            data: queuedData,
-            isFirstOutputChunk: options.isFirstOutputChunk === true,
-            isFirstVisibleOutputChunk: options.isFirstVisibleOutputChunk === true,
-            rawCodexResizeGateData: options.rawCodexResizeGateData === true,
-          });
+	          codexResizeGate.queuedWrites.push({
+	            data: queuedData,
+	            isFirstOutputChunk: options.isFirstOutputChunk === true,
+	            isFirstVisibleOutputChunk: options.isFirstVisibleOutputChunk === true,
+	            onCommitted: typeof options.onCommitted === "function" ? options.onCommitted : null,
+	            rawCodexResizeGateData: options.rawCodexResizeGateData === true,
+	          });
           codexResizeGate.queuedBytes += queuedData.byteLength;
           scheduleCodexResizeGateFlush("output");
           return;
@@ -8742,6 +8889,7 @@ function WorkspaceTerminal({
 
     resizeController = createTerminalResizeController({
       canResize: () => hasOpenPty && !isDisposed,
+      canNativeResize: () => hasOpenPty && !isDisposed && terminalActiveRef.current,
       container,
       defaultCols: TERMINAL_DEFAULT_COLS,
       defaultRows: TERMINAL_DEFAULT_ROWS,
@@ -8763,6 +8911,9 @@ function WorkspaceTerminal({
           resizeBatches: 1,
           resizePanes: 1,
         });
+        if (!terminalActiveRef.current) {
+          return;
+        }
         markTransientHeaderArtifactRedrawActivity("resize_done", {
           elapsedMs: Number(event.elapsedMs || 0),
           source: "resize_controller_done",
@@ -8782,6 +8933,9 @@ function WorkspaceTerminal({
       },
       onError: () => {},
       onStart: (event) => {
+        if (!terminalActiveRef.current) {
+          return;
+        }
         markTransientHeaderArtifactRedrawActivity("resize_start", {
           source: "resize_controller_start",
         });
@@ -8809,10 +8963,19 @@ function WorkspaceTerminal({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
         });
         const outputTextDecoder = new TextDecoder("utf-8", { fatal: false });
-        const processPreparedTerminalOutput = (payload = {}) => {
-          if (isDisposed) {
-            return;
-          }
+		        const processPreparedTerminalOutput = (payload = {}) => {
+		          const acknowledgeWorkerFrame = typeof payload.acknowledge === "function"
+		            ? payload.acknowledge
+		            : null;
+		          if (acknowledgeWorkerFrame) {
+		            workerOutputDrainInFlight = false;
+		            workerOutputPendingBytes = Math.max(0, Number(payload.workerQueueBytes || 0));
+		            workerOutputDirty = workerOutputPendingBytes > 0;
+		          }
+		          if (isDisposed) {
+		            acknowledgeWorkerFrame?.();
+		            return;
+		          }
 
           const chunkStartedAt = Number.isFinite(payload.chunkStartedAt)
             ? payload.chunkStartedAt
@@ -8821,10 +8984,25 @@ function WorkspaceTerminal({
             ? payload.data
             : payload.data instanceof ArrayBuffer
               ? new Uint8Array(payload.data)
-              : ArrayBuffer.isView(payload.data)
-                ? new Uint8Array(payload.data.buffer, payload.data.byteOffset, payload.data.byteLength)
-                : new Uint8Array(0);
-          if (!terminalData.byteLength) {
+	                : ArrayBuffer.isView(payload.data)
+	                  ? new Uint8Array(payload.data.buffer, payload.data.byteOffset, payload.data.byteLength)
+	                  : new Uint8Array(0);
+			          if (!terminalData.byteLength) {
+			            acknowledgeWorkerFrame?.();
+			            if (workerOutputDirty && !workerOutputDrainInFlight) {
+			              requestTerminalOutputRenderRef.current?.();
+			            }
+			            return;
+			          }
+          const payloadGeneration = Number(payload.generation || 0);
+          if (
+            payloadGeneration > 0
+            && payloadGeneration < terminalOutputWorkerGeneration
+          ) {
+            acknowledgeWorkerFrame?.();
+            if (workerOutputDirty && !workerOutputDrainInFlight) {
+              requestTerminalOutputRenderRef.current?.();
+            }
             return;
           }
 
@@ -8848,9 +9026,12 @@ function WorkspaceTerminal({
           const isFirstOutputChunk = !sawFirstOutput;
           outputChunks += sourceChunks;
           outputBytes += terminalData.byteLength;
+          const shouldCaptureProviderSessionFromOutput = !terminalUsesActivityHooks
+            && !capturedProviderSessionId
+            && Boolean(terminalThreadIdRef.current);
           const shouldInspectTerminalText = !isGenericTerminal && (
             isFirstOutputChunk
-            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
+            || (shouldCaptureProviderSessionFromOutput && outputChunks <= 80)
           );
           const visibleTerminalText = shouldInspectTerminalText
             ? String(payload.inspectionText || "")
@@ -8865,7 +9046,7 @@ function WorkspaceTerminal({
                 "codex-resume-output",
               );
             }
-            if (!capturedProviderSessionId && terminalThreadIdRef.current) {
+            if (shouldCaptureProviderSessionFromOutput) {
               providerSessionCaptureBuffer = `${providerSessionCaptureBuffer}${visibleTerminalText}`.slice(-2400);
               const nativeSessionId = extractNativeSessionIdFromOutput(
                 terminalAgentKind,
@@ -8981,8 +9162,8 @@ function WorkspaceTerminal({
             visibleChars,
           });
 
-          logTerminalDiagnosticEvent(
-            "frontend.output_chunk.slow",
+	          logTerminalDiagnosticEvent(
+	            "frontend.output_chunk.slow",
             {
               debugMs,
               displayBytes: terminalData.byteLength,
@@ -8998,15 +9179,34 @@ function WorkspaceTerminal({
               visibleChars: outputDebug.visibleChars,
               workerScheduledDelayMs: debugExtraMs,
             },
-            { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
-          );
+	            { minElapsedMs: TERMINAL_OUTPUT_CHUNK_DIAGNOSTIC_SLOW_MS },
+	          );
 
-          writeTerminalOutput(terminalData, {
-            isFirstOutputChunk,
-            isFirstVisibleOutputChunk,
-            outputDebug,
-            rawCodexResizeGateData: payload.rawCodexResizeGateData === true,
-          });
+          if (
+            hasVisibleOutput
+            && !isFirstOutputChunk
+            && !isFirstVisibleOutputChunk
+            && shouldUseInactiveHeadlessSnapshot(terminalData.byteLength)
+          ) {
+            markTerminalHeadlessOutputStale(
+              "inactive_worker_frame_skipped",
+              terminalData.byteLength,
+              sourceChunks,
+            );
+            acknowledgeWorkerFrame?.();
+            if (workerOutputDirty && !workerOutputDrainInFlight) {
+              requestTerminalOutputRenderRef.current?.();
+            }
+            return;
+          }
+
+		          writeTerminalOutput(terminalData, {
+	            isFirstOutputChunk,
+	            isFirstVisibleOutputChunk,
+	            onCommitted: acknowledgeWorkerFrame,
+	            outputDebug,
+	            rawCodexResizeGateData: payload.rawCodexResizeGateData === true,
+	          });
         };
 
         const processTerminalOutputInline = (data, chunkStartedAt = performance.now()) => {
@@ -9111,11 +9311,14 @@ function WorkspaceTerminal({
             return;
           }
 
-          const isFirstOutputChunk = !sawFirstOutput;
-          const shouldInspectTerminalText = !isGenericTerminal && (
-            isFirstOutputChunk
-            || (!capturedProviderSessionId && terminalThreadIdRef.current && outputChunks <= 80)
-          );
+	          const isFirstOutputChunk = !sawFirstOutput;
+	          const shouldCaptureProviderSessionFromOutput = !terminalUsesActivityHooks
+	            && !capturedProviderSessionId
+	            && Boolean(terminalThreadIdRef.current);
+	          const shouldInspectTerminalText = !isGenericTerminal && (
+	            isFirstOutputChunk
+	            || (shouldCaptureProviderSessionFromOutput && outputChunks <= 80)
+	          );
           const inspectionText = shouldInspectTerminalText
             ? stripLiveViewControlSequences(outputTextDecoder.decode(terminalData, { stream: true }))
             : "";
@@ -9131,13 +9334,66 @@ function WorkspaceTerminal({
           });
         };
 
+        let outputTransportSessionId = "";
         const terminalOutputWorkerSession = createTerminalOutputWorkerSession({
           coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
           id: `${paneId}:${terminalInstanceId}:output`,
+          onDrain: (payload = {}) => {
+            if (isDisposed) {
+              return;
+            }
+            if (
+              !terminalActiveRef.current
+              && (
+                payload.reason === "snapshot"
+                || Number(payload.snapshotBytes || 0) > 0
+              )
+            ) {
+              markTerminalHeadlessOutputStale(
+                "inactive_worker_snapshot_drained",
+                Number(payload.snapshotBytes || 0),
+                Number(payload.snapshotChunks || 1),
+              );
+            }
+            workerOutputDrainInFlight = false;
+            workerOutputPendingBytes = Math.max(0, Number(payload.workerQueueBytes || 0));
+            workerOutputDirty = workerOutputPendingBytes > 0;
+            if (workerOutputDirty) {
+              requestTerminalOutputRenderRef.current?.();
+            }
+          },
+          onDirty: (payload = {}) => {
+            if (isDisposed) {
+              return;
+            }
+            workerOutputDirty = true;
+            workerOutputPendingBytes = Math.max(
+              workerOutputPendingBytes,
+              Number(payload.workerQueueBytes || 0),
+            );
+            if (!outputBatchQueuedAt) {
+              outputBatchQueuedAt = performance.now();
+            }
+            requestTerminalOutputRenderRef.current?.();
+          },
           onOutput: processPreparedTerminalOutput,
         });
         if (terminalOutputWorkerSession) {
-          disposables.push(() => terminalOutputWorkerSession.dispose());
+          terminalOutputWorkerSessionRef.current = terminalOutputWorkerSession;
+          terminalOutputWorkerSession.setActive?.(terminalActiveRef.current);
+          outputTransportSessionId = terminalOutputWorkerSession.outputTransportSessionId || terminalOutputWorkerSession.id || "";
+          terminalOutputWorkerSession
+            .prepareTransport?.({
+              inspect: !isGenericTerminal,
+              timeoutMs: 0,
+            })
+            .catch(() => {});
+          disposables.push(() => {
+            if (terminalOutputWorkerSessionRef.current === terminalOutputWorkerSession) {
+              terminalOutputWorkerSessionRef.current = null;
+            }
+            terminalOutputWorkerSession.dispose();
+          });
         }
 
         const outputChannel = new Channel((message) => {
@@ -11349,6 +11605,9 @@ function WorkspaceTerminal({
           );
 
           startupControlReplyBridgeOpen = true;
+          if (isDisposed) {
+            throw new Error("Terminal launch was cancelled.");
+          }
           return invoke("terminal_open", {
             request: {
               paneId,
@@ -11372,6 +11631,7 @@ function WorkspaceTerminal({
               workspaceName: workspace?.name || "",
               cols: initialSize.cols,
               rows: initialSize.rows,
+              outputTransportSessionId,
             },
             outputChannel,
           });
@@ -11499,11 +11759,15 @@ function WorkspaceTerminal({
           threadId: startupThreadId,
           workspaceId: workspace?.id || "",
         });
-        resizeController?.resizeNow("terminal_open_done");
+        if (terminalActiveRef.current) {
+          resizeController?.resizeNow("terminal_open_done");
+        }
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);
 
-        focusTerminalKeyboardInput();
+        if (terminalActiveRef.current) {
+          scheduleTerminalKeyboardFocus("terminal_open_done", 80);
+        }
 
         const shouldWriteStartupModelRestore = false;
         if (
@@ -11561,13 +11825,13 @@ function WorkspaceTerminal({
               threadId: startupThreadId || "",
               workspaceId: workspace?.id || "",
             });
-            invoke("terminal_write", {
+            sendTerminalInputPayload({
               data: buildTerminalSubmittedInput(restoreModelCommand, terminalAgentKind, isGenericTerminal),
               instanceId: terminalInstanceId,
               paneId,
               promptEventSource: "startup-model-restore",
               threadId: startupThreadId || "",
-            }).then(() => {
+            }, { waitForAck: true }).then(() => {
               logBigViewSyncDiagnosticEvent("bigview.model_restore.terminal_write_done", {
                 agentId: terminalAgentKind,
                 instanceId: terminalInstanceId,
@@ -11998,12 +12262,12 @@ function WorkspaceTerminal({
             threadId: currentThreadId,
             workspaceId: workspace?.id || thread?.workspaceId || "",
           });
-          await invoke("terminal_write", {
+          await sendTerminalInputPayload({
             data: syncData,
             instanceId: currentInstanceId,
             paneId,
             threadId: currentThreadId,
-          });
+          }, { waitForAck: true });
           logTerminalStatus("frontend.pending_prompt.sync_write_done", {
             ...pendingPromptLogFields,
             instanceId: currentInstanceId,
@@ -12066,7 +12330,7 @@ function WorkspaceTerminal({
               threadId: currentThreadId,
               workspaceId: workspace?.id || thread?.workspaceId || "",
             });
-            await invoke("terminal_write", {
+            await sendTerminalInputPayload({
               data: submitSequence,
               instanceId: currentInstanceId,
               paneId,
@@ -12075,7 +12339,7 @@ function WorkspaceTerminal({
               promptEventSubmittedAt: pendingPromptSubmittedAt,
               promptEventText: promptText,
               threadId: currentThreadId,
-            });
+            }, { waitForAck: true });
             logTerminalStatus("frontend.pending_prompt.submit_write_done", {
               ...pendingPromptLogFields,
               instanceId: currentInstanceId,
@@ -12582,7 +12846,7 @@ function WorkspaceTerminal({
           workspaceId: workspace?.id || "",
         })
         : null;
-      await invoke("terminal_write", {
+      await sendTerminalInputPayload({
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
         data: `${syncData}${submitSequence}` || prompt,
@@ -12591,7 +12855,7 @@ function WorkspaceTerminal({
         promptEventSubmittedAt: submitSequence ? promptEventSubmittedAt : undefined,
         promptEventText: submitSequence ? prompt : undefined,
         threadId: terminalThreadIdRef.current,
-      });
+      }, { waitForAck: true });
       if (submittedWaiter) {
         await submittedWaiter.promise;
         recordSubmittedAgentMessage(terminalInstanceIdRef.current || 0, prompt, {
@@ -12644,12 +12908,12 @@ function WorkspaceTerminal({
           : "";
         if (clearInputData) {
           try {
-            await invoke("terminal_write", {
+            await sendTerminalInputPayload({
               data: clearInputData,
               instanceId: terminalInstanceIdRef.current || undefined,
               paneId,
               threadId: terminalThreadIdRef.current,
-            });
+            }, { waitForAck: true });
           } catch (_) {
             // Best-effort cleanup; the original send error is more useful to show.
           }
@@ -12959,9 +13223,6 @@ function WorkspaceTerminal({
     }
 
     const nextUiViewActive = !terminalUiViewActive;
-    if (nextUiViewActive) {
-      setTerminalUiViewMounted(true);
-    }
 
     activateTerminalPane("terminal_ui_view_toggle", { focusKeyboard: false });
     terminalUiViewActiveRef.current = nextUiViewActive;
@@ -12981,7 +13242,6 @@ function WorkspaceTerminal({
         return false;
       }
 
-      setTerminalUiViewMounted(true);
       activateTerminalPane("terminal_ui_view_arrow_shortcut", { focusKeyboard: false });
     } else {
       if (!terminalUiViewActiveRef.current) {
@@ -13001,15 +13261,6 @@ function WorkspaceTerminal({
     activateTerminalPane,
     canOpenTerminalUiView,
     focusTerminalKeyboardInputAfterUiHide,
-  ]);
-  useEffect(() => {
-    if (isActive && canOpenTerminalUiView && !terminalUiViewMounted) {
-      setTerminalUiViewMounted(true);
-    }
-  }, [
-    canOpenTerminalUiView,
-    isActive,
-    terminalUiViewMounted,
   ]);
   useEffect(() => {
     if (terminalClosed || terminalClosing) {
@@ -13061,7 +13312,6 @@ function WorkspaceTerminal({
   useEffect(() => {
     if (!thread || terminalClosed || terminalClosing) {
       setTerminalUiViewActive(false);
-      setTerminalUiViewMounted(false);
     }
   }, [terminalClosed, terminalClosing, thread]);
   const splitTerminal = useCallback((direction) => {
@@ -13217,11 +13467,66 @@ function WorkspaceTerminal({
   const terminalUiViewShouldRender = Boolean(thread)
     && !terminalClosed
     && !terminalClosing
-    && (
-      terminalUiViewActive
-      || terminalUiViewMounted
-      || (isActive && canOpenTerminalUiView)
+    && terminalUiViewActive;
+  const terminalUiTranscriptLoading = Boolean(
+    terminalUiViewShouldRender
+      && thread?.transcriptStatus === "loading"
+      && (!Array.isArray(thread?.messages) || thread.messages.length === 0),
+  );
+  const terminalUiTranscriptMessageCount = Array.isArray(thread?.messages) ? thread.messages.length : 0;
+  const terminalUiTranscriptMaxMessages = Math.max(
+    TERMINAL_UI_TRANSCRIPT_RECENT_MESSAGES,
+    Number.parseInt(thread?.transcriptMaxMessages, 10) || 0,
+  );
+  const terminalUiTranscriptCanLoadOlder = Boolean(
+    terminalUiViewShouldRender
+      && threadProviderSessionId
+      && terminalUiTranscriptMessageCount >= TERMINAL_UI_TRANSCRIPT_RECENT_MESSAGES - 8
+      && terminalUiTranscriptMaxMessages < TERMINAL_UI_TRANSCRIPT_HISTORY_MESSAGES,
+  );
+  const loadOlderTerminalUiTranscript = useCallback(() => {
+    if (
+      typeof onWorkspaceThreadTranscriptViewState !== "function"
+      || !terminalUiViewActiveRef.current
+      || !thread
+      || !threadProviderSessionId
+    ) {
+      return;
+    }
+
+    const nextMaxMessages = Math.min(
+      TERMINAL_UI_TRANSCRIPT_HISTORY_MESSAGES,
+      Math.max(
+        terminalUiTranscriptMaxMessages + TERMINAL_UI_TRANSCRIPT_RECENT_MESSAGES,
+        terminalUiTranscriptMessageCount + TERMINAL_UI_TRANSCRIPT_RECENT_MESSAGES,
+      ),
     );
+    onWorkspaceThreadTranscriptViewState({
+      active: true,
+      agentId: terminalAgentKind,
+      historyExpansion: true,
+      loadOlder: true,
+      maxMessages: nextMaxMessages,
+      nativeSessionId: threadProviderSessionId,
+      paneId,
+      providerSessionId: threadProviderSessionId,
+      terminalIndex,
+      threadId: terminalThreadId,
+      visible: true,
+      workspaceId: workspace?.id || "",
+    });
+  }, [
+    onWorkspaceThreadTranscriptViewState,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    terminalThreadId,
+    terminalUiTranscriptMaxMessages,
+    terminalUiTranscriptMessageCount,
+    thread,
+    threadProviderSessionId,
+    workspace?.id,
+  ]);
   const restartMenuAgentKind = terminalAgentKind;
   const restartRoleOptions = getTerminalRoleSwitchOptions(agentStatuses);
 
@@ -13237,6 +13542,7 @@ function WorkspaceTerminal({
       data-ui-view={terminalUiViewActive ? "true" : undefined}
       onFocusCapture={handleTerminalSurfaceFocusCapture}
       onPointerDownCapture={handleTerminalSurfacePointerDownCapture}
+      onWheelCapture={handleTerminalSurfaceWheelCapture}
       ref={surfaceRef}
     >
       <TerminalRestartPill data-terminal-control="true">
@@ -13388,24 +13694,43 @@ function WorkspaceTerminal({
                 onFocusCapture={handleTerminalUiViewFocusCapture}
                 onPointerDownCapture={handleTerminalUiViewPointerDownCapture}
               >
-                <WorkspaceThreadDetail
-                  agentStatuses={agentStatuses}
-                  composerAttachments={threadComposerAttachments}
-                  composerDrafts={threadComposerDrafts}
-                  composerFocusToken={terminalUiComposerFocusToken}
-                  density="compact"
-                  onCreateChat={createWorkspaceThreadChat}
-                  onDraftInput={syncWorkspaceThreadComposerInput}
-                  onSelectModel={changeWorkspaceThreadModel}
-                  onSubmitMessage={submitWorkspaceThreadMessage}
-                  thread={thread}
-                  todoDropActive={todoDropActive}
-                  todoDropTarget={todoDropTarget}
-                  todoDropUnsupportedMessage={todoDropUnsupportedMessage}
-                  workspace={workspace}
-                  workspaceRoot={workingDirectory}
-                  workspaceThreadEntry={workspaceThreadEntry}
-                />
+                {terminalUiTranscriptLoading ? (
+                  <TerminalStatusOverlay
+                    aria-live="polite"
+                    data-mode="detail"
+                    data-terminal-control="true"
+                    data-tone="neutral"
+                    role="status"
+                  >
+                    <div>
+                      <TerminalStatusSpinner aria-hidden="true" />
+                      <TerminalStatusCopy>
+                        <strong>Loading thread</strong>
+                        <span>Hydrating recent session activity.</span>
+                      </TerminalStatusCopy>
+                    </div>
+                  </TerminalStatusOverlay>
+                ) : (
+                  <WorkspaceThreadDetail
+                    agentStatuses={agentStatuses}
+                    composerAttachments={threadComposerAttachments}
+                    composerDrafts={threadComposerDrafts}
+                    composerFocusToken={terminalUiComposerFocusToken}
+                    density="compact"
+                    onCreateChat={createWorkspaceThreadChat}
+	                    onDraftInput={syncWorkspaceThreadComposerInput}
+                    onLoadOlderTranscript={terminalUiTranscriptCanLoadOlder ? loadOlderTerminalUiTranscript : undefined}
+	                    onSelectModel={changeWorkspaceThreadModel}
+                    onSubmitMessage={submitWorkspaceThreadMessage}
+                    thread={thread}
+                    todoDropActive={todoDropActive}
+                    todoDropTarget={todoDropTarget}
+                    todoDropUnsupportedMessage={todoDropUnsupportedMessage}
+                    workspace={workspace}
+                    workspaceRoot={workingDirectory}
+                    workspaceThreadEntry={workspaceThreadEntry}
+                  />
+                )}
               </TerminalInlineUiView>
             )}
             {terminalComposerAttachments.length > 0 && (

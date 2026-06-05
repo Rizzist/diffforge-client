@@ -262,6 +262,7 @@ export function measureTerminalGrid({
 
 export function createTerminalResizeController({
   canResize,
+  canNativeResize,
   command = "resize_terminal",
   container,
   debounceMs = DEFAULT_DEBOUNCE_MS,
@@ -310,6 +311,9 @@ export function createTerminalResizeController({
   const getPaneId = () => getOptionValue(paneId, "");
   const getInstanceId = () => getOptionValue(instanceId, undefined);
   const getCanResize = () => (typeof canResize === "function" ? canResize() : canResize !== false);
+  const getCanNativeResize = () => (
+    typeof canNativeResize === "function" ? canNativeResize() : canNativeResize !== false
+  );
 
   const clearNativeResizeTimer = () => {
     if (!nativeResizeTimer) {
@@ -457,6 +461,16 @@ export function createTerminalResizeController({
 
   const scheduleNativeResize = (request, reason, delayMs, force = false) => {
     if (disposed || !request?.cols || !request?.rows) {
+      return;
+    }
+
+    if (!force && !getCanNativeResize()) {
+      logNativeResizeCoalescing("skip_background_native_resize", {
+        cols: request.cols,
+        paneId: request.paneId || "",
+        reason,
+        rows: request.rows,
+      });
       return;
     }
 

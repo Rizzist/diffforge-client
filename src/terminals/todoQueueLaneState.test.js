@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  evaluateTodoQueueInFlightPrompt,
-  getTodoQueuePromptCompletionEvidence,
-} from "./todoQueueLaneState.js";
+import { evaluateTodoQueueInFlightPrompt } from "./todoQueueLaneState.js";
 
 const submittedAt = "2026-06-01T01:34:53.669Z";
 const submittedAtMs = Date.parse(submittedAt);
@@ -70,10 +67,10 @@ function baseEvaluation(overrides = {}) {
 test("accepted queued prompt is not complete just because input is fresh again", () => {
   const evaluation = baseEvaluation();
 
-  assert.equal(evaluation.latestUserPromptMatches, true);
+  assert.equal(evaluation.latestUserPromptMatches, false);
   assert.equal(evaluation.freshInputReady, true);
   assert.equal(evaluation.promptTurnMatches, false);
-  assert.equal(evaluation.promptUserMessageSeen, true);
+  assert.equal(evaluation.promptUserMessageSeen, false);
   assert.equal(evaluation.assistantTextAfterPrompt, false);
   assert.equal(evaluation.terminalConfirmedFinished, false);
   assert.equal(evaluation.releaseReason, "");
@@ -147,7 +144,9 @@ test("queued prompt completes after its provider turn closes", () => {
     targetThread: {
       id: "thread-1",
       latestTurn: {
+        completedSource: "cli-hook:provider-turn-completed",
         messageId: "todo-drop-prompt-1",
+        source: "cli-hook:user-prompt-submit",
         startedAt: submittedAt,
         state: "completed",
         turnId: "turn-thread-1-todo-drop-prompt-1",
@@ -170,7 +169,7 @@ test("queued prompt completes after its provider turn closes", () => {
   });
 
   assert.equal(evaluation.promptTurnMatches, true);
-  assert.equal(evaluation.assistantCompletionAfterPrompt, true);
+  assert.equal(evaluation.assistantCompletionAfterPrompt, false);
   assert.equal(evaluation.exactPromptTranscriptFinished, false);
   assert.equal(evaluation.terminalConfirmedFinished, true);
   assert.equal(evaluation.releaseReason, "provider_turn_closed");
@@ -182,7 +181,9 @@ test("hook-managed queued prompt releases from provider turn closure", () => {
     targetThread: {
       id: "thread-1",
       latestTurn: {
+        completedSource: "cli-hook:provider-turn-completed",
         messageId: "todo-drop-prompt-1",
+        source: "cli-hook:user-prompt-submit",
         startedAt: submittedAt,
         state: "completed",
         turnId: "turn-thread-1-todo-drop-prompt-1",
@@ -207,9 +208,110 @@ test("hook-managed queued prompt releases from provider turn closure", () => {
   assert.equal(evaluation.hookManaged, true);
   assert.equal(evaluation.promptTurnMatches, true);
   assert.equal(evaluation.exactPromptTranscriptFinished, false);
+  assert.equal(evaluation.latestTurnClosedByLifecycle, true);
   assert.equal(evaluation.terminalReadyForNextPrompt, true);
   assert.equal(evaluation.terminalConfirmedFinished, true);
   assert.equal(evaluation.releaseReason, "provider_turn_closed");
+});
+
+test("hook-managed queued prompt does not release from transcript-shaped closure", () => {
+  const evaluation = baseEvaluation({
+    hookManaged: true,
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        completedSource: "codex-session-watch",
+        messageId: "todo-drop-prompt-1",
+        source: "codex-session",
+        startedAt: submittedAt,
+        state: "completed",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }, {
+        createdAt: "2026-06-01T01:35:12.000Z",
+        id: "assistant-final",
+        kind: "message",
+        role: "assistant",
+        status: "complete",
+        text: "Done.",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.hookManaged, true);
+  assert.equal(evaluation.promptTurnMatches, true);
+  assert.equal(evaluation.latestTurnClosedByLifecycle, false);
+  assert.equal(evaluation.terminalReadyForNextPrompt, true);
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
+});
+
+test("hook-managed lifecycle completion waits for terminal readiness", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "thinking",
+    effectiveLatestTurnState: "running",
+    hookManaged: true,
+    inFlightPrompt: {
+      accepted: true,
+      itemId: "todo-1",
+      lifecycleCompleted: true,
+      lifecycleCompletionReason: "provider_turn_closed",
+      promptId: "todo-drop-prompt-1",
+      promptText: "i want to make some pages",
+      startedAtMs: submittedAtMs,
+      submittedAt,
+      submittedAtMs,
+      terminalInstanceId: 4,
+      threadId: "thread-1",
+    },
+    liveTerminal: {
+      inputReady: false,
+      instanceId: 4,
+      status: "active",
+      threadId: "thread-1",
+    },
+    providerBinding: {
+      inputReady: false,
+      nativeSessionId: "session-1",
+      status: "active",
+    },
+    terminalGroundTruth: {
+      agentInputReady: false,
+      completedTurnLooksSendable: false,
+      effectiveActivityStatus: "thinking",
+      effectiveLatestTurnState: "running",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+    targetThread: {
+      id: "thread-1",
+      latestTurn: {
+        messageId: "todo-drop-prompt-1",
+        source: "cli-hook:user-prompt-submit",
+        startedAt: submittedAt,
+        state: "running",
+        turnId: "turn-thread-1-todo-drop-prompt-1",
+      },
+      messages: [{
+        createdAt: submittedAt,
+        id: "todo-drop-prompt-1",
+        role: "user",
+        text: "i want to make some pages",
+      }],
+      transcriptSessionId: "session-1",
+    },
+  });
+
+  assert.equal(evaluation.providerLifecycleCompleted, true);
+  assert.equal(evaluation.terminalReadyCompletionSignal, false);
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
 });
 
 test("hook-managed queued prompt does not accept from matching transcript state", () => {
@@ -277,7 +379,7 @@ test("queued prompt does not release when transcript completion belongs to a dif
   });
 
   assert.equal(evaluation.promptTurnMatches, false);
-  assert.equal(evaluation.assistantCompletionAfterPrompt, true);
+  assert.equal(evaluation.assistantCompletionAfterPrompt, false);
   assert.equal(evaluation.exactPromptTranscriptFinished, false);
   assert.equal(evaluation.terminalReadyForNextPrompt, true);
   assert.equal(evaluation.terminalConfirmedFinished, false);
@@ -328,8 +430,8 @@ test("exact transcript completion does not release with stale terminal readiness
   assert.equal(evaluation.exactPromptTranscriptFinished, false);
   assert.equal(evaluation.freshInputReady, false);
   assert.equal(evaluation.terminalReadinessMatchesPrompt, false);
-  assert.equal(evaluation.terminalConfirmedFinished, true);
-  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
 });
 
 test("exact transcript completion does not release with mismatched readiness prompt id", () => {
@@ -370,8 +472,9 @@ test("exact transcript completion does not release with mismatched readiness pro
   assert.equal(evaluation.freshInputReady, true);
   assert.equal(evaluation.terminalReadinessPromptMatches, false);
   assert.equal(evaluation.terminalReadinessMatchesPrompt, false);
-  assert.equal(evaluation.terminalConfirmedFinished, true);
-  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+  assert.equal(evaluation.terminalReadyForNextPrompt, false);
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
 });
 
 test("exact transcript completion does not release while the terminal is not ready", () => {
@@ -450,7 +553,9 @@ test("idle terminal status can release an accepted completed queued prompt", () 
     targetThread: {
       id: "thread-1",
       latestTurn: {
+        completedSource: "cli-hook:provider-turn-completed",
         messageId: "todo-drop-prompt-1",
+        source: "cli-hook:user-prompt-submit",
         startedAt: submittedAt,
         state: "completed",
         turnId: "turn-thread-1-todo-drop-prompt-1",
@@ -499,10 +604,10 @@ test("exact matching turn id alone does not release a queued prompt", () => {
   });
 
   assert.equal(evaluation.promptTurnMatches, true);
-  assert.equal(evaluation.completedMatchingTurn, true);
+  assert.equal(evaluation.completedMatchingTurn, false);
   assert.equal(evaluation.exactPromptTranscriptFinished, false);
-  assert.equal(evaluation.terminalConfirmedFinished, true);
-  assert.equal(evaluation.releaseReason, "provider_turn_closed");
+  assert.equal(evaluation.terminalConfirmedFinished, false);
+  assert.equal(evaluation.releaseReason, "");
 });
 
 test("terminal restart releases the stale lane without claiming task completion", () => {
@@ -519,26 +624,4 @@ test("terminal restart releases the stale lane without claiming task completion"
   assert.equal(evaluation.terminalConfirmedFinished, false);
   assert.equal(evaluation.terminalInstanceChanged, true);
   assert.equal(evaluation.releaseReason, "terminal_instance_changed");
-});
-
-test("completion evidence ignores assistant output before the queued prompt", () => {
-  const evidence = getTodoQueuePromptCompletionEvidence({
-    messages: [{
-      id: "assistant-before",
-      role: "assistant",
-      status: "complete",
-      text: "Previous answer.",
-    }, {
-      createdAt: submittedAt,
-      id: "codex-82-user",
-      role: "user",
-      text: "i want to make some pages",
-    }],
-    promptText: "i want to make some pages",
-    submittedAtMs,
-  });
-
-  assert.equal(evidence.promptUserMessageSeen, true);
-  assert.equal(evidence.assistantTextAfterPrompt, false);
-  assert.equal(evidence.assistantCompletionAfterPrompt, false);
 });

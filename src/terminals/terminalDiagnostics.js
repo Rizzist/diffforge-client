@@ -84,6 +84,12 @@ export function syncTerminalDiagnosticLogging(forceEnabled = false) {
 
   const enabled = backendLoggingForceEnabled || isTerminalDiagnosticLoggingEnabled();
 
+  if (!enabled) {
+    backendLoggingSynced = false;
+    backendLoggingSyncInFlight = null;
+    return Promise.resolve(false);
+  }
+
   if (backendLoggingSynced === enabled) {
     return backendLoggingSyncInFlight || Promise.resolve(enabled);
   }
