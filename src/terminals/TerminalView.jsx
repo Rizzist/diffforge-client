@@ -5480,6 +5480,15 @@ function getTodoQueueItemWithTerminalAssignment(item, fields = {}) {
   const targetTerminalIndex = normalizeTodoTerminalIndex(
     fields.targetTerminalIndex ?? fields.terminalIndex,
   );
+  const targetTerminalName = normalizeTodoTerminalName(
+    fields.targetTerminalName
+      || fields.target_terminal_name
+      || fields.terminalName
+      || fields.terminal_name
+      || fields.targetName
+      || fields.target_name
+      || "",
+  );
   const targetThreadId = normalizeTodoTerminalIdentity(fields.targetThreadId || fields.threadId || "");
   const targetColorSlot = normalizeTerminalColorSlot(
     fields.targetColorSlot ?? fields.colorSlot,
@@ -5492,6 +5501,7 @@ function getTodoQueueItemWithTerminalAssignment(item, fields = {}) {
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetTerminalName ? { targetTerminalName } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
@@ -5773,6 +5783,16 @@ function getVoiceAgentQueueTargetFields(args = {}) {
       || args.threadId
       || "",
   );
+  const targetTerminalName = normalizeTodoTerminalName(
+    args.target_terminal_name
+      || args.targetTerminalName
+      || args.terminal_name
+      || args.terminalName
+      || args.target_name
+      || args.targetName
+      || args.name
+      || "",
+  );
   const targetColorSlot = normalizeTerminalColorSlot(
     args.target_color_slot
       ?? args.targetColorSlot
@@ -5791,6 +5811,7 @@ function getVoiceAgentQueueTargetFields(args = {}) {
     targetAgentId
       || targetTerminalId
       || Number.isInteger(targetTerminalIndex)
+      || targetTerminalName
       || targetThreadId
       || Number.isInteger(targetColorSlot)
       || targetTerminalColor,
@@ -5802,18 +5823,19 @@ function getVoiceAgentQueueTargetFields(args = {}) {
     targetTerminalColor,
     targetTerminalId,
     targetTerminalIndex,
+    targetTerminalName,
     targetThreadId,
   };
 }
 
-function createTodoQueueItemsFromVoiceAgentToolCall(toolCall) {
+function createTodoQueueItemsFromVoiceAgentToolCall(toolCall, options = {}) {
   const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
   return getVoiceAgentQueueTodoEntries(args)
-    .map((entry) => createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, args))
+    .map((entry) => createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, args, options))
     .filter(Boolean);
 }
 
-function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs = {}) {
+function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs = {}, options = {}) {
   const args = normalizeVoiceAgentQueueArguments(entry);
   const text = normalizeTodoQueueText(
     cleanPublicVoiceAgentText(
@@ -5832,7 +5854,13 @@ function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs 
   }
   const entryTargetFields = getVoiceAgentQueueTargetFields(args);
   const parentTargetFields = getVoiceAgentQueueTargetFields(parentArgs);
-  const targetFields = entryTargetFields.targetExplicit ? entryTargetFields : parentTargetFields;
+  const selectedTargetFields = entryTargetFields.targetExplicit ? entryTargetFields : parentTargetFields;
+  const resolvedTargetFields = typeof options.resolveTerminalTarget === "function"
+    ? options.resolveTerminalTarget(selectedTargetFields) || null
+    : null;
+  const targetFields = resolvedTargetFields
+    ? { ...selectedTargetFields, ...resolvedTargetFields, targetExplicit: true }
+    : selectedTargetFields;
   const itemId = String(args.id || args.todo_id || args.todoId || args.client_todo_id || args.clientTodoId || "").trim();
 
   const planTask = normalizeTodoQueuePlanTask({
@@ -5869,6 +5897,7 @@ function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs 
         targetTerminalColor: targetFields.targetTerminalColor,
         targetTerminalId: targetFields.targetTerminalId,
         targetTerminalIndex: targetFields.targetTerminalIndex,
+        targetTerminalName: targetFields.targetTerminalName,
         targetThreadId: targetFields.targetThreadId,
       },
     } : {}),
@@ -5879,11 +5908,13 @@ function getTodoQueuePendingFieldsFromItem(item, source = "") {
   const targetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
   const targetAgentId = getTodoQueueTargetAgentId(item);
   const targetColorSlot = getTodoQueueTargetColorSlot(item);
+  const targetTerminalName = getTodoQueueTargetTerminalName(item);
   const targetTerminalColor = getTodoQueueTargetTerminalColor(item);
   const targetExplicit = Boolean(
     targetAgentId
       || targetInfo.hasExplicitTerminalTarget
       || Number.isInteger(targetColorSlot)
+      || targetTerminalName
       || targetTerminalColor,
   );
   return {
@@ -5893,6 +5924,7 @@ function getTodoQueuePendingFieldsFromItem(item, source = "") {
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
     ...(targetInfo.requestedTargetTerminalId ? { targetTerminalId: targetInfo.requestedTargetTerminalId } : {}),
     ...(Number.isInteger(targetInfo.requestedTargetTerminalIndex) ? { targetTerminalIndex: targetInfo.requestedTargetTerminalIndex } : {}),
+    ...(targetTerminalName ? { targetTerminalName } : {}),
     ...(targetInfo.requestedTargetThreadId ? { targetThreadId: targetInfo.requestedTargetThreadId } : {}),
     ...(targetExplicit ? { targetExplicit: true } : {}),
   };
@@ -7065,6 +7097,14 @@ function normalizeTodoTerminalIdentity(value) {
   return String(value || "").trim();
 }
 
+function normalizeTodoTerminalName(value) {
+  return String(value || "").trim().slice(0, 120);
+}
+
+function normalizeTodoTerminalNameKey(value) {
+  return normalizeTodoTerminalName(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
 function normalizeTodoTerminalIndex(value) {
   const number = Number.parseInt(value, 10);
   return Number.isInteger(number) && number >= 0 ? number : null;
@@ -7105,6 +7145,44 @@ function getTodoQueueTargetAgentId(item) {
       || item?.remote_command?.target_agent_id
       || "",
   );
+}
+
+function getTodoQueueTargetTerminalName(item) {
+  const queueState = getTodoQueueRawQueueState(item);
+  const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
+  const readDirectTarget = !queueState || queueTargetExplicit;
+  const directTargetTerminalName = readDirectTarget
+    ? normalizeTodoTerminalName(
+      item?.targetTerminalName
+        || item?.target_terminal_name
+        || item?.terminalName
+        || item?.terminal_name
+        || item?.targetName
+        || item?.target_name
+        || item?.remoteCommand?.targetTerminalName
+        || item?.remoteCommand?.target_terminal_name
+        || item?.remoteCommand?.terminalName
+        || item?.remoteCommand?.terminal_name
+        || item?.remoteCommand?.targetName
+        || item?.remoteCommand?.target_name
+        || item?.remote_command?.target_terminal_name
+        || item?.remote_command?.terminal_name
+        || item?.remote_command?.target_name
+        || "",
+    )
+    : "";
+  const queueTargetTerminalName = queueTargetExplicit
+    ? normalizeTodoTerminalName(
+      queueState?.targetTerminalName
+        || queueState?.target_terminal_name
+        || queueState?.terminalName
+        || queueState?.terminal_name
+        || queueState?.targetName
+        || queueState?.target_name
+        || "",
+    )
+    : "";
+  return normalizeTodoTerminalName(directTargetTerminalName || queueTargetTerminalName);
 }
 
 function getTodoQueueTargetTerminalId(item) {
@@ -7517,6 +7595,7 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
         ? directTargetColorSlot
         : null
     );
+  const requestedTargetTerminalName = getTodoQueueTargetTerminalName(item);
   const requestedTargetTerminalIndex = queueStateHasIndexTarget
     ? queueRequestedTargetTerminalIndex
     : directRequestedTargetTerminalIndex ?? queueRequestedTargetTerminalIndex;
@@ -7540,9 +7619,11 @@ function getTodoQueueExplicitTerminalTargetInfo(item) {
   return {
     hasExplicitTerminalTarget: Number.isInteger(requestedTargetTerminalIndex)
       || Boolean(safeRequestedTargetTerminalId)
+      || Boolean(requestedTargetTerminalName)
       || Boolean(safeRequestedTargetThreadId),
     requestedTargetTerminalId: safeRequestedTargetTerminalId,
     requestedTargetTerminalIndex,
+    requestedTargetTerminalName,
     requestedTargetThreadId: safeRequestedTargetThreadId,
   };
 }
@@ -7587,6 +7668,7 @@ function normalizeTodoQueuePersistedQueueState(item) {
     ? queueTargetTerminalId
     : getTodoQueueTargetTerminalId(item);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+  const targetTerminalName = getTodoQueueTargetTerminalName(item);
   const targetThreadId = queueStateHasIndexTarget
     ? queueTargetThreadId
     : getTodoQueueTargetThreadId(item);
@@ -7621,6 +7703,7 @@ function normalizeTodoQueuePersistedQueueState(item) {
     ...(targetAgentId ? { targetAgentId, targetRole: targetAgentId } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetTerminalName ? { targetTerminalName } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
     ...(targetExplicit ? { targetExplicit: true, explicitTarget: true } : {}),
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
@@ -7647,6 +7730,13 @@ function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
   const fieldTargetTerminalIndex = normalizeTodoTerminalIndex(fields.targetTerminalIndex);
   const fieldTargetTerminalColor = normalizeTerminalHexColor(fields.targetTerminalColor);
   const fieldTargetTerminalId = normalizeTodoTerminalIdentity(fields.targetTerminalId);
+  const fieldTargetTerminalName = normalizeTodoTerminalName(
+    fields.targetTerminalName
+      || fields.target_terminal_name
+      || fields.terminalName
+      || fields.terminal_name
+      || "",
+  );
   const fieldTargetThreadId = normalizeTodoTerminalIdentity(fields.targetThreadId);
   const nextSource = fields.source || existingState.source || item.source || "";
   const nextTodoAction = getTodoQueueDispatchAction(item, nextSource, {
@@ -7715,6 +7805,9 @@ function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
       targetTerminalIndex: targetExplicit
         ? fieldTargetTerminalIndex ?? existingTargetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item)
         : null,
+      targetTerminalName: targetExplicit
+        ? fieldTargetTerminalName || existingState.targetTerminalName || existingState.target_terminal_name || getTodoQueueTargetTerminalName(item)
+        : "",
       targetThreadId: targetExplicit
         ? clearStaleIdentityForIndexTarget
           ? fieldTargetThreadId
@@ -7789,6 +7882,7 @@ function buildTodoQueuePendingItemsFromPersistedQueue(items, workspaceId = "") {
       targetTerminalIndex: Number.isInteger(queueState.targetTerminalIndex)
         ? queueState.targetTerminalIndex
         : getTodoQueueTargetTerminalIndex(item) ?? "",
+      targetTerminalName: queueState.targetTerminalName || getTodoQueueTargetTerminalName(item),
       targetThreadId: queueState.targetThreadId || getTodoQueueTargetThreadId(item),
       timeoutAtMs: 0,
       timeoutMs: 0,
@@ -7816,6 +7910,7 @@ function todoQueueRemoteItemsMatch(left, right) {
       && getTodoQueueTargetAgentId(left) === getTodoQueueTargetAgentId(right)
       && getTodoQueueTargetTerminalId(left) === getTodoQueueTargetTerminalId(right)
       && getTodoQueueTargetTerminalIndex(left) === getTodoQueueTargetTerminalIndex(right)
+      && getTodoQueueTargetTerminalName(left) === getTodoQueueTargetTerminalName(right)
       && getTodoQueueTargetThreadId(left) === getTodoQueueTargetThreadId(right)
   );
 }
@@ -8157,9 +8252,15 @@ function createTodoQueueItem(text, options = {}) {
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(options);
+  const targetTerminalName = getTodoQueueTargetTerminalName(options);
   const targetThreadId = getTodoQueueTargetThreadId(options);
   const targetColorSlot = getTodoQueueTargetColorSlot(options);
-  const hasTerminalTarget = Boolean(targetTerminalId || Number.isInteger(targetTerminalIndex) || targetThreadId);
+  const hasTerminalTarget = Boolean(
+    targetTerminalId
+      || Number.isInteger(targetTerminalIndex)
+      || targetTerminalName
+      || targetThreadId,
+  );
   const targetColorFallbackSlot = targetColorSlot ?? targetTerminalIndex ?? 0;
   const targetTerminalColor = hasTerminalTarget
     ? getTodoQueueTargetTerminalColor(options) || terminalColorForSlot(targetColorFallbackSlot)
@@ -8203,6 +8304,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetTerminalName ? { targetTerminalName } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
@@ -8227,9 +8329,15 @@ function normalizeTodoQueueItem(item) {
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+  const targetTerminalName = getTodoQueueTargetTerminalName(item);
   const targetThreadId = getTodoQueueTargetThreadId(item);
   const targetColorSlot = getTodoQueueTargetColorSlot(item);
-  const hasTerminalTarget = Boolean(targetTerminalId || Number.isInteger(targetTerminalIndex) || targetThreadId);
+  const hasTerminalTarget = Boolean(
+    targetTerminalId
+      || Number.isInteger(targetTerminalIndex)
+      || targetTerminalName
+      || targetThreadId,
+  );
   const targetColorFallbackSlot = targetColorSlot ?? targetTerminalIndex ?? 0;
   const targetTerminalColor = hasTerminalTarget
     ? getTodoQueueTargetTerminalColor(item) || terminalColorForSlot(targetColorFallbackSlot)
@@ -8280,6 +8388,7 @@ function normalizeTodoQueueItem(item) {
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+    ...(targetTerminalName ? { targetTerminalName } : {}),
     ...(targetThreadId ? { targetThreadId } : {}),
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
@@ -8374,6 +8483,7 @@ function buildTodoQueueCloudSyncItem(item, {
     ...(normalizedItem.targetAgentId ? { targetAgentId: normalizedItem.targetAgentId } : {}),
     ...(normalizedItem.targetTerminalId ? { targetTerminalId: normalizedItem.targetTerminalId } : {}),
     ...(Number.isInteger(normalizedItem.targetTerminalIndex) ? { targetTerminalIndex: normalizedItem.targetTerminalIndex } : {}),
+    ...(normalizedItem.targetTerminalName ? { targetTerminalName: normalizedItem.targetTerminalName } : {}),
     ...(normalizedItem.targetThreadId ? { targetThreadId: normalizedItem.targetThreadId } : {}),
     ...(Number.isInteger(normalizedItem.targetColorSlot) ? { targetColorSlot: normalizedItem.targetColorSlot } : {}),
     ...(normalizedItem.targetTerminalColor ? { targetTerminalColor: normalizedItem.targetTerminalColor } : {}),
@@ -12224,6 +12334,7 @@ function TerminalView({
           targetTerminalColor: fields.targetTerminalColor || getTodoQueueTargetTerminalColor(item),
           targetTerminalId: fields.targetTerminalId || getTodoQueueTargetTerminalId(item),
           targetTerminalIndex: fields.targetTerminalIndex ?? getTodoQueueTargetTerminalIndex(item),
+          targetTerminalName: fields.targetTerminalName || getTodoQueueTargetTerminalName(item),
           targetThreadId: fields.targetThreadId || getTodoQueueTargetThreadId(item),
           textPreview: nextReceipt.text,
         },
@@ -12652,6 +12763,73 @@ function TerminalView({
     getTerminalThread,
     terminalWorkspace?.id,
     workspaceThreadEntry,
+  ]);
+  const resolveTodoQueueTerminalTargetByName = useCallback((fields = {}) => {
+    const requestedName = normalizeTodoTerminalName(
+      fields.targetTerminalName
+        || fields.target_terminal_name
+        || fields.terminalName
+        || fields.terminal_name
+        || fields.targetName
+        || fields.target_name
+        || "",
+    );
+    const requestedNameKey = normalizeTodoTerminalNameKey(requestedName);
+    if (!requestedNameKey) {
+      return null;
+    }
+
+    const matches = logicalTerminalIndexes
+      .map((terminalIndex) => {
+        const role = getTerminalRole(terminalIndex);
+        const thread = getTerminalThread(terminalIndex);
+        const providerBinding = getWorkspaceThreadProviderBinding(thread, role);
+        const { liveTerminal } = resolveTodoQueueLiveTerminal(terminalIndex);
+        const paneId = getTerminalPaneId(terminalIndex);
+        const nameCandidates = [
+          liveTerminal?.terminalName,
+          liveTerminal?.terminal_name,
+          liveTerminal?.displayName,
+          liveTerminal?.display_name,
+          liveTerminal?.agentDisplayName,
+          liveTerminal?.agent_display_name,
+          liveTerminal?.agentType,
+          liveTerminal?.agent_type,
+          providerBinding?.terminalName,
+          providerBinding?.terminal_name,
+          providerBinding?.agentDisplayName,
+          providerBinding?.agent_display_name,
+          providerBinding?.agentType,
+          providerBinding?.agent_type,
+        ].map(normalizeTodoTerminalName).filter(Boolean);
+        const matched = nameCandidates.some((name) => (
+          normalizeTodoTerminalNameKey(name) === requestedNameKey
+        ));
+        if (!matched) {
+          return null;
+        }
+        return {
+          targetAgentId: normalizeTodoTerminalAgentId(role),
+          targetTerminalId: paneId,
+          targetTerminalIndex: terminalIndex,
+          targetTerminalName: requestedName,
+          targetThreadId: thread?.id || liveTerminal?.threadId || liveTerminal?.thread_id || "",
+        };
+      })
+      .filter(Boolean);
+
+    if (!matches.length) {
+      return {
+        targetTerminalName: requestedName,
+      };
+    }
+    return matches[0];
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    resolveTodoQueueLiveTerminal,
   ]);
   const selectedTerminalPlanTarget = useMemo(() => {
     const terminalIndex = logicalTerminalIndexes.find((candidateIndex) => (
@@ -13272,10 +13450,23 @@ function TerminalView({
     const status = String(eventStatus || existing.status || "active").trim().toLowerCase() || "active";
     const promptEventId = String(event.promptEventId || event.pendingPromptId || event.promptId || "").trim();
     const promptEpoch = Number(event.promptEpoch ?? event.prompt_epoch ?? existing.promptEpoch ?? existing.prompt_epoch ?? 0);
+    const agentType = String(event.agentType || event.agent_type || existing.agentType || existing.agent_type || "").trim();
+    const agentDisplayName = String(
+      event.agentDisplayName
+        || event.agent_display_name
+        || agentType
+        || existing.agentDisplayName
+        || existing.agent_display_name
+        || "",
+    ).trim();
     const nextTerminal = {
       activeTask: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
       active_task: event.activeTask || event.active_task || existing.activeTask || existing.active_task || null,
+      agentDisplayName,
+      agent_display_name: agentDisplayName,
       agentId: eventAgentId || existing.agentId || getTerminalRole(terminalIndex),
+      agentType,
+      agent_type: agentType,
       activityStatus,
       activity_status: activityStatus,
       coordination: event.coordination || existing.coordination || null,
@@ -13289,6 +13480,7 @@ function TerminalView({
       instanceId: event.instanceId ?? existing.instanceId ?? "",
       paneId,
       pendingPromptId: promptEventId || existing.pendingPromptId || existing.promptEventId || "",
+      provider: event.provider || existing.provider || "",
       promptEpoch: Number.isFinite(promptEpoch) && promptEpoch > 0 ? Math.floor(promptEpoch) : 0,
       prompt_epoch: Number.isFinite(promptEpoch) && promptEpoch > 0 ? Math.floor(promptEpoch) : 0,
       promptEventId: promptEventId || existing.promptEventId || existing.pendingPromptId || "",
@@ -13311,10 +13503,13 @@ function TerminalView({
     };
     const changed = existing.inputReady !== nextTerminal.inputReady
       || String(existing.activityStatus || existing.activity_status || "") !== String(nextTerminal.activityStatus || "")
+      || String(existing.agentDisplayName || existing.agent_display_name || "") !== String(nextTerminal.agentDisplayName || "")
+      || String(existing.agentType || existing.agent_type || "") !== String(nextTerminal.agentType || "")
       || String(existing.instanceId || "") !== String(nextTerminal.instanceId || "")
       || String(existing.paneId || "") !== String(nextTerminal.paneId || "")
       || String(existing.promptEventId || existing.pendingPromptId || "") !== String(nextTerminal.promptEventId || nextTerminal.pendingPromptId || "")
       || String(existing.sessionId || existing.session_id || "") !== String(nextTerminal.sessionId || "")
+      || String(existing.provider || "") !== String(nextTerminal.provider || "")
       || String(existing.status || "") !== String(nextTerminal.status || "")
       || String(existing.taskId || existing.task_id || "") !== String(nextTerminal.taskId || "")
       || String(existing.threadId || "") !== String(nextTerminal.threadId || "");
@@ -18674,7 +18869,9 @@ function TerminalView({
       return null;
     }
 
-    const items = createTodoQueueItemsFromVoiceAgentToolCall(toolCall);
+    const items = createTodoQueueItemsFromVoiceAgentToolCall(toolCall, {
+      resolveTerminalTarget: resolveTodoQueueTerminalTargetByName,
+    });
     if (!items.length) {
       logTerminalStatus("frontend.voice_agent.tool_call_skip", {
         reason: "invalid_queue_item",
@@ -18755,6 +18952,7 @@ function TerminalView({
     handleVoicePlanServerResult,
     queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
+    resolveTodoQueueTerminalTargetByName,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -18768,8 +18966,10 @@ function TerminalView({
         return;
       }
 
+      const resolvedRemoteTarget = resolveTodoQueueTerminalTargetByName(detail.item || {}) || null;
       const item = normalizeTodoQueueItem({
         ...(detail.item || {}),
+        ...(resolvedRemoteTarget || {}),
         kind: "todo",
         source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
         workspaceId: eventWorkspaceId,
@@ -18794,6 +18994,7 @@ function TerminalView({
           targetTerminalColor: getTodoQueueTargetTerminalColor(item),
           targetTerminalId: getTodoQueueTargetTerminalId(item),
           targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+          targetTerminalName: getTodoQueueTargetTerminalName(item),
           targetThreadId: getTodoQueueTargetThreadId(item),
           workspaceId: terminalWorkspace.id,
         });
@@ -18822,6 +19023,7 @@ function TerminalView({
           targetTerminalColor: getTodoQueueTargetTerminalColor(item),
           targetTerminalId: getTodoQueueTargetTerminalId(item),
           targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+          targetTerminalName: getTodoQueueTargetTerminalName(item),
           targetThreadId: getTodoQueueTargetThreadId(item),
           workspaceId: terminalWorkspace.id,
         });
@@ -18856,6 +19058,7 @@ function TerminalView({
         targetTerminalColor: getTodoQueueTargetTerminalColor(item),
         targetTerminalId: getTodoQueueTargetTerminalId(item),
         targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+        targetTerminalName: getTodoQueueTargetTerminalName(item),
         targetThreadId: getTodoQueueTargetThreadId(item),
         targetExplicit: remoteTargetInfo.hasExplicitTerminalTarget,
         workspaceId: terminalWorkspace.id,
@@ -18870,6 +19073,7 @@ function TerminalView({
         targetTerminalColor: getTodoQueueTargetTerminalColor(item),
         targetTerminalId: getTodoQueueTargetTerminalId(item),
         targetTerminalIndex: getTodoQueueTargetTerminalIndex(item),
+        targetTerminalName: getTodoQueueTargetTerminalName(item),
         targetThreadId: getTodoQueueTargetThreadId(item),
         surface: "tui_todo_queue",
         workspaceId: terminalWorkspace.id,
@@ -18882,6 +19086,7 @@ function TerminalView({
     };
   }, [
     recordTodoQueueRemoteCommandReceipt,
+    resolveTodoQueueTerminalTargetByName,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
@@ -18988,10 +19193,20 @@ function TerminalView({
       const explicitTargetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
       const {
         hasExplicitTerminalTarget,
-        requestedTargetTerminalId,
-        requestedTargetTerminalIndex,
-        requestedTargetThreadId,
+        requestedTargetTerminalName,
       } = explicitTargetInfo;
+      const resolvedNameTarget = requestedTargetTerminalName
+        ? resolveTodoQueueTerminalTargetByName({ targetTerminalName: requestedTargetTerminalName }) || null
+        : null;
+      const requestedTargetTerminalId = explicitTargetInfo.requestedTargetTerminalId
+        || resolvedNameTarget?.targetTerminalId
+        || "";
+      const requestedTargetTerminalIndex = Number.isInteger(explicitTargetInfo.requestedTargetTerminalIndex)
+        ? explicitTargetInfo.requestedTargetTerminalIndex
+        : normalizeTodoTerminalIndex(resolvedNameTarget?.targetTerminalIndex);
+      const requestedTargetThreadId = explicitTargetInfo.requestedTargetThreadId
+        || resolvedNameTarget?.targetThreadId
+        || "";
 
       if (hasExplicitTerminalTarget) {
         const candidateIndexes = Number.isInteger(requestedTargetTerminalIndex)
@@ -19025,6 +19240,7 @@ function TerminalView({
               requestedTargetAgentId,
               requestedTargetTerminalId,
               requestedTargetTerminalIndex,
+              requestedTargetTerminalName,
               requestedTargetThreadId,
               target: candidate,
             };
@@ -19039,6 +19255,7 @@ function TerminalView({
           requestedTargetAgentId,
           requestedTargetTerminalId,
           requestedTargetTerminalIndex,
+          requestedTargetTerminalName,
           requestedTargetThreadId,
           target: null,
           unavailable: matchedUnavailableTarget,
@@ -19060,6 +19277,7 @@ function TerminalView({
             requestedTargetAgentId,
             requestedTargetTerminalId,
             requestedTargetTerminalIndex,
+            requestedTargetTerminalName,
             requestedTargetThreadId,
             target: candidate,
           };
@@ -19075,6 +19293,7 @@ function TerminalView({
         requestedTargetAgentId,
         requestedTargetTerminalId,
         requestedTargetTerminalIndex,
+        requestedTargetTerminalName,
         requestedTargetThreadId,
         target: null,
         unavailable: firstUnavailableTarget,
@@ -19096,6 +19315,7 @@ function TerminalView({
       ? selectionTargetInfo.requestedTargetTerminalIndex
       : queuedItemExplicitTargetInfo.requestedTargetTerminalIndex;
     const requestedTargetThreadId = selectionTargetInfo.requestedTargetThreadId || queuedItemExplicitTargetInfo.requestedTargetThreadId;
+    const requestedTargetTerminalName = selectionTargetInfo.requestedTargetTerminalName || queuedItemExplicitTargetInfo.requestedTargetTerminalName;
     const queuedItemHasExplicitTerminalTarget = Boolean(
       selectionTargetInfo.hasExplicitTerminalTarget
         || queuedItemExplicitTargetInfo.hasExplicitTerminalTarget
@@ -19108,6 +19328,7 @@ function TerminalView({
         requestedTargetAgentId,
         requestedTargetTerminalId,
         requestedTargetTerminalIndex: Number.isInteger(requestedTargetTerminalIndex) ? requestedTargetTerminalIndex : "",
+        requestedTargetTerminalName,
         requestedTargetThreadId,
         terminalCount: logicalTerminalIndexes.length,
         workspaceId: terminalWorkspace?.id || "",
@@ -19175,6 +19396,7 @@ function TerminalView({
       targetTerminalColor: terminalColorForSlot(targetColorSlot),
       targetTerminalId: target.paneId || "",
       targetTerminalIndex,
+      targetTerminalName: requestedTargetTerminalName || getTodoQueueTargetTerminalName(queuedItem),
       targetThreadId: target.targetThread?.id || target.threadId || "",
     };
     recordTodoQueueRemoteCommandReceipt(queuedItem, "sending", {
@@ -19425,6 +19647,7 @@ function TerminalView({
     logicalTerminalIndexes,
     recordTodoQueueRemoteCommandReceipt,
     recordVoicePlanTaskStatus,
+    resolveTodoQueueTerminalTargetByName,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,
     terminalWorkspace?.id,

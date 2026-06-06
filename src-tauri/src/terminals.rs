@@ -7798,6 +7798,44 @@ fn terminal_activity_hook_name_key(value: &str) -> String {
         .collect()
 }
 
+fn terminal_activity_hook_display_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .chars()
+        .take(96)
+        .collect()
+}
+
+fn terminal_activity_hook_agent_display_name(
+    agent_type: Option<&str>,
+    provider: &str,
+    fallback: &str,
+) -> String {
+    for candidate in [agent_type, Some(provider), Some(fallback)] {
+        let Some(value) = candidate else {
+            continue;
+        };
+        let value = terminal_activity_hook_display_text(value);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+
+    String::new()
+}
+
 fn terminal_activity_hook_bool(event: &Value, keys: &[&str]) -> bool {
     keys.iter()
         .any(|key| event.get(*key).and_then(Value::as_bool).unwrap_or(false))
@@ -8194,6 +8232,15 @@ fn terminal_activity_hook_payload(
     let event_time = crate::coordination::kernel::now_rfc3339();
     let provider = terminal_activity_hook_string(event, &["provider"])
         .unwrap_or_else(|| metadata.agent_kind.clone());
+    let agent_type = terminal_activity_hook_string(
+        event,
+        &["agentType", "agent_type", "subagentType", "subagent_type"],
+    );
+    let agent_display_name = terminal_activity_hook_agent_display_name(
+        agent_type.as_deref(),
+        &provider,
+        &metadata.agent_kind,
+    );
     let provider_session_id = terminal_activity_hook_string(event, &["sessionId", "session_id"]);
     let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
     let user_message = terminal_activity_hook_string(
@@ -8250,6 +8297,8 @@ fn terminal_activity_hook_payload(
         thread_id: metadata.thread_id,
         agent_id: metadata.agent_id,
         agent_kind: metadata.agent_kind,
+        agent_type: agent_type.unwrap_or_default(),
+        agent_display_name,
         provider,
         event_type: event_type.to_string(),
         hook_event_name,

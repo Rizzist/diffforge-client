@@ -1703,6 +1703,8 @@ struct TerminalActivityHookPayload {
     thread_id: String,
     agent_id: String,
     agent_kind: String,
+    agent_type: String,
+    agent_display_name: String,
     provider: String,
     event_type: String,
     hook_event_name: String,

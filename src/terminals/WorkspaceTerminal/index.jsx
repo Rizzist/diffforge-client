@@ -122,8 +122,11 @@ import {
   TerminalParkedAgentBadge,
   TerminalParkedCancelButton,
   TerminalRestartPill,
+  TerminalRailIdentity,
+  TerminalAgentLabel,
   TerminalAgentDot,
   TerminalStateDebugBadge,
+  TerminalRailControls,
   TerminalRestartMenu,
   TerminalRestartDropdown,
   TerminalRestartOption,
@@ -583,6 +586,32 @@ function terminalInputDataIsSubmit(value) {
     || text.includes("\n")
     || text.includes(TERMINAL_ENTER_SEQUENCE)
     || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
+}
+
+function cleanTerminalRailAgentText(value) {
+  return Array.from(
+    String(value || "")
+      .replace(/[\u0000-\u001F\u007F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  ).slice(0, 80).join("");
+}
+
+function formatTerminalRailAgentName(value) {
+  return cleanTerminalRailAgentText(value)
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getTerminalRailAgentLabel(providerLabel, hookAgentLabel) {
+  const provider = formatTerminalRailAgentName(providerLabel) || "Agent";
+  const hookLabel = formatTerminalRailAgentName(hookAgentLabel);
+  if (!hookLabel || hookLabel.toLowerCase() === provider.toLowerCase()) {
+    return provider;
+  }
+
+  return `${provider} / ${hookLabel}`;
 }
 
 const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
@@ -2084,6 +2113,22 @@ function WorkspaceTerminal({
   const terminalAgentTitle = isGenericTerminal
     ? "Generic shell terminal"
     : `${agent?.label || "Agent"} terminal`;
+  const terminalProviderRailLabel = isGenericTerminal
+    ? "Shell"
+    : agent?.label || terminalAgentKind || "Agent";
+  const terminalHookRailLabel = threadProviderBinding?.agentDisplayName
+    || threadProviderBinding?.agentType
+    || "";
+  const terminalProviderRailDisplayLabel = formatTerminalRailAgentName(terminalProviderRailLabel) || "Agent";
+  const terminalHookRailDisplayLabel = formatTerminalRailAgentName(terminalHookRailLabel);
+  const terminalRailAgentLabel = getTerminalRailAgentLabel(
+    terminalProviderRailLabel,
+    terminalHookRailLabel,
+  );
+  const terminalRailAgentTitle = terminalHookRailDisplayLabel
+    && terminalHookRailDisplayLabel.toLowerCase() !== terminalProviderRailDisplayLabel.toLowerCase()
+    ? `${terminalAgentTitle}: ${terminalHookRailDisplayLabel}`
+    : terminalAgentTitle;
   const scheduleOpenCodeTerminalThemeRefresh = useCallback((themeId = getCurrentForgeThemeId()) => {
     if (isGenericTerminal || terminalAgentKind !== "opencode") {
       return;
@@ -13291,15 +13336,21 @@ function WorkspaceTerminal({
       ref={surfaceRef}
     >
       <TerminalRestartPill data-terminal-control="true">
+        <TerminalRailIdentity>
           <TerminalAgentDot
             aria-hidden="true"
             data-agent={terminalAgentKind}
             data-slot={getTerminalAgentColorSlot(terminalIndex)}
-            title={terminalAgentTitle}
+            title={terminalRailAgentTitle}
           />
+          <TerminalAgentLabel title={terminalRailAgentTitle}>
+            {terminalRailAgentLabel}
+          </TerminalAgentLabel>
           <TerminalStateDebugBadge title={`Terminal state: ${terminalStateDebugLabel}`}>
             {terminalStateDebugLabel}
           </TerminalStateDebugBadge>
+        </TerminalRailIdentity>
+        <TerminalRailControls>
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"
@@ -13411,6 +13462,7 @@ function WorkspaceTerminal({
           >
             <ButtonCloseIcon aria-hidden="true" />
           </TerminalCloseButton>
+        </TerminalRailControls>
         </TerminalRestartPill>
 
       <TerminalFrame

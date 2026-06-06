@@ -826,10 +826,16 @@ async function syncCloudMcpDesktopSessionToken(token, options = {}) {
     });
     const accountScope = options.accountScope || authStore.getActiveScope?.() || null;
     const scopePayload = accountScopeInvokePayload(accountScope);
+    const entitlementPayload = {
+      planName: options.planName || "plus",
+      deviceLimit: Number.isInteger(options.deviceLimit) ? options.deviceLimit : 3,
+    };
     const status = await invoke("cloud_mcp_set_desktop_session_token", {
       token: safeToken,
       scopeType: scopePayload.scopeType,
       teamId: scopePayload.teamId,
+      planName: entitlementPayload.planName,
+      deviceLimit: entitlementPayload.deviceLimit,
     });
     await recordCloudConnectionDiagnostic(safeToken, {
       channel: "rust-client-auth",
@@ -1050,6 +1056,7 @@ const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
+const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
@@ -3064,6 +3071,51 @@ function accountScopeInvokePayload(scope) {
 function accountScopeKey(scope) {
   const payload = accountScopeInvokePayload(scope);
   return payload.scopeType === "team" ? `team:${payload.teamId}` : "personal";
+}
+
+function billingPlanNameFromStatus(billingStatus, sessionUser) {
+  const paid = isPaidUser(sessionUser) || billingStatus?.planStatus === "paid";
+  const rawPlan = String(
+    billingStatus?.planName
+      || billingStatus?.credits?.planName
+      || sessionUser?.planName
+      || sessionUser?.plan_name
+      || "",
+  ).trim().toLowerCase();
+
+  if (!paid && rawPlan !== "free") {
+    return "free";
+  }
+  if (["free", "plus", "pro", "ultra"].includes(rawPlan)) {
+    return rawPlan;
+  }
+  return paid ? "plus" : "free";
+}
+
+function billingPlanDeviceLimitFromStatus(billingStatus, sessionUser) {
+  const explicitLimit = Number(
+    billingStatus?.entitlements?.deviceLimit
+      ?? billingStatus?.limits?.deviceLimit
+      ?? billingStatus?.user?.entitlements?.deviceLimit
+      ?? sessionUser?.deviceLimit
+      ?? sessionUser?.device_limit,
+  );
+  if (Number.isInteger(explicitLimit) && explicitLimit >= 0) {
+    return explicitLimit;
+  }
+  const planName = billingPlanNameFromStatus(billingStatus, sessionUser);
+  if (planName === "free") return 0;
+  if (planName === "pro") return 7;
+  if (planName === "ultra") return 20;
+  return 3;
+}
+
+function cloudMcpBillingEntitlementPayload(billingStatus, sessionUser) {
+  const planName = billingPlanNameFromStatus(billingStatus, sessionUser);
+  return {
+    planName,
+    deviceLimit: billingPlanDeviceLimitFromStatus(billingStatus, sessionUser),
+  };
 }
 
 function billingPlanLabelFromStatus(billingStatus, sessionUser) {
@@ -5703,9 +5755,10 @@ export default function App() {
     tokenomicsSyncPendingRefreshRef.current = false;
     void syncCloudMcpDesktopSessionToken(token, {
       accountScope: activeAccountScope,
+      ...cloudMcpBillingEntitlementPayload(billingStatus, user),
       flowId: `scope-${activeAccountScopeKey}`,
     });
-  }, [activeAccountScope, activeAccountScopeKey, authState]);
+  }, [activeAccountScope, activeAccountScopeKey, authState, billingStatus, user]);
   useEffect(() => {
     if (authState !== "authenticated") {
       cloudMcpStartupWarmupKeyRef.current = "";
@@ -5734,6 +5787,7 @@ export default function App() {
         accountScope: activeAccountScope,
         connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
         connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
+        ...cloudMcpBillingEntitlementPayload(billingStatus, user),
         flowId: `startup-cloud-mcp-${activeAccountScopeKey}`,
         requireConnected: true,
       }).catch((error) => {
@@ -5758,6 +5812,8 @@ export default function App() {
     activeAccountScope,
     activeAccountScopeKey,
     authState,
+    billingStatus,
+    user,
   ]);
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
@@ -7167,6 +7223,7 @@ export default function App() {
       setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
     }
     void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
+      ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
       onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
     });
     terminalPresenceSyncKeyRef.current = "";
@@ -8305,6 +8362,7 @@ export default function App() {
             connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
             connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
             flowId: `restore-${validationFlowId}`,
+            ...cloudMcpBillingEntitlementPayload(billingStatus, session.user),
             onProgress: updateCloudWorkspaceProgress,
             requireConnected: true,
           });
@@ -8421,6 +8479,7 @@ export default function App() {
             connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
             connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
             flowId: callback.state,
+            ...cloudMcpBillingEntitlementPayload(billingStatus, session.user),
             onProgress: updateCloudWorkspaceProgress,
             requireConnected: true,
           });
@@ -12265,6 +12324,31 @@ export default function App() {
             const agentLabel = normalizedRole === WORKSPACE_TERMINAL_ROLE_GENERIC
               ? "Terminal"
               : getManagedAgentLabel(normalizedRole);
+            const agentType = String(
+              providerBinding?.agentType
+                || providerBinding?.agent_type
+                || liveTerminal?.agentType
+                || liveTerminal?.agent_type
+                || "",
+            ).trim();
+            const agentDisplayName = String(
+              providerBinding?.agentDisplayName
+                || providerBinding?.agent_display_name
+                || liveTerminal?.agentDisplayName
+                || liveTerminal?.agent_display_name
+                || agentType
+                || "",
+            ).trim();
+            const terminalName = String(
+              liveTerminal?.terminalName
+                || liveTerminal?.terminal_name
+                || liveTerminal?.displayName
+                || liveTerminal?.display_name
+                || providerBinding?.terminalName
+                || providerBinding?.terminal_name
+                || agentDisplayName
+                || agentLabel,
+            ).trim();
             const terminalInstanceId = terminalBinding?.instanceId || liveTerminal?.instanceId || "";
             const paneId = terminalBinding?.paneId
               || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, normalizedRole);
@@ -12285,6 +12369,10 @@ export default function App() {
               agentId: normalizedRole,
               agentKind: normalizedRole,
               agentLabel,
+              agentDisplayName,
+              agent_display_name: agentDisplayName,
+              agentType,
+              agent_type: agentType,
               activityStatus: nativeRailState,
               activity_status: nativeRailState,
               color,
@@ -12300,6 +12388,8 @@ export default function App() {
               terminalIndex,
               terminalInstanceId,
               terminalLifecycle,
+              terminalName,
+              terminal_name: terminalName,
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
               turnId: latestTurn?.id || latestTurn?.turnId || "",
               turnStatus,
@@ -12630,6 +12720,50 @@ export default function App() {
         || presenceTerminal?.agent_kind
         || "",
     ).trim().toLowerCase() || "terminal";
+    const agentLabel = String(
+      options.agentLabel
+        || options.agent_label
+        || event.agentLabel
+        || event.agent_label
+        || presenceTerminal?.agentLabel
+        || presenceTerminal?.agent_label
+        || getManagedAgentLabel(agentId),
+    ).trim() || getManagedAgentLabel(agentId);
+    const agentType = String(
+      options.agentType
+        || options.agent_type
+        || event.agentType
+        || event.agent_type
+        || presenceTerminal?.agentType
+        || presenceTerminal?.agent_type
+        || "",
+    ).trim();
+    const agentDisplayName = String(
+      options.agentDisplayName
+        || options.agent_display_name
+        || event.agentDisplayName
+        || event.agent_display_name
+        || presenceTerminal?.agentDisplayName
+        || presenceTerminal?.agent_display_name
+        || agentType
+        || "",
+    ).trim();
+    const terminalName = String(
+      options.terminalName
+        || options.terminal_name
+        || options.displayName
+        || options.display_name
+        || event.terminalName
+        || event.terminal_name
+        || event.displayName
+        || event.display_name
+        || presenceTerminal?.terminalName
+        || presenceTerminal?.terminal_name
+        || presenceTerminal?.displayName
+        || presenceTerminal?.display_name
+        || agentDisplayName
+        || agentLabel,
+    ).trim();
     const paneId = String(
       options.paneId
         || event.paneId
@@ -12751,9 +12885,11 @@ export default function App() {
     const terminalPayload = {
       agentId,
       agentKind: agentId,
-      agentLabel: presenceTerminal?.agentLabel
-        || presenceTerminal?.agent_label
-        || getManagedAgentLabel(agentId),
+      agentLabel,
+      agentDisplayName,
+      agent_display_name: agentDisplayName,
+      agentType,
+      agent_type: agentType,
       activityStatus: visibleActivityStatus,
       activity_status: visibleActivityStatus,
       color: presenceTerminal?.color || "",
@@ -12784,6 +12920,8 @@ export default function App() {
       terminalIndex: safeTerminalIndex,
       terminalInstanceId,
       terminalLifecycle,
+      terminalName,
+      terminal_name: terminalName,
       threadId,
       turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
       turnStatus,
@@ -14856,6 +14994,7 @@ export default function App() {
     let disposed = false;
     let unlistenRemoteCommand = null;
     let unlistenCreditWallet = null;
+    let unlistenDeviceDeleted = null;
 
     const remoteCommandText = (event) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
@@ -15091,6 +15230,20 @@ export default function App() {
       }
       return "";
     };
+    const remoteControlTerminalNameKey = (value) => String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "");
+    const remoteControlTerminalNameCandidates = (terminal) => [
+      terminal?.terminalName,
+      terminal?.terminal_name,
+      terminal?.displayName,
+      terminal?.display_name,
+      terminal?.agentDisplayName,
+      terminal?.agent_display_name,
+      terminal?.agentType,
+      terminal?.agent_type,
+    ].map((value) => String(value || "").trim()).filter(Boolean);
     const remoteControlTerminalNumber = (terminal, keys) => {
       for (const key of keys) {
         const number = Number.parseInt(terminal?.[key], 10);
@@ -15161,6 +15314,8 @@ export default function App() {
       const terminals = Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [];
       const targetTerminalId = String(target.targetTerminalId || "").trim();
       const targetThreadId = String(target.targetThreadId || "").trim();
+      const targetTerminalName = String(target.targetTerminalName || "").trim();
+      const targetTerminalNameKey = remoteControlTerminalNameKey(targetTerminalName);
       const targetTerminalIndex = Number.isInteger(target.targetTerminalIndex)
         ? target.targetTerminalIndex
         : null;
@@ -15181,6 +15336,10 @@ export default function App() {
       )) || terminals.find((candidate) => (
         Number.isInteger(targetTerminalIndex)
           && remoteControlTerminalNumber(candidate, ["terminalIndex", "terminal_index"]) === targetTerminalIndex
+      )) || terminals.find((candidate) => (
+        targetTerminalNameKey
+          && remoteControlTerminalNameCandidates(candidate)
+            .some((name) => remoteControlTerminalNameKey(name) === targetTerminalNameKey)
       )) || null;
       return {
         presenceWorkspace,
@@ -15192,6 +15351,7 @@ export default function App() {
       agentId: remoteControlTerminalText(terminal, ["agentId", "agent_id", "agentKind", "agent_kind"]) || fallback.agentId || "",
       paneId: remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]) || fallback.targetTerminalId || "",
       reason: fallback.reason || "",
+      terminalName: remoteControlTerminalText(terminal, ["terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"]) || fallback.targetTerminalName || "",
       terminalIndex: remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]) ?? fallback.targetTerminalIndex ?? null,
       threadId: remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || fallback.targetThreadId || "",
     });
@@ -15375,12 +15535,13 @@ export default function App() {
       event,
       targetTerminalId,
       targetTerminalIndex,
+      targetTerminalName,
       targetThreadId,
       workspaceId,
     }) => {
       const normalizedKind = commandKind.replace(/\./g, "_");
       const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
-      const target = { targetTerminalId, targetTerminalIndex, targetThreadId };
+      const target = { targetTerminalId, targetTerminalIndex, targetTerminalName, targetThreadId };
       await recordRemoteCommandStatus(event, "validating", "Desktop is validating the remote control command.");
       if (!targetWorkspace) {
         await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
@@ -15506,6 +15667,10 @@ export default function App() {
           setBillingStatusState("ready");
           setBillingStatusError("");
         });
+        unlistenDeviceDeleted = await listen(CLOUD_MCP_DEVICE_DELETED_EVENT, async () => {
+          if (disposed) return;
+          await logout();
+        });
         unlistenRemoteCommand = await listen(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
           if (disposed) return;
           const event = remoteEvent?.payload || {};
@@ -15553,7 +15718,7 @@ export default function App() {
               || event.payload?.targetAgentId
               || "",
           );
-          const targetTerminalId = remoteCommandStringField(event, [
+          let targetTerminalId = remoteCommandStringField(event, [
             "target_terminal_id",
             "targetTerminalId",
             "terminal_id",
@@ -15561,18 +15726,55 @@ export default function App() {
             "pane_id",
             "paneId",
           ]);
-          const targetTerminalIndex = remoteCommandIntegerField(event, [
+          let targetTerminalIndex = remoteCommandIntegerField(event, [
             "target_terminal_index",
             "targetTerminalIndex",
             "terminal_index",
             "terminalIndex",
           ]);
-          const targetThreadId = remoteCommandStringField(event, [
+          let targetThreadId = remoteCommandStringField(event, [
             "target_thread_id",
             "targetThreadId",
             "thread_id",
             "threadId",
           ]);
+          let targetTerminalName = remoteCommandStringField(event, [
+            "target_terminal_name",
+            "targetTerminalName",
+            "terminal_name",
+            "terminalName",
+            "target_name",
+            "targetName",
+            "name",
+          ]);
+          const resolvedRemoteTarget = workspaceId
+            ? findRemoteControlTerminal(workspaceId, {
+              targetTerminalId,
+              targetTerminalIndex,
+              targetTerminalName,
+              targetThreadId,
+            }).terminal
+            : null;
+          if (resolvedRemoteTarget) {
+            targetTerminalId = targetTerminalId || remoteControlTerminalText(
+              resolvedRemoteTarget,
+              ["paneId", "pane_id", "terminalId", "terminal_id"],
+            );
+            targetThreadId = targetThreadId || remoteControlTerminalText(
+              resolvedRemoteTarget,
+              ["threadId", "thread_id"],
+            );
+            targetTerminalName = targetTerminalName || remoteControlTerminalText(
+              resolvedRemoteTarget,
+              ["terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"],
+            );
+            if (!Number.isInteger(targetTerminalIndex)) {
+              targetTerminalIndex = remoteControlTerminalNumber(
+                resolvedRemoteTarget,
+                ["terminalIndex", "terminal_index"],
+              );
+            }
+          }
           const targetColorSlot = normalizeTerminalColorSlot(remoteCommandIntegerField(event, [
             "target_color_slot",
             "targetColorSlot",
@@ -15588,7 +15790,17 @@ export default function App() {
             "terminalColor",
             "color",
           ]);
-          const hasTerminalTarget = Boolean(targetTerminalId || targetThreadId || Number.isInteger(targetTerminalIndex));
+          const hasTerminalTarget = Boolean(
+            targetTerminalId
+              || targetThreadId
+              || Number.isInteger(targetTerminalIndex)
+              || targetTerminalName,
+          );
+          const hasResolvedTerminalTarget = Boolean(
+            targetTerminalId
+              || targetThreadId
+              || Number.isInteger(targetTerminalIndex),
+          );
           const targetTerminalColor = hasTerminalTarget
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
@@ -15642,6 +15854,7 @@ export default function App() {
                 event,
                 targetTerminalId,
                 targetTerminalIndex,
+                targetTerminalName,
                 targetThreadId,
                 workspaceId,
               });
@@ -15681,6 +15894,7 @@ export default function App() {
                   todoWorkspaceId,
                   targetTerminalId,
                   targetTerminalIndex,
+                  targetTerminalName,
                   targetThreadId,
                   ...(targetTerminalColor ? { targetTerminalColor } : {}),
                   ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
@@ -15692,6 +15906,7 @@ export default function App() {
                 ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
                 targetTerminalId,
                 targetTerminalIndex,
+                targetTerminalName,
                 targetThreadId,
                 text,
                 workspaceId,
@@ -15702,7 +15917,7 @@ export default function App() {
               workspaceName: targetWorkspace?.name || "",
             },
           }));
-          if (hasTerminalTarget) {
+          if (hasResolvedTerminalTarget) {
             terminalStatusEventEmitterRef.current?.({
               activityStatus: "queued",
               agentId: agentId || "",
@@ -15734,10 +15949,12 @@ export default function App() {
             "queued",
             Number.isInteger(targetTerminalIndex)
               ? `Queued for terminal ${targetTerminalIndex + 1}.`
-              : agentId
+              : targetTerminalName
+                ? `Queued for ${targetTerminalName}.`
+                : agentId
                 ? `Queued for ${getManagedAgentLabel(agentId)}.`
                 : "Queued for the next available terminal.",
-            { commandId, commandKind, workspaceId },
+            { commandId, commandKind, targetTerminalName, workspaceId },
           );
         });
       } catch (error) {
@@ -15757,8 +15974,11 @@ export default function App() {
       if (typeof unlistenCreditWallet === "function") {
         unlistenCreditWallet();
       }
+      if (typeof unlistenDeviceDeleted === "function") {
+        unlistenDeviceDeleted();
+      }
     };
-  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, refreshAgentStatuses, workspaces]);
+  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, workspaces]);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
@@ -18745,10 +18965,19 @@ export default function App() {
       const activityStatus = payload.activityStatus
         || (inputReady ? "idle" : "thinking");
       const hookAgentId = payload.agentId || payload.agentKind || "";
+      const hookAgentType = payload.agentType || payload.agent_type || "";
+      const hookAgentDisplayName = payload.agentDisplayName
+        || payload.agent_display_name
+        || hookAgentType
+        || payload.provider
+        || payload.agentKind
+        || "";
       let lifecycleEvent = {
         ...payload,
         activityStatus,
         agentId: hookAgentId,
+        agentDisplayName: hookAgentDisplayName,
+        agentType: hookAgentType,
         commandPhase: payload.commandPhase || (inputReady ? "completed" : "running"),
         completionEvidence: payload.completionEvidence || "cli-hook",
         completedAt: payload.completedAt || (inputReady ? new Date().toISOString() : ""),
@@ -18794,6 +19023,8 @@ export default function App() {
         acceptedPromptMatched: Boolean(acceptedPromptDetail),
         hookEventName: payload.hookEventName || "",
         hookHealthStatus: payload.hookHealthStatus || "",
+        agentDisplayNamePresent: Boolean(hookAgentDisplayName),
+        agentTypePresent: Boolean(hookAgentType),
         instanceId: payload.instanceId || "",
         inputReady,
         paneId: payload.paneId || "",

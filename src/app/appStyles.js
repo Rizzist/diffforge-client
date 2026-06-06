@@ -4546,19 +4546,61 @@ export const TerminalRestartPill = styled.div`
   top: 5px;
   left: 50%;
   z-index: 80;
-  display: inline-flex;
+  display: flex;
+  width: max-content;
   max-width: calc(100% - 24px);
-  height: 26px;
   min-height: 26px;
+  height: auto;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
+  align-content: center;
+  flex-wrap: wrap;
+  gap: 2px 3px;
   padding: 2px 5px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 14px;
   background: rgba(65, 71, 82, 0.58);
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
   transform: translateX(-50%);
   backdrop-filter: blur(10px);
+`;
+
+export const TerminalRailIdentity = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1 1 118px;
+`;
+
+export const TerminalAgentLabel = styled.span`
+  display: inline-block;
+  min-width: 0;
+  max-width: clamp(44px, 28vw, 168px);
+  overflow: hidden;
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  line-height: 1;
+  pointer-events: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(48, 54, 68, 0.86);
+  }
+`;
+
+export const TerminalRailControls = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  flex: 0 0 auto;
 `;
 
 export const TerminalAgentDot = styled.span`

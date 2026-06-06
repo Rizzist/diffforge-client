@@ -1280,6 +1280,80 @@ test("session transcript completion does not settle running turn for a later pro
   assert.equal(hydratedThread.activityStatus, "thinking");
 });
 
+test("terminal hook activity preserves agent display identity", () => {
+  const workspaceId = "workspace-agent-label";
+  const threadId = "thread-agent-label";
+  const paneId = "pane-agent-label";
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      terminalOrder: ["0"],
+      terminals: {
+        0: {
+          agentId: "codex",
+          instanceId: 1,
+          paneId,
+          status: "active",
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "idle",
+          currentAgent: "codex",
+          messages: [],
+          providerBindings: {
+            codex: {
+              activityStatus: "idle",
+              inputReady: true,
+              status: "active",
+              terminalBinding: {
+                instanceId: 1,
+                paneId,
+                terminalIndex: 0,
+              },
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId,
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const next = markWorkspaceThreadAgentActivity(state, {
+    activityStatus: "thinking",
+    agentDisplayName: "code-reviewer",
+    agentId: "codex",
+    agentType: "reviewer",
+    instanceId: 1,
+    paneId,
+    provider: "codex",
+    terminalIndex: 0,
+    threadId,
+    type: "provider-turn-started",
+    workspaceId,
+  });
+
+  const binding = next[workspaceId].threads[threadId].providerBindings.codex;
+  const terminal = next[workspaceId].terminals[0];
+  assert.equal(binding.agentDisplayName, "code-reviewer");
+  assert.equal(binding.agentType, "reviewer");
+  assert.equal(binding.provider, "codex");
+  assert.equal(terminal.agentDisplayName, "code-reviewer");
+  assert.equal(terminal.agentType, "reviewer");
+  assert.equal(terminal.provider, "codex");
+});
+
 test("provider turn interruption settles running thread and keeps terminal input ready", () => {
   const workspaceId = "workspace-interrupt";
   const threadId = "thread-interrupt";

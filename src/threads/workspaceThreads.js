@@ -895,6 +895,10 @@ function cleanAgentId(value, fallback = DEFAULT_AGENT_ID) {
   return agentId || fallback;
 }
 
+function cleanAgentDisplayName(value, fallback = "") {
+  return cleanThreadLabelCandidate(value || fallback);
+}
+
 function isThreadAgentId(value) {
   return THREAD_AGENT_IDS.includes(cleanAgentId(value, ""));
 }
@@ -2521,6 +2525,8 @@ function normalizeActiveTerminal(value) {
 
   return {
     agentId: cleanAgentId(value.agentId || value.currentAgent),
+    agentDisplayName: cleanAgentDisplayName(value.agentDisplayName || value.agent_display_name),
+    agentType: cleanAgentDisplayName(value.agentType || value.agent_type),
     instanceId: Number.isInteger(instanceId) && instanceId > 0 ? instanceId : 0,
     inputReady: value.inputReady === true,
     inputReadyAt: cleanText(value.inputReadyAt),
@@ -2530,6 +2536,7 @@ function normalizeActiveTerminal(value) {
     paneId,
     ...promptingUserFields(value),
     fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
+    provider: cleanAgentDisplayName(value.provider),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
     sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
@@ -2557,6 +2564,14 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
 
   return {
     agentId: safeAgentId,
+    agentDisplayName: cleanAgentDisplayName(
+      binding.agentDisplayName || binding.agent_display_name,
+      fallback.agentDisplayName || fallback.agent_display_name,
+    ),
+    agentType: cleanAgentDisplayName(
+      binding.agentType || binding.agent_type,
+      fallback.agentType || fallback.agent_type,
+    ),
     coordination: normalizeCoordination(binding.coordination || fallback.coordination),
     activityStatus: options.stripLiveBindings
       ? "idle"
@@ -2606,6 +2621,7 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     nativeSessionTitleSource: cleanText(binding.nativeSessionTitleSource, fallback.nativeSessionTitleSource),
     nativeSessionTitleUpdatedAt: cleanText(binding.nativeSessionTitleUpdatedAt, fallback.nativeSessionTitleUpdatedAt),
     nativeSessionUpdatedAt: cleanText(binding.nativeSessionUpdatedAt, fallback.nativeSessionUpdatedAt),
+    provider: cleanAgentDisplayName(binding.provider, fallback.provider),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
     terminalBinding,
     updatedAt: cleanText(binding.updatedAt, fallback.updatedAt || nowIso()),
@@ -3512,8 +3528,18 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     clear: terminalReadinessIgnoredEvent ? false : marksInputBusy || marksInputReady,
     eventType,
   });
+  const agentType = cleanAgentDisplayName(
+    event.agentType || event.agent_type,
+    existing.agentType || existing.agent_type,
+  );
+  const agentDisplayName = cleanAgentDisplayName(
+    event.agentDisplayName || event.agent_display_name || agentType,
+    existing.agentDisplayName || existing.agent_display_name,
+  );
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
+    agentDisplayName,
+    agentType,
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
@@ -3522,6 +3548,7 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     lastActiveAt: now,
     paneId: event.paneId || existing.paneId,
     ...terminalPromptingFields,
+    provider: event.provider || existing.provider,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
     terminalIndex,
@@ -3708,6 +3735,14 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     : existingProviderBindings;
   const latestTurn = shouldClearOrphanRunning ? null : normalizeThreadLatestTurn(existing.latestTurn);
   const providerBinding = normalizeProviderBinding(baseProviderBindings[agentId], agentId, {
+    agentDisplayName: event.agentDisplayName
+      || event.agent_display_name
+      || activeTerminal?.agentDisplayName
+      || activeTerminal?.agent_display_name,
+    agentType: event.agentType
+      || event.agent_type
+      || activeTerminal?.agentType
+      || activeTerminal?.agent_type,
     coordination,
     inputReady: Boolean(activeTerminal?.inputReady),
     inputReadyAt: activeTerminal?.inputReadyAt || "",
@@ -3715,6 +3750,7 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     lastActiveAt: now,
     lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
     messageCount: nextMessageCount,
+    provider: event.provider || activeTerminal?.provider,
     status: safeStatus,
     terminalBinding,
     updatedAt: now,
@@ -3736,8 +3772,23 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     [agentId]: {
       ...providerBinding,
       activityStatus,
+      agentDisplayName: cleanAgentDisplayName(
+        event.agentDisplayName
+          || event.agent_display_name
+          || activeTerminal?.agentDisplayName
+          || activeTerminal?.agent_display_name,
+        providerBinding?.agentDisplayName,
+      ),
+      agentType: cleanAgentDisplayName(
+        event.agentType
+          || event.agent_type
+          || activeTerminal?.agentType
+          || activeTerminal?.agent_type,
+        providerBinding?.agentType,
+      ),
       coordination,
       inputReady: Boolean(activeTerminal?.inputReady),
+      provider: cleanAgentDisplayName(event.provider || activeTerminal?.provider, providerBinding?.provider),
       inputReadyAt: activeTerminal?.inputReadyAt || "",
       inputReadyConfidence: activeTerminal?.inputReadyConfidence || "",
       lastActiveAt: now,
@@ -5407,6 +5458,18 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
     eventType,
   });
+  const eventAgentType = cleanAgentDisplayName(
+    event.agentType || event.agent_type,
+    existingProviderBindingForAgent?.agentType,
+  );
+  const eventAgentDisplayName = cleanAgentDisplayName(
+    event.agentDisplayName || event.agent_display_name || eventAgentType,
+    existingProviderBindingForAgent?.agentDisplayName,
+  );
+  const eventProvider = cleanAgentDisplayName(
+    event.provider,
+    existingProviderBindingForAgent?.provider,
+  );
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
   let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
@@ -5429,6 +5492,8 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     providerBindings[agentId] = {
       ...providerBindings[agentId],
       activityStatus,
+      agentDisplayName: eventAgentDisplayName,
+      agentType: eventAgentType,
       lastActiveAt: now,
       lastMessageAt: messages.length ? messages[messages.length - 1].createdAt : providerBindings[agentId].lastMessageAt,
       messageCount: messages.length,
@@ -5444,6 +5509,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       nativeSessionKind: cleanText(event.nativeSessionKind, providerBindings[agentId].nativeSessionKind || "session"),
       nativeSessionSource: cleanText(event.nativeSessionSource, providerBindings[agentId].nativeSessionSource || "provider-turn"),
       nativeSessionUpdatedAt: cleanText(event.nativeSessionId || event.providerSessionId) ? now : providerBindings[agentId].nativeSessionUpdatedAt,
+      provider: eventProvider,
       status: cleanText(event.status, existing.status || providerBindings[agentId].status || "active"),
       updatedAt: now,
     };
@@ -5462,7 +5528,13 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       inputReadyAt,
       inputReadyConfidence,
       ...hookHealthFields(event, terminals[terminalKey]),
+      agentDisplayName: cleanAgentDisplayName(
+        event.agentDisplayName || event.agent_display_name || eventAgentType,
+        terminals[terminalKey].agentDisplayName,
+      ),
+      agentType: cleanAgentDisplayName(event.agentType || event.agent_type, terminals[terminalKey].agentType),
       ...terminalPromptingFields,
+      provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
       updatedAt: now,
     };
   }
@@ -5572,14 +5644,26 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
     clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
     eventType,
   });
+  const eventAgentType = cleanAgentDisplayName(
+    event.agentType || event.agent_type,
+    previousProviderBinding?.agentType,
+  );
+  const eventAgentDisplayName = cleanAgentDisplayName(
+    event.agentDisplayName || event.agent_display_name || eventAgentType,
+    previousProviderBinding?.agentDisplayName,
+  );
+  const eventProvider = cleanAgentDisplayName(event.provider, previousProviderBinding?.provider);
   providerBindings[agentId] = {
     ...previousProviderBinding,
     activityStatus,
+    agentDisplayName: eventAgentDisplayName,
+    agentType: eventAgentType,
     ...hookHealthFields(event, previousProviderBinding),
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
     ...providerPromptingFields,
+    provider: eventProvider,
     status: providerStatus,
     updatedAt: now,
   };
@@ -5596,7 +5680,13 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       inputReadyAt,
       inputReadyConfidence,
       ...hookHealthFields(event, terminals[terminalKey]),
+      agentDisplayName: cleanAgentDisplayName(
+        event.agentDisplayName || event.agent_display_name || eventAgentType,
+        terminals[terminalKey].agentDisplayName,
+      ),
+      agentType: cleanAgentDisplayName(event.agentType || event.agent_type, terminals[terminalKey].agentType),
       ...terminalPromptingFields,
+      provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
       status: eventStatus || terminals[terminalKey].status,
       updatedAt: now,
     };

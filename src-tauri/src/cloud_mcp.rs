@@ -19,6 +19,7 @@ const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
 const CLOUD_MCP_RUST_CLIENT_ID: &str = "rust-diffforge-agent";
 const CLOUD_MCP_DESKTOP_USER_AGENT: &str = "DiffForgeDesktop/0.1";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
+const CLOUD_MCP_DEVICE_DELETED_EVENT: &str = "cloud-mcp-device-deleted";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT: &str = "cloud-mcp-task-history-updated";
@@ -97,6 +98,8 @@ struct CloudMcpAuthRuntime {
     appwrite_jwt_expires_ms: Option<u64>,
     billing_scope_type: String,
     team_id: Option<String>,
+    plan_name: String,
+    device_limit: Option<u64>,
 }
 
 #[derive(Default)]
@@ -106,6 +109,8 @@ struct CloudMcpProcessAuthCache {
     appwrite_jwt_expires_ms: Option<u64>,
     billing_scope_type: String,
     team_id: Option<String>,
+    plan_name: String,
+    device_limit: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -977,6 +982,8 @@ fn cloud_mcp_update_process_auth_cache(
     appwrite_jwt_expires_ms: Option<u64>,
     billing_scope_type: Option<String>,
     team_id: Option<String>,
+    plan_name: Option<String>,
+    device_limit: Option<u64>,
 ) {
     let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() else {
         return;
@@ -998,6 +1005,11 @@ fn cloud_mcp_update_process_auth_cache(
     if let Some(billing_scope_type) = billing_scope_type {
         cache.billing_scope_type = billing_scope_type;
         cache.team_id = team_id;
+    }
+    if plan_name.is_some() || device_limit.is_some() {
+        let plan_name = cloud_mcp_plan_name_from_value(plan_name.or_else(|| Some(cache.plan_name.clone())));
+        cache.device_limit = cloud_mcp_device_limit_from_value(device_limit, &plan_name);
+        cache.plan_name = plan_name;
     }
 }
 
@@ -1028,9 +1040,44 @@ fn cloud_mcp_account_scope_from_values(
     ("personal".to_string(), None)
 }
 
+fn cloud_mcp_plan_name_from_value(value: Option<String>) -> String {
+    let Some(value) = value else {
+        return "plus".to_string();
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "free" => "free".to_string(),
+        "plus" => "plus".to_string(),
+        "pro" => "pro".to_string(),
+        "ultra" => "ultra".to_string(),
+        _ => "plus".to_string(),
+    }
+}
+
+fn cloud_mcp_device_limit_for_plan(plan_name: &str) -> u64 {
+    match plan_name {
+        "free" => 0,
+        "pro" => 7,
+        "ultra" => 20,
+        _ => 3,
+    }
+}
+
+fn cloud_mcp_device_limit_from_value(value: Option<u64>, plan_name: &str) -> Option<u64> {
+    value
+        .filter(|limit| *limit <= 10_000)
+        .or_else(|| Some(cloud_mcp_device_limit_for_plan(plan_name)))
+}
+
 async fn cloud_mcp_account_scope(state: &CloudMcpState) -> (String, Option<String>) {
     let auth = state.auth.lock().await;
     cloud_mcp_account_scope_from_values(Some(auth.billing_scope_type.clone()), auth.team_id.clone())
+}
+
+async fn cloud_mcp_account_plan(state: &CloudMcpState) -> (String, Option<u64>) {
+    let auth = state.auth.lock().await;
+    let plan_name = cloud_mcp_plan_name_from_value(Some(auth.plan_name.clone()));
+    let device_limit = cloud_mcp_device_limit_from_value(auth.device_limit, &plan_name);
+    (plan_name, device_limit)
 }
 
 fn cloud_mcp_process_account_scope() -> (String, Option<String>) {
@@ -1041,6 +1088,15 @@ fn cloud_mcp_process_account_scope() -> (String, Option<String>) {
         Some(cache.billing_scope_type.clone()),
         cache.team_id.clone(),
     )
+}
+
+fn cloud_mcp_process_account_plan() -> (String, Option<u64>) {
+    let Ok(cache) = cloud_mcp_process_auth_cache().lock() else {
+        return ("plus".to_string(), Some(3));
+    };
+    let plan_name = cloud_mcp_plan_name_from_value(Some(cache.plan_name.clone()));
+    let device_limit = cloud_mcp_device_limit_from_value(cache.device_limit, &plan_name);
+    (plan_name, device_limit)
 }
 
 fn cloud_mcp_process_known_account_scope() -> Option<(String, Option<String>)> {
@@ -1116,6 +1172,8 @@ async fn cloud_mcp_authorization_bearer(state: &CloudMcpState) -> Result<Option<
             Some(expires_ms),
             None,
             None,
+            None,
+            None,
         );
         return Ok(Some(jwt));
     }
@@ -1154,6 +1212,8 @@ fn cloud_mcp_process_authorization_bearer() -> Option<String> {
                 Some(desktop_session_token),
                 Some(jwt.clone()),
                 Some(expires_ms),
+                None,
+                None,
                 None,
                 None,
             );
@@ -1791,6 +1851,7 @@ async fn cloud_mcp_open_global_ws(
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
         String,
@@ -1823,6 +1884,18 @@ async fn cloud_mcp_open_global_ws(
             HeaderValue::from_str(&billing_scope_type)
                 .map_err(|error| format!("Invalid Cloud MCP scope header: {error}"))?,
         );
+        request.headers_mut().insert(
+            "x-diffforge-plan-name",
+            HeaderValue::from_str(&plan_name)
+                .map_err(|error| format!("Invalid Cloud MCP plan header: {error}"))?,
+        );
+        if let Some(device_limit) = device_limit {
+            request.headers_mut().insert(
+                "x-diffforge-device-limit",
+                HeaderValue::from_str(&device_limit.to_string())
+                    .map_err(|error| format!("Invalid Cloud MCP device limit header: {error}"))?,
+            );
+        }
         if billing_scope_type == "team" {
             if let Some(team_id) = team_id.as_deref() {
                 request.headers_mut().insert(
@@ -2238,6 +2311,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         )
         .await;
         let device_profile = cloud_mcp_desktop_device_profile();
+        let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
         let connection_epoch = state.global_ws_epoch.load(Ordering::SeqCst);
         let hello = json!({
             "kind": "hello",
@@ -2254,6 +2328,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "client_kind": device_profile["client_kind"].clone(),
             "client_type": device_profile["client_type"].clone(),
             "connection_source": device_profile["connection_source"].clone(),
+            "plan_name": plan_name,
+            "device_limit": device_limit,
             "contract": "diffforge.app_ws.v1",
             "auth": {
                 "connection_id": connection_id.clone(),
@@ -2766,6 +2842,12 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             if event_kind == "tokenomics_refresh_requested" {
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                continue;
+            }
+            if event_kind == "device_deleted" || event_kind == "device.removed" {
+                if cloud_mcp_remote_command_matches_device(&event) {
+                    let _ = app.emit(CLOUD_MCP_DEVICE_DELETED_EVENT, event.clone());
+                }
                 continue;
             }
             if cloud_mcp_is_tokenomics_state_event(&event_kind) {
@@ -3294,6 +3376,7 @@ async fn cloud_mcp_resolve_ws_target(
     };
 
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
+    let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
     cloud_mcp_set_global_ws_phase(state, "resolving_route", "resolving_route").await;
     match cloud_mcp_fetch_direct_route_async(
         base_url,
@@ -3301,6 +3384,8 @@ async fn cloud_mcp_resolve_ws_target(
         &bearer,
         &billing_scope_type,
         team_id.as_deref(),
+        &plan_name,
+        device_limit,
     )
     .await
     {
@@ -3438,6 +3523,8 @@ async fn cloud_mcp_fetch_direct_route_async(
     bearer: &str,
     billing_scope_type: &str,
     team_id: Option<&str>,
+    plan_name: &str,
+    device_limit: Option<u64>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({
@@ -3445,6 +3532,8 @@ async fn cloud_mcp_fetch_direct_route_async(
         "billingScopeType": billing_scope_type,
         "scopeType": billing_scope_type,
         "teamId": team_id,
+        "planName": plan_name,
+        "deviceLimit": device_limit,
     });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -3455,8 +3544,14 @@ async fn cloud_mcp_fetch_direct_route_async(
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
         .header("x-diffforge-scope-type", billing_scope_type)
+        .header("x-diffforge-plan-name", plan_name)
         .headers({
             let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(device_limit) = device_limit {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_limit.to_string()) {
+                    headers.insert("x-diffforge-device-limit", value);
+                }
+            }
             if billing_scope_type == "team" {
                 if let Some(team_id) = team_id {
                     if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
@@ -8339,6 +8434,8 @@ async fn cloud_mcp_set_desktop_session_token(
     token: Option<String>,
     scope_type: Option<String>,
     team_id: Option<String>,
+    plan_name: Option<String>,
+    device_limit: Option<u64>,
 ) -> Result<CloudMcpStatus, String> {
     let token = token
         .unwrap_or_default()
@@ -8352,6 +8449,8 @@ async fn cloud_mcp_set_desktop_session_token(
         Some(token)
     };
     let (billing_scope_type, team_id) = cloud_mcp_account_scope_from_values(scope_type, team_id);
+    let plan_name = cloud_mcp_plan_name_from_value(plan_name);
+    let device_limit = cloud_mcp_device_limit_from_value(device_limit, &plan_name);
 
     {
         let mut auth = state.auth.lock().await;
@@ -8360,6 +8459,8 @@ async fn cloud_mcp_set_desktop_session_token(
         auth.appwrite_jwt_expires_ms = None;
         auth.billing_scope_type = billing_scope_type.clone();
         auth.team_id = team_id.clone();
+        auth.plan_name = plan_name.clone();
+        auth.device_limit = device_limit;
     }
     cloud_mcp_update_process_auth_cache(
         desktop_session_token,
@@ -8367,6 +8468,8 @@ async fn cloud_mcp_set_desktop_session_token(
         None,
         Some(billing_scope_type),
         team_id,
+        Some(plan_name),
+        device_limit,
     );
 
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
@@ -9040,6 +9143,10 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "terminal_index": payload.terminal_index,
         "terminal_epoch": format!("{}:{}", terminal_id, payload.instance_id),
         "agent_kind": payload.agent_kind,
+        "agent_type": payload.agent_type.as_str(),
+        "agentType": payload.agent_type.as_str(),
+        "agent_display_name": payload.agent_display_name.as_str(),
+        "agentDisplayName": payload.agent_display_name.as_str(),
         "provider": payload.provider,
         "event_type": payload.event_type,
         "hook_event_name": payload.hook_event_name,
@@ -13951,6 +14058,7 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
     let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+    let (plan_name, device_limit) = cloud_mcp_process_account_plan();
     let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
@@ -13985,6 +14093,18 @@ fn cloud_mcp_proxy_post_json_endpoint(
             HeaderValue::from_str(&billing_scope_type)
                 .map_err(|error| format!("Invalid Cloud MCP scope header: {error}"))?,
         );
+        request.headers_mut().insert(
+            "x-diffforge-plan-name",
+            HeaderValue::from_str(&plan_name)
+                .map_err(|error| format!("Invalid Cloud MCP plan header: {error}"))?,
+        );
+        if let Some(device_limit) = device_limit {
+            request.headers_mut().insert(
+                "x-diffforge-device-limit",
+                HeaderValue::from_str(&device_limit.to_string())
+                    .map_err(|error| format!("Invalid Cloud MCP device limit header: {error}"))?,
+            );
+        }
         if billing_scope_type == "team" {
             if let Some(team_id) = team_id.as_deref() {
                 request.headers_mut().insert(
@@ -14056,6 +14176,8 @@ fn cloud_mcp_proxy_post_json_endpoint(
         "workspace_id": workspace_id,
         "billing_scope_type": billing_scope_type,
         "team_id": team_id,
+        "plan_name": plan_name,
+        "device_limit": device_limit,
         "request": body_value,
     });
     websocket
@@ -14132,12 +14254,15 @@ fn cloud_mcp_proxy_resolve_blocking_target(
         return fallback;
     };
     let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+    let (plan_name, device_limit) = cloud_mcp_process_account_plan();
     match cloud_mcp_fetch_direct_route_blocking(
         base_url,
         endpoint_path,
         &bearer,
         &billing_scope_type,
         team_id.as_deref(),
+        &plan_name,
+        device_limit,
     ) {
         Ok(Some(target)) => target,
         _ => fallback,
@@ -14150,6 +14275,8 @@ fn cloud_mcp_fetch_direct_route_blocking(
     bearer: &str,
     billing_scope_type: &str,
     team_id: Option<&str>,
+    plan_name: &str,
+    device_limit: Option<u64>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({
@@ -14157,6 +14284,8 @@ fn cloud_mcp_fetch_direct_route_blocking(
         "billingScopeType": billing_scope_type,
         "scopeType": billing_scope_type,
         "teamId": team_id,
+        "planName": plan_name,
+        "deviceLimit": device_limit,
     });
     let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -14167,8 +14296,14 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
         .header("x-diffforge-scope-type", billing_scope_type)
+        .header("x-diffforge-plan-name", plan_name)
         .headers({
             let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(device_limit) = device_limit {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_limit.to_string()) {
+                    headers.insert("x-diffforge-device-limit", value);
+                }
+            }
             if billing_scope_type == "team" {
                 if let Some(team_id) = team_id {
                     if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
