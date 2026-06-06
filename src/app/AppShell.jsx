@@ -1021,6 +1021,11 @@ const APP_THEME_OPTIONS = [
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
 const WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS = 240;
 const WORKSPACE_ACTIVE_SWITCH_OPENING_MS = 90;
+const WORKSPACE_APP_STARTUP_SCAN_IDLE_DELAY_MS = 700;
+const WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS = 450;
+const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
+const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
+const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -4725,6 +4730,51 @@ function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
   ].join(":");
 }
 
+function scheduleWorkspaceStartupIdleTask(callback, options = {}) {
+  if (typeof callback !== "function") {
+    return () => {};
+  }
+
+  if (typeof window === "undefined") {
+    callback();
+    return () => {};
+  }
+
+  const delayMs = Math.max(0, Number(options.delayMs || 0));
+  const timeoutMs = Math.max(1, Number(options.timeoutMs || WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS));
+  let idleId = 0;
+  let timeoutId = 0;
+  let cancelled = false;
+
+  const run = () => {
+    if (cancelled) {
+      return;
+    }
+    callback();
+  };
+
+  timeoutId = window.setTimeout(() => {
+    timeoutId = 0;
+    if (typeof window.requestIdleCallback === "function") {
+      idleId = window.requestIdleCallback(run, { timeout: timeoutMs });
+      return;
+    }
+    run();
+  }, delayMs);
+
+  return () => {
+    cancelled = true;
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      timeoutId = 0;
+    }
+    if (idleId && typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(idleId);
+      idleId = 0;
+    }
+  };
+}
+
 function getWorkspaceRailInitials(name) {
   const parts = String(name || "Workspace")
     .trim()
@@ -5239,6 +5289,7 @@ export default function App() {
   const tokenomicsSyncInFlightRef = useRef(false);
   const tokenomicsSyncPendingRefreshRef = useRef(false);
   const tokenomicsForceResyncRef = useRef(null);
+  const cloudMcpStartupWarmupKeyRef = useRef("");
   const workspaceCoordinationTargetsCacheRef = useRef(new Map());
   const workspaceCoordinationTargetsStateKeyRef = useRef("");
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
@@ -5524,6 +5575,59 @@ export default function App() {
       flowId: `scope-${activeAccountScopeKey}`,
     });
   }, [activeAccountScope, activeAccountScopeKey, authState]);
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      cloudMcpStartupWarmupKeyRef.current = "";
+      return undefined;
+    }
+
+    const token = authStore.getToken();
+    if (!isSafeAuthValue(token)) {
+      cloudMcpStartupWarmupKeyRef.current = "";
+      return undefined;
+    }
+
+    const warmupKey = `${activeAccountScopeKey}:${token}`;
+    if (cloudMcpStartupWarmupKeyRef.current === warmupKey) {
+      return undefined;
+    }
+    cloudMcpStartupWarmupKeyRef.current = warmupKey;
+
+    let disposed = false;
+    const cancelWarmup = scheduleWorkspaceStartupIdleTask(() => {
+      if (disposed) {
+        return;
+      }
+
+      void syncCloudMcpDesktopSessionToken(token, {
+        accountScope: activeAccountScope,
+        connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
+        connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
+        flowId: `startup-cloud-mcp-${activeAccountScopeKey}`,
+        requireConnected: true,
+      }).catch((error) => {
+        if (disposed) {
+          return;
+        }
+        logBigViewSyncDiagnosticEvent("cloud_mcp.startup_warmup.failed", {
+          message: getErrorMessage(error, "Unable to warm Cloud MCP connection."),
+          scope: activeAccountScopeKey,
+        });
+      });
+    }, {
+      delayMs: WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS,
+      timeoutMs: WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS,
+    });
+
+    return () => {
+      disposed = true;
+      cancelWarmup();
+    };
+  }, [
+    activeAccountScope,
+    activeAccountScopeKey,
+    authState,
+  ]);
   const activeWorkspaceHydrationRoot = activatedWorkspaceId
     ? getWorkspaceRootDirectory(workspaceSettings, activatedWorkspaceId) || defaultWorkingDirectory
     : "";
@@ -11643,6 +11747,85 @@ export default function App() {
     workspaceRuntimeThreadSignature,
     workspaces,
   ]);
+  const workspaceStartupWarmupTargets = useMemo(() => {
+    const targets = [];
+    const seen = new Set();
+
+    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
+      const workspaceId = String(descriptor.workspace?.id || "").trim();
+      const repoPath = cleanWorkspaceRootDirectory(descriptor.workingDirectory || "");
+      const key = `${workspaceId}:${getWorkspaceRootIdentity(repoPath)}`;
+      if (!workspaceId || !repoPath || seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      targets.push({
+        key,
+        repoPath,
+        workspaceId,
+        workspaceName: descriptor.workspace?.name || "",
+      });
+    });
+
+    return targets;
+  }, [enabledWorkspaceRuntimeDescriptors]);
+  const workspaceStartupWarmupTargetKey = useMemo(
+    () => JSON.stringify(workspaceStartupWarmupTargets.map((target) => [
+      target.workspaceId,
+      getWorkspaceRootIdentity(target.repoPath),
+      target.workspaceName,
+    ])),
+    [workspaceStartupWarmupTargets],
+  );
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || shouldShowWorkspaceSetup
+      || !workspaceStartupWarmupTargets.length
+    ) {
+      return undefined;
+    }
+
+    let disposed = false;
+    const cancelTasks = workspaceStartupWarmupTargets.map((target, index) => (
+      scheduleWorkspaceStartupIdleTask(() => {
+        if (disposed) {
+          return;
+        }
+
+        startWorkspaceArchitectureScan(target.workspaceId, {
+          reason: "app_startup_idle",
+          rootDirectory: target.repoPath,
+        });
+      }, {
+        delayMs: WORKSPACE_APP_STARTUP_SCAN_IDLE_DELAY_MS
+          + (index * WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS),
+        timeoutMs: WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS,
+      })
+    ));
+
+    logWorkspaceActivationTrace("workspace.open.architecture_scan.startup_scheduled", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+      targetCount: workspaceStartupWarmupTargets.length,
+      targets: workspaceStartupWarmupTargets.map((target) => ({
+        repoPath: target.repoPath,
+        workspaceId: target.workspaceId,
+        workspaceName: target.workspaceName,
+      })),
+    });
+
+    return () => {
+      disposed = true;
+      cancelTasks.forEach((cancelTask) => cancelTask());
+    };
+  }, [
+    authState,
+    logWorkspaceActivationTrace,
+    shouldShowWorkspaceSetup,
+    startWorkspaceArchitectureScan,
+    workspaceStartupWarmupTargetKey,
+    workspaceStartupWarmupTargets,
+  ]);
   useEffect(() => {
     const snapshot = workspaceRuntimeDescriptorBuildRef.current;
     if (!snapshot) {
@@ -12991,8 +13174,6 @@ export default function App() {
     if (
       authState !== "authenticated"
       || !isPaidUser(user)
-      || !workspaceHydrationReady
-      || workspaceActivationDeferred
       || shouldShowWorkspaceSetup
       || workspaceSyncState === "loading"
     ) {
@@ -13001,52 +13182,24 @@ export default function App() {
         isPaidUser: isPaidUser(user),
         reason: "gate_not_ready",
         shouldShowWorkspaceSetup,
-        workspaceActivationDeferred,
-        workspaceHydrationReady,
         workspaceSyncState,
       });
       return;
     }
 
-    const targets = [];
-    const seen = new Set();
-    const addTarget = (workspace, repoPath) => {
-      const workspaceId = String(workspace?.id || "").trim();
-      const rootDirectory = String(repoPath || "").trim();
-      if (!workspaceId || !rootDirectory) {
-        return;
-      }
-      const key = `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
-      if (seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
-        return;
-      }
-      seen.add(key);
-      targets.push({
-        key,
-        repoPath: rootDirectory,
-        workspaceId,
-        workspaceName: workspace?.name || "",
-      });
-    };
-
-    addTarget(selectedWorkspace, selectedWorkspaceRootDirectory || defaultWorkingDirectory);
-    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
-      addTarget(descriptor.workspace, descriptor.workingDirectory);
-    });
+    const targets = workspaceStartupWarmupTargets.filter((target) => (
+      !workspaceMcpStartupIndexKeysRef.current.has(target.key)
+    ));
 
     if (!targets.length) {
-      const emptyKey = JSON.stringify([
-        selectedWorkspace?.id || "",
-        selectedWorkspaceRootDirectory || defaultWorkingDirectory || "",
-        enabledWorkspaceRuntimeDescriptors.map((descriptor) => [
-          descriptor.workspace?.id || "",
-          descriptor.workingDirectory || "",
-        ]),
-      ]);
+      const emptyKey = workspaceStartupWarmupTargetKey;
       if (workspaceMcpStartupIndexEmptyKeyRef.current !== emptyKey) {
         workspaceMcpStartupIndexEmptyKeyRef.current = emptyKey;
         logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-          selectedWorkspaceId: selectedWorkspace?.id || "",
+          reason: workspaceStartupWarmupTargets.length
+            ? "already_indexed_or_in_flight"
+            : "no_startup_warmup_targets",
+          targetCount: workspaceStartupWarmupTargets.length,
         });
       }
       return undefined;
@@ -13054,7 +13207,6 @@ export default function App() {
     workspaceMcpStartupIndexEmptyKeyRef.current = "";
 
     let disposed = false;
-    let timer = 0;
     const indexTargets = () => {
       if (disposed) {
         return;
@@ -13101,48 +13253,51 @@ export default function App() {
         });
       });
     };
-    const hotDelayMs = getTerminalInputHotDelayMs(250);
-    logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.scheduled", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+    const hotDelayMs = getTerminalInputHotDelayMs(1000);
+    const delayMs = Math.max(
+      WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS,
       hotDelayMs,
+    );
+    logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.scheduled", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+      delayMs,
+      hotDelayMs,
+      mode: "app_startup_idle",
       targetCount: targets.length,
     });
-    timer = window.setTimeout(indexTargets, hotDelayMs);
+    const cancelIndexTargets = scheduleWorkspaceStartupIdleTask(indexTargets, {
+      delayMs,
+      timeoutMs: WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS,
+    });
     return () => {
       disposed = true;
-      if (timer) {
-        window.clearTimeout(timer);
-      }
+      cancelIndexTargets();
     };
   }, [
     authState,
-    defaultWorkingDirectory,
-    enabledWorkspaceRuntimeDescriptors,
     getTerminalInputHotDelayMs,
     logWorkspaceActivationTrace,
-    selectedWorkspace,
-    selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
     user,
-    workspaceHydrationReady,
-    workspaceActivationDeferred,
+    workspaceStartupWarmupTargetKey,
+    workspaceStartupWarmupTargets,
     workspaceSyncState,
   ]);
 
   useEffect(() => {
-    if (!workspaceHydrationReady || workspaceActivationDeferred) {
+    if (authState !== "authenticated" || shouldShowWorkspaceSetup) {
       logWorkspaceActivationTrace("workspace.open.shared_mcp.skip", activatedWorkspaceId || selectedWorkspaceId, {
-        reason: !workspaceHydrationReady ? "hydration_not_ready" : "activation_deferred",
-        workspaceActivationDeferred,
-        workspaceHydrationReady,
+        authState,
+        reason: authState !== "authenticated" ? "auth_not_ready" : "workspace_setup",
+        shouldShowWorkspaceSetup,
       });
       return;
     }
 
     const desiredTargets = new Map();
 
-    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
-      const workspaceId = descriptor.workspace?.id || "";
-      const repoPath = descriptor.workingDirectory || "";
+    workspaceStartupWarmupTargets.forEach((target) => {
+      const workspaceId = target.workspaceId || "";
+      const repoPath = target.repoPath || "";
       const runtimeKey = workspaceRuntimeActivationKey(workspaceId, repoPath);
 
       if (!runtimeKey) {
@@ -13152,7 +13307,7 @@ export default function App() {
       desiredTargets.set(runtimeKey, {
         repoPath,
         workspaceId,
-        workspaceName: descriptor.workspace?.name || "",
+        workspaceName: target.workspaceName || "",
       });
     });
 
@@ -13251,11 +13406,12 @@ export default function App() {
     });
   }, [
     activatedWorkspaceId,
-    enabledWorkspaceRuntimeDescriptors,
+    authState,
     logWorkspaceActivationTrace,
     selectedWorkspaceId,
-    workspaceActivationDeferred,
-    workspaceHydrationReady,
+    shouldShowWorkspaceSetup,
+    workspaceStartupWarmupTargetKey,
+    workspaceStartupWarmupTargets,
   ]);
   const isActivatedWorkspaceDeactivating = Boolean(
     workspaceDeactivationState.isActive

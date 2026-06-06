@@ -23811,7 +23811,7 @@ fn codex_managed_git_routes_for_general_worker_root(
             repo_root: write_root.to_path_buf(),
         });
     }
-    for repo_root in discover_nested_git_roots(write_root, 8, 256) {
+    for repo_root in discover_nested_git_roots(write_root, 4, 256) {
         routes.push(CodexManagedGitRoute { repo_root });
     }
     Ok(routes)
@@ -23823,7 +23823,7 @@ fn codex_managed_git_routes_for_direct_root(
     _agent_kind: &str,
 ) -> Result<Vec<CodexManagedGitRoute>, String> {
     let mut routes = Vec::new();
-    for repo_root in discover_nested_git_roots(write_root, 8, 256) {
+    for repo_root in discover_nested_git_roots(write_root, 4, 256) {
         routes.push(CodexManagedGitRoute { repo_root });
     }
     Ok(routes)
