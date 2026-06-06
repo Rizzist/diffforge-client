@@ -321,7 +321,9 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
 function architectureNormalizeTodoStatus(value) {
   const status = text(value).toLowerCase().replaceAll("_", "-");
   if (["complete", "completed", "done", "success", "sent"].includes(status)) return "completed";
-  if (["running", "sending", "submitted", "active", "in-progress", "working"].includes(status)) return "running";
+  if (["running", "sending", "submitted", "active", "in-progress", "working", "loading"].includes(status)) {
+    return "running";
+  }
   if (["queued", "pending", "listed", "ready", "list"].includes(status)) return status === "queued" ? "queued" : "listed";
   if (["paused", "parked", "waiting"].includes(status)) return "paused";
   if (["cancelled", "canceled"].includes(status)) return "cancelled";
@@ -370,14 +372,22 @@ function architectureTodoText(item) {
   );
 }
 
+function architectureTodoPreviewText(value, maxLength = 96) {
+  const normalized = text(value).replace(/\s+/gu, " ");
+  if (!normalized) return "";
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
 function architectureTodoTitle(item, fallback = "Todo") {
   const note = jsonObject(item?.note) || {};
   const body = architectureTodoText(item);
+  const bodyTitle = architectureTodoPreviewText(body);
   return text(
-    item?.title
+    bodyTitle
+      || item?.title
       || item?.name
-      || note.title
-      || body.split(/\r?\n/u).find(Boolean),
+      || note.title,
     fallback,
   );
 }
@@ -444,6 +454,7 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
         || finishedMs
         || createdMs;
       const body = architectureTodoText(item);
+      const bodyTitle = architectureTodoPreviewText(body);
       const id = text(item.todoId || item.todo_id || item.id || item.clientTodoId || item.client_todo_id, `todo-${index}`);
       return {
         body,
@@ -457,6 +468,7 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
         statusLabel: architectureTodoStatusLabel(status),
         target: architectureTodoTargetLabel(item),
         title: architectureTodoTitle(item, `Todo ${index + 1}`),
+        titleFromBody: Boolean(bodyTitle),
         updatedMs,
       };
     })
@@ -8404,14 +8416,6 @@ function HistoryTimeline({
 }
 
 function TodosHistoryPanel({ items = [], repoLabel }) {
-  const summary = useMemo(() => {
-    const total = items.length;
-    const active = items.filter((item) => ["active", "queued", "parked"].includes(item.statusKind)).length;
-    const done = items.filter((item) => item.statusKind === "done").length;
-    const failed = items.filter((item) => ["failed", "interrupted", "cancelled"].includes(item.statusKind)).length;
-    return { active, done, failed, total };
-  }, [items]);
-
   if (!items.length) {
     return (
       <HistoryPane>
@@ -8427,34 +8431,26 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
           <TimelineKicker>Workspace todos</TimelineKicker>
           <TimelineTitle>{repoLabel}</TimelineTitle>
         </div>
-        <TimelineSummary>{summary.total} todo{summary.total === 1 ? "" : "s"} · newest first</TimelineSummary>
+        <TimelineSummary>{items.length} todo{items.length === 1 ? "" : "s"} · newest first</TimelineSummary>
       </TimelineHeader>
-      <TodoHistoryStats aria-label="Todo history summary">
-        <TodoHistoryStat>
-          <span>Total</span>
-          <strong>{summary.total}</strong>
-        </TodoHistoryStat>
-        <TodoHistoryStat data-status="active">
-          <span>Active</span>
-          <strong>{summary.active}</strong>
-        </TodoHistoryStat>
-        <TodoHistoryStat data-status="done">
-          <span>Done</span>
-          <strong>{summary.done}</strong>
-        </TodoHistoryStat>
-        <TodoHistoryStat data-status="failed">
-          <span>Needs review</span>
-          <strong>{summary.failed}</strong>
-        </TodoHistoryStat>
-      </TodoHistoryStats>
       <TodoHistoryList aria-label="Todos history list">
         {items.map((item) => {
           const updated = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
           const created = formatTime(item.createdMs) || "";
           const detail = [item.target, item.source, created].filter(Boolean).join(" · ");
+          const isLive = item.statusKind === "active" || item.statusKind === "queued";
           return (
-            <TodoHistoryRow data-status={item.statusKind} key={item.id} title={detail}>
-              <TodoHistoryStatusDot aria-hidden="true" data-status={item.statusKind} />
+            <TodoHistoryRow
+              data-live={isLive ? "true" : "false"}
+              data-status={item.statusKind}
+              key={item.id}
+              title={detail}
+            >
+              <TodoHistoryStatusDot
+                aria-hidden="true"
+                data-live={isLive ? "true" : "false"}
+                data-status={item.statusKind}
+              />
               <TodoHistoryBody>
                 <TodoHistoryTitleLine>
                   <TodoHistoryTitle>{item.title}</TodoHistoryTitle>
@@ -8462,7 +8458,7 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
                     {item.statusLabel}
                   </StatusPill>
                 </TodoHistoryTitleLine>
-                {item.body && item.body !== item.title && (
+                {item.body && !item.titleFromBody && item.body !== item.title && (
                   <TodoHistoryText>{item.body}</TodoHistoryText>
                 )}
                 <TodoHistoryMeta>
@@ -11194,56 +11190,6 @@ const HistorySplit = styled.div`
   }
 `;
 
-const TodoHistoryStats = styled.div`
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  min-width: 0;
-
-  @media (max-width: 760px) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-`;
-
-const TodoHistoryStat = styled.div`
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-  padding: 9px 10px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.28);
-
-  span {
-    color: var(--forge-text-muted);
-    font-size: 9px;
-    font-weight: 900;
-    text-transform: uppercase;
-  }
-
-  strong {
-    color: var(--forge-text);
-    font-size: 18px;
-    font-weight: 880;
-    line-height: 1;
-  }
-
-  &[data-status="active"] {
-    border-color: rgba(96, 165, 250, 0.18);
-    background: rgba(30, 64, 175, 0.12);
-  }
-
-  &[data-status="done"] {
-    border-color: rgba(52, 211, 153, 0.16);
-    background: rgba(6, 78, 59, 0.11);
-  }
-
-  &[data-status="failed"] {
-    border-color: rgba(251, 113, 133, 0.16);
-    background: rgba(127, 29, 29, 0.1);
-  }
-`;
-
 const TodoHistoryList = styled.div`
   display: grid;
   align-content: start;
@@ -11253,7 +11199,27 @@ const TodoHistoryList = styled.div`
   border-top: 1px solid rgba(148, 163, 184, 0.12);
 `;
 
+const todoHistoryLiveBar = keyframes`
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scaleY(0.62);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+`;
+
+const todoHistoryDotSpin = keyframes`
+  to {
+    transform: rotate(360deg);
+  }
+`;
+
 const TodoHistoryRow = styled.div`
+  position: relative;
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr) minmax(92px, 126px);
   gap: 10px;
@@ -11268,6 +11234,19 @@ const TodoHistoryRow = styled.div`
 
   &[data-status="queued"] {
     background: linear-gradient(90deg, rgba(14, 165, 233, 0.055), transparent 62%);
+  }
+
+  &[data-live="true"]::before {
+    content: "";
+    position: absolute;
+    top: 9px;
+    bottom: 9px;
+    left: 0;
+    width: 2px;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #60a5fa, #38bdf8, #60a5fa);
+    transform-origin: center;
+    animation: ${todoHistoryLiveBar} 980ms ease-in-out infinite;
   }
 
   &[data-status="parked"] {
@@ -11286,6 +11265,7 @@ const TodoHistoryRow = styled.div`
 `;
 
 const TodoHistoryStatusDot = styled.span`
+  position: relative;
   align-self: start;
   width: 11px;
   height: 11px;
@@ -11308,6 +11288,16 @@ const TodoHistoryStatusDot = styled.span`
   &[data-status="queued"] {
     background: #38bdf8;
     box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.46);
+  }
+
+  &[data-live="true"]::after {
+    content: "";
+    position: absolute;
+    inset: -5px;
+    border: 1px solid rgba(96, 165, 250, 0.48);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: ${todoHistoryDotSpin} 780ms linear infinite;
   }
 
   &[data-status="parked"] {
