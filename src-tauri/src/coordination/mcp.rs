@@ -31,6 +31,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "architecture_revision_list",
     "architecture_revision_read",
     "architecture_revision_restore",
+    "list_todo_targets",
+    "send_todo_to_device",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -2626,6 +2628,8 @@ fn dispatch_tool_result(
         "architecture_revision_list" => kernel_architecture_revision_list(&kernel, &input),
         "architecture_revision_read" => kernel_architecture_revision_read(&kernel, &input),
         "architecture_revision_restore" => kernel_architecture_revision_restore(&kernel, &input),
+        "list_todo_targets" => kernel_list_todo_targets(&kernel, &input),
+        "send_todo_to_device" => kernel_send_todo_to_device(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
@@ -2766,6 +2770,165 @@ fn kernel_architecture_revision_restore(
         graph_id,
         revision_id,
     )?))
+}
+
+fn kernel_list_todo_targets(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let cloud = crate::cloud_mcp_forward_agent_list_todo_targets(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn kernel_send_todo_to_device(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let text = mcp_input_text(input, &["text", "body", "prompt", "message"])
+        .ok_or_else(|| "send_todo_to_device requires text.".to_string())?;
+    let target_device_id = mcp_input_text(
+        input,
+        &[
+            "target_device_id",
+            "targetDeviceId",
+            "device_id",
+            "deviceId",
+        ],
+    )
+    .ok_or_else(|| "send_todo_to_device requires target_device_id.".to_string())?;
+    let target_workspace_id = mcp_input_text(
+        input,
+        &[
+            "target_workspace_id",
+            "targetWorkspaceId",
+            "workspace_target_id",
+            "workspaceTargetId",
+        ],
+    )
+    .ok_or_else(|| "send_todo_to_device requires target_workspace_id.".to_string())?;
+    let mode = mcp_input_text(input, &["mode", "send_mode", "sendMode"])
+        .unwrap_or_else(|| "listed".to_string());
+    let cloud = crate::cloud_mcp_forward_agent_send_todo_to_device(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        &mode,
+        &text,
+        mcp_input_text(input, &["title"]).as_deref(),
+        &target_device_id,
+        &target_workspace_id,
+        mcp_input_text(input, &["target_workspace_name", "targetWorkspaceName"]).as_deref(),
+        mcp_input_text(
+            input,
+            &[
+                "target_device_name",
+                "targetDeviceName",
+                "device_name",
+                "deviceName",
+            ],
+        )
+        .as_deref(),
+        mcp_input_text(input, &["target_client_id", "targetClientId"]).as_deref(),
+        mcp_input_text(input, &["target_agent_id", "targetAgentId"]).as_deref(),
+        mcp_input_text(
+            input,
+            &[
+                "target_terminal_id",
+                "targetTerminalId",
+                "terminal_id",
+                "terminalId",
+                "pane_id",
+                "paneId",
+            ],
+        )
+        .as_deref(),
+        mcp_input_i64(
+            input,
+            &[
+                "target_terminal_index",
+                "targetTerminalIndex",
+                "terminal_index",
+                "terminalIndex",
+            ],
+        ),
+        mcp_input_text(
+            input,
+            &[
+                "target_thread_id",
+                "targetThreadId",
+                "thread_id",
+                "threadId",
+            ],
+        )
+        .as_deref(),
+        mcp_input_i64(
+            input,
+            &[
+                "target_color_slot",
+                "targetColorSlot",
+                "color_slot",
+                "colorSlot",
+            ],
+        ),
+        mcp_input_text(
+            input,
+            &[
+                "target_terminal_color",
+                "targetTerminalColor",
+                "terminal_color",
+                "terminalColor",
+            ],
+        )
+        .as_deref(),
+        mcp_input_text(input, &["todo_id", "todoId", "id"]).as_deref(),
+        mcp_input_text(
+            input,
+            &[
+                "client_request_id",
+                "clientRequestId",
+                "request_id",
+                "requestId",
+            ],
+        )
+        .as_deref(),
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn mcp_input_text(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        input
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn mcp_input_i64(input: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        input.get(*key).and_then(|value| {
+            value.as_i64().or_else(|| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .and_then(|text| text.parse::<i64>().ok())
+            })
+        })
+    })
 }
 
 fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -4368,6 +4531,8 @@ fn tool_description(name: &str) -> String {
         "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
         "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),
         "architecture_revision_restore" => "Restore one local-only architecture revision into .agents/architectures/graphs/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
+        "list_todo_targets" => "List same-account device/workspace targets that can receive a cloud todo from this workspace. Use this before send_todo_to_device instead of guessing device ids.".to_string(),
+        "send_todo_to_device" => "Send a cloud todo to a same-account target device/workspace. mode=listed leaves a normal listed todo. mode=queued actively queues it only when the target client is online; offline targets fall back to a listed todo.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
@@ -4478,6 +4643,34 @@ fn tool_input_schema(name: &str) -> Value {
                 "revision_id": {"type": "string", "description": "Required local-only architecture revision id to restore."}
             },
             "required": ["graph_id", "revision_id"],
+            "additionalProperties": true
+        }),
+        "list_todo_targets" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "workspace_id": {"type": "string", "description": "Optional observer/source workspace id. Defaults to the current coordination workspace."}
+            },
+            "additionalProperties": true
+        }),
+        "send_todo_to_device" => json!({
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Required todo body to place on or queue for the target device."},
+                "title": {"type": "string", "description": "Optional short title. Defaults to a summary of text."},
+                "mode": {"type": "string", "enum": ["listed", "queued"], "description": "listed creates a normal todo. queued actively queues only if the target device is online; offline falls back to listed.", "default": "listed"},
+                "target_device_id": {"type": "string", "description": "Required target device id from list_todo_targets."},
+                "target_workspace_id": {"type": "string", "description": "Required target workspace id from list_todo_targets."},
+                "target_workspace_name": {"type": "string", "description": "Optional target workspace label from list_todo_targets."},
+                "target_device_name": {"type": "string", "description": "Optional target device label from list_todo_targets."},
+                "target_terminal_index": {"type": "integer", "description": "Optional terminal index on the target device when mode=queued."},
+                "target_agent_id": {"type": "string", "description": "Optional target agent id/role when mode=queued."},
+                "target_terminal_id": {"type": "string", "description": "Optional target terminal pane id when mode=queued."},
+                "target_thread_id": {"type": "string", "description": "Optional target thread id when mode=queued."},
+                "todo_id": {"type": "string", "description": "Optional caller-provided todo id for idempotency."},
+                "client_request_id": {"type": "string", "description": "Optional caller-provided request id. Reusing it creates stable command/dispatch ids."}
+            },
+            "required": ["text", "target_device_id", "target_workspace_id"],
             "additionalProperties": true
         }),
         "checkpoint" => json!({

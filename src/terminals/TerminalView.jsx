@@ -9008,6 +9008,225 @@ function workspaceTodoItemsForWorkspace(workspaceTodos, workspaceId) {
       : [];
 }
 
+function workspaceTodoDispatchesForWorkspace(workspaceTodos, workspaceId) {
+  const dispatchCollection = workspaceTodoCollectionForWorkspace(
+    workspaceTodos,
+    workspaceId,
+    ["dispatches", "todoDispatches", "todo_dispatches"],
+    ["dispatchesByWorkspace", "dispatches_by_workspace", "todoDispatchesByWorkspace", "todo_dispatches_by_workspace"],
+  );
+  return Array.isArray(dispatchCollection?.items)
+    ? dispatchCollection.items
+    : Array.isArray(dispatchCollection)
+      ? dispatchCollection
+      : [];
+}
+
+function getWorkspaceTodoIdentity(item) {
+  return String(item?.todoId || item?.todo_id || item?.id || "").trim();
+}
+
+function getWorkspaceTodoStatus(item) {
+  return normalizeTodoQueueLifecycleStatus(
+    item?.todoStatus
+      || item?.todo_status
+      || item?.status
+      || item?.state,
+  ) || "listed";
+}
+
+function getWorkspaceTodoDeviceId(item) {
+  return String(
+    item?.deviceId
+      || item?.device_id
+      || item?.machineId
+      || item?.machine_id
+      || "",
+  ).trim();
+}
+
+function getWorkspaceTodoBodyRef(item) {
+  const todoId = getWorkspaceTodoIdentity(item);
+  const todoDeviceId = getWorkspaceTodoDeviceId(item);
+  const todoWorkspaceId = String(item?.workspaceId || item?.workspace_id || "").trim();
+  const todoRevision = String(item?.todoRevision || item?.todo_revision || "").trim();
+  const todoBodyHash = String(item?.todoBodyHash || item?.todo_body_hash || "").trim();
+  if (!todoId || !todoDeviceId || !todoWorkspaceId || (!todoRevision && !todoBodyHash)) {
+    return null;
+  }
+  return {
+    todoId,
+    todoDeviceId,
+    todoWorkspaceId,
+    ...(todoRevision ? { todoRevision } : {}),
+    ...(todoBodyHash ? { todoBodyHash } : {}),
+  };
+}
+
+function createTodoQueueItemFromWorkspaceTodo(item, workspaceId, hydratedText = "") {
+  const todoId = getWorkspaceTodoIdentity(item);
+  const text = normalizeTodoQueueText(
+    hydratedText
+      || item?.body
+      || item?.todoText
+      || item?.todo_text
+      || item?.text
+      || item?.todoBodyPreview
+      || item?.todo_body_preview
+      || item?.textPreview
+      || item?.text_preview
+      || "",
+  );
+  if (!todoId || !text) {
+    return null;
+  }
+  return normalizeTodoQueueItem({
+    createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
+    id: todoId,
+    kind: "todo",
+    source: item?.sourceKind || item?.source_kind || item?.source || "cloud-remote-listed-todo",
+    text,
+    todoStatus: "listed",
+    todoStatusReason: item?.todoStatusReason || item?.todo_status_reason || item?.statusReason || item?.status_reason || "",
+    workspaceId,
+    targetAgentId: item?.targetAgentId || item?.target_agent_id || "",
+    targetTerminalId: item?.targetTerminalId || item?.target_terminal_id || "",
+    targetTerminalIndex: item?.targetTerminalIndex ?? item?.target_terminal_index,
+    targetTerminalName: item?.targetTerminalName || item?.target_terminal_name || "",
+    targetThreadId: item?.targetThreadId || item?.target_thread_id || "",
+    targetColorSlot: item?.targetColorSlot ?? item?.target_color_slot,
+    targetTerminalColor: item?.targetTerminalColor || item?.target_terminal_color || "",
+  });
+}
+
+function listedWorkspaceTodosForCurrentDevice(workspaceTodos, workspaceId, desktopDeviceId) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeDeviceId = normalizeWorkspaceTodoDeviceId(desktopDeviceId);
+  if (!safeWorkspaceId || !safeDeviceId) {
+    return [];
+  }
+  return workspaceTodoItemsForWorkspace(workspaceTodos, safeWorkspaceId)
+    .filter((item) => {
+      if (!item || typeof item !== "object") {
+        return false;
+      }
+      if (getWorkspaceTodoStatus(item) !== "listed") {
+        return false;
+      }
+      const sourceKind = String(item.sourceKind || item.source_kind || item.source || "").trim();
+      if (!sourceKind.startsWith("cloud-")) {
+        return false;
+      }
+      return normalizeWorkspaceTodoDeviceId(getWorkspaceTodoDeviceId(item)) === safeDeviceId;
+    });
+}
+
+function getWorkspaceTodoDispatchId(item) {
+  return String(item?.dispatchId || item?.dispatch_id || item?.todoDispatchId || item?.todo_dispatch_id || "").trim();
+}
+
+function getWorkspaceTodoDispatchCommandId(item) {
+  return String(item?.commandId || item?.command_id || item?.id || "").trim();
+}
+
+function getWorkspaceTodoDispatchStatus(item) {
+  return normalizeTodoQueueLifecycleStatus(
+    item?.dispatchStatus
+      || item?.dispatch_status
+      || item?.status
+      || item?.state,
+  ) || "queued";
+}
+
+function getWorkspaceTodoDispatchBodyRef(item) {
+  const todoId = getWorkspaceTodoIdentity(item);
+  const todoDeviceId = String(item?.todoDeviceId || item?.todo_device_id || "").trim();
+  const todoWorkspaceId = String(item?.todoWorkspaceId || item?.todo_workspace_id || "").trim();
+  const todoRevision = String(item?.todoRevision || item?.todo_revision || "").trim();
+  const todoBodyHash = String(item?.todoBodyHash || item?.todo_body_hash || "").trim();
+  if (!todoId || !todoDeviceId || !todoWorkspaceId || (!todoRevision && !todoBodyHash)) {
+    return null;
+  }
+  return {
+    todoId,
+    todoDeviceId,
+    todoWorkspaceId,
+    ...(todoRevision ? { todoRevision } : {}),
+    ...(todoBodyHash ? { todoBodyHash } : {}),
+  };
+}
+
+function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedText = "") {
+  const dispatchId = getWorkspaceTodoDispatchId(item);
+  const commandId = getWorkspaceTodoDispatchCommandId(item) || dispatchId || getWorkspaceTodoIdentity(item);
+  const todoId = getWorkspaceTodoIdentity(item);
+  const text = normalizeTodoQueueText(
+    hydratedText
+      || item?.todoText
+      || item?.todo_text
+      || item?.text
+      || item?.body
+      || item?.todoBodyPreview
+      || item?.todo_body_preview
+      || "",
+  );
+  if (!commandId || !text) {
+    return null;
+  }
+  const dispatchSource = item?.dispatchSource || item?.dispatch_source || null;
+  const dispatchTarget = item?.dispatchTarget || item?.dispatch_target || null;
+  return normalizeTodoQueueItem({
+    createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
+    id: commandId,
+    kind: "todo",
+    remoteCommand: {
+      commandId,
+      dispatchSource,
+      dispatchTarget,
+      source: item?.sourceKind || item?.source_kind || "cloud-diffforge-todo-dispatch",
+      todoDeviceId: item?.todoDeviceId || item?.todo_device_id || "",
+      todoDispatchId: dispatchId,
+      todoId,
+      todoWorkspaceId: item?.todoWorkspaceId || item?.todo_workspace_id || "",
+    },
+    source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+    text,
+    todoStatus: "queued",
+    todoStatusReason: item?.statusReason || item?.status_reason || "",
+    workspaceId,
+    targetAgentId: item?.targetAgentId || item?.target_agent_id || "",
+    targetTerminalId: item?.targetTerminalId || item?.target_terminal_id || "",
+    targetTerminalIndex: item?.targetTerminalIndex ?? item?.target_terminal_index,
+    targetThreadId: item?.targetThreadId || item?.target_thread_id || "",
+    targetColorSlot: item?.targetColorSlot ?? item?.target_color_slot,
+    targetTerminalColor: item?.targetTerminalColor || item?.target_terminal_color || "",
+  });
+}
+
+function queuedWorkspaceTodoDispatchesForCurrentDevice(workspaceTodos, workspaceId, desktopDeviceId) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeDeviceId = normalizeWorkspaceTodoDeviceId(desktopDeviceId);
+  if (!safeWorkspaceId || !safeDeviceId) {
+    return [];
+  }
+  return workspaceTodoDispatchesForWorkspace(workspaceTodos, safeWorkspaceId)
+    .filter((item) => {
+      if (!item || typeof item !== "object") {
+        return false;
+      }
+      const status = getWorkspaceTodoDispatchStatus(item);
+      if (status !== "queued") {
+        return false;
+      }
+      const targetDeviceId = normalizeWorkspaceTodoDeviceId(item.targetDeviceId || item.target_device_id);
+      const targetWorkspaceId = String(item.targetWorkspaceId || item.target_workspace_id || "").trim();
+      if (targetDeviceId !== safeDeviceId || targetWorkspaceId !== safeWorkspaceId) {
+        return false;
+      }
+      return Boolean(getWorkspaceTodoDispatchCommandId(item) || getWorkspaceTodoDispatchId(item));
+    });
+}
+
 function findWorkspaceTodoForVoicePlanTask(workspaceTodos, workspaceId, planTask) {
   const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
   if (!normalizedPlanTask) {
@@ -12072,6 +12291,7 @@ function TerminalView({
     () => buildWorkspaceTodoDeviceMap(knownDevices, connectedDevices),
     [connectedDevices, knownDevices],
   );
+  const [cloudDesktopDeviceId, setCloudDesktopDeviceId] = useState("");
   todoQueueItemsRef.current = todoQueueItems;
   terminalBreakoutPhaseRef.current = terminalBreakoutPhase;
   terminalBreakoutPlacementsRef.current = terminalBreakoutPlacements;
@@ -15852,6 +16072,22 @@ function TerminalView({
     terminalBreakoutBackgroundDrawRef.current?.();
   }, [terminalBreakoutVisible, terminalBreakoutViewport, terminalPanelRect]);
 
+  useEffect(() => {
+    let cancelled = false;
+    invoke("cloud_mcp_get_desktop_device_profile").then((profile) => {
+      if (cancelled) {
+        return;
+      }
+      const deviceId = String(profile?.device_id || profile?.deviceId || "").trim();
+      if (deviceId) {
+        setCloudDesktopDeviceId(deviceId);
+      }
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const updateTodoQueueItems = useCallback((updater, options = {}) => {
     setTodoQueueItems((currentItems) => {
       const nextItems = normalizeTodoQueueItems(
@@ -15885,6 +16121,106 @@ function TerminalView({
       return nextItems;
     });
   }, [syncTodoQueueItemsToCloud, terminalWorkspace?.id]);
+
+  useEffect(() => {
+    const workspaceId = terminalWorkspace?.id || "";
+    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    const listedTodos = listedWorkspaceTodosForCurrentDevice(
+      workspaceTodos,
+      workspaceId,
+      cloudDesktopDeviceId,
+    );
+    if (!workspaceId || !cloudDesktopDeviceId || !listedTodos.length) {
+      return;
+    }
+    const existingIds = new Set(
+      todoQueueItemsRef.current
+        .map((item) => String(item?.id || "").trim())
+        .filter(Boolean),
+    );
+    const importCandidates = listedTodos.filter((item) => {
+      const todoId = getWorkspaceTodoIdentity(item);
+      return todoId && !existingIds.has(todoId);
+    });
+    if (!importCandidates.length) {
+      return;
+    }
+
+    let cancelled = false;
+    const importListedTodos = async () => {
+      const hydratedTextById = new Map();
+      const refs = importCandidates
+        .map(getWorkspaceTodoBodyRef)
+        .filter(Boolean);
+      if (repoPath && refs.length) {
+        try {
+          const hydration = await invoke("cloud_mcp_hydrate_workspace_todos", {
+            refs,
+            repoPath,
+            workspaceId,
+            workspaceName: terminalWorkspace?.name || "",
+          });
+          (Array.isArray(hydration?.items) ? hydration.items : []).forEach((item) => {
+            const todoId = getWorkspaceTodoIdentity(item);
+            const text = normalizeTodoQueueText(item?.body || item?.text || "");
+            if (todoId && text) {
+              hydratedTextById.set(todoId, text);
+            }
+          });
+        } catch (error) {
+          logTerminalStatus("frontend.todo_queue.cloud_listed_hydration_error", {
+            message: error?.message || String(error || ""),
+            workspaceId,
+          });
+        }
+      }
+      if (cancelled) {
+        return;
+      }
+      const importedItems = importCandidates
+        .map((item) => createTodoQueueItemFromWorkspaceTodo(
+          item,
+          workspaceId,
+          hydratedTextById.get(getWorkspaceTodoIdentity(item)) || "",
+        ))
+        .filter(Boolean);
+      if (!importedItems.length) {
+        return;
+      }
+      updateTodoQueueItems((currentItems) => {
+        const currentIds = new Set(
+          currentItems
+            .map((item) => String(item?.id || "").trim())
+            .filter(Boolean),
+        );
+        const additions = importedItems.filter((item) => !currentIds.has(item.id));
+        if (!additions.length) {
+          return currentItems;
+        }
+        logTerminalStatus("frontend.todo_queue.cloud_listed_imported", {
+          itemCount: additions.length,
+          workspaceId,
+        });
+        return currentItems.concat(additions);
+      }, {
+        force: true,
+        immediate: true,
+        reason: "cloud_listed_todos_imported",
+      });
+    };
+    void importListedTodos();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    cloudDesktopDeviceId,
+    defaultWorkingDirectory,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+    updateTodoQueueItems,
+    workspaceTodos,
+  ]);
 
   const clearTodoQueueItemPending = useCallback((itemId, reason = "unspecified", fields = {}) => {
     const safeItemId = String(itemId || "").trim();
@@ -18956,6 +19292,137 @@ function TerminalView({
     setTodoQueueItemPending,
     terminalWorkspace?.id,
     updateTodoQueueItems,
+  ]);
+
+  useEffect(() => {
+    const workspaceId = terminalWorkspace?.id || "";
+    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    const queuedDispatches = queuedWorkspaceTodoDispatchesForCurrentDevice(
+      workspaceTodos,
+      workspaceId,
+      cloudDesktopDeviceId,
+    );
+    if (!workspaceId || !cloudDesktopDeviceId || !queuedDispatches.length) {
+      return;
+    }
+    const existingIds = new Set(
+      todoQueueItemsRef.current
+        .map((item) => String(item?.id || "").trim())
+        .filter(Boolean),
+    );
+    const importCandidates = queuedDispatches.filter((item) => {
+      const commandId = getWorkspaceTodoDispatchCommandId(item) || getWorkspaceTodoDispatchId(item);
+      return commandId && !existingIds.has(commandId);
+    });
+    if (!importCandidates.length) {
+      return;
+    }
+
+    let cancelled = false;
+    const importQueuedDispatches = async () => {
+      const hydratedTextById = new Map();
+      const refs = importCandidates
+        .map(getWorkspaceTodoDispatchBodyRef)
+        .filter(Boolean);
+      if (repoPath && refs.length) {
+        try {
+          const hydration = await invoke("cloud_mcp_hydrate_workspace_todos", {
+            refs,
+            repoPath,
+            workspaceId,
+            workspaceName: terminalWorkspace?.name || "",
+          });
+          (Array.isArray(hydration?.items) ? hydration.items : []).forEach((item) => {
+            const todoId = getWorkspaceTodoIdentity(item);
+            const text = normalizeTodoQueueText(item?.body || item?.text || "");
+            if (todoId && text) {
+              hydratedTextById.set(todoId, text);
+            }
+          });
+        } catch (error) {
+          logTerminalStatus("frontend.todo_queue.cloud_dispatch_hydration_error", {
+            message: error?.message || String(error || ""),
+            workspaceId,
+          });
+        }
+      }
+      if (cancelled) {
+        return;
+      }
+      const importedItems = importCandidates
+        .map((item) => createTodoQueueItemFromWorkspaceDispatch(
+          item,
+          workspaceId,
+          hydratedTextById.get(getWorkspaceTodoIdentity(item)) || "",
+        ))
+        .filter(Boolean)
+        .filter((item) => {
+          const receiptKey = getTodoQueueRemoteCommandReceiptKey(item, workspaceId);
+          const receipt = receiptKey
+            ? todoQueueRemoteCommandReceiptsRef.current[receiptKey] || null
+            : null;
+          return !(receiptKey && todoQueueRemoteCommandReceiptBlocks(receipt));
+        });
+      if (!importedItems.length) {
+        return;
+      }
+
+      const currentIds = new Set(
+        todoQueueItemsRef.current
+          .map((item) => String(item?.id || "").trim())
+          .filter(Boolean),
+      );
+      const additions = importedItems.filter((item) => !currentIds.has(item.id));
+      if (!additions.length) {
+        return;
+      }
+      updateTodoQueueItems((currentItems) => {
+        const activeIds = new Set(
+          currentItems
+            .map((item) => String(item?.id || "").trim())
+            .filter(Boolean),
+        );
+        const activeAdditions = additions.filter((item) => !activeIds.has(item.id));
+        if (!activeAdditions.length) {
+          return currentItems;
+        }
+        logTerminalStatus("frontend.todo_queue.cloud_dispatch_imported", {
+          itemCount: activeAdditions.length,
+          workspaceId,
+        });
+        return currentItems.concat(activeAdditions);
+      }, {
+        force: true,
+        immediate: true,
+        reason: "cloud_dispatch_todos_imported",
+      });
+      additions.forEach((item) => {
+        recordTodoQueueRemoteCommandReceipt(item, "queued", {
+          workspaceId,
+        });
+        setTodoQueueItemPending(item.id, {
+          item: getTodoQueueItemLogSummary([item])[0] || null,
+          phase: "queued",
+          workspaceId,
+          ...getTodoQueuePendingFieldsFromItem(item, TODO_QUEUE_SOURCE_REMOTE_CONTROL),
+        });
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+    };
+    void importQueuedDispatches();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    cloudDesktopDeviceId,
+    defaultWorkingDirectory,
+    recordTodoQueueRemoteCommandReceipt,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+    updateTodoQueueItems,
+    workspaceTodos,
   ]);
 
   useEffect(() => {

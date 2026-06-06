@@ -2944,6 +2944,8 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
         event_kind,
         "workspace_todo_snapshot"
             | "workspace_todos_snapshot"
+            | "workspace_todo_listed_created"
+            | "workspace_todo_remote_listed"
             | "todo_queue_snapshot"
             | "todo_queue_state"
             | "workspace_todo_dispatch_requested"
@@ -5021,6 +5023,7 @@ async fn cloud_mcp_post_json_endpoint(
 
 fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
     match endpoint {
+        "/v1/status" => Some("status"),
         "/v1/events" => Some("event"),
         "/v1/sync/push" => Some("sync_push"),
         "/v1/sync/pull" => Some("sync_pull"),
@@ -5153,6 +5156,7 @@ fn cloud_mcp_post_log_context(
         })
         .cloned();
     let tool = match endpoint {
+        "/v1/status" => "cloud_status",
         "/v1/context/pack" => "cloud_get_context_pack",
         "/v1/task/history" => "cloud_get_task_history",
         "/v1/workspace/todos/hydrate" => "cloud_hydrate_workspace_todos",
@@ -12237,6 +12241,609 @@ impl CloudMcpProxyIdentity {
             Value::Object(payload),
         );
     }
+}
+
+pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Value, String> {
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = base_url_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(cloud_mcp_base_url);
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let request = cloud_mcp_proxy_agent_base_payload(
+        &identity,
+        "rust-diffforge-agent-list-todo-targets",
+    );
+    identity.log(
+        "cloud_mcp.agent_list_todo_targets.start",
+        "list_todo_targets",
+        json!({
+            "activity": "agent list todo targets",
+            "baseUrl": base_url,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/status", &request.to_string()) {
+        Ok(response) => {
+            let parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            let data = parsed.get("data").cloned().unwrap_or(parsed);
+            let workspace_todos = data
+                .get("workspace_todos")
+                .or_else(|| data.get("workspaceTodos"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let targets = cloud_mcp_proxy_todo_targets_from_workspace_todos(
+                &workspace_todos,
+                identity.workspace_id.as_deref(),
+            );
+            identity.log(
+                "cloud_mcp.agent_list_todo_targets.done",
+                "list_todo_targets",
+                json!({
+                    "activity": "agent todo targets listed",
+                    "baseUrl": base_url,
+                    "targetCount": targets.len(),
+                }),
+            );
+            Ok(json!({
+                "kind": "todo_targets",
+                "mode_support": ["listed", "queued"],
+                "workspace_id": identity.workspace_id,
+                "targets": targets,
+                "workspace_todos": workspace_todos,
+            }))
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.agent_list_todo_targets.error",
+                "list_todo_targets",
+                json!({
+                    "activity": "agent list todo targets failed",
+                    "baseUrl": base_url,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cloud_mcp_forward_agent_send_todo_to_device(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    mode: &str,
+    text: &str,
+    title: Option<&str>,
+    target_device_id: &str,
+    target_workspace_id: &str,
+    target_workspace_name: Option<&str>,
+    target_device_name: Option<&str>,
+    target_client_id: Option<&str>,
+    target_agent_id: Option<&str>,
+    target_terminal_id: Option<&str>,
+    target_terminal_index: Option<i64>,
+    target_thread_id: Option<&str>,
+    target_color_slot: Option<i64>,
+    target_terminal_color: Option<&str>,
+    todo_id: Option<&str>,
+    client_request_id: Option<&str>,
+) -> Result<Value, String> {
+    let mode = cloud_mcp_proxy_normalize_todo_send_mode(mode)?;
+    let text = cloud_mcp_clean_prompt_text(text);
+    if text.trim().is_empty() {
+        return Err("send_todo_to_device requires non-empty text.".to_string());
+    }
+    let target_device_id = target_device_id.trim();
+    if target_device_id.is_empty() {
+        return Err("send_todo_to_device requires target_device_id.".to_string());
+    }
+    let target_workspace_id = target_workspace_id.trim();
+    if target_workspace_id.is_empty() {
+        return Err("send_todo_to_device requires target_workspace_id.".to_string());
+    }
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = base_url_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(cloud_mcp_base_url);
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let source_workspace_id = identity.workspace_id.as_deref().unwrap_or_default();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let source_device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let request_id = client_request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let todo_id = todo_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent-todo-{request_id}"));
+    let title = title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cloud_mcp_prompt_summary(&text));
+    let mut payload = cloud_mcp_proxy_agent_base_payload(
+        &identity,
+        if mode == "queued" {
+            "cloud-agent-todo-dispatch"
+        } else {
+            "cloud-agent-listed-todo"
+        },
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "event_kind".to_string(),
+            json!(if mode == "queued" {
+                "workspace_todo_dispatch_requested"
+            } else {
+                "workspace_todo_listed_created"
+            }),
+        );
+        object.insert("mode".to_string(), json!(mode.as_str()));
+        object.insert("todo_id".to_string(), json!(todo_id.as_str()));
+        object.insert("todoId".to_string(), json!(todo_id.as_str()));
+        object.insert("title".to_string(), json!(title.as_str()));
+        object.insert("text".to_string(), json!(text.as_str()));
+        object.insert("body".to_string(), json!(text.as_str()));
+        object.insert("target_device_id".to_string(), json!(target_device_id));
+        object.insert("targetDeviceId".to_string(), json!(target_device_id));
+        object.insert(
+            "target_workspace_id".to_string(),
+            json!(target_workspace_id),
+        );
+        object.insert(
+            "targetWorkspaceId".to_string(),
+            json!(target_workspace_id),
+        );
+        object.insert("requested_by_device_id".to_string(), json!(source_device_id));
+        object.insert("requestedByDeviceId".to_string(), json!(source_device_id));
+        if !source_workspace_id.is_empty() {
+            object.insert(
+                "requested_by_workspace_id".to_string(),
+                json!(source_workspace_id),
+            );
+            object.insert(
+                "requestedByWorkspaceId".to_string(),
+                json!(source_workspace_id),
+            );
+            object.insert("todo_workspace_id".to_string(), json!(source_workspace_id));
+            object.insert("todoWorkspaceId".to_string(), json!(source_workspace_id));
+        }
+        object.insert("todo_device_id".to_string(), json!(source_device_id));
+        object.insert("todoDeviceId".to_string(), json!(source_device_id));
+        if let Some(value) = target_workspace_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert("target_workspace_name".to_string(), json!(value));
+            object.insert("targetWorkspaceName".to_string(), json!(value));
+        }
+        if let Some(value) = target_device_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert("target_device_name".to_string(), json!(value));
+            object.insert("targetDeviceName".to_string(), json!(value));
+        }
+        if let Some(value) = target_client_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            object.insert("target_client_id".to_string(), json!(value));
+            object.insert("targetClientId".to_string(), json!(value));
+        }
+        cloud_mcp_proxy_insert_todo_assignment(
+            object,
+            target_agent_id,
+            target_terminal_id,
+            target_terminal_index,
+            target_thread_id,
+            target_color_slot,
+            target_terminal_color,
+        );
+        let todo_id_value = object.get("todoId").cloned().unwrap_or(Value::Null);
+        object.insert(
+            "todo".to_string(),
+            json!({
+                "id": todo_id_value.clone(),
+                "todoId": todo_id_value,
+                "title": title.as_str(),
+                "text": text.as_str(),
+            }),
+        );
+        object.insert(
+            "target".to_string(),
+            json!({
+                "targetDeviceId": target_device_id,
+                "targetWorkspaceId": target_workspace_id,
+                "targetWorkspaceName": target_workspace_name.unwrap_or_default(),
+                "targetDeviceName": target_device_name.unwrap_or_default(),
+                "targetClientId": target_client_id.unwrap_or_default(),
+            }),
+        );
+        if mode == "queued" {
+            let dispatch_id = format!("todo-dispatch-{request_id}");
+            let command_id = format!("todo-command-{request_id}");
+            object.insert("dispatch_id".to_string(), json!(dispatch_id.as_str()));
+            object.insert("dispatchId".to_string(), json!(dispatch_id.as_str()));
+            object.insert("command_id".to_string(), json!(command_id.as_str()));
+            object.insert("commandId".to_string(), json!(command_id.as_str()));
+            object.insert("dispatch_kind".to_string(), json!("remote"));
+            object.insert("dispatchKind".to_string(), json!("remote"));
+        }
+    }
+
+    let event_kind = payload["event_kind"]
+        .as_str()
+        .unwrap_or("workspace_todo_listed_created");
+    let request = cloud_mcp_event_envelope(event_kind, &payload);
+    identity.log(
+        "cloud_mcp.agent_send_todo_to_device.start",
+        "send_todo_to_device",
+        json!({
+            "activity": "agent send todo to device",
+            "baseUrl": base_url,
+            "mode": mode,
+            "targetDeviceId": target_device_id,
+            "targetWorkspaceId": target_workspace_id,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
+        Ok(response) => {
+            let parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            identity.log(
+                "cloud_mcp.agent_send_todo_to_device.done",
+                "send_todo_to_device",
+                json!({
+                    "activity": "agent sent todo to device",
+                    "baseUrl": base_url,
+                    "mode": mode,
+                    "targetDeviceId": target_device_id,
+                    "targetWorkspaceId": target_workspace_id,
+                }),
+            );
+            Ok(json!({
+                "mode": mode,
+                "event_kind": event_kind,
+                "target_device_id": target_device_id,
+                "target_workspace_id": target_workspace_id,
+                "response": parsed,
+            }))
+        }
+        Err(error) => {
+            identity.log(
+                "cloud_mcp.agent_send_todo_to_device.error",
+                "send_todo_to_device",
+                json!({
+                    "activity": "agent send todo to device failed",
+                    "baseUrl": base_url,
+                    "mode": mode,
+                    "targetDeviceId": target_device_id,
+                    "targetWorkspaceId": target_workspace_id,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_proxy_agent_base_payload(identity: &CloudMcpProxyIdentity, source: &str) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("source".to_string(), json!(source));
+    payload.insert("client_id".to_string(), json!(identity.client_id));
+    payload.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
+    if let Some(repo_id) = identity.repo_id.as_deref() {
+        payload.insert("repo_id".to_string(), json!(repo_id));
+        payload.insert("repoId".to_string(), json!(repo_id));
+    }
+    if let Some(repo_path) = identity.repo_path.as_ref() {
+        let repo_path = repo_path.to_string_lossy().to_string();
+        payload.insert("repo_path".to_string(), json!(repo_path.clone()));
+        payload.insert("workspace_root".to_string(), json!(repo_path));
+    }
+    if let Some(workspace_id) = identity.workspace_id.as_deref() {
+        payload.insert("workspace_id".to_string(), json!(workspace_id));
+        payload.insert("workspaceId".to_string(), json!(workspace_id));
+    }
+    if let Some(agent_id) = identity.cloud_agent_id() {
+        payload.insert("agent_id".to_string(), json!(agent_id.clone()));
+        payload.insert("self_agent_id".to_string(), json!(agent_id.clone()));
+        payload.insert("current_agent_id".to_string(), json!(agent_id));
+    }
+    if let Some(session_id) = identity.session_id.as_deref() {
+        payload.insert("session_id".to_string(), json!(session_id));
+    }
+    Value::Object(payload)
+}
+
+fn cloud_mcp_proxy_normalize_todo_send_mode(mode: &str) -> Result<String, String> {
+    let normalized = mode
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' ', '.'], "_");
+    match normalized.as_str() {
+        "" | "list" | "listed" | "listed_only" | "todo_list" => Ok("listed".to_string()),
+        "queue" | "queued" | "dispatch" | "active_queue" | "run_if_online" => {
+            Ok("queued".to_string())
+        }
+        _ => Err("send_todo_to_device mode must be listed or queued.".to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_proxy_insert_todo_assignment(
+    object: &mut serde_json::Map<String, Value>,
+    target_agent_id: Option<&str>,
+    target_terminal_id: Option<&str>,
+    target_terminal_index: Option<i64>,
+    target_thread_id: Option<&str>,
+    target_color_slot: Option<i64>,
+    target_terminal_color: Option<&str>,
+) {
+    if let Some(value) = target_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("target_agent_id".to_string(), json!(value));
+        object.insert("targetAgentId".to_string(), json!(value));
+    }
+    if let Some(value) = target_terminal_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("target_terminal_id".to_string(), json!(value));
+        object.insert("targetTerminalId".to_string(), json!(value));
+    }
+    if let Some(value) = target_terminal_index {
+        object.insert("target_terminal_index".to_string(), json!(value));
+        object.insert("targetTerminalIndex".to_string(), json!(value));
+    }
+    if let Some(value) = target_thread_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("target_thread_id".to_string(), json!(value));
+        object.insert("targetThreadId".to_string(), json!(value));
+    }
+    if let Some(value) = target_color_slot {
+        object.insert("target_color_slot".to_string(), json!(value));
+        object.insert("targetColorSlot".to_string(), json!(value));
+    }
+    if let Some(value) = target_terminal_color
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("target_terminal_color".to_string(), json!(value));
+        object.insert("targetTerminalColor".to_string(), json!(value));
+    }
+}
+
+fn cloud_mcp_proxy_todo_targets_from_workspace_todos(
+    workspace_todos: &Value,
+    workspace_id: Option<&str>,
+) -> Vec<Value> {
+    let mut targets = Vec::<Value>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    cloud_mcp_proxy_collect_todo_targets(
+        workspace_todos.get("dispatchTargets").or_else(|| workspace_todos.get("dispatch_targets")),
+        workspace_id,
+        &mut seen,
+        &mut targets,
+    );
+    cloud_mcp_proxy_collect_todo_targets_by_workspace(
+        workspace_todos
+            .get("dispatchTargetsByWorkspace")
+            .or_else(|| workspace_todos.get("dispatch_targets_by_workspace")),
+        workspace_id,
+        &mut seen,
+        &mut targets,
+    );
+    targets
+}
+
+fn cloud_mcp_proxy_collect_todo_targets(
+    collection: Option<&Value>,
+    workspace_id: Option<&str>,
+    seen: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<Value>,
+) {
+    let Some(collection) = collection else {
+        return;
+    };
+    let items = collection
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| collection.as_array());
+    let Some(items) = items else {
+        return;
+    };
+    for item in items {
+        cloud_mcp_proxy_push_todo_target(item.clone(), workspace_id, seen, targets);
+    }
+}
+
+fn cloud_mcp_proxy_collect_todo_targets_by_workspace(
+    collection: Option<&Value>,
+    workspace_id: Option<&str>,
+    seen: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<Value>,
+) {
+    let Some(collection) = collection else {
+        return;
+    };
+    let entries = collection
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| collection.as_array());
+    let Some(entries) = entries else {
+        return;
+    };
+    for entry in entries {
+        let observer_workspace_id = cloud_mcp_payload_text(
+            entry,
+            &[
+                "workspace_id",
+                "workspaceId",
+                "observer_workspace_id",
+                "observerWorkspaceId",
+            ],
+        )
+        .unwrap_or_default();
+        if workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|workspace_id| observer_workspace_id != workspace_id)
+        {
+            continue;
+        }
+        if let Some(items) = entry.get("items").and_then(Value::as_array) {
+            for item in items {
+                let mut item = item.clone();
+                if let Some(object) = item.as_object_mut() {
+                    object
+                        .entry("observer_workspace_id".to_string())
+                        .or_insert_with(|| json!(observer_workspace_id));
+                }
+                cloud_mcp_proxy_push_todo_target(item, workspace_id, seen, targets);
+            }
+        }
+    }
+}
+
+fn cloud_mcp_proxy_push_todo_target(
+    mut item: Value,
+    workspace_id: Option<&str>,
+    seen: &mut std::collections::HashSet<String>,
+    targets: &mut Vec<Value>,
+) {
+    let target_device_id = cloud_mcp_payload_text(
+        &item,
+        &["targetDeviceId", "target_device_id", "deviceId", "device_id"],
+    )
+    .unwrap_or_default();
+    let target_workspace_id = cloud_mcp_payload_text(
+        &item,
+        &[
+            "targetWorkspaceId",
+            "target_workspace_id",
+            "workspaceId",
+            "workspace_id",
+        ],
+    )
+    .unwrap_or_default();
+    if target_device_id.trim().is_empty() || target_workspace_id.trim().is_empty() {
+        return;
+    }
+    if workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|workspace_id| {
+            cloud_mcp_payload_text(
+                &item,
+                &[
+                    "observer_workspace_id",
+                    "observerWorkspaceId",
+                    "workspace_id",
+                    "workspaceId",
+                ],
+            )
+            .as_deref()
+                != Some(workspace_id)
+        })
+    {
+        return;
+    }
+    let key = format!("{target_device_id}::{target_workspace_id}");
+    if !seen.insert(key) {
+        return;
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.insert("targetDeviceId".to_string(), json!(target_device_id));
+        object.insert("targetWorkspaceId".to_string(), json!(target_workspace_id));
+        object.insert("sameAccount".to_string(), json!(true));
+        object.insert("same_account".to_string(), json!(true));
+        object.insert("supportsListed".to_string(), json!(true));
+        object.insert("supportsQueued".to_string(), json!(true));
+    }
+    targets.push(item);
 }
 
 pub(crate) fn cloud_mcp_forward_agent_checkpoint(
