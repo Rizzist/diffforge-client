@@ -35,6 +35,8 @@ pub const WORKTREE_TASK_BINDING_MIGRATION_VERSION: i64 = 15;
 pub const WORKTREE_TASK_BINDING_MIGRATION_NAME: &str = "coordination_kernel_worktree_task_binding";
 pub const TERMINAL_TASK_PLAN_MIGRATION_VERSION: i64 = 16;
 pub const TERMINAL_TASK_PLAN_MIGRATION_NAME: &str = "coordination_kernel_terminal_task_plans";
+pub const TASK_SOURCE_TODO_REFS_MIGRATION_VERSION: i64 = 17;
+pub const TASK_SOURCE_TODO_REFS_MIGRATION_NAME: &str = "coordination_kernel_task_source_todo_refs";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -117,6 +119,10 @@ CREATE TABLE IF NOT EXISTS tasks(
   source_plan_item_id TEXT,
   assigned_role TEXT,
   expected_output TEXT,
+  source_todo_id TEXT,
+  source_todo_dispatch_id TEXT,
+  source_prompt_event_id TEXT,
+  source_command_id TEXT,
   started_at TEXT,
   finished_at TEXT,
   created_at TEXT NOT NULL,

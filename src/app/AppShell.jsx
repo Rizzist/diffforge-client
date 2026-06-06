@@ -14474,6 +14474,77 @@ export default function App() {
       }
       return "";
     };
+    const hydrateRemoteCommandTodoText = async (event, workspaceId, currentText = "") => {
+      const existingText = String(currentText || "").trim();
+      if (existingText) {
+        return existingText;
+      }
+      const todoId = remoteCommandStringField(event, ["todo_id", "todoId"]);
+      const todoDeviceId = remoteCommandStringField(event, [
+        "todo_device_id",
+        "todoDeviceId",
+        "origin_device_id",
+        "originDeviceId",
+      ]);
+      const todoWorkspaceId = remoteCommandStringField(event, [
+        "todo_workspace_id",
+        "todoWorkspaceId",
+        "origin_workspace_id",
+        "originWorkspaceId",
+      ]);
+      const todoRevision = remoteCommandStringField(event, [
+        "todo_revision",
+        "todoRevision",
+        "body_revision",
+        "bodyRevision",
+        "revision",
+      ]);
+      const todoBodyHash = remoteCommandStringField(event, [
+        "todo_body_hash",
+        "todoBodyHash",
+        "body_hash",
+        "bodyHash",
+        "hash",
+      ]);
+      if (!todoId || !todoDeviceId || !todoWorkspaceId || (!todoRevision && !todoBodyHash)) {
+        return "";
+      }
+      const targetWorkspace = findWorkspaceById(workspacesRef.current, workspaceId);
+      const repoPath = cleanWorkspaceRootDirectory(
+        targetWorkspace?.repoPath
+          || targetWorkspace?.rootDirectory
+          || getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId)
+          || "",
+      );
+      if (!repoPath) {
+        return "";
+      }
+      try {
+        const hydration = await invoke("cloud_mcp_hydrate_workspace_todos", {
+          refs: [{
+            todoId,
+            todoDeviceId,
+            todoWorkspaceId,
+            ...(todoRevision ? { todoRevision } : {}),
+            ...(todoBodyHash ? { todoBodyHash } : {}),
+          }],
+          repoPath,
+          workspaceId,
+          workspaceName: targetWorkspace?.name || "",
+        });
+        const item = Array.isArray(hydration?.items) ? hydration.items[0] : null;
+        return String(item?.body || item?.text || "").trim();
+      } catch (error) {
+        logBigViewSyncDiagnosticEvent("remote_control.todo_hydration_failed", {
+          commandId: remoteCommandStringField(event, ["command_id", "commandId"]),
+          message: getErrorMessage(error, "Unable to hydrate remote todo body."),
+          todoBodyHash,
+          todoId,
+          workspaceId,
+        });
+        return "";
+      }
+    };
     const remoteCommandIntegerField = (event, keys) => {
       const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
       for (const key of keys) {
@@ -15023,8 +15094,28 @@ export default function App() {
           const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
-          const text = remoteCommandText(event);
+          let text = remoteCommandText(event);
           const workspaceId = remoteCommandWorkspaceId(event);
+          const todoDispatchId = remoteCommandStringField(event, [
+            "todo_dispatch_id",
+            "todoDispatchId",
+          ]);
+          const todoId = remoteCommandStringField(event, [
+            "todo_id",
+            "todoId",
+          ]);
+          const todoDeviceId = remoteCommandStringField(event, [
+            "todo_device_id",
+            "todoDeviceId",
+            "origin_device_id",
+            "originDeviceId",
+          ]);
+          const todoWorkspaceId = remoteCommandStringField(event, [
+            "todo_workspace_id",
+            "todoWorkspaceId",
+            "origin_workspace_id",
+            "originWorkspaceId",
+          ]);
           const agentId = normalizeManagedAgentProviderId(
             event.target_agent_id
               || event.targetAgentId
@@ -15133,6 +15224,8 @@ export default function App() {
             }
             return;
           }
+          const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
+          text = await hydrateRemoteCommandTodoText(event, workspaceId, text);
           if (!text) {
             await recordRemoteCommandStatus(event, "failed", "Remote command did not include a task message.", {
               commandId,
@@ -15141,7 +15234,6 @@ export default function App() {
             });
             return;
           }
-          const targetWorkspace = findWorkspaceById(workspaces, workspaceId);
           window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
             detail: {
               item: {
@@ -15151,6 +15243,10 @@ export default function App() {
                 remoteCommand: {
                   commandId,
                   source: event.source || "next-diffforge",
+                  todoDispatchId,
+                  todoId,
+                  todoDeviceId,
+                  todoWorkspaceId,
                   targetTerminalId,
                   targetTerminalIndex,
                   targetThreadId,

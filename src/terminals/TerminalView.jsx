@@ -3690,6 +3690,48 @@ const TodoQueueItemText = styled.p`
   }
 `;
 
+const TodoQueueDispatchSelect = styled.select`
+  position: absolute;
+  top: 6px;
+  right: 36px;
+  z-index: 3;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(95, 179, 255, 0.24);
+  border-radius: 6px;
+  color: #cfe2ff;
+  background: rgba(24, 34, 54, 0.92);
+  font-size: 11px;
+  font-weight: 800;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    background 130ms ease,
+    border-color 130ms ease,
+    opacity 130ms ease,
+    transform 130ms ease;
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(95, 179, 255, 0.42);
+    background: rgba(32, 48, 78, 0.96);
+    outline: none;
+    transform: translateY(-1px);
+  }
+
+  ${TodoQueueItemCard}:hover &[data-visible="true"],
+  ${TodoQueueItemCard}:focus-within &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #164377;
+    background: rgba(255, 255, 255, 0.94);
+  }
+`;
+
 const TodoQueuePeerMeta = styled.div`
   display: flex;
   min-width: 0;
@@ -7803,6 +7845,16 @@ function getTodoQueueRemoteCommandId(item) {
   return String(item?.remoteCommand?.commandId || item?.remoteCommand?.id || item?.id || "").trim();
 }
 
+function getTodoQueueRemoteCommandDispatchId(item) {
+  return String(
+    item?.remoteCommand?.todoDispatchId
+      || item?.remoteCommand?.todo_dispatch_id
+      || item?.todoDispatchId
+      || item?.todo_dispatch_id
+      || "",
+  ).trim();
+}
+
 function getTodoQueueRemoteCommandReceiptKey(item, workspaceId = "") {
   const commandId = getTodoQueueRemoteCommandId(item);
   if (!commandId || normalizeTodoQueueSource(item?.source) !== TODO_QUEUE_SOURCE_REMOTE_CONTROL) {
@@ -8009,6 +8061,103 @@ function workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId) {
   return direct;
 }
 
+function workspaceTodoCollectionForWorkspace(workspaceTodos, workspaceId, directKeys = [], byWorkspaceKeys = []) {
+  if (!workspaceTodos || typeof workspaceTodos !== "object") {
+    return null;
+  }
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const direct = directKeys
+    .map((key) => workspaceTodos[key])
+    .find((value) => value);
+  const byWorkspace = byWorkspaceKeys
+    .map((key) => workspaceTodos[key])
+    .find((value) => value);
+
+  if (Array.isArray(byWorkspace)) {
+    return byWorkspace.find((entry) => (
+      String(
+        entry?.workspaceId
+          || entry?.workspace_id
+          || entry?.observerWorkspaceId
+          || entry?.observer_workspace_id
+          || "",
+      ).trim() === safeWorkspaceId
+    )) || direct;
+  }
+
+  if (byWorkspace && typeof byWorkspace === "object") {
+    return byWorkspace[safeWorkspaceId] || byWorkspace[String(safeWorkspaceId).toLowerCase()] || direct;
+  }
+
+  return direct;
+}
+
+function normalizeWorkspaceTodoDispatchTargets(workspaceTodos, workspaceId) {
+  const targetCollection = workspaceTodoCollectionForWorkspace(
+    workspaceTodos,
+    workspaceId,
+    ["dispatchTargets", "dispatch_targets"],
+    ["dispatchTargetsByWorkspace", "dispatch_targets_by_workspace"],
+  );
+  const items = Array.isArray(targetCollection?.items)
+    ? targetCollection.items
+    : Array.isArray(targetCollection)
+      ? targetCollection
+      : [];
+  const seen = new Set();
+  return items
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
+      }
+      const targetDeviceId = String(item.targetDeviceId || item.target_device_id || item.deviceId || item.device_id || "").trim();
+      const targetWorkspaceId = String(item.targetWorkspaceId || item.target_workspace_id || item.workspaceId || item.workspace_id || "").trim();
+      if (!targetDeviceId || !targetWorkspaceId) {
+        return null;
+      }
+      const key = `${targetDeviceId}::${targetWorkspaceId}`;
+      if (seen.has(key)) {
+        return null;
+      }
+      seen.add(key);
+      const deviceName = String(
+        item.targetDeviceName
+          || item.target_device_name
+          || item.deviceName
+          || item.device_name
+          || item.machineName
+          || item.machine_name
+          || targetDeviceId,
+      ).trim() || targetDeviceId;
+      const workspaceName = String(
+        item.targetWorkspaceName
+          || item.target_workspace_name
+          || item.workspaceName
+          || item.workspace_name
+          || targetWorkspaceId,
+      ).trim() || targetWorkspaceId;
+      const currentDevice = Boolean(item.currentDevice ?? item.current_device ?? item.canQueueLocal ?? item.can_queue_local);
+      return {
+        accountId: String(item.targetAccountId || item.target_account_id || item.accountId || item.account_id || "").trim(),
+        canQueue: item.canQueue !== false && item.can_queue !== false,
+        canQueueLocal: Boolean(item.canQueueLocal ?? item.can_queue_local ?? currentDevice),
+        canQueueRemote: Boolean(item.canQueueRemote ?? item.can_queue_remote ?? !currentDevice),
+        currentDevice,
+        deviceName,
+        gitRepoIdentityId: String(item.gitRepoIdentityId || item.git_repo_identity_id || "").trim(),
+        id: key,
+        label: currentDevice ? `${deviceName} / ${workspaceName}` : `${deviceName} / ${workspaceName}`,
+        repoName: String(item.gitRepoDisplayName || item.git_repo_display_name || "").trim(),
+        targetClientId: String(item.targetClientId || item.target_client_id || item.clientId || item.client_id || "").trim(),
+        targetDeviceId,
+        targetWorkspaceId,
+        workspaceName,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 48);
+}
+
 function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId) {
   const activity = workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId);
   const items = Array.isArray(activity?.items)
@@ -8042,6 +8191,7 @@ function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId) {
         900,
       ) || "Untitled todo";
       return {
+        accountId: String(item.accountId || item.account_id || "").trim(),
         deviceId,
         deviceName: String(
           item.deviceName
@@ -8248,6 +8398,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
+  dispatchTargets = [],
   draft,
   dropError = "",
   agentStatuses = [],
@@ -8264,6 +8415,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onCancelVoicePlan,
   onCancelVoicePlanTask,
   onDraftChange,
+  onDispatchTodoToTarget,
   onMinimizePane,
   onOpenWorkspaceSettings,
   onQueueAllItems,
@@ -9972,6 +10124,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     [connectedDevices],
   );
   const workspaceTodoPeerItems = Array.isArray(peerItems) ? peerItems : [];
+  const workspaceTodoDispatchTargets = Array.isArray(dispatchTargets)
+    ? dispatchTargets.filter((target) => target?.canQueue !== false)
+    : [];
+  const showTodoDispatchTargets = workspaceTodoDispatchTargets.length > 0
+    && typeof onDispatchTodoToTarget === "function";
+  const handleDispatchTargetChange = useCallback((event, item, source) => {
+    const targetId = String(event.target.value || "").trim();
+    event.target.value = "";
+    if (!targetId || typeof onDispatchTodoToTarget !== "function") {
+      return;
+    }
+    const target = workspaceTodoDispatchTargets.find((candidate) => candidate.id === targetId);
+    if (!target) {
+      return;
+    }
+    onDispatchTodoToTarget(item, target, { source });
+  }, [onDispatchTodoToTarget, workspaceTodoDispatchTargets]);
 
   return (
     <TodoQueueSurface
@@ -10217,6 +10386,26 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             {isQueued ? <Close aria-hidden="true" /> : <AddToQueue aria-hidden="true" />}
                           </TodoQueueItemActionButton>
                         )}
+                        {!isEditing && !isSending && showTodoDispatchTargets && (
+                          <TodoQueueDispatchSelect
+                            aria-label="Queue todo on device"
+                            data-todo-control="true"
+                            data-visible="true"
+                            defaultValue=""
+                            onChange={(event) => handleDispatchTargetChange(event, item, "local")}
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                            }}
+                            title="Queue on device"
+                          >
+                            <option value="">&gt;</option>
+                            {workspaceTodoDispatchTargets.map((target) => (
+                              <option key={target.id} value={target.id}>
+                                {target.label}
+                              </option>
+                            ))}
+                          </TodoQueueDispatchSelect>
+                        )}
                         {isPending && (
                           <TodoQueueItemPendingSpinner aria-label="Sending todo" role="img">
                             {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
@@ -10294,6 +10483,26 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         role="listitem"
                         title={metaParts.join(" · ")}
                       >
+                        {showTodoDispatchTargets && (
+                          <TodoQueueDispatchSelect
+                            aria-label="Queue peer todo on device"
+                            data-todo-control="true"
+                            data-visible="true"
+                            defaultValue=""
+                            onChange={(event) => handleDispatchTargetChange(event, item, "peer")}
+                            onPointerDown={(event) => {
+                              event.stopPropagation();
+                            }}
+                            title="Queue on device"
+                          >
+                            <option value="">&gt;</option>
+                            {workspaceTodoDispatchTargets.map((target) => (
+                              <option key={target.id} value={target.id}>
+                                {target.label}
+                              </option>
+                            ))}
+                          </TodoQueueDispatchSelect>
+                        )}
                         {running && (
                           <TodoQueueItemPendingSpinner aria-label="Peer todo running" role="img">
                             {TODO_QUEUE_PENDING_SPOKES.map((spoke) => (
@@ -10938,6 +11147,10 @@ function TerminalView({
     () => normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, terminalWorkspace?.id),
     [terminalWorkspace?.id, workspaceTodos],
   );
+  const workspaceTodoDispatchTargets = useMemo(
+    () => normalizeWorkspaceTodoDispatchTargets(workspaceTodos, terminalWorkspace?.id),
+    [terminalWorkspace?.id, workspaceTodos],
+  );
 
   const replaceTodoQueuePendingItems = useCallback((nextPendingItems) => {
     const normalizedPendingItems = nextPendingItems && typeof nextPendingItems === "object"
@@ -11141,6 +11354,20 @@ function TerminalView({
       todoQueueRemoteCommandReceiptStorageKeyRef.current,
       nextReceipts,
     );
+    const dispatchId = getTodoQueueRemoteCommandDispatchId(item);
+    if (dispatchId) {
+      void invoke("cloud_mcp_record_todo_dispatch_status", {
+        commandId: nextReceipt.commandId || undefined,
+        details: {
+          itemId: nextReceipt.itemId,
+          source: normalizeTodoQueueSource(item?.source),
+          textPreview: nextReceipt.text,
+        },
+        dispatchId,
+        status: nextReceipt.status,
+        workspaceId,
+      }).catch(() => {});
+    }
     return receiptKey;
   }, [terminalWorkspace?.id]);
 
@@ -14679,6 +14906,138 @@ function TerminalView({
       [safeItemId]: pendingItem,
     });
   }, [replaceTodoQueuePendingItems, terminalWorkspace?.id, updateTodoQueueItems]);
+
+  const dispatchTodoQueueItemToTarget = useCallback((item, target, options = {}) => {
+    const text = normalizeTodoQueueText(item?.text || "");
+    const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
+    const targetDeviceId = String(target?.targetDeviceId || "").trim();
+    const targetWorkspaceId = String(target?.targetWorkspaceId || "").trim();
+    const workspaceId = terminalWorkspace?.id || "";
+    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    if (!text || !todoId || !targetDeviceId || !targetWorkspaceId || !workspaceId || !repoPath) {
+      return;
+    }
+
+    const randomSuffix = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const dispatchId = `todo-dispatch-${randomSuffix}`;
+    const commandId = `todo-command-${randomSuffix}`;
+    const sourceWorkspaceId = String(
+      item?.sourceWorkspaceId
+        || item?.source_workspace_id
+        || item?.workspaceId
+        || item?.workspace_id
+        || workspaceId,
+    ).trim();
+    const sourceDeviceId = String(
+      item?.deviceId
+        || item?.device_id
+        || item?.todoDeviceId
+        || item?.todo_device_id
+        || "",
+    ).trim();
+    const targetIsCurrentWorkspace = Boolean(target?.currentDevice && targetWorkspaceId === workspaceId);
+    const remoteCommand = {
+      commandId,
+      source: "cloud-diffforge-todo-dispatch",
+      todoDeviceId: sourceDeviceId,
+      todoDispatchId: dispatchId,
+      todoId,
+      todoWorkspaceId: sourceWorkspaceId,
+    };
+    const todoPayload = {
+      commandId,
+      dispatchId,
+      text,
+      todoId,
+      todoWorkspaceId: sourceWorkspaceId,
+      ...(item?.accountId ? { todoAccountId: item.accountId } : {}),
+      ...(sourceDeviceId ? { todoDeviceId: sourceDeviceId } : {}),
+    };
+    const targetPayload = {
+      targetDeviceId,
+      targetDeviceName: target.deviceName || "",
+      targetWorkspaceId,
+      targetWorkspaceName: target.workspaceName || "",
+      ...(target.targetClientId ? { targetClientId: target.targetClientId } : {}),
+      ...(target.accountId ? { targetAccountId: target.accountId } : {}),
+    };
+
+    if (targetIsCurrentWorkspace) {
+      const queuedItem = normalizeTodoQueueItem(
+        options.source === "peer"
+          ? createTodoQueueItem(text, {
+            id: commandId,
+            remoteCommand,
+            source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+            workspaceId,
+          })
+          : {
+            ...item,
+            remoteCommand,
+            source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+            workspaceId,
+          },
+      );
+      if (queuedItem) {
+        updateTodoQueueItems((currentItems) => (
+          currentItems
+            .filter((candidate) => candidate.id !== queuedItem.id)
+            .concat([queuedItem])
+        ), {
+          immediate: true,
+          reason: "todo_dispatch_local_queued",
+        });
+        setTodoQueueItemPending(queuedItem.id, {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          phase: "queued",
+          reason: "todo_dispatch_local",
+          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+          workspaceId,
+        });
+        recordTodoQueueRemoteCommandReceipt(queuedItem, "queued", { workspaceId });
+      }
+    }
+
+    void invoke("cloud_mcp_request_workspace_todo_dispatch", {
+      dispatchKind: targetIsCurrentWorkspace ? "local" : "remote",
+      reason: targetIsCurrentWorkspace ? "todo_dispatch_local_queue" : "todo_dispatch_remote_queue",
+      repoPath,
+      target: targetPayload,
+      todo: todoPayload,
+      workspaceId,
+      workspaceName: terminalWorkspace?.name || "",
+    }).catch((error) => {
+      logTerminalStatus("frontend.todo_queue.dispatch_request_error", {
+        message: error?.message || String(error || ""),
+        targetDeviceId,
+        targetWorkspaceId,
+        todoId,
+        workspaceId,
+      });
+      if (targetIsCurrentWorkspace) {
+        void invoke("cloud_mcp_record_todo_dispatch_status", {
+          commandId,
+          details: {
+            message: error?.message || String(error || ""),
+            source: "todo_dispatch_local_queue",
+          },
+          dispatchId,
+          status: "failed",
+          workspaceId,
+        }).catch(() => {});
+      }
+    });
+  }, [
+    defaultWorkingDirectory,
+    recordTodoQueueRemoteCommandReceipt,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+    updateTodoQueueItems,
+  ]);
 
   const queueReleasedVoicePlanTasks = useCallback((tasks, snapshot = null, options = {}) => {
     const releasedTasks = (Array.isArray(tasks) ? tasks : [])
@@ -19605,6 +19964,7 @@ function TerminalView({
                           connectedDevices={connectedDevices}
                           coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
                           defaultWorkingDirectory={defaultWorkingDirectory}
+                          dispatchTargets={workspaceTodoDispatchTargets}
                           draft={todoQueueDraft}
                           dropError={todoDropError}
                           getItemAccentColor={getTodoQueueItemAccentColor}
@@ -19619,6 +19979,7 @@ function TerminalView({
                           onCancelVoicePlan={handleCancelVoicePlan}
                           onCancelVoicePlanTask={handleCancelVoicePlanTask}
                           onDraftChange={setTodoQueueDraft}
+                          onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
                           onMinimizePane={minimizeTodoQueuePane}
                           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
                           onQueueAllItems={queueAllTodoQueueItems}

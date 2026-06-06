@@ -2901,6 +2901,95 @@ impl CoordinationKernel {
         Ok(json!({"id": id, "title": title, "status": "ready"}))
     }
 
+    pub fn attach_task_source_refs(&self, task_id: &str, refs: &Value) -> Result<Value, String> {
+        let task_id = non_empty(task_id, "Task id")?;
+        let ref_text = |keys: &[&str]| -> Option<String> {
+            keys.iter()
+                .find_map(|key| {
+                    refs.get(*key)
+                        .or_else(|| refs.get("source_todo").and_then(|source| source.get(*key)))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let source_todo_id = ref_text(&["source_todo_id", "sourceTodoId", "todo_id", "todoId"]);
+        let source_todo_dispatch_id = ref_text(&[
+            "source_todo_dispatch_id",
+            "sourceTodoDispatchId",
+            "todo_dispatch_id",
+            "todoDispatchId",
+        ]);
+        let source_prompt_event_id = ref_text(&[
+            "source_prompt_event_id",
+            "sourcePromptEventId",
+            "prompt_event_id",
+            "promptEventId",
+        ]);
+        let source_command_id = ref_text(&[
+            "source_command_id",
+            "sourceCommandId",
+            "command_id",
+            "commandId",
+        ]);
+        if source_todo_id.is_none()
+            && source_todo_dispatch_id.is_none()
+            && source_prompt_event_id.is_none()
+            && source_command_id.is_none()
+        {
+            return Ok(api_ok(json!({
+                "updated": false,
+                "task_id": task_id,
+                "reason": "no_source_refs",
+            })));
+        }
+        let now = now_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks
+                 SET source_todo_id=COALESCE(?1, source_todo_id),
+                     source_todo_dispatch_id=COALESCE(?2, source_todo_dispatch_id),
+                     source_prompt_event_id=COALESCE(?3, source_prompt_event_id),
+                     source_command_id=COALESCE(?4, source_command_id),
+                     updated_at=?5
+                 WHERE id=?6",
+                params![
+                    source_todo_id.as_deref(),
+                    source_todo_dispatch_id.as_deref(),
+                    source_prompt_event_id.as_deref(),
+                    source_command_id.as_deref(),
+                    now,
+                    task_id,
+                ],
+            )
+            .map_err(|error| format!("Unable to attach task source todo refs: {error}"))?;
+        if updated == 0 {
+            return Ok(api_error(
+                "task_not_found",
+                "Task does not exist.",
+                json!({"task_id": task_id}),
+            ));
+        }
+        let task = self.query_one(
+            "SELECT * FROM tasks WHERE id=?1",
+            &[&task_id],
+            "Task does not exist.",
+        )?;
+        Ok(api_ok(json!({
+            "updated": true,
+            "task_id": task_id,
+            "source_todo": {
+                "todo_id": source_todo_id,
+                "todo_dispatch_id": source_todo_dispatch_id,
+                "prompt_event_id": source_prompt_event_id,
+                "command_id": source_command_id,
+            },
+            "task": task,
+        })))
+    }
+
     pub(crate) fn task_status_allows_start_reuse(status: &str) -> bool {
         !matches!(
             status,

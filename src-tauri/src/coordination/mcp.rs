@@ -2846,6 +2846,17 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         ));
     }
 
+    let source_todo_refs = cloud_start_task_source_refs(&cloud);
+    let attached_source_refs = if value_has_content(&source_todo_refs) {
+        let attached = kernel.attach_task_source_refs(&started_task_id, &source_todo_refs)?;
+        if attached["ok"].as_bool() == Some(false) {
+            return Ok(attached);
+        }
+        Some(attached["data"].clone())
+    } else {
+        None
+    };
+
     if let Some(object) = data.as_object_mut() {
         let brief = object
             .get("brief")
@@ -2856,6 +2867,10 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         object.insert("start_plan".to_string(), json!(start_plan));
         object.insert("cloud".to_string(), cloud_start_task_for_agent(&cloud));
         object.insert("cloud_task_id".to_string(), json!(cloud_task_id));
+        if let Some(attached) = attached_source_refs.as_ref() {
+            insert_if_present(object, "source_todo", attached["source_todo"].clone());
+            insert_if_present(object, "task", attached["task"].clone());
+        }
         object.insert(
             "task_id_source".to_string(),
             json!(if local_task_hint.is_some() {
@@ -2962,6 +2977,8 @@ fn cloud_start_task_for_agent(response: &Value) -> Value {
     if let Some(task_id) = cloud_start_task_id(response) {
         view.insert("task_id".to_string(), json!(task_id));
     }
+    let source_refs = cloud_start_task_source_refs(response);
+    insert_if_present(&mut view, "source_todo", source_refs["source_todo"].clone());
     insert_if_present(
         &mut view,
         "current_work",
@@ -3085,6 +3102,10 @@ fn cloud_task_history_for_agent(history: &Value) -> Value {
                                 "status",
                                 "title",
                                 "original_prompt",
+                                "source_todo",
+                                "todo_id",
+                                "todo_dispatch_id",
+                                "prompt_event_id",
                                 "coding_agent",
                                 "updated_at",
                             ],
@@ -3137,6 +3158,165 @@ fn value_has_content(value: &Value) -> bool {
         Value::Object(values) => !values.is_empty(),
         _ => true,
     }
+}
+
+fn cloud_start_task_source_refs(response: &Value) -> Value {
+    let todo_id = cloud_start_task_source_ref_text(
+        response,
+        &["todo_id", "todoId", "source_todo_id", "sourceTodoId"],
+    );
+    let todo_dispatch_id = cloud_start_task_source_ref_text(
+        response,
+        &[
+            "todo_dispatch_id",
+            "todoDispatchId",
+            "source_todo_dispatch_id",
+            "sourceTodoDispatchId",
+        ],
+    );
+    let prompt_event_id = cloud_start_task_source_ref_text(
+        response,
+        &[
+            "prompt_event_id",
+            "promptEventId",
+            "source_prompt_event_id",
+            "sourcePromptEventId",
+        ],
+    );
+    let command_id = cloud_start_task_source_ref_text(
+        response,
+        &[
+            "command_id",
+            "commandId",
+            "source_command_id",
+            "sourceCommandId",
+        ],
+    );
+    let mut source = Map::new();
+    if let Some(todo_id) = todo_id.as_deref() {
+        source.insert("todo_id".to_string(), json!(todo_id));
+        source.insert("todoId".to_string(), json!(todo_id));
+    }
+    if let Some(todo_dispatch_id) = todo_dispatch_id.as_deref() {
+        source.insert("todo_dispatch_id".to_string(), json!(todo_dispatch_id));
+        source.insert("todoDispatchId".to_string(), json!(todo_dispatch_id));
+    }
+    if let Some(prompt_event_id) = prompt_event_id.as_deref() {
+        source.insert("prompt_event_id".to_string(), json!(prompt_event_id));
+        source.insert("promptEventId".to_string(), json!(prompt_event_id));
+    }
+    if let Some(command_id) = command_id.as_deref() {
+        source.insert("command_id".to_string(), json!(command_id));
+        source.insert("commandId".to_string(), json!(command_id));
+    }
+    let mut refs = Map::new();
+    if let Some(todo_id) = todo_id.as_deref() {
+        refs.insert("source_todo_id".to_string(), json!(todo_id));
+        refs.insert("sourceTodoId".to_string(), json!(todo_id));
+        refs.insert("todo_id".to_string(), json!(todo_id));
+        refs.insert("todoId".to_string(), json!(todo_id));
+    }
+    if let Some(todo_dispatch_id) = todo_dispatch_id.as_deref() {
+        refs.insert(
+            "source_todo_dispatch_id".to_string(),
+            json!(todo_dispatch_id),
+        );
+        refs.insert("sourceTodoDispatchId".to_string(), json!(todo_dispatch_id));
+        refs.insert("todo_dispatch_id".to_string(), json!(todo_dispatch_id));
+        refs.insert("todoDispatchId".to_string(), json!(todo_dispatch_id));
+    }
+    if let Some(prompt_event_id) = prompt_event_id.as_deref() {
+        refs.insert("source_prompt_event_id".to_string(), json!(prompt_event_id));
+        refs.insert("sourcePromptEventId".to_string(), json!(prompt_event_id));
+        refs.insert("prompt_event_id".to_string(), json!(prompt_event_id));
+        refs.insert("promptEventId".to_string(), json!(prompt_event_id));
+    }
+    if let Some(command_id) = command_id.as_deref() {
+        refs.insert("source_command_id".to_string(), json!(command_id));
+        refs.insert("sourceCommandId".to_string(), json!(command_id));
+        refs.insert("command_id".to_string(), json!(command_id));
+        refs.insert("commandId".to_string(), json!(command_id));
+    }
+    if !source.is_empty() {
+        refs.insert("source_todo".to_string(), Value::Object(source));
+    }
+    Value::Object(refs)
+}
+
+fn cloud_start_task_source_ref_text(response: &Value, keys: &[&str]) -> Option<String> {
+    let containers = [
+        response,
+        &response["task"],
+        &response["data"]["task"],
+        &response["event"],
+        &response["event"]["task"],
+        &response["data"]["event"],
+        &response["data"]["event"]["task"],
+    ];
+    for container in containers {
+        for key in keys {
+            if let Some(value) = container
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+            if let Some(value) = container
+                .get("source_todo")
+                .and_then(|source| source.get(*key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+    for metadata in cloud_start_task_metadata_values(response) {
+        for key in keys {
+            if let Some(value) = metadata
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn cloud_start_task_metadata_values(response: &Value) -> Vec<Value> {
+    let containers = [
+        response,
+        &response["task"],
+        &response["data"]["task"],
+        &response["event"],
+        &response["event"]["task"],
+        &response["data"]["event"],
+        &response["data"]["event"]["task"],
+    ];
+    let mut values = Vec::new();
+    for container in containers {
+        for key in ["metadata", "metadata_json", "metadataJson"] {
+            let Some(value) = container.get(key) else {
+                continue;
+            };
+            if value.is_object() {
+                values.push(value.clone());
+            } else if let Some(raw) = value.as_str() {
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                    if parsed.is_object() {
+                        values.push(parsed);
+                    }
+                }
+            }
+        }
+    }
+    values
 }
 
 fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -4357,6 +4537,51 @@ mod tests {
         assert!(view["peer_work"][0].get("metadata_json").is_none());
         assert!(view["lane_conflicts"][0].get("payload").is_none());
         assert!(view["task_history"].get("repo_id").is_none());
+    }
+
+    #[test]
+    fn cloud_start_task_agent_view_exposes_source_todo_refs() {
+        let response = json!({
+            "task_id": "task-cloud-source",
+            "task": {
+                "id": "task-cloud-source",
+                "todo_id": "todo-direct-1",
+                "todo_dispatch_id": "dispatch-direct-1",
+                "prompt_event_id": "prompt-event-direct-1",
+                "metadata_json": {
+                    "source_command_id": "command-direct-1"
+                }
+            },
+            "spec_activity": {},
+            "context_pack": {},
+            "task_history": {"tasks": []}
+        });
+
+        let refs = cloud_start_task_source_refs(&response);
+        assert_eq!(refs["source_todo_id"].as_str(), Some("todo-direct-1"));
+        assert_eq!(
+            refs["source_todo_dispatch_id"].as_str(),
+            Some("dispatch-direct-1")
+        );
+        assert_eq!(
+            refs["source_prompt_event_id"].as_str(),
+            Some("prompt-event-direct-1")
+        );
+        assert_eq!(refs["source_command_id"].as_str(), Some("command-direct-1"));
+
+        let view = cloud_start_task_for_agent(&response);
+        assert_eq!(
+            view["source_todo"]["todo_id"].as_str(),
+            Some("todo-direct-1")
+        );
+        assert_eq!(
+            view["source_todo"]["todo_dispatch_id"].as_str(),
+            Some("dispatch-direct-1")
+        );
+        assert_eq!(
+            view["source_todo"]["command_id"].as_str(),
+            Some("command-direct-1")
+        );
     }
 
     #[test]

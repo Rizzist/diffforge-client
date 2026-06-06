@@ -17,6 +17,7 @@ use super::schema::{
     RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
     SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
+    TASK_SOURCE_TODO_REFS_MIGRATION_NAME, TASK_SOURCE_TODO_REFS_MIGRATION_VERSION,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
     TERMINAL_TASK_PLAN_MIGRATION_NAME, TERMINAL_TASK_PLAN_MIGRATION_VERSION,
     TERMINAL_TASK_PLAN_SCHEMA_SQL, WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
@@ -513,6 +514,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     )?);
     diagnostics.push(apply_worktree_task_binding_migration(connection)?);
     diagnostics.push(apply_terminal_task_plan_migration(connection)?);
+    diagnostics.push(apply_task_source_todo_refs_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -993,6 +995,47 @@ fn apply_terminal_task_plan_migration(
         0..0,
         ["TERMINAL_TASK_PLAN_SCHEMA_SQL executed idempotently".to_string()],
     );
+    Ok(migration)
+}
+
+fn apply_task_source_todo_refs_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    let mut details = Vec::new();
+    for (column, definition) in [
+        ("source_todo_id", "TEXT"),
+        ("source_todo_dispatch_id", "TEXT"),
+        ("source_prompt_event_id", "TEXT"),
+        ("source_command_id", "TEXT"),
+    ] {
+        let added = ensure_column(connection, "tasks", column, definition)?;
+        details.push(format!(
+            "tasks.{column} {}",
+            if added { "added" } else { "already_present" }
+        ));
+    }
+    with_sqlite_lock_retry("Unable to initialize task source todo indexes", || {
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_source_todo ON tasks(source_todo_id, updated_at)",
+            [],
+        )
+    })?;
+    details.push("idx_tasks_source_todo ensured".to_string());
+    let mut migration = if migration_applied(connection, TASK_SOURCE_TODO_REFS_MIGRATION_VERSION)? {
+        SchemaMigrationDiagnostics::new(
+            TASK_SOURCE_TODO_REFS_MIGRATION_VERSION,
+            TASK_SOURCE_TODO_REFS_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        )
+    } else {
+        record_migration_if_missing(
+            connection,
+            TASK_SOURCE_TODO_REFS_MIGRATION_VERSION,
+            TASK_SOURCE_TODO_REFS_MIGRATION_NAME,
+        )?
+    };
+    migration.details.splice(0..0, details);
     Ok(migration)
 }
 

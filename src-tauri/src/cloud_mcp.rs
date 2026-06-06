@@ -27,6 +27,8 @@ const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
+const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
+const CLOUD_MCP_TODO_BODY_CACHE_FILE: &str = "todo-body-cache.json";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -84,6 +86,7 @@ struct CloudMcpState {
     terminal_context_missing_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
     task_history_cache: Arc<Mutex<HashMap<String, Value>>>,
     task_history_refreshes: Arc<Mutex<HashSet<String>>>,
+    todo_body_cache: Arc<Mutex<HashMap<String, Value>>>,
     background_sync: CloudMcpBackgroundSync,
 }
 
@@ -152,6 +155,9 @@ struct CloudMcpTerminalContextState {
     workspace_id: String,
     workspace_name: String,
     session_mode: String,
+    todo_id: Option<String>,
+    todo_dispatch_id: Option<String>,
+    todo_command_id: Option<String>,
     created_ms: u64,
     last_changed_hash: String,
     last_checkpoint_ms: u64,
@@ -174,6 +180,13 @@ struct CloudMcpTerminalPromptMetadata {
     thread_id: Option<String>,
     workspace_id: String,
     workspace_name: String,
+}
+
+#[derive(Clone)]
+struct CloudMcpDirectPromptTodoRefs {
+    todo_id: String,
+    dispatch_id: String,
+    command_id: String,
 }
 
 #[derive(Clone)]
@@ -302,6 +315,7 @@ impl CloudMcpState {
             terminal_context_missing_until_ms: Arc::new(StdMutex::new(HashMap::new())),
             task_history_cache: Arc::new(Mutex::new(HashMap::new())),
             task_history_refreshes: Arc::new(Mutex::new(HashSet::new())),
+            todo_body_cache: Arc::new(Mutex::new(cloud_mcp_load_todo_body_cache())),
             background_sync: CloudMcpBackgroundSync {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 notify: Arc::new(tokio::sync::Notify::new()),
@@ -1174,6 +1188,75 @@ fn cloud_mcp_now_ms() -> u64 {
 fn cloud_mcp_short_hash(value: &str) -> String {
     let digest = Sha1::digest(value.as_bytes());
     format!("{digest:x}").chars().take(12).collect()
+}
+
+fn cloud_mcp_prompt_source_has_existing_todo(source: Option<&str>) -> bool {
+    matches!(
+        source
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase().replace(['_', ' '], "-"))
+            .as_deref(),
+        Some(
+            "todo-auto-queue"
+                | "voice-agent-queue"
+                | "voice-plan-queue"
+                | "remote-control"
+                | "terminal-view-drop"
+                | "tui-todo-auto-queue"
+                | "tui-voice-agent-queue"
+                | "tui-voice-plan-queue"
+                | "next-remote-control"
+        )
+    )
+}
+
+fn cloud_mcp_direct_prompt_todo_refs(
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+    terminal_index: Option<u16>,
+    prompt: &str,
+    prompt_metadata: &CloudMcpTerminalPromptMetadata,
+) -> Option<CloudMcpDirectPromptTodoRefs> {
+    let workspace_id = workspace_id.trim();
+    let prompt = prompt.trim();
+    if workspace_id.is_empty()
+        || prompt.is_empty()
+        || cloud_mcp_prompt_source_has_existing_todo(prompt_metadata.prompt_event_source.as_deref())
+    {
+        return None;
+    }
+    let seed = prompt_metadata
+        .prompt_event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("prompt-event:{workspace_id}:{value}"))
+        .unwrap_or_else(|| {
+            format!(
+                "direct-prompt:{workspace_id}:{pane_id}:{instance_id}:{}:{prompt}",
+                terminal_index
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "terminal".to_string())
+            )
+        });
+    let hash = cloud_mcp_short_hash(&seed);
+    Some(CloudMcpDirectPromptTodoRefs {
+        todo_id: format!("direct-prompt-todo-{hash}"),
+        dispatch_id: format!("direct-prompt-dispatch-{hash}"),
+        command_id: format!("direct-prompt-command-{hash}"),
+    })
+}
+
+fn cloud_mcp_direct_prompt_dispatch_status_for_turn(turn_status: &str) -> Option<&'static str> {
+    match turn_status.trim().to_ascii_lowercase().as_str() {
+        "completed" | "complete" | "done" => Some("completed"),
+        "failed" | "error" => Some("failed"),
+        "interrupted" | "cancelled" | "canceled" => Some("cancelled"),
+        "running" | "queued" => Some("running"),
+        _ => None,
+    }
 }
 
 fn cloud_mcp_repo_id_for_root(root: &Path) -> String {
@@ -2484,6 +2567,26 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["commandId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_id"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandId"])),
+        "todo_dispatch_id": cloud_mcp_payload_text(event, &["todo_dispatch_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["todoDispatchId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_dispatch_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoDispatchId"])),
+        "todoDispatchId": cloud_mcp_payload_text(event, &["todo_dispatch_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["todoDispatchId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_dispatch_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoDispatchId"])),
+        "todo_id": cloud_mcp_payload_text(event, &["todo_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["todoId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoId"])),
+        "todo_workspace_id": cloud_mcp_payload_text(event, &["todo_workspace_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["todoWorkspaceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_workspace_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoWorkspaceId"])),
+        "todo_device_id": cloud_mcp_payload_text(event, &["todo_device_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["todoDeviceId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todo_device_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "todoDeviceId"])),
         "command_kind": cloud_mcp_payload_text(event, &["command_kind"])
             .or_else(|| cloud_mcp_payload_text(event, &["commandKind"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_kind"]))
@@ -2583,6 +2686,10 @@ async fn cloud_mcp_send_remote_command_status_event(
     };
     tx.send(envelope)
         .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())?;
+    if cloud_mcp_payload_text(&payload, &["todo_dispatch_id", "todoDispatchId"]).is_some() {
+        let _ =
+            cloud_mcp_post_event_endpoint(state, "workspace_todo_dispatch_status", &payload).await;
+    }
     Ok(json!({"ok": true, "sent": true, "status": status}))
 }
 
@@ -2686,6 +2793,13 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
             | "workspace_todos_snapshot"
             | "todo_queue_snapshot"
             | "todo_queue_state"
+            | "workspace_todo_dispatch_requested"
+            | "todo_dispatch_requested"
+            | "workspace_todo_dispatch_status"
+            | "todo_dispatch_status"
+            | "todo_dispatch_update"
+            | "remote_command_ack"
+            | "remote_command_result"
     ) {
         return true;
     }
@@ -4711,6 +4825,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/sync/pull" => Some("sync_pull"),
         "/v1/context/pack" => Some("context_pack"),
         "/v1/task/history" => Some("task_history"),
+        "/v1/workspace/todos/hydrate" => Some("workspace_todo_hydrate"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -4837,6 +4952,7 @@ fn cloud_mcp_post_log_context(
     let tool = match endpoint {
         "/v1/context/pack" => "cloud_get_context_pack",
         "/v1/task/history" => "cloud_get_task_history",
+        "/v1/workspace/todos/hydrate" => "cloud_hydrate_workspace_todos",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -6825,6 +6941,9 @@ async fn cloud_mcp_observe_terminal_output(
                         entry.workspace_id.clone(),
                         entry.workspace_name.clone(),
                         entry.session_mode.clone(),
+                        entry.todo_id.clone(),
+                        entry.todo_dispatch_id.clone(),
+                        entry.todo_command_id.clone(),
                     ))
                 } else {
                     None
@@ -6963,6 +7082,9 @@ async fn cloud_mcp_observe_terminal_output(
         workspace_id,
         _workspace_name,
         session_mode,
+        todo_id,
+        todo_dispatch_id,
+        todo_command_id,
     )) = completion
     else {
         return;
@@ -7004,6 +7126,28 @@ async fn cloud_mcp_observe_terminal_output(
                 "workspace_id": workspace_id.clone(),
             }),
         );
+    }
+    if let (Some(todo_id), Some(dispatch_id), Some(command_id)) =
+        (todo_id, todo_dispatch_id, todo_command_id)
+    {
+        cloud_mcp_record_direct_prompt_todo_dispatch_status(
+            &state,
+            &CloudMcpDirectPromptTodoRefs {
+                todo_id,
+                dispatch_id,
+                command_id,
+            },
+            &workspace_id,
+            "completed",
+            json!({
+                "reason": "terminal_prompt_ready",
+                "agent_id": agent_id,
+                "pane_id": pane_id,
+                "prompt_event_id": prompt_event_id,
+                "thread_id": thread_id,
+            }),
+        )
+        .await;
     }
     if session_mode != TerminalSessionMode::ManagedPatch.as_str() {
         let brief = if work_brief.trim().is_empty() {
@@ -7099,6 +7243,279 @@ async fn cloud_mcp_observe_terminal_output(
     runtime.terminal_contexts.remove(&terminal_key);
 }
 
+async fn cloud_mcp_record_direct_prompt_todo_dispatch(
+    state: &CloudMcpState,
+    refs: &CloudMcpDirectPromptTodoRefs,
+    repo_id: &str,
+    repo_root: &Path,
+    pane_id: &str,
+    instance_id: u64,
+    agent_id: &str,
+    agent_kind: Option<&str>,
+    prompt: &str,
+    prompt_metadata: &CloudMcpTerminalPromptMetadata,
+    session_mode: &str,
+) {
+    let workspace_id = prompt_metadata.workspace_id.trim();
+    if workspace_id.is_empty() || prompt.trim().is_empty() {
+        return;
+    }
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = device_profile["device_id"]
+        .as_str()
+        .unwrap_or("rust-diffforge-desktop")
+        .to_string();
+    let device_name = device_profile["device_name"]
+        .as_str()
+        .unwrap_or("Desktop")
+        .to_string();
+    let workspace_name = prompt_metadata.workspace_name.trim();
+    let workspace_root = workspace_path_display(repo_root);
+    let title = cloud_mcp_prompt_summary(prompt);
+    let todo_id = refs.todo_id.as_str();
+    let dispatch_id = refs.dispatch_id.as_str();
+    let command_id = refs.command_id.as_str();
+    let prompt_event_id = prompt_metadata.prompt_event_id.as_deref();
+    let prompt_event_source = prompt_metadata.prompt_event_source.as_deref();
+    let prompt_event_submitted_at = prompt_metadata.prompt_event_submitted_at.as_deref();
+    let thread_id = prompt_metadata.thread_id.as_deref();
+    let agent_kind = agent_kind.unwrap_or_default();
+    let created_at = prompt_metadata
+        .prompt_event_submitted_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut snapshot_payload = json!({
+        "event_kind": "workspace_todo_snapshot",
+        "source": "rust-diffforge-direct-prompt",
+        "reason": "terminal_prompt_submitted",
+        "repo_id": repo_id,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name,
+        "workspaceName": workspace_name,
+        "workspace_root": workspace_root,
+        "workspaceRoot": workspace_root,
+        "device": device_profile.clone(),
+        "device_id": device_id.as_str(),
+        "deviceId": device_id.as_str(),
+        "machine_id": device_id.as_str(),
+        "machineId": device_id.as_str(),
+        "device_name": device_name.as_str(),
+        "machine_name": device_name.as_str(),
+        "snapshot_full": false,
+        "snapshotFull": false,
+        "prune_missing": false,
+        "pruneMissing": false,
+        "todos": [{
+            "id": todo_id,
+            "todo_id": todo_id,
+            "todoId": todo_id,
+            "todo_dispatch_id": dispatch_id,
+            "todoDispatchId": dispatch_id,
+            "command_id": command_id,
+            "commandId": command_id,
+            "text": prompt,
+            "body": prompt,
+            "title": title,
+            "status": "running",
+            "todo_status": "running",
+            "todoStatus": "running",
+            "source": "direct-terminal-prompt",
+            "source_kind": "direct-terminal-prompt",
+            "sourceKind": "direct-terminal-prompt",
+            "prompt_event_id": prompt_event_id,
+            "promptEventId": prompt_event_id,
+            "prompt_event_source": prompt_event_source,
+            "promptEventSource": prompt_event_source,
+            "prompt_event_submitted_at": prompt_event_submitted_at,
+            "promptEventSubmittedAt": prompt_event_submitted_at,
+            "created_at": created_at,
+            "createdAt": created_at,
+            "agent_id": agent_id,
+            "agentId": agent_id,
+            "agent_kind": agent_kind,
+            "agentKind": agent_kind,
+            "terminal_id": pane_id,
+            "terminalId": pane_id,
+            "pane_id": pane_id,
+            "paneId": pane_id,
+            "terminal_instance_id": instance_id,
+            "terminalInstanceId": instance_id,
+            "terminal_index": prompt_metadata.terminal_index,
+            "terminalIndex": prompt_metadata.terminal_index,
+            "thread_id": thread_id,
+            "threadId": thread_id,
+            "session_mode": session_mode,
+            "sessionMode": session_mode
+        }],
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut snapshot_payload);
+    if let Err(error) =
+        cloud_mcp_post_event_endpoint(state, "workspace_todo_snapshot", &snapshot_payload).await
+    {
+        log_terminal_status_event(
+            "backend.direct_prompt_todo.snapshot_error",
+            json!({
+                "dispatch_id": dispatch_id,
+                "error": clean_terminal_telemetry_text(&error),
+                "todo_id": todo_id,
+                "workspace_id": workspace_id,
+            }),
+        );
+        return;
+    }
+
+    let mut dispatch_payload = json!({
+        "event_kind": "workspace_todo_dispatch_requested",
+        "source": "rust-diffforge-direct-prompt",
+        "reason": "terminal_prompt_submitted",
+        "repo_id": repo_id,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name,
+        "workspaceName": workspace_name,
+        "workspace_root": workspace_root,
+        "workspaceRoot": workspace_root,
+        "device": device_profile,
+        "device_id": device_id.as_str(),
+        "deviceId": device_id.as_str(),
+        "machine_id": device_id.as_str(),
+        "machineId": device_id.as_str(),
+        "device_name": device_name.as_str(),
+        "machine_name": device_name.as_str(),
+        "requested_by_device_id": device_id.as_str(),
+        "requestedByDeviceId": device_id.as_str(),
+        "requested_by_workspace_id": workspace_id,
+        "requestedByWorkspaceId": workspace_id,
+        "dispatch_id": dispatch_id,
+        "dispatchId": dispatch_id,
+        "todo_dispatch_id": dispatch_id,
+        "todoDispatchId": dispatch_id,
+        "command_id": command_id,
+        "commandId": command_id,
+        "dispatch_kind": "local",
+        "dispatchKind": "local",
+        "todo_id": todo_id,
+        "todoId": todo_id,
+        "todo_device_id": device_id.as_str(),
+        "todoDeviceId": device_id.as_str(),
+        "todo_workspace_id": workspace_id,
+        "todoWorkspaceId": workspace_id,
+        "target_device_id": device_id.as_str(),
+        "targetDeviceId": device_id.as_str(),
+        "target_workspace_id": workspace_id,
+        "targetWorkspaceId": workspace_id,
+        "target_workspace_name": workspace_name,
+        "targetWorkspaceName": workspace_name,
+        "target_device_name": device_name.as_str(),
+        "targetDeviceName": device_name.as_str(),
+        "target_agent_id": agent_id,
+        "targetAgentId": agent_id,
+        "target_terminal_id": pane_id,
+        "targetTerminalId": pane_id,
+        "target_terminal_index": prompt_metadata.terminal_index,
+        "targetTerminalIndex": prompt_metadata.terminal_index,
+        "target_thread_id": thread_id,
+        "targetThreadId": thread_id,
+        "prompt_event_id": prompt_event_id,
+        "promptEventId": prompt_event_id,
+        "session_mode": session_mode,
+        "sessionMode": session_mode,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut dispatch_payload);
+    if let Err(error) = cloud_mcp_post_event_endpoint(
+        state,
+        "workspace_todo_dispatch_requested",
+        &dispatch_payload,
+    )
+    .await
+    {
+        log_terminal_status_event(
+            "backend.direct_prompt_todo.dispatch_error",
+            json!({
+                "dispatch_id": dispatch_id,
+                "error": clean_terminal_telemetry_text(&error),
+                "todo_id": todo_id,
+                "workspace_id": workspace_id,
+            }),
+        );
+        return;
+    }
+
+    cloud_mcp_record_direct_prompt_todo_dispatch_status(
+        state,
+        refs,
+        workspace_id,
+        "running",
+        json!({
+            "reason": "terminal_prompt_submitted",
+            "terminal_id": pane_id,
+            "terminal_instance_id": instance_id,
+            "prompt_event_id": prompt_metadata.prompt_event_id,
+        }),
+    )
+    .await;
+}
+
+async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
+    state: &CloudMcpState,
+    refs: &CloudMcpDirectPromptTodoRefs,
+    workspace_id: &str,
+    status: &str,
+    details: Value,
+) {
+    if refs.dispatch_id.trim().is_empty() {
+        return;
+    }
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let todo_id = refs.todo_id.as_str();
+    let dispatch_id = refs.dispatch_id.as_str();
+    let command_id = refs.command_id.as_str();
+    let mut payload = json!({
+        "event_kind": "workspace_todo_dispatch_status",
+        "source": "rust-diffforge-direct-prompt",
+        "todo_dispatch_id": dispatch_id,
+        "todoDispatchId": dispatch_id,
+        "dispatch_id": dispatch_id,
+        "dispatchId": dispatch_id,
+        "command_id": command_id,
+        "commandId": command_id,
+        "todo_id": todo_id,
+        "todoId": todo_id,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "status": status,
+        "dispatch_status": status,
+        "dispatchStatus": status,
+        "details": details,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
+    if let Err(error) =
+        cloud_mcp_post_event_endpoint(state, "workspace_todo_dispatch_status", &payload).await
+    {
+        log_terminal_status_event(
+            "backend.direct_prompt_todo.status_error",
+            json!({
+                "dispatch_id": dispatch_id,
+                "error": clean_terminal_telemetry_text(&error),
+                "status": status,
+                "todo_id": todo_id,
+                "workspace_id": workspace_id,
+            }),
+        );
+    }
+}
+
 async fn cloud_mcp_terminal_context_pack_for_prompt(
     state: CloudMcpState,
     pane_id: String,
@@ -7130,6 +7547,14 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         workspace_id: String::new(),
         workspace_name: String::new(),
     });
+    let direct_prompt_todo_refs = cloud_mcp_direct_prompt_todo_refs(
+        &prompt_metadata.workspace_id,
+        &pane_id,
+        instance_id,
+        prompt_metadata.terminal_index,
+        &prompt,
+        &prompt_metadata,
+    );
     {
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.insert(
@@ -7149,6 +7574,15 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 workspace_id: prompt_metadata.workspace_id.clone(),
                 workspace_name: prompt_metadata.workspace_name.clone(),
                 session_mode: session_mode.as_str().to_string(),
+                todo_id: direct_prompt_todo_refs
+                    .as_ref()
+                    .map(|refs| refs.todo_id.clone()),
+                todo_dispatch_id: direct_prompt_todo_refs
+                    .as_ref()
+                    .map(|refs| refs.dispatch_id.clone()),
+                todo_command_id: direct_prompt_todo_refs
+                    .as_ref()
+                    .map(|refs| refs.command_id.clone()),
                 created_ms: cloud_mcp_now_ms(),
                 last_changed_hash: String::new(),
                 last_checkpoint_ms: 0,
@@ -7181,6 +7615,25 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         return;
     }
 
+    if let Some(refs) = direct_prompt_todo_refs.as_ref() {
+        cloud_mcp_record_direct_prompt_todo_dispatch(
+            &state,
+            refs,
+            &repo_id,
+            &status_working_directory,
+            &pane_id,
+            instance_id,
+            &agent_id,
+            coordination
+                .as_ref()
+                .map(|coordination| coordination.agent_kind.as_str()),
+            &prompt,
+            &prompt_metadata,
+            session_mode.as_str(),
+        )
+        .await;
+    }
+
     let payload = json!({
         "source": "rust-diffforge-terminal",
         "repo_id": repo_id,
@@ -7198,6 +7651,12 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "prompt_event_id": prompt_metadata.prompt_event_id,
         "prompt_event_source": prompt_metadata.prompt_event_source,
         "prompt_event_submitted_at": prompt_metadata.prompt_event_submitted_at,
+        "todo_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.as_str()),
+        "todoId": direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.as_str()),
+        "todo_dispatch_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
+        "todoDispatchId": direct_prompt_todo_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
+        "command_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.command_id.as_str()),
+        "commandId": direct_prompt_todo_refs.as_ref().map(|refs| refs.command_id.as_str()),
         "task_id": local_task_id.clone(),
         "run_id": local_task_id.clone(),
         "prompt": prompt,
@@ -8359,6 +8818,16 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         .map(|entry| workspace_path_display(&entry.repo_root))
         .or_else(|| payload.cwd.clone())
         .unwrap_or_default();
+    let direct_prompt_refs = context_entry.as_ref().and_then(|entry| {
+        Some(CloudMcpDirectPromptTodoRefs {
+            todo_id: entry.todo_id.clone()?,
+            dispatch_id: entry.todo_dispatch_id.clone()?,
+            command_id: entry.todo_command_id.clone()?,
+        })
+    });
+    let prompt_event_id = context_entry
+        .as_ref()
+        .and_then(|entry| entry.prompt_event_id.as_deref());
     let state_value = cloud_mcp_terminal_lifecycle_state(
         &payload.event_type,
         &payload.status,
@@ -8403,6 +8872,14 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "provider_turn_id": payload.provider_turn_id,
         "provider_session_id": payload.provider_session_id,
         "native_session_id": payload.native_session_id,
+        "prompt_event_id": prompt_event_id,
+        "promptEventId": prompt_event_id,
+        "todo_id": direct_prompt_refs.as_ref().map(|refs| refs.todo_id.as_str()),
+        "todoId": direct_prompt_refs.as_ref().map(|refs| refs.todo_id.as_str()),
+        "todo_dispatch_id": direct_prompt_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
+        "todoDispatchId": direct_prompt_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
+        "command_id": direct_prompt_refs.as_ref().map(|refs| refs.command_id.as_str()),
+        "commandId": direct_prompt_refs.as_ref().map(|refs| refs.command_id.as_str()),
         "thread_id": payload.thread_id,
         "reason": reason,
         "summary": format!("Terminal {}.", state_value),
@@ -8414,6 +8891,28 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM
     };
     cloud_mcp_enqueue_terminal_lifecycle_delta(state, delta, terminal_id, reason, priority).await;
+    if let (Some(refs), Some(status)) = (
+        direct_prompt_refs.as_ref(),
+        cloud_mcp_direct_prompt_dispatch_status_for_turn(turn_status),
+    ) {
+        cloud_mcp_record_direct_prompt_todo_dispatch_status(
+            state,
+            refs,
+            &payload.workspace_id,
+            status,
+            json!({
+                "reason": reason,
+                "event_type": payload.event_type,
+                "hook_event_name": payload.hook_event_name,
+                "turn_status": turn_status,
+                "state": state_value,
+                "pane_id": terminal_id,
+                "terminal_instance_id": payload.instance_id,
+                "prompt_event_id": prompt_event_id,
+            }),
+        )
+        .await;
+    }
 }
 
 #[tauri::command]
@@ -9536,6 +10035,369 @@ async fn cloud_mcp_sync_workspace_todos(
         ),
     }
     result
+}
+
+#[tauri::command]
+async fn cloud_mcp_request_workspace_todo_dispatch(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    todo: Value,
+    target: Value,
+    dispatch_kind: Option<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut payload = json!({
+        "event_kind": "workspace_todo_dispatch_requested",
+        "source": "rust-diffforge-todo-dispatch",
+        "reason": reason.unwrap_or_else(|| "todo_dispatch_requested".to_string()),
+        "repo_id": req.repo_id,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name.clone().unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "requested_by_device_id": device_profile["device_id"].clone(),
+        "requestedByDeviceId": device_profile["device_id"].clone(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "dispatch_kind": dispatch_kind.unwrap_or_else(|| "remote".to_string()),
+        "todo": todo,
+        "target": target,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Value::Object(object) = &mut payload {
+        if let Some(todo_object) = object.get("todo").and_then(Value::as_object).cloned() {
+            for (key, value) in todo_object {
+                object.entry(key).or_insert(value);
+            }
+        }
+        if let Some(target_object) = object.get("target").and_then(Value::as_object).cloned() {
+            for (key, value) in target_object {
+                object.entry(key).or_insert(value);
+            }
+        }
+    }
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
+    log_terminal_status_event(
+        "backend.workspace_todos.dispatch_request",
+        json!({
+            "workspaceId": workspace_id,
+            "targetDeviceId": cloud_mcp_payload_text(&payload, &["target_device_id", "targetDeviceId"]),
+            "targetWorkspaceId": cloud_mcp_payload_text(&payload, &["target_workspace_id", "targetWorkspaceId"]),
+            "todoId": cloud_mcp_payload_text(&payload, &["todo_id", "todoId", "id"]),
+        }),
+    );
+    cloud_mcp_post_event_endpoint(
+        state.inner(),
+        "workspace_todo_dispatch_requested",
+        &payload,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn cloud_mcp_record_todo_dispatch_status(
+    state: State<'_, CloudMcpState>,
+    dispatch_id: String,
+    command_id: Option<String>,
+    workspace_id: Option<String>,
+    status: String,
+    details: Option<Value>,
+) -> Result<Value, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut payload = json!({
+        "event_kind": "workspace_todo_dispatch_status",
+        "source": "rust-diffforge-todo-dispatch",
+        "todo_dispatch_id": dispatch_id,
+        "todoDispatchId": dispatch_id,
+        "command_id": command_id.clone().unwrap_or_default(),
+        "commandId": command_id.unwrap_or_default(),
+        "workspace_id": workspace_id.clone().unwrap_or_default(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "status": status,
+        "dispatch_status": status,
+        "dispatchStatus": status,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    if let Some(details) = details {
+        if !details.is_null() {
+            payload["details"] = details;
+        }
+    }
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
+    cloud_mcp_post_event_endpoint(state.inner(), "workspace_todo_dispatch_status", &payload).await
+}
+
+fn cloud_mcp_todo_body_refs_array(value: &Value) -> Vec<Value> {
+    if let Some(items) = value.as_array() {
+        return items.clone();
+    }
+    for key in ["refs", "todoRefs", "todo_refs", "todos", "items"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            return items.clone();
+        }
+    }
+    value
+        .get("todo")
+        .or_else(|| value.get("ref"))
+        .or_else(|| value.get("item"))
+        .filter(|item| item.is_object())
+        .cloned()
+        .or_else(|| value.is_object().then(|| value.clone()))
+        .into_iter()
+        .collect()
+}
+
+fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
+    let todo_id = cloud_mcp_payload_text(value, &["todo_id", "todoId", "id"])?;
+    let device_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "todo_device_id",
+            "todoDeviceId",
+            "device_id",
+            "deviceId",
+            "source_device_id",
+            "sourceDeviceId",
+        ],
+    )?;
+    let workspace_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "todo_workspace_id",
+            "todoWorkspaceId",
+            "workspace_id",
+            "workspaceId",
+            "source_workspace_id",
+            "sourceWorkspaceId",
+        ],
+    )?;
+    let revision = cloud_mcp_payload_text(
+        value,
+        &[
+            "todo_revision",
+            "todoRevision",
+            "body_revision",
+            "bodyRevision",
+            "revision",
+        ],
+    )
+    .unwrap_or_default();
+    let body_hash = cloud_mcp_payload_text(
+        value,
+        &[
+            "todo_body_hash",
+            "todoBodyHash",
+            "body_hash",
+            "bodyHash",
+            "hash",
+        ],
+    )
+    .unwrap_or_default();
+    if revision.trim().is_empty() && body_hash.trim().is_empty() {
+        return None;
+    }
+    let account_id = cloud_mcp_payload_text(value, &["todo_account_id", "todoAccountId", "account_id", "accountId"])
+        .unwrap_or_default();
+    Some(format!(
+        "{}::{}::{}::{}::{}::{}",
+        account_id, device_id, workspace_id, todo_id, revision, body_hash
+    ))
+}
+
+fn cloud_mcp_todo_body_cache_path() -> Option<PathBuf> {
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))?;
+    Some(
+        base.join(".diffforge")
+            .join("cache")
+            .join(CLOUD_MCP_TODO_BODY_CACHE_FILE),
+    )
+}
+
+fn cloud_mcp_load_todo_body_cache() -> HashMap<String, Value> {
+    let Some(path) = cloud_mcp_todo_body_cache_path() else {
+        return HashMap::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|object| {
+            object
+                .into_iter()
+                .filter(|(_, value)| value.is_object())
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_save_todo_body_cache(cache: &HashMap<String, Value>) {
+    let Some(path) = cloud_mcp_todo_body_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(text) = serde_json::to_string(cache) {
+        let _ = fs::write(path, text);
+    }
+}
+
+fn cloud_mcp_prune_todo_body_cache(cache: &mut HashMap<String, Value>) {
+    if cache.len() <= CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS {
+        return;
+    }
+    let mut entries = cache
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                value
+                    .get("lastAccessedMs")
+                    .and_then(Value::as_u64)
+                    .or_else(|| value.get("cachedAtMs").and_then(Value::as_u64))
+                    .unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, last_accessed_ms)| *last_accessed_ms);
+    let remove_count = cache.len().saturating_sub(CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS);
+    for (key, _) in entries.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
+}
+
+#[tauri::command]
+async fn cloud_mcp_hydrate_workspace_todos(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    refs: Value,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let refs_array = cloud_mcp_todo_body_refs_array(&refs);
+    if refs_array.is_empty() {
+        return Ok(json!({
+            "kind": "workspace_todo_hydration",
+            "items": [],
+            "missing": [],
+            "cachedCount": 0,
+            "hydratedCount": 0,
+        }));
+    }
+
+    let now_ms = cloud_mcp_now_ms();
+    let mut cached_items = Vec::new();
+    let mut misses = Vec::new();
+    let mut cache_changed = false;
+    {
+        let mut cache = state.todo_body_cache.lock().await;
+        for item in refs_array.iter() {
+            let Some(key) = cloud_mcp_todo_body_cache_key(item) else {
+                misses.push(item.clone());
+                continue;
+            };
+            if let Some(cached) = cache.get_mut(&key) {
+                if let Some(object) = cached.as_object_mut() {
+                    object.insert("cached".to_string(), json!(true));
+                    object.insert("lastAccessedMs".to_string(), json!(now_ms));
+                }
+                cached_items.push(cached.clone());
+                cache_changed = true;
+            } else {
+                misses.push(item.clone());
+            }
+        }
+        if cache_changed {
+            cloud_mcp_prune_todo_body_cache(&mut cache);
+            cloud_mcp_save_todo_body_cache(&cache);
+        }
+    }
+
+    let mut hydrated_items = Vec::new();
+    let mut missing_items = Vec::new();
+    if !misses.is_empty() {
+        let payload = json!({
+            "repo_id": req.repo_id,
+            "repo_path": req.root_display,
+            "workspace_root": req.root_display,
+            "workspace_id": req.workspace_id.clone().unwrap_or_default(),
+            "workspaceId": req.workspace_id.clone().unwrap_or_default(),
+            "workspace_name": req.workspace_name.clone().unwrap_or_default(),
+            "workspaceName": req.workspace_name.clone().unwrap_or_default(),
+            "refs": misses,
+        });
+        let response =
+            cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/todos/hydrate", &payload)
+                .await?;
+        let data = response.get("data").cloned().unwrap_or(response);
+        hydrated_items = data
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        missing_items = data
+            .get("missing")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !hydrated_items.is_empty() {
+            let mut cache = state.todo_body_cache.lock().await;
+            for item in &hydrated_items {
+                if let Some(key) = cloud_mcp_todo_body_cache_key(item) {
+                    let mut cached = item.clone();
+                    if let Some(object) = cached.as_object_mut() {
+                        object.insert("cached".to_string(), json!(false));
+                        object.insert("cachedAtMs".to_string(), json!(now_ms));
+                        object.insert("lastAccessedMs".to_string(), json!(now_ms));
+                    }
+                    cache.insert(key, cached);
+                }
+            }
+            cloud_mcp_prune_todo_body_cache(&mut cache);
+            cloud_mcp_save_todo_body_cache(&cache);
+        }
+    }
+
+    let mut items = cached_items;
+    items.extend(hydrated_items);
+    let cached_count = items
+        .iter()
+        .filter(|item| item.get("cached").and_then(Value::as_bool).unwrap_or(false))
+        .count();
+    let hydrated_count = items.len().saturating_sub(cached_count);
+    Ok(json!({
+        "kind": "workspace_todo_hydration",
+        "version": 1,
+        "items": items,
+        "missing": missing_items,
+        "cached_count": cached_count,
+        "cachedCount": cached_count,
+        "hydrated_count": hydrated_count,
+        "hydratedCount": hydrated_count,
+    }))
 }
 
 fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
