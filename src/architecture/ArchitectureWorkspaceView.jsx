@@ -66,7 +66,23 @@ function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
-const ARCHITECTURE_GRAPH_LIST_REFRESH_MS = 700;
+function architectureRepoPathKey(value) {
+  return text(value).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function architectureRepoPathFromEntry(entry) {
+  return text(entry?.path || entry?.projectRoot || entry?.project_root || entry?.repoPath || entry?.repo_path);
+}
+
+function architectureGraphListCacheEntry(graphLists, repoPath) {
+  if (!graphLists || typeof graphLists !== "object") return null;
+  const repoKey = architectureRepoPathKey(repoPath);
+  return graphLists[repoKey]
+    || graphLists[repoPath]
+    || Object.values(graphLists).find((entry) => architectureRepoPathKey(entry?.repoPath || entry?.repo_path) === repoKey)
+    || null;
+}
+
 const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
 const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
@@ -97,6 +113,14 @@ const ARCHITECTURE_AGENT_EDIT_FALLBACK_COLORS = [
   "#a78bfa",
   "#2dd4bf",
 ];
+const ARCHITECTURE_API_CORRIDOR_INTENT = "api-corridor";
+const ARCHITECTURE_API_CORRIDOR_ALIASES = new Set([
+  "api-corridor",
+  "api-procedure-overlay",
+  "api-procedure",
+  "procedure-overlay",
+  "procedure-corridor",
+]);
 const ARCHITECTURE_ROUTE_GRID_CELL = 48;
 const ARCHITECTURE_ROUTE_GRID_MAX_POINTS = 1600;
 const ARCHITECTURE_ROUTE_CACHE_MAX = 700;
@@ -159,6 +183,236 @@ function taskHistoryFromSnapshot(snapshot) {
   return candidates.find((candidate) => jsonArray(candidate.tasks).length)
     || candidates[0]
     || { kind: "task_history", version: 1, tasks: [] };
+}
+
+function architectureWorkspaceTodoCollection(workspaceTodos, workspaceId, directKeys = [], byWorkspaceKeys = []) {
+  if (!workspaceTodos || typeof workspaceTodos !== "object") {
+    return null;
+  }
+  const safeWorkspaceId = text(workspaceId);
+  const direct = directKeys
+    .map((key) => workspaceTodos[key])
+    .find((value) => value);
+  const byWorkspace = byWorkspaceKeys
+    .map((key) => workspaceTodos[key])
+    .find((value) => value);
+
+  if (Array.isArray(byWorkspace)) {
+    return byWorkspace.find((entry) => (
+      text(
+        entry?.workspaceId
+          || entry?.workspace_id
+          || entry?.observerWorkspaceId
+          || entry?.observer_workspace_id,
+      ) === safeWorkspaceId
+    )) || direct;
+  }
+
+  if (byWorkspace && typeof byWorkspace === "object") {
+    return byWorkspace[safeWorkspaceId] || byWorkspace[safeWorkspaceId.toLowerCase()] || direct;
+  }
+
+  return direct;
+}
+
+function architectureTodoArrayFromCollection(collection) {
+  if (Array.isArray(collection)) return collection;
+  if (!collection || typeof collection !== "object") return [];
+  return jsonArray(collection.items).length
+    ? jsonArray(collection.items)
+    : jsonArray(collection.todos).length
+      ? jsonArray(collection.todos)
+      : jsonArray(collection.history).length
+        ? jsonArray(collection.history)
+        : jsonArray(collection.entries).length
+          ? jsonArray(collection.entries)
+          : jsonArray(collection.recent);
+}
+
+function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
+  const collections = [
+    architectureWorkspaceTodoCollection(
+      workspaceTodos,
+      workspaceId,
+      ["history", "todoHistory", "todo_history", "items", "todos"],
+      [
+        "historyByWorkspace",
+        "history_by_workspace",
+        "todoHistoryByWorkspace",
+        "todo_history_by_workspace",
+        "itemsByWorkspace",
+        "items_by_workspace",
+        "todosByWorkspace",
+        "todos_by_workspace",
+      ],
+    ),
+    architectureWorkspaceTodoCollection(
+      workspaceTodos,
+      workspaceId,
+      ["peerActivity", "peer_activity"],
+      ["peerActivityByWorkspace", "peer_activity_by_workspace"],
+    ),
+  ];
+
+  const seen = new Set();
+  return collections.flatMap(architectureTodoArrayFromCollection).filter((item, index) => {
+    if (!item || typeof item !== "object") return false;
+    const id = text(item.todoId || item.todo_id || item.id || item.clientTodoId || item.client_todo_id, `todo-${index}`);
+    const sourceDeviceId = text(item.deviceId || item.device_id || item.sourceDeviceId || item.source_device_id);
+    const key = `${sourceDeviceId}::${id}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function architectureNormalizeTodoStatus(value) {
+  const status = text(value).toLowerCase().replaceAll("_", "-");
+  if (["complete", "completed", "done", "success", "sent"].includes(status)) return "completed";
+  if (["running", "sending", "submitted", "active", "in-progress", "working"].includes(status)) return "running";
+  if (["queued", "pending", "listed", "ready", "list"].includes(status)) return status === "queued" ? "queued" : "listed";
+  if (["paused", "parked", "waiting"].includes(status)) return "paused";
+  if (["cancelled", "canceled"].includes(status)) return "cancelled";
+  if (["interrupted", "stopped"].includes(status)) return "interrupted";
+  if (["timed-out", "timeout", "expired"].includes(status)) return "timed-out";
+  if (["failed", "failure", "error", "blocked", "rejected"].includes(status)) return "failed";
+  if (["deleted", "removed"].includes(status)) return "deleted";
+  return status || "listed";
+}
+
+function architectureTodoStatusKind(status) {
+  if (status === "completed") return "done";
+  if (status === "running") return "active";
+  if (status === "queued") return "queued";
+  if (status === "paused") return "parked";
+  if (status === "cancelled") return "cancelled";
+  if (status === "interrupted") return "interrupted";
+  if (status === "timed-out" || status === "failed") return "failed";
+  if (status === "deleted") return "skipped";
+  return "unknown";
+}
+
+function architectureTodoStatusLabel(status) {
+  if (status === "timed-out") return "Timed Out";
+  if (status === "completed") return "Done";
+  if (status === "running") return "Running";
+  if (status === "queued") return "Queued";
+  if (status === "paused") return "Paused";
+  if (status === "cancelled") return "Cancelled";
+  if (status === "interrupted") return "Interrupted";
+  if (status === "failed") return "Failed";
+  if (status === "deleted") return "Deleted";
+  return "Listed";
+}
+
+function architectureTodoText(item) {
+  const note = jsonObject(item?.note) || {};
+  return text(
+    item?.text
+      || item?.body
+      || item?.prompt
+      || item?.todo
+      || item?.task
+      || note.text
+      || note.body,
+  );
+}
+
+function architectureTodoTitle(item, fallback = "Todo") {
+  const note = jsonObject(item?.note) || {};
+  const body = architectureTodoText(item);
+  return text(
+    item?.title
+      || item?.name
+      || note.title
+      || body.split(/\r?\n/u).find(Boolean),
+    fallback,
+  );
+}
+
+function architectureTodoSourceLabel(item) {
+  const source = text(item?.source || item?.kind || item?.origin);
+  if (!source) return "workspace";
+  return source.replace(/[-_]+/gu, " ");
+}
+
+function architectureTodoTargetLabel(item) {
+  const targetWorkspace = text(
+    item?.targetWorkspaceName
+      || item?.target_workspace_name
+      || item?.workspaceName
+      || item?.workspace_name,
+  );
+  const targetDevice = text(
+    item?.targetDeviceName
+      || item?.target_device_name
+      || item?.deviceName
+      || item?.device_name
+      || item?.machineName
+      || item?.machine_name,
+  );
+  const targetAgent = text(item?.targetAgentLabel || item?.target_agent_label || item?.targetAgentId || item?.target_agent_id);
+  const targetTerminalIndex = item?.targetTerminalIndex ?? item?.target_terminal_index;
+  const targetTerminal = text(item?.targetTerminalId || item?.target_terminal_id || item?.terminalId || item?.terminal_id);
+  if (targetAgent) return targetAgent;
+  if (Number.isInteger(Number(targetTerminalIndex))) return `Terminal ${Number(targetTerminalIndex) + 1}`;
+  if (targetTerminal) return targetTerminal;
+  if (targetDevice && targetWorkspace) return `${targetDevice} / ${targetWorkspace}`;
+  return targetDevice || targetWorkspace || "workspace";
+}
+
+function architectureTodoCreatedMs(item) {
+  return parseTimeMs(item?.createdAt || item?.created_at || item?.queuedAt || item?.queued_at);
+}
+
+function architectureTodoFinishedMs(item, status) {
+  if (status === "completed") return parseTimeMs(item?.completedAt || item?.completed_at || item?.todoCompletedAt || item?.todo_completed_at);
+  if (status === "cancelled") return parseTimeMs(item?.cancelledAt || item?.cancelled_at || item?.canceledAt || item?.canceled_at || item?.todoCancelledAt || item?.todo_cancelled_at);
+  if (status === "paused") return parseTimeMs(item?.pausedAt || item?.paused_at || item?.parkedAt || item?.parked_at || item?.todoPausedAt || item?.todo_paused_at);
+  if (status === "interrupted") return parseTimeMs(item?.interruptedAt || item?.interrupted_at || item?.todoInterruptedAt || item?.todo_interrupted_at);
+  if (status === "timed-out") return parseTimeMs(item?.timedOutAt || item?.timed_out_at || item?.timeoutAt || item?.timeout_at || item?.todoTimedOutAt || item?.todo_timed_out_at);
+  if (status === "failed") return parseTimeMs(item?.failedAt || item?.failed_at || item?.todoFailedAt || item?.todo_failed_at);
+  if (status === "deleted") return parseTimeMs(item?.deletedAt || item?.deleted_at || item?.todoDeletedAt || item?.todo_deleted_at);
+  return 0;
+}
+
+function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspaceId) {
+  return architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId)
+    .map((item, index) => {
+      const status = architectureNormalizeTodoStatus(
+        item.todoStatus
+          || item.todo_status
+          || item.status
+          || item.cloudStatus
+          || item.cloud_status,
+      );
+      const createdMs = architectureTodoCreatedMs(item);
+      const finishedMs = architectureTodoFinishedMs(item, status);
+      const updatedMs = parseTimeMs(item.updatedAt || item.updated_at || item.todoStatusUpdatedAt || item.todo_status_updated_at)
+        || finishedMs
+        || createdMs;
+      const body = architectureTodoText(item);
+      const id = text(item.todoId || item.todo_id || item.id || item.clientTodoId || item.client_todo_id, `todo-${index}`);
+      return {
+        body,
+        createdMs,
+        duration: formatTimelineDuration(createdMs, finishedMs || updatedMs, status === "running"),
+        id,
+        rawStatus: text(item.todoStatus || item.todo_status || item.status || item.cloudStatus || item.cloud_status, status),
+        source: architectureTodoSourceLabel(item),
+        status,
+        statusKind: architectureTodoStatusKind(status),
+        statusLabel: architectureTodoStatusLabel(status),
+        target: architectureTodoTargetLabel(item),
+        title: architectureTodoTitle(item, `Todo ${index + 1}`),
+        updatedMs,
+      };
+    })
+    .sort((left, right) => (
+      (right.updatedMs || right.createdMs || 0) - (left.updatedMs || left.createdMs || 0)
+        || left.title.localeCompare(right.title)
+    ))
+    .slice(0, 200);
 }
 
 function taskStatus(task) {
@@ -276,6 +530,7 @@ const ARCHITECTURE_KIND_OPTIONS = [
   { label: "Architecture", value: "architecture" },
   { label: "Deployment", value: "deployment" },
   { label: "API pathway", value: "api-pathway" },
+  { label: "API corridor", value: "api-corridor" },
   { label: "Data flow", value: "data-flow" },
   { label: "Control graph", value: "control-graph" },
   { label: "State machine", value: "state-machine" },
@@ -319,6 +574,10 @@ const ARCHITECTURE_NODE_ROLE_OPTIONS = [
 
 const ARCHITECTURE_EDGE_ROLE_OPTIONS = [
   "calls",
+  "request",
+  "response",
+  "redirect",
+  "callback",
   "reads",
   "writes",
   "publishes",
@@ -339,6 +598,7 @@ const ARCHITECTURE_EDGE_ROLE_VALUES = new Set(ARCHITECTURE_EDGE_ROLE_OPTIONS);
 const ARCHITECTURE_GROUP_INTENT_ICONS = {
   architecture: "group",
   "api-pathway": "api",
+  "api-corridor": "route",
   "data-flow": "flow",
   "control-graph": "router",
   "state-machine": "flow",
@@ -351,6 +611,7 @@ const ARCHITECTURE_GROUP_INTENT_ICONS = {
 const ARCHITECTURE_GROUP_INTENT_COLORS = {
   architecture: "blue",
   "api-pathway": "sky",
+  "api-corridor": "cyan",
   "data-flow": "emerald",
   "control-graph": "amber",
   "state-machine": "violet",
@@ -405,7 +666,11 @@ const ARCHITECTURE_NODE_ROLE_KIND = {
 };
 
 const ARCHITECTURE_EDGE_ROLE_KIND = {
+  callback: "calls",
   "depends-on": "depends",
+  redirect: "calls",
+  request: "calls",
+  response: "calls",
   reads: "reads",
   writes: "writes",
   publishes: "publishes",
@@ -961,6 +1226,7 @@ const ARCHITECTURE_TITLE_ICON_SUFFIXES = new Set([
 ]);
 
 const architectureNodeTypes = {
+  architectureCorridor: ArchitectureApiCorridorNode,
   architectureGroup: ArchitectureCanvasGroup,
   architectureNode: ArchitectureCanvasNode,
 };
@@ -1620,7 +1886,12 @@ function architectureSemanticOptionLabel(options, value, fallback = "") {
 
 function architectureGroupIntent(value, fallback = "architecture") {
   const slug = architectureSemanticSlug(value, fallback);
+  if (ARCHITECTURE_API_CORRIDOR_ALIASES.has(slug)) return ARCHITECTURE_API_CORRIDOR_INTENT;
   return ARCHITECTURE_GROUP_INTENT_VALUES.has(slug) ? slug : slug;
+}
+
+function architectureIsApiCorridorIntent(value) {
+  return architectureGroupIntent(value, "") === ARCHITECTURE_API_CORRIDOR_INTENT;
 }
 
 function architectureGroupIntentLabel(value) {
@@ -2066,6 +2337,7 @@ function architectureParseDslGraph(graph) {
     filePath: text(graph?.filePath),
     nodes: [],
     edges: [],
+    apiCorridors: [],
   };
   const nameToId = new Map();
   const nodeById = new Map();
@@ -2083,7 +2355,7 @@ function architectureParseDslGraph(graph) {
     if (!cleanName) return null;
     if (nameToId.has(cleanName)) return nameToId.get(cleanName);
     const id = uniqueId(cleanName, isGroup ? "group" : "node");
-    const parentId = explicitParentId || stack.at(-1)?.id || "";
+    const parentId = explicitParentId || [...stack].reverse().find((item) => item.type === "group")?.id || "";
     const semanticProps = architectureCleanDslProps(props);
     const title = text(props.label, cleanName);
     const intent = isGroup
@@ -2131,6 +2403,37 @@ function architectureParseDslGraph(graph) {
     return id;
   };
   const ensureNode = (name) => registerNode(name, {}, false, "");
+  const resolveReference = (value) => {
+    const raw = text(value);
+    if (!raw) return "";
+    return nameToId.get(raw) || (nodeById.has(raw) ? raw : "");
+  };
+  const pushCorridorStep = (corridor, leftName, rightName, connectorValue, cleanLabel, edgeProps = {}) => {
+    if (!corridor || !leftName || !rightName) return;
+    const sourceName = connectorValue === "<" ? rightName : leftName;
+    const targetName = connectorValue === "<" ? leftName : rightName;
+    const role = architectureEdgeRole(
+      edgeProps.role || edgeProps.kind || edgeProps.type,
+      "request",
+    );
+    corridor.steps.push({
+      id: uniqueId(`${corridor.id}-step`, "corridor-step"),
+      sourceName,
+      targetName,
+      label: cleanLabel,
+      kind: architectureEdgeKindFromRole(role, "calls"),
+      role,
+      branch: text(edgeProps.branch || edgeProps.variant),
+      condition: text(edgeProps.condition || edgeProps.guard),
+      criticality: text(edgeProps.criticality),
+      event: text(edgeProps.event),
+      method: text(edgeProps.method),
+      path: text(edgeProps.path || edgeProps.route),
+      status: text(edgeProps.status),
+      step: text(edgeProps.step),
+      semanticProps: edgeProps,
+    });
+  };
 
   source.split(/\r?\n/u).forEach((rawLine) => {
     let line = architectureStripDslComments(rawLine);
@@ -2163,8 +2466,32 @@ function architectureParseDslGraph(graph) {
     if (opensGroup) {
       line = line.slice(0, -1).trim();
       const { name, props } = architectureExtractDslProps(line);
+      const intent = architectureGroupIntent(props.intent || props.view || props.kind || props.type);
+      if (architectureIsApiCorridorIntent(intent)) {
+        const semanticProps = architectureCleanDslProps(props);
+        const id = uniqueId(name, "api-corridor");
+        const corridor = {
+          id,
+          title: text(props.label, name),
+          anchorName: text(props.anchor || props.endpoint || props.edge),
+          display: text(props.display || props.mode, "overlay"),
+          fromName: text(props.from || props.source || props.client),
+          intent: ARCHITECTURE_API_CORRIDOR_INTENT,
+          lastVerified: text(props.lastVerified || props.last_verified || props.verified),
+          orient: text(props.orient || props.orientation, "shortest-path"),
+          route: text(props.route || props.via),
+          semanticProps,
+          source: text(props.sourceRef || props.source || props.ref),
+          status: text(props.status, "current"),
+          steps: [],
+          toName: text(props.to || props.target || props.server),
+        };
+        parsed.apiCorridors.push(corridor);
+        stack.push({ corridor, id, name, type: "apiCorridor" });
+        return;
+      }
       const id = registerNode(name, props, true);
-      if (id) stack.push({ id, name });
+      if (id) stack.push({ id, name, type: "group" });
       return;
     }
 
@@ -2176,6 +2503,7 @@ function architectureParseDslGraph(graph) {
       const labelParts = architectureExtractDslProps(connectionLabelRaw);
       const cleanLabel = labelParts.name;
       const edgeProps = architectureCleanDslProps(labelParts.props);
+      const activeCorridor = stack.at(-1)?.type === "apiCorridor" ? stack.at(-1).corridor : null;
       for (let index = 0; index < tokens.length - 2; index += 2) {
         const left = tokens[index];
         const connector = tokens[index + 1];
@@ -2185,6 +2513,13 @@ function architectureParseDslGraph(graph) {
         const rightNames = architectureSplitDslTopLevel(right.value).map((item) => architectureExtractDslProps(item).name).filter(Boolean);
         leftNames.forEach((leftName) => {
           rightNames.forEach((rightName) => {
+            if (activeCorridor) {
+              pushCorridorStep(activeCorridor, leftName, rightName, connector.value, cleanLabel, edgeProps);
+              if (connector.value === "<>") {
+                pushCorridorStep(activeCorridor, rightName, leftName, ">", cleanLabel, edgeProps);
+              }
+              return;
+            }
             const sourceId = ensureNode(connector.value === "<" ? rightName : leftName);
             const targetId = ensureNode(connector.value === "<" ? leftName : rightName);
             if (!sourceId || !targetId) return;
@@ -2225,8 +2560,40 @@ function architectureParseDslGraph(graph) {
     }
 
     const { name, props } = architectureExtractDslProps(line);
+    if (stack.at(-1)?.type === "apiCorridor") return;
     registerNode(name, props, false);
   });
+
+  parsed.apiCorridors = parsed.apiCorridors
+    .map((corridor, index) => {
+      const fromId = resolveReference(corridor.fromName)
+        || resolveReference(corridor.steps[0]?.sourceName)
+        || "";
+      const toId = resolveReference(corridor.toName)
+        || resolveReference(corridor.steps.at(-1)?.targetName)
+        || "";
+      const routeNames = architectureTokenizeDslConnection(corridor.route)
+        .filter((token) => token.type === "name")
+        .flatMap((token) => architectureSplitDslTopLevel(token.value).map((item) => architectureExtractDslProps(item).name))
+        .filter(Boolean);
+      const steps = corridor.steps.map((step, stepIndex) => ({
+        ...step,
+        source: resolveReference(step.sourceName),
+        target: resolveReference(step.targetName),
+        step: text(step.step, String(stepIndex + 1)),
+      }));
+      return {
+        ...corridor,
+        anchor: resolveReference(corridor.anchorName),
+        from: fromId,
+        index,
+        routeIds: routeNames.map(resolveReference).filter(Boolean),
+        routeNames,
+        steps,
+        to: toId,
+      };
+    })
+    .filter((corridor) => corridor.steps.length);
 
   return architectureLayoutGraph(parsed);
 }
@@ -2417,6 +2784,177 @@ function architectureFlowEdgeFromGraphEdge(edge) {
   };
 }
 
+function architectureFlowNodeTitle(node) {
+  return text(node?.data?.title || node?.title || node?.label || node?.id, "Node");
+}
+
+function architectureShortestPathNodeIds(sourceId, targetId, edges) {
+  const source = text(sourceId);
+  const target = text(targetId);
+  if (!source || !target) return [];
+  if (source === target) return [source];
+  const neighbors = new Map();
+  const add = (left, right) => {
+    if (!left || !right) return;
+    if (!neighbors.has(left)) neighbors.set(left, new Set());
+    neighbors.get(left).add(right);
+  };
+  jsonArray(edges).forEach((edge) => {
+    add(edge.source, edge.target);
+    add(edge.target, edge.source);
+  });
+  const queue = [[source]];
+  const seen = new Set([source]);
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const path = queue[cursor];
+    const last = path.at(-1);
+    for (const neighbor of neighbors.get(last) || []) {
+      if (seen.has(neighbor)) continue;
+      const nextPath = [...path, neighbor];
+      if (neighbor === target) return nextPath;
+      seen.add(neighbor);
+      queue.push(nextPath);
+    }
+  }
+  return [source, target];
+}
+
+function architectureApiCorridorParticipantIds(corridor, edges) {
+  const from = text(corridor?.from);
+  const to = text(corridor?.to);
+  const routeIds = jsonArray(corridor?.routeIds).map(text).filter(Boolean);
+  if (routeIds.length >= 2) return routeIds;
+  const shortest = architectureShortestPathNodeIds(from, to, edges);
+  if (shortest.length >= 2) return shortest;
+  const stepIds = [];
+  jsonArray(corridor?.steps).forEach((step) => {
+    [step?.source, step?.target].map(text).filter(Boolean).forEach((id) => {
+      if (!stepIds.includes(id)) stepIds.push(id);
+    });
+  });
+  return stepIds.length ? stepIds : [from, to].filter(Boolean);
+}
+
+function architectureApiCorridorRoleTone(role) {
+  const normalized = architectureEdgeRole(role);
+  if (["response", "callback"].includes(normalized)) return "response";
+  if (["redirect"].includes(normalized)) return "redirect";
+  if (["reads", "writes", "publishes", "subscribes"].includes(normalized)) return "effect";
+  if (["retries", "fails-to"].includes(normalized)) return "failure";
+  return "request";
+}
+
+function architectureApiCorridorStepLabel(step) {
+  return text(
+    step?.label
+      || [step?.method, step?.path].map(text).filter(Boolean).join(" ")
+      || step?.event
+      || step?.status,
+    "exchange",
+  );
+}
+
+function architectureApiCorridorSummary(corridor) {
+  const firstRequest = jsonArray(corridor?.steps).find((step) => text(step?.method) || text(step?.path))
+    || jsonArray(corridor?.steps)[0]
+    || null;
+  return [
+    text(firstRequest?.method),
+    text(firstRequest?.path),
+  ].filter(Boolean).join(" ") || architectureApiCorridorStepLabel(firstRequest) || text(corridor?.title, "API corridor");
+}
+
+function architectureApiCorridorFlowNodeFromCorridor(corridor, index, flowNodes, flowEdges, direction = "LR") {
+  if (!corridor || typeof corridor !== "object") return null;
+  const nodeById = new Map(flowNodes.map((node) => [node.id, node]));
+  const routeIds = architectureApiCorridorParticipantIds(corridor, flowEdges)
+    .filter((id) => nodeById.has(id));
+  const fromId = text(corridor.from) || routeIds[0] || "";
+  const toId = text(corridor.to) || routeIds.at(-1) || "";
+  const fromNode = nodeById.get(fromId) || nodeById.get(routeIds[0]);
+  const toNode = nodeById.get(toId) || nodeById.get(routeIds.at(-1));
+  if (!fromNode || !toNode) return null;
+
+  const positionCache = new Map();
+  const fromPosition = architectureAbsoluteNodePosition(fromNode, nodeById, positionCache);
+  const toPosition = architectureAbsoluteNodePosition(toNode, nodeById, positionCache);
+  const fromSize = architectureNodeSize(fromNode);
+  const toSize = architectureNodeSize(toNode);
+  const fromCenter = {
+    x: fromPosition.x + fromSize.width / 2,
+    y: fromPosition.y + fromSize.height / 2,
+  };
+  const toCenter = {
+    x: toPosition.x + toSize.width / 2,
+    y: toPosition.y + toSize.height / 2,
+  };
+  const dx = toCenter.x - fromCenter.x;
+  const dy = toCenter.y - fromCenter.y;
+  const orient = text(corridor.orient || corridor.orientation, "shortest-path").toLowerCase();
+  const horizontal = orient === "horizontal" || orient === "right" || orient === "left"
+    ? true
+    : orient === "vertical" || orient === "down" || orient === "up"
+      ? false
+      : Math.abs(dx) >= Math.abs(dy);
+  const compactWidth = horizontal ? 340 : 260;
+  const compactHeight = horizontal ? 64 : 86;
+  const offset = 42 + (index % 4) * 18;
+  const midpoint = {
+    x: (fromCenter.x + toCenter.x) / 2,
+    y: (fromCenter.y + toCenter.y) / 2,
+  };
+  const position = horizontal
+    ? { x: midpoint.x - compactWidth / 2, y: midpoint.y - compactHeight / 2 - offset }
+    : { x: midpoint.x - compactWidth / 2 + offset, y: midpoint.y - compactHeight / 2 };
+  const routeParticipants = routeIds.map((id) => ({
+    id,
+    title: architectureFlowNodeTitle(nodeById.get(id)),
+  }));
+  const steps = jsonArray(corridor.steps).map((step, stepIndex) => ({
+    ...step,
+    id: text(step?.id, `${corridor.id}-step-${stepIndex + 1}`),
+    label: architectureApiCorridorStepLabel(step),
+    sourceTitle: architectureFlowNodeTitle(nodeById.get(step?.source)) || text(step?.sourceName, "source"),
+    targetTitle: architectureFlowNodeTitle(nodeById.get(step?.target)) || text(step?.targetName, "target"),
+    tone: architectureApiCorridorRoleTone(step?.role || step?.kind),
+  }));
+
+  return {
+    id: text(corridor.id, architectureEntityId("api-corridor")),
+    type: "architectureCorridor",
+    position: {
+      x: Math.round(position.x),
+      y: Math.round(position.y),
+    },
+    selectable: false,
+    draggable: false,
+    zIndex: 18 + index,
+    style: {
+      height: compactHeight,
+      width: compactWidth,
+    },
+    data: {
+      anchor: text(corridor.anchor),
+      anchorName: text(corridor.anchorName),
+      direction,
+      from: fromId,
+      fromTitle: architectureFlowNodeTitle(fromNode),
+      lastVerified: text(corridor.lastVerified),
+      orientation: horizontal ? "horizontal" : "vertical",
+      orient: text(corridor.orient || corridor.orientation, "shortest-path"),
+      routeParticipants,
+      semanticProps: architectureCleanDslProps(corridor.semanticProps),
+      source: text(corridor.source),
+      status: text(corridor.status, "current"),
+      steps,
+      summary: architectureApiCorridorSummary(corridor),
+      title: text(corridor.title, "API corridor"),
+      to: toId,
+      toTitle: architectureFlowNodeTitle(toNode),
+    },
+  };
+}
+
 function architectureGraphToFlow(graph) {
   const compiledGraph = architectureParseDslGraph(graph) || graph;
   const direction = text(compiledGraph?.layout?.direction, "LR").toUpperCase();
@@ -2426,15 +2964,88 @@ function architectureGraphToFlow(graph) {
   const edges = jsonArray(compiledGraph?.edges)
     .map(architectureFlowEdgeFromGraphEdge)
     .filter(Boolean);
-  return { edges, nodes };
+  const corridorNodes = jsonArray(compiledGraph?.apiCorridors || compiledGraph?.api_corridors)
+    .map((corridor, index) => architectureApiCorridorFlowNodeFromCorridor(corridor, index, nodes, edges, direction))
+    .filter(Boolean);
+  return { edges, nodes: [...nodes, ...corridorNodes] };
+}
+
+function architectureApiCorridorDslNodeName(id, fallback, dslNameById) {
+  return architectureDslName(dslNameById.get(text(id)) || text(fallback, id));
+}
+
+function architectureApiCorridorFlowNodeToGraph(node) {
+  const data = jsonObject(node?.data) || {};
+  return {
+    anchor: text(data.anchor),
+    anchorName: text(data.anchorName),
+    display: "overlay",
+    from: text(data.from),
+    fromName: text(data.fromTitle),
+    id: text(node?.id),
+    intent: ARCHITECTURE_API_CORRIDOR_INTENT,
+    lastVerified: text(data.lastVerified),
+    orient: text(data.orient, "shortest-path"),
+    semanticProps: architectureCleanDslProps(data.semanticProps),
+    source: text(data.source),
+    status: text(data.status, "current"),
+    steps: jsonArray(data.steps).map((step, index) => ({
+      ...step,
+      id: text(step?.id, `${node?.id || "api-corridor"}-step-${index + 1}`),
+      step: text(step?.step, String(index + 1)),
+    })),
+    title: text(data.title, "API corridor"),
+    to: text(data.to),
+    toName: text(data.toTitle),
+  };
+}
+
+function architectureApiCorridorDslLines(node, dslNameById) {
+  const corridor = architectureApiCorridorFlowNodeToGraph(node);
+  const props = architecturePropsWithOrderedOverrides(corridor.semanticProps, {
+    intent: ARCHITECTURE_API_CORRIDOR_INTENT,
+    display: "overlay",
+    from: dslNameById.get(corridor.from) || corridor.fromName,
+    to: dslNameById.get(corridor.to) || corridor.toName,
+    ...(corridor.anchor ? { anchor: dslNameById.get(corridor.anchor) || corridor.anchorName || corridor.anchor } : corridor.anchorName ? { anchor: corridor.anchorName } : {}),
+    orient: corridor.orient || "shortest-path",
+    ...(corridor.status ? { status: corridor.status } : {}),
+    ...(corridor.source ? { source: corridor.source } : {}),
+    ...(corridor.lastVerified ? { lastVerified: corridor.lastVerified } : {}),
+  });
+  const lines = [
+    `${architectureDslName(corridor.title)}${architectureDslPropsText(props)} {`,
+  ];
+  corridor.steps.forEach((step, index) => {
+    const role = architectureEdgeRole(step?.role || step?.kind, "request");
+    const source = architectureApiCorridorDslNodeName(step?.source, step?.sourceName || step?.sourceTitle, dslNameById);
+    const target = architectureApiCorridorDslNodeName(step?.target, step?.targetName || step?.targetTitle, dslNameById);
+    const stepProps = architecturePropsWithOrderedOverrides(step?.semanticProps, {
+      step: text(step?.step, String(index + 1)),
+      role,
+      ...(step?.method ? { method: step.method } : {}),
+      ...(step?.path ? { path: step.path } : {}),
+      ...(step?.status ? { status: step.status } : {}),
+      ...(step?.event ? { event: step.event } : {}),
+      ...(step?.condition ? { condition: step.condition } : {}),
+      ...(step?.branch ? { branch: step.branch } : {}),
+      ...(step?.criticality ? { criticality: step.criticality } : {}),
+    });
+    const label = text(step?.label);
+    const labelWithProps = `${label}${architectureDslPropsText(stepProps)}`.trim();
+    lines.push(`  ${source} > ${target}${labelWithProps ? `: ${labelWithProps}` : ""}`);
+  });
+  lines.push("}");
+  return lines;
 }
 
 function architectureFlowGraphToDsl(graph, nodes, edges) {
   const currentGraph = jsonObject(graph) || {};
   const graphTitle = text(currentGraph.title, "Architecture graph");
   const groupPath = architectureFolderPathParts(currentGraph.groupPath);
+  const corridorNodes = nodes.filter((node) => node.type === "architectureCorridor");
   const groupNodes = nodes.filter((node) => node.type === "architectureGroup");
-  const regularNodes = nodes.filter((node) => node.type !== "architectureGroup");
+  const regularNodes = nodes.filter((node) => node.type !== "architectureGroup" && node.type !== "architectureCorridor");
   const allNodes = [...groupNodes, ...regularNodes];
   const nodeById = new Map(allNodes.map((node) => [node.id, node]));
   const childrenByParent = new Map();
@@ -2507,8 +3118,9 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   (childrenByParent.get("") || [])
     .filter((node) => node.type !== "architectureGroup")
     .forEach((node) => lines.push(lineForNode(node, 0)));
-  if (edges.length) lines.push("");
-  edges.forEach((edge) => {
+  const structuralEdges = edges.filter((edge) => nodeById.has(edge.source) && nodeById.has(edge.target));
+  if (structuralEdges.length) lines.push("");
+  structuralEdges.forEach((edge) => {
     const source = architectureDslName(dslNameById.get(edge.source) || edge.source);
     const target = architectureDslName(dslNameById.get(edge.target) || edge.target);
     const label = text(edge.data?.label);
@@ -2522,6 +3134,11 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     const labelWithProps = `${label}${architectureDslPropsText(props)}`.trim();
     lines.push(`${source} ${architectureEdgeConnectorForRole(role, edge.data?.kind)} ${target}${labelWithProps ? `: ${labelWithProps}` : ""}`);
   });
+  if (corridorNodes.length) lines.push("");
+  corridorNodes.forEach((node, index) => {
+    if (index) lines.push("");
+    lines.push(...architectureApiCorridorDslLines(node, dslNameById));
+  });
   return `${lines.join("\n").replace(/\n{3,}/gu, "\n\n").trim()}\n`;
 }
 
@@ -2532,7 +3149,10 @@ function architectureGraphFromFlow(graph, nodes, edges) {
     ...currentGraph,
     source,
     sourceFormat: "eraserDsl",
-    nodes: nodes.map((node) => {
+    apiCorridors: nodes
+      .filter((node) => node.type === "architectureCorridor")
+      .map(architectureApiCorridorFlowNodeToGraph),
+    nodes: nodes.filter((node) => node.type !== "architectureCorridor").map((node) => {
       const isGroup = node.type === "architectureGroup";
       const display = architectureNodeDisplayMode(node.data || {}, isGroup);
       const compact = display === "compact";
@@ -2576,7 +3196,10 @@ function architectureGraphFromFlow(graph, nodes, edges) {
         } : {}),
       };
     }),
-    edges: edges.map((edge) => ({
+    edges: edges.filter((edge) => (
+      nodes.some((node) => node.type !== "architectureCorridor" && node.id === edge.source)
+      && nodes.some((node) => node.type !== "architectureCorridor" && node.id === edge.target)
+    )).map((edge) => ({
       id: edge.id,
       source: edge.source,
       target: edge.target,
@@ -2821,6 +3444,26 @@ function architectureValidateSemanticGraph(graph, nodes, edges) {
       if (!hasDepends) warnings.push(`${title}: use depends-on edges to show dependency direction.`);
     }
   });
+  jsonArray(nodes)
+    .filter((node) => node.type === "architectureCorridor")
+    .forEach((corridor) => {
+      const title = text(corridor.data?.title, "API corridor");
+      const steps = jsonArray(corridor.data?.steps);
+      if (!steps.length) {
+        warnings.push(`${title}: add ordered procedure steps.`);
+        return;
+      }
+      if (steps.length > 12) {
+        warnings.push(`${title}: consider phases or a control graph for long procedures.`);
+      }
+      if (!text(corridor.data?.from) || !text(corridor.data?.to)) {
+        warnings.push(`${title}: set from and to to existing graph nodes or groups.`);
+      }
+      const unresolved = steps.filter((step) => !text(step.source) || !text(step.target));
+      if (unresolved.length) {
+        warnings.push(`${title}: ${unresolved.length} step${unresolved.length === 1 ? "" : "s"} reference missing graph participants.`);
+      }
+    });
   return warnings.slice(0, 8);
 }
 
@@ -2980,7 +3623,9 @@ function architectureAgentTaskText({
     repoPath ? `Repo: ${repoPath}` : "",
     "",
     "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
-    "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
+    "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
+    "Use api-corridor overlay containers only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors explain runtime order across existing nodes; they are not replacement topology and not line-by-line source narration.",
+    "Write corridors as `OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path] { Browser > API Server: GET /auth/start [step: 1, role: request, method: GET, path: /auth/start] }`. Corridor message endpoints should reference existing graph nodes or groups.",
     "Preserve semantic props when editing. Groups should use intent. Nodes should use role, lifecycle, source, and status when useful. Edges should use role plus condition, event, and criticality when useful.",
     "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar graph entrypoints: write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.",
   ].filter(Boolean).join("\n");
@@ -3898,9 +4543,15 @@ export default function ArchitectureWorkspaceView({
   architectureRepositoryScanError = "",
   architectureRepositoryScanSnapshot = null,
   architectureRepositoryScanState = "idle",
+  architectureGraphLists = {},
+  architectureSelectedGraphId = "",
+  architectureSelectedRepoPath = "",
   architectureSnapshot = null,
   architectureState = "idle",
+  onArchitectureGraphListRefresh = null,
+  onArchitectureSelectionChange = null,
   workspace,
+  workspaceTodos = null,
 }) {
   const activeWorkspaceId = workspace?.id || "";
   const activeWorkspaceName = workspace?.name || "";
@@ -3912,6 +4563,10 @@ export default function ArchitectureWorkspaceView({
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
+  const todoHistoryItems = useMemo(
+    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId),
+    [activeWorkspaceId, workspaceTodos],
+  );
   const visibleTasks = useMemo(() => {
     if (!finishedPlanTaskIds.size) return tasks;
     return tasks.map((task, index) => {
@@ -3922,6 +4577,8 @@ export default function ArchitectureWorkspaceView({
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "architectures"
     ? `Architectures · repo scoped · ${repoLabel}`
+    : viewMode === "todoHistory"
+      ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "scannedResult"
       ? `Scanned Result · architecture scan · ${repoLabel}`
       : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
@@ -4059,6 +4716,13 @@ export default function ArchitectureWorkspaceView({
             Architectures
           </ViewToggleButton>
           <ViewToggleButton
+            data-active={viewMode === "todoHistory" ? "true" : "false"}
+            onClick={() => setViewMode("todoHistory")}
+            type="button"
+          >
+            Todos History
+          </ViewToggleButton>
+          <ViewToggleButton
             data-active={viewMode === "taskHistory" ? "true" : "false"}
             onClick={() => setViewMode("taskHistory")}
             type="button"
@@ -4082,10 +4746,20 @@ export default function ArchitectureWorkspaceView({
           queueWorkspaceName={activeWorkspaceName}
           repoLabel={repoLabel}
           repoPath={repoPath}
+          graphLists={architectureGraphLists}
+          onGraphListRefresh={onArchitectureGraphListRefresh}
+          onSelectionChange={onArchitectureSelectionChange}
           repositoryScan={architectureRepositoryScanSnapshot}
           repositoryScanError={architectureRepositoryScanError}
           repositoryScanState={architectureRepositoryScanState}
+          workspaceSelectedGraphId={architectureSelectedGraphId}
+          workspaceSelectedRepoPath={architectureSelectedRepoPath}
           tasks={visibleTasks}
+        />
+      ) : viewMode === "todoHistory" ? (
+        <TodosHistoryPanel
+          items={todoHistoryItems}
+          repoLabel={repoLabel}
         />
       ) : viewMode === "scannedResult" ? (
         <ScannedResultPanel
@@ -4113,6 +4787,9 @@ export default function ArchitectureWorkspaceView({
 }
 
 function ArchitecturesPanel({
+  graphLists = {},
+  onGraphListRefresh = null,
+  onSelectionChange = null,
   queueWorkspaceId = "",
   queueWorkspaceName = "",
   repoLabel,
@@ -4120,6 +4797,8 @@ function ArchitecturesPanel({
   repositoryScan = null,
   repositoryScanError = "",
   repositoryScanState = "idle",
+  workspaceSelectedGraphId = "",
+  workspaceSelectedRepoPath = "",
   tasks = [],
 }) {
   const [repositories, setRepositories] = useState([]);
@@ -4163,8 +4842,13 @@ function ArchitecturesPanel({
     if (repositoryScanState === "ready" || nextRepositories.length) {
       setRepositories(nextRepositories);
       setSelectedRepoPath((current) => {
-        if (current && nextRepositories.some((repo) => repo.path === current)) return current;
-        return nextRepositories[0]?.path || "";
+        const preferredRepoPath = text(workspaceSelectedRepoPath);
+        const preferredRepoKey = architectureRepoPathKey(preferredRepoPath);
+        if (preferredRepoKey && nextRepositories.some((repo) => architectureRepoPathKey(architectureRepoPathFromEntry(repo)) === preferredRepoKey)) {
+          return preferredRepoPath;
+        }
+        if (current && nextRepositories.some((repo) => architectureRepoPathKey(architectureRepoPathFromEntry(repo)) === architectureRepoPathKey(current))) return current;
+        return architectureRepoPathFromEntry(nextRepositories[0]) || "";
       });
       setRepoState("ready");
       setError("");
@@ -4176,7 +4860,46 @@ function ArchitecturesPanel({
     setCreatingGraph(false);
     setRepoState("idle");
     setError("");
-  }, [repositoryScan, repositoryScanError, repositoryScanState]);
+  }, [repositoryScan, repositoryScanError, repositoryScanState, workspaceSelectedRepoPath]);
+
+  const selectedGraphListCacheEntry = useMemo(
+    () => architectureGraphListCacheEntry(graphLists, selectedRepoPath),
+    [graphLists, selectedRepoPath],
+  );
+
+  useEffect(() => {
+    if (!selectedRepoPath || !selectedGraphListCacheEntry) return;
+    const nextGraphs = jsonArray(selectedGraphListCacheEntry.graphs || selectedGraphListCacheEntry.navTree);
+    const cacheState = text(selectedGraphListCacheEntry.state, nextGraphs.length ? "ready" : "idle");
+    setGraphs(nextGraphs);
+    setRepositories((currentRepositories) => currentRepositories.map((repository) => (
+      architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === architectureRepoPathKey(selectedRepoPath)
+        ? { ...repository, graphCount: nextGraphs.length }
+        : repository
+    )));
+    setSelectedGraphId((current) => {
+      const preferredGraphId = architectureRepoPathKey(workspaceSelectedRepoPath) === architectureRepoPathKey(selectedRepoPath)
+        ? text(workspaceSelectedGraphId)
+        : "";
+      if (preferredGraphId && nextGraphs.some((graph) => graph.id === preferredGraphId)) return preferredGraphId;
+      if (current && nextGraphs.some((graph) => graph.id === current)) return current;
+      return nextGraphs[0]?.id || "";
+    });
+    if (!nextGraphs.length) {
+      setSelectedGraph(null);
+    }
+    if (cacheState === "error") {
+      setGraphState("error");
+      setError(text(selectedGraphListCacheEntry.error, "Unable to load architecture graphs."));
+      return;
+    }
+    setGraphState(cacheState === "loading" && !nextGraphs.length ? "loading" : "ready");
+  }, [
+    selectedGraphListCacheEntry,
+    selectedRepoPath,
+    workspaceSelectedGraphId,
+    workspaceSelectedRepoPath,
+  ]);
 
   const loadGraphList = useCallback((repo = selectedRepoPath, options = {}) => {
     if (!repo) {
@@ -4187,16 +4910,23 @@ function ArchitecturesPanel({
     }
     if (!options.silent) setGraphState("loading");
     setError("");
-    return invoke("architecture_graphs_list", { repoPath: repo })
+    const listPromise = typeof onGraphListRefresh === "function"
+      ? onGraphListRefresh(repo, options)
+      : invoke("architecture_graphs_list", { repoPath: repo }).then((result) => jsonArray(result?.graphs));
+    return listPromise
       .then((result) => {
-        const nextGraphs = jsonArray(result?.graphs);
+        const nextGraphs = jsonArray(result?.graphs || result);
         setGraphs(nextGraphs);
         setRepositories((currentRepositories) => currentRepositories.map((repository) => (
-          repository.path === repo
+          architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === architectureRepoPathKey(repo)
             ? { ...repository, graphCount: nextGraphs.length }
             : repository
         )));
         setSelectedGraphId((current) => {
+          const preferredGraphId = architectureRepoPathKey(workspaceSelectedRepoPath) === architectureRepoPathKey(repo)
+            ? text(workspaceSelectedGraphId)
+            : "";
+          if (preferredGraphId && nextGraphs.some((graph) => graph.id === preferredGraphId)) return preferredGraphId;
           if (current && nextGraphs.some((graph) => graph.id === current)) return current;
           return nextGraphs[0]?.id || "";
         });
@@ -4214,19 +4944,16 @@ function ArchitecturesPanel({
         setError(nextError?.message || String(nextError || "Unable to load architecture graphs."));
         return [];
       });
-  }, [selectedRepoPath]);
+  }, [
+    onGraphListRefresh,
+    selectedRepoPath,
+    workspaceSelectedGraphId,
+    workspaceSelectedRepoPath,
+  ]);
 
   useEffect(() => {
-    void loadGraphList(selectedRepoPath);
-  }, [loadGraphList, selectedRepoPath]);
-
-  useEffect(() => {
-    if (!selectedRepoPath) return undefined;
-    const interval = window.setInterval(() => {
-      void loadGraphList(selectedRepoPath, { silent: true });
-    }, ARCHITECTURE_GRAPH_LIST_REFRESH_MS);
-    return () => window.clearInterval(interval);
-  }, [loadGraphList, selectedRepoPath]);
+    void loadGraphList(selectedRepoPath, { silent: Boolean(selectedGraphListCacheEntry) });
+  }, [loadGraphList, selectedGraphListCacheEntry, selectedRepoPath]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4285,9 +5012,21 @@ function ArchitecturesPanel({
     return () => window.clearInterval(interval);
   }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
 
-  const selectedRepo = repositories.find((repo) => repo.path === selectedRepoPath) || null;
+  const selectedRepo = repositories.find((repo) => (
+    architectureRepoPathKey(architectureRepoPathFromEntry(repo)) === architectureRepoPathKey(selectedRepoPath)
+  )) || null;
   const selectedRepoKind = selectedRepo ? scannedResultGraphKind(selectedRepo) : "";
   const selectedRepoKindLabel = selectedRepo ? scannedResultEntryKindLabel(selectedRepo) : "";
+  useEffect(() => {
+    if (!selectedRepoPath || typeof onSelectionChange !== "function") return;
+    if (selectedGraphId && graphs.length && !graphs.some((graph) => graph.id === selectedGraphId)) return;
+    onSelectionChange({ graphId: selectedGraphId, repoPath: selectedRepoPath });
+  }, [
+    graphs,
+    onSelectionChange,
+    selectedGraphId,
+    selectedRepoPath,
+  ]);
   const agentEditMarkersStorageKey = useMemo(
     () => architectureAgentEditMarkersStorageKey(queueWorkspaceId, selectedRepoPath || repoPath),
     [queueWorkspaceId, repoPath, selectedRepoPath],
@@ -4374,7 +5113,7 @@ function ArchitecturesPanel({
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
-        void loadGraphList(selectedRepoPath);
+        void loadGraphList(selectedRepoPath, { refresh: true });
       })
       .catch((nextError) => {
         setSaveState("idle");
@@ -4395,7 +5134,7 @@ function ArchitecturesPanel({
         setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || nextGraph.id);
         setSaveState("idle");
-        void loadGraphList(selectedRepoPath);
+        void loadGraphList(selectedRepoPath, { refresh: true });
         return nextGraph;
       })
       .catch((nextError) => {
@@ -4504,19 +5243,20 @@ function ArchitecturesPanel({
           <ArchitectureTree>
             {singleRepository ? renderTreeRows(0) : repositories.map((repo) => {
               const repoKind = scannedResultGraphKind(repo);
+              const architectureRepoPath = architectureRepoPathFromEntry(repo);
               return (
                 <ArchitectureTreeRepoGroup key={repo.id}>
                   <ArchitectureTreeRow
-                    data-active={repo.path === selectedRepoPath ? "true" : "false"}
+                    data-active={architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) ? "true" : "false"}
                     data-kind={repoKind === "git" ? "repo" : "folder"}
                     onClick={() => {
-                      setSelectedRepoPath(repo.path);
+                      setSelectedRepoPath(architectureRepoPath);
                       setSelectedGraphId("");
                       setSelectedGraph(null);
                       setCreatingGraph(false);
                     }}
                     style={{ "--tree-depth": 0 }}
-                    title={repo.path}
+                    title={architectureRepoPath}
                     type="button"
                   >
                     <ArchitectureTreeGlyph data-kind={repoKind === "git" ? "repo" : "folder"} aria-hidden="true" />
@@ -4524,7 +5264,7 @@ function ArchitecturesPanel({
                     <em>{scannedResultEntryKindLabel(repo)}</em>
                     <em>{repo.graphCount}</em>
                   </ArchitectureTreeRow>
-                  {repo.path === selectedRepoPath && (
+                  {architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) && (
                     <ArchitectureTreeBranch>
                       {renderTreeRows(1)}
                     </ArchitectureTreeBranch>
@@ -4727,10 +5467,31 @@ function ArchitectureGraphEditor({
   const [selectedNodes, setSelectedNodes] = useState([]);
   const [selectedEdges, setSelectedEdges] = useState([]);
   const [localError, setLocalError] = useState("");
+  const [expandedCorridorId, setExpandedCorridorId] = useState("");
   const [routingMode, setRoutingMode] = useState("settled");
   const routeCacheRef = useRef(new Map());
   const routeSettleTimerRef = useRef(null);
-  const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes), [nodes]);
+  const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes).map((node) => {
+    if (node.type !== "architectureCorridor") return node;
+    const expanded = expandedCorridorId === node.id;
+    const horizontal = text(node.data?.orientation, "horizontal") === "horizontal";
+    const stepCount = jsonArray(node.data?.steps).length;
+    const expandedHeight = Math.min(430, Math.max(168, 96 + stepCount * 42));
+    const expandedWidth = horizontal ? 640 : 390;
+    return {
+      ...node,
+      data: {
+        ...(node.data || {}),
+        expanded,
+        onToggle: () => setExpandedCorridorId((current) => (current === node.id ? "" : node.id)),
+      },
+      style: {
+        ...(node.style || {}),
+        height: expanded ? expandedHeight : numberValue(node.style?.height, horizontal ? 64 : 86),
+        width: expanded ? expandedWidth : numberValue(node.style?.width, horizontal ? 340 : 260),
+      },
+    };
+  }), [expandedCorridorId, nodes]);
   const renderEdges = useMemo(() => architectureEdgesWithRoutingData(edges, renderNodes, {
     interactive: routingMode === "interactive",
     routeCache: routeCacheRef.current,
@@ -4753,6 +5514,7 @@ function ArchitectureGraphEditor({
     setDraftGraph(jsonObject(graph) || {});
     setSelectedNodes([]);
     setSelectedEdges([]);
+    setExpandedCorridorId("");
     setDirty(false);
     setLocalError("");
     setAgentCommandDraft("");
@@ -5093,6 +5855,92 @@ function ArchitectureGraphEditor({
         </ArchitectureCanvasViewport>
       </ArchitectureEditorBody>
     </ArchitectureEditorShell>
+  );
+}
+
+function ArchitectureApiCorridorNode({ data }) {
+  const expanded = Boolean(data?.expanded);
+  const steps = jsonArray(data?.steps);
+  const participants = jsonArray(data?.routeParticipants);
+  const status = text(data?.status, "current");
+  const orientation = text(data?.orientation, "horizontal");
+  const summary = text(data?.summary, `${steps.length} exchanges`);
+  const handleToggle = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    data?.onToggle?.();
+  };
+
+  return (
+    <ArchitectureApiCorridorShell
+      data-expanded={expanded ? "true" : "false"}
+      data-orientation={orientation}
+      data-status={status}
+    >
+      <ArchitectureApiCorridorHeader
+        aria-expanded={expanded}
+        onClick={handleToggle}
+        title={`${text(data?.title, "API corridor")}\n${summary}`}
+        type="button"
+      >
+        <ArchitectureApiCorridorGlyph aria-hidden="true" />
+        <ArchitectureApiCorridorHeaderText>
+          <strong>{text(data?.title, "API corridor")}</strong>
+          <span>{summary}</span>
+        </ArchitectureApiCorridorHeaderText>
+        <ArchitectureApiCorridorBadge>{steps.length} step{steps.length === 1 ? "" : "s"}</ArchitectureApiCorridorBadge>
+      </ArchitectureApiCorridorHeader>
+      {expanded ? (
+        <ArchitectureApiCorridorExpanded>
+          {participants.length > 0 && (
+            <ArchitectureApiCorridorParticipants aria-label="API corridor participants">
+              {participants.map((participant, index) => (
+                <span key={`${participant.id || participant.title}-${index}`}>{participant.title}</span>
+              ))}
+            </ArchitectureApiCorridorParticipants>
+          )}
+          <ArchitectureApiCorridorStepList>
+            {steps.map((step, index) => {
+              const chips = [
+                step.method,
+                step.path,
+                step.status,
+                step.condition,
+                step.event,
+                step.branch,
+              ].map(text).filter(Boolean).slice(0, 4);
+              return (
+                <ArchitectureApiCorridorStep
+                  data-tone={step.tone || architectureApiCorridorRoleTone(step.role)}
+                  key={step.id || `${step.sourceTitle}-${step.targetTitle}-${index}`}
+                >
+                  <ArchitectureApiCorridorStepNumber>{text(step.step, String(index + 1))}</ArchitectureApiCorridorStepNumber>
+                  <ArchitectureApiCorridorStepBody>
+                    <ArchitectureApiCorridorStepRoute>
+                      <span>{text(step.sourceTitle, "source")}</span>
+                      <i aria-hidden="true">{"->"}</i>
+                      <span>{text(step.targetTitle, "target")}</span>
+                    </ArchitectureApiCorridorStepRoute>
+                    <ArchitectureApiCorridorStepLabel>{step.label}</ArchitectureApiCorridorStepLabel>
+                    {chips.length > 0 && (
+                      <ArchitectureApiCorridorStepChips>
+                        {chips.map((chip) => <span key={chip}>{chip}</span>)}
+                      </ArchitectureApiCorridorStepChips>
+                    )}
+                  </ArchitectureApiCorridorStepBody>
+                </ArchitectureApiCorridorStep>
+              );
+            })}
+          </ArchitectureApiCorridorStepList>
+        </ArchitectureApiCorridorExpanded>
+      ) : (
+        <ArchitectureApiCorridorCollapsed aria-hidden="true">
+          {participants.slice(0, 4).map((participant, index) => (
+            <span key={`${participant.id || participant.title}-${index}`}>{participant.title}</span>
+          ))}
+        </ArchitectureApiCorridorCollapsed>
+      )}
+    </ArchitectureApiCorridorShell>
   );
 }
 
@@ -6845,6 +7693,86 @@ function HistoryTimeline({
   );
 }
 
+function TodosHistoryPanel({ items = [], repoLabel }) {
+  const summary = useMemo(() => {
+    const total = items.length;
+    const active = items.filter((item) => ["active", "queued", "parked"].includes(item.statusKind)).length;
+    const done = items.filter((item) => item.statusKind === "done").length;
+    const failed = items.filter((item) => ["failed", "interrupted", "cancelled"].includes(item.statusKind)).length;
+    return { active, done, failed, total };
+  }, [items]);
+
+  if (!items.length) {
+    return (
+      <HistoryPane>
+        <EmptyState>No todo history recorded yet.</EmptyState>
+      </HistoryPane>
+    );
+  }
+
+  return (
+    <HistoryPane>
+      <TimelineHeader>
+        <div>
+          <TimelineKicker>Workspace todos</TimelineKicker>
+          <TimelineTitle>{repoLabel}</TimelineTitle>
+        </div>
+        <TimelineSummary>{summary.total} todo{summary.total === 1 ? "" : "s"} · newest first</TimelineSummary>
+      </TimelineHeader>
+      <TodoHistoryStats aria-label="Todo history summary">
+        <TodoHistoryStat>
+          <span>Total</span>
+          <strong>{summary.total}</strong>
+        </TodoHistoryStat>
+        <TodoHistoryStat data-status="active">
+          <span>Active</span>
+          <strong>{summary.active}</strong>
+        </TodoHistoryStat>
+        <TodoHistoryStat data-status="done">
+          <span>Done</span>
+          <strong>{summary.done}</strong>
+        </TodoHistoryStat>
+        <TodoHistoryStat data-status="failed">
+          <span>Needs review</span>
+          <strong>{summary.failed}</strong>
+        </TodoHistoryStat>
+      </TodoHistoryStats>
+      <TodoHistoryList aria-label="Todos history list">
+        {items.map((item) => {
+          const updated = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
+          const created = formatTime(item.createdMs) || "";
+          const detail = [item.target, item.source, created].filter(Boolean).join(" · ");
+          return (
+            <TodoHistoryRow data-status={item.statusKind} key={item.id} title={detail}>
+              <TodoHistoryStatusDot aria-hidden="true" data-status={item.statusKind} />
+              <TodoHistoryBody>
+                <TodoHistoryTitleLine>
+                  <TodoHistoryTitle>{item.title}</TodoHistoryTitle>
+                  <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
+                    {item.statusLabel}
+                  </StatusPill>
+                </TodoHistoryTitleLine>
+                {item.body && item.body !== item.title && (
+                  <TodoHistoryText>{item.body}</TodoHistoryText>
+                )}
+                <TodoHistoryMeta>
+                  <TodoHistoryMetaChip>{item.target}</TodoHistoryMetaChip>
+                  <TodoHistoryMetaChip>{item.source}</TodoHistoryMetaChip>
+                  {item.duration && <TodoHistoryMetaChip>{item.duration}</TodoHistoryMetaChip>}
+                </TodoHistoryMeta>
+              </TodoHistoryBody>
+              <TodoHistoryTime>
+                <strong>{updated}</strong>
+                {created && <span>{created}</span>}
+              </TodoHistoryTime>
+            </TodoHistoryRow>
+          );
+        })}
+      </TodoHistoryList>
+    </HistoryPane>
+  );
+}
+
 function TaskDetailPanel({
   finishPlanError = "",
   finishingPlanTaskId = "",
@@ -8215,6 +9143,333 @@ const ArchitectureAgentEditStatus = styled.div`
   }
 `;
 
+const ArchitectureApiCorridorShell = styled.div`
+  position: relative;
+  isolation: isolate;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(45, 212, 191, 0.34);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.92);
+  background:
+    linear-gradient(180deg, rgba(8, 47, 73, 0.78), rgba(15, 23, 42, 0.82)),
+    rgba(2, 6, 23, 0.72);
+  box-shadow:
+    0 18px 36px rgba(0, 0, 0, 0.28),
+    0 0 0 1px rgba(45, 212, 191, 0.08);
+  backdrop-filter: blur(10px);
+  pointer-events: auto;
+
+  &::before {
+    position: absolute;
+    z-index: 0;
+    border-radius: 999px;
+    background: linear-gradient(90deg, rgba(45, 212, 191, 0.16), rgba(125, 211, 252, 0.78), rgba(45, 212, 191, 0.16));
+    content: "";
+    pointer-events: none;
+  }
+
+  &[data-expanded="false"][data-orientation="horizontal"]::before {
+    right: 11px;
+    bottom: 15px;
+    left: 39px;
+    height: 2px;
+  }
+
+  &[data-expanded="false"][data-orientation="vertical"]::before {
+    top: 39px;
+    bottom: 9px;
+    left: 28px;
+    width: 2px;
+    background: linear-gradient(180deg, rgba(45, 212, 191, 0.16), rgba(125, 211, 252, 0.78), rgba(45, 212, 191, 0.16));
+  }
+
+  &[data-expanded="true"]::before {
+    opacity: 0;
+  }
+
+  > * {
+    position: relative;
+    z-index: 1;
+  }
+
+  &[data-expanded="false"] {
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  &[data-expanded="true"] {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  &[data-status="uncertain"] {
+    border-color: rgba(251, 191, 36, 0.38);
+  }
+
+  &[data-status="deprecated"] {
+    border-color: rgba(251, 113, 133, 0.34);
+  }
+`;
+
+const ArchitectureApiCorridorHeader = styled.button`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+  min-height: 52px;
+  padding: 8px 9px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid rgba(45, 212, 191, 0.72);
+    outline-offset: -2px;
+  }
+`;
+
+const ArchitectureApiCorridorGlyph = styled.span`
+  position: relative;
+  display: block;
+  width: 20px;
+  height: 20px;
+  border: 1px solid rgba(45, 212, 191, 0.32);
+  border-radius: 7px;
+  background: rgba(13, 148, 136, 0.16);
+
+  &::before,
+  &::after {
+    position: absolute;
+    left: 4px;
+    right: 4px;
+    height: 2px;
+    border-radius: 2px;
+    background: rgba(153, 246, 228, 0.92);
+    content: "";
+  }
+
+  &::before {
+    top: 6px;
+  }
+
+  &::after {
+    bottom: 6px;
+    background: rgba(125, 211, 252, 0.9);
+  }
+`;
+
+const ArchitectureApiCorridorHeaderText = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(240, 253, 250, 0.96);
+    font-size: 11px;
+    font-weight: 900;
+  }
+
+  span {
+    color: rgba(186, 230, 253, 0.74);
+    font-size: 9px;
+    font-weight: 760;
+  }
+`;
+
+const ArchitectureApiCorridorBadge = styled.span`
+  padding: 3px 5px;
+  border: 1px solid rgba(125, 211, 252, 0.18);
+  border-radius: 6px;
+  color: rgba(224, 242, 254, 0.82);
+  background: rgba(8, 47, 73, 0.5);
+  font-size: 8px;
+  font-weight: 880;
+  white-space: nowrap;
+`;
+
+const ArchitectureApiCorridorCollapsed = styled.div`
+  display: flex;
+  min-width: 0;
+  gap: 4px;
+  padding: 0 9px 8px 39px;
+  overflow: hidden;
+
+  span {
+    min-width: 0;
+    max-width: 88px;
+    overflow: hidden;
+    padding: 2px 5px;
+    border: 1px solid rgba(45, 212, 191, 0.14);
+    border-radius: 6px;
+    color: rgba(204, 251, 241, 0.74);
+    background: rgba(6, 78, 59, 0.16);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 8px;
+    font-weight: 760;
+  }
+`;
+
+const ArchitectureApiCorridorExpanded = styled.div`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 9px 10px;
+`;
+
+const ArchitectureApiCorridorParticipants = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow: hidden;
+
+  span {
+    min-width: 0;
+    max-width: 112px;
+    overflow: hidden;
+    padding: 3px 6px;
+    border: 1px solid rgba(148, 163, 184, 0.13);
+    border-radius: 6px;
+    color: rgba(203, 213, 225, 0.78);
+    background: rgba(2, 6, 23, 0.28);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 8px;
+    font-weight: 800;
+  }
+`;
+
+const ArchitectureApiCorridorStepList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+`;
+
+const ArchitectureApiCorridorStep = styled.div`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 7px;
+  min-width: 0;
+  padding: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.24);
+
+  &[data-tone="response"] {
+    border-color: rgba(96, 165, 250, 0.16);
+    background: rgba(30, 64, 175, 0.11);
+  }
+
+  &[data-tone="effect"] {
+    border-color: rgba(52, 211, 153, 0.15);
+    background: rgba(6, 78, 59, 0.11);
+  }
+
+  &[data-tone="redirect"] {
+    border-color: rgba(251, 191, 36, 0.16);
+    background: rgba(120, 53, 15, 0.11);
+  }
+
+  &[data-tone="failure"] {
+    border-color: rgba(251, 113, 133, 0.18);
+    background: rgba(127, 29, 29, 0.12);
+  }
+`;
+
+const ArchitectureApiCorridorStepNumber = styled.span`
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid rgba(45, 212, 191, 0.22);
+  border-radius: 6px;
+  color: rgba(204, 251, 241, 0.9);
+  background: rgba(13, 148, 136, 0.16);
+  font-size: 8px;
+  font-weight: 900;
+`;
+
+const ArchitectureApiCorridorStepBody = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+`;
+
+const ArchitectureApiCorridorStepRoute = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: rgba(148, 163, 184, 0.76);
+  font-size: 8px;
+  font-weight: 820;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  i {
+    flex: 0 0 auto;
+    color: rgba(45, 212, 191, 0.86);
+    font-style: normal;
+  }
+`;
+
+const ArchitectureApiCorridorStepLabel = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.92);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 850;
+`;
+
+const ArchitectureApiCorridorStepChips = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+
+  span {
+    max-width: 130px;
+    overflow: hidden;
+    padding: 2px 5px;
+    border: 1px solid rgba(125, 211, 252, 0.13);
+    border-radius: 5px;
+    color: rgba(224, 242, 254, 0.72);
+    background: rgba(8, 47, 73, 0.28);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 7.5px;
+    font-weight: 780;
+  }
+`;
+
 const ArchitectureSliceToolbar = styled.div`
   position: absolute;
   top: 12px;
@@ -8731,6 +9986,13 @@ const ArchitectureCanvasGroupShell = styled.div`
       rgba(15, 23, 42, 0.18);
   }
 
+  &[data-intent="api-corridor"] {
+    border-color: rgba(45, 212, 191, 0.42);
+    background:
+      linear-gradient(180deg, rgba(13, 148, 136, 0.12), rgba(2, 6, 23, 0.16)),
+      rgba(15, 23, 42, 0.18);
+  }
+
   &[data-intent="data-flow"] {
     border-color: rgba(52, 211, 153, 0.38);
     background:
@@ -8926,6 +10188,231 @@ const HistorySplit = styled.div`
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
     overflow: auto;
+  }
+`;
+
+const TodoHistoryStats = styled.div`
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+`;
+
+const TodoHistoryStat = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.28);
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 9px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 18px;
+    font-weight: 880;
+    line-height: 1;
+  }
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.18);
+    background: rgba(30, 64, 175, 0.12);
+  }
+
+  &[data-status="done"] {
+    border-color: rgba(52, 211, 153, 0.16);
+    background: rgba(6, 78, 59, 0.11);
+  }
+
+  &[data-status="failed"] {
+    border-color: rgba(251, 113, 133, 0.16);
+    background: rgba(127, 29, 29, 0.1);
+  }
+`;
+
+const TodoHistoryList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const TodoHistoryRow = styled.div`
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) minmax(92px, 126px);
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: var(--forge-text);
+
+  &[data-status="active"] {
+    background: linear-gradient(90deg, rgba(37, 99, 235, 0.08), transparent 62%);
+  }
+
+  &[data-status="queued"] {
+    background: linear-gradient(90deg, rgba(14, 165, 233, 0.055), transparent 62%);
+  }
+
+  &[data-status="parked"] {
+    background: linear-gradient(90deg, rgba(217, 119, 6, 0.06), transparent 62%);
+  }
+
+  &[data-status="failed"],
+  &[data-status="interrupted"],
+  &[data-status="cancelled"] {
+    background: linear-gradient(90deg, rgba(127, 29, 29, 0.09), transparent 62%);
+  }
+
+  @media (max-width: 700px) {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+`;
+
+const TodoHistoryStatusDot = styled.span`
+  align-self: start;
+  width: 11px;
+  height: 11px;
+  margin: 4px 0 0 4px;
+  border: 2px solid rgba(15, 23, 42, 0.96);
+  border-radius: 50%;
+  background: #94a3b8;
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.42);
+
+  &[data-status="done"] {
+    background: #34d399;
+    box-shadow: 0 0 0 1px rgba(52, 211, 153, 0.5);
+  }
+
+  &[data-status="active"] {
+    background: #60a5fa;
+    box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.62), 0 0 18px rgba(96, 165, 250, 0.3);
+  }
+
+  &[data-status="queued"] {
+    background: #38bdf8;
+    box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.46);
+  }
+
+  &[data-status="parked"] {
+    background: #f59e0b;
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.5);
+  }
+
+  &[data-status="failed"],
+  &[data-status="interrupted"],
+  &[data-status="cancelled"] {
+    background: #fb7185;
+    box-shadow: 0 0 0 1px rgba(251, 113, 133, 0.5);
+  }
+`;
+
+const TodoHistoryBody = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const TodoHistoryTitleLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const TodoHistoryTitle = styled.strong`
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(241, 245, 249, 0.94);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 840;
+  line-height: 1.25;
+`;
+
+const TodoHistoryText = styled.p`
+  display: -webkit-box;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  overflow: hidden;
+  color: rgba(203, 213, 225, 0.78);
+  font-size: 11px;
+  font-weight: 690;
+  line-height: 1.38;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+`;
+
+const TodoHistoryMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+`;
+
+const TodoHistoryMetaChip = styled.span`
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  padding: 3px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.11);
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.72);
+  background: rgba(2, 6, 23, 0.22);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 760;
+`;
+
+const TodoHistoryTime = styled.div`
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+  padding-right: 4px;
+  color: var(--forge-text-muted);
+  font-size: 9px;
+  font-weight: 760;
+  text-align: right;
+
+  strong {
+    color: var(--forge-text);
+    font-size: 10px;
+    font-weight: 850;
+    line-height: 1.15;
+    white-space: nowrap;
+  }
+
+  span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  @media (max-width: 700px) {
+    grid-column: 2;
+    align-items: flex-start;
+    text-align: left;
   }
 `;
 

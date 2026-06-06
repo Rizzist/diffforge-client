@@ -180,6 +180,11 @@ struct CloudMcpTerminalPromptMetadata {
     thread_id: Option<String>,
     workspace_id: String,
     workspace_name: String,
+    todo_id: Option<String>,
+    todo_dispatch_id: Option<String>,
+    todo_command_id: Option<String>,
+    todo_action: Option<String>,
+    todo_resume_requested: bool,
 }
 
 #[derive(Clone)]
@@ -1209,6 +1214,14 @@ fn cloud_mcp_prompt_source_has_existing_todo(source: Option<&str>) -> bool {
                 | "next-remote-control"
         )
     )
+}
+
+fn cloud_mcp_clean_optional_text(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn cloud_mcp_direct_prompt_todo_refs(
@@ -2768,6 +2781,30 @@ async fn cloud_mcp_start_remote_command_listener(
                     continue;
                 }
             }
+            if cloud_mcp_is_voice_plan_result_event(&event_kind) {
+                let result = event
+                    .get("result")
+                    .cloned()
+                    .or_else(|| {
+                        event
+                            .get("stored")
+                            .and_then(|stored| stored.get("result"))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| event.clone());
+                let workspace_id = cloud_mcp_payload_text(&event, &["workspace_id", "workspaceId"])
+                    .or_else(|| cloud_mcp_payload_text(&result, &["workspace_id", "workspaceId"]))
+                    .unwrap_or_default();
+                let _ = app.emit(
+                    VOICE_PLAN_SERVER_RESULT_EVENT,
+                    json!({
+                        "result": result,
+                        "source": "cloud_voice_plan_graph_event",
+                        "workspaceId": workspace_id,
+                    }),
+                );
+                continue;
+            }
             if event_kind != "remote_command_requested" {
                 continue;
             }
@@ -2835,6 +2872,18 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
         .get("data")
         .and_then(|data| data.get("workspace_todos").or_else(|| data.get("workspaceTodos")))
         .is_some()
+}
+
+fn cloud_mcp_is_voice_plan_result_event(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        "voice_plan_task_status"
+            | "voice_plan_task_update"
+            | "voice_plan_step_update"
+            | "voice_plan_step_tasks_update"
+            | "voice_plan_steps_update"
+            | "voice_plan_plan_update"
+    )
 }
 
 #[tauri::command]
@@ -7661,6 +7710,11 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         thread_id: None,
         workspace_id: String::new(),
         workspace_name: String::new(),
+        todo_id: None,
+        todo_dispatch_id: None,
+        todo_command_id: None,
+        todo_action: None,
+        todo_resume_requested: false,
     });
     let direct_prompt_todo_refs = cloud_mcp_direct_prompt_todo_refs(
         &prompt_metadata.workspace_id,
@@ -7670,6 +7724,22 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         &prompt,
         &prompt_metadata,
     );
+    let effective_todo_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_id)
+        .or_else(|| direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.clone()));
+    let effective_todo_dispatch_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id)
+        .or_else(|| {
+            direct_prompt_todo_refs
+                .as_ref()
+                .map(|refs| refs.dispatch_id.clone())
+        });
+    let effective_todo_command_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id)
+        .or_else(|| {
+            direct_prompt_todo_refs
+                .as_ref()
+                .map(|refs| refs.command_id.clone())
+        });
+    let effective_todo_action = cloud_mcp_clean_optional_text(&prompt_metadata.todo_action);
+    let effective_todo_resume_requested = prompt_metadata.todo_resume_requested;
     {
         let mut runtime = state.inner.lock().await;
         runtime.terminal_contexts.insert(
@@ -7689,15 +7759,9 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
                 workspace_id: prompt_metadata.workspace_id.clone(),
                 workspace_name: prompt_metadata.workspace_name.clone(),
                 session_mode: session_mode.as_str().to_string(),
-                todo_id: direct_prompt_todo_refs
-                    .as_ref()
-                    .map(|refs| refs.todo_id.clone()),
-                todo_dispatch_id: direct_prompt_todo_refs
-                    .as_ref()
-                    .map(|refs| refs.dispatch_id.clone()),
-                todo_command_id: direct_prompt_todo_refs
-                    .as_ref()
-                    .map(|refs| refs.command_id.clone()),
+                todo_id: effective_todo_id.clone(),
+                todo_dispatch_id: effective_todo_dispatch_id.clone(),
+                todo_command_id: effective_todo_command_id.clone(),
                 created_ms: cloud_mcp_now_ms(),
                 last_changed_hash: String::new(),
                 last_checkpoint_ms: 0,
@@ -7766,12 +7830,18 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         "prompt_event_id": prompt_metadata.prompt_event_id,
         "prompt_event_source": prompt_metadata.prompt_event_source,
         "prompt_event_submitted_at": prompt_metadata.prompt_event_submitted_at,
-        "todo_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.as_str()),
-        "todoId": direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.as_str()),
-        "todo_dispatch_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
-        "todoDispatchId": direct_prompt_todo_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
-        "command_id": direct_prompt_todo_refs.as_ref().map(|refs| refs.command_id.as_str()),
-        "commandId": direct_prompt_todo_refs.as_ref().map(|refs| refs.command_id.as_str()),
+        "todo_id": effective_todo_id.as_deref(),
+        "todoId": effective_todo_id.as_deref(),
+        "todo_dispatch_id": effective_todo_dispatch_id.as_deref(),
+        "todoDispatchId": effective_todo_dispatch_id.as_deref(),
+        "command_id": effective_todo_command_id.as_deref(),
+        "commandId": effective_todo_command_id.as_deref(),
+        "todo_action": effective_todo_action.as_deref(),
+        "todoAction": effective_todo_action.as_deref(),
+        "todo_resume_requested": effective_todo_resume_requested,
+        "todoResumeRequested": effective_todo_resume_requested,
+        "resume_requested": effective_todo_resume_requested,
+        "resumeRequested": effective_todo_resume_requested,
         "task_id": local_task_id.clone(),
         "run_id": local_task_id.clone(),
         "prompt": prompt,
@@ -10053,6 +10123,83 @@ async fn cloud_mcp_record_voice_plan_task_status(
             "backend.voice_plan_task_status.error",
             json!({
                 "endpoint": "voice_plan_task_status",
+                "error": clean_terminal_telemetry_text(error),
+                "payload": payload,
+            }),
+        ),
+    }
+    result
+}
+
+#[tauri::command]
+async fn cloud_mcp_update_voice_plan_steps(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    update: Value,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = match update {
+        Value::Object(object) => Value::Object(object),
+        _ => return Err("Voice plan step update payload must be an object.".to_string()),
+    };
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_kind".to_string(), json!("voice_plan_step_update"));
+        object.insert("repo_id".to_string(), json!(req.repo_id.clone()));
+        object.insert("repoId".to_string(), json!(req.repo_id.clone()));
+        object.insert("repo_path".to_string(), json!(req.root_display.clone()));
+        object.insert("repoPath".to_string(), json!(req.root_display.clone()));
+        object.insert(
+            "workspace_root".to_string(),
+            json!(req.root_display.clone()),
+        );
+        object.insert("workspaceRoot".to_string(), json!(req.root_display.clone()));
+        object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
+        object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+        if let Some(name) = workspace_name {
+            object.insert("workspace_name".to_string(), json!(name));
+        }
+    }
+
+    log_terminal_status_event(
+        "backend.voice_plan_step_update.send",
+        json!({
+            "endpoint": "voice_plan_step_update",
+            "payload": payload.clone(),
+            "workspace_id": workspace_id,
+        }),
+    );
+    let result =
+        cloud_mcp_post_event_endpoint(state.inner(), "voice_plan_step_update", &payload).await;
+    match &result {
+        Ok(value) => {
+            log_terminal_status_event(
+                "backend.voice_plan_step_update.result",
+                json!({
+                    "endpoint": "voice_plan_step_update",
+                    "ok": true,
+                    "result": value,
+                }),
+            );
+            let _ = app.emit(
+                VOICE_PLAN_SERVER_RESULT_EVENT,
+                json!({
+                    "result": value,
+                    "source": "backend_voice_plan_step_update",
+                    "workspaceId": workspace_id,
+                }),
+            );
+        }
+        Err(error) => log_terminal_status_event(
+            "backend.voice_plan_step_update.error",
+            json!({
+                "endpoint": "voice_plan_step_update",
                 "error": clean_terminal_telemetry_text(error),
                 "payload": payload,
             }),

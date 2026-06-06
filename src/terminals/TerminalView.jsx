@@ -1533,6 +1533,7 @@ const VOICE_PLAN_CLIENT_RELEASE_STATUSES = new Set([
   "sent_to_client",
 ]);
 const VOICE_PLAN_PARKED_STATUSES = new Set([
+  "paused",
   "parked",
   "resume_ready",
   "resume_requested",
@@ -1550,6 +1551,11 @@ const VOICE_PLAN_INTERRUPTED_STATUSES = new Set([
   "interrupt",
   "interrupted",
   "stopped",
+]);
+const VOICE_PLAN_TIMED_OUT_STATUSES = new Set([
+  "expired",
+  "timed_out",
+  "timeout",
 ]);
 const VOICE_PLAN_RUNNING_STATUSES = new Set([
   "active",
@@ -5340,6 +5346,88 @@ function normalizeTodoQueueLifecycleStatus(value) {
   return "";
 }
 
+function normalizeTodoQueueDispatchAction(value) {
+  const action = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (["resume", "manual_resume", "resume_unfinished", "resume_unfinished_plan_tasks"].includes(action)) {
+    return "resume";
+  }
+  if (["retry", "requeue", "manual_requeue", "rerun", "restart"].includes(action)) {
+    return "retry";
+  }
+  if (["dispatch", "send", "queue", "start"].includes(action)) {
+    return "dispatch";
+  }
+  return action;
+}
+
+function todoQueueDispatchActionIsResume(value) {
+  return normalizeTodoQueueDispatchAction(value) === "resume";
+}
+
+function getTodoQueueItemTodoId(item) {
+  return String(
+    item?.todoId
+      || item?.todo_id
+      || item?.clientTodoId
+      || item?.client_todo_id
+      || item?.remoteCommand?.todoId
+      || item?.remoteCommand?.todo_id
+      || item?.planTask?.clientTodoId
+      || item?.planTask?.client_todo_id
+      || item?.planTask?.todoId
+      || item?.planTask?.todo_id
+      || item?.id
+      || "",
+  ).trim();
+}
+
+function getTodoQueueDispatchAction(item, source = "", fields = {}) {
+  const queueState = getTodoQueueRawQueueState(item) || {};
+  const explicitAction = normalizeTodoQueueDispatchAction(
+    fields.todoAction
+      || fields.todo_action
+      || fields.action
+      || item?.todoAction
+      || item?.todo_action
+      || item?.queueAction
+      || item?.queue_action
+      || queueState.todoAction
+      || queueState.todo_action
+      || queueState.action
+      || item?.remoteCommand?.todoAction
+      || item?.remoteCommand?.todo_action
+      || item?.remoteCommand?.action
+      || "",
+  );
+  if (explicitAction) {
+    return explicitAction;
+  }
+  const reasonText = [
+    source,
+    fields.reason,
+    queueState.reason,
+    item?.reason,
+  ].join(" ").toLowerCase();
+  if (reasonText.includes("resume") && !reasonText.includes("retry") && !reasonText.includes("requeue")) {
+    return "resume";
+  }
+  const status = normalizeTodoQueueLifecycleStatus(
+    item?.todoStatus
+      || item?.todo_status
+      || item?.status
+      || item?.cloudStatus
+      || item?.cloud_status
+      || "",
+  );
+  if (status === "paused") {
+    return "resume";
+  }
+  if (["cancelled", "interrupted", "timed_out", "failed"].includes(status)) {
+    return "retry";
+  }
+  return "dispatch";
+}
+
 function getTodoQueueItemCloudStatus(item, pendingItem = null) {
   if (pendingItem) {
     return getTodoQueuePendingPhase(pendingItem) === "queued" ? "queued" : "running";
@@ -5642,11 +5730,96 @@ function cleanPublicVoiceAgentText(value) {
   return text;
 }
 
-function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
+function getVoiceAgentQueueTodoEntries(args) {
+  const entries = ["todos", "items", "tasks"].find((key) => Array.isArray(args?.[key]));
+  if (entries) {
+    return args[entries].filter((item) => item && typeof item === "object").slice(0, 12);
+  }
+  return args && typeof args === "object" ? [args] : [];
+}
+
+function getVoiceAgentQueueTargetFields(args = {}) {
+  const rawAgentId = normalizeVoiceAgentManagementAgent(
+    args.target_agent_id
+      || args.targetAgentId
+      || args.agent_type
+      || args.agentType
+      || args.target_role
+      || args.targetRole,
+  );
+  const targetAgentId = rawAgentId && rawAgentId !== "any" ? rawAgentId : "";
+  const targetTerminalIndex = normalizeTodoTerminalIndex(
+    args.target_terminal_index
+      ?? args.targetTerminalIndex
+      ?? args.terminal_index
+      ?? args.terminalIndex
+      ?? args.lane
+      ?? args.lane_index
+      ?? args.laneIndex,
+  );
+  const targetTerminalId = normalizeTodoTerminalIdentity(
+    args.target_terminal_id
+      || args.targetTerminalId
+      || args.terminal_id
+      || args.terminalId
+      || args.pane_id
+      || args.paneId
+      || "",
+  );
+  const targetThreadId = normalizeTodoTerminalIdentity(
+    args.target_thread_id
+      || args.targetThreadId
+      || args.thread_id
+      || args.threadId
+      || "",
+  );
+  const targetColorSlot = normalizeTerminalColorSlot(
+    args.target_color_slot
+      ?? args.targetColorSlot
+      ?? args.color_slot
+      ?? args.colorSlot,
+  );
+  const targetTerminalColor = normalizeTerminalHexColor(
+    args.target_terminal_color
+      || args.targetTerminalColor
+      || args.terminal_color
+      || args.terminalColor
+      || args.color
+      || "",
+  );
+  const targetExplicit = Boolean(
+    targetAgentId
+      || targetTerminalId
+      || Number.isInteger(targetTerminalIndex)
+      || targetThreadId
+      || Number.isInteger(targetColorSlot)
+      || targetTerminalColor,
+  );
+  return {
+    targetAgentId,
+    targetColorSlot,
+    targetExplicit,
+    targetTerminalColor,
+    targetTerminalId,
+    targetTerminalIndex,
+    targetThreadId,
+  };
+}
+
+function createTodoQueueItemsFromVoiceAgentToolCall(toolCall) {
   const args = normalizeVoiceAgentQueueArguments(toolCall?.arguments || toolCall?.args);
+  return getVoiceAgentQueueTodoEntries(args)
+    .map((entry) => createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, args))
+    .filter(Boolean);
+}
+
+function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs = {}) {
+  const args = normalizeVoiceAgentQueueArguments(entry);
   const text = normalizeTodoQueueText(
     cleanPublicVoiceAgentText(
       args.text
+        || args.body
+        || args.prompt
         || args.todo
         || args.task
         || toolCall?.text
@@ -5657,6 +5830,10 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
   if (!text) {
     return null;
   }
+  const entryTargetFields = getVoiceAgentQueueTargetFields(args);
+  const parentTargetFields = getVoiceAgentQueueTargetFields(parentArgs);
+  const targetFields = entryTargetFields.targetExplicit ? entryTargetFields : parentTargetFields;
+  const itemId = String(args.id || args.todo_id || args.todoId || args.client_todo_id || args.clientTodoId || "").trim();
 
   const planTask = normalizeTodoQueuePlanTask({
     doneWhen: args.plan_done_when || args.planDoneWhen,
@@ -5672,13 +5849,53 @@ function createTodoQueueItemFromVoiceAgentToolCall(toolCall) {
 
   return createTodoQueueItem(text, {
     ...(planTask ? {
-      id: planTask.taskId,
+      id: planTask.clientTodoId || planTask.taskId,
       planTask,
       source: TODO_QUEUE_SOURCE_VOICE_PLAN,
     } : {
+      ...(itemId ? { id: itemId } : {}),
       source: TODO_QUEUE_SOURCE_VOICE_AGENT,
     }),
+    title: args.title || "",
+    ...targetFields,
+    ...(targetFields.targetExplicit ? {
+      queueState: {
+        phase: "queued",
+        state: "queued",
+        source: planTask ? TODO_QUEUE_SOURCE_VOICE_PLAN : TODO_QUEUE_SOURCE_VOICE_AGENT,
+        targetAgentId: targetFields.targetAgentId,
+        targetColorSlot: targetFields.targetColorSlot,
+        targetExplicit: true,
+        targetTerminalColor: targetFields.targetTerminalColor,
+        targetTerminalId: targetFields.targetTerminalId,
+        targetTerminalIndex: targetFields.targetTerminalIndex,
+        targetThreadId: targetFields.targetThreadId,
+      },
+    } : {}),
   });
+}
+
+function getTodoQueuePendingFieldsFromItem(item, source = "") {
+  const targetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
+  const targetAgentId = getTodoQueueTargetAgentId(item);
+  const targetColorSlot = getTodoQueueTargetColorSlot(item);
+  const targetTerminalColor = getTodoQueueTargetTerminalColor(item);
+  const targetExplicit = Boolean(
+    targetAgentId
+      || targetInfo.hasExplicitTerminalTarget
+      || Number.isInteger(targetColorSlot)
+      || targetTerminalColor,
+  );
+  return {
+    source,
+    ...(targetAgentId ? { targetAgentId, targetRole: targetAgentId } : {}),
+    ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
+    ...(targetTerminalColor ? { targetTerminalColor } : {}),
+    ...(targetInfo.requestedTargetTerminalId ? { targetTerminalId: targetInfo.requestedTargetTerminalId } : {}),
+    ...(Number.isInteger(targetInfo.requestedTargetTerminalIndex) ? { targetTerminalIndex: targetInfo.requestedTargetTerminalIndex } : {}),
+    ...(targetInfo.requestedTargetThreadId ? { targetThreadId: targetInfo.requestedTargetThreadId } : {}),
+    ...(targetExplicit ? { targetExplicit: true } : {}),
+  };
 }
 
 function normalizeVoiceHistoryText(value, maxLength = TODO_QUEUE_MAX_TEXT_LENGTH) {
@@ -5868,9 +6085,14 @@ function normalizeVoicePlanSnapshot(value) {
 function normalizeVoicePlanTasks(value, context = {}) {
   return (Array.isArray(value) ? value : []).map((task, index) => ({
     agentId: String(task?.agentId || task?.agent_id || "").trim(),
+    clientTodoId: String(task?.clientTodoId || task?.client_todo_id || task?.todoId || task?.todo_id || "").trim(),
     id: String(task?.taskId || task?.id || "").trim(),
     ordinal: Number.isFinite(Number(task?.ordinal)) ? Number(task.ordinal) : index,
     promptEventId: String(task?.promptEventId || task?.prompt_event_id || "").trim(),
+    requeueCount: Number.isFinite(Number(task?.requeueCount ?? task?.requeue_count))
+      ? Number(task?.requeueCount ?? task?.requeue_count)
+      : 0,
+    requeuedAt: String(task?.requeuedAt || task?.requeued_at || "").trim(),
     releasePolicy: String(task?.releasePolicy || task?.release_policy || "").trim(),
     requiresQueueDrain: Boolean(task?.requiresQueueDrain || task?.requires_queue_drain),
     doneWhen: String(task?.doneWhen || task?.done_when || "").trim(),
@@ -5880,14 +6102,21 @@ function normalizeVoicePlanTasks(value, context = {}) {
     runId: String(task?.runId || task?.run_id || context.runId || "").trim(),
     stage: String(task?.stage || context.stage || "").trim(),
     status: String(task?.status || "").trim(),
+    statusReason: String(task?.statusReason || task?.status_reason || task?.todoStatusReason || task?.todo_status_reason || "").trim(),
+    statusSource: String(task?.statusSource || task?.status_source || "").trim(),
     stepOrdinal: Number.isFinite(Number(task?.stepOrdinal ?? task?.step_ordinal ?? context.stepOrdinal))
       ? Number(task?.stepOrdinal ?? task?.step_ordinal ?? context.stepOrdinal)
       : 0,
+    targetTerminalColor: String(task?.targetTerminalColor || task?.target_terminal_color || "").trim(),
     terminalIndex: Number.isFinite(Number(task?.terminalIndex ?? task?.terminal_index))
       ? Number(task?.terminalIndex ?? task?.terminal_index)
       : null,
+    terminalId: String(task?.terminalId || task?.terminal_id || task?.targetTerminalId || task?.target_terminal_id || "").trim(),
     text: normalizeVoiceHistoryText(task?.text, 420),
+    threadId: String(task?.threadId || task?.thread_id || task?.targetThreadId || task?.target_thread_id || "").trim(),
     title: normalizeVoiceHistoryText(task?.title, 120),
+    todoDerived: Boolean(task?.todoDerived || task?.todo_derived),
+    todoStatus: String(task?.todoStatus || task?.todo_status || "").trim(),
   })).filter((task) => task.id || task.text);
 }
 
@@ -5921,6 +6150,9 @@ function getVoicePlanTaskStatusLabel(task) {
   if (status === "needs requeue") {
     return "requeue";
   }
+  if (status === "timed out") {
+    return "timed out";
+  }
   if (status === "sent to client") {
     return "queued";
   }
@@ -5929,6 +6161,7 @@ function getVoicePlanTaskStatusLabel(task) {
 
 function getVoicePlanTaskControlPlanTask(plan, step, stageName, task) {
   return normalizeTodoQueuePlanTask({
+    clientTodoId: task?.clientTodoId || task?.client_todo_id || task?.todoId || task?.todo_id,
     doneWhen: task?.doneWhen,
     maxConcurrency: task?.maxConcurrency,
     releasePolicy: task?.releasePolicy,
@@ -5949,6 +6182,7 @@ function getVoicePlanReleasedTaskFromControlTask(plan, step, stageName, task) {
     return null;
   }
   return {
+    clientTodoId: planTask.clientTodoId || planTask.taskId,
     doneWhen: planTask.doneWhen,
     maxConcurrency: planTask.maxConcurrency,
     releasePolicy: planTask.releasePolicy,
@@ -5967,13 +6201,16 @@ function voicePlanTaskMatchesPlanTask(item, planTask) {
   if (!item?.id || !normalizedPlanTask?.taskId) {
     return false;
   }
-  if (String(item.id || "") === normalizedPlanTask.taskId) {
+  const itemId = String(item.id || "").trim();
+  const clientTodoId = String(normalizedPlanTask.clientTodoId || normalizedPlanTask.taskId || "").trim();
+  if (itemId === normalizedPlanTask.taskId || itemId === clientTodoId) {
     return true;
   }
   const itemPlanTask = getTodoQueueItemPlanTask(item);
   return Boolean(
     itemPlanTask
       && itemPlanTask.taskId === normalizedPlanTask.taskId
+      && (!clientTodoId || itemPlanTask.clientTodoId === clientTodoId || itemId === clientTodoId)
       && (!normalizedPlanTask.runId || itemPlanTask.runId === normalizedPlanTask.runId),
   );
 }
@@ -5990,9 +6227,10 @@ function getVoicePlanTaskLocalQueueState(planTask, items = [], pendingItems = {}
   const item = (Array.isArray(items) ? items : []).find((candidate) => (
     voicePlanTaskMatchesPlanTask(candidate, normalizedPlanTask)
   )) || null;
+  const clientTodoId = String(normalizedPlanTask.clientTodoId || normalizedPlanTask.taskId || "").trim();
   const pendingItem = item?.id
-    ? pendingItems?.[item.id] || pendingItems?.[normalizedPlanTask.taskId] || null
-    : pendingItems?.[normalizedPlanTask.taskId] || null;
+    ? pendingItems?.[item.id] || pendingItems?.[clientTodoId] || pendingItems?.[normalizedPlanTask.taskId] || null
+    : pendingItems?.[clientTodoId] || pendingItems?.[normalizedPlanTask.taskId] || null;
   return {
     item,
     pendingItem,
@@ -6000,13 +6238,54 @@ function getVoicePlanTaskLocalQueueState(planTask, items = [], pendingItems = {}
   };
 }
 
-function getVoicePlanTaskUiStatus(task, planTask, items = [], pendingItems = {}) {
+function getVoicePlanStatusFromWorkspaceTodo(todo) {
+  const status = normalizeTodoQueueLifecycleStatus(
+    todo?.todoStatus
+      || todo?.todo_status
+      || todo?.cloudStatus
+      || todo?.cloud_status
+      || todo?.status,
+  );
+  if (status === "completed") return "done";
+  if (status === "queued") return "queued";
+  if (status === "running") return "running";
+  if (status === "paused") return "paused";
+  if (status === "cancelled") return "cancelled";
+  if (status === "interrupted") return "interrupted";
+  if (status === "timed_out") return "timed_out";
+  if (status === "failed") return "failed";
+  if (status === "listed") return "sent_to_client";
+  return "";
+}
+
+function getVoicePlanTaskUiStatus(
+  task,
+  planTask,
+  items = [],
+  pendingItems = {},
+  workspaceTodos = null,
+  workspaceId = "",
+) {
   const { item, pendingItem, pendingPhase } = getVoicePlanTaskLocalQueueState(planTask, items, pendingItems);
   if (pendingPhase === "queued") {
     return "queued";
   }
   if (pendingPhase === "sending") {
     return "dispatched";
+  }
+  const localTodoStatus = item ? getVoicePlanStatusFromWorkspaceTodo(item) : "";
+  if (localTodoStatus) {
+    return localTodoStatus;
+  }
+  const workspaceTodoStatus = getVoicePlanStatusFromWorkspaceTodo(
+    findWorkspaceTodoForVoicePlanTask(workspaceTodos, workspaceId, planTask),
+  );
+  if (workspaceTodoStatus) {
+    return workspaceTodoStatus;
+  }
+  const taskTodoStatus = getVoicePlanStatusFromWorkspaceTodo(task);
+  if (taskTodoStatus) {
+    return taskTodoStatus;
   }
   const status = normalizeVoicePlanStatus(task?.status);
   if (
@@ -6037,10 +6316,13 @@ function getVoicePlanTaskTone(status) {
   if (VOICE_PLAN_INTERRUPTED_STATUSES.has(normalized)) {
     return "interrupted";
   }
+  if (VOICE_PLAN_TIMED_OUT_STATUSES.has(normalized)) {
+    return "failed";
+  }
   if (normalized === "needs_requeue") {
     return "waiting";
   }
-  if (VOICE_PLAN_RUNNING_STATUSES.has(normalized) || VOICE_PLAN_PARKED_STATUSES.has(normalized)) {
+  if (VOICE_PLAN_RUNNING_STATUSES.has(normalized) || VOICE_PLAN_PARKED_STATUSES.has(normalized) || normalized === "paused") {
     return "running";
   }
   if (VOICE_PLAN_QUEUEABLE_STATUSES.has(normalized)) {
@@ -6055,16 +6337,28 @@ function getVoicePlanTaskControlAvailability({
   plan = null,
   planTask = null,
   task = null,
+  workspaceId = "",
+  workspaceTodos = null,
 } = {}) {
   const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
   const localState = getVoicePlanTaskLocalQueueState(normalizedPlanTask, items, pendingItems);
-  const uiStatus = getVoicePlanTaskUiStatus(task, normalizedPlanTask, items, pendingItems);
+  const cloudTodo = findWorkspaceTodoForVoicePlanTask(workspaceTodos, workspaceId, normalizedPlanTask);
+  const uiStatus = getVoicePlanTaskUiStatus(
+    task,
+    normalizedPlanTask,
+    items,
+    pendingItems,
+    workspaceTodos,
+    workspaceId,
+  );
   const tone = getVoicePlanTaskTone(uiStatus);
   const planTone = getVoicePlanTaskTone(plan?.status);
   const hasLocalQueue = Boolean(localState.item || localState.pendingItem);
+  const hasCloudTodo = Boolean(cloudTodo);
   const isDone = tone === "done";
   const isWaiting = VOICE_PLAN_WAITING_STATUSES.has(normalizeVoicePlanStatus(task?.status))
-    && !hasLocalQueue;
+    && !hasLocalQueue
+    && !hasCloudTodo;
   const canCancel = Boolean(
     normalizedPlanTask
       && !isDone
@@ -6079,11 +6373,15 @@ function getVoicePlanTaskControlAvailability({
       && !hasLocalQueue
       && !isDone
       && !isWaiting
+      && tone !== "queued"
+      && tone !== "running"
       && planTone !== "done",
   );
   return {
     canCancel,
     canRequeue,
+    cloudTodo,
+    hasCloudTodo,
     hasLocalQueue,
     localItem: localState.item,
     pendingItem: localState.pendingItem,
@@ -6093,7 +6391,7 @@ function getVoicePlanTaskControlAvailability({
   };
 }
 
-function getVoicePlanProgressCounts(plan, items = [], pendingItems = {}) {
+function getVoicePlanProgressCounts(plan, items = [], pendingItems = {}, workspaceTodos = null, workspaceId = "") {
   const tasks = [];
   (Array.isArray(plan?.steps) ? plan.steps : []).forEach((step) => {
     VOICE_PLAN_STAGE_ORDER.forEach((stageName) => {
@@ -6105,6 +6403,8 @@ function getVoicePlanProgressCounts(plan, items = [], pendingItems = {}) {
           plan,
           planTask,
           task,
+          workspaceId,
+          workspaceTodos,
         }));
       });
     });
@@ -6127,7 +6427,7 @@ function getVoicePlanProgressCounts(plan, items = [], pendingItems = {}) {
   };
 }
 
-function voicePlanHasCancellableWork(plan, items = [], pendingItems = {}) {
+function voicePlanHasCancellableWork(plan, items = [], pendingItems = {}, workspaceTodos = null, workspaceId = "") {
   const planTone = getVoicePlanTaskTone(plan?.status);
   if (planTone === "done" || planTone === "cancelled" || planTone === "failed" || planTone === "interrupted") {
     return false;
@@ -6142,13 +6442,15 @@ function voicePlanHasCancellableWork(plan, items = [], pendingItems = {}) {
           plan,
           planTask,
           task,
+          workspaceId,
+          workspaceTodos,
         }).canCancel || getVoicePlanTaskTone(task?.status) !== "done";
       })
     ))
   ));
 }
 
-function voicePlanHasRequeueableWork(plan, items = [], pendingItems = {}) {
+function voicePlanHasRequeueableWork(plan, items = [], pendingItems = {}, workspaceTodos = null, workspaceId = "") {
   return (Array.isArray(plan?.steps) ? plan.steps : []).some((step) => (
     VOICE_PLAN_STAGE_ORDER.some((stageName) => (
       getVoicePlanStageTasks(step, stageName).some((task) => {
@@ -6159,6 +6461,8 @@ function voicePlanHasRequeueableWork(plan, items = [], pendingItems = {}) {
           plan,
           planTask,
           task,
+          workspaceId,
+          workspaceTodos,
         }).canRequeue;
       })
     ))
@@ -6178,11 +6482,13 @@ function normalizeVoicePlanReleasedTask(value, snapshot = null) {
       || "",
   ).trim();
   const taskId = String(value.taskId || value.task_id || value.id || "").trim();
+  const clientTodoId = String(value.clientTodoId || value.client_todo_id || value.todoId || value.todo_id || "").trim();
   const text = normalizeTodoQueueText(cleanPublicVoiceAgentText(value.text || value.todo || value.task || ""));
   if (!runId || !taskId || !text) {
     return null;
   }
   return {
+    clientTodoId: clientTodoId || taskId,
     doneWhen: String(value.doneWhen || value.done_when || value.planDoneWhen || value.plan_done_when || "").trim(),
     maxConcurrency: Number.isFinite(Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency))
       ? Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency)
@@ -6278,10 +6584,12 @@ function normalizeTodoQueuePlanTask(value) {
   }
   const runId = String(value.runId || value.run_id || value.planRunId || value.plan_run_id || "").trim();
   const taskId = String(value.taskId || value.task_id || value.planTaskId || value.plan_task_id || value.id || "").trim();
+  const clientTodoId = String(value.clientTodoId || value.client_todo_id || value.todoId || value.todo_id || "").trim();
   if (!runId || !taskId) {
     return null;
   }
   return {
+    clientTodoId: clientTodoId || taskId,
     doneWhen: String(value.doneWhen || value.done_when || value.planDoneWhen || value.plan_done_when || "").trim(),
     maxConcurrency: Number.isFinite(Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency))
       ? Number(value.maxConcurrency ?? value.max_concurrency ?? value.planMaxConcurrency ?? value.plan_max_concurrency)
@@ -6496,11 +6804,16 @@ function getVoicePlanTaskStatusLogSummary(task) {
     return null;
   }
   return {
+    clientTodoId: task.clientTodoId || task.client_todo_id || task.todoId || task.todo_id || "",
+    requeueCount: task.requeueCount ?? task.requeue_count ?? 0,
+    requeuedAt: task.requeuedAt || task.requeued_at || "",
     runId: task.runId || task.run_id || task.planRunId || task.plan_run_id || "",
     stage: task.stage || task.planStage || task.plan_stage || "",
     stepOrdinal: task.stepOrdinal ?? task.step_ordinal ?? "",
     status: task.status || "",
+    statusSource: task.statusSource || task.status_source || "",
     taskId: task.taskId || task.task_id || task.id || task.planTaskId || task.plan_task_id || "",
+    todoStatus: task.todoStatus || task.todo_status || "",
     textLength: String(task.text || task.todo || task.task || "").length,
     title: task.title || "",
   };
@@ -7282,16 +7595,28 @@ function normalizeTodoQueuePersistedQueueState(item) {
   const createdAt = String(queueState.createdAt || queueState.created_at || queueState.queuedAt || queueState.queued_at || "").trim();
   const updatedAt = String(queueState.updatedAt || queueState.updated_at || "").trim();
   const reason = String(queueState.reason || "").trim();
+  const todoId = getTodoQueueItemTodoId(item);
   const commandId = String(queueState.commandId || queueState.command_id || item?.remoteCommand?.commandId || item?.remote_command?.command_id || "").trim();
   const dispatchId = String(queueState.dispatchId || queueState.dispatch_id || queueState.todoDispatchId || queueState.todo_dispatch_id || item?.remoteCommand?.todoDispatchId || item?.remote_command?.todo_dispatch_id || "").trim();
   const promptId = String(queueState.promptId || queueState.prompt_id || queueState.promptEventId || queueState.prompt_event_id || "").trim();
+  const todoAction = getTodoQueueDispatchAction(item, source, queueState);
+  const todoResumeRequested = Boolean(
+    queueState.todoResumeRequested === true
+      || queueState.todo_resume_requested === true
+      || queueState.resumeRequested === true
+      || queueState.resume_requested === true
+      || todoQueueDispatchActionIsResume(todoAction)
+  );
 
   return {
     phase,
     state: phase,
+    ...(todoId ? { todoId } : {}),
     ...(commandId ? { commandId } : {}),
     ...(dispatchId ? { dispatchId, todoDispatchId: dispatchId } : {}),
     ...(promptId ? { promptId, promptEventId: promptId } : {}),
+    ...(todoAction ? { todoAction, action: todoAction } : {}),
+    ...(todoResumeRequested ? { todoResumeRequested: true, resumeRequested: true } : {}),
     ...(source ? { source } : {}),
     ...(targetAgentId ? { targetAgentId, targetRole: targetAgentId } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
@@ -7323,6 +7648,22 @@ function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
   const fieldTargetTerminalColor = normalizeTerminalHexColor(fields.targetTerminalColor);
   const fieldTargetTerminalId = normalizeTodoTerminalIdentity(fields.targetTerminalId);
   const fieldTargetThreadId = normalizeTodoTerminalIdentity(fields.targetThreadId);
+  const nextSource = fields.source || existingState.source || item.source || "";
+  const nextTodoAction = getTodoQueueDispatchAction(item, nextSource, {
+    ...existingState,
+    ...fields,
+  });
+  const nextTodoResumeRequested = Boolean(
+    fields.todoResumeRequested === true
+      || fields.todo_resume_requested === true
+      || fields.resumeRequested === true
+      || fields.resume_requested === true
+      || existingState.todoResumeRequested === true
+      || existingState.todo_resume_requested === true
+      || existingState.resumeRequested === true
+      || existingState.resume_requested === true
+      || todoQueueDispatchActionIsResume(nextTodoAction)
+  );
   const fieldsHaveIndexTarget = Number.isInteger(fieldTargetTerminalIndex)
     || Number.isInteger(fieldTargetColorSlot);
   const fieldIdentityTargetIndex = fieldTargetTerminalIndex ?? fieldTargetColorSlot;
@@ -7351,10 +7692,14 @@ function getTodoQueueItemWithPersistedQueueState(item, phase, fields = {}) {
       ...existingState,
       phase: safePhase,
       state: safePhase,
+      todoId: fields.todoId || fields.todo_id || existingState.todoId || existingState.todo_id || getTodoQueueItemTodoId(item),
       commandId: fields.commandId || existingState.commandId || existingState.command_id || getTodoQueueRemoteCommandId(item),
       dispatchId: fields.dispatchId || fields.todoDispatchId || existingState.dispatchId || existingState.dispatch_id || existingState.todoDispatchId || existingState.todo_dispatch_id || getTodoQueueRemoteCommandDispatchId(item),
       promptId: fields.promptId || fields.promptEventId || existingState.promptId || existingState.prompt_id || existingState.promptEventId || existingState.prompt_event_id || "",
-      source: fields.source || existingState.source || item.source || "",
+      source: nextSource,
+      todoAction: nextTodoAction,
+      action: nextTodoAction,
+      todoResumeRequested: nextTodoResumeRequested,
       targetAgentId: fields.targetAgentId || existingState.targetAgentId || existingState.target_agent_id || getTodoQueueTargetAgentId(item),
       targetColorSlot: targetExplicit
         ? fieldTargetColorSlot ?? existingTargetColorSlot ?? getTodoQueueTargetColorSlot(item)
@@ -8539,6 +8884,47 @@ function normalizeWorkspaceTodoDispatchTargets(workspaceTodos, workspaceId) {
     .slice(0, 48);
 }
 
+function workspaceTodoItemsForWorkspace(workspaceTodos, workspaceId) {
+  const todoCollection = workspaceTodoCollectionForWorkspace(
+    workspaceTodos,
+    workspaceId,
+    ["items", "todos"],
+    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
+  );
+  return Array.isArray(todoCollection?.items)
+    ? todoCollection.items
+    : Array.isArray(todoCollection)
+      ? todoCollection
+      : [];
+}
+
+function findWorkspaceTodoForVoicePlanTask(workspaceTodos, workspaceId, planTask) {
+  const normalizedPlanTask = normalizeTodoQueuePlanTask(planTask);
+  if (!normalizedPlanTask) {
+    return null;
+  }
+  const ids = new Set([
+    normalizedPlanTask.clientTodoId,
+    normalizedPlanTask.taskId,
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+  if (!ids.size) {
+    return null;
+  }
+  return workspaceTodoItemsForWorkspace(workspaceTodos, workspaceId).find((item) => {
+    const itemTodoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
+    if (ids.has(itemTodoId)) {
+      return true;
+    }
+    const itemPlanTask = normalizeTodoQueuePlanTask(item?.planTask || item?.plan_task);
+    return Boolean(
+      itemPlanTask
+        && itemPlanTask.runId === normalizedPlanTask.runId
+        && itemPlanTask.taskId === normalizedPlanTask.taskId
+        && ids.has(itemPlanTask.clientTodoId || itemPlanTask.taskId),
+    );
+  }) || null;
+}
+
 function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, deviceMap = new Map()) {
   const activity = workspaceTodoPeerActivityForWorkspace(workspaceTodos, workspaceId);
   const items = Array.isArray(activity?.items)
@@ -8836,6 +9222,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   workspace,
   workspaceError = "",
   workspaceId,
+  workspaceTodos = null,
 }) {
   const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
   const orchestratorVoiceHistoryStoreKey = useMemo(
@@ -9204,6 +9591,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 plan,
                 planTask,
                 task,
+                workspaceId: orchestratorPanelWorkspaceId,
+                workspaceTodos,
               });
               if (control.status !== "needs_requeue") {
                 return;
@@ -9225,8 +9614,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   }, [
     onVoicePlanNeedsRequeue,
     orchestratorVoiceHistoryItems,
+    orchestratorPanelWorkspaceId,
     pendingItems,
     queueItems,
+    workspaceTodos,
   ]);
 
   const recordVoiceHistoryTranscript = useCallback((event) => {
@@ -10960,30 +11351,30 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                       rows={1}
                       spellCheck="true"
                       value={draft}
-	                    />
-	                    <TodoQueueDraftBullet aria-hidden="true" />
-	                  </TodoQueueComposer>
-	                </TodoQueueList>
-	                <TodoQueueFooterActions>
-	                  <TodoQueueAutoQueueAllButton
-	                    aria-label="Autoqueue all todos"
-	                    data-todo-control="true"
-	                    disabled={!autoQueueAllEligibleCount}
-	                    onClick={(event) => {
-	                      event.preventDefault();
-	                      event.stopPropagation();
-	                      onQueueAllItems?.();
-	                    }}
-	                    title={autoQueueAllEligibleCount ? "Queue all unqueued todos" : "No unqueued todos"}
-	                    type="button"
-	                  >
-	                    <AddToQueue aria-hidden="true" />
-	                    <span>Autoqueue all</span>
-	                  </TodoQueueAutoQueueAllButton>
-	                </TodoQueueFooterActions>
+                    />
+                    <TodoQueueDraftBullet aria-hidden="true" />
+                  </TodoQueueComposer>
+                </TodoQueueList>
+                <TodoQueueFooterActions>
+                  <TodoQueueAutoQueueAllButton
+                    aria-label="Autoqueue all todos"
+                    data-todo-control="true"
+                    disabled={!autoQueueAllEligibleCount}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onQueueAllItems?.();
+                    }}
+                    title={autoQueueAllEligibleCount ? "Queue all unqueued todos" : "No unqueued todos"}
+                    type="button"
+                  >
+                    <AddToQueue aria-hidden="true" />
+                    <span>Autoqueue all</span>
+                  </TodoQueueAutoQueueAllButton>
+                </TodoQueueFooterActions>
 
-	                {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
-	              </TodoQueueBoard>
+                {dropError && <TodoQueueError role="alert">{dropError}</TodoQueueError>}
+              </TodoQueueBoard>
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
                 <OrchestratorHistoryScroll ref={orchestratorHistoryScrollRef}>
@@ -11099,7 +11490,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                   <OrchestratorHistoryPlanHeaderMain>
                                     <OrchestratorHistoryPlanTitle>{item.plan.title}</OrchestratorHistoryPlanTitle>
                                     {(() => {
-                                      const progress = getVoicePlanProgressCounts(item.plan, queueItems, pendingItems);
+                                      const progress = getVoicePlanProgressCounts(
+                                        item.plan,
+                                        queueItems,
+                                        pendingItems,
+                                        workspaceTodos,
+                                        orchestratorPanelWorkspaceId,
+                                      );
                                       const progressPercent = progress.total
                                         ? Math.round((progress.done / progress.total) * 100)
                                         : 0;
@@ -11123,8 +11520,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                     })()}
                                   </OrchestratorHistoryPlanHeaderMain>
                                   {(() => {
-                                    const canCancelPlan = voicePlanHasCancellableWork(item.plan, queueItems, pendingItems);
-                                    const canResumePlan = voicePlanHasRequeueableWork(item.plan, queueItems, pendingItems);
+                                    const canCancelPlan = voicePlanHasCancellableWork(
+                                      item.plan,
+                                      queueItems,
+                                      pendingItems,
+                                      workspaceTodos,
+                                      orchestratorPanelWorkspaceId,
+                                    );
+                                    const canResumePlan = voicePlanHasRequeueableWork(
+                                      item.plan,
+                                      queueItems,
+                                      pendingItems,
+                                      workspaceTodos,
+                                      orchestratorPanelWorkspaceId,
+                                    );
                                     if (!canCancelPlan && !canResumePlan) {
                                       return <OrchestratorHistoryPlanTaskHiddenAction aria-hidden="true" />;
                                     }
@@ -11195,6 +11604,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                                     plan: item.plan,
                                                     planTask,
                                                     task,
+                                                    workspaceId: orchestratorPanelWorkspaceId,
+                                                    workspaceTodos,
                                                   });
                                                   const statusLabel = getVoicePlanTaskStatusLabel({ status: control.status });
                                                   return (
@@ -15839,13 +16250,14 @@ function TerminalView({
 
     const existingIds = new Set(todoQueueItemsRef.current.map((item) => item.id));
     const createdItems = eligibleTasks.reduce((items, task) => {
+      const todoId = String(task.clientTodoId || task.taskId || "").trim();
       if (
-        existingIds.has(task.taskId)
-        || todoQueuePendingItemsRef.current[task.taskId]
+        existingIds.has(todoId)
+        || todoQueuePendingItemsRef.current[todoId]
       ) {
         logTerminalStatus("frontend.voice_plan.release_duplicate_skip", {
-          alreadyPending: Boolean(todoQueuePendingItemsRef.current[task.taskId]),
-          alreadyQueued: existingIds.has(task.taskId),
+          alreadyPending: Boolean(todoQueuePendingItemsRef.current[todoId]),
+          alreadyQueued: existingIds.has(todoId),
           releaseSource,
           task: getVoicePlanTaskStatusLogSummary(task),
           workspaceId: terminalWorkspace?.id || "",
@@ -15854,8 +16266,9 @@ function TerminalView({
         return items;
       }
       const item = createTodoQueueItem(task.text, {
-        id: task.taskId,
+        id: todoId,
         planTask: {
+          clientTodoId: todoId,
           doneWhen: task.doneWhen,
           maxConcurrency: task.maxConcurrency,
           releasePolicy: task.releasePolicy,
@@ -16044,7 +16457,7 @@ function TerminalView({
     try {
       logTerminalStatus("frontend.voice_plan.status_send", {
         payload,
-        repoPath: target.projectRoot || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        repoPath: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
         workspaceId: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || "",
       });
@@ -16273,7 +16686,7 @@ function TerminalView({
     }
 
     const item = findTodoQueueItemForVoicePlanTask(normalizedPlanTask);
-    const itemId = String(item?.id || normalizedPlanTask.taskId || "").trim();
+    const itemId = String(item?.id || normalizedPlanTask.clientTodoId || normalizedPlanTask.taskId || "").trim();
     const inFlight = findTodoQueueInFlightPromptForVoicePlanTask(normalizedPlanTask, item);
     if (inFlight?.terminalIndex != null) {
       const reservation = todoQueueTerminalReservationsRef.current.get(inFlight.terminalIndex);
@@ -16376,7 +16789,7 @@ function TerminalView({
       return;
     }
     const result = await recordVoicePlanTaskStatus(normalizedPlanTask, "queued", {
-      clientTodoId: normalizedPlanTask.taskId,
+      clientTodoId: normalizedPlanTask.clientTodoId || normalizedPlanTask.taskId,
       controlAction: "requeue",
       controlScope: "task",
       reason: "manual_requeue",
@@ -16425,6 +16838,8 @@ function TerminalView({
             plan,
             planTask,
             task,
+            workspaceId: terminalWorkspace?.id || "",
+            workspaceTodos,
           });
           if (!control.canRequeue) {
             return;
@@ -16443,7 +16858,7 @@ function TerminalView({
     const queuedTasks = [];
     for (const { planTask, releasedTask } of releasedTasks) {
       const result = await recordVoicePlanTaskStatus(planTask, "queued", {
-        clientTodoId: planTask.taskId,
+        clientTodoId: planTask.clientTodoId || planTask.taskId,
         controlAction: "resume_unfinished",
         controlScope: "plan",
         reason: "resume_unfinished_plan_tasks",
@@ -16472,6 +16887,8 @@ function TerminalView({
   }, [
     queueReleasedVoicePlanTasks,
     recordVoicePlanTaskStatus,
+    terminalWorkspace?.id,
+    workspaceTodos,
   ]);
 
   const handleCancelVoicePlan = useCallback(async (plan) => {
@@ -16712,12 +17129,34 @@ function TerminalView({
     const targetLogIndex = Number.isInteger(target.targetTerminalIndex)
       ? target.targetTerminalIndex
       : targetTerminalIndex ?? "";
+    const todoQueueState = normalizeTodoQueuePersistedQueueState(currentItem) || {};
+    const todoId = getTodoQueueItemTodoId(currentItem);
+    const todoDispatchId = String(
+      todoQueueState.todoDispatchId
+        || todoQueueState.dispatchId
+        || currentItem.todoDispatchId
+        || currentItem.todo_dispatch_id
+        || getTodoQueueRemoteCommandDispatchId(currentItem)
+        || "",
+    ).trim();
+    const todoCommandId = String(
+      todoQueueState.commandId
+        || currentItem.commandId
+        || currentItem.command_id
+        || getTodoQueueRemoteCommandId(currentItem)
+        || "",
+    ).trim();
+    const todoAction = getTodoQueueDispatchAction(currentItem, source, todoQueueState);
+    const todoResumeRequested = todoQueueDispatchActionIsResume(todoAction);
     const terminalWriteLogBase = {
       item: itemLogSummary,
       paneId,
       source,
       targetRole,
       targetTerminalIndex: targetLogIndex,
+      todoAction,
+      todoId,
+      todoResumeRequested,
       workspaceId,
     };
     const planTask = getTodoQueueItemPlanTask(currentItem);
@@ -17438,6 +17877,11 @@ function TerminalView({
                 promptEventSource,
                 promptEventSubmittedAt: attemptSubmittedAt,
                 promptEventText: terminalText,
+                todoAction,
+                todoCommandId,
+                todoDispatchId,
+                todoId,
+                todoResumeRequested,
                 threadId: targetThread.id,
               });
               logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
@@ -18230,8 +18674,8 @@ function TerminalView({
       return null;
     }
 
-    const item = createTodoQueueItemFromVoiceAgentToolCall(toolCall);
-    if (!item) {
+    const items = createTodoQueueItemsFromVoiceAgentToolCall(toolCall);
+    if (!items.length) {
       logTerminalStatus("frontend.voice_agent.tool_call_skip", {
         reason: "invalid_queue_item",
         toolName,
@@ -18239,8 +18683,11 @@ function TerminalView({
       });
       return null;
     }
-    const planTask = getTodoQueueItemPlanTask(item);
-    if (planTask) {
+    const planItems = items.filter((item) => getTodoQueueItemPlanTask(item));
+    const genericItems = items.filter((item) => !getTodoQueueItemPlanTask(item));
+    const createdPlanItems = [];
+    planItems.forEach((item) => {
+      const planTask = getTodoQueueItemPlanTask(item);
       logTerminalStatus("frontend.voice_plan.tool_call_release", {
         item: getTodoQueueItemLogSummary([item])[0] || null,
         planTask,
@@ -18261,36 +18708,47 @@ function TerminalView({
       }], voicePlanSnapshotsRef.current.get(planTask.runId) || null, {
         source: "voice_agent_tool_call",
       });
-      return createdItems[0] || null;
+      createdPlanItems.push(...createdItems);
+    });
+
+    if (!genericItems.length) {
+      return createdPlanItems[0] || null;
     }
 
     const callId = String(toolCall?.call_id || toolCall?.callId || "").trim();
-    const source = getTodoQueueItemAutoQueueSource(item);
-    updateTodoQueueItems((currentItems) => currentItems.concat([item]));
+    const itemsWithWorkspace = genericItems.map((item) => (
+      item.workspaceId || !terminalWorkspace?.id
+        ? item
+        : { ...item, workspaceId: terminalWorkspace.id }
+    ));
+    updateTodoQueueItems((currentItems) => currentItems.concat(itemsWithWorkspace));
     setTodoDropError("");
     logTerminalStatus("frontend.voice_agent.queue_item_created", {
       callId,
-      item: getTodoQueueItemLogSummary([item])[0] || null,
-      source,
+      itemCount: itemsWithWorkspace.length,
+      items: getTodoQueueItemLogSummary(itemsWithWorkspace),
       workspaceId: terminalWorkspace?.id || "",
     });
-    setTodoQueueItemPending(item.id, {
-      item: getTodoQueueItemLogSummary([item])[0] || null,
-      phase: "queued",
-      source,
-      workspaceId: terminalWorkspace?.id || "",
+    itemsWithWorkspace.forEach((item) => {
+      const source = getTodoQueueItemAutoQueueSource(item);
+      setTodoQueueItemPending(item.id, {
+        item: getTodoQueueItemLogSummary([item])[0] || null,
+        phase: "queued",
+        workspaceId: item.workspaceId || terminalWorkspace?.id || "",
+        ...getTodoQueuePendingFieldsFromItem(item, source),
+      });
     });
     setTodoQueueDispatchRevision((revision) => revision + 1);
 
     logBigViewSyncDiagnosticEvent("tui.text.voice_agent_queue", {
       callId,
-      item: getTodoQueueItemLogSummary([item])[0] || null,
-      source,
+      itemCount: itemsWithWorkspace.length,
+      items: getTodoQueueItemLogSummary(itemsWithWorkspace),
       surface: "tui_todo_queue",
       workspaceId: terminalWorkspace?.id || "",
     });
 
-    return item;
+    return createdPlanItems[0] || itemsWithWorkspace[0] || null;
   }, [
     claimVoiceAgentToolCall,
     executeVoiceAgentOpenCodingAgentsToolCall,
@@ -20780,6 +21238,7 @@ function TerminalView({
                           workspace={terminalWorkspace}
                           workspaceError={workspaceError}
                           workspaceId={terminalWorkspace.id}
+                          workspaceTodos={workspaceTodos}
                         />
                       )}
                     </ResizePanel>

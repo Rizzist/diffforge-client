@@ -1026,6 +1026,8 @@ const WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS = 450;
 const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
 const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
 const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
+const WORKSPACE_ARCHITECTURE_GRAPH_LIST_REFRESH_MS = 900;
+const WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS = 90;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -4776,6 +4778,57 @@ function workspaceGraphStateKey(repoPath, workspaceId) {
   return `${normalizedWorkspaceId}::${normalizedRepoPath}`;
 }
 
+function workspaceArchitectureRepoKey(repoPath) {
+  return normalizeGraphWorkspacePath(repoPath);
+}
+
+function workspaceArchitectureRepositoriesFromScan(scan) {
+  return Array.isArray(scan?.repositories) ? scan.repositories : [];
+}
+
+function workspaceArchitectureRepoPath(repo) {
+  return graphText(repo?.path || repo?.projectRoot || repo?.project_root);
+}
+
+function workspaceArchitectureGraphListEntry(repoPath, patch = {}) {
+  const safeRepoPath = graphText(patch.repoPath || patch.repo_path || repoPath);
+  const graphs = Array.isArray(patch.graphs) ? patch.graphs : [];
+  return {
+    architectureRoot: graphText(patch.architectureRoot || patch.architecture_root),
+    error: graphText(patch.error),
+    graphs,
+    navTree: Array.isArray(patch.navTree) ? patch.navTree : graphs,
+    repoPath: safeRepoPath,
+    requestedAt: Number(patch.requestedAt || 0),
+    state: graphText(patch.state, graphs.length ? "ready" : "idle"),
+    updatedAt: Number(patch.updatedAt || 0),
+  };
+}
+
+function workspaceArchitectureScanWithGraphCount(scan, repoPath, graphCount) {
+  if (!scan || typeof scan !== "object") return scan;
+  const repoKey = workspaceArchitectureRepoKey(repoPath);
+  if (!repoKey) return scan;
+  const repositories = workspaceArchitectureRepositoriesFromScan(scan);
+  if (!repositories.length) return scan;
+  let changed = false;
+  const nextRepositories = repositories.map((repo) => {
+    if (workspaceArchitectureRepoKey(repo?.path || repo?.projectRoot || repo?.project_root) !== repoKey) {
+      return repo;
+    }
+    if (Number(repo?.graphCount ?? repo?.graph_count ?? 0) === graphCount) {
+      return repo;
+    }
+    changed = true;
+    return {
+      ...repo,
+      graphCount,
+      graph_count: graphCount,
+    };
+  });
+  return changed ? { ...scan, repositories: nextRepositories } : scan;
+}
+
 function workspaceGraphSnapshotKey(snapshot) {
   return workspaceGraphStateKey(
     graphSnapshotRepoPath(snapshot),
@@ -5287,6 +5340,7 @@ export default function App() {
   const workspacePendingActivationIdRef = useRef("");
   const workspaceGraphStateRef = useRef(workspaceGraphState);
   const workspaceArchitectureScanInFlightRef = useRef(new Set());
+  const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const mainWindowFocusedRef = useRef(mainWindowFocused);
@@ -6053,6 +6107,191 @@ export default function App() {
     logWorkspaceActivationTrace,
     setWorkspaceGraphStatus,
   ]);
+
+  const refreshWorkspaceArchitectureGraphList = useCallback((workspaceId, repoPath, options = {}) => {
+    const safeWorkspaceId = graphText(workspaceId);
+    const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
+    if (!safeWorkspaceId || !safeRepoPath) {
+      return Promise.resolve([]);
+    }
+
+    const workspaceRootPath = cleanWorkspaceRootDirectory(
+      options.workspaceRootDirectory
+        || getWorkspaceRootDirectory(workspaceSettingsRef.current, safeWorkspaceId)
+        || defaultWorkingDirectoryRef.current
+        || safeRepoPath,
+    );
+    const stateKey = workspaceGraphStateKey(workspaceRootPath, safeWorkspaceId);
+    const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
+    if (!stateKey || !repoKey) {
+      return Promise.resolve([]);
+    }
+
+    const existingState = workspaceGraphStateRef.current[stateKey] || {};
+    const existingLists = existingState.architectureGraphLists || {};
+    const existingEntry = existingLists[repoKey] || null;
+    const existingGraphs = Array.isArray(existingEntry?.graphs) ? existingEntry.graphs : [];
+    if (!options.refresh && existingEntry?.state === "ready") {
+      return Promise.resolve(existingGraphs);
+    }
+
+    const requestKey = `${stateKey}::${repoKey}`;
+    if (workspaceArchitectureGraphListInFlightRef.current.has(requestKey)) {
+      return Promise.resolve(existingGraphs);
+    }
+
+    const requestedAt = Date.now();
+    workspaceArchitectureGraphListInFlightRef.current.add(requestKey);
+    setWorkspaceGraphState((current) => {
+      const previous = current[stateKey] || {};
+      const previousLists = previous.architectureGraphLists || {};
+      const previousEntry = previousLists[repoKey] || {};
+      const nextEntry = workspaceArchitectureGraphListEntry(safeRepoPath, {
+        ...previousEntry,
+        requestedAt,
+        state: options.silent && previousEntry.state ? previousEntry.state : "loading",
+      });
+      const next = {
+        ...current,
+        [stateKey]: {
+          ...previous,
+          repoPath: workspaceRootPath,
+          workspaceId: safeWorkspaceId,
+          architectureGraphLists: {
+            ...previousLists,
+            [repoKey]: nextEntry,
+          },
+          architectureGraphListsUpdatedAt: requestedAt,
+        },
+      };
+      workspaceGraphStateRef.current = next;
+      return next;
+    });
+
+    return invoke("architecture_graphs_list", { repoPath: safeRepoPath })
+      .then((result) => {
+        const graphs = Array.isArray(result?.graphs) ? result.graphs : [];
+        const completedAt = Date.now();
+        setWorkspaceGraphState((current) => {
+          const previous = current[stateKey] || {};
+          const previousLists = previous.architectureGraphLists || {};
+          const selectedRepoKey = workspaceArchitectureRepoKey(previous.architectureSelectedRepoPath);
+          const selectedRepoPath = previous.architectureSelectedRepoPath || safeRepoPath;
+          const shouldSelectGraph = !selectedRepoKey || selectedRepoKey === repoKey;
+          let selectedGraphId = previous.architectureSelectedGraphId || "";
+          if (shouldSelectGraph && selectedGraphId && !graphs.some((graph) => graph?.id === selectedGraphId)) {
+            selectedGraphId = "";
+          }
+          if (shouldSelectGraph && !selectedGraphId) {
+            selectedGraphId = graphs[0]?.id || "";
+          }
+
+          const nextScan = workspaceArchitectureScanWithGraphCount(
+            previous.architectureRepositoryScanSnapshot,
+            safeRepoPath,
+            graphs.length,
+          );
+          const next = {
+            ...current,
+            [stateKey]: {
+              ...previous,
+              repoPath: workspaceRootPath,
+              workspaceId: safeWorkspaceId,
+              architectureGraphLists: {
+                ...previousLists,
+                [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+                  architectureRoot: result?.architectureRoot || result?.architecture_root,
+                  graphs,
+                  navTree: graphs,
+                  repoPath: result?.repoPath || result?.repo_path || safeRepoPath,
+                  requestedAt,
+                  state: "ready",
+                  updatedAt: completedAt,
+                }),
+              },
+              architectureGraphListsUpdatedAt: completedAt,
+              architectureRepositoryScanSnapshot: nextScan,
+              architectureSelectedRepoPath: selectedRepoPath,
+              architectureSelectedGraphId: selectedGraphId,
+            },
+          };
+          workspaceGraphStateRef.current = next;
+          return next;
+        });
+        return graphs;
+      })
+      .catch((error) => {
+        const message = getErrorMessage(error, "Unable to load architecture graphs.");
+        setWorkspaceGraphState((current) => {
+          const previous = current[stateKey] || {};
+          const previousLists = previous.architectureGraphLists || {};
+          const previousEntry = previousLists[repoKey] || {};
+          const next = {
+            ...current,
+            [stateKey]: {
+              ...previous,
+              repoPath: workspaceRootPath,
+              workspaceId: safeWorkspaceId,
+              architectureGraphLists: {
+                ...previousLists,
+                [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+                  ...previousEntry,
+                  error: message,
+                  requestedAt,
+                  state: "error",
+                  updatedAt: Date.now(),
+                }),
+              },
+            },
+          };
+          workspaceGraphStateRef.current = next;
+          return next;
+        });
+        if (!options.silent) {
+          throw error;
+        }
+        return existingGraphs;
+      })
+      .finally(() => {
+        workspaceArchitectureGraphListInFlightRef.current.delete(requestKey);
+      });
+  }, []);
+
+  const setWorkspaceArchitectureSelection = useCallback((workspaceId, options = {}) => {
+    const safeWorkspaceId = graphText(workspaceId);
+    if (!safeWorkspaceId) return;
+    const workspaceRootPath = cleanWorkspaceRootDirectory(
+      options.workspaceRootDirectory
+        || getWorkspaceRootDirectory(workspaceSettingsRef.current, safeWorkspaceId)
+        || defaultWorkingDirectoryRef.current,
+    );
+    const stateKey = workspaceGraphStateKey(workspaceRootPath, safeWorkspaceId);
+    if (!stateKey) return;
+    const selectedRepoPath = graphText(options.repoPath);
+    const selectedGraphId = graphText(options.graphId);
+    setWorkspaceGraphState((current) => {
+      const previous = current[stateKey] || {};
+      const nextSelectedRepoPath = selectedRepoPath || previous.architectureSelectedRepoPath || "";
+      if (
+        previous.architectureSelectedRepoPath === nextSelectedRepoPath
+        && previous.architectureSelectedGraphId === selectedGraphId
+      ) {
+        return current;
+      }
+      const next = {
+        ...current,
+        [stateKey]: {
+          ...previous,
+          repoPath: workspaceRootPath || previous.repoPath,
+          workspaceId: safeWorkspaceId,
+          architectureSelectedRepoPath: nextSelectedRepoPath,
+          architectureSelectedGraphId: selectedGraphId,
+        },
+      };
+      workspaceGraphStateRef.current = next;
+      return next;
+    });
+  }, []);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -14314,6 +14553,106 @@ export default function App() {
 
   useEffect(() => {
     const repoPath = activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = activatedWorkspaceIdForGraphSync;
+    const repositories = workspaceArchitectureRepositoriesFromScan(activatedArchitectureRepositoryScanSnapshot);
+    if (
+      !repoPath
+      || !workspaceId
+      || activatedArchitectureRepositoryScanState !== "ready"
+      || !repositories.length
+    ) {
+      return undefined;
+    }
+
+    const architectureRepoPaths = repositories
+      .map(workspaceArchitectureRepoPath)
+      .filter(Boolean);
+    if (!architectureRepoPaths.length) {
+      return undefined;
+    }
+    const currentState = workspaceGraphStateRef.current[workspaceGraphStateKey(repoPath, workspaceId)] || {};
+    if (!currentState.architectureSelectedRepoPath) {
+      setWorkspaceArchitectureSelection(workspaceId, {
+        repoPath: architectureRepoPaths[0],
+        workspaceRootDirectory: repoPath,
+      });
+    }
+
+    const timers = architectureRepoPaths
+      .filter(Boolean)
+      .map((architectureRepoPath, index) => window.setTimeout(() => {
+        refreshWorkspaceArchitectureGraphList(workspaceId, architectureRepoPath, {
+          reason: "workspace_architecture_graph_list_preload",
+          workspaceRootDirectory: repoPath,
+        }).catch(() => {});
+      }, index * WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS));
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [
+    activatedArchitectureRepositoryScanSnapshot,
+    activatedArchitectureRepositoryScanState,
+    activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceTerminalWorkingDirectory,
+    refreshWorkspaceArchitectureGraphList,
+    setWorkspaceArchitectureSelection,
+  ]);
+
+  useEffect(() => {
+    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = activatedWorkspaceIdForGraphSync;
+    const repositories = workspaceArchitectureRepositoriesFromScan(activatedArchitectureRepositoryScanSnapshot);
+    if (
+      !repoPath
+      || !workspaceId
+      || activatedArchitectureRepositoryScanState !== "ready"
+      || !repositories.length
+    ) {
+      return undefined;
+    }
+
+    const initialRepoPath = graphText(
+      activatedWorkspaceGraphState.architectureSelectedRepoPath
+        || workspaceArchitectureRepoPath(repositories[0]),
+    );
+    if (!initialRepoPath) {
+      return undefined;
+    }
+
+    const interval = window.setInterval(() => {
+      const stateKey = workspaceGraphStateKey(repoPath, workspaceId);
+      const currentState = workspaceGraphStateRef.current[stateKey] || {};
+      const currentScan = currentState.architectureRepositoryScanSnapshot || activatedArchitectureRepositoryScanSnapshot;
+      const currentRepositories = workspaceArchitectureRepositoriesFromScan(currentScan);
+      const selectedRepoPath = graphText(
+        currentState.architectureSelectedRepoPath
+          || initialRepoPath,
+      );
+      const selectedRepoKey = workspaceArchitectureRepoKey(selectedRepoPath);
+      const selectedRepo = currentRepositories.find((repo) => (
+        workspaceArchitectureRepoKey(workspaceArchitectureRepoPath(repo)) === selectedRepoKey
+      ));
+      refreshWorkspaceArchitectureGraphList(workspaceId, workspaceArchitectureRepoPath(selectedRepo) || selectedRepoPath, {
+        refresh: true,
+        reason: "workspace_architecture_graph_list_background_refresh",
+        silent: true,
+        workspaceRootDirectory: repoPath,
+      }).catch(() => {});
+    }, WORKSPACE_ARCHITECTURE_GRAPH_LIST_REFRESH_MS);
+
+    return () => window.clearInterval(interval);
+  }, [
+    activatedArchitectureRepositoryScanSnapshot,
+    activatedArchitectureRepositoryScanState,
+    activatedWorkspaceGraphState.architectureSelectedRepoPath,
+    activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceTerminalWorkingDirectory,
+    refreshWorkspaceArchitectureGraphList,
+  ]);
+
+  useEffect(() => {
+    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
     if (!workspaceHydrationReady || !repoPath || !activatedWorkspaceIdForGraphSync) {
       return undefined;
     }
@@ -14363,6 +14702,30 @@ export default function App() {
   const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
     ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
     : {};
+  const refreshSelectedWorkspaceArchitectureGraphList = useCallback((architectureRepoPath, options = {}) => {
+    if (!selectedWorkspace?.id) {
+      return Promise.resolve([]);
+    }
+    return refreshWorkspaceArchitectureGraphList(selectedWorkspace.id, architectureRepoPath, {
+      ...options,
+      workspaceRootDirectory: selectedWorkspaceFileRoot,
+    });
+  }, [
+    refreshWorkspaceArchitectureGraphList,
+    selectedWorkspace?.id,
+    selectedWorkspaceFileRoot,
+  ]);
+  const updateSelectedWorkspaceArchitectureSelection = useCallback((selection = {}) => {
+    if (!selectedWorkspace?.id) return;
+    setWorkspaceArchitectureSelection(selectedWorkspace.id, {
+      ...selection,
+      workspaceRootDirectory: selectedWorkspaceFileRoot,
+    });
+  }, [
+    selectedWorkspace?.id,
+    selectedWorkspaceFileRoot,
+    setWorkspaceArchitectureSelection,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -20564,9 +20927,15 @@ export default function App() {
                       architectureRepositoryScanError={selectedWorkspaceGraphState.architectureRepositoryScanError || ""}
                       architectureRepositoryScanSnapshot={selectedWorkspaceGraphState.architectureRepositoryScanSnapshot || null}
                       architectureRepositoryScanState={selectedWorkspaceGraphState.architectureRepositoryScanState || "idle"}
+                      architectureGraphLists={selectedWorkspaceGraphState.architectureGraphLists || {}}
+                      architectureSelectedGraphId={selectedWorkspaceGraphState.architectureSelectedGraphId || ""}
+                      architectureSelectedRepoPath={selectedWorkspaceGraphState.architectureSelectedRepoPath || ""}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
                       architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
+                      onArchitectureGraphListRefresh={refreshSelectedWorkspaceArchitectureGraphList}
+                      onArchitectureSelectionChange={updateSelectedWorkspaceArchitectureSelection}
                       workspace={selectedWorkspace}
+                      workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                     />
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />

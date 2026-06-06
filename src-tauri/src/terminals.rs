@@ -439,6 +439,11 @@ async fn write_to_active_terminal_audio_input_target(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
+        None,
         true,
     )
     .await?;
@@ -7529,6 +7534,11 @@ async fn terminal_resume_parked_prompt_once(
         None,
         resumed_prompt_event_source,
         Some(&resumed_prompt_submitted_at),
+        None,
+        None,
+        None,
+        None,
+        false,
         Some(&resume_request),
         Some(&resume_request),
         true,
@@ -7560,6 +7570,11 @@ async fn terminal_resume_parked_prompt_once(
             workspace_name: prompt_metadata
                 .map(|metadata| metadata.workspace_name.clone())
                 .unwrap_or_else(|| metadata.workspace_name.clone()),
+            todo_id: None,
+            todo_dispatch_id: None,
+            todo_command_id: None,
+            todo_action: None,
+            todo_resume_requested: false,
         };
         let prompt_for_cloud = resume_request.clone();
         tauri::async_runtime::spawn(async move {
@@ -7627,6 +7642,11 @@ fn emit_terminal_prompt_submitted(
     prompt_event_revision: Option<u64>,
     prompt_event_source: Option<&str>,
     prompt_event_submitted_at: Option<&str>,
+    todo_id: Option<&str>,
+    todo_dispatch_id: Option<&str>,
+    todo_command_id: Option<&str>,
+    todo_action: Option<&str>,
+    todo_resume_requested: bool,
     expected_prompt: Option<&str>,
     observed_prompt: Option<&str>,
     prompt_match: bool,
@@ -7681,6 +7701,9 @@ fn emit_terminal_prompt_submitted(
             "pane_id": metadata.pane_id.clone(),
             "prompt_event_id": prompt_event_id.unwrap_or_default(),
             "prompt_event_source": prompt_event_source.unwrap_or_default(),
+            "todo_action": todo_action.unwrap_or_default(),
+            "todo_id": todo_id.unwrap_or_default(),
+            "todo_resume_requested": todo_resume_requested,
             "prompt_len": prompt.len(),
             "prompt_match": prompt_match,
             "prompt_source": prompt_source,
@@ -7721,6 +7744,23 @@ fn emit_terminal_prompt_submitted(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
+            todo_id: todo_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            todo_dispatch_id: todo_dispatch_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            todo_command_id: todo_command_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            todo_action: todo_action
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            todo_resume_requested,
             expected_prompt: expected_prompt
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
@@ -8562,6 +8602,11 @@ fn spawn_terminal_input_queue_worker(
                 payload.prompt_event_source,
                 payload.prompt_event_submitted_at,
                 payload.prompt_event_text,
+                payload.todo_id,
+                payload.todo_dispatch_id,
+                payload.todo_command_id,
+                payload.todo_action,
+                payload.todo_resume_requested,
                 payload.thread_id,
                 true,
             )
@@ -9152,6 +9197,11 @@ async fn terminal_write_inner(
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
+    todo_id: Option<String>,
+    todo_dispatch_id: Option<String>,
+    todo_command_id: Option<String>,
+    todo_action: Option<String>,
+    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
     _realtime_write: bool,
 ) -> Result<(), String> {
@@ -9478,6 +9528,11 @@ async fn terminal_write_inner(
             prompt_event_revision,
             prompt_event_source.as_deref(),
             prompt_event_submitted_at.as_deref(),
+            todo_id.as_deref(),
+            todo_dispatch_id.as_deref(),
+            todo_command_id.as_deref(),
+            todo_action.as_deref(),
+            todo_resume_requested.unwrap_or(false),
             requested_event_prompt.as_deref(),
             Some(&prompt),
             prompt_event_text_matches_observed,
@@ -9543,6 +9598,11 @@ async fn terminal_write_inner(
                 prompt_event_id: prompt_event_id.clone(),
                 prompt_event_source: prompt_event_source.clone(),
                 prompt_event_submitted_at: prompt_event_submitted_at.clone(),
+                todo_id: todo_id.clone(),
+                todo_dispatch_id: todo_dispatch_id.clone(),
+                todo_command_id: todo_command_id.clone(),
+                todo_action: todo_action.clone(),
+                todo_resume_requested: todo_resume_requested.unwrap_or(false),
                 terminal_index: metadata.terminal_index,
                 thread_id: thread_id
                     .clone()
@@ -9757,6 +9817,11 @@ async fn terminal_write(
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
+    todo_id: Option<String>,
+    todo_dispatch_id: Option<String>,
+    todo_command_id: Option<String>,
+    todo_action: Option<String>,
+    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
     terminal_write_inner(
@@ -9771,6 +9836,11 @@ async fn terminal_write(
         prompt_event_source,
         prompt_event_submitted_at,
         prompt_event_text,
+        todo_id,
+        todo_dispatch_id,
+        todo_command_id,
+        todo_action,
+        todo_resume_requested,
         thread_id,
         false,
     )
@@ -9788,6 +9858,11 @@ async fn terminal_write_realtime(
     prompt_event_source: Option<String>,
     prompt_event_submitted_at: Option<String>,
     prompt_event_text: Option<String>,
+    todo_id: Option<String>,
+    todo_dispatch_id: Option<String>,
+    todo_command_id: Option<String>,
+    todo_action: Option<String>,
+    todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
@@ -9813,6 +9888,11 @@ async fn terminal_write_realtime(
             prompt_event_source,
             prompt_event_submitted_at,
             prompt_event_text,
+            todo_id,
+            todo_dispatch_id,
+            todo_command_id,
+            todo_action,
+            todo_resume_requested,
             thread_id,
             true,
         )

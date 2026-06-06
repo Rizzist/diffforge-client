@@ -14,9 +14,9 @@ Architecture graphs are first-class Diff Forge agent artifacts. They are not gen
 - `.agents/architectures/AGENTS.md` and `.agents/architectures/icon-aliases.json` are generated reference files for agents.
 - In Git workspaces, `.agents/architectures/graphs/*.arch` graph source files are the only visible-root direct-write exception. Code and docs still belong in the assigned worktree/branch root.
 
-When a user asks for an architecture, diagram, system map, deployment view, data flow, auth flow, billing/subscription flow, control graph, state machine, dependency graph, API pathway, or subsystem visualization, create or update a `.arch` graph in `.agents/architectures/graphs/`.
+When a user asks for an architecture, diagram, system map, deployment view, data flow, auth flow, billing/subscription flow, control graph, state machine, dependency graph, API pathway, API corridor, or subsystem visualization, create or update a `.arch` graph in `.agents/architectures/graphs/`.
 
-Architecture graphs are general system graphs. One `.arch` graph may contain multiple connected or disconnected semantic groups: architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem. Do not remove disconnected groups just because they are not connected to the current slice.
+Architecture graphs are general system graphs. One `.arch` graph may contain multiple connected or disconnected semantic groups: architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem. Do not remove disconnected groups just because they are not connected to the current slice.
 
 ## Agent workflow
 
@@ -30,8 +30,9 @@ Call `coordination-kernel.architecture_context` before architecture, diagram, de
 6. Keep titles human-readable. The title should explain the graph's purpose; group `intent` should explain each slice's semantics.
 7. Preserve semantic props when editing. Groups use `intent`, `scope`, `owner`, and `status`. Nodes use `role`, `lifecycle`, `source`, and `status`. Edges use `role`, `condition`, `event`, and `criticality`.
 8. Use compact actor nodes for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints. Write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.
-9. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
-10. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
+9. Use API corridors only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors are architectural procedure summaries, not line-by-line implementation narration.
+10. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
+11. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
 
 ## DSL syntax
 
@@ -78,11 +79,27 @@ Supported basics:
 - `A <> B: label [role: calls]` creates bidirectional call edges.
 - Control/state edges should use `role: transitions`, `role: guards`, `condition: ...`, or `event: ...` when useful.
 
+API corridors are overlay containers for ordered runtime behavior across existing nodes or groups:
+
+```arch
+OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path, status: current] {
+  Browser > Web App: Click login [step: 1, role: event]
+  Web App > API Server: GET /auth/oauth/start [step: 2, role: request, method: GET, path: /auth/oauth/start]
+  API Server > Auth Provider: Redirect authorize [step: 3, role: redirect, status: 302]
+  Auth Provider > Web App: Callback code [step: 4, role: callback]
+  Web App > API Server: POST /auth/oauth/callback [step: 5, role: request, method: POST, path: /auth/oauth/callback]
+  API Server > Session Store: Create session [step: 6, role: writes]
+  API Server > Web App: Set cookie [step: 7, role: response, status: 200]
+}
+```
+
+Inside an API corridor, arrows are ordered procedure messages, not new structural architecture edges. `from`, `to`, `anchor`, and message endpoints should reference existing graph nodes or groups. Use optional `route: "Browser > Web App > API Server"` only when shortest-path placement would be ambiguous. Keep corridors concise, usually 3-9 meaningful steps, and mark uncertainty with `status: uncertain` instead of guessing.
+
 ## Semantic schema
 
 Group intents:
 
-- `architecture`, `api-pathway`, `data-flow`, `control-graph`, `state-machine`, `dependency-graph`, `deployment`, `runtime`, `subsystem`
+- `architecture`, `api-pathway`, `api-corridor`, `data-flow`, `control-graph`, `state-machine`, `dependency-graph`, `deployment`, `runtime`, `subsystem`
 
 Node roles:
 
@@ -95,7 +112,7 @@ Node lifecycle values:
 
 Edge roles:
 
-- `calls`, `reads`, `writes`, `publishes`, `subscribes`, `transitions`, `guards`, `depends-on`, `emits`, `retries`, `fails-to`, `resolves-to`
+- `calls`, `request`, `response`, `redirect`, `callback`, `reads`, `writes`, `publishes`, `subscribes`, `transitions`, `guards`, `depends-on`, `emits`, `retries`, `fails-to`, `resolves-to`
 
 Use these props to make graph meaning durable for humans, the Architecture tab, and future agent edits.
 
@@ -134,6 +151,7 @@ If an exact icon is unknown, use the best semantic alias. The graph should still
 - Prefer readable labels on important edges.
 - A single graph may contain multiple semantic groups, connected or disconnected. Split into separate graph files only when the scope is genuinely separate.
 - For control graphs and state machines, include a start lifecycle, terminal states, and labels/conditions on decision branches.
+- For API corridors, create or update normal architecture nodes/edges first, then add the concise ordered overlay only when procedure order, security, side effects, retries, or external integrations matter.
 - Architecture files are for humans and agents: optimize for understanding, debugging, and future planning.
 "##;
 
@@ -145,13 +163,23 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "Use simple aliases first. The renderer resolves LikeC4 icons, styled-icons simple-icons, and semantic fallbacks.",
     "When a node or container title names a real provider, product, framework, cloud service, database, or company, prefer that exact lowercase slug as the icon alias.",
     "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service. The renderer also tries to infer installed package icons from titles when a generic fallback is used.",
-    "Architecture graphs are general system graphs. Use group intent, node role, and edge role props to preserve meaning across agent edits and visual saves."
+    "Architecture graphs are general system graphs. Use group intent, node role, edge role, and api-corridor overlay props to preserve meaning across agent edits and visual saves."
   ],
   "semanticSchema": {
-    "groupIntents": ["architecture", "api-pathway", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment", "runtime", "subsystem"],
+    "groupIntents": ["architecture", "api-pathway", "api-corridor", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment", "runtime", "subsystem"],
     "nodeRoles": ["actor", "service", "api", "endpoint", "controller", "worker", "queue", "datastore", "cache", "file", "external", "state", "decision", "action", "event", "timer", "terminal", "dependency", "package"],
     "nodeLifecycle": ["start", "normal", "error", "retry", "terminal", "fallback"],
-    "edgeRoles": ["calls", "reads", "writes", "publishes", "subscribes", "transitions", "guards", "depends-on", "emits", "retries", "fails-to", "resolves-to"]
+    "edgeRoles": ["calls", "request", "response", "redirect", "callback", "reads", "writes", "publishes", "subscribes", "transitions", "guards", "depends-on", "emits", "retries", "fails-to", "resolves-to"]
+  },
+  "apiCorridors": {
+    "purpose": "Opt-in overlay containers for important ordered API procedures across existing graph nodes or groups.",
+    "syntax": "OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path] { Browser > API Server: GET /auth/start [step: 1, role: request, method: GET, path: /auth/start] }",
+    "guardrails": [
+      "Use for auth, checkout, webhooks, task dispatch, uploads, token refresh, async jobs, destructive mutations, and external integrations.",
+      "Do not create API corridors for ordinary CRUD routes unless order, security, side effects, retries, or external integrations matter.",
+      "Message endpoints should reference existing graph nodes or groups; create/update normal architecture topology first.",
+      "Keep corridors concise, usually 3-9 meaningful steps. Use status: uncertain when the flow is not evidence-backed."
+    ]
   },
   "packageResolution": {
     "likec4": "Any installed @likec4/icons slug in aws, azure, gcp, tech, or bootstrap can be used, for example appwrite, appwrite-icon, aws:s3, gcp:cloud-run, or azure:functions.",
@@ -1224,8 +1252,9 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
                 "Call architecture_context or architecture_list before creating or updating architecture/system graph artifacts.",
                 "Read the closest existing .agents/architectures/graphs/*.arch file directly before modifying a known subsystem.",
                 "Create or update .agents/architectures/graphs/*.arch with normal file edits using the eraser-like DSL.",
-                "One .arch graph may contain connected or disconnected groups for architecture, api-pathway, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
+                "One .arch graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
                 "Preserve group intent, node role/lifecycle/source/status, and edge role/condition/event/criticality props when editing.",
+                "Use api-corridor overlay containers only for important ordered API procedures; create or update normal architecture nodes and structural edges first.",
                 "Write containers and nodes first, then edges, and save the file incrementally so the Architecture tab updates live.",
                 "Use architecture_icon_reference when choosing cloud, tech, company, product, framework, or semantic icon aliases.",
                 "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks.",
@@ -1244,6 +1273,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "groupIntents": [
                 "architecture",
                 "api-pathway",
+                "api-corridor",
                 "data-flow",
                 "control-graph",
                 "state-machine",
@@ -1283,6 +1313,10 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             ],
             "edgeRoles": [
                 "calls",
+                "request",
+                "response",
+                "redirect",
+                "callback",
                 "reads",
                 "writes",
                 "publishes",
@@ -1297,6 +1331,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             ],
             "validationHints": [
                 "control-graph and state-machine groups should have a start lifecycle, terminal states, and labeled decision branches",
+                "api-corridor overlays should reference existing nodes/groups and stay concise, usually 3-9 material steps",
                 "data-flow groups should use reads, writes, publishes, or subscribes edges",
                 "dependency-graph groups should use depends-on edges"
             ]
@@ -1308,13 +1343,14 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "container": "Runtime Boundary [icon: cloud, color: blue, intent: deployment] { ... }",
             "node": "API [icon: api, role: endpoint, desc: Request handling]",
             "compactNode": "User [icon: users, role: actor, display: compact]",
+            "apiCorridor": "OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path] { Browser > API Server: GET /auth/start [step: 1, role: request, method: GET, path: /auth/start] }",
             "edges": [
                 "Client > API: request [role: calls]",
                 "API -- Database: dependency [role: depends-on]",
                 "Decision > Retry: retry [role: guards, condition: recoverable]",
                 "Idle > Active: start [role: transitions, event: start]"
             ],
-            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nAPI Pathway [icon: api, intent: api-pathway] {\n  Client [icon: users, role: actor, display: compact]\n  API [icon: api, role: endpoint, desc: Handles requests]\n  Database [icon: database, role: datastore]\n}\n\nClient > API: request [role: calls]\nAPI > Database: read/write [role: writes]"
+            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nAPI Pathway [icon: api, intent: api-pathway] {\n  Client [icon: users, role: actor, display: compact]\n  API [icon: api, role: endpoint, desc: Handles requests]\n  Database [icon: database, role: datastore]\n}\n\nClient > API: request [role: calls]\nAPI > Database: read/write [role: writes]\n\nCreate Session [intent: api-corridor, display: overlay, from: Client, to: API, anchor: API, orient: shortest-path] {\n  Client > API: POST /sessions [step: 1, role: request, method: POST, path: /sessions]\n  API > Database: Create session [step: 2, role: writes]\n  API > Client: 201 Created [step: 3, role: response, status: 201]\n}"
         }
     }))
 }
