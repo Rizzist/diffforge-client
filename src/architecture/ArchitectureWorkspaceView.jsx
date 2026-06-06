@@ -28,6 +28,8 @@ import { Groups } from "@styled-icons/material-rounded/Groups";
 import { Http } from "@styled-icons/material-rounded/Http";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
 import { Hub } from "@styled-icons/material-rounded/Hub";
+import { KeyboardDoubleArrowLeft } from "@styled-icons/material-rounded/KeyboardDoubleArrowLeft";
+import { KeyboardDoubleArrowRight } from "@styled-icons/material-rounded/KeyboardDoubleArrowRight";
 import { Lock } from "@styled-icons/material-rounded/Lock";
 import { Memory } from "@styled-icons/material-rounded/Memory";
 import { North } from "@styled-icons/material-rounded/North";
@@ -5337,8 +5339,6 @@ function ArchitecturesPanel({
   const selectedRepo = repositories.find((repo) => (
     architectureRepoPathKey(architectureRepoPathFromEntry(repo)) === architectureRepoPathKey(selectedRepoPath)
   )) || null;
-  const selectedRepoKind = selectedRepo ? scannedResultGraphKind(selectedRepo) : "";
-  const selectedRepoKindLabel = selectedRepo ? scannedResultEntryKindLabel(selectedRepo) : "";
   useEffect(() => {
     if (!selectedRepoPath || typeof onSelectionChange !== "function") return;
     if (selectedGraphId && graphs.length && !graphs.some((graph) => graph.id === selectedGraphId)) return;
@@ -5368,6 +5368,7 @@ function ArchitecturesPanel({
     [...new Set(graphs.map((graph) => architectureFolderPathText(graph.groupPath)).filter(Boolean))]
       .sort((left, right) => left.localeCompare(right))
   ), [graphs]);
+  const revisionBrowserOpen = revisionBrowser.open && Boolean(selectedRepoPath);
 
   useEffect(() => {
     if (!agentEditMarkersStorageKey) {
@@ -5406,6 +5407,8 @@ function ArchitecturesPanel({
       graphId: text(graphId),
       open: true,
     });
+    setCreatingGraph(false);
+    setError("");
   }, []);
 
   const closeRevisionBrowser = useCallback(() => {
@@ -5418,6 +5421,7 @@ function ArchitecturesPanel({
     setDraftGraphTemplate("system");
     setDraftLocationMode(nextFolderPath ? "folder" : "root");
     setDraftFolderPath(nextFolderPath);
+    setRevisionBrowser((current) => ({ ...current, open: false }));
     setCreatingGraph(true);
     setError("");
   }, []);
@@ -5545,6 +5549,7 @@ function ArchitecturesPanel({
             onClick={() => {
               setSelectedGraphId(row.graph.id);
               setCreatingGraph(false);
+              setRevisionBrowser((current) => ({ ...current, open: false }));
             }}
             style={{ "--tree-depth": row.depth }}
             title={[row.graph.filePath, rowMarkerTitle].filter(Boolean).join("\n")}
@@ -5587,9 +5592,6 @@ function ArchitecturesPanel({
           <ArchitectureNavHeader>
             <ArchitectureNavTitle>
               <strong>Architectures</strong>
-              {singleRepository && selectedRepo && (
-                <ArchitectureRepoKindBadge data-kind={selectedRepoKind}>{selectedRepoKindLabel}</ArchitectureRepoKindBadge>
-              )}
             </ArchitectureNavTitle>
             <ArchitectureNavHeaderActions>
               <ArchitectureCreateGraphButton
@@ -5616,7 +5618,7 @@ function ArchitecturesPanel({
                 title="Hide architecture navigation"
                 type="button"
               >
-                &lt;&lt;
+                <KeyboardDoubleArrowLeft aria-hidden="true" />
               </ArchitectureNavToggleButton>
             </ArchitectureNavHeaderActions>
           </ArchitectureNavHeader>
@@ -5634,6 +5636,7 @@ function ArchitecturesPanel({
                       setSelectedGraphId("");
                       setSelectedGraph(null);
                       setCreatingGraph(false);
+                      setRevisionBrowser((current) => ({ ...current, open: false }));
                     }}
                     style={{ "--tree-depth": 0 }}
                     title={architectureRepoPath}
@@ -5674,10 +5677,19 @@ function ArchitecturesPanel({
               title="Show architecture navigation"
               type="button"
             >
-              &gt;&gt;
+              <KeyboardDoubleArrowRight aria-hidden="true" />
             </ArchitectureRestoreNavButton>
           )}
-          {creatingGraph || !selectedGraph ? (
+          {revisionBrowserOpen ? (
+            <ArchitectureRevisionDrawer
+              activeGraphDirty={selectedGraphDirty}
+              graphId={revisionBrowser.graphId}
+              onClose={closeRevisionBrowser}
+              onRestored={handleRevisionRestored}
+              repoPath={selectedRepoPath}
+              selectedGraphId={selectedGraphId}
+            />
+          ) : creatingGraph || !selectedGraph ? (
             <ArchitectureCreateSurface
               canCancel={creatingGraph && Boolean(selectedGraph)}
               draftFolderPath={draftFolderPath}
@@ -5709,16 +5721,6 @@ function ArchitecturesPanel({
               queueWorkspaceName={queueWorkspaceName}
               saveState={saveState}
               selectedRepo={selectedRepo}
-            />
-          )}
-          {revisionBrowser.open && selectedRepoPath && (
-            <ArchitectureRevisionDrawer
-              activeGraphDirty={selectedGraphDirty}
-              graphId={revisionBrowser.graphId}
-              onClose={closeRevisionBrowser}
-              onRestored={handleRevisionRestored}
-              repoPath={selectedRepoPath}
-              selectedGraphId={selectedGraphId}
             />
           )}
         </ArchitectureEditorContent>
@@ -6496,7 +6498,7 @@ function ArchitectureRevisionDrawer({
   const activeGraphLabel = scopedGraphId || selectedGraphId || "repo";
 
   return (
-    <ArchitectureRevisionOverlay role="dialog" aria-label={title}>
+    <ArchitectureRevisionOverlay role="region" aria-label={title}>
       <ArchitectureRevisionDrawerShell>
         <ArchitectureRevisionHeader>
           <div>
@@ -8933,13 +8935,17 @@ const ArchitectureNavToggleButton = styled(ArchitectureIconButton)`
   border-color: rgba(148, 163, 184, 0.18);
   color: rgba(203, 213, 225, 0.8);
   background: rgba(15, 23, 42, 0.42);
-  font-size: 10px;
-  font-weight: 900;
 
   &:hover:not(:disabled),
   &:focus-visible {
     border-color: rgba(125, 211, 252, 0.34);
     background: rgba(14, 165, 233, 0.14);
+  }
+
+  svg {
+    display: block;
+    width: 15px;
+    height: 15px;
   }
 `;
 
@@ -9159,32 +9165,6 @@ const ArchitectureNavTitle = styled.div`
   min-width: 0;
   align-items: center;
   gap: 7px;
-`;
-
-const ArchitectureRepoKindBadge = styled.span`
-  flex: 0 0 auto;
-  padding: 2px 6px;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 999px;
-  color: rgba(148, 163, 184, 0.82);
-  background: rgba(15, 23, 42, 0.48);
-  font-size: 8px;
-  font-weight: 920;
-  line-height: 1.2;
-  text-transform: uppercase;
-
-  &[data-kind="git"] {
-    border-color: rgba(52, 211, 153, 0.26);
-    color: rgba(110, 231, 183, 0.9);
-    background: rgba(20, 83, 45, 0.2);
-  }
-
-  &[data-kind="folder"],
-  &[data-kind="container"] {
-    border-color: rgba(251, 191, 36, 0.26);
-    color: rgba(253, 230, 138, 0.9);
-    background: rgba(120, 53, 15, 0.2);
-  }
 `;
 
 const ArchitectureRepoList = styled.div`
@@ -9541,9 +9521,12 @@ const ArchitectureRestoreNavButton = styled.button`
   backdrop-filter: blur(10px);
   cursor: pointer;
   font: inherit;
-  font-size: 11px;
-  font-weight: 900;
-  letter-spacing: 0;
+
+  svg {
+    display: block;
+    width: 17px;
+    height: 17px;
+  }
 
   &:hover,
   &:focus-visible {
@@ -9751,26 +9734,28 @@ const ArchitectureEditorNotice = styled.div`
 `;
 
 const ArchitectureRevisionOverlay = styled.div`
-  position: absolute;
-  inset: 0;
-  z-index: 18;
+  position: relative;
   display: grid;
-  justify-content: end;
   min-width: 0;
   min-height: 0;
-  background: linear-gradient(90deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.58));
+  height: 100%;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.18), rgba(2, 6, 23, 0.12)),
+    rgba(2, 6, 23, 0.18);
 `;
 
 const ArchitectureRevisionDrawerShell = styled.aside`
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  width: min(760px, 100vw);
+  width: 100%;
   min-width: 0;
   min-height: 0;
-  border-left: 1px solid rgba(148, 163, 184, 0.16);
-  background: rgba(8, 12, 18, 0.96);
-  box-shadow: -28px 0 60px rgba(0, 0, 0, 0.32);
-  backdrop-filter: blur(14px);
+  height: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(8, 12, 18, 0.74);
+  overflow: hidden;
 `;
 
 const ArchitectureRevisionHeader = styled.header`

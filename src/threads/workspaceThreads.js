@@ -22,6 +22,16 @@ const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
 const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
 const DEFAULT_AGENT_ID = "codex";
 const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
+const WORKSPACE_TERMINAL_NICKNAMES = [
+  "Al", "Bo", "Cy", "Ed", "Ev", "Jo", "Li", "Mo", "Oz", "Ty",
+  "Ada", "Ali", "Amy", "Ari", "Ava", "Bea", "Ben", "Bob", "Cal", "Dan",
+  "Eli", "Eva", "Gia", "Gus", "Hal", "Ian", "Ira", "Jay", "Kai", "Kim",
+  "Leo", "Lia", "Lou", "Mac", "Max", "Mia", "Ned", "Ona", "Pam", "Ray",
+  "Rex", "Sam", "Sue", "Taj", "Alex", "Matt", "Mike", "Noah", "Omar", "Ezra",
+];
+const WORKSPACE_TERMINAL_NICKNAME_BY_KEY = new Map(
+  WORKSPACE_TERMINAL_NICKNAMES.map((name) => [name.toLowerCase(), name]),
+);
 const LIVE_TERMINAL_STATUSES = new Set([
   "active",
   "closed",
@@ -897,6 +907,132 @@ function cleanAgentId(value, fallback = DEFAULT_AGENT_ID) {
 
 function cleanAgentDisplayName(value, fallback = "") {
   return cleanThreadLabelCandidate(value || fallback);
+}
+
+function normalizeWorkspaceTerminalNickname(value, fallback = "") {
+  const text = String(value || fallback)
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) {
+    return "";
+  }
+
+  const key = text.toLowerCase().replace(/[^a-z]/g, "");
+  return WORKSPACE_TERMINAL_NICKNAME_BY_KEY.get(key) || "";
+}
+
+function terminalNicknameKey(value) {
+  return normalizeWorkspaceTerminalNickname(value).toLowerCase();
+}
+
+function terminalNicknameFromSources(...sources) {
+  for (const source of sources) {
+    const nickname = normalizeWorkspaceTerminalNickname(source);
+    if (nickname) {
+      return nickname;
+    }
+  }
+
+  return "";
+}
+
+function workspaceTerminalNicknameFromRecord(record) {
+  return terminalNicknameFromSources(
+    record?.terminalNickname,
+    record?.terminal_nickname,
+    record?.terminalName,
+    record?.terminal_name,
+    record?.displayName,
+    record?.display_name,
+  );
+}
+
+function randomWorkspaceTerminalNicknameOffset() {
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const values = new Uint32Array(1);
+    crypto.getRandomValues(values);
+    return values[0] % WORKSPACE_TERMINAL_NICKNAMES.length;
+  }
+
+  return Math.floor(Math.random() * WORKSPACE_TERMINAL_NICKNAMES.length);
+}
+
+function workspaceTerminalNicknameInUse(entry, nickname, options = {}) {
+  const key = terminalNicknameKey(nickname);
+  if (!key) {
+    return false;
+  }
+
+  const excludeThreadId = cleanText(options.excludeThreadId || options.threadId);
+  const excludeTerminalKey = terminalSessionKey(options.excludeTerminalIndex ?? options.terminalIndex);
+
+  return Object.entries(entry?.terminals || {}).some(([terminalKey, terminal]) => {
+    if (excludeTerminalKey && terminalKey === excludeTerminalKey) {
+      return false;
+    }
+    if (excludeThreadId && cleanText(terminal?.threadId) === excludeThreadId) {
+      return false;
+    }
+    return terminalNicknameKey(workspaceTerminalNicknameFromRecord(terminal)) === key;
+  }) || Object.values(entry?.threads || {}).some((thread) => {
+    if (!thread || (excludeThreadId && cleanText(thread.id) === excludeThreadId)) {
+      return false;
+    }
+    const threadTerminalKey = terminalSessionKey(getThreadTerminalIndex(thread));
+    const mappedThreadId = threadTerminalKey ? cleanText(entry?.terminalThreadIds?.[threadTerminalKey]) : "";
+    const activeThreadId = threadTerminalKey ? cleanText(entry?.terminals?.[threadTerminalKey]?.threadId) : "";
+    if (mappedThreadId !== thread.id && activeThreadId !== thread.id) {
+      return false;
+    }
+    return terminalNicknameKey(workspaceTerminalNicknameFromRecord(thread)) === key;
+  });
+}
+
+function pickWorkspaceTerminalNickname(entry, options = {}) {
+  const offset = randomWorkspaceTerminalNicknameOffset();
+  for (let index = 0; index < WORKSPACE_TERMINAL_NICKNAMES.length; index += 1) {
+    const nickname = WORKSPACE_TERMINAL_NICKNAMES[(offset + index) % WORKSPACE_TERMINAL_NICKNAMES.length];
+    if (!workspaceTerminalNicknameInUse(entry, nickname, options)) {
+      return nickname;
+    }
+  }
+
+  return "";
+}
+
+function resolveWorkspaceTerminalNickname(entry, candidates = [], options = {}) {
+  for (const candidate of candidates) {
+    const nickname = normalizeWorkspaceTerminalNickname(candidate);
+    if (nickname && !workspaceTerminalNicknameInUse(entry, nickname, options)) {
+      return nickname;
+    }
+  }
+
+  return pickWorkspaceTerminalNickname(entry, options);
+}
+
+export function getWorkspaceThreadTerminalNickname(thread, providerBinding = null, terminal = null) {
+  return terminalNicknameFromSources(
+    terminal?.terminalNickname,
+    terminal?.terminal_nickname,
+    terminal?.terminalName,
+    terminal?.terminal_name,
+    terminal?.displayName,
+    terminal?.display_name,
+    thread?.terminalNickname,
+    thread?.terminal_nickname,
+    thread?.terminalName,
+    thread?.terminal_name,
+    thread?.displayName,
+    thread?.display_name,
+    providerBinding?.terminalNickname,
+    providerBinding?.terminal_nickname,
+    providerBinding?.terminalName,
+    providerBinding?.terminal_name,
+    providerBinding?.displayName,
+    providerBinding?.display_name,
+  );
 }
 
 function isThreadAgentId(value) {
@@ -2535,11 +2671,14 @@ function normalizeActiveTerminal(value) {
     lastActiveAt: cleanText(value.lastActiveAt, value.updatedAt || nowIso()),
     paneId,
     ...promptingUserFields(value),
+    displayName: workspaceTerminalNicknameFromRecord(value),
     fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
     provider: cleanAgentDisplayName(value.provider),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
     sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
+    terminalName: workspaceTerminalNicknameFromRecord(value),
+    terminalNickname: workspaceTerminalNicknameFromRecord(value),
     terminalIndex,
     threadId: cleanText(value.threadId),
     updatedAt: cleanText(value.updatedAt, nowIso()),
@@ -2623,6 +2762,48 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     nativeSessionUpdatedAt: cleanText(binding.nativeSessionUpdatedAt, fallback.nativeSessionUpdatedAt),
     provider: cleanAgentDisplayName(binding.provider, fallback.provider),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
+    displayName: terminalNicknameFromSources(
+      binding.displayName,
+      binding.display_name,
+      binding.terminalNickname,
+      binding.terminal_nickname,
+      binding.terminalName,
+      binding.terminal_name,
+      fallback.displayName,
+      fallback.display_name,
+      fallback.terminalNickname,
+      fallback.terminal_nickname,
+      fallback.terminalName,
+      fallback.terminal_name,
+    ),
+    terminalName: terminalNicknameFromSources(
+      binding.terminalName,
+      binding.terminal_name,
+      binding.terminalNickname,
+      binding.terminal_nickname,
+      binding.displayName,
+      binding.display_name,
+      fallback.terminalName,
+      fallback.terminal_name,
+      fallback.terminalNickname,
+      fallback.terminal_nickname,
+      fallback.displayName,
+      fallback.display_name,
+    ),
+    terminalNickname: terminalNicknameFromSources(
+      binding.terminalNickname,
+      binding.terminal_nickname,
+      binding.terminalName,
+      binding.terminal_name,
+      binding.displayName,
+      binding.display_name,
+      fallback.terminalNickname,
+      fallback.terminal_nickname,
+      fallback.terminalName,
+      fallback.terminal_name,
+      fallback.displayName,
+      fallback.display_name,
+    ),
     terminalBinding,
     updatedAt: cleanText(binding.updatedAt, fallback.updatedAt || nowIso()),
   };
@@ -2759,6 +2940,20 @@ function normalizeThread(thread, workspaceId, options = {}) {
   const normalizedProviderBindings = orphanRunningThreadState
     ? clearOrphanRunningProviderBindings(providerBindings)
     : providerBindings;
+  const terminalNickname = terminalNicknameFromSources(
+    thread.terminalNickname,
+    thread.terminal_nickname,
+    thread.terminalName,
+    thread.terminal_name,
+    thread.displayName,
+    thread.display_name,
+    normalizedProviderBindings[currentAgent]?.terminalNickname,
+    normalizedProviderBindings[currentAgent]?.terminal_nickname,
+    normalizedProviderBindings[currentAgent]?.terminalName,
+    normalizedProviderBindings[currentAgent]?.terminal_name,
+    normalizedProviderBindings[currentAgent]?.displayName,
+    normalizedProviderBindings[currentAgent]?.display_name,
+  );
 
   return {
     coordination,
@@ -2786,6 +2981,9 @@ function normalizeThread(thread, workspaceId, options = {}) {
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
     providerBindings: normalizedProviderBindings,
     terminalBinding,
+    displayName: terminalNickname,
+    terminalName: terminalNickname,
+    terminalNickname,
     terminalIndex,
     title: storedTitle || storedSessionName || fallbackTitle,
     transcriptHydratedAt: options.stripMessages ? "" : cleanText(thread.transcriptHydratedAt),
@@ -2850,6 +3048,99 @@ function archiveThreadRecord(thread, archivedAt = nowIso()) {
     terminalBinding: null,
     updatedAt: archivedAt,
   };
+}
+
+function setProviderBindingTerminalNickname(providerBinding, nickname) {
+  if (!providerBinding || !nickname) {
+    return providerBinding;
+  }
+
+  return {
+    ...providerBinding,
+    displayName: nickname,
+    terminalName: nickname,
+    terminalNickname: nickname,
+  };
+}
+
+function applyWorkspaceTerminalNickname(entry, terminalKey, threadId, nickname) {
+  const safeNickname = normalizeWorkspaceTerminalNickname(nickname);
+  if (!safeNickname) {
+    return false;
+  }
+
+  let changed = false;
+  if (terminalKey && entry.terminals[terminalKey]) {
+    const terminal = entry.terminals[terminalKey];
+    if (workspaceTerminalNicknameFromRecord(terminal) !== safeNickname) {
+      entry.terminals[terminalKey] = {
+        ...terminal,
+        displayName: safeNickname,
+        terminalName: safeNickname,
+        terminalNickname: safeNickname,
+      };
+      changed = true;
+    }
+  }
+
+  const thread = threadId ? entry.threads?.[threadId] : null;
+  if (thread && workspaceTerminalNicknameFromRecord(thread) !== safeNickname) {
+    const agentId = cleanAgentId(thread.currentAgent, "");
+    const providerBindings = { ...(thread.providerBindings || {}) };
+    if (isThreadAgentId(agentId) && providerBindings[agentId]) {
+      providerBindings[agentId] = setProviderBindingTerminalNickname(providerBindings[agentId], safeNickname);
+    }
+    entry.threads[threadId] = {
+      ...thread,
+      displayName: safeNickname,
+      providerBindings,
+      terminalName: safeNickname,
+      terminalNickname: safeNickname,
+    };
+    changed = true;
+  }
+
+  return changed;
+}
+
+function reconcileWorkspaceTerminalNicknames(entry) {
+  const orderedKeys = [
+    ...entry.terminalOrder,
+    ...Object.keys(entry.terminalThreadIds || {}).sort((left, right) => Number(left) - Number(right)),
+    ...Object.keys(entry.terminals || {}).sort((left, right) => Number(left) - Number(right)),
+  ].filter((key, index, keys) => key && keys.indexOf(key) === index);
+  const used = new Set();
+
+  const pickUnused = () => {
+    const offset = randomWorkspaceTerminalNicknameOffset();
+    for (let index = 0; index < WORKSPACE_TERMINAL_NICKNAMES.length; index += 1) {
+      const nickname = WORKSPACE_TERMINAL_NICKNAMES[(offset + index) % WORKSPACE_TERMINAL_NICKNAMES.length];
+      if (!used.has(terminalNicknameKey(nickname))) {
+        return nickname;
+      }
+    }
+    return "";
+  };
+
+  orderedKeys.forEach((terminalKey) => {
+    const terminal = entry.terminals?.[terminalKey] || null;
+    const threadId = cleanText(terminal?.threadId || entry.terminalThreadIds?.[terminalKey]);
+    const thread = threadId ? entry.threads?.[threadId] : null;
+    let nickname = terminalNicknameFromSources(
+      workspaceTerminalNicknameFromRecord(terminal),
+      workspaceTerminalNicknameFromRecord(thread),
+      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(thread, thread?.currentAgent)),
+    );
+    if (!nickname || used.has(terminalNicknameKey(nickname))) {
+      nickname = pickUnused();
+    }
+    if (nickname) {
+      used.add(terminalNicknameKey(nickname));
+    }
+    applyWorkspaceTerminalNickname(entry, terminalKey, threadId, nickname);
+  });
+
+  return entry;
 }
 
 function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
@@ -3008,7 +3299,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     threadsView.selectedWorkspaceId = workspaceId;
   }
 
-  return {
+  return reconcileWorkspaceTerminalNicknames({
     activeThreadId: safeActiveThreadId,
     archivedThreadOrder: normalizedArchivedOrder,
     archivedThreads: normalizedArchivedThreads,
@@ -3018,7 +3309,7 @@ function normalizeWorkspaceEntry(entry, workspaceId, options = {}) {
     threadOrder: normalizedOrder.slice(0, MAX_THREADS_PER_WORKSPACE),
     threads: normalizedThreads,
     threadsView,
-  };
+  });
 }
 
 export function normalizeWorkspaceThreads(value, options = {}) {
@@ -3536,10 +3827,32 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     event.agentDisplayName || event.agent_display_name || agentType,
     existing.agentDisplayName || existing.agent_display_name,
   );
+  const terminalNickname = resolveWorkspaceTerminalNickname(
+    entry,
+    [
+      event.terminalNickname,
+      event.terminal_nickname,
+      event.terminalName,
+      event.terminal_name,
+      event.displayName,
+      event.display_name,
+      workspaceTerminalNicknameFromRecord(entry.threads?.[nextThreadId]),
+      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(
+        entry.threads?.[nextThreadId],
+        entry.threads?.[nextThreadId]?.currentAgent || event.agentId || event.currentAgent,
+      )),
+      workspaceTerminalNicknameFromRecord(existing),
+    ],
+    {
+      excludeTerminalIndex: terminalIndex,
+      excludeThreadId: nextThreadId,
+    },
+  );
   const terminal = normalizeActiveTerminal({
     agentId: event.agentId || event.currentAgent || existing.agentId,
     agentDisplayName,
     agentType,
+    displayName: terminalNickname,
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
@@ -3551,6 +3864,8 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     provider: event.provider || existing.provider,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
+    terminalName: terminalNickname,
+    terminalNickname,
     terminalIndex,
     threadId: nextThreadId,
     updatedAt: now,
@@ -3695,6 +4010,24 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     paneId: event.paneId || activeTerminal?.paneId,
     terminalIndex,
   });
+  const terminalNickname = resolveWorkspaceTerminalNickname(
+    entry,
+    [
+      event.terminalNickname,
+      event.terminal_nickname,
+      event.terminalName,
+      event.terminal_name,
+      event.displayName,
+      event.display_name,
+      workspaceTerminalNicknameFromRecord(existing),
+      workspaceTerminalNicknameFromRecord(getWorkspaceThreadProviderBinding(existing, agentId)),
+      workspaceTerminalNicknameFromRecord(activeTerminal),
+    ],
+    {
+      excludeTerminalIndex: terminalIndex,
+      excludeThreadId: threadId,
+    },
+  );
   const nextMessageCount = options.incrementMessageCount
     ? normalizeMessageCount(existing.messageCount) + 1
     : normalizeMessageCount(existing.messageCount);
@@ -3752,6 +4085,9 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     messageCount: nextMessageCount,
     provider: event.provider || activeTerminal?.provider,
     status: safeStatus,
+    displayName: terminalNickname,
+    terminalName: terminalNickname,
+    terminalNickname,
     terminalBinding,
     updatedAt: now,
   });
@@ -3802,7 +4138,10 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       nativeSessionKind: cleanText(event.nativeSessionKind, providerBinding?.nativeSessionKind || "session"),
       nativeSessionSource: cleanText(event.nativeSessionSource, providerBinding?.nativeSessionSource),
       nativeSessionUpdatedAt: event.nativeSessionId ? now : providerBinding?.nativeSessionUpdatedAt || "",
+      displayName: terminalNickname,
       status: safeStatus,
+      terminalName: terminalNickname,
+      terminalNickname,
       terminalBinding,
       updatedAt: now,
     },
@@ -3821,10 +4160,13 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     latestTurn,
     preferredAgent: cleanAgentId(event.preferredAgent || existing.preferredAgent || agentId),
     providerBindings,
+    displayName: terminalNickname,
     sessionName: eventSessionName || existingSessionName || eventTitle || existingTitle,
     slotKey: cleanText(event.slotKey || activeTerminal?.slotKey, existing.slotKey),
     status: safeStatus,
     terminalBinding,
+    terminalName: terminalNickname,
+    terminalNickname,
     terminalIndex,
     title: eventTitle || existingTitle || existingSessionName || defaultThreadTitle(terminalIndex, agentId),
     updatedAt: now,
@@ -3834,8 +4176,11 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     entry.terminals[terminalKey] = {
       ...entry.terminals[terminalKey],
       agentId,
+      displayName: terminalNickname,
       lastActiveAt: now,
       status: safeStatus,
+      terminalName: terminalNickname,
+      terminalNickname,
       threadId,
       updatedAt: now,
     };
@@ -3907,6 +4252,9 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
           lastActiveAt: now,
           messageCount: 0,
           status: terminal.status || event.status || "active",
+          displayName: terminal.terminalNickname,
+          terminalName: terminal.terminalNickname,
+          terminalNickname: terminal.terminalNickname,
           terminalBinding: normalizeTerminalBinding({
             instanceId: terminal.instanceId,
             paneId: terminal.paneId,
@@ -3915,6 +4263,7 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
           updatedAt: now,
         }),
       },
+      displayName: terminal.terminalNickname,
       sessionName: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
       slotKey: terminal.slotKey || defaultSlotKey(terminal.terminalIndex),
       status: terminal.status || event.status || "active",
@@ -3923,6 +4272,8 @@ export function updateWorkspaceActiveTerminal(state, event = {}) {
         paneId: terminal.paneId,
         terminalIndex: terminal.terminalIndex,
       }),
+      terminalName: terminal.terminalNickname,
+      terminalNickname: terminal.terminalNickname,
       terminalIndex: terminal.terminalIndex,
       title: defaultThreadTitle(terminal.terminalIndex, terminal.agentId),
       transcriptHydrationMode: event.freshSession ? "session-only" : "",
@@ -3998,6 +4349,24 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       threadId,
     });
   }
+  const boundTerminal = terminalKey ? entry.terminals[terminalKey] || existingTerminal : existingTerminal;
+  const terminalNickname = resolveWorkspaceTerminalNickname(
+    entry,
+    [
+      event.terminalNickname,
+      event.terminal_nickname,
+      event.terminalName,
+      event.terminal_name,
+      event.displayName,
+      event.display_name,
+      workspaceTerminalNicknameFromRecord(boundTerminal),
+      workspaceTerminalNicknameFromRecord(previousThread),
+    ],
+    {
+      excludeTerminalIndex: terminalIndex,
+      excludeThreadId: threadId,
+    },
+  );
 
   if (!entry.threads[threadId]) {
     entry.threads[threadId] = {
@@ -4018,18 +4387,24 @@ export function materializeWorkspaceThreadForTerminal(state, event = {}) {
       providerBindings: isThreadAgentId(agentId)
         ? {
           [agentId]: normalizeProviderBinding(null, agentId, {
+            displayName: terminalNickname,
             lastActiveAt: now,
             lastMessageAt: now,
             messageCount: 0,
             status: "active",
+            terminalName: terminalNickname,
+            terminalNickname,
             updatedAt: now,
           }),
         }
         : {},
+      displayName: terminalNickname,
       sessionName: promptLabel,
       slotKey: cleanText(event.slotKey || existingTerminal?.slotKey, defaultSlotKey(terminalIndex)),
       status: "active",
       terminalBinding: null,
+      terminalName: terminalNickname,
+      terminalNickname,
       terminalIndex,
       title: promptLabel,
       transcriptHydrationMode,

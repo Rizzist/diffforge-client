@@ -93,12 +93,9 @@ const EMPTY_MARKETPLACE = {
 };
 
 const EMPTY_SECRET_DRAFT = {
-  id: "",
+  draftId: "",
   key: "",
-  label: "",
-  description: "",
   value: "",
-  agentAccessEnabled: false,
 };
 
 const PROVIDER_OPTIONS = [
@@ -814,7 +811,8 @@ export default function McpsWorkspaceView({
   const [configDraft, setConfigDraft] = useState({});
   const [manualDraft, setManualDraft] = useState(EMPTY_MANUAL);
   const [marketplaceDraft, setMarketplaceDraft] = useState(EMPTY_MARKETPLACE);
-  const [secretDraft, setSecretDraft] = useState(EMPTY_SECRET_DRAFT);
+  const [secretDraftRows, setSecretDraftRows] = useState([]);
+  const [secretValueDrafts, setSecretValueDrafts] = useState({});
   const [actionState, setActionState] = useState("idle");
   const [actionContext, setActionContext] = useState({});
   const selectedIdRef = useRef(selectedId);
@@ -900,7 +898,8 @@ export default function McpsWorkspaceView({
     if (selectedServer) {
       setConfigDraft(configValuesFromServer(selectedServer));
       if (!isSecretsServer(selectedServer)) {
-        setSecretDraft(EMPTY_SECRET_DRAFT);
+        setSecretDraftRows([]);
+        setSecretValueDrafts({});
       }
     }
   }, [selectedServer?.id]);
@@ -1166,10 +1165,30 @@ export default function McpsWorkspaceView({
     }
   }, [beginAction, commandBase, finishAction, replaceRegistry, selectedServer, workspaceId]);
 
-  const saveSecret = useCallback(async () => {
-    const key = secretDraft.key.trim();
-    if (!workspaceId || !key) return;
-    if (!secretDraft.id && !secretDraft.value) return;
+  const addSecretDraftRow = useCallback(() => {
+    setSecretDraftRows((rows) => [
+      ...rows,
+      {
+        ...EMPTY_SECRET_DRAFT,
+        draftId: `secret-draft-${Date.now()}-${rows.length}`,
+      },
+    ]);
+  }, []);
+
+  const removeSecretDraftRow = useCallback((draftId) => {
+    setSecretDraftRows((rows) => rows.filter((row) => row.draftId !== draftId));
+  }, []);
+
+  const updateSecretDraftRow = useCallback((draftId, patch) => {
+    setSecretDraftRows((rows) =>
+      rows.map((row) => (row.draftId === draftId ? { ...row, ...patch } : row)),
+    );
+  }, []);
+
+  const saveSecretRow = useCallback(async (row) => {
+    const key = String(row?.key || "").trim();
+    const value = String(row?.value || "");
+    if (!workspaceId || !key || !value) return;
     beginAction("saving_secret", { name: key });
     setError("");
     try {
@@ -1179,60 +1198,34 @@ export default function McpsWorkspaceView({
         workspaceName,
         input: {
           key,
-          label: secretDraft.label.trim(),
-          description: secretDraft.description.trim(),
-          value: secretDraft.value,
-          agent_access_enabled: secretDraft.agentAccessEnabled,
+          value,
         },
       });
       const data = replaceRegistry(response);
       const secretsServer = asArray(data.servers).find(isSecretsServer);
       setSelectedId(secretsServer?.id || SECRETS_SERVER_KEY);
-      setSecretDraft(EMPTY_SECRET_DRAFT);
+      if (row.draftId) {
+        removeSecretDraftRow(row.draftId);
+      }
+      setSecretValueDrafts((drafts) => {
+        const next = { ...drafts };
+        delete next[row.id || key];
+        return next;
+      });
     } catch (caught) {
       setError(errorMessage(caught));
     } finally {
       finishAction();
     }
-  }, [beginAction, commandBase, finishAction, replaceRegistry, secretDraft, workspaceId, workspaceName]);
-
-  const editSecret = useCallback((secret) => {
-    setSecretDraft({
-      id: secret?.id || "",
-      key: secret?.key || "",
-      label: secret?.label || "",
-      description: secret?.description || "",
-      value: "",
-      agentAccessEnabled: Boolean(secret?.agent_access_enabled),
-    });
-  }, []);
-
-  const toggleSecretAccess = useCallback(
-    async (secret) => {
-      if (!workspaceId || !secret?.key) return;
-      beginAction("saving_secret", { name: secret.key });
-      setError("");
-      try {
-        const response = await invoke("coordination_upsert_workspace_mcp_secret", {
-          ...commandBase,
-          workspaceId,
-          workspaceName,
-          input: {
-            key: secret.key,
-            label: secret.label || "",
-            description: secret.description || "",
-            agent_access_enabled: !Boolean(secret.agent_access_enabled),
-          },
-        });
-        replaceRegistry(response);
-      } catch (caught) {
-        setError(errorMessage(caught));
-      } finally {
-        finishAction();
-      }
-    },
-    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
-  );
+  }, [
+    beginAction,
+    commandBase,
+    finishAction,
+    removeSecretDraftRow,
+    replaceRegistry,
+    workspaceId,
+    workspaceName,
+  ]);
 
   const deleteSecret = useCallback(
     async (secret) => {
@@ -1247,16 +1240,19 @@ export default function McpsWorkspaceView({
           secretId: secret.id,
         });
         replaceRegistry(response);
-        if (secretDraft.id === secret.id) {
-          setSecretDraft(EMPTY_SECRET_DRAFT);
-        }
+        setSecretValueDrafts((drafts) => {
+          const next = { ...drafts };
+          delete next[secret.id];
+          delete next[secret.key];
+          return next;
+        });
       } catch (caught) {
         setError(errorMessage(caught));
       } finally {
         finishAction();
       }
     },
-    [beginAction, commandBase, finishAction, replaceRegistry, secretDraft.id, workspaceId, workspaceName],
+    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
   );
 
   const renderInstalledList = () => (
@@ -1656,9 +1652,6 @@ export default function McpsWorkspaceView({
 
   const renderSecretsPanel = (server) => {
     const secrets = asArray(server?.secrets);
-    const editing = Boolean(secretDraft.id);
-    const canSaveSecret =
-      Boolean(secretDraft.key.trim()) && (editing || Boolean(secretDraft.value));
     return (
       <McpAccessPanel>
         <McpAccessTopline>
@@ -1670,113 +1663,51 @@ export default function McpsWorkspaceView({
             {secrets.length}
           </McpStatusBadge>
         </McpAccessTopline>
-        <McpFieldGrid>
-          <McpWideField>
-            <PanelKicker>Key</PanelKicker>
-            <McpInput
-              onChange={(event) =>
-                setSecretDraft((draft) => ({ ...draft, key: event.target.value }))
-              }
-              placeholder="APP_API_KEY"
-              value={secretDraft.key}
-            />
-          </McpWideField>
-          <McpWideField>
-            <PanelKicker>Label</PanelKicker>
-            <McpInput
-              onChange={(event) =>
-                setSecretDraft((draft) => ({ ...draft, label: event.target.value }))
-              }
-              value={secretDraft.label}
-            />
-          </McpWideField>
-          <McpWideField>
-            <PanelKicker>Description</PanelKicker>
-            <McpInput
-              onChange={(event) =>
-                setSecretDraft((draft) => ({ ...draft, description: event.target.value }))
-              }
-              value={secretDraft.description}
-            />
-          </McpWideField>
-          <McpWideField>
-            <PanelKicker>Value</PanelKicker>
-            <McpInput
-              onChange={(event) =>
-                setSecretDraft((draft) => ({ ...draft, value: event.target.value }))
-              }
-              placeholder={editing ? "Leave blank to keep existing value" : ""}
-              type="password"
-              value={secretDraft.value}
-            />
-          </McpWideField>
-        </McpFieldGrid>
-        <McpToolList>
-          <McpSwitchButton
-            aria-pressed={secretDraft.agentAccessEnabled ? "true" : "false"}
-            disabled={actionState !== "idle"}
-            onClick={() =>
-              setSecretDraft((draft) => ({
-                ...draft,
-                agentAccessEnabled: !draft.agentAccessEnabled,
-              }))
-            }
-            type="button"
-          >
-            <span aria-hidden="true" />
-            Agent readable
-          </McpSwitchButton>
-        </McpToolList>
         <McpEditorActions>
           <button
             disabled={actionState !== "idle"}
-            onClick={() => setSecretDraft(EMPTY_SECRET_DRAFT)}
+            onClick={addSecretDraftRow}
             type="button"
           >
-            Reset
-          </button>
-          <button
-            disabled={!canSaveSecret || actionState !== "idle"}
-            onClick={saveSecret}
-            type="button"
-          >
-            {buttonContent(actionState === "saving_secret", editing ? "Update Secret" : "Add Secret", "Saving")}
+            Add
           </button>
         </McpEditorActions>
-        {secrets.length ? (
-          <McpServerList>
+        {secrets.length || secretDraftRows.length ? (
+          <McpSecretRows>
             {secrets.map((secret) => {
-              const accessEnabled = Boolean(secret.agent_access_enabled);
+              const rowKey = secret.id || secret.key;
+              const value = secretValueDrafts[rowKey] || "";
               const savingThis = actionState === "saving_secret" && actionContext.name === secret.key;
               const deletingThis =
                 actionState === "deleting_secret" && actionContext.name === secret.key;
+              const saveDisabled = actionState !== "idle" || !value;
               return (
-                <McpServerButton as="div" data-active="false" key={secret.id || secret.key}>
-                  <McpServerIcon data-state={accessEnabled ? "enabled" : "planned"}>
-                    <ButtonKeyIcon aria-hidden="true" />
-                  </McpServerIcon>
-                  <McpServerCopy>
-                    <strong>{secret.key}</strong>
-                    <span>
-                      {secret.label || "Secret"} ·{" "}
-                      {accessEnabled ? "agent readable" : "locked"} ·{" "}
-                      {secret.available ? "stored" : "missing"}
-                    </span>
-                  </McpServerCopy>
-                  <McpInlineActions>
+                <McpSecretRow key={rowKey}>
+                  <McpSecretField data-size="key">
+                    <PanelKicker>Key</PanelKicker>
+                    <McpInput readOnly value={secret.key || ""} />
+                  </McpSecretField>
+                  <McpSecretField data-size="value">
+                    <PanelKicker>Value</PanelKicker>
+                    <McpInput
+                      onChange={(event) =>
+                        setSecretValueDrafts((drafts) => ({
+                          ...drafts,
+                          [rowKey]: event.target.value,
+                        }))
+                      }
+                      placeholder={secret.available ? "Stored value" : ""}
+                      type="password"
+                      value={value}
+                    />
+                  </McpSecretField>
+                  <McpSecretActions>
                     <button
-                      disabled={actionState !== "idle"}
-                      onClick={() => editSecret(secret)}
+                      disabled={saveDisabled}
+                      onClick={() => saveSecretRow({ ...secret, value })}
                       type="button"
                     >
-                      Edit
-                    </button>
-                    <button
-                      disabled={actionState !== "idle"}
-                      onClick={() => toggleSecretAccess(secret)}
-                      type="button"
-                    >
-                      {buttonContent(savingThis, accessEnabled ? "Lock" : "Allow", "Saving")}
+                      {buttonContent(savingThis, "Save", "Saving")}
                     </button>
                     <button
                       disabled={actionState !== "idle"}
@@ -1785,13 +1716,57 @@ export default function McpsWorkspaceView({
                     >
                       {buttonContent(deletingThis, "Delete", "Deleting")}
                     </button>
-                  </McpInlineActions>
-                </McpServerButton>
+                  </McpSecretActions>
+                </McpSecretRow>
               );
             })}
-          </McpServerList>
+            {secretDraftRows.map((row) => {
+              const canSave = row.key.trim() && row.value;
+              const savingThis = actionState === "saving_secret" && actionContext.name === row.key.trim();
+              return (
+                <McpSecretRow key={row.draftId}>
+                  <McpSecretField data-size="key">
+                    <PanelKicker>Key</PanelKicker>
+                    <McpInput
+                      onChange={(event) =>
+                        updateSecretDraftRow(row.draftId, { key: event.target.value })
+                      }
+                      placeholder="APP_API_KEY"
+                      value={row.key}
+                    />
+                  </McpSecretField>
+                  <McpSecretField data-size="value">
+                    <PanelKicker>Value</PanelKicker>
+                    <McpInput
+                      onChange={(event) =>
+                        updateSecretDraftRow(row.draftId, { value: event.target.value })
+                      }
+                      type="password"
+                      value={row.value}
+                    />
+                  </McpSecretField>
+                  <McpSecretActions>
+                    <button
+                      disabled={!canSave || actionState !== "idle"}
+                      onClick={() => saveSecretRow(row)}
+                      type="button"
+                    >
+                      {buttonContent(savingThis, "Save", "Saving")}
+                    </button>
+                    <button
+                      disabled={actionState !== "idle"}
+                      onClick={() => removeSecretDraftRow(row.draftId)}
+                      type="button"
+                    >
+                      Cancel
+                    </button>
+                  </McpSecretActions>
+                </McpSecretRow>
+              );
+            })}
+          </McpSecretRows>
         ) : (
-          <McpEmptyAccess>No local workspace secrets added.</McpEmptyAccess>
+          <McpEmptyAccess>No key/value pairs.</McpEmptyAccess>
         )}
       </McpAccessPanel>
     );
@@ -2369,5 +2344,39 @@ const McpRegistryActionBar = styled.div`
 
   html[data-forge-theme="light"] & button {
     background: var(--forge-surface);
+  }
+`;
+
+const McpSecretRows = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+`;
+
+const McpSecretRow = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(130px, 0.58fr) minmax(220px, 1.42fr) auto;
+  align-items: end;
+  gap: 8px;
+
+  @container (max-width: 680px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const McpSecretField = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+`;
+
+const McpSecretActions = styled(McpInlineActions)`
+  align-self: end;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+
+  @container (max-width: 680px) {
+    justify-content: flex-start;
   }
 `;

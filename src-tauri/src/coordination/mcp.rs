@@ -1878,7 +1878,6 @@ fn workspace_gateway_secrets_server_public(
         "tool_prefix": "secrets__",
         "tools": ["list", "get", "write_env_file"],
         "secret_count": secrets["summary"]["secret_count"].clone(),
-        "agent_readable_secret_count": secrets["summary"]["agent_readable_secret_count"].clone(),
     }))
 }
 

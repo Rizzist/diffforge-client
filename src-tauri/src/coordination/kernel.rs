@@ -404,8 +404,6 @@ fn workspace_mcp_secret_key(value: &str) -> Result<String, String> {
 
 fn workspace_mcp_secret_public_row(mut row: Value) -> Value {
     row["available"] = json!(row["available"].as_i64().unwrap_or_default() != 0);
-    row["agent_access_enabled"] =
-        json!(row["agent_access_enabled"].as_i64().unwrap_or_default() != 0);
     row
 }
 
@@ -645,10 +643,6 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
 }
 
 fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value) -> Value {
-    let readable_count = secrets
-        .iter()
-        .filter(|secret| secret["agent_access_enabled"].as_bool() == Some(true))
-        .count();
     json!({
         "id": "secrets",
         "server_key": "secrets",
@@ -683,7 +677,6 @@ fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value)
         "agent_visibility": workspace_mcp_visibility(true, true, client_mount_summary, true),
         "runtime_note": "Local-only built-in secrets vault. Values are not synced to Cloud.",
         "secret_count": secrets.len(),
-        "agent_readable_secret_count": readable_count,
         "secrets": secrets,
     })
 }
@@ -7504,10 +7497,7 @@ impl CoordinationKernel {
             "SELECT id,
                     workspace_id,
                     key,
-                    label,
-                    description,
                     CASE WHEN TRIM(value) <> '' THEN 1 ELSE 0 END AS available,
-                    agent_access_enabled,
                     created_at,
                     updated_at,
                     last_used_at
@@ -7525,16 +7515,11 @@ impl CoordinationKernel {
     pub fn workspace_mcp_secrets(&self, workspace_id: &str) -> Result<Value, String> {
         let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
         let secrets = self.workspace_mcp_secret_public_rows(workspace_id)?;
-        let readable_count = secrets
-            .iter()
-            .filter(|secret| secret["agent_access_enabled"].as_bool() == Some(true))
-            .count();
         Ok(json!({
             "workspace_id": workspace_id,
             "secrets": secrets,
             "summary": {
                 "secret_count": secrets.len(),
-                "agent_readable_secret_count": readable_count,
             },
         }))
     }
@@ -7564,38 +7549,6 @@ impl CoordinationKernel {
                 return Err("Secret value is required for a new workspace secret.".to_string());
             }
         };
-        let label = input["label"]
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|row| row["label"].as_str().map(str::to_string))
-            })
-            .unwrap_or_else(|| key.clone());
-        let description = if input.get("description").is_some() {
-            input["description"]
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        } else {
-            existing
-                .as_ref()
-                .and_then(|row| row["description"].as_str().map(str::to_string))
-        };
-        let agent_access_enabled = input["agent_access_enabled"]
-            .as_bool()
-            .map(bool_i64)
-            .or_else(|| input["agent_access_enabled"].as_i64())
-            .unwrap_or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|row| row["agent_access_enabled"].as_i64())
-                    .unwrap_or_default()
-            });
         let id = existing
             .as_ref()
             .and_then(|row| row["id"].as_str().map(str::to_string))
@@ -7608,26 +7561,12 @@ impl CoordinationKernel {
         self.conn
             .execute(
                 "INSERT INTO workspace_mcp_secrets(
-                    id, workspace_id, key, label, description, value,
-                    agent_access_enabled, created_at, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    id, workspace_id, key, value, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(workspace_id, key) DO UPDATE SET
-                    label=excluded.label,
-                    description=excluded.description,
                     value=excluded.value,
-                    agent_access_enabled=excluded.agent_access_enabled,
                     updated_at=excluded.updated_at",
-                params![
-                    id,
-                    workspace_id,
-                    key,
-                    label,
-                    description,
-                    value,
-                    agent_access_enabled,
-                    created_at,
-                    now
-                ],
+                params![id, workspace_id, key, value, created_at, now],
             )
             .map_err(|error| format!("Unable to save workspace MCP secret: {error}"))?;
         self.emit_event(
@@ -7638,7 +7577,6 @@ impl CoordinationKernel {
             json!({
                 "workspace_id": workspace_id,
                 "key": key,
-                "agent_access_enabled": agent_access_enabled != 0,
             }),
         )?;
         self.workspace_mcp_secrets(workspace_id)
@@ -7694,11 +7632,6 @@ impl CoordinationKernel {
             .into_iter()
             .next()
             .ok_or_else(|| format!("Workspace MCP secret `{key}` does not exist."))?;
-        if row["agent_access_enabled"].as_i64().unwrap_or_default() == 0 {
-            return Err(format!(
-                "Workspace MCP secret `{key}` is not enabled for agent access."
-            ));
-        }
         let value = row["value"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -7725,8 +7658,6 @@ impl CoordinationKernel {
         )?;
         Ok(json!({
             "key": row["key"].clone(),
-            "label": row["label"].clone(),
-            "description": row["description"].clone(),
             "value": value,
             "secret": true,
         }))

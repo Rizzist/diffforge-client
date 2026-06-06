@@ -42,6 +42,13 @@ const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW: u8 = 2;
 const CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS: u64 = 350;
+const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
+    "Al", "Bo", "Cy", "Ed", "Ev", "Jo", "Li", "Mo", "Oz", "Ty", "Ada", "Ali", "Amy",
+    "Ari", "Ava", "Bea", "Ben", "Bob", "Cal", "Dan", "Eli", "Eva", "Gia", "Gus",
+    "Hal", "Ian", "Ira", "Jay", "Kai", "Kim", "Leo", "Lia", "Lou", "Mac", "Max",
+    "Mia", "Ned", "Ona", "Pam", "Ray", "Rex", "Sam", "Sue", "Taj", "Alex", "Matt",
+    "Mike", "Noah", "Omar", "Ezra",
+];
 
 #[derive(Clone)]
 struct CloudMcpBackgroundSync {
@@ -2646,6 +2653,42 @@ async fn cloud_mcp_send_remote_command_status_event(
     let now = cloud_mcp_now_ms();
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
+    let target_terminal_nickname = cloud_mcp_terminal_nickname_text(
+        event,
+        &[
+            "target_terminal_nickname",
+            "targetTerminalNickname",
+            "terminal_nickname",
+            "terminalNickname",
+            "target_terminal_name",
+            "targetTerminalName",
+            "terminal_name",
+            "terminalName",
+            "target_name",
+            "targetName",
+            "name",
+        ],
+    )
+    .or_else(|| {
+        event.get("payload").and_then(|payload| {
+            cloud_mcp_terminal_nickname_text(
+                payload,
+                &[
+                    "target_terminal_nickname",
+                    "targetTerminalNickname",
+                    "terminal_nickname",
+                    "terminalNickname",
+                    "target_terminal_name",
+                    "targetTerminalName",
+                    "terminal_name",
+                    "terminalName",
+                    "target_name",
+                    "targetName",
+                    "name",
+                ],
+            )
+        })
+    });
     let status_kind = if matches!(
         status,
         "blocked" | "completed" | "failed" | "rejected" | "cancelled" | "canceled"
@@ -2707,6 +2750,10 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminalId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "pane_id"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "paneId"])),
+        "target_terminal_nickname": target_terminal_nickname.clone(),
+        "targetTerminalNickname": target_terminal_nickname.clone(),
+        "target_terminal_name": target_terminal_nickname.clone(),
+        "targetTerminalName": target_terminal_nickname,
         "target_terminal_index": cloud_mcp_payload_text(event, &["target_terminal_index"])
             .or_else(|| cloud_mcp_payload_text(event, &["targetTerminalIndex"]))
             .or_else(|| cloud_mcp_payload_text(event, &["terminal_index"]))
@@ -5204,6 +5251,46 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_terminal_nickname_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn cloud_mcp_normalize_terminal_nickname(value: &str) -> Option<String> {
+    let key = cloud_mcp_terminal_nickname_key(value);
+    if key.is_empty() {
+        return None;
+    }
+
+    CLOUD_MCP_TERMINAL_NICKNAMES
+        .iter()
+        .find(|name| name.to_ascii_lowercase() == key)
+        .map(|name| (*name).to_string())
+}
+
+fn cloud_mcp_terminal_nickname_text(payload: &Value, path: &[&str]) -> Option<String> {
+    for key in path {
+        if let Some(value) = payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(cloud_mcp_normalize_terminal_nickname)
+        {
+            return Some(value);
+        }
+    }
+
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .and_then(cloud_mcp_normalize_terminal_nickname)
 }
 
 fn cloud_mcp_payload_object(payload: &Value, path: &[&str]) -> Option<Value> {
@@ -8807,6 +8894,17 @@ async fn cloud_mcp_sync_terminal_presence(
                 let agent_label =
                     cloud_mcp_payload_text(terminal, &["agent_label", "agentLabel", "label"])
                         .unwrap_or_else(|| agent_kind.clone());
+                let terminal_nickname = cloud_mcp_terminal_nickname_text(
+                    terminal,
+                    &[
+                        "terminal_nickname",
+                        "terminalNickname",
+                        "terminal_name",
+                        "terminalName",
+                        "display_name",
+                        "displayName",
+                    ],
+                );
                 let status = cloud_mcp_payload_text(terminal, &["status", "state"])
                     .unwrap_or_else(|| "active".to_string());
                 let session_state =
@@ -8837,8 +8935,11 @@ async fn cloud_mcp_sync_terminal_presence(
                     ),
                     "agent_kind": agent_kind,
                     "agent_label": agent_label,
+                    "display_name": terminal_nickname.clone(),
                     "status": status,
                     "session_state": session_state,
+                    "terminal_name": terminal_nickname.clone(),
+                    "terminal_nickname": terminal_nickname,
                     "terminal_index": terminal_index,
                     "terminal_epoch": cloud_mcp_payload_text(terminal, &["terminal_epoch", "terminalEpoch"]),
                     "terminal_instance_id": terminal_instance_id,
@@ -9427,6 +9528,17 @@ async fn cloud_mcp_sync_terminal_status_event(
         .unwrap_or_else(cloud_mcp_now_ms);
     let terminal_epoch = cloud_mcp_payload_text(&terminal, &["terminal_epoch", "terminalEpoch"])
         .unwrap_or_else(|| format!("{terminal_id}:{terminal_instance_id}"));
+    let terminal_nickname = cloud_mcp_terminal_nickname_text(
+        &terminal,
+        &[
+            "terminal_nickname",
+            "terminalNickname",
+            "terminal_name",
+            "terminalName",
+            "display_name",
+            "displayName",
+        ],
+    );
     let payload = json!({
         "source": "rust-diffforge-terminal-lifecycle-delta",
         "event_kind": "terminal_lifecycle_delta",
@@ -9439,11 +9551,14 @@ async fn cloud_mcp_sync_terminal_status_event(
         "workspace_id": req.workspace_id,
         "workspace_name": req.workspace_name,
         "workspace_status": workspace_status,
+        "display_name": terminal_nickname.clone(),
         "terminal_id": terminal_id,
         "pane_id": pane_id,
         "terminal_instance_id": terminal_instance_id,
         "terminal_index": terminal_index,
         "terminal_epoch": terminal_epoch,
+        "terminal_name": terminal_nickname.clone(),
+        "terminal_nickname": terminal_nickname,
         "agent_kind": agent_kind,
         "provider": cloud_mcp_payload_text(&terminal, &["provider", "agentKind", "agent_kind"]),
         "event_type": event_type,
@@ -11696,6 +11811,45 @@ mod cloud_mcp_tests {
             "event_kind": "remote_command_requested",
         });
         assert!(cloud_mcp_claim_remote_command_receipt(&state, &other_workspace).await);
+    }
+
+    #[test]
+    fn terminal_nickname_text_only_allows_workspace_pool_names() {
+        let payload = json!({
+            "terminal_nickname": "b-o-b",
+            "terminalName": "Codex",
+        });
+        assert_eq!(
+            cloud_mcp_terminal_nickname_text(
+                &payload,
+                &["terminal_nickname", "terminalName"],
+            ),
+            Some("Bob".to_string()),
+        );
+
+        let fallback = json!({
+            "terminal_nickname": "Codex",
+            "terminalName": "ali",
+        });
+        assert_eq!(
+            cloud_mcp_terminal_nickname_text(
+                &fallback,
+                &["terminal_nickname", "terminalName"],
+            ),
+            Some("Ali".to_string()),
+        );
+
+        let rejected = json!({
+            "terminal_nickname": "Charlie",
+            "terminalName": "Codex",
+        });
+        assert_eq!(
+            cloud_mcp_terminal_nickname_text(
+                &rejected,
+                &["terminal_nickname", "terminalName"],
+            ),
+            None,
+        );
     }
 
     #[test]

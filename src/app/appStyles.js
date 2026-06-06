@@ -2355,11 +2355,13 @@ export const RailSectionTitle = styled.p`
 `;
 
 export const RailCollapseButton = styled.button`
-  display: grid;
+  display: inline-flex;
   width: 28px;
   height: 28px;
-  place-items: center;
+  align-items: center;
+  justify-content: center;
   justify-self: end;
+  padding: 0;
   border: 1px solid rgba(230, 236, 245, 0.1);
   border-radius: 8px;
   color: var(--forge-text-muted);
@@ -2367,6 +2369,7 @@ export const RailCollapseButton = styled.button`
     linear-gradient(180deg, rgba(230, 236, 245, 0.05), rgba(230, 236, 245, 0.018)),
     rgba(7, 9, 13, 0.74);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+  line-height: 0;
   transition:
     background 160ms ease,
     border-color 160ms ease,
@@ -2375,8 +2378,11 @@ export const RailCollapseButton = styled.button`
     transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   svg {
+    display: block;
+    flex: 0 0 auto;
     width: 16px;
     height: 16px;
+    margin: 0;
     transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
@@ -3112,8 +3118,11 @@ export const RailActionButton = styled.button`
   }
 
   svg {
+    display: block;
+    flex: 0 0 auto;
     width: 15px;
     height: 15px;
+    margin: 0;
     color: var(--forge-text-muted);
     transition: color 160ms ease;
   }
@@ -3531,6 +3540,7 @@ export const TerminalWorkspaceSurface = styled.section`
   --terminal-focus-outline-inset: 0px;
 
   position: relative;
+  container-type: inline-size;
   isolation: isolate;
   display: flex;
   flex-direction: column;
@@ -4546,15 +4556,15 @@ export const TerminalRestartPill = styled.div`
   top: 5px;
   left: 50%;
   z-index: 80;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto auto;
   width: max-content;
-  max-width: calc(100% - 24px);
+  max-width: 92%;
   min-height: 26px;
   height: auto;
   align-items: center;
   justify-content: center;
   align-content: center;
-  flex-wrap: wrap;
   gap: 2px 3px;
   padding: 2px 5px;
   border: 0;
@@ -4563,6 +4573,13 @@ export const TerminalRestartPill = styled.div`
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
   transform: translateX(-50%);
   backdrop-filter: blur(10px);
+
+  @container (max-width: 420px) {
+    grid-template-columns: minmax(0, 1fr) auto;
+    min-height: 48px;
+    gap: 1px 5px;
+    padding: 3px 6px 4px;
+  }
 `;
 
 export const TerminalRailIdentity = styled.span`
@@ -4570,9 +4587,10 @@ export const TerminalRailIdentity = styled.span`
   min-width: 0;
   max-width: 100%;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 4px;
-  flex: 1 1 118px;
+  grid-column: 1;
+  grid-row: 1;
 `;
 
 export const TerminalAgentLabel = styled.span`
@@ -4600,7 +4618,30 @@ export const TerminalRailControls = styled.span`
   align-items: center;
   justify-content: center;
   gap: 2px;
-  flex: 0 0 auto;
+
+  &[data-rail-row="primary"] {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  &[data-rail-row="secondary"] {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: center;
+  }
+
+  @container (max-width: 420px) {
+    &[data-rail-row="primary"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    &[data-rail-row="secondary"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+  }
 `;
 
 export const TerminalAgentDot = styled.span`

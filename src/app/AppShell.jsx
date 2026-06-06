@@ -108,6 +108,7 @@ import {
   getWorkspaceThreadCanArchive,
   getWorkspaceThreadDetailVisibilityKey,
   getWorkspaceThreadProviderBinding,
+  getWorkspaceThreadTerminalNickname,
   getWorkspaceThreadsByTerminalIndex,
   hydrateWorkspaceThreadSessionTranscript,
   invalidateWorkspaceThreadProviderSession,
@@ -5174,13 +5175,27 @@ function normalizeWorkspaceTerminalSlotIndexes(indexes) {
   }, []);
 }
 
+function reconcileWorkspaceTerminalSlotIndexes(indexes, count) {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const normalizedIndexes = normalizeWorkspaceTerminalSlotIndexes(indexes);
+  const usedIndexes = new Set(normalizedIndexes);
+  const nextIndexes = normalizedIndexes.slice(0, terminalCount);
+
+  let nextIndex = 0;
+  while (nextIndexes.length < terminalCount) {
+    if (!usedIndexes.has(nextIndex)) {
+      usedIndexes.add(nextIndex);
+      nextIndexes.push(nextIndex);
+    }
+    nextIndex += 1;
+  }
+
+  return nextIndexes;
+}
+
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
   if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
-    const normalizedIndexes = normalizeWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId]);
-    const safeTerminalCount = Number.parseInt(terminalCount, 10);
-    return Number.isInteger(safeTerminalCount) && safeTerminalCount > 0
-      ? normalizedIndexes.slice(0, safeTerminalCount)
-      : normalizedIndexes;
+    return reconcileWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId], terminalCount);
   }
 
   return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
@@ -9534,16 +9549,18 @@ export default function App() {
         throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
       }
 
-      const nextTerminalIndexes = getDefaultTerminalIndexes(terminalCount);
-      const nextTerminalIndexSet = new Set(nextTerminalIndexes);
-      const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
-        [terminalIndex, terminalRoles[index]]
-      )));
       const currentTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
         workspaceTerminalLogicalIndexes,
         selectedWorkspace.id,
         currentTerminalCount,
       );
+      const nextTerminalIndexes = rootDirectory !== currentRootDirectory
+        ? getDefaultTerminalIndexes(terminalCount)
+        : reconcileWorkspaceTerminalSlotIndexes(currentTerminalIndexes, terminalCount);
+      const nextTerminalIndexSet = new Set(nextTerminalIndexes);
+      const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
+        [terminalIndex, terminalRoles[index]]
+      )));
       const rootChanged = rootDirectory !== currentRootDirectory;
       const rootWasEmptyAtSelection = rootDirectory
         ? rootChanged
@@ -9684,13 +9701,20 @@ export default function App() {
       });
 
       if (rootChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
+        const nextDisplayRows = getWorkspaceDisplayTerminalRows(
+          workspaceTerminalDisplayLayoutsRef.current,
+          selectedWorkspace.id,
+          nextTerminalIndexes,
+        ).map((row) => row.terminalIndexes.slice());
         const nextLogicalIndexesByWorkspace = {
           ...workspaceTerminalLogicalIndexes,
           [selectedWorkspace.id]: nextTerminalIndexes,
         };
         const nextDisplayLayouts = {
           ...workspaceTerminalDisplayLayoutsRef.current,
-          [selectedWorkspace.id]: getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes),
+          [selectedWorkspace.id]: nextDisplayRows.length
+            ? nextDisplayRows
+            : getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes),
         };
         workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
         workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
@@ -12435,8 +12459,10 @@ export default function App() {
                 || agentType
                 || "",
             ).trim();
+            const terminalNickname = getWorkspaceThreadTerminalNickname(thread, providerBinding, liveTerminal);
             const terminalName = String(
-              liveTerminal?.terminalName
+              terminalNickname
+                || liveTerminal?.terminalName
                 || liveTerminal?.terminal_name
                 || liveTerminal?.displayName
                 || liveTerminal?.display_name
@@ -12484,8 +12510,11 @@ export default function App() {
               terminalIndex,
               terminalInstanceId,
               terminalLifecycle,
+              displayName: terminalName,
               terminalName,
               terminal_name: terminalName,
+              terminalNickname,
+              terminal_nickname: terminalNickname,
               threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
               turnId: latestTurn?.id || latestTurn?.turnId || "",
               turnStatus,
@@ -12844,8 +12873,18 @@ export default function App() {
         || agentType
         || "",
     ).trim();
+    const terminalNickname = String(
+      options.terminalNickname
+        || options.terminal_nickname
+        || event.terminalNickname
+        || event.terminal_nickname
+        || presenceTerminal?.terminalNickname
+        || presenceTerminal?.terminal_nickname
+        || "",
+    ).trim();
     const terminalName = String(
-      options.terminalName
+      terminalNickname
+        || options.terminalName
         || options.terminal_name
         || options.displayName
         || options.display_name
@@ -13016,8 +13055,11 @@ export default function App() {
       terminalIndex: safeTerminalIndex,
       terminalInstanceId,
       terminalLifecycle,
+      displayName: terminalName,
       terminalName,
       terminal_name: terminalName,
+      terminalNickname,
+      terminal_nickname: terminalNickname,
       threadId,
       turnId: event.turnId || event.activeTurnId || presenceTerminal?.turnId || presenceTerminal?.turn_id || "",
       turnStatus,
@@ -15337,6 +15379,8 @@ export default function App() {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "");
     const remoteControlTerminalNameCandidates = (terminal) => [
+      terminal?.terminalNickname,
+      terminal?.terminal_nickname,
       terminal?.terminalName,
       terminal?.terminal_name,
       terminal?.displayName,
@@ -15453,7 +15497,7 @@ export default function App() {
       agentId: remoteControlTerminalText(terminal, ["agentId", "agent_id", "agentKind", "agent_kind"]) || fallback.agentId || "",
       paneId: remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]) || fallback.targetTerminalId || "",
       reason: fallback.reason || "",
-      terminalName: remoteControlTerminalText(terminal, ["terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"]) || fallback.targetTerminalName || "",
+      terminalName: remoteControlTerminalText(terminal, ["terminalNickname", "terminal_nickname", "terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"]) || fallback.targetTerminalName || "",
       terminalIndex: remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]) ?? fallback.targetTerminalIndex ?? null,
       threadId: remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || fallback.targetThreadId || "",
     });
@@ -15841,6 +15885,10 @@ export default function App() {
             "threadId",
           ]);
           let targetTerminalName = remoteCommandStringField(event, [
+            "target_terminal_nickname",
+            "targetTerminalNickname",
+            "terminal_nickname",
+            "terminalNickname",
             "target_terminal_name",
             "targetTerminalName",
             "terminal_name",
@@ -15868,7 +15916,7 @@ export default function App() {
             );
             targetTerminalName = targetTerminalName || remoteControlTerminalText(
               resolvedRemoteTarget,
-              ["terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"],
+              ["terminalNickname", "terminal_nickname", "terminalName", "terminal_name", "displayName", "display_name", "agentDisplayName", "agent_display_name"],
             );
             if (!Number.isInteger(targetTerminalIndex)) {
               targetTerminalIndex = remoteControlTerminalNumber(

@@ -5612,7 +5612,7 @@ function normalizeTerminalCoordinationTargets(value) {
     .filter(Boolean);
 }
 
-function terminalCoordinationTargetForIndex(targets, terminalIndexes, terminalIndex, fallbackRoot = "") {
+function terminalCoordinationTargetForIndex(targets, terminalIndex, fallbackRoot = "") {
   const normalizedTargets = normalizeTerminalCoordinationTargets(targets);
   if (!normalizedTargets.length) {
     return fallbackRoot
@@ -5624,8 +5624,8 @@ function terminalCoordinationTargetForIndex(targets, terminalIndexes, terminalIn
     return normalizedTargets[0];
   }
 
-  const position = (Array.isArray(terminalIndexes) ? terminalIndexes : []).indexOf(terminalIndex);
-  const targetIndex = position >= 0 ? position % normalizedTargets.length : 0;
+  const safeTerminalIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+  const targetIndex = safeTerminalIndex % normalizedTargets.length;
   return normalizedTargets[targetIndex];
 }
 
@@ -12159,13 +12159,11 @@ function TerminalView({
   const getTerminalProjectTarget = useCallback((terminalIndex) => (
     terminalCoordinationTargetForIndex(
       normalizedTerminalWorkspaceCoordinationTargets,
-      logicalTerminalIndexes,
       terminalIndex,
       terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
     )
   ), [
     defaultWorkingDirectory,
-    logicalTerminalIndexes,
     normalizedTerminalWorkspaceCoordinationTargets,
     terminalWorkspaceWorkingDirectory,
   ]);

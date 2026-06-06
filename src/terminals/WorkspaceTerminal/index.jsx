@@ -372,6 +372,7 @@ import {
 } from "../terminalActivityState.js";
 import {
   createWorkspaceThreadId,
+  getWorkspaceThreadTerminalNickname,
   getWorkspaceThreadProviderBinding,
 } from "../../threads/workspaceThreads";
 import {
@@ -586,32 +587,6 @@ function terminalInputDataIsSubmit(value) {
     || text.includes("\n")
     || text.includes(TERMINAL_ENTER_SEQUENCE)
     || text.includes(TERMINAL_ENTER_SEQUENCE_MOD1);
-}
-
-function cleanTerminalRailAgentText(value) {
-  return Array.from(
-    String(value || "")
-      .replace(/[\u0000-\u001F\u007F]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim(),
-  ).slice(0, 80).join("");
-}
-
-function formatTerminalRailAgentName(value) {
-  return cleanTerminalRailAgentText(value)
-    .replace(/[_-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function getTerminalRailAgentLabel(providerLabel, hookAgentLabel) {
-  const provider = formatTerminalRailAgentName(providerLabel) || "Agent";
-  const hookLabel = formatTerminalRailAgentName(hookAgentLabel);
-  if (!hookLabel || hookLabel.toLowerCase() === provider.toLowerCase()) {
-    return provider;
-  }
-
-  return `${provider} / ${hookLabel}`;
 }
 
 const TERMINAL_INPUT_TRANSPORT_BUFFERED_LIMIT_BYTES = 512 * 1024;
@@ -2110,25 +2085,18 @@ function WorkspaceTerminal({
     isGenericTerminal,
   }), [isGenericTerminal, terminalAgentKind]);
   const useNormalizerAgentScrollStability = false;
-  const terminalAgentTitle = isGenericTerminal
-    ? "Generic shell terminal"
-    : `${agent?.label || "Agent"} terminal`;
-  const terminalProviderRailLabel = isGenericTerminal
-    ? "Shell"
-    : agent?.label || terminalAgentKind || "Agent";
-  const terminalHookRailLabel = threadProviderBinding?.agentDisplayName
-    || threadProviderBinding?.agentType
-    || "";
-  const terminalProviderRailDisplayLabel = formatTerminalRailAgentName(terminalProviderRailLabel) || "Agent";
-  const terminalHookRailDisplayLabel = formatTerminalRailAgentName(terminalHookRailLabel);
-  const terminalRailAgentLabel = getTerminalRailAgentLabel(
-    terminalProviderRailLabel,
-    terminalHookRailLabel,
+  const workspaceEntryTerminal = workspaceThreadEntry?.terminals?.[String(terminalIndex)] || null;
+  const terminalNickname = getWorkspaceThreadTerminalNickname(
+    thread,
+    threadProviderBinding,
+    workspaceEntryTerminal,
   );
-  const terminalRailAgentTitle = terminalHookRailDisplayLabel
-    && terminalHookRailDisplayLabel.toLowerCase() !== terminalProviderRailDisplayLabel.toLowerCase()
-    ? `${terminalAgentTitle}: ${terminalHookRailDisplayLabel}`
-    : terminalAgentTitle;
+  const terminalRailAgentLabel = terminalNickname || (isGenericTerminal ? "Shell" : "Agent");
+  const terminalRailAgentTitle = terminalNickname
+    ? `${terminalNickname} terminal`
+    : isGenericTerminal
+      ? "Shell terminal"
+      : "Agent terminal";
   const scheduleOpenCodeTerminalThemeRefresh = useCallback((themeId = getCurrentForgeThemeId()) => {
     if (isGenericTerminal || terminalAgentKind !== "opencode") {
       return;
@@ -13350,7 +13318,7 @@ function WorkspaceTerminal({
             {terminalStateDebugLabel}
           </TerminalStateDebugBadge>
         </TerminalRailIdentity>
-        <TerminalRailControls>
+        <TerminalRailControls data-rail-row="primary">
           <TerminalRestartButton
             aria-label="Drag terminal"
             data-terminal-drag-handle="true"
@@ -13361,6 +13329,17 @@ function WorkspaceTerminal({
           >
             <ButtonDragIcon aria-hidden="true" />
           </TerminalRestartButton>
+          <TerminalCloseButton
+            aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
+            disabled={terminalClosed || terminalClosing}
+            onClick={handleTerminalCloseButtonClick}
+            title={threadsViewActive ? "Exit threads view" : "Close terminal"}
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
+        <TerminalRailControls data-rail-row="secondary">
           <TerminalRestartButton
             aria-label={terminalUiViewActive ? "Show terminal view" : "Show UI view"}
             aria-pressed={terminalUiViewActive ? "true" : "false"}
@@ -13453,15 +13432,6 @@ function WorkspaceTerminal({
                 })}
               </TerminalRestartDropdown>
           </TerminalRestartMenu>
-          <TerminalCloseButton
-            aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
-            disabled={terminalClosed || terminalClosing}
-            onClick={handleTerminalCloseButtonClick}
-            title={threadsViewActive ? "Exit threads view" : "Close terminal"}
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
         </TerminalRailControls>
         </TerminalRestartPill>
 

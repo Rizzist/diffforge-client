@@ -5,10 +5,14 @@ import {
   appendWorkspaceThreadProjectionEvents,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
+  getWorkspaceThreadTerminalNickname,
   hydrateWorkspaceThreadSessionTranscript,
   markWorkspaceThreadAgentActivity,
+  markWorkspaceThreadTerminalDetached,
   materializeWorkspaceThreadForTerminal,
   normalizeWorkspaceThreads,
+  persistWorkspaceThreads,
+  updateWorkspaceActiveTerminal,
 } from "./workspaceThreads.js";
 
 test("session transcript completion settles the exact active running turn", () => {
@@ -1352,6 +1356,190 @@ test("terminal hook activity preserves agent display identity", () => {
   assert.equal(terminal.agentDisplayName, "code-reviewer");
   assert.equal(terminal.agentType, "reviewer");
   assert.equal(terminal.provider, "codex");
+});
+
+test("workspace terminals get unique stable short nicknames", () => {
+  const workspaceId = "workspace-terminal-names";
+  const next = [0, 1, 2].reduce((state, terminalIndex) => (
+    materializeWorkspaceThreadForTerminal(state, {
+      agentId: "codex",
+      instanceId: terminalIndex + 1,
+      paneId: `pane-${terminalIndex}`,
+      terminalIndex,
+      threadId: `thread-${terminalIndex}`,
+      type: "message-submitted",
+      userMessage: `hello ${terminalIndex}`,
+      workspaceId,
+    })
+  ), {});
+
+  const entry = next[workspaceId];
+  const nicknames = entry.threadOrder.map((threadId) => {
+    const thread = entry.threads[threadId];
+    const terminal = entry.terminals[String(thread.terminalIndex)];
+    const binding = thread.providerBindings.codex;
+    const nickname = getWorkspaceThreadTerminalNickname(thread, binding, terminal);
+    assert.match(nickname, /^[A-Z][a-z]{1,3}$/);
+    assert.equal(thread.terminalNickname, nickname);
+    assert.equal(thread.terminalName, nickname);
+    assert.equal(binding.terminalNickname, nickname);
+    assert.equal(terminal.terminalNickname, nickname);
+    return nickname;
+  });
+  assert.equal(new Set(nicknames).size, nicknames.length);
+
+  const persisted = persistWorkspaceThreads(next);
+  const persistedNicknames = entry.threadOrder.map((threadId) => (
+    persisted[workspaceId].threads[threadId].terminalNickname
+  ));
+  assert.deepEqual(persistedNicknames, nicknames);
+  assert.equal(Object.keys(persisted[workspaceId].terminals).length, 0);
+});
+
+test("workspace terminal nickname reconciliation keeps one duplicate per workspace", () => {
+  const workspaceId = "workspace-terminal-name-dupes";
+  const normalized = normalizeWorkspaceThreads({
+    [workspaceId]: {
+      terminalThreadIds: {
+        0: "thread-a",
+        1: "thread-b",
+      },
+      threadOrder: ["thread-a", "thread-b"],
+      threads: {
+        "thread-a": {
+          currentAgent: "codex",
+          id: "thread-a",
+          materialized: true,
+          providerBindings: {
+            codex: {
+              terminalNickname: "Bob",
+            },
+          },
+          terminalIndex: 0,
+          terminalNickname: "Bob",
+          workspaceId,
+        },
+        "thread-b": {
+          currentAgent: "codex",
+          id: "thread-b",
+          materialized: true,
+          providerBindings: {
+            codex: {
+              terminalNickname: "Bob",
+            },
+          },
+          terminalIndex: 1,
+          terminalNickname: "Bob",
+          workspaceId,
+        },
+      },
+    },
+  });
+  const entry = normalized[workspaceId];
+  const first = entry.threads["thread-a"].terminalNickname;
+  const second = entry.threads["thread-b"].terminalNickname;
+
+  assert.equal(first, "Bob");
+  assert.match(second, /^[A-Z][a-z]{1,3}$/);
+  assert.notEqual(second, first);
+});
+
+test("existing terminal nickname wins over hook agent display name", () => {
+  const workspaceId = "workspace-terminal-name-hook";
+  const state = materializeWorkspaceThreadForTerminal({}, {
+    agentDisplayName: "reviewer",
+    agentId: "codex",
+    agentType: "reviewer",
+    instanceId: 1,
+    paneId: "pane-hook",
+    status: "active",
+    terminalIndex: 0,
+    terminalNickname: "Ali",
+    threadId: "thread-hook",
+    type: "message-submitted",
+    userMessage: "start",
+    workspaceId,
+  });
+  const next = markWorkspaceThreadAgentActivity(state, {
+    activityStatus: "thinking",
+    agentDisplayName: "code-reviewer",
+    agentId: "codex",
+    agentType: "reviewer",
+    instanceId: 1,
+    paneId: "pane-hook",
+    terminalIndex: 0,
+    threadId: "thread-hook",
+    type: "provider-turn-started",
+    workspaceId,
+  });
+  const thread = next[workspaceId].threads["thread-hook"];
+  const terminal = next[workspaceId].terminals[0];
+  const binding = thread.providerBindings.codex;
+
+  assert.equal(binding.agentDisplayName, "code-reviewer");
+  assert.equal(getWorkspaceThreadTerminalNickname(thread, binding, terminal), "Ali");
+});
+
+test("workspace terminal nickname survives close and reopen", () => {
+  const workspaceId = "workspace-terminal-name-reopen";
+  const threadId = "thread-reopen";
+  const state = materializeWorkspaceThreadForTerminal({}, {
+    agentId: "codex",
+    instanceId: 1,
+    paneId: "pane-reopen-1",
+    status: "active",
+    terminalIndex: 0,
+    threadId,
+    type: "message-submitted",
+    userMessage: "start",
+    workspaceId,
+  });
+  const firstThread = state[workspaceId].threads[threadId];
+  const firstTerminal = state[workspaceId].terminals[0];
+  const firstNickname = getWorkspaceThreadTerminalNickname(
+    firstThread,
+    firstThread.providerBindings.codex,
+    firstTerminal,
+  );
+
+  assert.ok(firstNickname);
+
+  const closed = markWorkspaceThreadTerminalDetached(state, {
+    agentId: "codex",
+    instanceId: 1,
+    paneId: "pane-reopen-1",
+    status: "closed",
+    terminalIndex: 0,
+    threadId,
+    workspaceId,
+  });
+  assert.equal(closed[workspaceId].terminals[0], undefined);
+
+  const restored = normalizeWorkspaceThreads(persistWorkspaceThreads(closed));
+  assert.equal(restored[workspaceId].terminalThreadIds[0], threadId);
+  assert.equal(restored[workspaceId].threads[threadId].terminalNickname, firstNickname);
+
+  const reopened = updateWorkspaceActiveTerminal(restored, {
+    agentId: "codex",
+    instanceId: 2,
+    paneId: "pane-reopen-2",
+    status: "active",
+    terminalIndex: 0,
+    type: "opened",
+    workspaceId,
+  });
+  const reopenedThread = reopened[workspaceId].threads[threadId];
+  const reopenedTerminal = reopened[workspaceId].terminals[0];
+
+  assert.equal(reopenedTerminal.threadId, threadId);
+  assert.equal(
+    getWorkspaceThreadTerminalNickname(
+      reopenedThread,
+      reopenedThread.providerBindings.codex,
+      reopenedTerminal,
+    ),
+    firstNickname,
+  );
 });
 
 test("provider turn interruption settles running thread and keeps terminal input ready", () => {
