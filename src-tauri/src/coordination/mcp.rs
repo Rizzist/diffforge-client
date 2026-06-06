@@ -28,6 +28,9 @@ pub const TOOL_NAMES: &[&str] = &[
     "architecture_context",
     "architecture_list",
     "architecture_icon_reference",
+    "architecture_revision_list",
+    "architecture_revision_read",
+    "architecture_revision_restore",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -2620,6 +2623,9 @@ fn dispatch_tool_result(
         "architecture_context" => kernel_architecture_context(&kernel, &input),
         "architecture_list" => kernel_architecture_list(&kernel, &input),
         "architecture_icon_reference" => kernel_architecture_icon_reference(&kernel, &input),
+        "architecture_revision_list" => kernel_architecture_revision_list(&kernel, &input),
+        "architecture_revision_read" => kernel_architecture_revision_read(&kernel, &input),
+        "architecture_revision_restore" => kernel_architecture_revision_restore(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
@@ -2693,6 +2699,72 @@ fn kernel_architecture_icon_reference(
 ) -> Result<Value, String> {
     Ok(api_ok(crate::architecture_icon_reference_value(
         architecture_tool_repo_path(kernel, input),
+    )?))
+}
+
+fn kernel_architecture_revision_list(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    let graph_id = input["graph_id"]
+        .as_str()
+        .or_else(|| input["graphId"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Ok(api_ok(crate::architecture_graph_revisions_list_value(
+        architecture_tool_repo_path(kernel, input),
+        graph_id,
+    )?))
+}
+
+fn kernel_architecture_revision_read(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    let graph_id = input["graph_id"]
+        .as_str()
+        .or_else(|| input["graphId"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "architecture_revision_read requires graph_id.".to_string())?
+        .to_string();
+    let revision_id = input["revision_id"]
+        .as_str()
+        .or_else(|| input["revisionId"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "architecture_revision_read requires revision_id.".to_string())?
+        .to_string();
+    Ok(api_ok(crate::architecture_graph_revision_read_value(
+        architecture_tool_repo_path(kernel, input),
+        graph_id,
+        revision_id,
+    )?))
+}
+
+fn kernel_architecture_revision_restore(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    let graph_id = input["graph_id"]
+        .as_str()
+        .or_else(|| input["graphId"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "architecture_revision_restore requires graph_id.".to_string())?
+        .to_string();
+    let revision_id = input["revision_id"]
+        .as_str()
+        .or_else(|| input["revisionId"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "architecture_revision_restore requires revision_id.".to_string())?
+        .to_string();
+    Ok(api_ok(crate::architecture_graph_revision_restore_value(
+        architecture_tool_repo_path(kernel, input),
+        graph_id,
+        revision_id,
     )?))
 }
 
@@ -4293,6 +4365,9 @@ fn tool_description(name: &str) -> String {
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
+        "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
+        "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),
+        "architecture_revision_restore" => "Restore one local-only architecture revision into .agents/architectures/graphs/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
@@ -4375,6 +4450,34 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {
                 "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
             },
+            "additionalProperties": true
+        }),
+        "architecture_revision_list" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "graph_id": {"type": "string", "description": "Optional architecture graph id. Omit to list local-only revisions across the repo, including deleted graph snapshots."}
+            },
+            "additionalProperties": true
+        }),
+        "architecture_revision_read" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "graph_id": {"type": "string", "description": "Required architecture graph id."},
+                "revision_id": {"type": "string", "description": "Required local-only architecture revision id from architecture_revision_list."}
+            },
+            "required": ["graph_id", "revision_id"],
+            "additionalProperties": true
+        }),
+        "architecture_revision_restore" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "graph_id": {"type": "string", "description": "Required architecture graph id."},
+                "revision_id": {"type": "string", "description": "Required local-only architecture revision id to restore."}
+            },
+            "required": ["graph_id", "revision_id"],
             "additionalProperties": true
         }),
         "checkpoint" => json!({

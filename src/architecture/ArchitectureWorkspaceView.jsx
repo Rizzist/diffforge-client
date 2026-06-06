@@ -83,7 +83,47 @@ function architectureGraphListCacheEntry(graphLists, repoPath) {
     || null;
 }
 
+function architectureGraphContentHash(graph) {
+  return text(graph?.contentHash || graph?.content_hash || graph?.hash);
+}
+
+function architectureGraphCloudRef(graph) {
+  const cloudGraph = graph?.cloudGraph || graph?.cloud_graph || graph;
+  const graphId = text(cloudGraph?.id || cloudGraph?.architectureId || cloudGraph?.architecture_id || graph?.id);
+  if (!graphId) return null;
+  return {
+    id: graphId,
+    architectureId: graphId,
+    contentHash: architectureGraphContentHash(cloudGraph) || architectureGraphContentHash(graph),
+    contentRevision: text(cloudGraph?.contentRevision || cloudGraph?.content_revision || graph?.contentRevision || graph?.content_revision),
+  };
+}
+
+function architectureGraphNeedsCloudHydration(graph) {
+  return Boolean(graph?.cloudOnly || graph?.cloudNeedsHydration || graph?.cloud_needs_hydration);
+}
+
+function architectureRevisionGraphId(revision) {
+  return text(revision?.graphId || revision?.graph_id);
+}
+
+function architectureRevisionId(revision) {
+  return text(revision?.revisionId || revision?.revision_id);
+}
+
+function architectureRevisionReasonLabel(reason) {
+  const value = text(reason, "revision");
+  return value
+    .replace(/[_-]+/gu, " ")
+    .replace(/\b\w/gu, (match) => match.toUpperCase());
+}
+
+function architectureRevisionTimestamp(revision) {
+  return revision?.timestamp || revision?.updatedAt || revision?.updated_at || revision?.createdAt || revision?.created_at;
+}
+
 const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
+const ARCHITECTURE_CLOUD_UPDATED_EVENT = "cloud-mcp-workspace-architectures-updated";
 const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
@@ -5014,6 +5054,13 @@ function ArchitecturesPanel({
   const [navCollapsed, setNavCollapsed] = useState(false);
   const [saveState, setSaveState] = useState("idle");
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
+  const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
+  const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
+  const selectedGraphDirtyRef = useRef(false);
+
+  useEffect(() => {
+    selectedGraphDirtyRef.current = selectedGraphDirty;
+  }, [selectedGraphDirty]);
 
   useEffect(() => {
     const nextRepositories = jsonArray(repositoryScan?.repositories);
@@ -5153,23 +5200,91 @@ function ArchitecturesPanel({
   }, [loadGraphList, selectedGraphListCacheEntry, selectedRepoPath]);
 
   useEffect(() => {
+    if (!selectedRepoPath || !queueWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let unlistenArchitecture = null;
+    listen(ARCHITECTURE_CLOUD_UPDATED_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = jsonObject(event?.payload) || {};
+      const nestedPayload = jsonObject(payload.payload) || {};
+      const eventWorkspaceId = text(
+        payload.workspaceId
+          || payload.workspace_id
+          || nestedPayload.workspaceId
+          || nestedPayload.workspace_id,
+      );
+      const workspaceIds = jsonArray(payload.workspace_ids || payload.workspaceIds || nestedPayload.workspace_ids || nestedPayload.workspaceIds)
+        .map((item) => text(item))
+        .filter(Boolean);
+      if (
+        eventWorkspaceId
+        && eventWorkspaceId !== queueWorkspaceId
+        && !workspaceIds.includes(queueWorkspaceId)
+      ) {
+        return;
+      }
+      void loadGraphList(selectedRepoPath, {
+        refresh: true,
+        silent: true,
+        workspaceName: queueWorkspaceName,
+      });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenArchitecture = unlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenArchitecture) unlistenArchitecture();
+    };
+  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+
+  useEffect(() => {
     let cancelled = false;
     if (!selectedRepoPath || !selectedGraphId) {
       setSelectedGraph(null);
+      setSelectedGraphDirty(false);
       return () => {
         cancelled = true;
       };
     }
 
     setGraphState("loading");
-    invoke("architecture_graph_read", {
-      graphId: selectedGraphId,
-      repoPath: selectedRepoPath,
-    })
+    const selectedSummary = graphs.find((graph) => text(graph?.id) === selectedGraphId) || null;
+    const hydrateRef = architectureGraphNeedsCloudHydration(selectedSummary)
+      ? architectureGraphCloudRef(selectedSummary)
+      : null;
+    const readPromise = hydrateRef
+      ? invoke("cloud_mcp_hydrate_workspace_architecture", {
+        refs: [hydrateRef],
+        repoPath: selectedRepoPath,
+        workspaceId: queueWorkspaceId,
+        workspaceName: queueWorkspaceName,
+      }).then((result) => {
+        const hydratedGraph = jsonArray(result?.items || result?.graphs)[0];
+        if (hydratedGraph) return hydratedGraph;
+        return invoke("architecture_graph_read", {
+          graphId: selectedGraphId,
+          repoPath: selectedRepoPath,
+        });
+      })
+      : invoke("architecture_graph_read", {
+        graphId: selectedGraphId,
+        repoPath: selectedRepoPath,
+      });
+    readPromise
       .then((graph) => {
         if (cancelled) return;
+        if (selectedGraphDirtyRef.current) return;
         setSelectedGraph(graph);
         setGraphState("ready");
+        if (hydrateRef) {
+          void loadGraphList(selectedRepoPath, { refresh: true, silent: true });
+        }
       })
       .catch((nextError) => {
         if (cancelled) return;
@@ -5181,7 +5296,14 @@ function ArchitecturesPanel({
     return () => {
       cancelled = true;
     };
-  }, [selectedGraphId, selectedRepoPath]);
+  }, [
+    graphs,
+    loadGraphList,
+    queueWorkspaceId,
+    queueWorkspaceName,
+    selectedGraphId,
+    selectedRepoPath,
+  ]);
 
   useEffect(() => {
     if (!selectedRepoPath || !selectedGraphId || creatingGraph || saveState === "saving") {
@@ -5198,6 +5320,9 @@ function ArchitecturesPanel({
             const nextSource = text(graph?.source);
             const currentUpdatedAt = text(current?.updatedAt);
             const nextUpdatedAt = text(graph?.updatedAt);
+            if (selectedGraphDirtyRef.current) {
+              return current;
+            }
             if (currentSource === nextSource && currentUpdatedAt === nextUpdatedAt) {
               return current;
             }
@@ -5276,6 +5401,17 @@ function ArchitecturesPanel({
     });
   }, [agentEditMarkersStorageKey, graphs, tasks]);
 
+  const openRevisionBrowser = useCallback((graphId = "") => {
+    setRevisionBrowser({
+      graphId: text(graphId),
+      open: true,
+    });
+  }, []);
+
+  const closeRevisionBrowser = useCallback(() => {
+    setRevisionBrowser((current) => ({ ...current, open: false }));
+  }, []);
+
   const beginCreateGraph = useCallback((folderPath = "") => {
     const nextFolderPath = text(folderPath);
     setDraftTitle("Architecture graph");
@@ -5302,7 +5438,8 @@ function ArchitecturesPanel({
       repoPath: selectedRepoPath,
     })
       .then((result) => {
-        setSelectedGraph(result?.graph || graph);
+        const nextGraph = result?.graph || graph;
+        setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || graph.id);
         setCreatingGraph(false);
         setDraftTitle("Architecture graph");
@@ -5310,13 +5447,22 @@ function ArchitecturesPanel({
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
+        if (queueWorkspaceId) {
+          void invoke("cloud_mcp_sync_workspace_architecture", {
+            graph: nextGraph,
+            reason: "architecture_graph_create",
+            repoPath: selectedRepoPath,
+            workspaceId: queueWorkspaceId,
+            workspaceName: queueWorkspaceName,
+          }).catch(() => {});
+        }
         void loadGraphList(selectedRepoPath, { refresh: true });
       })
       .catch((nextError) => {
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath]);
+  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -5331,6 +5477,15 @@ function ArchitecturesPanel({
         setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || nextGraph.id);
         setSaveState("idle");
+        if (queueWorkspaceId) {
+          void invoke("cloud_mcp_sync_workspace_architecture", {
+            graph: nextGraph,
+            reason: "architecture_graph_save",
+            repoPath: selectedRepoPath,
+            workspaceId: queueWorkspaceId,
+            workspaceName: queueWorkspaceName,
+          }).catch(() => {});
+        }
         void loadGraphList(selectedRepoPath, { refresh: true });
         return nextGraph;
       })
@@ -5339,7 +5494,26 @@ function ArchitecturesPanel({
         setError(nextError?.message || String(nextError || "Unable to save architecture graph."));
         throw nextError;
       });
-  }, [loadGraphList, selectedRepoPath]);
+  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+
+  const handleRevisionRestored = useCallback((result) => {
+    const nextGraph = result?.graph || null;
+    const nextGraphId = text(result?.graphId || result?.graph_id || nextGraph?.id);
+    if (nextGraph) setSelectedGraph(nextGraph);
+    if (nextGraphId) setSelectedGraphId(nextGraphId);
+    setCreatingGraph(false);
+    setSelectedGraphDirty(false);
+    if (queueWorkspaceId && nextGraph) {
+      void invoke("cloud_mcp_sync_workspace_architecture", {
+        graph: nextGraph,
+        reason: "architecture_revision_restore",
+        repoPath: selectedRepoPath,
+        workspaceId: queueWorkspaceId,
+        workspaceName: queueWorkspaceName,
+      }).catch(() => {});
+    }
+    void loadGraphList(selectedRepoPath, { refresh: true });
+  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
 
   const renderTreeRows = useCallback((emptyDepth = 0) => (
     <>
@@ -5426,6 +5600,15 @@ function ArchitecturesPanel({
                 type="button"
               >
                 <Add aria-hidden="true" />
+              </ArchitectureCreateGraphButton>
+              <ArchitectureCreateGraphButton
+                aria-label="Open architecture revision history"
+                disabled={!selectedRepoPath}
+                onClick={() => openRevisionBrowser("")}
+                title="Open architecture revision history"
+                type="button"
+              >
+                <Cached aria-hidden="true" />
               </ArchitectureCreateGraphButton>
               <ArchitectureNavToggleButton
                 aria-label="Hide architecture navigation"
@@ -5519,11 +5702,23 @@ function ArchitecturesPanel({
               agentEditMarker={selectedAgentEditMarker}
               graph={selectedGraph}
               onAgentEditQueued={recordAgentEditQueued}
+              onDirtyChange={setSelectedGraphDirty}
+              onOpenRevisions={openRevisionBrowser}
               onSave={saveGraph}
               queueWorkspaceId={queueWorkspaceId}
               queueWorkspaceName={queueWorkspaceName}
               saveState={saveState}
               selectedRepo={selectedRepo}
+            />
+          )}
+          {revisionBrowser.open && selectedRepoPath && (
+            <ArchitectureRevisionDrawer
+              activeGraphDirty={selectedGraphDirty}
+              graphId={revisionBrowser.graphId}
+              onClose={closeRevisionBrowser}
+              onRestored={handleRevisionRestored}
+              repoPath={selectedRepoPath}
+              selectedGraphId={selectedGraphId}
             />
           )}
         </ArchitectureEditorContent>
@@ -5648,6 +5843,8 @@ function ArchitectureGraphEditor({
   agentEditMarker = null,
   graph,
   onAgentEditQueued = () => {},
+  onDirtyChange = () => {},
+  onOpenRevisions = null,
   onSave,
   queueWorkspaceId = "",
   queueWorkspaceName = "",
@@ -5724,6 +5921,10 @@ function ArchitectureGraphEditor({
   useEffect(() => () => {
     if (routeSettleTimerRef.current) clearTimeout(routeSettleTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    onDirtyChange(dirty);
+  }, [dirty, onDirtyChange]);
 
   const onNodesChange = useCallback((changes) => {
     if (changes.some((change) => change.type !== "select")) setDirty(true);
@@ -6111,6 +6312,14 @@ function ArchitectureGraphEditor({
             </ArchitectureRunTargetsBar>
           )}
           <ArchitectureFloatingActions>
+            <ArchitectureFloatingButton
+              onClick={() => {
+                if (typeof onOpenRevisions === "function") onOpenRevisions(draftGraph.id || graph?.id);
+              }}
+              type="button"
+            >
+              History
+            </ArchitectureFloatingButton>
             <ArchitectureFloatingDangerButton
               disabled={!selectedNodes.length && !selectedEdges.length}
               onClick={deleteSelected}
@@ -6153,6 +6362,207 @@ function ArchitectureGraphEditor({
         </ArchitectureCanvasViewport>
       </ArchitectureEditorBody>
     </ArchitectureEditorShell>
+  );
+}
+
+function ArchitectureRevisionDrawer({
+  activeGraphDirty = false,
+  graphId = "",
+  onClose = () => {},
+  onRestored = () => {},
+  repoPath = "",
+  selectedGraphId = "",
+}) {
+  const scopedGraphId = text(graphId);
+  const [items, setItems] = useState([]);
+  const [state, setState] = useState("loading");
+  const [error, setError] = useState("");
+  const [selectedRevisionId, setSelectedRevisionId] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [previewState, setPreviewState] = useState("idle");
+  const [restoreState, setRestoreState] = useState("idle");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!repoPath) {
+      setItems([]);
+      setState("idle");
+      return () => {
+        cancelled = true;
+      };
+    }
+    setState("loading");
+    setError("");
+    setNotice("");
+    invoke("architecture_graph_revisions_list", {
+      graphId: scopedGraphId || null,
+      repoPath,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        const revisions = jsonArray(result?.revisions);
+        setItems(revisions);
+        setSelectedRevisionId((current) => {
+          if (current && revisions.some((item) => architectureRevisionId(item) === current)) return current;
+          return architectureRevisionId(revisions[0]) || "";
+        });
+        setState("ready");
+      })
+      .catch((nextError) => {
+        if (cancelled) return;
+        setItems([]);
+        setSelectedRevisionId("");
+        setState("error");
+        setError(nextError?.message || String(nextError || "Unable to load architecture revisions."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath, scopedGraphId]);
+
+  const selectedRevision = useMemo(() => (
+    items.find((item) => architectureRevisionId(item) === selectedRevisionId) || items[0] || null
+  ), [items, selectedRevisionId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!repoPath || !selectedRevision) {
+      setPreview(null);
+      setPreviewState("idle");
+      return () => {
+        cancelled = true;
+      };
+    }
+    const revisionId = architectureRevisionId(selectedRevision);
+    const revisionGraphId = architectureRevisionGraphId(selectedRevision);
+    if (!revisionId || !revisionGraphId) {
+      setPreview(null);
+      setPreviewState("idle");
+      return () => {
+        cancelled = true;
+      };
+    }
+    setPreviewState("loading");
+    setError("");
+    invoke("architecture_graph_revision_read", {
+      graphId: revisionGraphId,
+      repoPath,
+      revisionId,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        setPreview(result);
+        setPreviewState("ready");
+      })
+      .catch((nextError) => {
+        if (cancelled) return;
+        setPreview(null);
+        setPreviewState("error");
+        setError(nextError?.message || String(nextError || "Unable to read architecture revision."));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath, selectedRevision]);
+
+  const restoreRevision = useCallback(() => {
+    if (!repoPath || !selectedRevision || activeGraphDirty || restoreState === "restoring") return;
+    const revisionId = architectureRevisionId(selectedRevision);
+    const revisionGraphId = architectureRevisionGraphId(selectedRevision);
+    if (!revisionId || !revisionGraphId) return;
+    setRestoreState("restoring");
+    setError("");
+    setNotice("");
+    invoke("architecture_graph_revision_restore", {
+      graphId: revisionGraphId,
+      repoPath,
+      revisionId,
+    })
+      .then((result) => {
+        setRestoreState("idle");
+        setNotice("Revision restored");
+        onRestored(result);
+      })
+      .catch((nextError) => {
+        setRestoreState("idle");
+        setError(nextError?.message || String(nextError || "Unable to restore architecture revision."));
+      });
+  }, [activeGraphDirty, onRestored, repoPath, restoreState, selectedRevision]);
+
+  const source = text(preview?.source);
+  const title = scopedGraphId ? "Graph History" : "Architecture History";
+  const restoreDisabled = !selectedRevision || activeGraphDirty || restoreState === "restoring";
+  const activeGraphLabel = scopedGraphId || selectedGraphId || "repo";
+
+  return (
+    <ArchitectureRevisionOverlay role="dialog" aria-label={title}>
+      <ArchitectureRevisionDrawerShell>
+        <ArchitectureRevisionHeader>
+          <div>
+            <TimelineKicker>{activeGraphLabel}</TimelineKicker>
+            <ArchitectureRevisionTitle>{title}</ArchitectureRevisionTitle>
+          </div>
+          <ArchitectureRevisionHeaderActions>
+            <ArchitectureSmallButton onClick={onClose} type="button">Close</ArchitectureSmallButton>
+          </ArchitectureRevisionHeaderActions>
+        </ArchitectureRevisionHeader>
+        <ArchitectureRevisionBody>
+          <ArchitectureRevisionList aria-label="Architecture revisions" data-state={state}>
+            {state === "loading" && <ArchitectureRevisionEmpty>Loading revisions...</ArchitectureRevisionEmpty>}
+            {state !== "loading" && !items.length && (
+              <ArchitectureRevisionEmpty>No local revisions recorded yet.</ArchitectureRevisionEmpty>
+            )}
+            {items.map((item) => {
+              const revisionId = architectureRevisionId(item);
+              const revisionGraphId = architectureRevisionGraphId(item);
+              const timestamp = architectureRevisionTimestamp(item);
+              return (
+                <ArchitectureRevisionRow
+                  data-deleted={item?.deleted ? "true" : "false"}
+                  data-selected={revisionId === architectureRevisionId(selectedRevision) ? "true" : "false"}
+                  key={`${revisionGraphId}-${revisionId}`}
+                  onClick={() => setSelectedRevisionId(revisionId)}
+                  title={item?.filePath || item?.file_path || revisionId}
+                  type="button"
+                >
+                  <strong>{text(item?.title, revisionGraphId || "Architecture")}</strong>
+                  <span>{architectureRevisionReasonLabel(item?.reason)} · {formatRelativeTimeMs(timestamp) || formatTime(timestamp) || "unknown"}</span>
+                  <em>{revisionGraphId}{item?.deleted ? " · deleted" : ""}</em>
+                </ArchitectureRevisionRow>
+              );
+            })}
+          </ArchitectureRevisionList>
+          <ArchitectureRevisionPreview>
+            {error && <ArchitectureEditorNotice data-kind="error">{error}</ArchitectureEditorNotice>}
+            {notice && <ArchitectureEditorNotice>{notice}</ArchitectureEditorNotice>}
+            {selectedRevision && (
+              <ArchitectureRevisionMeta>
+                <strong>{text(selectedRevision.title, architectureRevisionGraphId(selectedRevision))}</strong>
+                <span>{architectureRevisionReasonLabel(selectedRevision.reason)}</span>
+                <span>{formatTime(architectureRevisionTimestamp(selectedRevision)) || "unknown time"}</span>
+                <span>{selectedRevision.nodeCount || 0} nodes · {selectedRevision.edgeCount || 0} edges</span>
+              </ArchitectureRevisionMeta>
+            )}
+            <ArchitectureRevisionSource data-state={previewState}>
+              {previewState === "loading" ? "Loading source..." : source || "Select a revision to preview its source."}
+            </ArchitectureRevisionSource>
+            <ArchitectureRevisionActions>
+              {activeGraphDirty && (
+                <ArchitectureRevisionRestoreNote>Save the current graph before restoring a revision.</ArchitectureRevisionRestoreNote>
+              )}
+              <ArchitectureFloatingPrimaryButton
+                disabled={restoreDisabled}
+                onClick={restoreRevision}
+                type="button"
+              >
+                {restoreState === "restoring" ? "Restoring..." : "Restore Revision"}
+              </ArchitectureFloatingPrimaryButton>
+            </ArchitectureRevisionActions>
+          </ArchitectureRevisionPreview>
+        </ArchitectureRevisionBody>
+      </ArchitectureRevisionDrawerShell>
+    </ArchitectureRevisionOverlay>
   );
 }
 
@@ -9338,6 +9748,211 @@ const ArchitectureEditorNotice = styled.div`
     color: #fecaca;
     background: rgba(127, 29, 29, 0.16);
   }
+`;
+
+const ArchitectureRevisionOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  display: grid;
+  justify-content: end;
+  min-width: 0;
+  min-height: 0;
+  background: linear-gradient(90deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.58));
+`;
+
+const ArchitectureRevisionDrawerShell = styled.aside`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(760px, 100vw);
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(8, 12, 18, 0.96);
+  box-shadow: -28px 0 60px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(14px);
+`;
+
+const ArchitectureRevisionHeader = styled.header`
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 13px 14px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const ArchitectureRevisionHeaderActions = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+`;
+
+const ArchitectureRevisionTitle = styled.strong`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.96);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1.2;
+`;
+
+const ArchitectureRevisionBody = styled.div`
+  display: grid;
+  grid-template-columns: minmax(230px, 0.78fr) minmax(0, 1.22fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
+`;
+
+const ArchitectureRevisionList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border-right: 1px solid rgba(148, 163, 184, 0.1);
+`;
+
+const ArchitectureRevisionEmpty = styled.div`
+  padding: 14px;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 12px;
+  font-weight: 760;
+`;
+
+const ArchitectureRevisionRow = styled.button`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.09);
+  color: rgba(226, 232, 240, 0.86);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+
+  strong,
+  span,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(248, 250, 252, 0.94);
+    font-size: 12px;
+    font-weight: 860;
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.72);
+    font-size: 10px;
+    font-weight: 760;
+  }
+
+  em {
+    color: rgba(148, 163, 184, 0.68);
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 760;
+  }
+
+  &[data-selected="true"] {
+    background: rgba(20, 184, 166, 0.1);
+    box-shadow: inset 3px 0 0 rgba(45, 212, 191, 0.64);
+  }
+
+  &[data-deleted="true"] {
+    background: linear-gradient(90deg, rgba(127, 29, 29, 0.12), transparent 72%);
+  }
+`;
+
+const ArchitectureRevisionPreview = styled.div`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px;
+`;
+
+const ArchitectureRevisionMeta = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+
+  strong,
+  span {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    padding: 4px 7px;
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 7px;
+    background: rgba(15, 23, 42, 0.44);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  strong {
+    color: rgba(240, 253, 250, 0.92);
+    border-color: rgba(45, 212, 191, 0.16);
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.74);
+  }
+`;
+
+const ArchitectureRevisionSource = styled.pre`
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.86);
+  background: rgba(2, 6, 23, 0.55);
+  font-family: "SFMono-Regular", "Cascadia Code", "Roboto Mono", monospace;
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+`;
+
+const ArchitectureRevisionActions = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const ArchitectureRevisionRestoreNote = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  color: rgba(254, 202, 202, 0.82);
+  font-size: 10px;
+  font-weight: 800;
 `;
 
 const ArchitectureEditorBody = styled.div`

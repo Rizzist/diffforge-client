@@ -4857,6 +4857,83 @@ function workspaceArchitectureGraphListEntry(repoPath, patch = {}) {
   };
 }
 
+function workspaceArchitectureGraphId(graph) {
+  return graphText(graph?.id || graph?.architectureId || graph?.architecture_id || graph?.graphId || graph?.graph_id);
+}
+
+function workspaceArchitectureGraphUpdatedMs(graph) {
+  const raw = graph?.updatedAt || graph?.updated_at || graph?.createdAt || graph?.created_at || 0;
+  const number = Number(raw);
+  if (Number.isFinite(number) && number > 0) return number;
+  const parsed = Date.parse(String(raw || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function workspaceArchitectureGraphContentHash(graph) {
+  return graphText(graph?.contentHash || graph?.content_hash || graph?.hash);
+}
+
+function workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs) {
+  const merged = new Map();
+  jsonArray(localGraphs).forEach((graph) => {
+    const graphId = workspaceArchitectureGraphId(graph);
+    if (!graphId) return;
+    merged.set(graphId, {
+      ...graph,
+      id: graphId,
+      cloudAvailable: false,
+      cloudNeedsHydration: false,
+      hydrated: true,
+      localAvailable: true,
+    });
+  });
+
+  jsonArray(cloudGraphs).forEach((cloudGraph) => {
+    const graphId = workspaceArchitectureGraphId(cloudGraph);
+    if (!graphId) return;
+    const existing = merged.get(graphId);
+    const cloudHash = workspaceArchitectureGraphContentHash(cloudGraph);
+    const localHash = workspaceArchitectureGraphContentHash(existing);
+    const cloudUpdatedMs = workspaceArchitectureGraphUpdatedMs(cloudGraph);
+    const localUpdatedMs = workspaceArchitectureGraphUpdatedMs(existing);
+    const cloudNewer = !existing
+      || (cloudUpdatedMs && localUpdatedMs && cloudUpdatedMs > localUpdatedMs)
+      || (cloudHash && localHash && cloudHash !== localHash);
+    if (!existing) {
+      merged.set(graphId, {
+        ...cloudGraph,
+        id: graphId,
+        cloudAvailable: true,
+        cloudGraph,
+        cloudNeedsHydration: true,
+        cloudOnly: true,
+        hydrated: false,
+        localAvailable: false,
+      });
+      return;
+    }
+    merged.set(graphId, {
+      ...existing,
+      ...(cloudNewer ? {
+        title: graphText(cloudGraph.title, existing.title),
+        updatedAt: cloudGraph.updatedAt || cloudGraph.updated_at || existing.updatedAt,
+        updated_at: cloudGraph.updated_at || cloudGraph.updatedAt || existing.updated_at,
+      } : {}),
+      cloudAvailable: true,
+      cloudContentHash: cloudHash,
+      cloudGraph,
+      cloudNeedsHydration: cloudNewer,
+      cloudUpdatedAt: cloudGraph.updatedAt || cloudGraph.updated_at || "",
+      hydrated: !cloudNewer,
+      localAvailable: true,
+    });
+  });
+
+  return Array.from(merged.values()).sort((left, right) => (
+    workspaceArchitectureGraphUpdatedMs(right) - workspaceArchitectureGraphUpdatedMs(left)
+  ) || graphText(left.title).localeCompare(graphText(right.title)));
+}
+
 function workspaceArchitectureScanWithGraphCount(scan, repoPath, graphCount) {
   if (!scan || typeof scan !== "object") return scan;
   const repoKey = workspaceArchitectureRepoKey(repoPath);
@@ -6224,10 +6301,29 @@ export default function App() {
       return next;
     });
 
-    return invoke("architecture_graphs_list", { repoPath: safeRepoPath })
-      .then((result) => {
-        const graphs = Array.isArray(result?.graphs) ? result.graphs : [];
+    const workspaceName = graphText(options.workspaceName || options.workspace_name);
+    const localListPromise = invoke("architecture_graphs_list", { repoPath: safeRepoPath });
+    const cloudListPromise = invoke("cloud_mcp_get_workspace_architectures", {
+      repoPath: safeRepoPath,
+      workspaceId: safeWorkspaceId,
+      workspaceName,
+    }).catch(() => null);
+
+    return Promise.all([localListPromise, cloudListPromise])
+      .then(([result, cloudResult]) => {
+        const localGraphs = Array.isArray(result?.graphs) ? result.graphs : [];
+        const cloudGraphs = jsonArray(cloudResult?.graphs || cloudResult?.architectures);
+        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
         const completedAt = Date.now();
+        if (localGraphs.length) {
+          invoke("cloud_mcp_sync_workspace_architectures", {
+            graphs: localGraphs,
+            reason: options.reason || "workspace_architecture_graph_list_sync",
+            repoPath: safeRepoPath,
+            workspaceId: safeWorkspaceId,
+            workspaceName,
+          }).catch(() => {});
+        }
         setWorkspaceGraphState((current) => {
           const previous = current[stateKey] || {};
           const previousLists = previous.architectureGraphLists || {};
@@ -14721,6 +14817,7 @@ export default function App() {
       .map((architectureRepoPath, index) => window.setTimeout(() => {
         refreshWorkspaceArchitectureGraphList(workspaceId, architectureRepoPath, {
           reason: "workspace_architecture_graph_list_preload",
+          workspaceName: activatedWorkspaceNameForGraphSync,
           workspaceRootDirectory: repoPath,
         }).catch(() => {});
       }, index * WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS));
@@ -14732,6 +14829,7 @@ export default function App() {
     activatedArchitectureRepositoryScanSnapshot,
     activatedArchitectureRepositoryScanState,
     activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceNameForGraphSync,
     activatedWorkspaceTerminalWorkingDirectory,
     refreshWorkspaceArchitectureGraphList,
     setWorkspaceArchitectureSelection,
@@ -14775,6 +14873,7 @@ export default function App() {
         refresh: true,
         reason: "workspace_architecture_graph_list_background_refresh",
         silent: true,
+        workspaceName: activatedWorkspaceNameForGraphSync,
         workspaceRootDirectory: repoPath,
       }).catch(() => {});
     }, WORKSPACE_ARCHITECTURE_GRAPH_LIST_REFRESH_MS);
@@ -14785,6 +14884,7 @@ export default function App() {
     activatedArchitectureRepositoryScanState,
     activatedWorkspaceGraphState.architectureSelectedRepoPath,
     activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceNameForGraphSync,
     activatedWorkspaceTerminalWorkingDirectory,
     refreshWorkspaceArchitectureGraphList,
   ]);
@@ -14846,11 +14946,13 @@ export default function App() {
     }
     return refreshWorkspaceArchitectureGraphList(selectedWorkspace.id, architectureRepoPath, {
       ...options,
+      workspaceName: selectedWorkspace.name || "",
       workspaceRootDirectory: selectedWorkspaceFileRoot,
     });
   }, [
     refreshWorkspaceArchitectureGraphList,
     selectedWorkspace?.id,
+    selectedWorkspace?.name,
     selectedWorkspaceFileRoot,
   ]);
   const updateSelectedWorkspaceArchitectureSelection = useCallback((selection = {}) => {

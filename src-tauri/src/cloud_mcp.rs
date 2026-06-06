@@ -24,6 +24,8 @@ const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT: &str = "cloud-mcp-task-history-updated";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
+const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
+    "cloud-mcp-workspace-architectures-updated";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
@@ -2863,6 +2865,13 @@ async fn cloud_mcp_start_remote_command_listener(
                     continue;
                 }
             }
+            if cloud_mcp_is_workspace_architecture_wake_event(&event_kind, &event) {
+                let _ = app.emit(
+                    CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT,
+                    event.clone(),
+                );
+                continue;
+            }
             if cloud_mcp_is_voice_plan_result_event(&event_kind) {
                 let result = event
                     .get("result")
@@ -2953,6 +2962,29 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
     event
         .get("data")
         .and_then(|data| data.get("workspace_todos").or_else(|| data.get("workspaceTodos")))
+        .is_some()
+}
+
+fn cloud_mcp_is_workspace_architecture_wake_event(event_kind: &str, event: &Value) -> bool {
+    if matches!(
+        event_kind,
+        "workspace_architecture_snapshot"
+            | "workspace_architectures_snapshot"
+            | "workspace_architecture_updated"
+            | "workspace_architecture_graph_updated"
+            | "architecture_graph_updated"
+    ) {
+        return true;
+    }
+    if event_kind != "live_runtime_snapshot" {
+        return false;
+    }
+    event
+        .get("data")
+        .and_then(|data| {
+            data.get("workspace_architectures")
+                .or_else(|| data.get("workspaceArchitectures"))
+        })
         .is_some()
 }
 
@@ -4995,6 +5027,8 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/context/pack" => Some("context_pack"),
         "/v1/task/history" => Some("task_history"),
         "/v1/workspace/todos/hydrate" => Some("workspace_todo_hydrate"),
+        "/v1/workspace/architectures/list" => Some("workspace_architectures_list"),
+        "/v1/workspace/architectures/hydrate" => Some("workspace_architecture_hydrate"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -5122,6 +5156,8 @@ fn cloud_mcp_post_log_context(
         "/v1/context/pack" => "cloud_get_context_pack",
         "/v1/task/history" => "cloud_get_task_history",
         "/v1/workspace/todos/hydrate" => "cloud_hydrate_workspace_todos",
+        "/v1/workspace/architectures/list" => "cloud_get_workspace_architectures",
+        "/v1/workspace/architectures/hydrate" => "cloud_hydrate_workspace_architecture",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -10313,6 +10349,297 @@ async fn cloud_mcp_update_voice_plan_steps(
         ),
     }
     result
+}
+
+fn cloud_mcp_architecture_payload_base(
+    req: &CloudMcpRepoRequest,
+    workspace_id: &str,
+    workspace_name: Option<&str>,
+    reason: &str,
+) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut payload = json!({
+        "source": "rust-diffforge-architecture",
+        "reason": reason,
+        "repo_id": req.repo_id,
+        "repoId": req.repo_id,
+        "repo_path": req.root_display,
+        "repoPath": req.root_display,
+        "workspace_root": req.root_display,
+        "workspaceRoot": req.root_display,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name.unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machineId": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
+    cloud_mcp_apply_git_identity_to_value(&mut payload, &identity);
+    payload
+}
+
+fn cloud_mcp_architecture_graphs_payload(value: Value) -> Vec<Value> {
+    if let Some(items) = value.as_array() {
+        return items.clone();
+    }
+    for key in ["graphs", "architectures", "items"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            return items.clone();
+        }
+    }
+    value
+        .get("graph")
+        .or_else(|| value.get("architecture"))
+        .or_else(|| value.get("item"))
+        .filter(|item| item.is_object())
+        .cloned()
+        .or_else(|| value.is_object().then(|| value.clone()))
+        .into_iter()
+        .collect()
+}
+
+fn cloud_mcp_architecture_refs_array(value: &Value) -> Vec<Value> {
+    if let Some(items) = value.as_array() {
+        return items.clone();
+    }
+    for key in ["refs", "graphs", "architectures", "items"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            return items.clone();
+        }
+    }
+    value
+        .get("ref")
+        .or_else(|| value.get("graph"))
+        .or_else(|| value.get("architecture"))
+        .or_else(|| value.get("item"))
+        .filter(|item| item.is_object())
+        .cloned()
+        .or_else(|| value.is_object().then(|| value.clone()))
+        .into_iter()
+        .collect()
+}
+
+fn cloud_mcp_prepare_architecture_graph(mut graph: Value) -> Value {
+    let hash = graph
+        .get("contentHash")
+        .or_else(|| graph.get("content_hash"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            graph
+                .get("source")
+                .and_then(Value::as_str)
+                .map(architecture_content_hash)
+        });
+    if let Some(object) = graph.as_object_mut() {
+        if let Some(hash) = hash {
+            object
+                .entry("contentHash".to_string())
+                .or_insert_with(|| json!(hash.clone()));
+            object
+                .entry("content_hash".to_string())
+                .or_insert_with(|| json!(hash.clone()));
+            object
+                .entry("contentRevision".to_string())
+                .or_insert_with(|| json!(hash.clone()));
+            object
+                .entry("content_revision".to_string())
+                .or_insert_with(|| json!(hash));
+        }
+        object
+            .entry("sourceFormat".to_string())
+            .or_insert_with(|| json!("eraserDsl"));
+        object
+            .entry("source_format".to_string())
+            .or_insert_with(|| json!("eraserDsl"));
+    }
+    graph
+}
+
+fn cloud_mcp_architecture_hydrated_graph(mut item: Value) -> Option<Value> {
+    let source = cloud_mcp_payload_text(&item, &["source", "source_text", "sourceText"])?;
+    let graph_id = cloud_mcp_payload_text(
+        &item,
+        &[
+            "id",
+            "architecture_id",
+            "architectureId",
+            "graph_id",
+            "graphId",
+        ],
+    )?;
+    let object = item.as_object_mut()?;
+    object.insert("id".to_string(), json!(graph_id));
+    object.insert("source".to_string(), json!(source));
+    object
+        .entry("sourceFormat".to_string())
+        .or_insert_with(|| json!("eraserDsl"));
+    object
+        .entry("source_format".to_string())
+        .or_insert_with(|| json!("eraserDsl"));
+    Some(item)
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_workspace_architectures(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let payload = cloud_mcp_architecture_payload_base(
+        &req,
+        workspace_id.as_deref().unwrap_or_default(),
+        workspace_name.as_deref(),
+        "architecture_index_pull",
+    );
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/list", &payload)
+            .await?;
+    Ok(response.get("data").cloned().unwrap_or(response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_workspace_architectures(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    graphs: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path,
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = cloud_mcp_architecture_payload_base(
+        &req,
+        &workspace_id,
+        workspace_name.as_deref(),
+        reason.as_deref().unwrap_or("architecture_index_sync"),
+    );
+    let graph_items = cloud_mcp_architecture_graphs_payload(graphs)
+        .into_iter()
+        .map(cloud_mcp_prepare_architecture_graph)
+        .collect::<Vec<_>>();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "event_kind".to_string(),
+            json!("workspace_architecture_snapshot"),
+        );
+        object.insert("graphs".to_string(), json!(graph_items.clone()));
+        object.insert("architectures".to_string(), json!(graph_items));
+        object.insert("content_transport".to_string(), json!("refs"));
+        object.insert("contentTransport".to_string(), json!("refs"));
+    }
+    cloud_mcp_post_event_endpoint(state.inner(), "workspace_architecture_snapshot", &payload).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_workspace_architecture(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    graph: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path,
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let mut payload = cloud_mcp_architecture_payload_base(
+        &req,
+        &workspace_id,
+        workspace_name.as_deref(),
+        reason.as_deref().unwrap_or("architecture_graph_save"),
+    );
+    let graph = cloud_mcp_prepare_architecture_graph(graph);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "event_kind".to_string(),
+            json!("workspace_architecture_updated"),
+        );
+        object.insert("graph".to_string(), graph.clone());
+        object.insert("graphs".to_string(), json!([graph.clone()]));
+        object.insert("architecture".to_string(), graph.clone());
+        object.insert("architectures".to_string(), json!([graph]));
+        object.insert("content_transport".to_string(), json!("inline"));
+        object.insert("contentTransport".to_string(), json!("inline"));
+    }
+    cloud_mcp_post_event_endpoint(state.inner(), "workspace_architecture_updated", &payload).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_hydrate_workspace_architecture(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    refs: Value,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(repo_path.clone(), workspace_id.clone(), workspace_name.clone());
+    let refs_array = cloud_mcp_architecture_refs_array(&refs);
+    if refs_array.is_empty() {
+        return Ok(json!({
+            "kind": "workspace_architecture_hydration",
+            "items": [],
+            "missing": [],
+            "hydratedCount": 0,
+            "hydrated_count": 0,
+        }));
+    }
+    let mut payload = cloud_mcp_architecture_payload_base(
+        &req,
+        workspace_id.as_deref().unwrap_or_default(),
+        workspace_name.as_deref(),
+        "architecture_content_hydrate",
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("refs".to_string(), json!(refs_array));
+    }
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/hydrate", &payload)
+            .await?;
+    let mut data = response.get("data").cloned().unwrap_or(response);
+    let hydrated_items = data
+        .get("items")
+        .or_else(|| data.get("graphs"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut saved_items = Vec::new();
+    for item in hydrated_items {
+        let Some(graph) = cloud_mcp_architecture_hydrated_graph(item.clone()) else {
+            saved_items.push(item);
+            continue;
+        };
+        let repo_for_write = repo_path.clone();
+        let saved = tauri::async_runtime::spawn_blocking(move || {
+            architecture_graph_write_cloud_arch_blocking(repo_for_write, graph)
+        })
+        .await
+        .map_err(|error| format!("Architecture hydration worker failed: {error}"))??;
+        saved_items.push(saved.graph);
+    }
+    if let Some(object) = data.as_object_mut() {
+        let saved_count = saved_items.len();
+        object.insert("items".to_string(), json!(saved_items.clone()));
+        object.insert("graphs".to_string(), json!(saved_items));
+        object.insert("hydrated_count".to_string(), json!(saved_count));
+        object.insert("hydratedCount".to_string(), json!(saved_count));
+    }
+    Ok(data)
 }
 
 #[tauri::command]
