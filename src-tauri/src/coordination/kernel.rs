@@ -62,7 +62,12 @@ const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__get_server_status",
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
+    "secrets__list",
+    "secrets__get",
+    "secrets__write_env_file",
 ];
+const WORKSPACE_MCP_SECRETS_TOOLS: &[&str] =
+    &["secrets__list", "secrets__get", "secrets__write_env_file"];
 const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
 const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
 const WORKTREE_DIFF_UNTRACKED_MAX_BYTES: u64 = 1_000_000;
@@ -380,6 +385,30 @@ fn required_json_text<'a>(input: &'a Value, key: &str) -> Result<&'a str, String
         .ok_or_else(|| format!("{key} is required."))
 }
 
+fn workspace_mcp_secret_key(value: &str) -> Result<String, String> {
+    let key = required_trimmed(value, "key")?.to_ascii_uppercase();
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err("key is required.".to_string());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(
+            "Secret keys must be env-style names using letters, numbers, and underscores."
+                .to_string(),
+        );
+    }
+    Ok(key)
+}
+
+fn workspace_mcp_secret_public_row(mut row: Value) -> Value {
+    row["available"] = json!(row["available"].as_i64().unwrap_or_default() != 0);
+    row["agent_access_enabled"] =
+        json!(row["agent_access_enabled"].as_i64().unwrap_or_default() != 0);
+    row
+}
+
 fn json_text_or_default(value: Option<&Value>, default: Value) -> Result<String, String> {
     match value {
         Some(value) if !value.is_null() => serde_json::to_string(value),
@@ -612,6 +641,50 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
         "last_probe_message": health["spawn_probe"]["error"].clone(),
         "agent_visibility": workspace_mcp_visibility(true, true, client_mount_summary, true),
         "runtime_note": "Always mounted as a required Diff Forge coordination server.",
+    })
+}
+
+fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value) -> Value {
+    let readable_count = secrets
+        .iter()
+        .filter(|secret| secret["agent_access_enabled"].as_bool() == Some(true))
+        .count();
+    json!({
+        "id": "secrets",
+        "server_key": "secrets",
+        "name": "Secrets MCP",
+        "description": "Built-in local workspace secrets for coding agents.",
+        "built_in": true,
+        "secrets_builtin": true,
+        "toggleable": false,
+        "source_kind": "built_in",
+        "source_label": "Diff Forge",
+        "package_ref": "local-only",
+        "version": "",
+        "transport": "stdio",
+        "command": "internal",
+        "args_json": [],
+        "url": Value::Null,
+        "env_schema_json": [],
+        "config_values_json": {},
+        "missing_required_config": [],
+        "tools_json": WORKSPACE_MCP_SECRETS_TOOLS,
+        "install_state": "installed",
+        "workspace_enabled": true,
+        "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+        "agent_config_access_enabled": true,
+        "agent_secret_config_access_enabled": true,
+        "agent_env_file_write_enabled": true,
+        "status": "healthy",
+        "badge_state": "enabled",
+        "config_status": "configured",
+        "last_probe_status": "healthy",
+        "last_probe_message": "Local-only workspace secrets are available through the gateway.",
+        "agent_visibility": workspace_mcp_visibility(true, true, client_mount_summary, true),
+        "runtime_note": "Local-only built-in secrets vault. Values are not synced to Cloud.",
+        "secret_count": secrets.len(),
+        "agent_readable_secret_count": readable_count,
+        "secrets": secrets,
     })
 }
 
@@ -7381,8 +7454,13 @@ impl CoordinationKernel {
              ORDER BY workspace_enabled DESC, name ASC",
             &[&workspace_id],
         )?;
+        let secret_rows = self.workspace_mcp_secret_public_rows(workspace_id)?;
 
         let mut servers = vec![coordination_workspace_mcp_server(&coordination_status)];
+        servers.push(workspace_mcp_secrets_server(
+            &secret_rows,
+            &client_mount_summary,
+        ));
         for row in installed_rows {
             servers.push(workspace_mcp_public_server(row, &client_mount_summary));
         }
@@ -7417,6 +7495,240 @@ impl CoordinationKernel {
                 "active_agent_count": active_agent_count,
             },
             "coordination_kernel": coordination_status,
+        }))
+    }
+
+    fn workspace_mcp_secret_public_rows(&self, workspace_id: &str) -> Result<Vec<Value>, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let rows = self.query_json(
+            "SELECT id,
+                    workspace_id,
+                    key,
+                    label,
+                    description,
+                    CASE WHEN TRIM(value) <> '' THEN 1 ELSE 0 END AS available,
+                    agent_access_enabled,
+                    created_at,
+                    updated_at,
+                    last_used_at
+             FROM workspace_mcp_secrets
+             WHERE workspace_id=?1
+             ORDER BY key ASC",
+            &[&workspace_id],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(workspace_mcp_secret_public_row)
+            .collect())
+    }
+
+    pub fn workspace_mcp_secrets(&self, workspace_id: &str) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let secrets = self.workspace_mcp_secret_public_rows(workspace_id)?;
+        let readable_count = secrets
+            .iter()
+            .filter(|secret| secret["agent_access_enabled"].as_bool() == Some(true))
+            .count();
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "secrets": secrets,
+            "summary": {
+                "secret_count": secrets.len(),
+                "agent_readable_secret_count": readable_count,
+            },
+        }))
+    }
+
+    pub fn upsert_workspace_mcp_secret(
+        &self,
+        workspace_id: &str,
+        input: &Value,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let key = workspace_mcp_secret_key(required_json_text(input, "key")?)?;
+        let existing = self
+            .query_json(
+                "SELECT * FROM workspace_mcp_secrets WHERE workspace_id=?1 AND key=?2",
+                &[&workspace_id, &key],
+            )?
+            .into_iter()
+            .next();
+        let value_input = input["value"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+        let value = match (value_input, existing.as_ref()) {
+            (Some(value), _) => value,
+            (None, Some(row)) => row["value"].as_str().unwrap_or_default().to_string(),
+            (None, None) => {
+                return Err("Secret value is required for a new workspace secret.".to_string());
+            }
+        };
+        let label = input["label"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|row| row["label"].as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| key.clone());
+        let description = if input.get("description").is_some() {
+            input["description"]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        } else {
+            existing
+                .as_ref()
+                .and_then(|row| row["description"].as_str().map(str::to_string))
+        };
+        let agent_access_enabled = input["agent_access_enabled"]
+            .as_bool()
+            .map(bool_i64)
+            .or_else(|| input["agent_access_enabled"].as_i64())
+            .unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|row| row["agent_access_enabled"].as_i64())
+                    .unwrap_or_default()
+            });
+        let id = existing
+            .as_ref()
+            .and_then(|row| row["id"].as_str().map(str::to_string))
+            .unwrap_or_else(uuid);
+        let created_at = existing
+            .as_ref()
+            .and_then(|row| row["created_at"].as_str().map(str::to_string))
+            .unwrap_or_else(now_rfc3339);
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_secrets(
+                    id, workspace_id, key, label, description, value,
+                    agent_access_enabled, created_at, updated_at
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(workspace_id, key) DO UPDATE SET
+                    label=excluded.label,
+                    description=excluded.description,
+                    value=excluded.value,
+                    agent_access_enabled=excluded.agent_access_enabled,
+                    updated_at=excluded.updated_at",
+                params![
+                    id,
+                    workspace_id,
+                    key,
+                    label,
+                    description,
+                    value,
+                    agent_access_enabled,
+                    created_at,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to save workspace MCP secret: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_secret_saved",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "key": key,
+                "agent_access_enabled": agent_access_enabled != 0,
+            }),
+        )?;
+        self.workspace_mcp_secrets(workspace_id)
+    }
+
+    pub fn delete_workspace_mcp_secret(
+        &self,
+        workspace_id: &str,
+        secret_id: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let secret_id = required_trimmed(secret_id, "secret_id")?;
+        let row = self
+            .query_json(
+                "SELECT key FROM workspace_mcp_secrets WHERE workspace_id=?1 AND id=?2",
+                &[&workspace_id, &secret_id],
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Workspace MCP secret does not exist.".to_string())?;
+        self.conn
+            .execute(
+                "DELETE FROM workspace_mcp_secrets WHERE workspace_id=?1 AND id=?2",
+                params![workspace_id, secret_id],
+            )
+            .map_err(|error| format!("Unable to delete workspace MCP secret: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_secret_deleted",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "key": row["key"].clone(),
+            }),
+        )?;
+        self.workspace_mcp_secrets(workspace_id)
+    }
+
+    pub fn read_workspace_mcp_secret_for_agent(
+        &self,
+        workspace_id: &str,
+        key: &str,
+    ) -> Result<Value, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let key = workspace_mcp_secret_key(key)?;
+        let row = self
+            .query_json(
+                "SELECT * FROM workspace_mcp_secrets
+                 WHERE workspace_id=?1 AND key=?2",
+                &[&workspace_id, &key],
+            )?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("Workspace MCP secret `{key}` does not exist."))?;
+        if row["agent_access_enabled"].as_i64().unwrap_or_default() == 0 {
+            return Err(format!(
+                "Workspace MCP secret `{key}` is not enabled for agent access."
+            ));
+        }
+        let value = row["value"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("Workspace MCP secret `{key}` has no value."))?
+            .to_string();
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE workspace_mcp_secrets
+                 SET last_used_at=?1
+                 WHERE workspace_id=?2 AND key=?3",
+                params![now, workspace_id, key],
+            )
+            .map_err(|error| format!("Unable to record workspace MCP secret usage: {error}"))?;
+        self.emit_event(
+            "workspace_mcp_secret_used",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "key": key,
+            }),
+        )?;
+        Ok(json!({
+            "key": row["key"].clone(),
+            "label": row["label"].clone(),
+            "description": row["description"].clone(),
+            "value": value,
+            "secret": true,
         }))
     }
 

@@ -789,6 +789,9 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__get_server_status",
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
+    "secrets__list",
+    "secrets__get",
+    "secrets__write_env_file",
 ];
 
 fn append_codex_mcp_server_config_args(
@@ -1116,6 +1119,9 @@ fn claude_auto_approved_tools_arg(
             "workspace_mcp__get_server_status",
             "workspace_mcp__get_server_config",
             "workspace_mcp__write_env_file",
+            "secrets__list",
+            "secrets__get",
+            "secrets__write_env_file",
         ]
         .into_iter()
         .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),

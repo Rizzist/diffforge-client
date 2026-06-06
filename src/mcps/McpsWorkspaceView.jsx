@@ -54,6 +54,7 @@ const VIEW_MARKETPLACES = "marketplaces";
 const EDITOR_DETAILS = "details";
 const EDITOR_MANUAL = "manual";
 const EDITOR_MARKETPLACE = "marketplace";
+const SECRETS_SERVER_KEY = "secrets";
 const APPROVAL_ALWAYS_ALLOW = "always_allow";
 const APPROVAL_PROMPT = "prompt";
 
@@ -89,6 +90,15 @@ const EMPTY_MARKETPLACE = {
   provider: "claude",
   command: "",
   scope: "workspace",
+};
+
+const EMPTY_SECRET_DRAFT = {
+  id: "",
+  key: "",
+  label: "",
+  description: "",
+  value: "",
+  agentAccessEnabled: false,
 };
 
 const PROVIDER_OPTIONS = [
@@ -357,6 +367,10 @@ function booleanSetting(server, key, fallback = true) {
   return Boolean(server[key]);
 }
 
+function isSecretsServer(server) {
+  return server?.server_key === SECRETS_SERVER_KEY || server?.id === SECRETS_SERVER_KEY;
+}
+
 function actionCopy(actionState, context = {}) {
   const name = context.name || context.source || "MCP";
   switch (actionState) {
@@ -414,6 +428,16 @@ function actionCopy(actionState, context = {}) {
       return {
         title: `Uninstalling ${name}`,
         detail: "Removing the MCP from this workspace and refreshing the registry.",
+      };
+    case "saving_secret":
+      return {
+        title: `Saving ${name}`,
+        detail: "Updating the local workspace secret vault.",
+      };
+    case "deleting_secret":
+      return {
+        title: `Deleting ${name}`,
+        detail: "Removing the local workspace secret.",
       };
     case "refreshing":
     case "loading":
@@ -790,6 +814,7 @@ export default function McpsWorkspaceView({
   const [configDraft, setConfigDraft] = useState({});
   const [manualDraft, setManualDraft] = useState(EMPTY_MANUAL);
   const [marketplaceDraft, setMarketplaceDraft] = useState(EMPTY_MARKETPLACE);
+  const [secretDraft, setSecretDraft] = useState(EMPTY_SECRET_DRAFT);
   const [actionState, setActionState] = useState("idle");
   const [actionContext, setActionContext] = useState({});
   const selectedIdRef = useRef(selectedId);
@@ -874,6 +899,9 @@ export default function McpsWorkspaceView({
   useEffect(() => {
     if (selectedServer) {
       setConfigDraft(configValuesFromServer(selectedServer));
+      if (!isSecretsServer(selectedServer)) {
+        setSecretDraft(EMPTY_SECRET_DRAFT);
+      }
     }
   }, [selectedServer?.id]);
 
@@ -1138,6 +1166,99 @@ export default function McpsWorkspaceView({
     }
   }, [beginAction, commandBase, finishAction, replaceRegistry, selectedServer, workspaceId]);
 
+  const saveSecret = useCallback(async () => {
+    const key = secretDraft.key.trim();
+    if (!workspaceId || !key) return;
+    if (!secretDraft.id && !secretDraft.value) return;
+    beginAction("saving_secret", { name: key });
+    setError("");
+    try {
+      const response = await invoke("coordination_upsert_workspace_mcp_secret", {
+        ...commandBase,
+        workspaceId,
+        workspaceName,
+        input: {
+          key,
+          label: secretDraft.label.trim(),
+          description: secretDraft.description.trim(),
+          value: secretDraft.value,
+          agent_access_enabled: secretDraft.agentAccessEnabled,
+        },
+      });
+      const data = replaceRegistry(response);
+      const secretsServer = asArray(data.servers).find(isSecretsServer);
+      setSelectedId(secretsServer?.id || SECRETS_SERVER_KEY);
+      setSecretDraft(EMPTY_SECRET_DRAFT);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      finishAction();
+    }
+  }, [beginAction, commandBase, finishAction, replaceRegistry, secretDraft, workspaceId, workspaceName]);
+
+  const editSecret = useCallback((secret) => {
+    setSecretDraft({
+      id: secret?.id || "",
+      key: secret?.key || "",
+      label: secret?.label || "",
+      description: secret?.description || "",
+      value: "",
+      agentAccessEnabled: Boolean(secret?.agent_access_enabled),
+    });
+  }, []);
+
+  const toggleSecretAccess = useCallback(
+    async (secret) => {
+      if (!workspaceId || !secret?.key) return;
+      beginAction("saving_secret", { name: secret.key });
+      setError("");
+      try {
+        const response = await invoke("coordination_upsert_workspace_mcp_secret", {
+          ...commandBase,
+          workspaceId,
+          workspaceName,
+          input: {
+            key: secret.key,
+            label: secret.label || "",
+            description: secret.description || "",
+            agent_access_enabled: !Boolean(secret.agent_access_enabled),
+          },
+        });
+        replaceRegistry(response);
+      } catch (caught) {
+        setError(errorMessage(caught));
+      } finally {
+        finishAction();
+      }
+    },
+    [beginAction, commandBase, finishAction, replaceRegistry, workspaceId, workspaceName],
+  );
+
+  const deleteSecret = useCallback(
+    async (secret) => {
+      if (!workspaceId || !secret?.id) return;
+      beginAction("deleting_secret", { name: secret.key || "Secret" });
+      setError("");
+      try {
+        const response = await invoke("coordination_delete_workspace_mcp_secret", {
+          ...commandBase,
+          workspaceId,
+          workspaceName,
+          secretId: secret.id,
+        });
+        replaceRegistry(response);
+        if (secretDraft.id === secret.id) {
+          setSecretDraft(EMPTY_SECRET_DRAFT);
+        }
+      } catch (caught) {
+        setError(errorMessage(caught));
+      } finally {
+        finishAction();
+      }
+    },
+    [beginAction, commandBase, finishAction, replaceRegistry, secretDraft.id, workspaceId, workspaceName],
+  );
+
   const renderInstalledList = () => (
     <McpServerList>
       {servers.map((server) => {
@@ -1153,7 +1274,11 @@ export default function McpsWorkspaceView({
             type="button"
           >
             <McpServerIcon data-state={statusInfo.state}>
-              <ButtonHubIcon aria-hidden="true" />
+              {isSecretsServer(server) ? (
+                <ButtonKeyIcon aria-hidden="true" />
+              ) : (
+                <ButtonHubIcon aria-hidden="true" />
+              )}
             </McpServerIcon>
             <McpServerCopy>
               <strong>{server.name}</strong>
@@ -1529,6 +1654,149 @@ export default function McpsWorkspaceView({
     </McpEditorPanel>
   );
 
+  const renderSecretsPanel = (server) => {
+    const secrets = asArray(server?.secrets);
+    const editing = Boolean(secretDraft.id);
+    const canSaveSecret =
+      Boolean(secretDraft.key.trim()) && (editing || Boolean(secretDraft.value));
+    return (
+      <McpAccessPanel>
+        <McpAccessTopline>
+          <span>
+            <ButtonKeyIcon aria-hidden="true" />
+            Secrets
+          </span>
+          <McpStatusBadge data-state={secrets.length ? "enabled" : "planned"}>
+            {secrets.length}
+          </McpStatusBadge>
+        </McpAccessTopline>
+        <McpFieldGrid>
+          <McpWideField>
+            <PanelKicker>Key</PanelKicker>
+            <McpInput
+              onChange={(event) =>
+                setSecretDraft((draft) => ({ ...draft, key: event.target.value }))
+              }
+              placeholder="APP_API_KEY"
+              value={secretDraft.key}
+            />
+          </McpWideField>
+          <McpWideField>
+            <PanelKicker>Label</PanelKicker>
+            <McpInput
+              onChange={(event) =>
+                setSecretDraft((draft) => ({ ...draft, label: event.target.value }))
+              }
+              value={secretDraft.label}
+            />
+          </McpWideField>
+          <McpWideField>
+            <PanelKicker>Description</PanelKicker>
+            <McpInput
+              onChange={(event) =>
+                setSecretDraft((draft) => ({ ...draft, description: event.target.value }))
+              }
+              value={secretDraft.description}
+            />
+          </McpWideField>
+          <McpWideField>
+            <PanelKicker>Value</PanelKicker>
+            <McpInput
+              onChange={(event) =>
+                setSecretDraft((draft) => ({ ...draft, value: event.target.value }))
+              }
+              placeholder={editing ? "Leave blank to keep existing value" : ""}
+              type="password"
+              value={secretDraft.value}
+            />
+          </McpWideField>
+        </McpFieldGrid>
+        <McpToolList>
+          <McpSwitchButton
+            aria-pressed={secretDraft.agentAccessEnabled ? "true" : "false"}
+            disabled={actionState !== "idle"}
+            onClick={() =>
+              setSecretDraft((draft) => ({
+                ...draft,
+                agentAccessEnabled: !draft.agentAccessEnabled,
+              }))
+            }
+            type="button"
+          >
+            <span aria-hidden="true" />
+            Agent readable
+          </McpSwitchButton>
+        </McpToolList>
+        <McpEditorActions>
+          <button
+            disabled={actionState !== "idle"}
+            onClick={() => setSecretDraft(EMPTY_SECRET_DRAFT)}
+            type="button"
+          >
+            Reset
+          </button>
+          <button
+            disabled={!canSaveSecret || actionState !== "idle"}
+            onClick={saveSecret}
+            type="button"
+          >
+            {buttonContent(actionState === "saving_secret", editing ? "Update Secret" : "Add Secret", "Saving")}
+          </button>
+        </McpEditorActions>
+        {secrets.length ? (
+          <McpServerList>
+            {secrets.map((secret) => {
+              const accessEnabled = Boolean(secret.agent_access_enabled);
+              const savingThis = actionState === "saving_secret" && actionContext.name === secret.key;
+              const deletingThis =
+                actionState === "deleting_secret" && actionContext.name === secret.key;
+              return (
+                <McpServerButton as="div" data-active="false" key={secret.id || secret.key}>
+                  <McpServerIcon data-state={accessEnabled ? "enabled" : "planned"}>
+                    <ButtonKeyIcon aria-hidden="true" />
+                  </McpServerIcon>
+                  <McpServerCopy>
+                    <strong>{secret.key}</strong>
+                    <span>
+                      {secret.label || "Secret"} ·{" "}
+                      {accessEnabled ? "agent readable" : "locked"} ·{" "}
+                      {secret.available ? "stored" : "missing"}
+                    </span>
+                  </McpServerCopy>
+                  <McpInlineActions>
+                    <button
+                      disabled={actionState !== "idle"}
+                      onClick={() => editSecret(secret)}
+                      type="button"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      disabled={actionState !== "idle"}
+                      onClick={() => toggleSecretAccess(secret)}
+                      type="button"
+                    >
+                      {buttonContent(savingThis, accessEnabled ? "Lock" : "Allow", "Saving")}
+                    </button>
+                    <button
+                      disabled={actionState !== "idle"}
+                      onClick={() => deleteSecret(secret)}
+                      type="button"
+                    >
+                      {buttonContent(deletingThis, "Delete", "Deleting")}
+                    </button>
+                  </McpInlineActions>
+                </McpServerButton>
+              );
+            })}
+          </McpServerList>
+        ) : (
+          <McpEmptyAccess>No local workspace secrets added.</McpEmptyAccess>
+        )}
+      </McpAccessPanel>
+    );
+  };
+
   const renderDetails = () => {
     if (!selectedServer) {
       return (
@@ -1560,6 +1828,7 @@ export default function McpsWorkspaceView({
       true,
     );
     const selectedTools = asArray(selectedServer.tools_json);
+    const selectedIsSecrets = isSecretsServer(selectedServer);
 
     return (
       <McpEditorPanel>
@@ -1729,61 +1998,65 @@ export default function McpsWorkspaceView({
           </McpAccessPanel>
         )}
 
-        <McpAccessPanel>
-          <McpAccessTopline>
-            <span>
-              <ButtonKeyIcon aria-hidden="true" />
-              Configuration
-            </span>
-            <McpStatusBadge data-state={missingRequired.length ? "blocked" : "enabled"}>
-              {missingRequired.length ? "Required" : "Ready"}
-            </McpStatusBadge>
-          </McpAccessTopline>
-          {asArray(selectedServer.env_schema_json).length ? (
-            <McpFieldGrid>
-              {asArray(selectedServer.env_schema_json).map((item) => {
-                const key = item.key || "";
-                const missing = item.required && !String(configDraft[key] || "").trim();
-                return (
-                  <McpWideField key={key}>
-                    <PanelKicker>
-                      {item.label || key} · {item.secret ? "secret" : "workspace"} ·{" "}
-                      {item.required ? "required" : "optional"}
-                    </PanelKicker>
-                    <McpInput
-                      data-state={missing ? "blocked" : "planned"}
-                      onChange={(event) =>
-                        setConfigDraft((draft) => ({ ...draft, [key]: event.target.value }))
-                      }
-                      type={item.secret ? "password" : "text"}
-                      value={configDraft[key] || ""}
-                    />
-                  </McpWideField>
-                );
-              })}
-            </McpFieldGrid>
-          ) : (
-            <McpEmptyAccess>No workspace configuration required.</McpEmptyAccess>
-          )}
-          {!selectedServer.built_in && (
-            <McpEditorActions>
-              <button
-                disabled={actionState !== "idle"}
-                onClick={() => setConfigDraft(configValuesFromServer(selectedServer))}
-                type="button"
-              >
-                Reset
-              </button>
-              <button
-                disabled={actionState !== "idle"}
-                onClick={() => updateSelected({ config_values: configDraft })}
-                type="button"
-              >
-                {buttonContent(actionState === "saving_config", "Save Config", "Saving")}
-              </button>
-            </McpEditorActions>
-          )}
-        </McpAccessPanel>
+        {selectedIsSecrets ? (
+          renderSecretsPanel(selectedServer)
+        ) : (
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonKeyIcon aria-hidden="true" />
+                Configuration
+              </span>
+              <McpStatusBadge data-state={missingRequired.length ? "blocked" : "enabled"}>
+                {missingRequired.length ? "Required" : "Ready"}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            {asArray(selectedServer.env_schema_json).length ? (
+              <McpFieldGrid>
+                {asArray(selectedServer.env_schema_json).map((item) => {
+                  const key = item.key || "";
+                  const missing = item.required && !String(configDraft[key] || "").trim();
+                  return (
+                    <McpWideField key={key}>
+                      <PanelKicker>
+                        {item.label || key} · {item.secret ? "secret" : "workspace"} ·{" "}
+                        {item.required ? "required" : "optional"}
+                      </PanelKicker>
+                      <McpInput
+                        data-state={missing ? "blocked" : "planned"}
+                        onChange={(event) =>
+                          setConfigDraft((draft) => ({ ...draft, [key]: event.target.value }))
+                        }
+                        type={item.secret ? "password" : "text"}
+                        value={configDraft[key] || ""}
+                      />
+                    </McpWideField>
+                  );
+                })}
+              </McpFieldGrid>
+            ) : (
+              <McpEmptyAccess>No workspace configuration required.</McpEmptyAccess>
+            )}
+            {!selectedServer.built_in && (
+              <McpEditorActions>
+                <button
+                  disabled={actionState !== "idle"}
+                  onClick={() => setConfigDraft(configValuesFromServer(selectedServer))}
+                  type="button"
+                >
+                  Reset
+                </button>
+                <button
+                  disabled={actionState !== "idle"}
+                  onClick={() => updateSelected({ config_values: configDraft })}
+                  type="button"
+                >
+                  {buttonContent(actionState === "saving_config", "Save Config", "Saving")}
+                </button>
+              </McpEditorActions>
+            )}
+          </McpAccessPanel>
+        )}
 
         <McpAccessPanel>
           <McpAccessTopline>

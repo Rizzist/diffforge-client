@@ -45,6 +45,9 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__get_server_status",
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
+    "secrets__list",
+    "secrets__get",
+    "secrets__write_env_file",
 ];
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
 
@@ -1109,6 +1112,20 @@ fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value
                 Err(error) => workspace_gateway_error_content(error),
             }
         }
+        "secrets__list" => match workspace_gateway_list_secrets(context) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "secrets__get" => match workspace_gateway_get_secret(context, &input) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "secrets__write_env_file" => {
+            match workspace_gateway_write_secrets_env_file(context, &input) {
+                Ok(result) => workspace_gateway_content(result),
+                Err(error) => workspace_gateway_error_content(error),
+            }
+        }
         _ => workspace_gateway_error_content(format!("Unknown gateway tool: {tool}")),
     }
 }
@@ -1165,6 +1182,15 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
         "workspace_mcp__write_env_file" => {
             "Write agent-visible workspace MCP configuration into an env file without returning secret values in the tool result."
         }
+        "secrets__list" => {
+            "List local-only workspace secret keys and metadata without returning secret values."
+        }
+        "secrets__get" => {
+            "Read one local-only workspace secret value. The secret must be explicitly enabled for agent access by the user."
+        }
+        "secrets__write_env_file" => {
+            "Write selected local-only workspace secrets into an env file without returning secret values in the tool result. Each secret must be enabled for agent access."
+        }
         _ => "Workspace MCP gateway tool.",
     }
 }
@@ -1196,6 +1222,36 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 }
             },
             "required": ["server_key"]
+        }),
+        "secrets__list" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }),
+        "secrets__get" => json!({
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Required local workspace secret key."}
+            },
+            "required": ["key"],
+            "additionalProperties": true
+        }),
+        "secrets__write_env_file" => json!({
+            "type": "object",
+            "properties": {
+                "keys": {
+                    "type": "array",
+                    "description": "Required local workspace secret keys to write.",
+                    "items": {"type": "string"},
+                    "minItems": 1
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Env file path relative to the agent worktree when available. Defaults to .env.local."
+                }
+            },
+            "required": ["keys"],
+            "additionalProperties": true
         }),
         _ => json!({"type": "object", "properties": {}}),
     }
@@ -1298,6 +1354,117 @@ fn workspace_gateway_write_env_file(context: &McpContext, input: &Value) -> Resu
     }))
 }
 
+fn workspace_gateway_list_secrets(context: &McpContext) -> Result<Value, String> {
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let secrets = kernel.workspace_mcp_secrets(&workspace_id)?;
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server_key": "secrets",
+        "secrets": secrets["secrets"].clone(),
+        "summary": secrets["summary"].clone(),
+        "values_returned": false,
+    }))
+}
+
+fn workspace_gateway_get_secret(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let key = input["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "key is required.".to_string())?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let secret = kernel.read_workspace_mcp_secret_for_agent(&workspace_id, key)?;
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server_key": "secrets",
+        "secret": secret,
+        "secret_values_returned": true,
+        "handling": "Use this value only for the requested local operation. Do not print it, checkpoint it, summarize it, or include it in todos, architecture files, patches, logs, or cloud payloads.",
+    }))
+}
+
+fn workspace_gateway_write_secrets_env_file(
+    context: &McpContext,
+    input: &Value,
+) -> Result<Value, String> {
+    let keys = workspace_gateway_secret_keys_from_input(input)?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let target = workspace_gateway_env_file_path(context, input["path"].as_str())?;
+    let mut updates = Vec::new();
+    for key in keys {
+        let secret = kernel.read_workspace_mcp_secret_for_agent(&workspace_id, &key)?;
+        let value = secret["value"].as_str().unwrap_or_default().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        updates.push(WorkspaceGatewayEnvUpdate {
+            key: secret["key"].as_str().unwrap_or(&key).to_string(),
+            source_key: secret["key"].as_str().unwrap_or(&key).to_string(),
+            value,
+            secret: true,
+        });
+    }
+    if updates.is_empty() {
+        return Err("No enabled workspace secrets are available to write.".to_string());
+    }
+    workspace_gateway_write_env_updates(&target, &updates)?;
+    let written = updates
+        .iter()
+        .map(|update| {
+            json!({
+                "key": update.key,
+                "source_key": update.source_key,
+                "secret": update.secret,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server_key": "secrets",
+        "path": target.display().to_string(),
+        "written": written,
+        "secret_values_returned": false,
+    }))
+}
+
+fn workspace_gateway_secret_keys_from_input(input: &Value) -> Result<Vec<String>, String> {
+    let mut keys = Vec::new();
+    if let Some(array) = input["keys"].as_array() {
+        keys.extend(
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if keys.is_empty() {
+        if let Some(key) = input["key"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            keys.push(key.to_string());
+        }
+    }
+    if keys.is_empty() {
+        return Err("keys is required.".to_string());
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
 fn workspace_gateway_config_access_summary(server: &Value) -> Value {
     json!({
         "non_secret_config_read_enabled": workspace_gateway_agent_config_access_enabled(server),
@@ -1307,18 +1474,26 @@ fn workspace_gateway_config_access_summary(server: &Value) -> Value {
 }
 
 fn workspace_gateway_agent_config_access_enabled(server: &Value) -> bool {
-    server["agent_config_access_enabled"].as_i64().unwrap_or(1) != 0
+    server["agent_config_access_enabled"]
+        .as_bool()
+        .unwrap_or_else(|| server["agent_config_access_enabled"].as_i64().unwrap_or(1) != 0)
 }
 
 fn workspace_gateway_agent_secret_config_access_enabled(server: &Value) -> bool {
     server["agent_secret_config_access_enabled"]
-        .as_i64()
-        .unwrap_or_default()
-        != 0
+        .as_bool()
+        .unwrap_or_else(|| {
+            server["agent_secret_config_access_enabled"]
+                .as_i64()
+                .unwrap_or_default()
+                != 0
+        })
 }
 
 fn workspace_gateway_agent_env_file_write_enabled(server: &Value) -> bool {
-    server["agent_env_file_write_enabled"].as_i64().unwrap_or(1) != 0
+    server["agent_env_file_write_enabled"]
+        .as_bool()
+        .unwrap_or_else(|| server["agent_env_file_write_enabled"].as_i64().unwrap_or(1) != 0)
 }
 
 fn workspace_gateway_config_variables(server: &Value, reveal_secrets: bool) -> Vec<Value> {
@@ -1570,6 +1745,8 @@ fn workspace_gateway_workspace_id(
         "SELECT workspace_id FROM workspace_mcp_servers
          UNION
          SELECT workspace_id FROM workspace_mcp_marketplaces
+         UNION
+         SELECT workspace_id FROM workspace_mcp_secrets
          ORDER BY workspace_id ASC",
         &[],
     )?;
@@ -1605,6 +1782,9 @@ fn workspace_gateway_server_by_key(
     workspace_id: &str,
     server_key: &str,
 ) -> Result<Option<Value>, String> {
+    if server_key == "secrets" {
+        return workspace_gateway_secrets_server_public(kernel, workspace_id).map(Some);
+    }
     let mut rows = kernel.query_json(
         "SELECT * FROM workspace_mcp_servers
          WHERE workspace_id=?1 AND server_key=?2 AND install_state='installed'
@@ -1625,6 +1805,8 @@ fn workspace_gateway_generation(
             SELECT updated_at FROM workspace_mcp_marketplaces WHERE workspace_id=?1
             UNION ALL
             SELECT updated_at FROM workspace_mcp_marketplace_indexes WHERE workspace_id=?1
+            UNION ALL
+            SELECT updated_at FROM workspace_mcp_secrets WHERE workspace_id=?1
          )",
         &[&workspace_id],
     )?;
@@ -1639,10 +1821,14 @@ fn workspace_gateway_manifest(context: &McpContext) -> Result<Value, String> {
     let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
     let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
     let servers = workspace_gateway_servers(&kernel, &workspace_id)?;
-    let public_servers = servers
+    let mut public_servers = servers
         .iter()
         .map(workspace_gateway_server_public)
         .collect::<Vec<_>>();
+    public_servers.insert(
+        0,
+        workspace_gateway_secrets_server_public(&kernel, &workspace_id)?,
+    );
     let enabled_count = public_servers
         .iter()
         .filter(|server| server["runtime_status"].as_str() == Some("enabled"))
@@ -1665,6 +1851,34 @@ fn workspace_gateway_manifest(context: &McpContext) -> Result<Value, String> {
             "config_required_count": config_required_count,
         },
         "servers": public_servers,
+    }))
+}
+
+fn workspace_gateway_secrets_server_public(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+) -> Result<Value, String> {
+    let secrets = kernel.workspace_mcp_secrets(workspace_id)?;
+    Ok(json!({
+        "id": "secrets",
+        "server_key": "secrets",
+        "name": "Secrets MCP",
+        "source_kind": "built_in",
+        "source_label": "Diff Forge",
+        "package_ref": "local-only",
+        "transport": "stdio",
+        "workspace_enabled": true,
+        "approval_policy": "always_allow",
+        "agent_config_access_enabled": true,
+        "agent_secret_config_access_enabled": true,
+        "agent_env_file_write_enabled": true,
+        "runtime_status": "enabled",
+        "missing_required_config": [],
+        "tool_namespace": "secrets",
+        "tool_prefix": "secrets__",
+        "tools": ["list", "get", "write_env_file"],
+        "secret_count": secrets["summary"]["secret_count"].clone(),
+        "agent_readable_secret_count": secrets["summary"]["agent_readable_secret_count"].clone(),
     }))
 }
 

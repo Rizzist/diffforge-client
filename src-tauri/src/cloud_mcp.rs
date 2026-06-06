@@ -9586,6 +9586,9 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
                     ],
                 )
                 .unwrap_or_else(|| format!("server-{}", index + 1));
+                if server_key == "secrets" {
+                    return None;
+                }
                 let name = cloud_mcp_payload_text(
                     server,
                     &["name", "label", "display_name", "displayName"],

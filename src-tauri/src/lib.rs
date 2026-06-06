@@ -3819,6 +3819,8 @@ pub fn run() {
             coordination::tauri_commands::coordination_install_workspace_mcp_server,
             coordination::tauri_commands::coordination_update_workspace_mcp_server,
             coordination::tauri_commands::coordination_uninstall_workspace_mcp_server,
+            coordination::tauri_commands::coordination_upsert_workspace_mcp_secret,
+            coordination::tauri_commands::coordination_delete_workspace_mcp_secret,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon,
             coordination::tauri_commands::coordination_activate_shared_mcp_daemon_background,
             coordination::tauri_commands::coordination_deactivate_shared_mcp_daemon,

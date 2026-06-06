@@ -37,6 +37,8 @@ pub const TERMINAL_TASK_PLAN_MIGRATION_VERSION: i64 = 16;
 pub const TERMINAL_TASK_PLAN_MIGRATION_NAME: &str = "coordination_kernel_terminal_task_plans";
 pub const TASK_SOURCE_TODO_REFS_MIGRATION_VERSION: i64 = 17;
 pub const TASK_SOURCE_TODO_REFS_MIGRATION_NAME: &str = "coordination_kernel_task_source_todo_refs";
+pub const WORKSPACE_MCP_SECRETS_MIGRATION_VERSION: i64 = 18;
+pub const WORKSPACE_MCP_SECRETS_MIGRATION_NAME: &str = "coordination_kernel_workspace_mcp_secrets";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -1053,4 +1055,23 @@ ON workspace_mcp_catalog_items(workspace_id, marketplace_id, name);
 
 CREATE INDEX IF NOT EXISTS idx_workspace_mcp_indexes_workspace
 ON workspace_mcp_marketplace_indexes(workspace_id, status);
+"#;
+
+pub const WORKSPACE_MCP_SECRETS_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_secrets(
+  id TEXT PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  label TEXT,
+  description TEXT,
+  value TEXT NOT NULL,
+  agent_access_enabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_used_at TEXT,
+  UNIQUE(workspace_id, key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_mcp_secrets_workspace
+ON workspace_mcp_secrets(workspace_id, key);
 "#;
