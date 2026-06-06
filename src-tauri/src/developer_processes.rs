@@ -851,6 +851,147 @@ fn developer_process_is_agent_root_noise(process: &DeveloperProcessInfo) -> bool
     developer_process_text_is_agent_root_noise(&text)
 }
 
+fn terminal_activity_event_string(event: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| event.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn terminal_activity_event_bool(event: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| event.get(*key).and_then(Value::as_bool).unwrap_or(false))
+}
+
+fn terminal_activity_event_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn terminal_activity_subagent_event_is_pending(event: &Value) -> bool {
+    let status = terminal_activity_event_key(&terminal_activity_event_string(
+        event,
+        &[
+            "permissionStatus",
+            "permission_status",
+            "approvalStatus",
+            "approval_status",
+            "status",
+        ],
+    ));
+    let decision = terminal_activity_event_key(&terminal_activity_event_string(
+        event,
+        &[
+            "permissionDecision",
+            "permission_decision",
+            "approvalDecision",
+            "approval_decision",
+            "decision",
+        ],
+    ));
+    let resolved = matches!(
+        decision.as_str(),
+        "allow"
+            | "allowed"
+            | "approve"
+            | "approved"
+            | "auto"
+            | "autoallow"
+            | "autoallowed"
+            | "autoapprove"
+            | "autoapproved"
+            | "deny"
+            | "denied"
+            | "reject"
+            | "rejected"
+    ) || matches!(
+        status.as_str(),
+        "allow"
+            | "allowed"
+            | "approve"
+            | "approved"
+            | "auto"
+            | "autoallow"
+            | "autoallowed"
+            | "autoapprove"
+            | "autoapproved"
+            | "deny"
+            | "denied"
+            | "reject"
+            | "rejected"
+            | "resolved"
+    );
+    if resolved {
+        return false;
+    }
+
+    matches!(
+        status.as_str(),
+        "approvalrequired"
+            | "awaitingapproval"
+            | "awaitinginput"
+            | "awaitinginstruction"
+            | "awaitinguser"
+            | "manualapprovalrequired"
+            | "needsuser"
+            | "needsuserinput"
+            | "pending"
+            | "requested"
+            | "requiresapproval"
+            | "requiresinput"
+            | "requiresuserinput"
+            | "reviewrequested"
+            | "waitingforapproval"
+            | "waitingforuser"
+    ) || terminal_activity_event_bool(
+        event,
+        &[
+            "manualApprovalRequired",
+            "manual_approval_required",
+            "providerBlockedForUser",
+            "provider_blocked_for_user",
+            "requiresUserInput",
+            "requires_user_input",
+            "terminalIsPromptingUser",
+            "terminal_is_prompting_user",
+            "promptingUser",
+            "prompting_user",
+        ],
+    )
+}
+
+fn terminal_activity_subagent_event_status(event_key: &str, event: &Value) -> String {
+    if terminal_activity_subagent_event_is_pending(event) {
+        return "awaiting_instruction".to_string();
+    }
+
+    let status = terminal_activity_event_key(&terminal_activity_event_string(
+        event,
+        &["status", "activityStatus", "activity_status", "commandPhase", "command_phase"],
+    ));
+    if matches!(
+        status.as_str(),
+        "done" | "complete" | "completed" | "finished" | "success" | "toolcompleted"
+    ) {
+        return "done".to_string();
+    }
+    if matches!(
+        status.as_str(),
+        "blocked" | "failed" | "failure" | "error" | "interrupted" | "stopped"
+    ) {
+        return "failed".to_string();
+    }
+
+    if event_key == "subagentstop" || event_key == "posttooluse" {
+        return "done".to_string();
+    }
+    "running".to_string()
+}
+
 fn terminal_activity_subagents_from_events(
     activity_events_path: &Path,
     fallback_provider: &str,
@@ -889,7 +1030,10 @@ fn terminal_activity_subagents_from_events(
             .as_str()
             .is_some_and(|tool| tool.eq_ignore_ascii_case("Agent") || tool.eq_ignore_ascii_case("Task"));
         let is_subagent_event = event_key == "subagentstart" || event_key == "subagentstop";
-        if !is_subagent_event && !is_agent_tool {
+        let event_status = terminal_activity_subagent_event_status(&event_key, &event);
+        let is_agent_prompt = event_status == "awaiting_instruction"
+            && (!agent_id.is_empty() || !tool_use_id.is_empty() || !agent_type.is_empty());
+        if !is_subagent_event && !is_agent_tool && !is_agent_prompt {
             continue;
         }
         let key = if !agent_id.is_empty() {
@@ -910,7 +1054,7 @@ fn terminal_activity_subagents_from_events(
                 agent_type: agent_type.to_string(),
                 label,
                 description: description.to_string(),
-                status: "running".to_string(),
+                status: event_status.clone(),
                 started_at_ms: Some(timestamp_ms),
                 finished_at_ms: None,
                 updated_at_ms: timestamp_ms,
@@ -939,12 +1083,13 @@ fn terminal_activity_subagents_from_events(
         }
         entry.label = terminal_activity_subagent_label(&entry.agent_type, &entry.description);
         entry.updated_at_ms = timestamp_ms;
-        if event_key == "subagentstop" || event_key == "posttooluse" {
-            entry.status = "done".to_string();
+        if event_status == "done" {
+            entry.status = event_status;
             entry.finished_at_ms = Some(timestamp_ms);
-        }
-        if event_key == "subagentstart" || event_key == "pretooluse" {
-            entry.status = "running".to_string();
+        } else if event_status == "awaiting_instruction" || event_status == "failed" {
+            entry.status = event_status;
+        } else if event_key == "subagentstart" || event_key == "pretooluse" {
+            entry.status = event_status;
             entry.started_at_ms = entry.started_at_ms.or(Some(timestamp_ms));
         }
         if let Some(value) = event["transcriptPath"].as_str().filter(|value| !value.trim().is_empty()) {
@@ -956,7 +1101,19 @@ fn terminal_activity_subagents_from_events(
         {
             entry.agent_transcript_path = value.to_string();
         }
-        if let Some(value) = event["lastMessage"].as_str().filter(|value| !value.trim().is_empty()) {
+        let last_message = terminal_activity_event_string(
+            &event,
+            &[
+                "promptingUserText",
+                "prompting_user_text",
+                "lastMessage",
+                "last_message",
+                "message",
+            ],
+        );
+        if !last_message.is_empty() {
+            entry.last_message = last_message;
+        } else if let Some(value) = event["lastMessage"].as_str().filter(|value| !value.trim().is_empty()) {
             entry.last_message = value.to_string();
         }
         if is_subagent_event {
@@ -992,8 +1149,9 @@ fn terminal_activity_subagent_label(agent_type: &str, description: &str) -> Stri
 
 fn terminal_activity_subagent_status_rank(status: &str) -> u8 {
     match status.trim().to_ascii_lowercase().as_str() {
+        "awaiting_instruction" | "awaiting_input" | "awaiting_user" | "blocked" => 4,
         "running" | "active" => 3,
-        "failed" | "blocked" => 2,
+        "failed" => 2,
         "done" | "completed" => 1,
         _ => 0,
     }
@@ -3395,6 +3553,46 @@ mod developer_process_docker_tests {
         process.executable = "/Users/dev/.nvm/versions/node/bin/node".to_string();
 
         assert!(developer_terminal_activity_process_visible(&process));
+    }
+
+    #[test]
+    fn terminal_activity_subagent_preserves_awaiting_instruction_status() {
+        let path = std::env::temp_dir().join(format!(
+            "diffforge-subagent-activity-{}.jsonl",
+            current_time_ms(),
+        ));
+        let body = [
+            json!({
+                "timestampMs": 1000,
+                "eventName": "PreToolUse",
+                "provider": "claude",
+                "toolName": "Task",
+                "toolUseId": "tool-1",
+                "agentType": "Halley",
+                "description": "Check the database",
+            })
+            .to_string(),
+            json!({
+                "timestampMs": 1100,
+                "eventName": "PermissionPrompt",
+                "provider": "claude",
+                "toolUseId": "tool-1",
+                "agentType": "Halley",
+                "requiresUserInput": true,
+                "promptingUserText": "Approve database inspection",
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, body).unwrap();
+
+        let subagents = terminal_activity_subagents_from_events(&path, "claude");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].label, "Halley");
+        assert_eq!(subagents[0].status, "awaiting_instruction");
+        assert_eq!(subagents[0].last_message, "Approve database inspection");
     }
 
     #[test]
