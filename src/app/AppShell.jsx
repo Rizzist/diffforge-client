@@ -1020,6 +1020,7 @@ const APP_THEME_OPTIONS = [
 ];
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
 const WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS = 240;
+const WORKSPACE_ACTIVE_SWITCH_OPENING_MS = 90;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -3845,6 +3846,123 @@ function normalizeWorkspaceCoordinationTargetResponse(response, fallbackRoot = "
   };
 }
 
+function workspaceCoordinationTargetFromScanEntry(value, fallbackRoot = "") {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const repoPath = cleanWorkspaceRootDirectory(
+    source.repoPath
+      || source.repo_path
+      || source.projectRoot
+      || source.project_root
+      || source.rootDirectory
+      || source.root_directory
+      || source.path
+      || fallbackRoot,
+  );
+  if (!repoPath) {
+    return null;
+  }
+
+  const projectKind = String(
+    source.projectKind
+      || source.project_kind
+      || source.kind
+      || (
+        source.hasGit === true || source.has_git === true
+          ? "git_repo"
+          : getWorkspaceRootIdentity(repoPath) === getWorkspaceRootIdentity(fallbackRoot)
+            ? "workspace_root"
+            : "project_folder"
+      ),
+  ).trim();
+
+  return normalizeWorkspaceCoordinationTarget({
+    dbPath: source.dbPath || source.db_path,
+    hasAgents: source.hasAgents || source.has_agents,
+    hasGit: source.hasGit || source.has_git || projectKind === "git_repo",
+    hasKernelDb: source.hasKernelDb || source.has_kernel_db,
+    isWorkspaceRoot: source.isWorkspaceRoot
+      || source.is_workspace_root
+      || getWorkspaceRootIdentity(repoPath) === getWorkspaceRootIdentity(fallbackRoot),
+    mountId: source.mountId || source.mount_id,
+    projectKind,
+    projectName: source.projectName
+      || source.project_name
+      || source.name
+      || getDirectoryName(repoPath),
+    repoPath,
+    workspaceRelativePath: source.workspaceRelativePath
+      || source.workspace_relative_path
+      || source.relativePath
+      || source.relative_path,
+  }, fallbackRoot);
+}
+
+function workspaceCoordinationTargetResponseFromScanSnapshot(snapshot, fallbackRoot = "") {
+  const body = snapshot && typeof snapshot === "object" ? snapshot : {};
+  const raw = body.raw && typeof body.raw === "object" ? body.raw : {};
+  const rootDirectory = cleanWorkspaceRootDirectory(
+    body.root
+      || body.rootDirectory
+      || body.root_directory
+      || body.requestedRepoPath
+      || body.requested_repo_path
+      || raw.root
+      || raw.rootDirectory
+      || raw.root_directory
+      || raw.requestedRepoPath
+      || raw.requested_repo_path
+      || fallbackRoot,
+  );
+  if (!rootDirectory) {
+    return null;
+  }
+
+  const candidateLists = [
+    body.workspaceMounts,
+    body.workspace_mounts,
+    body.projectMounts,
+    body.project_mounts,
+    body.repositories,
+    body.mounts,
+    raw.workspaceMounts,
+    raw.workspace_mounts,
+    raw.projectMounts,
+    raw.project_mounts,
+    raw.repositories,
+    raw.mounts,
+  ].filter(Array.isArray);
+
+  const targets = dedupeWorkspaceCoordinationTargets(candidateLists.flatMap((list) => (
+    list.map((entry) => workspaceCoordinationTargetFromScanEntry(entry, rootDirectory))
+  )));
+  const rootTarget = workspaceCoordinationTargetFromScanEntry(
+    body.selectedRoot || body.selected_root || raw.selectedRoot || raw.selected_root || {
+      isWorkspaceRoot: true,
+      projectKind: "workspace_root",
+      projectName: getDirectoryName(rootDirectory),
+      repoPath: rootDirectory,
+    },
+    rootDirectory,
+  );
+  const completeTargets = dedupeWorkspaceCoordinationTargets([
+    rootTarget,
+    ...targets,
+  ]);
+
+  return {
+    container: Boolean(body.container || raw.container),
+    rootDirectory,
+    targets: completeTargets,
+    workspaceKind: String(
+      body.workspaceKind
+        || body.workspace_kind
+        || raw.workspaceKind
+        || raw.workspace_kind
+        || "",
+    ).trim(),
+  };
+}
+
 function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
   const safeRoot = cleanWorkspaceRootDirectory(rootDirectory);
   if (!safeRoot) {
@@ -4583,6 +4701,30 @@ function workspaceGraphSnapshotKey(snapshot) {
   );
 }
 
+function getWorkspaceGraphScanSnapshotForRoot(graphState, repoPath, workspaceId) {
+  const key = workspaceGraphStateKey(repoPath, workspaceId);
+  if (!key) {
+    return null;
+  }
+
+  return graphState?.[key]?.architectureRepositoryScanSnapshot || null;
+}
+
+function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
+  if (!request || typeof request !== "object") {
+    return "";
+  }
+
+  return [
+    String(launchKey || ""),
+    String(request.workspaceId || ""),
+    String(request.paneId || ""),
+    String(request.instanceId || ""),
+    String(request.terminalIndex ?? ""),
+    String(request.threadId || ""),
+  ].join(":");
+}
+
 function getWorkspaceRailInitials(name) {
   const parts = String(name || "Workspace")
     .trim()
@@ -4977,6 +5119,11 @@ export default function App() {
   const [workspaceAgentLaunchEpoch, setWorkspaceAgentLaunchEpoch] = useState(0);
   const [preparedTerminalVersion, setPreparedTerminalVersion] = useState(0);
   const [workspaceAgentBatchSentKey, setWorkspaceAgentBatchSentKey] = useState("");
+  const setWorkspaceAgentBatchSentLaunchKey = useCallback((nextKey) => {
+    const safeKey = String(nextKey || "");
+    workspaceAgentBatchSentKeyRef.current = safeKey;
+    setWorkspaceAgentBatchSentKey(safeKey);
+  }, []);
   const [windowFrameState, setWindowFrameState] = useState(WINDOW_FRAME_STATE_DEFAULT);
   const [mainWindowFocused, setMainWindowFocused] = useState(readMainWindowFocusedFallback);
   const [workspaceCloseState, setWorkspaceCloseState] = useState(WORKSPACE_CLOSE_INITIAL_STATE);
@@ -5046,6 +5193,8 @@ export default function App() {
   const workspaceActivationSequenceRef = useRef(0);
   const workspaceActivationStartedAtRef = useRef(new Map());
   const workspaceActivationStateLogKeyRef = useRef("");
+  const workspaceRuntimeSelectionLogKeyRef = useRef("");
+  const workspaceRuntimeDescriptorLogKeyRef = useRef("");
   const workspaceRuntimeDescriptorBuildRef = useRef(null);
   const deferredWorkspaceActivationRef = useRef({
     frame: 0,
@@ -5059,6 +5208,9 @@ export default function App() {
   const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceAgentBatchWaitLogKeyRef = useRef("");
+  const workspaceAgentBatchSentKeyRef = useRef("");
+  const workspaceAgentBatchStartedSessionKeysRef = useRef(new Set());
+  const workspaceAgentBatchInFlightSessionKeysRef = useRef(new Set());
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
@@ -5066,6 +5218,7 @@ export default function App() {
   const sharedMcpBackgroundJobsRef = useRef(new Map());
   const workspaceMcpStartupIndexKeysRef = useRef(new Set());
   const workspaceMcpStartupIndexJobsRef = useRef(new Map());
+  const workspaceMcpStartupIndexEmptyKeyRef = useRef("");
   const workspaceDeactivationInFlightRef = useRef("");
   const agentInstallationSyncKeyRef = useRef("");
   const terminalPresenceSyncKeyRef = useRef("");
@@ -5086,6 +5239,8 @@ export default function App() {
   const tokenomicsSyncInFlightRef = useRef(false);
   const tokenomicsSyncPendingRefreshRef = useRef(false);
   const tokenomicsForceResyncRef = useRef(null);
+  const workspaceCoordinationTargetsCacheRef = useRef(new Map());
+  const workspaceCoordinationTargetsStateKeyRef = useRef("");
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   const workspaceTerminalRoleOptions = useMemo(
     () => getWorkspaceTerminalRoleOptions(agentStatuses),
@@ -5441,7 +5596,7 @@ export default function App() {
 
   useEffect(() => {
     if (!workspaceHydrationReady || workspaceActivationDeferred) {
-      logWorkspaceActivationTrace("workspace.open.coordination_targets.skip", activatedWorkspaceId || selectedWorkspaceId, {
+      logWorkspaceActivationTrace("workspace.open.coordination_targets.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         reason: !workspaceHydrationReady ? "hydration_not_ready" : "activation_deferred",
         workspaceActivationDeferred,
         workspaceHydrationReady,
@@ -5450,64 +5605,101 @@ export default function App() {
     }
 
     if (!workspaceCoordinationRootEntries.length) {
-      logWorkspaceActivationTrace("workspace.open.coordination_targets.empty", activatedWorkspaceId || selectedWorkspaceId, {
+      logWorkspaceActivationTrace("workspace.open.coordination_targets.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         workspaceHydrationReady,
       });
+      workspaceCoordinationTargetsStateKeyRef.current = "";
       setWorkspaceCoordinationTargetsByRoot({});
       return undefined;
     }
 
-    let cancelled = false;
     const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
-    logWorkspaceActivationTrace("workspace.open.coordination_targets.start", activatedWorkspaceId || selectedWorkspaceId, {
-      rootCount: workspaceCoordinationRootEntries.length,
-      roots: workspaceCoordinationRootEntries.map((entry) => ({
-        rootDirectory: entry.rootDirectory,
-        workspaceId: entry.workspaceId,
-      })),
-    });
-    Promise.all(
-      workspaceCoordinationRootEntries.map(async (entry) => {
-        const key = getWorkspaceRootIdentity(entry.rootDirectory);
-        try {
-          const response = await invoke("coordination_workspace_targets", {
-            repoPath: entry.rootDirectory,
-          });
-          return [
-            key,
-            normalizeWorkspaceCoordinationTargetResponse(response, entry.rootDirectory),
-          ];
-        } catch {
-          return [
-            key,
-            normalizeWorkspaceCoordinationTargetResponse(null, entry.rootDirectory),
-          ];
-        }
-      }),
-    ).then((entries) => {
-      if (cancelled) {
+    const nextTargetsByRoot = {};
+    let cacheHitCount = 0;
+    let fallbackCount = 0;
+    let scanSnapshotCount = 0;
+
+    workspaceCoordinationRootEntries.forEach((entry) => {
+      const rootKey = getWorkspaceRootIdentity(entry.rootDirectory);
+      if (!rootKey) {
         return;
       }
-      logWorkspaceActivationTrace("workspace.open.coordination_targets.done", activatedWorkspaceId || selectedWorkspaceId, {
-        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
-        rootCount: entries.length,
-        targetCount: entries.reduce((sum, [, targets]) => (
-          sum + (Array.isArray(targets) ? targets.length : 0)
-        ), 0),
-      });
-      setWorkspaceCoordinationTargetsByRoot(Object.fromEntries(entries));
+
+      const scanSnapshot = getWorkspaceGraphScanSnapshotForRoot(
+        workspaceGraphState,
+        entry.rootDirectory,
+        entry.workspaceId,
+      );
+      const scanResponse = scanSnapshot
+        ? workspaceCoordinationTargetResponseFromScanSnapshot(scanSnapshot, entry.rootDirectory)
+        : null;
+      if (scanResponse?.targets?.length) {
+        workspaceCoordinationTargetsCacheRef.current.set(rootKey, scanResponse);
+        nextTargetsByRoot[rootKey] = scanResponse;
+        scanSnapshotCount += 1;
+        return;
+      }
+
+      const cachedResponse = workspaceCoordinationTargetsCacheRef.current.get(rootKey);
+      if (cachedResponse?.targets?.length) {
+        nextTargetsByRoot[rootKey] = cachedResponse;
+        cacheHitCount += 1;
+        return;
+      }
+
+      const fallbackResponse = normalizeWorkspaceCoordinationTargetResponse(
+        null,
+        entry.rootDirectory,
+      );
+      workspaceCoordinationTargetsCacheRef.current.set(rootKey, fallbackResponse);
+      nextTargetsByRoot[rootKey] = fallbackResponse;
+      fallbackCount += 1;
     });
 
-    return () => {
-      cancelled = true;
-    };
+    const nextTargetsStateKey = JSON.stringify(
+      Object.entries(nextTargetsByRoot)
+        .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+        .map(([rootKey, record]) => [
+          rootKey,
+          String(record?.workspaceKind || ""),
+          (Array.isArray(record?.targets) ? record.targets : [])
+            .map((target) => [
+              getWorkspaceRootIdentity(target?.repoPath || ""),
+              String(target?.projectKind || ""),
+              String(target?.mountKind || ""),
+              String(target?.mountId || ""),
+              String(target?.workspaceRelativePath || ""),
+              Boolean(target?.hasGit),
+              Boolean(target?.hasAgents),
+              Boolean(target?.hasKernelDb),
+            ])
+            .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+        ]),
+    );
+    if (workspaceCoordinationTargetsStateKeyRef.current === nextTargetsStateKey) {
+      return undefined;
+    }
+    workspaceCoordinationTargetsStateKeyRef.current = nextTargetsStateKey;
+
+    logWorkspaceActivationTrace("workspace.open.coordination_targets.resolved", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+      cacheHitCount,
+      elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+      fallbackCount,
+      rootCount: workspaceCoordinationRootEntries.length,
+      scanSnapshotCount,
+      targetCount: Object.values(nextTargetsByRoot).reduce((sum, record) => (
+        sum + (Array.isArray(record?.targets) ? record.targets.length : 0)
+      ), 0),
+    });
+    setWorkspaceCoordinationTargetsByRoot(nextTargetsByRoot);
+
+    return undefined;
   }, [
     workspaceActivationDeferred,
-    activatedWorkspaceId,
     logWorkspaceActivationTrace,
-    selectedWorkspaceId,
     workspaceCoordinationRootEntries,
     workspaceCoordinationRootKey,
+    workspaceGraphState,
     workspaceHydrationReady,
   ]);
 
@@ -6884,7 +7076,9 @@ export default function App() {
     if (previousActivatedWorkspaceId !== workspace.id) {
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
-      setWorkspaceAgentBatchSentKey("");
+      workspaceAgentBatchStartedSessionKeysRef.current.clear();
+      workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+      setWorkspaceAgentBatchSentLaunchKey("");
     }
 
     logWorkspaceActivationTrace("workspace.open.activate.committed", workspace.id, {
@@ -6901,6 +7095,7 @@ export default function App() {
   }, [
     beginWorkspaceActivationTrace,
     logWorkspaceActivationTrace,
+    setWorkspaceAgentBatchSentLaunchKey,
     updateWorkspaceLifecycleSettings,
     workspaces,
   ]);
@@ -7046,6 +7241,102 @@ export default function App() {
     };
   }, [activateWorkspace, cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
 
+  const scheduleWorkspaceActiveSwitchAfterPaint = useCallback((workspaceId, source = "workspace_switch", trace = null, fields = {}) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return;
+    }
+
+    cancelDeferredWorkspaceActivation();
+
+    const token = deferredWorkspaceActivationRef.current.token + 1;
+    const scheduledAtMs = getWorkspaceActivationDiagnosticNowMs();
+    deferredWorkspaceActivationRef.current = {
+      frame: 0,
+      idle: 0,
+      secondFrame: 0,
+      timeout: 0,
+      token,
+      workspaceId: safeWorkspaceId,
+    };
+    setWorkspacePendingActivationId(safeWorkspaceId);
+    workspacePendingActivationIdRef.current = safeWorkspaceId;
+    logWorkspaceActivationTrace("workspace.open.active_runtime_switch_pending_set", safeWorkspaceId, {
+      ...fields,
+      source,
+      token,
+    }, { trace });
+
+    const finishSwitch = () => {
+      const current = deferredWorkspaceActivationRef.current;
+      if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.active_runtime_switch_stale", safeWorkspaceId, {
+          ...fields,
+          currentToken: current.token,
+          currentWorkspaceId: current.workspaceId,
+          expectedToken: token,
+          source,
+        }, { trace });
+        return;
+      }
+
+      deferredWorkspaceActivationRef.current = {
+        frame: 0,
+        idle: 0,
+        secondFrame: 0,
+        timeout: 0,
+        token,
+        workspaceId: "",
+      };
+      setWorkspacePendingActivationId((currentPendingId) => (
+        currentPendingId === safeWorkspaceId ? "" : currentPendingId
+      ));
+      if (workspacePendingActivationIdRef.current === safeWorkspaceId) {
+        workspacePendingActivationIdRef.current = "";
+      }
+
+      logWorkspaceActivationTrace("workspace.open.active_runtime_switch_done", safeWorkspaceId, {
+        ...fields,
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+        source,
+        token,
+      }, { trace, force: true });
+    };
+
+    const frame = window.requestAnimationFrame(() => {
+      const current = deferredWorkspaceActivationRef.current;
+      if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
+        logWorkspaceActivationTrace("workspace.open.active_runtime_switch_frame_stale", safeWorkspaceId, {
+          ...fields,
+          currentToken: current.token,
+          currentWorkspaceId: current.workspaceId,
+          expectedToken: token,
+          source,
+        }, { trace });
+        return;
+      }
+
+      logWorkspaceActivationTrace("workspace.open.active_runtime_switch_first_frame", safeWorkspaceId, {
+        ...fields,
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
+        openingMs: WORKSPACE_ACTIVE_SWITCH_OPENING_MS,
+        source,
+        token,
+      }, { trace });
+      const timeout = window.setTimeout(finishSwitch, WORKSPACE_ACTIVE_SWITCH_OPENING_MS);
+      deferredWorkspaceActivationRef.current = {
+        ...current,
+        frame: 0,
+        timeout,
+      };
+    });
+
+    deferredWorkspaceActivationRef.current = {
+      ...deferredWorkspaceActivationRef.current,
+      frame,
+    };
+  }, [cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
+
   const requestWorkspaceActivation = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
     const safeWorkspaceId = String(workspaceId || "").trim();
@@ -7069,16 +7360,33 @@ export default function App() {
     }
 
     const trace = beginWorkspaceActivationTrace(workspace.id, source);
+    const previousSelectedWorkspaceId = selectedWorkspaceIdRef.current;
+    const previousActivatedWorkspaceId = activatedWorkspaceIdRef.current;
+    const previousPendingActivationId = workspacePendingActivationIdRef.current;
     const activeWorkspaceIds = normalizeEnabledWorkspaceIds(
       workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
     );
+    const activeRuntimeWorkspaceIds = normalizeEnabledWorkspaceIds([
+      ...activeWorkspaceIds,
+      previousActivatedWorkspaceId,
+    ]);
     const workspaceAlreadyActive = activeWorkspaceIds.includes(workspace.id)
-      || activatedWorkspaceIdRef.current === workspace.id;
+      || previousActivatedWorkspaceId === workspace.id;
+    const transitionKind = workspaceAlreadyActive
+      ? previousSelectedWorkspaceId === workspace.id
+        ? "reselect_active_runtime"
+        : "switch_active_runtime"
+      : "activate_inactive_runtime";
     logWorkspaceActivationTrace("workspace.open.activation_requested", workspace.id, {
       alreadyActive: workspaceAlreadyActive,
-      activeRuntimeWorkspaceCount: activeWorkspaceIds.length,
-      selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      activeRuntimeWorkspaceCount: activeRuntimeWorkspaceIds.length,
+      activeRuntimeWorkspaceIds,
+      previousActivatedWorkspaceId,
+      previousPendingActivationId,
+      previousSelectedWorkspaceId,
+      selectedWorkspaceId: previousSelectedWorkspaceId,
       source,
+      transitionKind,
       workspaceName: workspace.name || "",
     }, { trace });
 
@@ -7092,9 +7400,29 @@ export default function App() {
     });
 
     if (workspaceAlreadyActive) {
+      const clearedPendingActivationId = workspacePendingActivationIdRef.current;
+      const activeSwitchFields = {
+        activeRuntimeWorkspaceCount: activeRuntimeWorkspaceIds.length,
+        activeRuntimeWorkspaceIds,
+        clearedPendingActivationId,
+        previousActivatedWorkspaceId,
+        previousSelectedWorkspaceId,
+        transitionKind,
+        workspaceName: workspace.name || "",
+      };
+      if (transitionKind === "switch_active_runtime") {
+        scheduleWorkspaceActiveSwitchAfterPaint(workspace.id, source, trace, activeSwitchFields);
+        return true;
+      }
+
       cancelDeferredWorkspaceActivation();
       setWorkspacePendingActivationId("");
       workspacePendingActivationIdRef.current = "";
+      logWorkspaceActivationTrace("workspace.open.active_runtime_switch_done", workspace.id, {
+        ...activeSwitchFields,
+        elapsedMs: 0,
+        source,
+      }, { trace, force: true });
       return true;
     }
 
@@ -7102,6 +7430,7 @@ export default function App() {
     workspacePendingActivationIdRef.current = workspace.id;
     logWorkspaceActivationTrace("workspace.open.pending_activation_set", workspace.id, {
       source,
+      transitionKind,
     }, { trace });
     scheduleWorkspaceActivationAfterPaint(workspace.id, source, trace);
     return true;
@@ -7110,6 +7439,7 @@ export default function App() {
     cancelDeferredWorkspaceActivation,
     logWorkspaceActivationTrace,
     scheduleWorkspaceActivationAfterPaint,
+    scheduleWorkspaceActiveSwitchAfterPaint,
     showView,
     workspaces,
   ]);
@@ -7126,10 +7456,28 @@ export default function App() {
     const workspaceRoot = getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace.id)
       || defaultWorkingDirectoryRef.current
       || "";
+    const activeWorkspaceIds = normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    );
+    const activeRuntimeWorkspaceIds = normalizeEnabledWorkspaceIds([
+      ...activeWorkspaceIds,
+      activatedWorkspaceIdRef.current,
+    ]);
+    const workspaceAlreadyActive = activeRuntimeWorkspaceIds.includes(workspace.id);
+    const transitionKind = workspaceAlreadyActive
+      ? selectedWorkspaceIdRef.current === workspace.id
+        ? "reselect_active_runtime"
+        : "switch_active_runtime"
+      : "activate_inactive_runtime";
     logWorkspaceActivationTrace("workspace.open.rail_select", workspace.id, {
-      alreadyActive: activatedWorkspaceIdRef.current === workspace.id,
+      activeRuntimeWorkspaceCount: activeRuntimeWorkspaceIds.length,
+      activeRuntimeWorkspaceIds,
+      alreadyActive: workspaceAlreadyActive,
+      pendingActivationId: workspacePendingActivationIdRef.current,
+      previousSelectedWorkspaceId: selectedWorkspaceIdRef.current,
       rootDirectory: workspaceRoot,
       selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      transitionKind,
       workspaceName: workspace.name || "",
     });
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
@@ -7179,7 +7527,9 @@ export default function App() {
 
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
-    setWorkspaceAgentBatchSentKey("");
+    workspaceAgentBatchStartedSessionKeysRef.current.clear();
+    workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+    setWorkspaceAgentBatchSentLaunchKey("");
 
     try {
       unlistenCloseProgress = await listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
@@ -7259,7 +7609,12 @@ export default function App() {
       workspaceDeactivationInFlightRef.current = "";
       setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
     }
-  }, [clearPreparedWorkspaceTerminals, defaultWorkingDirectory, updateWorkspaceLifecycleSettings]);
+  }, [
+    clearPreparedWorkspaceTerminals,
+    defaultWorkingDirectory,
+    setWorkspaceAgentBatchSentLaunchKey,
+    updateWorkspaceLifecycleSettings,
+  ]);
 
   const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
     const targetWorkspaceId = String(workspaceId || "").trim();
@@ -7304,7 +7659,9 @@ export default function App() {
     clearPreparedWorkspaceTerminals(targetWorkspaceId);
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
-    setWorkspaceAgentBatchSentKey("");
+    workspaceAgentBatchStartedSessionKeysRef.current.clear();
+    workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+    setWorkspaceAgentBatchSentLaunchKey("");
 
     try {
       const warnings = [];
@@ -7443,6 +7800,7 @@ export default function App() {
     clearPreparedWorkspaceTerminals,
     activeWorkspaceScopePayload,
     expireDesktopSession,
+    setWorkspaceAgentBatchSentLaunchKey,
     showView,
     updateWorkspaceLifecycleSettings,
     workspaceDeleteConfirmId,
@@ -8639,7 +8997,9 @@ export default function App() {
         clearPreparedWorkspaceTerminals(selectedWorkspace.id);
         workspaceAgentLaunchKeyRef.current = "";
         workspaceAgentBatchInFlightKeyRef.current = "";
-        setWorkspaceAgentBatchSentKey("");
+        workspaceAgentBatchStartedSessionKeysRef.current.clear();
+        workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+        setWorkspaceAgentBatchSentLaunchKey("");
 
         const cleanupStartedAt = performance.now();
 
@@ -8795,6 +9155,7 @@ export default function App() {
     workspaceTerminalRoleOptions,
     clearPreparedWorkspaceTerminals,
     closeWorkspaceSettings,
+    setWorkspaceAgentBatchSentLaunchKey,
   ]);
 
   const closeWorkspaceTerminal = useCallback(({ threadId, workspaceId, terminalIndex }) => {
@@ -10574,16 +10935,22 @@ export default function App() {
     startupAgentSettingsPendingRef.current = false;
     workspaceAgentLaunchKeyRef.current = "";
     workspaceAgentBatchInFlightKeyRef.current = "";
+    workspaceAgentBatchStartedSessionKeysRef.current.clear();
+    workspaceAgentBatchInFlightSessionKeysRef.current.clear();
     workspacePendingActivationIdRef.current = "";
+    workspaceRuntimeDescriptorLogKeyRef.current = "";
+    workspaceRuntimeSelectionLogKeyRef.current = "";
+    workspaceMcpStartupIndexEmptyKeyRef.current = "";
+    workspaceCoordinationTargetsStateKeyRef.current = "";
     crashRecoveryScanRef.current = false;
     preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
     setStartupAgentUpdateMessage("");
     setWorkspaceAgentLaunchEpoch(0);
-    setWorkspaceAgentBatchSentKey("");
+    setWorkspaceAgentBatchSentLaunchKey("");
     setPreparedTerminalVersion((version) => version + 1);
     setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
-  }, [authState]);
+  }, [authState, setWorkspaceAgentBatchSentLaunchKey]);
 
   useEffect(() => {
     if (authInitialized) {
@@ -11282,13 +11649,20 @@ export default function App() {
       return;
     }
 
-    logWorkspaceActivationTrace("workspace.open.runtime_descriptors", activatedWorkspaceId || selectedWorkspaceId, {
+    const logFields = {
       ...snapshot,
       activatedWorkspaceId,
       selectedWorkspaceId,
       workspaceActivationDeferred,
       workspaceHydrationReady,
-    });
+    };
+    const logKey = JSON.stringify(logFields);
+    if (workspaceRuntimeDescriptorLogKeyRef.current === logKey) {
+      return;
+    }
+
+    workspaceRuntimeDescriptorLogKeyRef.current = logKey;
+    logWorkspaceActivationTrace("workspace.open.runtime_descriptors", activatedWorkspaceId || selectedWorkspaceId, logFields);
   }, [
     activatedWorkspaceId,
     enabledWorkspaceRuntimeDescriptors,
@@ -11297,6 +11671,13 @@ export default function App() {
     workspaceActivationDeferred,
     workspaceHydrationReady,
   ]);
+  const selectedWorkspaceRuntimeDescriptor = useMemo(() => (
+    selectedWorkspace?.id
+      ? enabledWorkspaceRuntimeDescriptors.find((descriptor) => (
+        descriptor.workspace?.id === selectedWorkspace.id
+      )) || null
+      : null
+  ), [enabledWorkspaceRuntimeDescriptors, selectedWorkspace?.id]);
   const terminalPresenceWorkspaces = useMemo(() => (
     enabledWorkspaceRuntimeDescriptors
       .map((descriptor) => {
@@ -12635,7 +13016,7 @@ export default function App() {
       if (!workspaceId || !rootDirectory) {
         return;
       }
-      const key = workspaceId;
+      const key = `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
       if (seen.has(key) || workspaceMcpStartupIndexKeysRef.current.has(key)) {
         return;
       }
@@ -12654,11 +13035,23 @@ export default function App() {
     });
 
     if (!targets.length) {
-      logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-        selectedWorkspaceId: selectedWorkspace?.id || "",
-      });
+      const emptyKey = JSON.stringify([
+        selectedWorkspace?.id || "",
+        selectedWorkspaceRootDirectory || defaultWorkingDirectory || "",
+        enabledWorkspaceRuntimeDescriptors.map((descriptor) => [
+          descriptor.workspace?.id || "",
+          descriptor.workingDirectory || "",
+        ]),
+      ]);
+      if (workspaceMcpStartupIndexEmptyKeyRef.current !== emptyKey) {
+        workspaceMcpStartupIndexEmptyKeyRef.current = emptyKey;
+        logWorkspaceActivationTrace("workspace.open.workspace_mcp_index.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+          selectedWorkspaceId: selectedWorkspace?.id || "",
+        });
+      }
       return undefined;
     }
+    workspaceMcpStartupIndexEmptyKeyRef.current = "";
 
     let disposed = false;
     let timer = 0;
@@ -12992,6 +13385,69 @@ export default function App() {
     : hasSelectedWorkspace
       ? "No active workspace."
       : "No workspace selected.";
+  useEffect(() => {
+    const selectedWorkspaceId = selectedWorkspace?.id || "";
+    const selectedRuntimeActive = Boolean(selectedWorkspaceRuntimeDescriptor);
+    const selectedRuntimeVisible = Boolean(
+      selectedRuntimeActive
+        && shouldRevealWorkspaceTerminal
+        && visibleView === DEFAULT_WORKSPACE_VIEW,
+    );
+    const transitionKind = selectedWorkspaceId
+      ? selectedRuntimeActive
+        ? selectedWorkspaceId === activatedWorkspaceId
+          ? "selected_activated_runtime"
+          : "selected_mounted_runtime"
+        : shouldShowWorkspacePendingActivation
+          ? "selected_pending_activation"
+          : "selected_inactive_runtime"
+      : "no_workspace_selected";
+    const snapshot = {
+      activeRuntimeWorkspaceCount: enabledRuntimeWorkspaceIds.length,
+      activeRuntimeWorkspaceIds: enabledRuntimeWorkspaceIds,
+      activeView,
+      activatedWorkspaceId,
+      descriptorAgentTerminalCount: selectedWorkspaceRuntimeDescriptor?.agentTerminalEntries?.length || 0,
+      descriptorLogicalTerminalCount: selectedWorkspaceRuntimeDescriptor?.logicalTerminalCount || 0,
+      pendingActivationId: workspacePendingActivationId,
+      selectedRuntimeActive,
+      selectedRuntimeVisible,
+      selectedWorkspaceId,
+      selectedWorkspaceName: selectedWorkspace?.name || "",
+      transitionKind,
+      visibleView,
+      workspaceActivationDeferred,
+      workspaceHydrationReady,
+      workspaceState,
+    };
+    const snapshotKey = JSON.stringify(snapshot);
+    if (workspaceRuntimeSelectionLogKeyRef.current === snapshotKey) {
+      return;
+    }
+
+    workspaceRuntimeSelectionLogKeyRef.current = snapshotKey;
+    logWorkspaceActivationTrace(
+      "workspace.open.runtime_selection_state",
+      selectedWorkspaceId || activatedWorkspaceId,
+      snapshot,
+      { force: selectedRuntimeVisible },
+    );
+  }, [
+    activeView,
+    activatedWorkspaceId,
+    enabledRuntimeWorkspaceIds,
+    logWorkspaceActivationTrace,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceRuntimeDescriptor,
+    shouldRevealWorkspaceTerminal,
+    shouldShowWorkspacePendingActivation,
+    visibleView,
+    workspaceActivationDeferred,
+    workspaceHydrationReady,
+    workspacePendingActivationId,
+    workspaceState,
+  ]);
   const shouldShowTerminalNav = hasSelectedWorkspace;
   const shouldShowWorkspaceDetailNav = hasSelectedWorkspace;
   const isSelectedWorkspaceActivated = Boolean(
@@ -18091,73 +18547,121 @@ export default function App() {
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
       workspaceAgentBatchWaitLogKeyRef.current = "";
-      setWorkspaceAgentBatchSentKey("");
+      workspaceAgentBatchStartedSessionKeysRef.current.clear();
+      workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+      setWorkspaceAgentBatchSentLaunchKey("");
       return;
     }
 
-    if (
-      workspaceAgentBatchSentKey === workspaceAgentLaunchKey
-      || workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
-      || preparedWorkspaceTerminalCount === 0
-      || preparedWorkspaceTerminalCount < activatedWorkspaceAgentTerminalEntries.length
-    ) {
-      const waitReason = workspaceAgentBatchSentKey === workspaceAgentLaunchKey
-        ? "already_sent"
-        : workspaceAgentBatchInFlightKeyRef.current === workspaceAgentLaunchKey
+    if (workspaceAgentLaunchKeyRef.current !== workspaceAgentLaunchKey) {
+      workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
+      workspaceAgentBatchInFlightKeyRef.current = "";
+      workspaceAgentBatchWaitLogKeyRef.current = "";
+      workspaceAgentBatchStartedSessionKeysRef.current.clear();
+      workspaceAgentBatchInFlightSessionKeysRef.current.clear();
+      setWorkspaceAgentBatchSentLaunchKey("");
+    }
+
+    const pendingPreparedWorkspaceTerminalRequests = preparedWorkspaceTerminalRequests.filter((request) => {
+      const requestKey = getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey);
+      return requestKey
+        && !workspaceAgentBatchStartedSessionKeysRef.current.has(requestKey)
+        && !workspaceAgentBatchInFlightSessionKeysRef.current.has(requestKey);
+    });
+    const inFlightPreparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.reduce((count, request) => {
+      const requestKey = getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey);
+      return requestKey && workspaceAgentBatchInFlightSessionKeysRef.current.has(requestKey)
+        ? count + 1
+        : count;
+    }, 0);
+    const startedPreparedWorkspaceTerminalCount = preparedWorkspaceTerminalRequests.reduce((count, request) => {
+      const requestKey = getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey);
+      return requestKey && workspaceAgentBatchStartedSessionKeysRef.current.has(requestKey)
+        ? count + 1
+        : count;
+    }, 0);
+    const pendingRequestKeys = pendingPreparedWorkspaceTerminalRequests
+      .map((request) => getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey))
+      .filter(Boolean);
+
+    if (preparedWorkspaceTerminalCount === 0 || pendingPreparedWorkspaceTerminalRequests.length === 0) {
+      const allExpectedPrepared = preparedWorkspaceTerminalCount >= activatedWorkspaceAgentTerminalEntries.length;
+      const waitReason = preparedWorkspaceTerminalCount === 0
+        ? "no_prepared_terminals"
+        : inFlightPreparedWorkspaceTerminalCount > 0
           ? "already_in_flight"
-          : preparedWorkspaceTerminalCount === 0
-            ? "no_prepared_terminals"
-            : "waiting_for_all_prepared_terminals";
-      const waitLogKey = `${workspaceAgentLaunchKey}:${waitReason}:${preparedWorkspaceTerminalCount}`;
+          : preparedWorkspaceTerminalAgentStartCount === 0 && allExpectedPrepared
+            ? "all_prepared_terminals_ready"
+            : pendingPreparedWorkspaceTerminalRequests.length === 0 && preparedWorkspaceTerminalAgentStartCount > 0
+              ? "already_sent"
+              : "waiting_for_more_prepared_terminals";
+      const waitLogKey = [
+        workspaceAgentLaunchKey,
+        waitReason,
+        preparedWorkspaceTerminalCount,
+        preparedWorkspaceTerminalAgentStartCount,
+        pendingPreparedWorkspaceTerminalRequests.length,
+        inFlightPreparedWorkspaceTerminalCount,
+        startedPreparedWorkspaceTerminalCount,
+      ].join(":");
       if (workspaceAgentBatchWaitLogKeyRef.current !== waitLogKey) {
         workspaceAgentBatchWaitLogKeyRef.current = waitLogKey;
         logWorkspaceActivationTrace("workspace.open.agent_batch.wait", activatedWorkspace?.id || "", {
           agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
           inFlightLaunchKey: workspaceAgentBatchInFlightKeyRef.current,
+          inFlightPreparedWorkspaceTerminalCount,
           launchKey: workspaceAgentLaunchKey,
+          pendingPreparedWorkspaceTerminalCount: pendingPreparedWorkspaceTerminalRequests.length,
           preparedWorkspaceTerminalAgentStartCount,
           preparedWorkspaceTerminalCount,
           reason: waitReason,
-          sentLaunchKey: workspaceAgentBatchSentKey,
+          sentLaunchKey: workspaceAgentBatchSentKeyRef.current || workspaceAgentBatchSentKey,
+          startedPreparedWorkspaceTerminalCount,
+        });
+      }
+
+      if (
+        waitReason === "all_prepared_terminals_ready"
+        && workspaceAgentBatchSentKeyRef.current !== workspaceAgentLaunchKey
+      ) {
+        workspaceAgentBatchWaitLogKeyRef.current = "";
+        setWorkspaceAgentBatchSentLaunchKey(workspaceAgentLaunchKey);
+        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
+        logWorkspaceActivationTrace("workspace.open.agent_batch.direct_ready", activatedWorkspace.id, {
+          agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
+          launchKey: workspaceAgentLaunchKey,
+          preparedWorkspaceTerminalAgentStartCount,
+          preparedWorkspaceTerminalCount,
+          sessions: preparedWorkspaceTerminalSessions.map((session) => ({
+            agentStarted: session.agentStarted === true,
+            instanceId: session.instanceId || "",
+            needsAgentStart: session.needsAgentStart === true,
+            paneId: session.paneId || "",
+            provider: session.provider || "",
+            terminalIndex: session.terminalIndex ?? "",
+            threadId: session.threadId || "",
+            workspaceId: session.workspaceId || "",
+          })),
         });
       }
       return;
     }
 
-    if (preparedWorkspaceTerminalAgentStartCount === 0) {
-      workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
-      workspaceAgentBatchInFlightKeyRef.current = "";
-      workspaceAgentBatchWaitLogKeyRef.current = "";
-      setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
-      setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
-      logWorkspaceActivationTrace("workspace.open.agent_batch.direct_ready", activatedWorkspace.id, {
-        agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
-        launchKey: workspaceAgentLaunchKey,
-        preparedWorkspaceTerminalAgentStartCount,
-        preparedWorkspaceTerminalCount,
-        sessions: preparedWorkspaceTerminalSessions.map((session) => ({
-          agentStarted: session.agentStarted === true,
-          instanceId: session.instanceId || "",
-          needsAgentStart: session.needsAgentStart === true,
-          paneId: session.paneId || "",
-          provider: session.provider || "",
-          terminalIndex: session.terminalIndex ?? "",
-          threadId: session.threadId || "",
-          workspaceId: session.workspaceId || "",
-        })),
-      });
-      return;
-    }
-
-    workspaceAgentLaunchKeyRef.current = workspaceAgentLaunchKey;
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
     workspaceAgentBatchWaitLogKeyRef.current = "";
+    pendingRequestKeys.forEach((requestKey) => {
+      workspaceAgentBatchInFlightSessionKeysRef.current.add(requestKey);
+    });
     const batchStartedAt = performance.now();
 
     logWorkspaceActivationTrace("workspace.open.agent_batch.start", activatedWorkspace.id, {
+      inFlightPreparedWorkspaceTerminalCount,
       launchKey: workspaceAgentLaunchKey,
-      requestCount: preparedWorkspaceTerminalRequests.length,
-      requests: preparedWorkspaceTerminalRequests.map((request) => ({
+      pendingPreparedWorkspaceTerminalCount: pendingPreparedWorkspaceTerminalRequests.length,
+      preparedWorkspaceTerminalAgentStartCount,
+      preparedWorkspaceTerminalCount,
+      requestCount: pendingPreparedWorkspaceTerminalRequests.length,
+      requests: pendingPreparedWorkspaceTerminalRequests.map((request) => ({
         hasProviderSessionId: Boolean(request.providerSessionId),
         instanceId: request.instanceId || "",
         model: request.model || "",
@@ -18170,8 +18674,8 @@ export default function App() {
     });
     logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_start", {
       launchKey: workspaceAgentLaunchKey,
-      requestCount: preparedWorkspaceTerminalRequests.length,
-      requests: preparedWorkspaceTerminalRequests.map((request) => ({
+      requestCount: pendingPreparedWorkspaceTerminalRequests.length,
+      requests: pendingPreparedWorkspaceTerminalRequests.map((request) => ({
         hasProviderSessionId: Boolean(request.providerSessionId),
         instanceId: request.instanceId || "",
         model: request.model || "",
@@ -18184,12 +18688,13 @@ export default function App() {
       workspaceId: activatedWorkspace.id,
     });
 
-    invoke("terminal_start_agent_many", { requests: preparedWorkspaceTerminalRequests })
+    invoke("terminal_start_agent_many", { requests: pendingPreparedWorkspaceTerminalRequests })
       .then((result) => {
         const results = Array.isArray(result?.results) ? result.results : [];
         logWorkspaceActivationTrace("workspace.open.agent_batch.done", activatedWorkspace.id, {
           elapsedMs: Math.max(0, performance.now() - batchStartedAt),
           launchKey: workspaceAgentLaunchKey,
+          requestCount: pendingPreparedWorkspaceTerminalRequests.length,
           resultCount: results.length,
           startedCount: results.filter((paneResult) => paneResult?.started).length,
         });
@@ -18204,7 +18709,7 @@ export default function App() {
             return;
           }
 
-          const request = preparedWorkspaceTerminalRequests.find((candidate) => (
+          const request = pendingPreparedWorkspaceTerminalRequests.find((candidate) => (
             candidate.paneId === paneResult.paneId
             && Number(candidate.instanceId || 0) === Number(paneResult.instanceId || 0)
           ));
@@ -18322,11 +18827,17 @@ export default function App() {
             });
           }
         });
-        workspaceAgentBatchInFlightKeyRef.current = "";
-        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        pendingRequestKeys.forEach((requestKey) => {
+          workspaceAgentBatchInFlightSessionKeysRef.current.delete(requestKey);
+          workspaceAgentBatchStartedSessionKeysRef.current.add(requestKey);
+        });
+        if (workspaceAgentBatchInFlightSessionKeysRef.current.size === 0) {
+          workspaceAgentBatchInFlightKeyRef.current = "";
+        }
+        setWorkspaceAgentBatchSentLaunchKey(workspaceAgentLaunchKey);
         setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
         preparedTerminalsRef.current.forEach((session, key) => {
-          if (preparedWorkspaceTerminalRequests.some((request) => (
+          if (pendingPreparedWorkspaceTerminalRequests.some((request) => (
             request.paneId === session.paneId && request.instanceId === session.instanceId
           ))) {
             preparedTerminalsRef.current.delete(key);
@@ -18339,19 +18850,25 @@ export default function App() {
           elapsedMs: Math.max(0, performance.now() - batchStartedAt),
           launchKey: workspaceAgentLaunchKey,
           message: error?.message || String(error || ""),
-          requestCount: preparedWorkspaceTerminalRequests.length,
+          requestCount: pendingPreparedWorkspaceTerminalRequests.length,
         });
         logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_error", {
           launchKey: workspaceAgentLaunchKey,
           message: error?.message || String(error || ""),
-          requestCount: preparedWorkspaceTerminalRequests.length,
+          requestCount: pendingPreparedWorkspaceTerminalRequests.length,
           workspaceId: activatedWorkspace.id,
         });
-        workspaceAgentBatchInFlightKeyRef.current = "";
-        setWorkspaceAgentBatchSentKey(workspaceAgentLaunchKey);
+        pendingRequestKeys.forEach((requestKey) => {
+          workspaceAgentBatchInFlightSessionKeysRef.current.delete(requestKey);
+          workspaceAgentBatchStartedSessionKeysRef.current.add(requestKey);
+        });
+        if (workspaceAgentBatchInFlightSessionKeysRef.current.size === 0) {
+          workspaceAgentBatchInFlightKeyRef.current = "";
+        }
+        setWorkspaceAgentBatchSentLaunchKey(workspaceAgentLaunchKey);
         setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
         preparedTerminalsRef.current.forEach((session, key) => {
-          if (preparedWorkspaceTerminalRequests.some((request) => (
+          if (pendingPreparedWorkspaceTerminalRequests.some((request) => (
             request.paneId === session.paneId && request.instanceId === session.instanceId
           ))) {
             preparedTerminalsRef.current.delete(key);
@@ -18368,6 +18885,7 @@ export default function App() {
     preparedWorkspaceTerminalCount,
     preparedWorkspaceTerminalRequests,
     preparedWorkspaceTerminalSessions,
+    setWorkspaceAgentBatchSentLaunchKey,
     workspaceAgentBatchSentKey,
     workspaceAgentLaunchKey,
     workspaceTerminalAgentLaunchReady,
