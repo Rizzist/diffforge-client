@@ -22,8 +22,11 @@ const CLOUD_MCP_REMOTE_COMMAND_EVENT: &str = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT: &str = "cloud-mcp-task-history-updated";
+const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
+const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
+const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -1180,6 +1183,261 @@ fn cloud_mcp_repo_id_for_root(root: &Path) -> String {
     )
 }
 
+fn cloud_mcp_git_repo_identity_id(prefix: &str, value: &str) -> String {
+    format!("{prefix}-{}", cloud_mcp_short_hash(value))
+}
+
+fn cloud_mcp_git_remote_host_path_from_url(url: &str) -> Option<(String, String)> {
+    let mut value = url.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(index) = value.find(['?', '#']) {
+        value.truncate(index);
+    }
+    value = value.trim_end_matches('/').to_string();
+    if value.is_empty() {
+        return None;
+    }
+
+    let without_scheme = if let Some(index) = value.find("://") {
+        value[index + 3..].to_string()
+    } else {
+        value.clone()
+    };
+
+    if let Some(at_index) = without_scheme.find('@') {
+        let host_path = &without_scheme[at_index + 1..];
+        if let Some(colon_index) = host_path.find(':') {
+            let before_slash = host_path.find('/').unwrap_or(usize::MAX);
+            if colon_index < before_slash {
+                let host = host_path[..colon_index].trim().to_ascii_lowercase();
+                let path = host_path[colon_index + 1..].trim_matches('/').to_string();
+                if !host.is_empty() && !path.is_empty() {
+                    return Some((host, path));
+                }
+            }
+        }
+    }
+
+    let host_path = without_scheme
+        .rsplit_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(without_scheme.as_str());
+    let mut parts = host_path.splitn(2, '/');
+    let host = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let path = parts.next().unwrap_or_default().trim_matches('/').to_string();
+    if host.is_empty() || path.is_empty() || host.contains('\\') {
+        return None;
+    }
+    Some((host, path))
+}
+
+fn cloud_mcp_normalized_git_remote_url(url: &str) -> Option<String> {
+    let (host, mut path) = cloud_mcp_git_remote_host_path_from_url(url)?;
+    path = path.replace('\\', "/");
+    while path.ends_with('/') {
+        path.pop();
+    }
+    if path.to_ascii_lowercase().ends_with(".git") {
+        path.truncate(path.len().saturating_sub(4));
+    }
+    let normalized_path = path
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized_path.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{}", normalized_path.to_ascii_lowercase()))
+}
+
+fn cloud_mcp_git_remotes_for_identity(root: &Path) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut remotes = workspace_git_remotes(root)
+        .into_iter()
+        .filter_map(|remote| {
+            let name = cloud_mcp_payload_text(&remote, &["name"]).unwrap_or_default();
+            let direction = cloud_mcp_payload_text(&remote, &["direction"]).unwrap_or_default();
+            let url = cloud_mcp_payload_text(&remote, &["url"])?;
+            let canonical = cloud_mcp_normalized_git_remote_url(&url)?;
+            if !seen.insert(canonical.clone()) {
+                return None;
+            }
+            let canonical_hash = cloud_mcp_short_hash(&canonical);
+            Some(json!({
+                "name": name,
+                "direction": direction,
+                "canonical": canonical,
+                "canonical_hash": canonical_hash,
+                "canonicalHash": canonical_hash,
+            }))
+        })
+        .collect::<Vec<_>>();
+    remotes.sort_by(|left, right| {
+        left["canonical"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(right["canonical"].as_str().unwrap_or_default())
+    });
+    remotes
+}
+
+fn cloud_mcp_git_branch_for_identity(root: &Path) -> String {
+    let branch = workspace_git_text_or_empty(
+        root,
+        &["branch", "--show-current"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    );
+    if !branch.is_empty() {
+        return branch;
+    }
+    workspace_git_text_or_empty(
+        root,
+        &["rev-parse", "--short", "HEAD"],
+        Duration::from_secs(GIT_STATUS_TIMEOUT_SECS),
+    )
+    .chars()
+    .take(16)
+    .collect()
+}
+
+fn cloud_mcp_git_repo_identity_for_path(path: &Path) -> Value {
+    let git_root = workspace_git_top_level(path)
+        .or_else(|| {
+            if path.join(".git").exists() {
+                Some(path.to_path_buf())
+            } else {
+                None
+            }
+        });
+    let Some(git_root) = git_root else {
+        return json!({
+            "git_repo_present": false,
+            "gitRepoPresent": false,
+            "git_repo_identity_id": Value::Null,
+            "gitRepoIdentityId": Value::Null,
+            "git_repo_identity_kind": "none",
+            "gitRepoIdentityKind": "none",
+        });
+    };
+
+    let git_root = git_root.canonicalize().unwrap_or(git_root);
+    let remotes = cloud_mcp_git_remotes_for_identity(&git_root);
+    let canonical_remote = remotes
+        .iter()
+        .find(|remote| {
+            cloud_mcp_payload_text(remote, &["name"])
+                .map(|name| name == "origin")
+                .unwrap_or(false)
+        })
+        .or_else(|| remotes.first())
+        .and_then(|remote| cloud_mcp_payload_text(remote, &["canonical"]));
+    let canonical_remote_hash = canonical_remote
+        .as_deref()
+        .map(cloud_mcp_short_hash)
+        .unwrap_or_default();
+    let root_display = workspace_path_display(&git_root);
+    let identity_kind = if canonical_remote.is_some() {
+        "remote"
+    } else {
+        "local_git_root"
+    };
+    let identity_seed = canonical_remote
+        .clone()
+        .unwrap_or_else(|| normalized_path_key(&git_root));
+    let identity_id = if canonical_remote.is_some() {
+        cloud_mcp_git_repo_identity_id("git-remote", &identity_seed)
+    } else {
+        cloud_mcp_git_repo_identity_id("git-local", &identity_seed)
+    };
+    let display_name = canonical_remote
+        .as_deref()
+        .and_then(|remote| remote.rsplit('/').next())
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            git_root
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| "repository".to_string())
+        });
+    let head_sha = workspace_git_head_sha(&git_root);
+    let branch = cloud_mcp_git_branch_for_identity(&git_root);
+    json!({
+        "git_repo_present": true,
+        "gitRepoPresent": true,
+        "git_repo_identity_id": identity_id.clone(),
+        "gitRepoIdentityId": identity_id,
+        "git_repo_identity_kind": identity_kind,
+        "gitRepoIdentityKind": identity_kind,
+        "git_repo_display_name": display_name.clone(),
+        "gitRepoDisplayName": display_name,
+        "git_repo_root": root_display.clone(),
+        "gitRepoRoot": root_display,
+        "git_repo_canonical_remote": canonical_remote.clone(),
+        "gitRepoCanonicalRemote": canonical_remote,
+        "git_repo_canonical_remote_hash": canonical_remote_hash.clone(),
+        "gitRepoCanonicalRemoteHash": canonical_remote_hash,
+        "git_repo_remote_count": remotes.len(),
+        "gitRepoRemoteCount": remotes.len(),
+        "git_repo_remotes": remotes.clone(),
+        "gitRepoRemotes": remotes,
+        "git_branch": branch.clone(),
+        "gitBranch": branch,
+        "git_head_sha": head_sha.clone(),
+        "gitHeadSha": head_sha,
+    })
+}
+
+fn cloud_mcp_git_identity_from_workspace_or_path(workspace: &Value, root_path: &str) -> Value {
+    workspace
+        .get("git_repo_identity")
+        .or_else(|| workspace.get("gitRepoIdentity"))
+        .filter(|identity| {
+            cloud_mcp_payload_text(identity, &["git_repo_identity_id", "gitRepoIdentityId"])
+                .is_some()
+        })
+        .cloned()
+        .unwrap_or_else(|| cloud_mcp_git_repo_identity_for_path(Path::new(root_path)))
+}
+
+fn cloud_mcp_apply_git_identity_to_value(value: &mut Value, identity: &Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("git_repo_identity".to_string(), identity.clone());
+    object.insert("gitRepoIdentity".to_string(), identity.clone());
+    for (field, aliases) in [
+        ("git_repo_present", &["gitRepoPresent"][..]),
+        ("git_repo_identity_id", &["gitRepoIdentityId"][..]),
+        ("git_repo_identity_kind", &["gitRepoIdentityKind"][..]),
+        ("git_repo_display_name", &["gitRepoDisplayName"][..]),
+        ("git_repo_root", &["gitRepoRoot"][..]),
+        ("git_repo_canonical_remote", &["gitRepoCanonicalRemote"][..]),
+        (
+            "git_repo_canonical_remote_hash",
+            &["gitRepoCanonicalRemoteHash"][..],
+        ),
+        ("git_repo_remote_count", &["gitRepoRemoteCount"][..]),
+        ("git_repo_remotes", &["gitRepoRemotes"][..]),
+        ("git_branch", &["gitBranch"][..]),
+        ("git_head_sha", &["gitHeadSha"][..]),
+    ] {
+        let item = identity
+            .get(field)
+            .or_else(|| aliases.iter().find_map(|alias| identity.get(*alias)))
+            .cloned()
+            .unwrap_or(Value::Null);
+        object.insert(field.to_string(), item.clone());
+        for alias in aliases {
+            object.insert((*alias).to_string(), item.clone());
+        }
+    }
+}
+
 fn cloud_mcp_workspace_location_fingerprint(root: &Path) -> String {
     format!(
         "loc-{}",
@@ -1971,16 +2229,18 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         ) {
             let _ = cloud_mcp_send_liveness_pong_event(state, &event).await;
         }
-        let _ = state.global_ws_events.send(event);
-        let mut runtime = state.inner.lock().await;
-        runtime.connected = true;
-        runtime.status = "connected".to_string();
-        runtime.global_ws_connected = true;
-        runtime.global_ws_status = "connected".to_string();
-        runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
-        if let Some(data) = live_runtime_snapshot {
-            runtime.live_runtime_status = Some(data);
+        {
+            let mut runtime = state.inner.lock().await;
+            runtime.connected = true;
+            runtime.status = "connected".to_string();
+            runtime.global_ws_connected = true;
+            runtime.global_ws_status = "connected".to_string();
+            runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
+            if let Some(data) = live_runtime_snapshot {
+                runtime.live_runtime_status = Some(data);
+            }
         }
+        let _ = state.global_ws_events.send(event);
     }
 }
 
@@ -2370,6 +2630,12 @@ async fn cloud_mcp_start_remote_command_listener(
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
                 continue;
             }
+            if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
+                let _ = app.emit(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, event.clone());
+                if event_kind != "remote_command_requested" {
+                    continue;
+                }
+            }
             if event_kind != "remote_command_requested" {
                 continue;
             }
@@ -2411,6 +2677,25 @@ async fn cloud_mcp_start_remote_command_listener(
 
 fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
     matches!(event_kind, "tokenomics_account_snapshot")
+}
+
+fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bool {
+    if matches!(
+        event_kind,
+        "workspace_todo_snapshot"
+            | "workspace_todos_snapshot"
+            | "todo_queue_snapshot"
+            | "todo_queue_state"
+    ) {
+        return true;
+    }
+    if event_kind != "live_runtime_snapshot" {
+        return false;
+    }
+    event
+        .get("data")
+        .and_then(|data| data.get("workspace_todos").or_else(|| data.get("workspaceTodos")))
+        .is_some()
 }
 
 #[tauri::command]
@@ -2603,11 +2888,14 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                 if workspace_id.is_empty() || repo_id.is_empty() || !seen.insert(key) {
                     continue;
                 }
-                workspaces.push(json!({
+                let root_display = cloud_mcp_payload_text(workspace, &["workspace_root", "workspaceRoot", "repo_path", "repoPath"])
+                    .unwrap_or_default();
+                let git_identity = cloud_mcp_git_identity_from_workspace_or_path(workspace, &root_display);
+                let mut workspace_value = json!({
                     "workspace_id": workspace_id,
                     "repo_id": repo_id,
                     "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
-                    "workspace_root": cloud_mcp_payload_text(workspace, &["workspace_root", "workspaceRoot", "repo_path", "repoPath"]),
+                    "workspace_root": root_display,
                     "workspace_location_fingerprint": cloud_mcp_payload_text(
                         workspace,
                         &[
@@ -2636,7 +2924,9 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                         .or_else(|| workspace.get("workspaceActive"))
                         .cloned()
                         .unwrap_or_else(|| json!(false)),
-                }));
+                });
+                cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
+                workspaces.push(workspace_value);
             }
         }
     }
@@ -2648,7 +2938,8 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
         if !seen.insert(key) {
             continue;
         }
-        workspaces.push(json!({
+        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&workspace.root));
+        let mut workspace_value = json!({
             "workspace_id": workspace.workspace_id,
             "repo_id": repo_id,
             "workspace_name": workspace.workspace_name,
@@ -2659,7 +2950,9 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             "workspace_status": "registered",
             "terminal_count": 0,
             "mcp_server_count": 0,
-        }));
+        });
+        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
+        workspaces.push(workspace_value);
     }
 
     workspaces
@@ -4804,7 +5097,8 @@ async fn cloud_mcp_register_prepared_workspace(
     reason: &str,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let now_ms = cloud_mcp_now_ms();
-    let repo_id = format!("repo-{}", cloud_mcp_short_hash(&prepared.root_display));
+    let repo_id = cloud_mcp_repo_id_for_root(&prepared.root);
+    let git_identity = cloud_mcp_git_repo_identity_for_path(&prepared.root);
     let policy_graph_detected = prepared.policy_graph.is_some();
     let workspace_status = CloudMcpWorkspaceStatus {
         root: prepared.root_display.clone(),
@@ -4821,7 +5115,7 @@ async fn cloud_mcp_register_prepared_workspace(
         policy_graph_detected,
         policy_graph_path: prepared.policy_graph_path.clone(),
     };
-    let payload = json!({
+    let mut payload = json!({
         "source": "rust-diffforge",
         "repo_id": repo_id.clone(),
         "agent_id": "rust-diffforge",
@@ -4842,6 +5136,10 @@ async fn cloud_mcp_register_prepared_workspace(
             "context_pack_model": true,
         }
     });
+    cloud_mcp_apply_git_identity_to_value(&mut payload, &git_identity);
+    if let Some(inner_payload) = payload.get_mut("payload") {
+        cloud_mcp_apply_git_identity_to_value(inner_payload, &git_identity);
+    }
     let event_response = cloud_mcp_post_event_endpoint(state, reason, &payload).await?;
     if reason == "workspace_registration" {
         let reconcile_payload = json!({
@@ -4969,17 +5267,20 @@ async fn cloud_mcp_ws_send_workspace_registration(
     workspace: &CloudMcpWorkspaceStatus,
 ) -> Result<Value, String> {
     let root = Path::new(&workspace.root);
+    let git_identity = cloud_mcp_git_repo_identity_for_path(root);
+    let mut payload = json!({
+        "repo_id": repo_id,
+        "workspace_id": workspace.workspace_id,
+        "workspace_name": workspace.workspace_name,
+        "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(root),
+        "workspace_root": workspace.root,
+        "schema_version": 1,
+    });
+    cloud_mcp_apply_git_identity_to_value(&mut payload, &git_identity);
     cloud_mcp_ws_request(
         state,
         "workspace_register",
-        &json!({
-            "repo_id": repo_id,
-            "workspace_id": workspace.workspace_id,
-            "workspace_name": workspace.workspace_name,
-            "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(root),
-            "workspace_root": workspace.root,
-            "schema_version": 1,
-        }),
+        &payload,
     )
     .await
 }
@@ -5768,120 +6069,6 @@ async fn cloud_mcp_sync_terminal_agent_status(
                 "terminal_instance_id": instance_id,
             }),
         ),
-    }
-    if let Some(task_id) = local_task_id.filter(|value| !value.trim().is_empty()) {
-        let task_spec_payload = json!({
-            "source": "rust-diffforge-terminal-lifecycle",
-            "entity_type": "task",
-            "canonical_event_kind": cloud_mcp_task_spec_event_kind(status),
-            "repo_id": repo_id,
-            "agent_id": agent_id,
-            "agent_label": agent_label,
-            "self_agent_id": agent_id,
-            "current_agent_id": agent_id,
-            "status": status,
-            "task_status": cloud_mcp_task_spec_status(status),
-            "lane": lane,
-            "current_prompt": current_prompt,
-            "summary": progress_summary,
-            "progress_summary": progress_summary,
-            "task_id": task_id,
-            "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
-            "claimed_paths": cloud_mcp_terminal_claimed_paths(coordination, Some(task_id)),
-            "workspace_root": workspace_path_display(working_directory),
-            "terminal_id": pane_id,
-            "pane_id": pane_id,
-            "terminal_instance_id": instance_id,
-            "producer_id": format!("{}:{}", pane_id, instance_id),
-            "producer_seq": cloud_mcp_now_ms() as i64,
-            "metadata": {
-                "agent_label": agent_label,
-                "agent_kind": coordination.map(|coordination| coordination.agent_kind.clone()),
-                "coding_agent": coordination.map(|coordination| coordination.agent_kind.clone()),
-                "managed_by": "rust-diffforge",
-                "reason": reason,
-                "terminal_id": pane_id,
-                "terminal_instance_id": instance_id,
-                "workspace_root": workspace_path_display(working_directory),
-                "session_id": coordination.map(|coordination| coordination.session_id.clone()),
-                "session_mode": session_mode.unwrap_or(if coordination.is_some() { "managed_patch" } else { "free" }),
-                "local_coordination_task_id": task_id,
-                "coordination_task_id": task_id,
-                "local_lease_file_evidence": has_claimed_paths,
-            },
-            "ts_ms": cloud_mcp_now_ms(),
-        });
-        log_terminal_status_event(
-            "backend.cloud_mcp.task_spec_event.send",
-            json!({
-                "endpoint": "task_spec_event",
-                "payload": task_spec_payload.clone(),
-                "reason": reason,
-                "terminal_id": pane_id,
-                "terminal_instance_id": instance_id,
-            }),
-        );
-        let task_spec_result =
-            cloud_mcp_post_event_endpoint(state, "task_spec_event", &task_spec_payload).await;
-        match &task_spec_result {
-            Ok(value) => log_terminal_status_event(
-                "backend.cloud_mcp.task_spec_event.result",
-                json!({
-                    "endpoint": "task_spec_event",
-                    "ok": true,
-                    "result": value,
-                    "terminal_id": pane_id,
-                    "terminal_instance_id": instance_id,
-                }),
-            ),
-            Err(error) => log_terminal_status_event(
-                "backend.cloud_mcp.task_spec_event.error",
-                json!({
-                    "endpoint": "task_spec_event",
-                    "error": clean_terminal_telemetry_text(error),
-                    "terminal_id": pane_id,
-                    "terminal_instance_id": instance_id,
-                }),
-            ),
-        }
-    }
-}
-
-fn cloud_mcp_task_spec_status(status: &str) -> &'static str {
-    match status
-        .trim()
-        .to_ascii_lowercase()
-        .replace('-', "_")
-        .as_str()
-    {
-        "done" | "completed" | "complete" | "idle" | "ready" | "prompt_ready" => "done",
-        "merged" | "applied" => "merged",
-        "skipped" => "skipped",
-        "cancelled" | "canceled" => "cancelled",
-        "interrupted" => "interrupted",
-        "failed" | "error" => "failed",
-        "queued" => "queued",
-        "dispatched" => "dispatched",
-        "claimed" => "claimed",
-        "started" => "started",
-        "review" | "submitted" | "patch_submitted" => "review",
-        "parked" | "waiting" | "paused" | "resume_ready" | "resume_requested" => "waiting",
-        "starting" => "starting",
-        _ => "working",
-    }
-}
-
-fn cloud_mcp_task_spec_event_kind(status: &str) -> &'static str {
-    match cloud_mcp_task_spec_status(status) {
-        "done" | "merged" | "skipped" => "task.completed",
-        "cancelled" => "task.cancelled",
-        "interrupted" => "task.interrupted",
-        "failed" => "task.failed",
-        "queued" => "task.queued",
-        "dispatched" => "task.dispatched",
-        "claimed" | "started" | "starting" => "task.started",
-        "waiting" => "task.needs_input",
-        _ => "task.progressed",
     }
 }
 
@@ -7804,6 +7991,7 @@ async fn cloud_mcp_sync_terminal_presence(
             }
         });
         let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
         let terminal_items = cloud_mcp_workspace_terminal_items(workspace);
         let terminals = terminal_items
             .iter()
@@ -7905,7 +8093,7 @@ async fn cloud_mcp_sync_terminal_presence(
             .collect::<Vec<_>>();
 
         let terminal_count = terminals.len();
-        normalized_workspaces.push(json!({
+        let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
             "device_name": device_profile["device_name"].clone(),
@@ -7922,7 +8110,9 @@ async fn cloud_mcp_sync_terminal_presence(
             "workspace_status": workspace_status,
             "terminal_count": terminal_count,
             "terminals": terminals,
-        }));
+        });
+        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
+        normalized_workspaces.push(workspace_value);
     }
     let terminal_count = normalized_workspaces
         .iter()
@@ -8616,7 +8806,8 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             .collect::<Vec<_>>();
 
         let server_count = servers.len();
-        normalized_workspaces.push(json!({
+        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
+        let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
             "device_name": device_profile["device_name"].clone(),
@@ -8633,7 +8824,9 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             "workspace_status": workspace_status,
             "server_count": server_count,
             "servers": servers,
-        }));
+        });
+        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
+        normalized_workspaces.push(workspace_value);
     }
 
     let snapshot_id = format!(
@@ -9252,6 +9445,149 @@ async fn cloud_mcp_record_voice_plan_task_status(
         ),
     }
     result
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_workspace_todos(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    todos: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut payload = match todos {
+        Value::Object(object) => Value::Object(object),
+        Value::Array(items) => json!({ "todos": items }),
+        _ => return Err("Workspace todo sync payload must be an object or array.".to_string()),
+    };
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
+
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("event_kind".to_string(), json!("workspace_todo_snapshot"));
+        object.insert("source".to_string(), json!("rust-diffforge-todo-queue"));
+        object.insert(
+            "reason".to_string(),
+            json!(reason.unwrap_or_else(|| "todo_queue_sync".to_string())),
+        );
+        object.insert("workspace_id".to_string(), json!(workspace_id.clone()));
+        object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+        object.insert(
+            "workspace_name".to_string(),
+            json!(workspace_name.clone().unwrap_or_default()),
+        );
+        object.insert(
+            "workspaceName".to_string(),
+            json!(workspace_name.unwrap_or_default()),
+        );
+        object.insert("device".to_string(), device_profile.clone());
+        object.insert("device_id".to_string(), device_profile["device_id"].clone());
+        object.insert("deviceId".to_string(), device_profile["device_id"].clone());
+        object.insert("machine_id".to_string(), device_profile["device_id"].clone());
+        object.insert("machineId".to_string(), device_profile["device_id"].clone());
+        object.insert("device_name".to_string(), device_profile["device_name"].clone());
+        object.insert("machine_name".to_string(), device_profile["machine_name"].clone());
+        object.insert("snapshot_full".to_string(), json!(true));
+        object.insert("snapshotFull".to_string(), json!(true));
+        object.insert("prune_missing".to_string(), json!(false));
+        object.insert("pruneMissing".to_string(), json!(false));
+        object.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
+    }
+
+    log_terminal_status_event(
+        "backend.workspace_todos.sync_send",
+        json!({
+            "repoPath": req.root_display,
+            "workspaceId": workspace_id,
+            "todoCount": payload
+                .get("todos")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0),
+        }),
+    );
+    let result = cloud_mcp_post_event_endpoint(
+        state.inner(),
+        "workspace_todo_snapshot",
+        &payload,
+    )
+    .await;
+    match &result {
+        Ok(value) => log_terminal_status_event(
+            "backend.workspace_todos.sync_result",
+            json!({
+                "ok": true,
+                "result": value,
+                "workspaceId": workspace_id,
+            }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.workspace_todos.sync_error",
+            json!({
+                "error": clean_terminal_telemetry_text(error),
+                "workspaceId": workspace_id,
+            }),
+        ),
+    }
+    result
+}
+
+fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            items.truncate(CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS);
+            for item in items.iter_mut() {
+                cloud_mcp_limit_workspace_todo_sync_payload(item);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(items) = object.get_mut("todos").and_then(Value::as_array_mut) {
+                items.truncate(CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS);
+            }
+            for (key, child) in object.iter_mut() {
+                let normalized_key = key.to_ascii_lowercase();
+                if matches!(
+                    normalized_key.as_str(),
+                    "src" | "dataurl" | "data_url" | "image_data" | "imagedata"
+                ) {
+                    *child = Value::Null;
+                    continue;
+                }
+                if matches!(
+                    normalized_key.as_str(),
+                    "text" | "title" | "body" | "prompt" | "notetext" | "note_text"
+                ) {
+                    if let Value::String(text) = child {
+                        *text = cloud_mcp_truncate_chars(
+                            text,
+                            CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS,
+                        );
+                    }
+                    continue;
+                }
+                cloud_mcp_limit_workspace_todo_sync_payload(child);
+            }
+        }
+        Value::String(text) => {
+            if text.chars().count() > CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS {
+                *text = cloud_mcp_truncate_chars(text, CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cloud_mcp_truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
 }
 
 #[tauri::command]

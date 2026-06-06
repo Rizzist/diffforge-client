@@ -2902,7 +2902,7 @@ mod workspace_files_tests {
     }
 
     #[test]
-    fn project_mount_scan_finds_deep_nested_git_boundaries() {
+    fn project_mount_scan_ignores_git_boundaries_past_depth_limit() {
         let root = test_workspace_root("diffforge-deep-nested-git-mount");
         let child = root
             .join("cases")
@@ -2921,8 +2921,8 @@ mod workspace_files_tests {
             .map(|mount| mount.mount_id.as_str())
             .collect::<HashSet<_>>();
 
-        assert_eq!(response.workspace_kind, "container");
-        assert!(mount_ids.contains("cases/client/regions/east/apps/mobile/native"));
+        assert_eq!(response.workspace_kind, "plain");
+        assert!(!mount_ids.contains("cases/client/regions/east/apps/mobile/native"));
         assert!(!root.join(".git").exists());
 
         let _ = fs::remove_dir_all(root);

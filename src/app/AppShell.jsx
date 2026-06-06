@@ -1050,6 +1050,7 @@ const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
+const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 
@@ -2351,6 +2352,16 @@ function cloudConnectedDevicesFromRuntimeStatus(status) {
   return Array.from(byId.values()).slice(0, 12);
 }
 
+function cloudWorkspaceTodosFromRuntimeStatus(status) {
+  const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
+  const workspaceTodos = status?.workspaceTodos
+    || status?.workspace_todos
+    || liveRuntime?.workspaceTodos
+    || liveRuntime?.workspace_todos
+    || null;
+  return workspaceTodos && typeof workspaceTodos === "object" ? workspaceTodos : null;
+}
+
 function sanitizeWorkspaceMcpServerForCloud(server) {
   if (!server || typeof server !== "object") {
     return null;
@@ -2570,6 +2581,7 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   status: "idle",
   title: "Cloud workspace",
   updatedAt: 0,
+  workspaceTodos: null,
 });
 const CLOUD_WORKSPACE_CONNECT_ATTEMPTS = 8;
 const CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS = 2200;
@@ -3185,6 +3197,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const connected = Boolean(status?.connected && (status?.globalWsConnected || status?.global_ws_connected));
   const statusKey = globalStatus || runtimeStatus;
   const connectedDevices = cloudConnectedDevicesFromRuntimeStatus(status);
+  const workspaceTodos = cloudWorkspaceTodosFromRuntimeStatus(status);
 
   if (connected || statusKey === "connected") {
     return {
@@ -3193,6 +3206,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "workspace_socket",
       status: "connected",
       title: "Cloud workspace ready",
+      workspaceTodos,
     };
   }
 
@@ -3203,6 +3217,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "cloud_auth",
       status: "active",
       title: "Preparing cloud auth",
+      workspaceTodos,
     };
   }
 
@@ -3213,6 +3228,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "cloud_route",
       status: "active",
       title: "Finding your cloud route",
+      workspaceTodos,
     };
   }
 
@@ -3223,6 +3239,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "cloud_instance",
       status: "active",
       title: "Setting up your instance",
+      workspaceTodos,
     };
   }
 
@@ -3233,6 +3250,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "workspace_socket",
       status: "active",
       title: "Linking the live workspace",
+      workspaceTodos,
     };
   }
 
@@ -3243,6 +3261,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       stage: "workspace_socket",
       status: "active",
       title: "Linking the live workspace",
+      workspaceTodos,
     };
   }
 
@@ -3252,6 +3271,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     stage: "cloud_route",
     status: "active",
     title: "Preparing your cloud workspace",
+    workspaceTodos,
   };
 }
 
@@ -3266,9 +3286,19 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     : Array.isArray(previous?.connectedDevices)
       ? previous.connectedDevices
       : [];
+  const workspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
+    ? progress.workspaceTodos
+    : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
+      ? previous.workspaceTodos
+      : null;
 
   if (previousStatus === "connected" && nextStatus !== "error") {
-    return previous;
+    return {
+      ...previous,
+      connectedDevices,
+      updatedAt: Date.now(),
+      workspaceTodos,
+    };
   }
 
   if (!["connected", "error"].includes(nextStatus) && nextRank < previousRank) {
@@ -3280,6 +3310,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
       ),
       connectedDevices,
       updatedAt: Date.now(),
+      workspaceTodos,
     };
   }
 
@@ -3291,6 +3322,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     status: nextStatus,
     title: String(progress?.title || previous.title || "Cloud workspace"),
     updatedAt: Date.now(),
+    workspaceTodos,
   };
 }
 
@@ -14290,6 +14322,27 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     let unlistenTaskHistory = null;
+    let unlistenWorkspaceTodos = null;
+    let workspaceTodoRefreshTimer = 0;
+
+    const refreshCloudWorkspaceTodos = () => {
+      if (cancelled || workspaceTodoRefreshTimer) {
+        return;
+      }
+      workspaceTodoRefreshTimer = window.setTimeout(() => {
+        workspaceTodoRefreshTimer = 0;
+        if (cancelled) {
+          return;
+        }
+        invoke("cloud_mcp_get_status").then((status) => {
+          if (cancelled) return;
+          setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress(
+            cloudWorkspaceProgressFromRuntimeStatus(status),
+            current,
+          ));
+        }).catch(() => {});
+      }, 80);
+    };
 
     listen("cloud-mcp-task-history-updated", (event) => {
       if (cancelled) return;
@@ -14316,10 +14369,27 @@ export default function App() {
       unlistenTaskHistory = unlisten;
     }).catch(() => {});
 
+    listen(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
+      refreshCloudWorkspaceTodos();
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenWorkspaceTodos = unlisten;
+    }).catch(() => {});
+
     return () => {
       cancelled = true;
+      if (workspaceTodoRefreshTimer) {
+        window.clearTimeout(workspaceTodoRefreshTimer);
+        workspaceTodoRefreshTimer = 0;
+      }
       if (unlistenTaskHistory) {
         unlistenTaskHistory();
+      }
+      if (unlistenWorkspaceTodos) {
+        unlistenWorkspaceTodos();
       }
     };
   }, [applyWorkspaceGraphSnapshot, setWorkspaceGraphStatus]);
@@ -19668,6 +19738,7 @@ export default function App() {
                             billingStatus={billingStatus}
                             connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}
+                            workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}

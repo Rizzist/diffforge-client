@@ -3731,6 +3731,7 @@ pub fn run() {
             cloud_mcp_record_remote_command_status,
             cloud_mcp_sync_device_workspace_snapshot,
             cloud_mcp_record_voice_plan_task_status,
+            cloud_mcp_sync_workspace_todos,
             cloud_mcp_get_activity,
             cloud_mcp_get_task_history,
             agent_thread_session_discover,
