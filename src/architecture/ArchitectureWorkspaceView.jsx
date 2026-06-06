@@ -121,6 +121,16 @@ const ARCHITECTURE_API_CORRIDOR_ALIASES = new Set([
   "procedure-overlay",
   "procedure-corridor",
 ]);
+const ARCHITECTURE_RUN_DEFAULT_ENVS = ["local", "staging", "production"];
+const ARCHITECTURE_RUN_DEFAULT_MODES = ["plan", "apply", "verify"];
+const ARCHITECTURE_RUN_ACTION_LABELS = {
+  deploy: "Deploy",
+  "health-check": "Health Check",
+  "logs-toggle": "Toggle Logs",
+  rollback: "Rollback",
+  "rotate-secret": "Rotate Secret",
+  "smoke-test": "Smoke Test",
+};
 const ARCHITECTURE_ROUTE_GRID_CELL = 48;
 const ARCHITECTURE_ROUTE_GRID_MAX_POINTS = 1600;
 const ARCHITECTURE_ROUTE_CACHE_MAX = 700;
@@ -1244,6 +1254,147 @@ function architectureSlug(value, fallback = "architecture") {
   return slug || fallback;
 }
 
+function architectureTitleFromSlug(value, fallback = "Run") {
+  const raw = text(value);
+  if (!raw) return fallback;
+  return raw
+    .split(/[-_\s]+/u)
+    .filter(Boolean)
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ") || fallback;
+}
+
+function architectureRunList(value, fallback = []) {
+  const raw = text(value);
+  const source = raw ? raw.split(/[|,]/u) : fallback;
+  const seen = new Set();
+  return source
+    .map((item) => architectureSemanticSlug(item))
+    .filter((item) => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+function architectureRunTargetId(label, action, index = 0) {
+  return `run-${architectureSlug(label || action || "target")}-${index + 1}`;
+}
+
+function architectureNormalizeRunTarget(target, index = 0) {
+  if (!target || typeof target !== "object") return null;
+  const props = architectureCleanDslProps(target.semanticProps || target.props || target);
+  const action = architectureSemanticSlug(
+    target.action || props.action || props.kind || props.type || target.kind || target.type,
+    "run",
+  );
+  const label = text(
+    target.label || target.title || target.name || props.label || props.title,
+    ARCHITECTURE_RUN_ACTION_LABELS[action] || architectureTitleFromSlug(action, "Run"),
+  );
+  const envs = architectureRunList(
+    target.envs || target.environments || props.envs || props.environments || props.env,
+    ARCHITECTURE_RUN_DEFAULT_ENVS,
+  );
+  const modes = architectureRunList(
+    target.modes || target.allowedModes || target.allowed_modes || props.modes || props.allowedModes || props.allowed_modes || props.mode,
+    ARCHITECTURE_RUN_DEFAULT_MODES,
+  );
+  const defaultEnv = architectureSemanticSlug(
+    target.defaultEnv || target.default_env || props.defaultEnv || props.default_env,
+    envs.includes("staging") ? "staging" : envs[0] || "local",
+  );
+  const defaultMode = architectureSemanticSlug(
+    target.defaultMode || target.default_mode || props.defaultMode || props.default_mode,
+    modes.includes("plan") ? "plan" : modes[0] || "plan",
+  );
+  return {
+    action,
+    defaultEnv: envs.includes(defaultEnv) ? defaultEnv : envs[0] || "local",
+    defaultMode: modes.includes(defaultMode) ? defaultMode : modes[0] || "plan",
+    envs: envs.length ? envs : ARCHITECTURE_RUN_DEFAULT_ENVS,
+    id: text(target.id || props.id, architectureRunTargetId(label, action, index)),
+    label,
+    modes: modes.length ? modes : ARCHITECTURE_RUN_DEFAULT_MODES,
+    requiresApproval: text(target.requiresApproval || target.requires_approval || props.requiresApproval || props.requires_approval || props.approval),
+    scope: text(target.scope || props.scope),
+    semanticProps: props,
+  };
+}
+
+function architectureRunTargetFromDslLine(line, index = 0) {
+  const raw = text(line).replace(/^run\s+/u, "");
+  if (!raw) return null;
+  const { name, props } = architectureExtractDslProps(raw);
+  return architectureNormalizeRunTarget({
+    ...props,
+    label: name,
+    semanticProps: props,
+  }, index);
+}
+
+function architectureRunTargetDslLine(target, index = 0) {
+  const runTarget = architectureNormalizeRunTarget(target, index);
+  if (!runTarget) return "";
+  const props = architecturePropsWithOrderedOverrides(runTarget.semanticProps, {
+    action: runTarget.action,
+    envs: runTarget.envs.join(","),
+    modes: runTarget.modes.join(","),
+    defaultEnv: runTarget.defaultEnv,
+    defaultMode: runTarget.defaultMode,
+    ...(runTarget.scope ? { scope: runTarget.scope } : {}),
+    ...(runTarget.requiresApproval ? { approval: runTarget.requiresApproval } : {}),
+  });
+  return `run ${architectureDslString(runTarget.label)}${architectureDslPropsText(props)}`;
+}
+
+function architectureRunTargetsFromGraph(graph) {
+  const direct = jsonArray(graph?.runTargets || graph?.run_targets)
+    .map(architectureNormalizeRunTarget)
+    .filter(Boolean);
+  if (direct.length) return direct;
+  const source = text(graph?.source);
+  if (!source) return [];
+  const targets = [];
+  source.split(/\r?\n/u).forEach((rawLine) => {
+    const line = architectureStripDslComments(rawLine);
+    if (!/^run\s+/u.test(line)) return;
+    const target = architectureRunTargetFromDslLine(line, targets.length);
+    if (target) targets.push(target);
+  });
+  return targets;
+}
+
+function architectureRunTargetSelection(target, selections = {}) {
+  const runTarget = architectureNormalizeRunTarget(target) || {};
+  const selected = jsonObject(selections[runTarget.id]) || {};
+  const env = architectureSemanticSlug(selected.env, runTarget.defaultEnv || runTarget.envs?.[0] || "local");
+  const mode = architectureSemanticSlug(selected.mode, runTarget.defaultMode || "plan");
+  return {
+    env: jsonArray(runTarget.envs).includes(env) ? env : runTarget.defaultEnv || runTarget.envs?.[0] || "local",
+    mode: jsonArray(runTarget.modes).includes(mode) ? mode : runTarget.defaultMode || "plan",
+  };
+}
+
+function architectureRunRisk(env, mode) {
+  const safeEnv = architectureSemanticSlug(env);
+  const safeMode = architectureSemanticSlug(mode);
+  if (safeEnv === "production" && ["apply", "rollback"].includes(safeMode)) return "high";
+  if (["apply", "rollback"].includes(safeMode)) return "medium";
+  return "low";
+}
+
+function architectureRunPrompt(target, env, mode) {
+  const runTarget = architectureNormalizeRunTarget(target) || {};
+  return [
+    `Run architecture target "${text(runTarget.label, "Run")}".`,
+    `Action: ${text(runTarget.action, "run")}.`,
+    `Environment: ${text(env, runTarget.defaultEnv || "local")}.`,
+    `Mode: ${text(mode, runTarget.defaultMode || "plan")}.`,
+    runTarget.scope ? `Scope: ${runTarget.scope}.` : "",
+  ].filter(Boolean).join(" ");
+}
+
 function architectureIconSlug(value, fallback = "") {
   const raw = text(value).toLowerCase();
   const slug = raw
@@ -2338,6 +2489,7 @@ function architectureParseDslGraph(graph) {
     nodes: [],
     edges: [],
     apiCorridors: [],
+    runTargets: [],
   };
   const nameToId = new Map();
   const nodeById = new Map();
@@ -2458,6 +2610,11 @@ function architectureParseDslGraph(graph) {
       parsed.layout.direction = direction === "down" ? "TB"
         : direction === "up" ? "BT"
           : direction === "left" ? "RL" : "LR";
+      return;
+    }
+    if (/^run\s+/u.test(line)) {
+      const target = architectureRunTargetFromDslLine(line, parsed.runTargets.length);
+      if (target) parsed.runTargets.push(target);
       return;
     }
     if (/^(colorMode|styleMode|typeface|legend)\b/u.test(line)) return;
@@ -3043,6 +3200,7 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
   const currentGraph = jsonObject(graph) || {};
   const graphTitle = text(currentGraph.title, "Architecture graph");
   const groupPath = architectureFolderPathParts(currentGraph.groupPath);
+  const runTargets = architectureRunTargetsFromGraph(currentGraph);
   const corridorNodes = nodes.filter((node) => node.type === "architectureCorridor");
   const groupNodes = nodes.filter((node) => node.type === "architectureGroup");
   const regularNodes = nodes.filter((node) => node.type !== "architectureGroup" && node.type !== "architectureCorridor");
@@ -3093,6 +3251,10 @@ function architectureFlowGraphToDsl(graph, nodes, edges) {
     "direction right",
   ];
   if (groupPath.length) lines.push(`folder ${architectureDslString(groupPath.join(" / "))}`);
+  runTargets.forEach((target, index) => {
+    const line = architectureRunTargetDslLine(target, index);
+    if (line) lines.push(line);
+  });
   lines.push("");
   const emitGroup = (group, depth = 0) => {
     const intent = architectureGroupIntent(group.data?.intent);
@@ -3149,6 +3311,7 @@ function architectureGraphFromFlow(graph, nodes, edges) {
     ...currentGraph,
     source,
     sourceFormat: "eraserDsl",
+    runTargets: architectureRunTargetsFromGraph(currentGraph),
     apiCorridors: nodes
       .filter((node) => node.type === "architectureCorridor")
       .map(architectureApiCorridorFlowNodeToGraph),
@@ -3612,8 +3775,21 @@ function architectureAgentTaskText({
   graph,
   prompt,
   repoPath,
+  runEnvironment = "",
+  runMode = "",
+  runTarget = null,
 }) {
   const identity = architectureGraphIdentity(graph);
+  const normalizedRunTarget = architectureNormalizeRunTarget(runTarget);
+  const runLines = normalizedRunTarget ? [
+    "",
+    `Run target: ${normalizedRunTarget.label}`,
+    `Run action: ${normalizedRunTarget.action}`,
+    `Run environment: ${text(runEnvironment, normalizedRunTarget.defaultEnv)}`,
+    `Run mode: ${text(runMode, normalizedRunTarget.defaultMode)}`,
+    normalizedRunTarget.scope ? `Run scope: ${normalizedRunTarget.scope}` : "",
+    "Run target instructions: the `run` line describes operational intent and guardrails, not shell commands. Read the selected architecture graph and repo evidence before acting. In plan mode, stay read-only and explain the intended operation. For apply, rollback, production, destructive, credential, migration, or externally mutating work, use normal Diff Forge coordination and approval gates before changing or running anything.",
+  ] : [];
   return [
     `Architecture graph request: ${prompt}`,
     "",
@@ -3626,8 +3802,10 @@ function architectureAgentTaskText({
     "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
     "Use api-corridor overlay containers only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors explain runtime order across existing nodes; they are not replacement topology and not line-by-line source narration.",
     "Write corridors as `OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path] { Browser > API Server: GET /auth/start [step: 1, role: request, method: GET, path: /auth/start] }`. Corridor message endpoints should reference existing graph nodes or groups.",
+    "Use `run` lines only as graph-level launch metadata, for example `run \"Deploy\" [action: deploy, envs: \"local,staging,production\", modes: \"plan,apply,verify,rollback\", defaultEnv: staging, scope: \"Deployment\"]`. Do not treat run lines as executable scripts.",
     "Preserve semantic props when editing. Groups should use intent. Nodes should use role, lifecycle, source, and status when useful. Edges should use role plus condition, event, and criticality when useful.",
     "Use compact actor nodes for people, users, customers, admins, agents, bots, browsers, CLI clients, and similar graph entrypoints: write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.",
+    ...runLines,
   ].filter(Boolean).join("\n");
 }
 
@@ -3635,6 +3813,9 @@ function architectureQueueAgentTodo({
   graph,
   prompt,
   repoPath,
+  runEnvironment = "",
+  runMode = "",
+  runTarget = null,
   workspaceId,
   workspaceName,
 }) {
@@ -3649,8 +3830,15 @@ function architectureQueueAgentTodo({
     repoPath: text(repoPath),
     title: identity.graphTitle,
   };
+  const architectureRun = architectureNormalizeRunTarget(runTarget);
+  const selectedRun = architectureRun ? {
+    environment: text(runEnvironment, architectureRun.defaultEnv),
+    mode: text(runMode, architectureRun.defaultMode),
+    target: architectureRun,
+  } : null;
   const item = {
     architectureGraph,
+    ...(selectedRun ? { architectureRun: selectedRun } : {}),
     createdAt: now,
     id: commandId,
     kind: "todo",
@@ -3662,6 +3850,7 @@ function architectureQueueAgentTodo({
       updatedAt: now,
     },
     remoteCommand: {
+      ...(selectedRun ? { architectureRun: selectedRun } : {}),
       architectureGraph,
       commandId,
       graphFilePath: identity.graphFilePath,
@@ -3670,7 +3859,15 @@ function architectureQueueAgentTodo({
       source: "architecture-tab",
     },
     source: ARCHITECTURE_TODO_QUEUE_SOURCE,
-    text: architectureAgentTaskText({ commandId, graph, prompt, repoPath }),
+    text: architectureAgentTaskText({
+      commandId,
+      graph,
+      prompt,
+      repoPath,
+      runEnvironment,
+      runMode,
+      runTarget: architectureRun,
+    }),
     workspaceId: safeWorkspaceId,
   };
   const storageKey = architectureTodoQueueStorageKey(safeWorkspaceId);
@@ -5468,9 +5665,11 @@ function ArchitectureGraphEditor({
   const [selectedEdges, setSelectedEdges] = useState([]);
   const [localError, setLocalError] = useState("");
   const [expandedCorridorId, setExpandedCorridorId] = useState("");
+  const [runSelections, setRunSelections] = useState({});
   const [routingMode, setRoutingMode] = useState("settled");
   const routeCacheRef = useRef(new Map());
   const routeSettleTimerRef = useRef(null);
+  const runTargets = useMemo(() => architectureRunTargetsFromGraph(draftGraph), [draftGraph]);
   const renderNodes = useMemo(() => architectureOrderFlowNodes(nodes).map((node) => {
     if (node.type !== "architectureCorridor") return node;
     const expanded = expandedCorridorId === node.id;
@@ -5515,6 +5714,7 @@ function ArchitectureGraphEditor({
     setSelectedNodes([]);
     setSelectedEdges([]);
     setExpandedCorridorId("");
+    setRunSelections({});
     setDirty(false);
     setLocalError("");
     setAgentCommandDraft("");
@@ -5739,6 +5939,56 @@ function ArchitectureGraphEditor({
     if (queuedItem) onAgentEditQueued(queuedItem);
     setLocalError("");
   }, [agentCommandDraft, draftGraph, onAgentEditQueued, selectedRepo?.path, queueWorkspaceId, queueWorkspaceName]);
+
+  const updateRunSelection = useCallback((targetId, patch) => {
+    const safeTargetId = text(targetId);
+    if (!safeTargetId) return;
+    setRunSelections((current) => ({
+      ...current,
+      [safeTargetId]: {
+        ...(jsonObject(current[safeTargetId]) || {}),
+        ...patch,
+      },
+    }));
+    if (agentCommandNotice) setAgentCommandNotice("");
+  }, [agentCommandNotice]);
+
+  const queueArchitectureRunTarget = useCallback((target) => {
+    const runTarget = architectureNormalizeRunTarget(target);
+    if (!runTarget) return;
+    if (dirty) {
+      setLocalError("Save this architecture graph before running a target.");
+      return;
+    }
+    if (!queueWorkspaceId) {
+      setLocalError("Open a workspace before running an architecture target.");
+      return;
+    }
+    const selection = architectureRunTargetSelection(runTarget, runSelections);
+    const prompt = architectureRunPrompt(runTarget, selection.env, selection.mode);
+    const queuedItem = architectureQueueAgentTodo({
+      graph: draftGraph,
+      prompt,
+      repoPath: selectedRepo?.path || "",
+      runEnvironment: selection.env,
+      runMode: selection.mode,
+      runTarget,
+      workspaceId: queueWorkspaceId,
+      workspaceName: queueWorkspaceName,
+    });
+    setAgentCommandNotice(queuedItem ? `Queued ${runTarget.label}` : "Queued locally");
+    if (queuedItem) onAgentEditQueued(queuedItem);
+    setLocalError("");
+  }, [
+    dirty,
+    draftGraph,
+    onAgentEditQueued,
+    queueWorkspaceId,
+    queueWorkspaceName,
+    runSelections,
+    selectedRepo?.path,
+  ]);
+
   const agentCommandReady = Boolean(text(agentCommandDraft));
   const agentCommandStatus = localError || agentCommandNotice || (dirty ? "Unsaved changes" : "Press Enter to queue");
   const agentEditBlurb = architectureAgentEditMarkerBlurb(agentEditMarker);
@@ -5811,6 +6061,54 @@ function ArchitectureGraphEditor({
                 <span key={warning}>{warning}</span>
               ))}
             </ArchitectureValidationPanel>
+          )}
+          {runTargets.length > 0 && (
+            <ArchitectureRunTargetsBar
+              aria-label="Architecture run targets"
+              data-disabled={dirty || saveState === "saving" ? "true" : "false"}
+            >
+              {runTargets.slice(0, 4).map((target) => {
+                const selection = architectureRunTargetSelection(target, runSelections);
+                const risk = architectureRunRisk(selection.env, selection.mode);
+                return (
+                  <ArchitectureRunTargetControl
+                    data-risk={risk}
+                    key={target.id}
+                    title={`${target.label}\n${target.action}${target.scope ? ` / ${target.scope}` : ""}`}
+                  >
+                    <ArchitectureRunButton
+                      data-action={target.action}
+                      data-risk={risk}
+                      disabled={dirty || saveState === "saving"}
+                      onClick={() => queueArchitectureRunTarget(target)}
+                      type="button"
+                    >
+                      {target.label}
+                    </ArchitectureRunButton>
+                    <ArchitectureRunSelect
+                      aria-label={`${target.label} environment`}
+                      disabled={dirty || saveState === "saving"}
+                      onChange={(event) => updateRunSelection(target.id, { env: event.target.value })}
+                      value={selection.env}
+                    >
+                      {target.envs.map((env) => (
+                        <option key={env} value={env}>{architectureTitleFromSlug(env, env)}</option>
+                      ))}
+                    </ArchitectureRunSelect>
+                    <ArchitectureRunSelect
+                      aria-label={`${target.label} mode`}
+                      disabled={dirty || saveState === "saving"}
+                      onChange={(event) => updateRunSelection(target.id, { mode: event.target.value })}
+                      value={selection.mode}
+                    >
+                      {target.modes.map((mode) => (
+                        <option key={mode} value={mode}>{architectureTitleFromSlug(mode, mode)}</option>
+                      ))}
+                    </ArchitectureRunSelect>
+                  </ArchitectureRunTargetControl>
+                );
+              })}
+            </ArchitectureRunTargetsBar>
           )}
           <ArchitectureFloatingActions>
             <ArchitectureFloatingDangerButton
@@ -9093,6 +9391,111 @@ const ArchitectureFloatingActions = styled.div`
   &:focus-within {
     opacity: 1;
     transform: translateY(0);
+  }
+`;
+
+const ArchitectureRunTargetsBar = styled.div`
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  max-width: min(720px, calc(100% - 330px));
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  pointer-events: auto;
+  transform: translateX(-50%);
+
+  &[data-disabled="true"] {
+    opacity: 0.56;
+  }
+
+  @media (max-width: 980px) {
+    top: 50px;
+    max-width: calc(100% - 24px);
+  }
+`;
+
+const ArchitectureRunTargetControl = styled.div`
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 3px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 999px;
+  background: rgba(8, 12, 18, 0.82);
+  box-shadow: 0 14px 28px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(12px);
+
+  &[data-risk="high"] {
+    border-color: rgba(251, 113, 133, 0.32);
+  }
+
+  &[data-risk="medium"] {
+    border-color: rgba(251, 191, 36, 0.24);
+  }
+`;
+
+const ArchitectureRunButton = styled.button`
+  min-width: 0;
+  max-width: 132px;
+  height: 24px;
+  padding: 0 10px;
+  overflow: hidden;
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 999px;
+  color: rgba(240, 253, 250, 0.94);
+  background: rgba(13, 148, 136, 0.2);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &[data-risk="high"] {
+    border-color: rgba(251, 113, 133, 0.46);
+    color: #fee2e2;
+    background: rgba(127, 29, 29, 0.24);
+  }
+
+  &[data-risk="medium"] {
+    border-color: rgba(251, 191, 36, 0.36);
+    color: rgba(254, 243, 199, 0.92);
+    background: rgba(120, 53, 15, 0.2);
+  }
+
+  &:disabled {
+    cursor: default;
+  }
+
+  &:not(:disabled):hover {
+    filter: brightness(1.18);
+  }
+`;
+
+const ArchitectureRunSelect = styled.select`
+  max-width: 112px;
+  min-width: 76px;
+  height: 24px;
+  padding: 0 20px 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(15, 23, 42, 0.92);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 820;
+  outline: none;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: default;
   }
 `;
 

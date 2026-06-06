@@ -31,8 +31,9 @@ Call `coordination-kernel.architecture_context` before architecture, diagram, de
 7. Preserve semantic props when editing. Groups use `intent`, `scope`, `owner`, and `status`. Nodes use `role`, `lifecycle`, `source`, and `status`. Edges use `role`, `condition`, `event`, and `criticality`.
 8. Use compact actor nodes for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints. Write `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]` and omit `desc` for those compact nodes.
 9. Use API corridors only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors are architectural procedure summaries, not line-by-line implementation narration.
-10. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
-11. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
+10. Use `run` lines only for graph-level operations a human should intentionally trigger from the Architecture tab. Run lines describe intent and guardrails, not shell commands.
+11. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats.
+12. Do not edit generated architecture files such as `.agents/architectures/index.json`, `.agents/architectures/AGENTS.md`, or `.agents/architectures/icon-aliases.json`.
 
 ## DSL syntax
 
@@ -71,6 +72,7 @@ Supported basics:
 - `title "Name"` sets the graph title.
 - `folder "Area / Subarea"` nests the graph in the Architecture sidebar.
 - `direction right`, `direction down`, `direction left`, or `direction up` controls layout.
+- `run "Deploy" [action: deploy, envs: "local,staging,production", modes: "plan,apply,verify,rollback", defaultEnv: staging, scope: "Deployment"]` adds one Architecture-tab run button.
 - `Container [icon: box, color: amber, intent: control-graph] { ... }` creates a typed group/container.
 - `Node [icon: api, role: endpoint, desc: Short description]` creates a semantic node.
 - `Actor [icon: users, role: actor, display: compact]` creates an icon + label actor/client node. Omit `desc` on compact nodes.
@@ -78,6 +80,15 @@ Supported basics:
 - `A -- B: label [role: depends-on]` creates a dependency edge.
 - `A <> B: label [role: calls]` creates bidirectional call edges.
 - Control/state edges should use `role: transitions`, `role: guards`, `condition: ...`, or `event: ...` when useful.
+
+Run targets are one-line launch metadata:
+
+```arch
+run "Deploy" [action: deploy, envs: "local,staging,production", modes: "plan,apply,verify,rollback", defaultEnv: staging, scope: "Deployment"]
+run "Toggle Logs" [action: logs-toggle, envs: "local,staging,production", modes: "plan,apply,verify", defaultEnv: local, scope: "Observability"]
+```
+
+Keep run targets to one line each. Use semantic `action`, explicit `envs`, allowed `modes`, a safe `defaultEnv`, and a `scope` matching an existing graph group or node. Do not put shell commands, secrets, credentials, tokens, or production URLs in run lines. Agents must inspect the repo and produce evidence-based plans before applying changes.
 
 API corridors are overlay containers for ordered runtime behavior across existing nodes or groups:
 
@@ -152,6 +163,7 @@ If an exact icon is unknown, use the best semantic alias. The graph should still
 - A single graph may contain multiple semantic groups, connected or disconnected. Split into separate graph files only when the scope is genuinely separate.
 - For control graphs and state machines, include a start lifecycle, terminal states, and labels/conditions on decision branches.
 - For API corridors, create or update normal architecture nodes/edges first, then add the concise ordered overlay only when procedure order, security, side effects, retries, or external integrations matter.
+- For run targets, default to `plan`, use production only when genuinely needed, and let the launched agent discover commands from repo evidence instead of encoding commands in `.arch`.
 - Architecture files are for humans and agents: optimize for understanding, debugging, and future planning.
 "##;
 
@@ -163,7 +175,7 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
     "Use simple aliases first. The renderer resolves LikeC4 icons, styled-icons simple-icons, and semantic fallbacks.",
     "When a node or container title names a real provider, product, framework, cloud service, database, or company, prefer that exact lowercase slug as the icon alias.",
     "If an exact logo is unknown, use a semantic fallback such as api, server, database, storage, queue, worker, external, or service. The renderer also tries to infer installed package icons from titles when a generic fallback is used.",
-    "Architecture graphs are general system graphs. Use group intent, node role, edge role, and api-corridor overlay props to preserve meaning across agent edits and visual saves."
+    "Architecture graphs are general system graphs. Use group intent, node role, edge role, api-corridor overlay props, and one-line run targets to preserve meaning across agent edits and visual saves."
   ],
   "semanticSchema": {
     "groupIntents": ["architecture", "api-pathway", "api-corridor", "data-flow", "control-graph", "state-machine", "dependency-graph", "deployment", "runtime", "subsystem"],
@@ -179,6 +191,16 @@ const ARCHITECTURE_ICON_REFERENCE: &str = r##"{
       "Do not create API corridors for ordinary CRUD routes unless order, security, side effects, retries, or external integrations matter.",
       "Message endpoints should reference existing graph nodes or groups; create/update normal architecture topology first.",
       "Keep corridors concise, usually 3-9 meaningful steps. Use status: uncertain when the flow is not evidence-backed."
+    ]
+  },
+  "runTargets": {
+    "purpose": "One-line launch metadata for Architecture-tab buttons that queue an agent to operate from the selected graph.",
+    "syntax": "run \"Deploy\" [action: deploy, envs: \"local,staging,production\", modes: \"plan,apply,verify,rollback\", defaultEnv: staging, scope: \"Deployment\"]",
+    "guardrails": [
+      "Use only for graph-level operations a human would intentionally trigger.",
+      "Run targets describe intent and guardrails, not shell commands.",
+      "Keep each target to one line with semantic action, envs, modes, defaultEnv, and scope.",
+      "Agents must inspect the repo and plan from evidence before applying, especially for production or destructive work."
     ]
   },
   "packageResolution": {
@@ -1255,6 +1277,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
                 "One .arch graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
                 "Preserve group intent, node role/lifecycle/source/status, and edge role/condition/event/criticality props when editing.",
                 "Use api-corridor overlay containers only for important ordered API procedures; create or update normal architecture nodes and structural edges first.",
+                "Use one-line run targets only for graph-level Architecture-tab operations; run targets describe intent and guardrails, not shell commands.",
                 "Write containers and nodes first, then edges, and save the file incrementally so the Architecture tab updates live.",
                 "Use architecture_icon_reference when choosing cloud, tech, company, product, framework, or semantic icon aliases.",
                 "Prefer exact provider/product/framework slugs such as appwrite, react, vercel, github, postgres, redis, or cockroachdb when a node/container title names that technology; semantic aliases are only fallbacks.",
@@ -1332,6 +1355,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "validationHints": [
                 "control-graph and state-machine groups should have a start lifecycle, terminal states, and labeled decision branches",
                 "api-corridor overlays should reference existing nodes/groups and stay concise, usually 3-9 material steps",
+                "run targets should stay one line each, use safe defaults, and avoid shell commands or secrets",
                 "data-flow groups should use reads, writes, publishes, or subscribes edges",
                 "dependency-graph groups should use depends-on edges"
             ]
@@ -1340,6 +1364,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             "title": "title \"Human-readable graph name\"",
             "folder": "folder \"Area / Subarea\"",
             "direction": "direction right | down | left | up",
+            "runTarget": "run \"Deploy\" [action: deploy, envs: \"local,staging,production\", modes: \"plan,apply,verify,rollback\", defaultEnv: staging, scope: \"Deployment\"]",
             "container": "Runtime Boundary [icon: cloud, color: blue, intent: deployment] { ... }",
             "node": "API [icon: api, role: endpoint, desc: Request handling]",
             "compactNode": "User [icon: users, role: actor, display: compact]",
@@ -1350,7 +1375,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
                 "Decision > Retry: retry [role: guards, condition: recoverable]",
                 "Idle > Active: start [role: transitions, event: start]"
             ],
-            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\n\nAPI Pathway [icon: api, intent: api-pathway] {\n  Client [icon: users, role: actor, display: compact]\n  API [icon: api, role: endpoint, desc: Handles requests]\n  Database [icon: database, role: datastore]\n}\n\nClient > API: request [role: calls]\nAPI > Database: read/write [role: writes]\n\nCreate Session [intent: api-corridor, display: overlay, from: Client, to: API, anchor: API, orient: shortest-path] {\n  Client > API: POST /sessions [step: 1, role: request, method: POST, path: /sessions]\n  API > Database: Create session [step: 2, role: writes]\n  API > Client: 201 Created [step: 3, role: response, status: 201]\n}"
+            "example": "title \"Subsystem Architecture\"\ndirection right\nfolder \"backend / subsystem\"\nrun \"Verify API\" [action: health-check, envs: \"local,staging\", modes: \"plan,verify\", defaultEnv: local, scope: \"API\"]\n\nAPI Pathway [icon: api, intent: api-pathway] {\n  Client [icon: users, role: actor, display: compact]\n  API [icon: api, role: endpoint, desc: Handles requests]\n  Database [icon: database, role: datastore]\n}\n\nClient > API: request [role: calls]\nAPI > Database: read/write [role: writes]\n\nCreate Session [intent: api-corridor, display: overlay, from: Client, to: API, anchor: API, orient: shortest-path] {\n  Client > API: POST /sessions [step: 1, role: request, method: POST, path: /sessions]\n  API > Database: Create session [step: 2, role: writes]\n  API > Client: 201 Created [step: 3, role: response, status: 201]\n}"
         }
     }))
 }
