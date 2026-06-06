@@ -290,6 +290,17 @@ struct ArchitectureRepositoryList {
     repositories: Vec<ArchitectureRepositoryEntry>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchitectureScannedResult {
+    root_directory: String,
+    workspace_kind: String,
+    cache: Value,
+    mounts: Vec<Value>,
+    workspace_mounts: Vec<Value>,
+    repositories: Vec<ArchitectureRepositoryEntry>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ArchitectureGraphSummary {
@@ -958,15 +969,14 @@ fn architecture_repository_entry(
     }
 }
 
-fn architecture_repositories_blocking(
-    root_directory: Option<String>,
-) -> Result<ArchitectureRepositoryList, String> {
-    let root = resolve_workspace_root_directory(root_directory.as_deref())?;
-    let mounts = workspace_project_mounts(&root);
+fn architecture_repositories_from_mounts(
+    root: &Path,
+    mounts: &[WorkspaceProjectMount],
+) -> ArchitectureRepositoryList {
     let mut seen = HashSet::new();
     let mut repositories = Vec::new();
 
-    for mount in mounts.iter().filter(|mount| mount.has_git) {
+    for mount in mounts.iter().filter(|mount| workspace_mount_is_project(mount)) {
         let key = normalized_path_key(&mount.root_path);
         if seen.insert(key) {
             repositories.push(architecture_repository_entry(
@@ -997,10 +1007,48 @@ fn architecture_repositories_blocking(
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    Ok(ArchitectureRepositoryList {
+    ArchitectureRepositoryList {
         root_directory: workspace_path_display(&root),
         repositories,
-    })
+    }
+}
+
+fn architecture_scanned_result_from_topology(
+    root: &Path,
+    topology: TerminalWorkspaceTopologyScan,
+) -> ArchitectureScannedResult {
+    let mounts = topology.mounts;
+    let workspace_mounts = workspace_mount_manifest_from_projects(root, &mounts);
+    let workspace_kind = workspace_kind_for_mounts(&root, &mounts);
+    let repositories = architecture_repositories_from_mounts(root, &mounts).repositories;
+    let cache = json!({
+        "key": topology.cache_key,
+        "status": topology.cache_status,
+        "hit": topology.cache_hit,
+        "fresh": true,
+        "scannedAtMs": topology.scanned_ms,
+        "ttlMs": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
+        "source": "backend_workspace_topology_cache",
+        "reason": "Shared workspace topology cache used by terminals, Architectures, and Scanned Result.",
+    });
+
+    let mounts = mounts
+        .iter()
+        .map(|mount| serde_json::to_value(mount).unwrap_or_else(|_| json!({})))
+        .collect::<Vec<_>>();
+    let workspace_mounts = workspace_mounts
+        .iter()
+        .map(|mount| serde_json::to_value(mount).unwrap_or_else(|_| json!({})))
+        .collect::<Vec<_>>();
+
+    ArchitectureScannedResult {
+        root_directory: workspace_path_display(&root),
+        workspace_kind,
+        cache,
+        mounts,
+        workspace_mounts,
+        repositories,
+    }
 }
 
 fn architecture_graphs_list_blocking(repo_path: String) -> Result<ArchitectureGraphList, String> {
@@ -1280,10 +1328,21 @@ pub(crate) fn architecture_graphs_list_value(repo_path: String) -> Result<Value,
 #[tauri::command]
 async fn architecture_repositories(
     root_directory: Option<String>,
+    state: State<'_, TerminalState>,
 ) -> Result<ArchitectureRepositoryList, String> {
-    tauri::async_runtime::spawn_blocking(move || architecture_repositories_blocking(root_directory))
-        .await
-        .map_err(|error| format!("Architecture repository worker failed: {error}"))?
+    let root = resolve_workspace_root_directory(root_directory.as_deref())?;
+    let topology = terminal_workspace_topology_scan_for_launch(state.inner(), &root).await;
+    Ok(architecture_repositories_from_mounts(&root, &topology.mounts))
+}
+
+#[tauri::command]
+async fn architecture_scanned_result(
+    root_directory: Option<String>,
+    state: State<'_, TerminalState>,
+) -> Result<ArchitectureScannedResult, String> {
+    let root = resolve_workspace_root_directory(root_directory.as_deref())?;
+    let topology = terminal_workspace_topology_scan_for_launch(state.inner(), &root).await;
+    Ok(architecture_scanned_result_from_topology(&root, topology))
 }
 
 #[tauri::command]

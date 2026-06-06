@@ -530,7 +530,6 @@ const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const PLAN_REFRESH_TIMEOUT_MS = 5000;
-const RAW_SCAN_CACHE_LOAD_TIMEOUT_MS = 2500;
 const BILLING_STATUS_REFRESH_MS = 60000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
@@ -3846,245 +3845,6 @@ function normalizeWorkspaceCoordinationTargetResponse(response, fallbackRoot = "
   };
 }
 
-function rawScanWorkspacePathJoin(rootDirectory, relativePath) {
-  const root = cleanWorkspaceRootDirectory(rootDirectory);
-  const relative = String(relativePath || "")
-    .trim()
-    .replace(/^[\\/]+|[\\/]+$/g, "");
-  if (!root || !relative) return root;
-  const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
-  return `${root.replace(/[\\/]+$/g, "")}${separator}${relative.replace(/[\\/]+/g, separator)}`;
-}
-
-function rawScanMountDepth(relativePath) {
-  return String(relativePath || "")
-    .split("/")
-    .filter((part) => part.trim())
-    .length;
-}
-
-function rawScanParentMountId(relativePath) {
-  const parts = String(relativePath || "")
-    .split("/")
-    .filter((part) => part.trim());
-  if (parts.length <= 1) return null;
-  return parts.slice(0, -1).join("/");
-}
-
-function rawScanProjectKindForTarget(target) {
-  const projectKind = String(target?.projectKind || "").trim();
-  if (target?.hasGit || projectKind === "git" || projectKind === "git_repo") return "git";
-  if (projectKind === "workspace_root" || !projectKind) return "project";
-  return projectKind;
-}
-
-function rawScanMountFromCoordinationTarget(target, rootDirectory) {
-  const normalized = normalizeWorkspaceCoordinationTarget(target);
-  if (!normalized) return null;
-  const relativePath = normalized.workspaceRelativePath;
-  const mountId = normalized.mountId || relativePath || "root";
-  const projectKind = rawScanProjectKindForTarget(normalized);
-  const projectRoot = cleanWorkspaceRootDirectory(normalized.repoPath)
-    || rawScanWorkspacePathJoin(rootDirectory, relativePath);
-
-  return {
-    mountId,
-    workspaceRelativePath: relativePath,
-    projectRoot,
-    projectName: normalized.projectName || getDirectoryName(projectRoot) || "Project",
-    projectKind,
-    mountKind: "project",
-    parentMountId: rawScanParentMountId(relativePath),
-    mountDepth: rawScanMountDepth(relativePath),
-    hasGit: projectKind === "git" || Boolean(normalized.hasGit),
-    hasAgents: Boolean(normalized.hasAgents),
-  };
-}
-
-function rawScanWorkspaceMountsFromProjectMounts(rootDirectory, projectMounts) {
-  const mounts = [];
-  const seen = new Set();
-
-  projectMounts.forEach((projectMount) => {
-    const parts = String(projectMount.workspaceRelativePath || "")
-      .split("/")
-      .filter((part) => part.trim());
-    for (let depth = 1; depth < parts.length; depth += 1) {
-      const relativePath = parts.slice(0, depth).join("/");
-      if (seen.has(relativePath)) continue;
-      seen.add(relativePath);
-      mounts.push({
-        mountId: relativePath,
-        workspaceRelativePath: relativePath,
-        projectRoot: rawScanWorkspacePathJoin(rootDirectory, relativePath),
-        projectName: parts[depth - 1] || relativePath,
-        projectKind: "container",
-        mountKind: "container",
-        parentMountId: rawScanParentMountId(relativePath),
-        mountDepth: rawScanMountDepth(relativePath),
-        hasGit: false,
-        hasAgents: false,
-      });
-    }
-  });
-
-  return [...mounts, ...projectMounts].sort((left, right) => (
-    String(left.workspaceRelativePath || "").localeCompare(String(right.workspaceRelativePath || ""))
-      || String(left.mountKind || "").localeCompare(String(right.mountKind || ""))
-  ));
-}
-
-function rawScanFolderTraceEntry(rootDirectory, mount, scanAction = "startup_mount") {
-  const relativePath = String(mount?.workspaceRelativePath || "").trim();
-  const projectKind = String(mount?.projectKind || "none").trim();
-  return {
-    relativePath,
-    path: cleanWorkspaceRootDirectory(mount?.projectRoot) || rawScanWorkspacePathJoin(rootDirectory, relativePath),
-    depth: rawScanMountDepth(relativePath),
-    entryKind: "directory",
-    scanAction,
-    selectedRoot: !relativePath,
-    skipped: false,
-    projectKind,
-    mountId: String(mount?.mountId || relativePath || "root"),
-    mountKind: String(mount?.mountKind || "project"),
-    projectName: String(mount?.projectName || "").trim(),
-    hasGitMarker: Boolean(mount?.hasGit),
-    isExactGitRoot: !relativePath && Boolean(mount?.hasGit),
-    hasProjectMarker: true,
-    hasAgents: Boolean(mount?.hasAgents),
-  };
-}
-
-function buildRawScanSnapshotFromCoordinationTargetRecord(record, {
-  repoPath,
-  workspaceId,
-  workspaceName,
-} = {}) {
-  if (!record || typeof record !== "object") return null;
-  const rootDirectory = cleanWorkspaceRootDirectory(record.rootDirectory || repoPath);
-  if (!rootDirectory) return null;
-
-  const targets = Array.isArray(record.targets) ? record.targets : [];
-  const projectMounts = targets
-    .map((target) => rawScanMountFromCoordinationTarget(target, rootDirectory))
-    .filter(Boolean);
-  const workspaceMounts = rawScanWorkspaceMountsFromProjectMounts(rootDirectory, projectMounts);
-  const selectedRootMount = projectMounts.find((mount) => !mount.workspaceRelativePath) || null;
-  const activeProjectRoot = projectMounts.length === 1 ? projectMounts[0].projectRoot : "";
-  const workspaceKind = String(record.workspaceKind || "").trim()
-    || (record.container ? "container" : selectedRootMount ? selectedRootMount.projectKind : "workspace");
-  const generatedAtMs = Date.now();
-  const rootTraceMount = selectedRootMount || {
-    mountId: "root",
-    workspaceRelativePath: "",
-    projectRoot: rootDirectory,
-    projectName: workspaceName || getDirectoryName(rootDirectory) || "Workspace",
-    projectKind: selectedRootMount?.projectKind || "none",
-    mountKind: selectedRootMount ? "project" : "root",
-    hasGit: Boolean(selectedRootMount?.hasGit),
-    hasAgents: Boolean(selectedRootMount?.hasAgents),
-  };
-
-  return {
-    generatedAtMs,
-    scanMode: "startup_fanout",
-    requestedRepoPath: graphText(repoPath, rootDirectory),
-    workspaceId: graphText(workspaceId),
-    workspaceName: graphText(workspaceName),
-    root: rootDirectory,
-    workspaceKind,
-    activeProjectRoot,
-    selectedRoot: {
-      projectKind: selectedRootMount?.projectKind || "none",
-      exactGitRoot: Boolean(selectedRootMount?.hasGit),
-      gitTopLevel: selectedRootMount?.hasGit ? selectedRootMount.projectRoot : "",
-      broadArea: false,
-      emptyDirectory: false,
-      emptyForGitBootstrap: false,
-      mount: selectedRootMount,
-    },
-    cache: {
-      key: normalizeGraphWorkspacePath(rootDirectory),
-      status: "startup_fanout",
-      hit: true,
-      fresh: true,
-      scannedAtMs: generatedAtMs,
-      ageMs: 0,
-      previousAgeMs: null,
-      ttlMs: null,
-      reason: "Raw Scan is showing the workspace startup fanout because no terminal topology cache has project mounts yet.",
-      source: "coordination_workspace_targets",
-    },
-    limits: {},
-    projectMounts,
-    workspaceMounts,
-    launchTargets: [],
-    folderTrace: {
-      entries: [
-        rawScanFolderTraceEntry(rootDirectory, rootTraceMount, "startup_root"),
-        ...workspaceMounts
-          .filter((mount) => mount.workspaceRelativePath)
-          .map((mount) => rawScanFolderTraceEntry(rootDirectory, mount)),
-      ],
-      truncated: false,
-      maxEntries: Math.max(1, workspaceMounts.length + 1),
-      unreadableEntries: 0,
-      source: "coordination_workspace_targets",
-      live: false,
-    },
-    diagnostic: {
-      reason: "Startup coordination target fanout was adapted into the Raw Scan graph.",
-    },
-  };
-}
-
-function rawScanArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function rawScanHasMountData(snapshot) {
-  return rawScanArray(snapshot?.projectMounts).length > 0
-    || rawScanArray(snapshot?.workspaceMounts).length > 0;
-}
-
-function rawScanShouldUseStartupFanout(snapshot) {
-  const cacheStatus = graphText(snapshot?.cache?.status).toLowerCase();
-  return !rawScanHasMountData(snapshot)
-    || ["missing", "unavailable", "error"].includes(cacheStatus);
-}
-
-function mergeStartupFanoutIntoRawScan(startupSnapshot, rawScanSnapshot) {
-  if (!startupSnapshot || !rawScanShouldUseStartupFanout(rawScanSnapshot)) {
-    return rawScanSnapshot;
-  }
-
-  const terminalCache = rawScanSnapshot?.cache && typeof rawScanSnapshot.cache === "object"
-    ? rawScanSnapshot.cache
-    : null;
-  const launchTargets = rawScanArray(rawScanSnapshot?.launchTargets).length
-    ? rawScanSnapshot.launchTargets
-    : startupSnapshot.launchTargets;
-
-  return {
-    ...startupSnapshot,
-    generatedAtMs: Date.now(),
-    requestedRepoPath: graphText(rawScanSnapshot?.requestedRepoPath, startupSnapshot.requestedRepoPath),
-    launchTargets,
-    cache: {
-      ...startupSnapshot.cache,
-      terminalCache,
-      reason: terminalCache?.status
-        ? `${startupSnapshot.cache.reason} Terminal cache status was ${terminalCache.status}.`
-        : startupSnapshot.cache.reason,
-    },
-    diagnostic: {
-      ...(startupSnapshot.diagnostic || {}),
-      terminalCache,
-    },
-  };
-}
-
 function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
   const safeRoot = cleanWorkspaceRootDirectory(rootDirectory);
   if (!safeRoot) {
@@ -4816,58 +4576,6 @@ function workspaceGraphStateKey(repoPath, workspaceId) {
   return `${normalizedWorkspaceId}::${normalizedRepoPath}`;
 }
 
-function buildUnavailableRawScanSnapshot({
-  reason,
-  repoPath,
-  status = "unavailable",
-  workspaceId,
-  workspaceName,
-}) {
-  const generatedAtMs = Date.now();
-  return {
-    generatedAtMs,
-    scanMode: "cached_topology",
-    requestedRepoPath: graphText(repoPath),
-    workspaceId: graphText(workspaceId),
-    workspaceName: graphText(workspaceName),
-    root: graphText(repoPath),
-    workspaceKind: "workspace",
-    activeProjectRoot: "",
-    selectedRoot: {
-      projectKind: "none",
-      exactGitRoot: false,
-      gitTopLevel: "",
-      broadArea: false,
-      emptyDirectory: false,
-      emptyForGitBootstrap: false,
-      mount: null,
-    },
-    cache: {
-      key: normalizeGraphWorkspacePath(repoPath),
-      status,
-      hit: false,
-      fresh: false,
-      scannedAtMs: generatedAtMs,
-      ageMs: 0,
-      previousAgeMs: null,
-      ttlMs: null,
-      reason: graphText(reason, "No cached startup scan is available."),
-      source: "workspace_topology_cache",
-    },
-    limits: {},
-    projectMounts: [],
-    workspaceMounts: [],
-    launchTargets: [],
-    folderTrace: {
-      entries: [],
-      reason: graphText(reason, "No cached startup scan is available."),
-    },
-    diagnostic: {
-      reason: graphText(reason, "No cached startup scan is available."),
-    },
-  };
-}
-
 function workspaceGraphSnapshotKey(snapshot) {
   return workspaceGraphStateKey(
     graphSnapshotRepoPath(snapshot),
@@ -5303,6 +5011,8 @@ export default function App() {
   const selectedWorkspaceIdRef = useRef("");
   const activatedWorkspaceIdRef = useRef("");
   const workspacePendingActivationIdRef = useRef("");
+  const workspaceGraphStateRef = useRef(workspaceGraphState);
+  const workspaceArchitectureScanInFlightRef = useRef(new Set());
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const mainWindowFocusedRef = useRef(mainWindowFocused);
@@ -5857,16 +5567,119 @@ export default function App() {
   const setWorkspaceGraphStatus = useCallback((repoPath, workspaceId, statusPatch) => {
     const key = workspaceGraphStateKey(repoPath, workspaceId);
     if (!key) return;
-    setWorkspaceGraphState((current) => ({
-      ...current,
-      [key]: {
-        ...(current[key] || {}),
-        repoPath,
-        workspaceId,
-        ...statusPatch,
-      },
-    }));
+    setWorkspaceGraphState((current) => {
+      const next = {
+        ...current,
+        [key]: {
+          ...(current[key] || {}),
+          repoPath,
+          workspaceId,
+          ...statusPatch,
+        },
+      };
+      workspaceGraphStateRef.current = next;
+      return next;
+    });
   }, []);
+
+  const startWorkspaceArchitectureScan = useCallback((workspaceId, options = {}) => {
+    const safeWorkspaceId = graphText(workspaceId);
+    if (!safeWorkspaceId) return false;
+
+    const repoPath = cleanWorkspaceRootDirectory(
+      options.rootDirectory
+        || getWorkspaceRootDirectory(workspaceSettingsRef.current, safeWorkspaceId)
+        || defaultWorkingDirectoryRef.current,
+    );
+    const key = workspaceGraphStateKey(repoPath, safeWorkspaceId);
+    if (!repoPath || !key) return false;
+
+    const existing = workspaceGraphStateRef.current[key] || {};
+    const existingScanState = existing.architectureRepositoryScanState || "idle";
+    if (
+      !options.refresh
+        && (
+          existing.architectureRepositoryScanSnapshot
+          || existingScanState === "loading"
+          || existingScanState === "ready"
+        )
+    ) {
+      logWorkspaceActivationTrace("workspace.open.architecture_scan.cache_hit", safeWorkspaceId, {
+        reason: options.reason || "workspace_activation",
+        repoPath,
+        scanState: existingScanState,
+      });
+      return false;
+    }
+
+    if (workspaceArchitectureScanInFlightRef.current.has(key)) {
+      logWorkspaceActivationTrace("workspace.open.architecture_scan.in_flight", safeWorkspaceId, {
+        reason: options.reason || "workspace_activation",
+        repoPath,
+      });
+      return false;
+    }
+
+    const requestedAt = Date.now();
+    workspaceArchitectureScanInFlightRef.current.add(key);
+    setWorkspaceGraphStatus(repoPath, safeWorkspaceId, {
+      architectureRepositoryScanCacheKey: key,
+      architectureRepositoryScanError: "",
+      architectureRepositoryScanReason: options.reason || "workspace_activation",
+      architectureRepositoryScanRequestedAt: requestedAt,
+      architectureRepositoryScanSource: "backend_workspace_topology_cache",
+      architectureRepositoryScanState: "loading",
+    });
+    logWorkspaceActivationTrace("workspace.open.architecture_scan.start", safeWorkspaceId, {
+      reason: options.reason || "workspace_activation",
+      repoPath,
+    });
+
+    invoke("architecture_scanned_result", { rootDirectory: repoPath || null })
+      .then((result) => {
+        const completedAt = Date.now();
+        const resultCache = result?.cache && typeof result.cache === "object" ? result.cache : {};
+        setWorkspaceGraphStatus(repoPath, safeWorkspaceId, {
+          architectureRepositoryScanCacheKey: resultCache.key || key,
+          architectureRepositoryScanError: "",
+          architectureRepositoryScanSnapshot: result,
+          architectureRepositoryScanSource: resultCache.source || "backend_workspace_topology_cache",
+          architectureRepositoryScanState: "ready",
+          architectureRepositoryScanUpdatedAt: completedAt,
+        });
+        const repositories = Array.isArray(result?.repositories) ? result.repositories : [];
+        const gitCount = repositories.filter((repo) => repo?.hasGit === true || repo?.has_git === true).length;
+        logWorkspaceActivationTrace("workspace.open.architecture_scan.done", safeWorkspaceId, {
+          folderCount: Math.max(0, repositories.length - gitCount),
+          gitCount,
+          mountCount: Array.isArray(result?.mounts) ? result.mounts.length : 0,
+          repoPath,
+          repositoryCount: repositories.length,
+          workspaceMountCount: Array.isArray(result?.workspaceMounts) ? result.workspaceMounts.length : 0,
+        });
+      })
+      .catch((error) => {
+        setWorkspaceGraphStatus(repoPath, safeWorkspaceId, {
+          architectureRepositoryScanCacheKey: key,
+          architectureRepositoryScanError: getErrorMessage(error, "Unable to scan workspace architecture."),
+          architectureRepositoryScanSource: "backend_workspace_topology_cache",
+          architectureRepositoryScanState: "error",
+          architectureRepositoryScanUpdatedAt: Date.now(),
+        });
+        logWorkspaceActivationTrace("workspace.open.architecture_scan.error", safeWorkspaceId, {
+          error: getErrorMessage(error, "Unable to scan workspace architecture."),
+          repoPath,
+        });
+      })
+      .finally(() => {
+        workspaceArchitectureScanInFlightRef.current.delete(key);
+      });
+
+    return true;
+  }, [
+    logWorkspaceActivationTrace,
+    setWorkspaceGraphStatus,
+  ]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -5902,6 +5715,7 @@ export default function App() {
           architectureUpdatedAt: Date.now(),
         };
       });
+      workspaceGraphStateRef.current = next;
       return next;
     });
   }, []);
@@ -6125,6 +5939,10 @@ export default function App() {
   useEffect(() => {
     selectedWorkspaceIdRef.current = selectedWorkspaceId;
   }, [selectedWorkspaceId]);
+
+  useEffect(() => {
+    workspaceGraphStateRef.current = workspaceGraphState;
+  }, [workspaceGraphState]);
 
   useEffect(() => {
     activatedWorkspaceIdRef.current = activatedWorkspaceId;
@@ -7087,7 +6905,7 @@ export default function App() {
     workspaces,
   ]);
 
-  const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_click", trace = null) => {
+  const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_activation", trace = null) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
     if (!safeWorkspaceId) {
       return;
@@ -7228,53 +7046,97 @@ export default function App() {
     };
   }, [activateWorkspace, cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
 
-  const activateWorkspaceFromRail = useCallback((workspaceId) => {
+  const requestWorkspaceActivation = useCallback((workspaceId, source = "manual") => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
-    if (!workspace) {
-      logWorkspaceActivationTrace("workspace.open.rail_click_missing", workspaceId, {
-        availableWorkspaceCount: workspaces.length,
+    const safeWorkspaceId = String(workspaceId || "").trim();
+
+    if (workspaceDeactivationInFlightRef.current) {
+      logWorkspaceActivationTrace("workspace.open.activation_request_blocked", safeWorkspaceId, {
+        reason: "workspace_deactivation_in_flight",
+        source,
+        workspaceDeactivationInFlight: workspaceDeactivationInFlightRef.current,
       });
-      return;
+      return false;
     }
 
-    const trace = beginWorkspaceActivationTrace(workspace.id, "workspace_click");
-    const workspaceAlreadyActive = activatedWorkspaceIdRef.current === workspace.id;
-    const workspaceRoot = getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace.id)
-      || defaultWorkingDirectoryRef.current
-      || "";
-    logWorkspaceActivationTrace("workspace.open.rail_click", workspace.id, {
+    if (!workspace) {
+      logWorkspaceActivationTrace("workspace.open.activation_request_blocked", safeWorkspaceId, {
+        availableWorkspaceCount: workspaces.length,
+        reason: "workspace_not_found",
+        source,
+      });
+      return false;
+    }
+
+    const trace = beginWorkspaceActivationTrace(workspace.id, source);
+    const activeWorkspaceIds = normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    );
+    const workspaceAlreadyActive = activeWorkspaceIds.includes(workspace.id)
+      || activatedWorkspaceIdRef.current === workspace.id;
+    logWorkspaceActivationTrace("workspace.open.activation_requested", workspace.id, {
       alreadyActive: workspaceAlreadyActive,
-      rootDirectory: workspaceRoot,
+      activeRuntimeWorkspaceCount: activeWorkspaceIds.length,
       selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      source,
       workspaceName: workspace.name || "",
     }, { trace });
-    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
+
     setSelectedWorkspaceId(workspace.id);
     selectedWorkspaceIdRef.current = workspace.id;
     setWorkspaceSettingsModalId("");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: `${source}_workspace_activation`,
+      telemetryWorkspaceId: workspace.id,
+    });
+
     if (workspaceAlreadyActive) {
       cancelDeferredWorkspaceActivation();
       setWorkspacePendingActivationId("");
       workspacePendingActivationIdRef.current = "";
-    } else {
-      setWorkspacePendingActivationId(workspace.id);
-      workspacePendingActivationIdRef.current = workspace.id;
-      logWorkspaceActivationTrace("workspace.open.pending_activation_set", workspace.id, {
-        source: "workspace_click",
-      }, { trace });
-      scheduleWorkspaceActivationAfterPaint(workspace.id, "workspace_click", trace);
+      return true;
     }
-    showView(DEFAULT_WORKSPACE_VIEW, {
-      immediate: true,
-      telemetrySource: "workspace_click_terminal_focus",
-      telemetryWorkspaceId: workspace.id,
-    });
+
+    setWorkspacePendingActivationId(workspace.id);
+    workspacePendingActivationIdRef.current = workspace.id;
+    logWorkspaceActivationTrace("workspace.open.pending_activation_set", workspace.id, {
+      source,
+    }, { trace });
+    scheduleWorkspaceActivationAfterPaint(workspace.id, source, trace);
+    return true;
   }, [
     beginWorkspaceActivationTrace,
     cancelDeferredWorkspaceActivation,
     logWorkspaceActivationTrace,
     scheduleWorkspaceActivationAfterPaint,
     showView,
+    workspaces,
+  ]);
+
+  const selectWorkspaceFromRail = useCallback((workspaceId) => {
+    const workspace = findWorkspaceById(workspaces, workspaceId);
+    if (!workspace) {
+      logWorkspaceActivationTrace("workspace.open.rail_select_missing", workspaceId, {
+        availableWorkspaceCount: workspaces.length,
+      });
+      return;
+    }
+
+    const workspaceRoot = getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace.id)
+      || defaultWorkingDirectoryRef.current
+      || "";
+    logWorkspaceActivationTrace("workspace.open.rail_select", workspace.id, {
+      alreadyActive: activatedWorkspaceIdRef.current === workspace.id,
+      rootDirectory: workspaceRoot,
+      selectedWorkspaceId: selectedWorkspaceIdRef.current,
+      workspaceName: workspace.name || "",
+    });
+    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspaceId));
+    requestWorkspaceActivation(workspace.id, "workspace_rail");
+  }, [
+    logWorkspaceActivationTrace,
+    requestWorkspaceActivation,
     workspaces,
   ]);
 
@@ -13110,8 +12972,7 @@ export default function App() {
   );
   const selectedWorkspaceIsActivated = Boolean(
     selectedWorkspace?.id
-      && activatedWorkspace?.id
-      && selectedWorkspace.id === activatedWorkspace.id
+      && enabledRuntimeWorkspaceIds.includes(selectedWorkspace.id)
       && !workspaceActivationDeferred,
   );
   const shouldShowWorkspacePendingActivation = Boolean(
@@ -13658,6 +13519,15 @@ export default function App() {
   );
   const activatedWorkspaceIdForGraphSync = activatedWorkspace?.id || "";
   const activatedWorkspaceNameForGraphSync = activatedWorkspace?.name || "";
+  const activatedWorkspaceGraphStateKey = workspaceGraphStateKey(
+    activatedWorkspaceTerminalWorkingDirectory,
+    activatedWorkspaceIdForGraphSync,
+  );
+  const activatedWorkspaceGraphState = activatedWorkspaceGraphStateKey
+    ? workspaceGraphState[activatedWorkspaceGraphStateKey] || {}
+    : {};
+  const activatedArchitectureRepositoryScanState = activatedWorkspaceGraphState.architectureRepositoryScanState || "idle";
+  const activatedArchitectureRepositoryScanSnapshot = activatedWorkspaceGraphState.architectureRepositoryScanSnapshot || null;
 
   const hardResetCloudSqlite = useCallback(async () => {
     setCloudSqliteResetMessage("");
@@ -13726,6 +13596,35 @@ export default function App() {
 
   useEffect(() => {
     const repoPath = activatedWorkspaceTerminalWorkingDirectory;
+    const workspaceId = activatedWorkspaceIdForGraphSync;
+    if (!repoPath || !workspaceId) {
+      return undefined;
+    }
+
+    if (
+      activatedArchitectureRepositoryScanSnapshot
+      || activatedArchitectureRepositoryScanState === "loading"
+      || activatedArchitectureRepositoryScanState === "ready"
+      || activatedArchitectureRepositoryScanState === "error"
+    ) {
+      return undefined;
+    }
+
+    startWorkspaceArchitectureScan(workspaceId, {
+      reason: "workspace_activation",
+      rootDirectory: repoPath,
+    });
+    return undefined;
+  }, [
+    activatedArchitectureRepositoryScanSnapshot,
+    activatedArchitectureRepositoryScanState,
+    activatedWorkspaceIdForGraphSync,
+    activatedWorkspaceTerminalWorkingDirectory,
+    startWorkspaceArchitectureScan,
+  ]);
+
+  useEffect(() => {
+    const repoPath = activatedWorkspaceTerminalWorkingDirectory;
     if (!workspaceHydrationReady || !repoPath || !activatedWorkspaceIdForGraphSync) {
       return undefined;
     }
@@ -13775,21 +13674,6 @@ export default function App() {
   const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
     ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
     : {};
-  const selectedWorkspaceStartupRawScanSnapshot = useMemo(() => {
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
-    const record = workspaceCoordinationTargetsByRoot?.[getWorkspaceRootIdentity(repoPath)];
-    return buildRawScanSnapshotFromCoordinationTargetRecord(record, {
-      repoPath,
-      workspaceId: selectedWorkspace?.id || "",
-      workspaceName: selectedWorkspace?.name || "",
-    });
-  }, [
-    activatedWorkspaceTerminalWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceFileRoot,
-    workspaceCoordinationTargetsByRoot,
-  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -13827,161 +13711,6 @@ export default function App() {
       }
     };
   }, [applyWorkspaceGraphSnapshot, setWorkspaceGraphStatus]);
-
-  useEffect(() => {
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
-    const workspaceId = selectedWorkspace?.id || "";
-    if (
-      !workspaceHydrationReady
-      || !repoPath
-      || !workspaceId
-      || !selectedWorkspaceStartupRawScanSnapshot
-    ) {
-      return;
-    }
-
-    const currentSnapshot = selectedWorkspaceGraphState.rawScanSnapshot || null;
-    if (!rawScanShouldUseStartupFanout(currentSnapshot)) {
-      return;
-    }
-
-    const rawScanSnapshot = mergeStartupFanoutIntoRawScan(
-      selectedWorkspaceStartupRawScanSnapshot,
-      currentSnapshot,
-    );
-    setWorkspaceGraphStatus(repoPath, workspaceId, {
-      rawScanError: "",
-      rawScanRequestedAt: selectedWorkspaceGraphState.rawScanRequestedAt || Date.now(),
-      rawScanSnapshot,
-      rawScanState: "ready",
-    });
-  }, [
-    activatedWorkspaceTerminalWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspaceFileRoot,
-    selectedWorkspaceGraphState.rawScanRequestedAt,
-    selectedWorkspaceGraphState.rawScanSnapshot,
-    selectedWorkspaceStartupRawScanSnapshot,
-    setWorkspaceGraphStatus,
-    workspaceHydrationReady,
-  ]);
-
-  useEffect(() => {
-    const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
-    const workspaceId = selectedWorkspace?.id || "";
-    const workspaceName = selectedWorkspace?.name || null;
-    if (!workspaceHydrationReady || !repoPath || !workspaceId) {
-      return undefined;
-    }
-
-    const rawScanState = selectedWorkspaceGraphState.rawScanState || "";
-    const loadingStartedAt = Number(selectedWorkspaceGraphState.rawScanRequestedAt) || 0;
-    const loadingIsFresh = rawScanState === "loading"
-      && loadingStartedAt > 0
-      && Date.now() - loadingStartedAt < RAW_SCAN_CACHE_LOAD_TIMEOUT_MS;
-    if (
-      selectedWorkspaceGraphState.rawScanSnapshot
-      || loadingIsFresh
-    ) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    const requestedAt = Date.now();
-    const timeoutId = window.setTimeout(() => {
-      if (cancelled) return;
-      const unavailableSnapshot = buildUnavailableRawScanSnapshot({
-        reason: "The cached startup scan command did not return. Raw Scan only displays the initial startup topology cache, so this usually means no cached scan has been populated yet or the backend is still busy.",
-        repoPath,
-        status: "unavailable",
-        workspaceId,
-        workspaceName,
-      });
-      setWorkspaceGraphStatus(repoPath, workspaceId, {
-        rawScanError: "",
-        rawScanRequestedAt: requestedAt,
-        rawScanSnapshot: mergeStartupFanoutIntoRawScan(
-          selectedWorkspaceStartupRawScanSnapshot,
-          unavailableSnapshot,
-        ),
-        rawScanState: "ready",
-      });
-    }, RAW_SCAN_CACHE_LOAD_TIMEOUT_MS);
-
-    setWorkspaceGraphStatus(repoPath, workspaceId, {
-      rawScanError: "",
-      rawScanRequestedAt: requestedAt,
-      rawScanState: "loading",
-    });
-
-    invoke("terminal_workspace_raw_scan", {
-      repoPath,
-      workspaceId,
-      workspaceName,
-    })
-      .then((scan) => {
-        if (cancelled) return;
-        window.clearTimeout(timeoutId);
-        const terminalRawScanSnapshot = scan && typeof scan === "object"
-          ? scan
-          : buildUnavailableRawScanSnapshot({
-            reason: "The cached startup scan command returned no payload. Raw Scan only displays the initial startup topology cache.",
-            repoPath,
-            status: "unavailable",
-            workspaceId,
-            workspaceName,
-          });
-        const rawScanSnapshot = mergeStartupFanoutIntoRawScan(
-          selectedWorkspaceStartupRawScanSnapshot,
-          terminalRawScanSnapshot,
-        );
-        setWorkspaceGraphStatus(repoPath, workspaceId, {
-          rawScanError: "",
-          rawScanRequestedAt: requestedAt,
-          rawScanSnapshot,
-          rawScanState: "ready",
-        });
-      })
-      .catch((error) => {
-        if (cancelled) return;
-        window.clearTimeout(timeoutId);
-        const message = getErrorMessage(error, "Unable to load cached startup scan.");
-        const errorSnapshot = buildUnavailableRawScanSnapshot({
-          reason: message,
-          repoPath,
-          status: "error",
-          workspaceId,
-          workspaceName,
-        });
-        const rawScanSnapshot = mergeStartupFanoutIntoRawScan(
-          selectedWorkspaceStartupRawScanSnapshot,
-          errorSnapshot,
-        );
-        const hasStartupFallback = rawScanSnapshot !== errorSnapshot;
-        setWorkspaceGraphStatus(repoPath, workspaceId, {
-          rawScanError: hasStartupFallback ? "" : message,
-          rawScanRequestedAt: requestedAt,
-          rawScanSnapshot,
-          rawScanState: hasStartupFallback ? "ready" : "error",
-        });
-      });
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timeoutId);
-    };
-  }, [
-    activatedWorkspaceTerminalWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspaceFileRoot,
-    selectedWorkspaceGraphState.rawScanRequestedAt,
-    selectedWorkspaceGraphState.rawScanSnapshot,
-    selectedWorkspaceGraphState.rawScanState,
-    selectedWorkspaceStartupRawScanSnapshot,
-    setWorkspaceGraphStatus,
-    workspaceHydrationReady,
-  ]);
 
   useEffect(() => {
     const repoPath = selectedWorkspaceFileRoot || activatedWorkspaceTerminalWorkingDirectory;
@@ -19064,7 +18793,7 @@ export default function App() {
                             data-runtime={workspaceRuntimeState}
                             data-selected={workspace.id === selectedWorkspaceId}
                             onClick={() => {
-                              activateWorkspaceFromRail(workspace.id);
+                              selectWorkspaceFromRail(workspace.id);
                             }}
                             title={notificationLabel ? `${workspace.name} - ${notificationLabel}` : workspace.name}
                             type="button"
@@ -19237,7 +18966,6 @@ export default function App() {
                       const runtimeWorkspace = runtimeDescriptor.workspace;
                       const runtimeVisible = Boolean(
                         runtimeWorkspace?.id
-                          && runtimeWorkspace.id === activatedWorkspace?.id
                           && runtimeWorkspace.id === selectedWorkspace?.id
                           && shouldRevealWorkspaceTerminal,
                       );
@@ -19683,7 +19411,7 @@ export default function App() {
                         ) : (
                           <PrimaryButton
                             disabled={!selectedWorkspace || workspaceDeactivationState.isActive}
-                            onClick={() => selectedWorkspace && activateWorkspace(selectedWorkspace.id, "settings_page")}
+                            onClick={() => selectedWorkspace && requestWorkspaceActivation(selectedWorkspace.id, "settings_page")}
                             type="button"
                           >
                             <ButtonTerminalIcon aria-hidden="true" />
@@ -19922,11 +19650,11 @@ export default function App() {
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       rootDirectory={selectedWorkspaceFileRoot}
                       architectureError={selectedWorkspaceGraphState.architectureError || ""}
+                      architectureRepositoryScanError={selectedWorkspaceGraphState.architectureRepositoryScanError || ""}
+                      architectureRepositoryScanSnapshot={selectedWorkspaceGraphState.architectureRepositoryScanSnapshot || null}
+                      architectureRepositoryScanState={selectedWorkspaceGraphState.architectureRepositoryScanState || "idle"}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
                       architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
-                      rawScanError={selectedWorkspaceGraphState.rawScanError || ""}
-                      rawScanSnapshot={selectedWorkspaceGraphState.rawScanSnapshot || null}
-                      rawScanState={selectedWorkspaceGraphState.rawScanState || "idle"}
                       workspace={selectedWorkspace}
                     />
                   ) : (
@@ -20142,7 +19870,7 @@ export default function App() {
                           ) : (
                             <SecondaryButton
                               disabled={isWorkspaceSettingsBusy}
-                              onClick={() => activateWorkspace(selectedWorkspace.id, "workspace_settings")}
+                              onClick={() => requestWorkspaceActivation(selectedWorkspace.id, "workspace_settings")}
                               type="button"
                             >
                               <ButtonTerminalIcon aria-hidden="true" />

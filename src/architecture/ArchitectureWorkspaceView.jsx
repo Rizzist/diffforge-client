@@ -3587,37 +3587,85 @@ function buildTimelineItems(tasks) {
   };
 }
 
-function mountField(mount, camelKey, snakeKey, fallback = "") {
-  return text(mount?.[camelKey] ?? mount?.[snakeKey], fallback);
-}
-
-function rawGraphNodeKind(mount) {
-  const mountKind = mountField(mount, "mountKind", "mount_kind");
-  const projectKind = mountField(mount, "projectKind", "project_kind");
-  if (mountKind === "container" || projectKind === "container") return "container";
-  if (projectKind === "git" || mount?.hasGit === true || mount?.has_git === true) return "git";
-  return "project";
-}
-
-function rawGraphParentPath(relativePath) {
+function scannedResultParentPath(relativePath) {
   const parts = text(relativePath).split("/").filter(Boolean);
   if (parts.length <= 1) return "";
   return parts.slice(0, -1).join("/");
 }
 
-function buildRawScanGraph(scan) {
+function scannedResultPathJoin(rootDirectory, relativePath) {
+  const root = text(rootDirectory).replace(/[\\/]+$/g, "");
+  const relative = text(relativePath).replace(/^[\\/]+|[\\/]+$/g, "");
+  if (!root || !relative) return root || relative;
+  const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  return `${root}${separator}${relative.replace(/[\\/]+/g, separator)}`;
+}
+
+function scannedResultEntryPath(entry) {
+  return text(entry?.projectRoot || entry?.project_root || entry?.path || entry?.repoPath || entry?.repo_path);
+}
+
+function scannedResultEntryName(entry, fallback = "Project") {
+  const entryPath = scannedResultEntryPath(entry);
+  return text(entry?.projectName || entry?.project_name || entry?.name, pathName(entryPath, fallback));
+}
+
+function scannedResultRelativePath(entry, rootDirectory) {
+  const explicit = text(entry?.workspaceRelativePath || entry?.workspace_relative_path || entry?.relativePath || entry?.relative_path);
+  if (explicit === ".") return "";
+  if (explicit) return explicit.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+
+  const root = text(rootDirectory).replace(/\\/g, "/").replace(/\/+$/g, "");
+  const entryPath = scannedResultEntryPath(entry).replace(/\\/g, "/").replace(/\/+$/g, "");
+  if (!root || !entryPath) return "";
+  if (entryPath.toLowerCase() === root.toLowerCase()) return "";
+  if (entryPath.toLowerCase().startsWith(`${root.toLowerCase()}/`)) {
+    return entryPath.slice(root.length + 1);
+  }
+  return "";
+}
+
+function scannedResultEntryHasGit(entry) {
+  return entry?.hasGit === true || entry?.has_git === true;
+}
+
+function scannedResultEntryMountKind(entry) {
+  return text(entry?.mountKind || entry?.mount_kind);
+}
+
+function scannedResultGraphKind(entry) {
+  if (
+    scannedResultEntryMountKind(entry) === "container"
+    || text(entry?.projectKind || entry?.project_kind) === "container"
+  ) {
+    return "container";
+  }
+  return scannedResultEntryHasGit(entry) ? "git" : "project";
+}
+
+function scannedResultEntryKindLabel(entry) {
+  const graphKind = scannedResultGraphKind(entry);
+  if (graphKind === "git") return "git repo";
+  if (graphKind === "container") return "folder";
+  return "project folder";
+}
+
+function scannedResultGraphBadge(entry) {
+  return scannedResultEntryKindLabel(entry);
+}
+
+function buildScannedResultGraph(scan) {
   const object = jsonObject(scan);
   if (!object) {
     return {
       edges: [],
       nodes: [],
       stats: {
-        cacheLabel: "No scan data",
-        cacheReason: "Raw Scan reads the cached startup topology. No cached response has been loaded yet.",
-        cacheStatus: "waiting",
-        projectCount: 0,
+        graphCount: 0,
+        gitCount: 0,
+        repoCount: 0,
+        rootLabel: "No scan data",
         sourceLabel: "Waiting",
-        workspaceKind: "workspace",
       },
     };
   }
@@ -3625,7 +3673,13 @@ function buildRawScanGraph(scan) {
   const nodeMap = new Map();
   const edgeMap = new Map();
   const rootId = "root";
-  const rootName = text(object.workspaceName) || pathName(object.root, "workspace");
+  const rootDirectory = text(object.rootDirectory || object.root_directory || object.repoPath || object.repo_path);
+  const rootName = pathName(rootDirectory, "workspace");
+  const cacheSource = text(object.cache?.source || object.cacheSource || object.cache_source);
+  const cacheStatus = text(object.cache?.status || object.cacheStatus || object.cache_status);
+  const sourceLabel = cacheSource === "backend_workspace_topology_cache"
+    ? `backend cache${cacheStatus ? `: ${cacheStatus.replaceAll("_", " ")}` : ""}`
+    : "architecture scan";
 
   const addNode = (node) => {
     const existing = nodeMap.get(node.id) || {};
@@ -3644,125 +3698,136 @@ function buildRawScanGraph(scan) {
     id: rootId,
     kind: "root",
     label: rootName,
-    meta: text(object.workspaceKind, "workspace"),
-    path: text(object.root),
+    meta: rootDirectory,
+    path: rootDirectory,
     relativePath: "",
-    badge: text(object.scanMode, "cached_topology").replaceAll("_", " "),
+    badge: "architecture root",
     depth: 0,
   });
 
-  const mounts = [
-    ...jsonArray(object.workspaceMounts),
-    ...jsonArray(object.projectMounts),
-  ];
-  const seenMountKeys = new Set();
-  const mountNodes = [];
+  const repositories = jsonArray(object.repositories);
+  const repoByPath = new Map(repositories.map((repo) => [scannedResultEntryPath(repo), repo]));
+  const workspaceMounts = jsonArray(object.workspaceMounts || object.workspace_mounts);
+  const mounts = workspaceMounts.length ? workspaceMounts : jsonArray(object.mounts);
+  const hasExplicitWorkspaceMounts = workspaceMounts.length > 0;
+  const scanEntries = mounts.length
+    ? mounts.map((mount) => ({
+      ...mount,
+      graphCount: numberValue(repoByPath.get(scannedResultEntryPath(mount))?.graphCount, 0),
+    }))
+    : repositories;
+  const entryNodeIdsByMountId = new Map();
+  scanEntries.forEach((entry, index) => {
+    const relativePath = scannedResultRelativePath(entry, rootDirectory);
+    if (!relativePath) return;
+    const entryId = text(entry?.mountId || entry?.mount_id || entry?.id, scannedResultEntryPath(entry) || `scan-entry-${index}`);
+    entryNodeIdsByMountId.set(entryId, `${scannedResultGraphKind(entry)}:${entryId}`);
+  });
+  let gitCount = 0;
+  let totalGraphCount = 0;
 
-  mounts.forEach((mount) => {
-    const relativePath = mountField(mount, "workspaceRelativePath", "workspace_relative_path");
-    const mountId = mountField(mount, "mountId", "mount_id", relativePath || "root");
-    const key = mountId || relativePath || mountField(mount, "projectRoot", "project_root");
-    if (!key || seenMountKeys.has(key)) return;
-    seenMountKeys.add(key);
-    if (!relativePath) {
+  scanEntries.forEach((entry, index) => {
+    const entryPath = scannedResultEntryPath(entry);
+    const relativePath = scannedResultRelativePath(entry, rootDirectory);
+    const parts = relativePath.split("/").filter(Boolean);
+    const entryId = text(entry?.mountId || entry?.mount_id || entry?.id, entryPath || `scan-entry-${index}`);
+    const entryName = scannedResultEntryName(entry, "Project");
+    const entryKind = scannedResultGraphKind(entry);
+    const graphCount = numberValue(entry?.graphCount ?? entry?.graph_count, 0);
+    if (entryKind === "git") gitCount += 1;
+    totalGraphCount += graphCount;
+
+    if (!parts.length) {
       addNode({
         id: rootId,
-        kind: "root",
-        label: mountField(mount, "projectName", "project_name", rootName),
-        meta: mountField(mount, "projectKind", "project_kind", text(object.workspaceKind, "workspace")),
-        path: mountField(mount, "projectRoot", "project_root", text(object.root)),
+        kind: entryKind === "git" ? "rootGit" : "root",
+        label: entryName || rootName,
+        meta: entryPath || rootDirectory,
+        path: entryPath || rootDirectory,
         relativePath: "",
-        badge: mountField(mount, "mountKind", "mount_kind", "root"),
+        badge: scannedResultGraphBadge(entry),
         depth: 0,
       });
       return;
     }
-    mountNodes.push({ mount, mountId, relativePath });
-    addNode({
-      id: `mount:${mountId}`,
-      kind: rawGraphNodeKind(mount),
-      label: mountField(mount, "projectName", "project_name", pathName(relativePath, "project")),
-      meta: relativePath,
-      path: mountField(mount, "projectRoot", "project_root"),
-      relativePath,
-      badge: mountField(mount, "projectKind", "project_kind", "project"),
-      depth: numberValue(mount?.mountDepth ?? mount?.mount_depth, relativePath.split("/").filter(Boolean).length),
-      mountId,
-    });
-  });
 
-  const idByMountId = new Map(mountNodes.map((entry) => [entry.mountId, `mount:${entry.mountId}`]));
-  const idByPath = new Map(mountNodes.map((entry) => [entry.relativePath, `mount:${entry.mountId}`]));
-  mountNodes.forEach(({ mount, mountId, relativePath }) => {
-    const parentMountId = mountField(mount, "parentMountId", "parent_mount_id");
-    const parentId = idByMountId.get(parentMountId)
-      || idByPath.get(rawGraphParentPath(relativePath))
-      || rootId;
-    addEdge(parentId, `mount:${mountId}`);
-  });
-
-  if (nodeMap.size <= 1) {
-    const traceEntries = jsonArray(object.folderTrace?.entries);
-    const traceIdByPath = new Map();
-    traceEntries.forEach((entry, index) => {
-      const relativePath = text(entry?.relativePath);
-      if (!relativePath && index > 0) return;
-      const id = relativePath ? `trace:${relativePath}` : rootId;
-      traceIdByPath.set(relativePath, id);
-      const depth = numberValue(entry?.depth, relativePath.split("/").filter(Boolean).length);
+    const repoNodeId = `${entryKind}:${entryId}`;
+    if (hasExplicitWorkspaceMounts) {
+      const parentMountId = text(entry?.parentMountId || entry?.parent_mount_id);
+      const parentNodeId = parentMountId ? entryNodeIdsByMountId.get(parentMountId) : rootId;
       addNode({
-        id,
-        kind: entry?.skipped ? "skipped" : text(entry?.projectKind) === "git" ? "git" : "trace",
-        label: relativePath ? pathName(relativePath) : rootName,
-        meta: relativePath || text(object.root),
-        path: text(entry?.path),
+        id: repoNodeId,
+        kind: entryKind,
+        label: entryName,
+        meta: relativePath,
+        path: entryPath,
         relativePath,
-        badge: text(entry?.scanAction, "scan").replaceAll("_", " "),
-        depth,
+        badge: scannedResultGraphBadge(entry),
+        depth: parts.length,
+        entry,
       });
+      addEdge(parentNodeId || rootId, repoNodeId);
+      return;
+    }
+
+    let parentId = rootId;
+    parts.slice(0, -1).forEach((part, partIndex) => {
+      const folderPath = parts.slice(0, partIndex + 1).join("/");
+      const folderId = `folder:${folderPath}`;
+      addNode({
+        id: folderId,
+        kind: "container",
+        label: part,
+        meta: folderPath,
+        path: scannedResultPathJoin(rootDirectory, folderPath),
+        relativePath: folderPath,
+        badge: "folder",
+        depth: partIndex + 1,
+      });
+      addEdge(parentId, folderId);
+      parentId = folderId;
     });
-    traceEntries.forEach((entry, index) => {
-      const relativePath = text(entry?.relativePath);
-      if (!relativePath && index > 0) return;
-      if (!relativePath) return;
-      const parentRelativePath = rawGraphParentPath(relativePath);
-      const parentId = traceIdByPath.get(parentRelativePath) || idByPath.get(parentRelativePath) || rootId;
-      const id = traceIdByPath.get(relativePath);
-      if (id !== rootId) {
-        addEdge(parentId, id);
-      }
+
+    const parentRelativePath = scannedResultParentPath(relativePath);
+    const fallbackParentId = parentRelativePath ? `folder:${parentRelativePath}` : rootId;
+    addNode({
+      id: repoNodeId,
+      kind: entryKind,
+      label: entryName,
+      meta: relativePath,
+      path: entryPath,
+      relativePath,
+      badge: scannedResultGraphBadge(entry),
+      depth: parts.length,
+      entry,
     });
-  }
+    addEdge(parentId || fallbackParentId, repoNodeId);
+  });
 
   const nodes = Array.from(nodeMap.values());
   const nodeIds = new Set(nodes.map((node) => node.id));
   const edges = Array.from(edgeMap.values()).filter((edge) => nodeIds.has(edge.from) && nodeIds.has(edge.to));
-  const cacheStatus = text(object.cache?.status, "missing");
-  const cacheAge = formatDurationMs(object.cache?.ageMs);
-  const cacheReason = text(
-    object.cache?.reason
-      || object.diagnostic?.reason
-      || object.folderTrace?.reason
-      || (cacheStatus === "missing"
-        ? "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan."
-        : ""),
-  );
+  const folderCount = nodes.filter((node) => (
+    node.kind === "root"
+      || node.kind === "container"
+      || node.kind === "folder"
+  )).length;
 
   return {
     edges,
     nodes,
     stats: {
-      cacheLabel: cacheAge ? `${cacheStatus} · ${cacheAge}` : cacheStatus,
-      cacheReason,
-      cacheStatus,
-      projectCount: jsonArray(object.projectMounts).length,
-      sourceLabel: text(object.scanMode, "cached_topology").replaceAll("_", " "),
-      workspaceKind: text(object.workspaceKind, "workspace"),
+      folderCount,
+      graphCount: totalGraphCount,
+      gitCount,
+      repoCount: scanEntries.length,
+      rootLabel: rootDirectory || rootName,
+      sourceLabel,
     },
   };
 }
 
-function layoutRawScanGraph(graph) {
+function layoutScannedResultGraph(graph) {
   const nodes = jsonArray(graph?.nodes);
   if (!nodes.length) {
     return { edges: [], height: 360, nodes: [], width: 760 };
@@ -3830,11 +3895,11 @@ export default function ArchitectureWorkspaceView({
   defaultWorkingDirectory,
   rootDirectory,
   architectureError = "",
+  architectureRepositoryScanError = "",
+  architectureRepositoryScanSnapshot = null,
+  architectureRepositoryScanState = "idle",
   architectureSnapshot = null,
   architectureState = "idle",
-  rawScanError = "",
-  rawScanSnapshot = null,
-  rawScanState = "idle",
   workspace,
 }) {
   const activeWorkspaceId = workspace?.id || "";
@@ -3857,8 +3922,8 @@ export default function ArchitectureWorkspaceView({
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "architectures"
     ? `Architectures · repo scoped · ${repoLabel}`
-    : viewMode === "rawScan"
-      ? `Raw Scan · startup cache · ${repoLabel}`
+    : viewMode === "scannedResult"
+      ? `Scanned Result · architecture scan · ${repoLabel}`
       : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
   const visibleArchitectureError = architectureCloudMcpNoiseError(architectureError) ? "" : architectureError;
 
@@ -4001,11 +4066,11 @@ export default function ArchitectureWorkspaceView({
             Task History
           </ViewToggleButton>
           <ViewToggleButton
-            data-active={viewMode === "rawScan" ? "true" : "false"}
-            onClick={() => setViewMode("rawScan")}
+            data-active={viewMode === "scannedResult" ? "true" : "false"}
+            onClick={() => setViewMode("scannedResult")}
             type="button"
           >
-            Raw Scan
+            Scanned Result
           </ViewToggleButton>
         </ViewToggleGroup>
         <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
@@ -4017,13 +4082,16 @@ export default function ArchitectureWorkspaceView({
           queueWorkspaceName={activeWorkspaceName}
           repoLabel={repoLabel}
           repoPath={repoPath}
+          repositoryScan={architectureRepositoryScanSnapshot}
+          repositoryScanError={architectureRepositoryScanError}
+          repositoryScanState={architectureRepositoryScanState}
           tasks={visibleTasks}
         />
-      ) : viewMode === "rawScan" ? (
-        <RawScanPanel
-          error={rawScanError}
-          scan={rawScanSnapshot}
-          state={rawScanState}
+      ) : viewMode === "scannedResult" ? (
+        <ScannedResultPanel
+          error={architectureRepositoryScanError}
+          scan={architectureRepositoryScanSnapshot}
+          state={architectureRepositoryScanState}
         />
       ) : (
         <HistoryTimeline
@@ -4049,6 +4117,9 @@ function ArchitecturesPanel({
   queueWorkspaceName = "",
   repoLabel,
   repoPath,
+  repositoryScan = null,
+  repositoryScanError = "",
+  repositoryScanState = "idle",
   tasks = [],
 }) {
   const [repositories, setRepositories] = useState([]);
@@ -4069,32 +4140,43 @@ function ArchitecturesPanel({
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
 
   useEffect(() => {
-    let cancelled = false;
-    setRepoState("loading");
-    setError("");
-    invoke("architecture_repositories", { rootDirectory: repoPath || null })
-      .then((result) => {
-        if (cancelled) return;
-        const nextRepositories = jsonArray(result?.repositories);
+    const nextRepositories = jsonArray(repositoryScan?.repositories);
+
+    if (repositoryScanState === "loading") {
+      setRepoState("loading");
+      setError("");
+      if (nextRepositories.length) {
         setRepositories(nextRepositories);
-        setSelectedRepoPath((current) => {
-          if (current && nextRepositories.some((repo) => repo.path === current)) return current;
-          return nextRepositories[0]?.path || "";
-        });
-        setRepoState("ready");
-      })
-      .catch((nextError) => {
-        if (cancelled) return;
-        setRepositories([]);
-        setSelectedRepoPath("");
-        setCreatingGraph(false);
-        setRepoState("error");
-        setError(nextError?.message || String(nextError || "Unable to load architecture repositories."));
+      }
+      return;
+    }
+
+    if (repositoryScanState === "error") {
+      setRepositories([]);
+      setSelectedRepoPath("");
+      setCreatingGraph(false);
+      setRepoState("error");
+      setError(repositoryScanError || "Unable to load architecture repositories.");
+      return;
+    }
+
+    if (repositoryScanState === "ready" || nextRepositories.length) {
+      setRepositories(nextRepositories);
+      setSelectedRepoPath((current) => {
+        if (current && nextRepositories.some((repo) => repo.path === current)) return current;
+        return nextRepositories[0]?.path || "";
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [repoPath]);
+      setRepoState("ready");
+      setError("");
+      return;
+    }
+
+    setRepositories([]);
+    setSelectedRepoPath("");
+    setCreatingGraph(false);
+    setRepoState("idle");
+    setError("");
+  }, [repositoryScan, repositoryScanError, repositoryScanState]);
 
   const loadGraphList = useCallback((repo = selectedRepoPath, options = {}) => {
     if (!repo) {
@@ -4204,6 +4286,8 @@ function ArchitecturesPanel({
   }, [creatingGraph, saveState, selectedGraphId, selectedRepoPath]);
 
   const selectedRepo = repositories.find((repo) => repo.path === selectedRepoPath) || null;
+  const selectedRepoKind = selectedRepo ? scannedResultGraphKind(selectedRepo) : "";
+  const selectedRepoKindLabel = selectedRepo ? scannedResultEntryKindLabel(selectedRepo) : "";
   const agentEditMarkersStorageKey = useMemo(
     () => architectureAgentEditMarkersStorageKey(queueWorkspaceId, selectedRepoPath || repoPath),
     [queueWorkspaceId, repoPath, selectedRepoPath],
@@ -4391,7 +4475,12 @@ function ArchitecturesPanel({
       {!navCollapsed && (
         <ArchitectureNavRail aria-label="Architecture repositories">
           <ArchitectureNavHeader>
-            <strong>Architectures</strong>
+            <ArchitectureNavTitle>
+              <strong>Architectures</strong>
+              {singleRepository && selectedRepo && (
+                <ArchitectureRepoKindBadge data-kind={selectedRepoKind}>{selectedRepoKindLabel}</ArchitectureRepoKindBadge>
+              )}
+            </ArchitectureNavTitle>
             <ArchitectureNavHeaderActions>
               <ArchitectureCreateGraphButton
                 aria-label="Create architecture graph"
@@ -4413,32 +4502,36 @@ function ArchitecturesPanel({
             </ArchitectureNavHeaderActions>
           </ArchitectureNavHeader>
           <ArchitectureTree>
-            {singleRepository ? renderTreeRows(0) : repositories.map((repo) => (
-              <ArchitectureTreeRepoGroup key={repo.id}>
-                <ArchitectureTreeRow
-                  data-active={repo.path === selectedRepoPath ? "true" : "false"}
-                  data-kind="repo"
-                  onClick={() => {
-                    setSelectedRepoPath(repo.path);
-                    setSelectedGraphId("");
-                    setSelectedGraph(null);
-                    setCreatingGraph(false);
-                  }}
-                  style={{ "--tree-depth": 0 }}
-                  title={repo.path}
-                  type="button"
-                >
-                  <ArchitectureTreeGlyph data-kind="repo" aria-hidden="true" />
-                  <span>{repo.name}</span>
-                  <em>{repo.graphCount}</em>
-                </ArchitectureTreeRow>
-                {repo.path === selectedRepoPath && (
-                  <ArchitectureTreeBranch>
-                    {renderTreeRows(1)}
-                  </ArchitectureTreeBranch>
-                )}
-              </ArchitectureTreeRepoGroup>
-            ))}
+            {singleRepository ? renderTreeRows(0) : repositories.map((repo) => {
+              const repoKind = scannedResultGraphKind(repo);
+              return (
+                <ArchitectureTreeRepoGroup key={repo.id}>
+                  <ArchitectureTreeRow
+                    data-active={repo.path === selectedRepoPath ? "true" : "false"}
+                    data-kind={repoKind === "git" ? "repo" : "folder"}
+                    onClick={() => {
+                      setSelectedRepoPath(repo.path);
+                      setSelectedGraphId("");
+                      setSelectedGraph(null);
+                      setCreatingGraph(false);
+                    }}
+                    style={{ "--tree-depth": 0 }}
+                    title={repo.path}
+                    type="button"
+                  >
+                    <ArchitectureTreeGlyph data-kind={repoKind === "git" ? "repo" : "folder"} aria-hidden="true" />
+                    <span>{repo.name}</span>
+                    <em>{scannedResultEntryKindLabel(repo)}</em>
+                    <em>{repo.graphCount}</em>
+                  </ArchitectureTreeRow>
+                  {repo.path === selectedRepoPath && (
+                    <ArchitectureTreeBranch>
+                      {renderTreeRows(1)}
+                    </ArchitectureTreeBranch>
+                  )}
+                </ArchitectureTreeRepoGroup>
+              );
+            })}
             {repoState === "ready" && !repositories.length && (
               <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
             )}
@@ -6868,54 +6961,68 @@ function TaskDetailPanel({
   );
 }
 
-function RawScanPanel({ error, scan, state }) {
-  const graph = useMemo(() => buildRawScanGraph(scan), [scan]);
+function ScannedResultPanel({ error = "", scan = null, state = "idle" }) {
+  const graph = useMemo(() => buildScannedResultGraph(scan), [scan]);
   const hasGraph = graph.nodes.length > 0;
   const isLoading = state === "loading";
-  const cacheReason = graph.stats.cacheReason || "";
-  const cacheStatus = graph.stats.cacheStatus || "";
-  const emptyMessage = isLoading
-    ? "Loading startup workspace graph..."
-    : cacheReason || "No startup workspace graph cached yet.";
-  const shouldShowCacheNotice = Boolean(
-    cacheReason
-      && !isLoading
-      && (!hasGraph || ["error", "missing", "stale_cached", "unavailable"].includes(cacheStatus)),
-  );
+  const repositoriesByPath = new Map(jsonArray(scan?.repositories).map((repo) => [scannedResultEntryPath(repo), repo]));
+  const discoveredScanEntries = jsonArray(scan?.workspaceMounts || scan?.workspace_mounts).length
+    ? jsonArray(scan?.workspaceMounts || scan?.workspace_mounts)
+    : jsonArray(scan?.mounts).length
+      ? jsonArray(scan.mounts)
+      : jsonArray(scan?.repositories);
+  const scanEntries = discoveredScanEntries.map((entry) => {
+    const matchingRepository = repositoriesByPath.get(scannedResultEntryPath(entry));
+    return {
+      ...entry,
+      graphCount: numberValue(entry?.graphCount ?? entry?.graph_count ?? matchingRepository?.graphCount ?? matchingRepository?.graph_count, 0),
+    };
+  });
 
   return (
-    <RawShell>
-      <RawHeader>
+    <ScannedResultShell>
+      <ScannedResultHeader>
         <div>
-          <RawKicker>Startup cache</RawKicker>
-          <RawTitle>{isLoading ? "Loading cached workspace graph..." : "Cached workspace graph"}</RawTitle>
+          <ScannedResultKicker>Architecture scan</ScannedResultKicker>
+          <ScannedResultTitle>{isLoading && !hasGraph ? "Scanning workspace..." : "Scanned Result"}</ScannedResultTitle>
         </div>
-      </RawHeader>
+      </ScannedResultHeader>
       {error && <ArchitectureError>{error}</ArchitectureError>}
-      <RawGraphStats>
+      <ScannedResultStats>
         <span>{graph.stats.sourceLabel}</span>
-        <span>{graph.stats.cacheLabel}</span>
-        <span>{graph.stats.workspaceKind}</span>
-        <span>{graph.stats.projectCount} project{graph.stats.projectCount === 1 ? "" : "s"}</span>
-      </RawGraphStats>
-      {shouldShowCacheNotice && (
-        <RawCacheNotice data-cache-status={cacheStatus}>{cacheReason}</RawCacheNotice>
-      )}
+        <span>{graph.stats.repoCount} scan entr{graph.stats.repoCount === 1 ? "y" : "ies"}</span>
+        <span>{graph.stats.gitCount} git</span>
+        <span>{graph.stats.folderCount} folder{graph.stats.folderCount === 1 ? "" : "s"}</span>
+      </ScannedResultStats>
       {hasGraph ? (
-        <RawScanGraph graph={graph} />
+        <ScannedResultGraph graph={graph} />
       ) : (
-        <EmptyState>{emptyMessage}</EmptyState>
+        <EmptyState>{isLoading ? "Scanning workspace..." : "No architecture scan result yet."}</EmptyState>
       )}
-      <RawDetails>
-        <summary>Raw payload</summary>
-        <JsonBlock>{JSON.stringify(scan || { state }, null, 2)}</JsonBlock>
-      </RawDetails>
-    </RawShell>
+      {scanEntries.length > 0 && (
+        <ScannedResultList aria-label="Scanned entries">
+          {scanEntries.map((entry, index) => {
+            const graphCount = numberValue(entry?.graphCount ?? entry?.graph_count, 0);
+            return (
+              <ScannedResultListRow
+                data-kind={scannedResultGraphKind(entry)}
+                key={text(entry.mountId || entry.mount_id || entry.id || scannedResultEntryPath(entry), `scan-entry-${index}`)}
+              >
+                <strong>{scannedResultEntryName(entry, "Project")}</strong>
+                <span>{text(scannedResultRelativePath(entry, scan?.rootDirectory || scan?.root_directory), ".")}</span>
+                <em>{scannedResultEntryKindLabel(entry)}</em>
+                <em>{graphCount} graph{graphCount === 1 ? "" : "s"}</em>
+              </ScannedResultListRow>
+            );
+          })}
+        </ScannedResultList>
+      )}
+    </ScannedResultShell>
   );
 }
 
-function RawScanGraph({ graph }) {
-  const layout = useMemo(() => layoutRawScanGraph(graph), [graph]);
+function ScannedResultGraph({ graph }) {
+  const layout = useMemo(() => layoutScannedResultGraph(graph), [graph]);
   const nodeById = useMemo(
     () => new Map(layout.nodes.map((node) => [node.id, node])),
     [layout.nodes],
@@ -6924,14 +7031,14 @@ function RawScanGraph({ graph }) {
   const nodeHeight = 66;
 
   return (
-    <RawGraphViewport>
-      <RawGraphSvg
-        aria-label="Cached workspace scan graph"
+    <ScannedResultGraphViewport>
+      <ScannedResultGraphSvg
+        aria-label="Architecture scan graph"
         role="img"
         viewBox={`0 0 ${layout.width} ${layout.height}`}
       >
         <defs>
-          <marker id="raw-graph-arrow" markerHeight="8" markerWidth="8" orient="auto" refX="7" refY="4">
+          <marker id="scanned-result-arrow" markerHeight="8" markerWidth="8" orient="auto" refX="7" refY="4">
             <path d="M0,0 L8,4 L0,8 Z" fill="rgba(147, 197, 253, 0.72)" />
           </marker>
         </defs>
@@ -6947,10 +7054,10 @@ function RawScanGraph({ graph }) {
             const midX = startX + Math.max(50, (endX - startX) * 0.52);
             return (
               <path
-                className="raw-edge"
+                className="scan-edge"
                 d={`M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`}
                 key={`${edge.from}-${edge.to}`}
-                markerEnd="url(#raw-graph-arrow)"
+                markerEnd="url(#scanned-result-arrow)"
               />
             );
           })}
@@ -6959,16 +7066,16 @@ function RawScanGraph({ graph }) {
           {layout.nodes.map((node) => (
             <g data-kind={node.kind} key={node.id} transform={`translate(${node.x}, ${node.y - nodeHeight / 2})`}>
               <title>{[node.label, node.meta, node.path].filter(Boolean).join("\n")}</title>
-              <rect className="raw-node-box" height={nodeHeight} rx="8" width={nodeWidth} />
-              <circle className="raw-node-dot" cx="18" cy="21" r="5" />
-              <text className="raw-node-label" x="32" y="24">{shortLabel(node.label, 24)}</text>
-              <text className="raw-node-meta" x="14" y="46">{shortLabel(node.meta || node.relativePath || node.path, 30)}</text>
-              <text className="raw-node-badge" x={nodeWidth - 14} y="46" textAnchor="end">{shortLabel(node.badge, 13)}</text>
+              <rect className="scan-node-box" height={nodeHeight} rx="8" width={nodeWidth} />
+              <circle className="scan-node-dot" cx="18" cy="21" r="5" />
+              <text className="scan-node-label" x="32" y="24">{shortLabel(node.label, 24)}</text>
+              <text className="scan-node-meta" x="14" y="46">{shortLabel(node.meta || node.relativePath || node.path, 30)}</text>
+              <text className="scan-node-badge" x={nodeWidth - 14} y="46" textAnchor="end">{shortLabel(node.badge, 13)}</text>
             </g>
           ))}
         </g>
-      </RawGraphSvg>
-    </RawGraphViewport>
+      </ScannedResultGraphSvg>
+    </ScannedResultGraphViewport>
   );
 }
 
@@ -7267,8 +7374,16 @@ const ArchitectureTreeRow = styled.button`
     font-weight: 880;
   }
 
+  &[data-kind="repo"] em:first-of-type {
+    color: rgba(52, 211, 153, 0.84);
+  }
+
   &[data-kind="folder"] {
     color: rgba(148, 163, 184, 0.86);
+  }
+
+  &[data-kind="folder"] em:first-of-type {
+    color: rgba(251, 191, 36, 0.84);
   }
 
   &[data-kind="graph"] {
@@ -7400,6 +7515,39 @@ const ArchitectureRailHeader = styled.header`
     font-size: 10px;
     font-weight: 900;
     text-transform: none;
+  }
+`;
+
+const ArchitectureNavTitle = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+`;
+
+const ArchitectureRepoKindBadge = styled.span`
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 999px;
+  color: rgba(148, 163, 184, 0.82);
+  background: rgba(15, 23, 42, 0.48);
+  font-size: 8px;
+  font-weight: 920;
+  line-height: 1.2;
+  text-transform: uppercase;
+
+  &[data-kind="git"] {
+    border-color: rgba(52, 211, 153, 0.26);
+    color: rgba(110, 231, 183, 0.9);
+    background: rgba(20, 83, 45, 0.2);
+  }
+
+  &[data-kind="folder"],
+  &[data-kind="container"] {
+    border-color: rgba(251, 191, 36, 0.26);
+    color: rgba(253, 230, 138, 0.9);
+    background: rgba(120, 53, 15, 0.2);
   }
 `;
 
@@ -9455,9 +9603,9 @@ const TaskActionError = styled.div`
   overflow-wrap: anywhere;
 `;
 
-const RawShell = styled.div`
+const ScannedResultShell = styled.div`
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 12px;
   min-width: 0;
   min-height: 0;
@@ -9465,27 +9613,27 @@ const RawShell = styled.div`
   padding: 14px;
 `;
 
-const RawHeader = styled.header`
+const ScannedResultHeader = styled.header`
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
 `;
 
-const RawKicker = styled.div`
+const ScannedResultKicker = styled.div`
   color: var(--forge-text-muted);
   font-size: 11px;
   font-weight: 850;
   text-transform: uppercase;
 `;
 
-const RawTitle = styled.strong`
+const ScannedResultTitle = styled.strong`
   display: block;
   margin-top: 3px;
   font-size: 16px;
 `;
 
-const RawGraphStats = styled.div`
+const ScannedResultStats = styled.div`
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
@@ -9501,33 +9649,7 @@ const RawGraphStats = styled.div`
   }
 `;
 
-const RawCacheNotice = styled.div`
-  padding: 9px 10px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  color: rgba(203, 213, 225, 0.82);
-  background: rgba(15, 23, 42, 0.38);
-  font-size: 11px;
-  font-weight: 740;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-
-  &[data-cache-status="missing"],
-  &[data-cache-status="stale_cached"],
-  &[data-cache-status="unavailable"] {
-    border-color: rgba(251, 191, 36, 0.22);
-    color: rgba(254, 240, 138, 0.88);
-    background: rgba(113, 63, 18, 0.12);
-  }
-
-  &[data-cache-status="error"] {
-    border-color: rgba(248, 113, 113, 0.24);
-    color: rgba(254, 202, 202, 0.9);
-    background: rgba(127, 29, 29, 0.13);
-  }
-`;
-
-const RawGraphViewport = styled.div`
+const ScannedResultGraphViewport = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -9540,73 +9662,84 @@ const RawGraphViewport = styled.div`
   background-size: 26px 26px;
 `;
 
-const RawGraphSvg = styled.svg`
+const ScannedResultGraphSvg = styled.svg`
   display: block;
   min-width: 760px;
   min-height: 360px;
 
-  .raw-edge {
+  .scan-edge {
     fill: none;
     stroke: rgba(147, 197, 253, 0.5);
     stroke-width: 2;
   }
 
-  .raw-node-box {
+  .scan-node-box {
     fill: rgba(15, 23, 42, 0.92);
     stroke: rgba(148, 163, 184, 0.24);
     stroke-width: 1.4;
   }
 
-  .raw-node-dot {
+  .scan-node-dot {
     fill: #94a3b8;
   }
 
-  .raw-node-label {
+  .scan-node-label {
     fill: #f8fafc;
     font-size: 13px;
     font-weight: 850;
   }
 
-  .raw-node-meta,
-  .raw-node-badge {
+  .scan-node-meta,
+  .scan-node-badge {
     fill: rgba(203, 213, 225, 0.68);
     font-size: 10px;
     font-weight: 760;
   }
 
-  [data-kind="root"] .raw-node-box {
+  [data-kind="root"] .scan-node-box {
     fill: rgba(30, 64, 175, 0.28);
     stroke: rgba(96, 165, 250, 0.55);
   }
 
-  [data-kind="root"] .raw-node-dot {
+  [data-kind="root"] .scan-node-dot {
     fill: #60a5fa;
   }
 
-  [data-kind="git"] .raw-node-box {
+  [data-kind="rootGit"] .scan-node-box,
+  [data-kind="git"] .scan-node-box {
     fill: rgba(20, 83, 45, 0.2);
     stroke: rgba(52, 211, 153, 0.42);
   }
 
-  [data-kind="git"] .raw-node-dot {
+  [data-kind="rootGit"] .scan-node-dot,
+  [data-kind="git"] .scan-node-dot {
     fill: #34d399;
   }
 
-  [data-kind="project"] .raw-node-box {
-    fill: rgba(8, 47, 73, 0.24);
-    stroke: rgba(56, 189, 248, 0.34);
-  }
-
-  [data-kind="project"] .raw-node-dot {
-    fill: #38bdf8;
-  }
-
-  [data-kind="container"] .raw-node-box {
+  [data-kind="folder"] .scan-node-box {
     fill: rgba(120, 53, 15, 0.18);
     stroke: rgba(251, 191, 36, 0.36);
   }
 
-  [data-kind="container"] .raw-node-dot {
+  [data-kind="folder"] .scan-node-dot {
+    fill: #fbbf24;
+  }
+
+  [data-kind="project"] .scan-node-box {
+    fill: rgba(8, 47, 73, 0.24);
+    stroke: rgba(56, 189, 248, 0.34);
+  }
+
+  [data-kind="project"] .scan-node-dot {
+    fill: #38bdf8;
+  }
+
+  [data-kind="container"] .scan-node-box {
+    fill: rgba(120, 53, 15, 0.18);
+    stroke: rgba(251, 191, 36, 0.36);
+  }
+
+  [data-kind="container"] .scan-node-dot {
     fill: #fbbf24;
   }
 
@@ -9615,41 +9748,55 @@ const RawGraphSvg = styled.svg`
   }
 `;
 
-const RawDetails = styled.details`
+const ScannedResultList = styled.div`
+  display: grid;
+  gap: 6px;
   min-width: 0;
-
-  summary {
-    cursor: pointer;
-    color: var(--forge-text-muted);
-    font-size: 11px;
-    font-weight: 850;
-  }
-
-  &[open] {
-    display: grid;
-    gap: 8px;
-  }
-
-  & > pre {
-    max-height: 220px;
-  }
+  max-height: 150px;
+  overflow: auto;
 `;
 
-const JsonBlock = styled.pre`
+const ScannedResultListRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(120px, 1.2fr) minmax(120px, 2fr) auto auto;
+  gap: 8px;
+  align-items: center;
   min-width: 0;
-  min-height: 0;
-  margin: 0;
-  overflow: auto;
-  padding: 12px;
+  padding: 7px 9px;
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 8px;
-  color: #cbd5e1;
-  background: rgba(2, 6, 23, 0.72);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  background: rgba(15, 23, 42, 0.32);
   font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  font-weight: 760;
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(248, 250, 252, 0.92);
+  }
+
+  span,
+  em {
+    color: var(--forge-text-muted);
+    font-style: normal;
+  }
+
+  &[data-kind="git"] em:first-of-type {
+    color: rgba(52, 211, 153, 0.86);
+  }
+
+  &[data-kind="folder"],
+  &[data-kind="container"] {
+    em:first-of-type {
+      color: rgba(251, 191, 36, 0.84);
+    }
+  }
 `;
 
 const EmptyState = styled.div`

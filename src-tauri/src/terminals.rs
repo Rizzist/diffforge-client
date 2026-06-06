@@ -1354,7 +1354,6 @@ struct TerminalWorkspaceTopologyScan {
     cache_status: &'static str,
     cache_hit: bool,
     scanned_ms: u64,
-    cache_age_ms: Option<u64>,
 }
 
 async fn terminal_workspace_topology_cached_scan(
@@ -1365,7 +1364,6 @@ async fn terminal_workspace_topology_cached_scan(
     let key = terminal_workspace_topology_cache_key(workspace_root);
     let cache = cache.read().await;
     if let Some(snapshot) = cache.get(&key) {
-        let age_ms = now_ms.saturating_sub(snapshot.scanned_ms);
         return TerminalWorkspaceTopologyScan {
             mounts: snapshot.mounts.clone(),
             cache_key: key,
@@ -1376,7 +1374,6 @@ async fn terminal_workspace_topology_cached_scan(
             },
             cache_hit: true,
             scanned_ms: snapshot.scanned_ms,
-            cache_age_ms: Some(age_ms),
         };
     }
 
@@ -1386,7 +1383,6 @@ async fn terminal_workspace_topology_cached_scan(
         cache_status: "missing",
         cache_hit: false,
         scanned_ms: now_ms,
-        cache_age_ms: None,
     }
 }
 
@@ -1409,7 +1405,6 @@ async fn terminal_workspace_topology_scan_for_launch_from_cache(
                     cache_status: "hit",
                     cache_hit: true,
                     scanned_ms: snapshot.scanned_ms,
-                    cache_age_ms: Some(age_ms),
                 };
             }
             stale_age_ms = Some(age_ms);
@@ -1436,7 +1431,6 @@ async fn terminal_workspace_topology_scan_for_launch_from_cache(
         },
         cache_hit: false,
         scanned_ms,
-        cache_age_ms: stale_age_ms,
     }
 }
 
@@ -1480,229 +1474,6 @@ async fn terminal_workspace_topology_scan_for_launch(
         None,
     )
     .await
-}
-
-fn terminal_raw_scan_folder_row(
-    workspace_root: &Path,
-    path: &Path,
-    depth: usize,
-    scan_action: &str,
-    selected_root: bool,
-    skipped: bool,
-    mount: Option<&WorkspaceProjectMount>,
-) -> Value {
-    let relative_path = child_relative_path(workspace_root, path).unwrap_or_default();
-    let project_kind = mount
-        .map(|mount| mount.project_kind.as_str())
-        .unwrap_or("none");
-    json!({
-        "relativePath": relative_path,
-        "path": workspace_path_display(path),
-        "depth": depth,
-        "entryKind": "directory",
-        "scanAction": scan_action,
-        "selectedRoot": selected_root,
-        "skipped": skipped,
-        "projectKind": if skipped { "none" } else { project_kind },
-        "mountId": mount.map(|mount| mount.mount_id.clone()).unwrap_or_default(),
-        "mountKind": mount.map(|mount| mount.mount_kind.clone()).unwrap_or_default(),
-        "projectName": mount.map(|mount| mount.project_name.clone()).unwrap_or_default(),
-        "hasGitMarker": mount.map(|mount| mount.has_git).unwrap_or(false),
-        "isExactGitRoot": selected_root && mount.map(|mount| mount.has_git).unwrap_or(false),
-        "hasProjectMarker": mount.is_some(),
-        "hasAgents": mount.map(|mount| mount.has_agents).unwrap_or(false),
-    })
-}
-
-fn terminal_raw_scan_cached_folder_trace(
-    workspace_root: &Path,
-    mounts: &[WorkspaceProjectMount],
-) -> Value {
-    let workspace_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    let workspace_root_key = normalized_path_key(&workspace_root);
-    let mut entries = vec![terminal_raw_scan_folder_row(
-        &workspace_root,
-        &workspace_root,
-        0,
-        "cached_root",
-        true,
-        false,
-        mounts
-            .iter()
-            .find(|mount| normalized_path_key(&mount.root_path) == workspace_root_key),
-    )];
-
-    for mount in mounts {
-        let relative_path =
-            child_relative_path(&workspace_root, &mount.root_path).unwrap_or_default();
-        if relative_path.is_empty() {
-            continue;
-        }
-        let depth = relative_path
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .count();
-        entries.push(terminal_raw_scan_folder_row(
-            &workspace_root,
-            &mount.root_path,
-            depth,
-            "cached_mount",
-            false,
-            false,
-            Some(mount),
-        ));
-    }
-
-    let entry_count = entries.len();
-    json!({
-        "entries": entries,
-        "truncated": false,
-        "maxEntries": entry_count,
-        "unreadableEntries": 0,
-        "source": "cached_topology",
-        "live": false,
-    })
-}
-
-fn terminal_raw_scan_launch_targets(
-    workspace_root: &Path,
-    mounts: &[WorkspaceProjectMount],
-    selected_root_empty_for_git_bootstrap: bool,
-) -> Vec<Value> {
-    [
-        TerminalSessionMode::General,
-        TerminalSessionMode::ManagedPatch,
-        TerminalSessionMode::DirectEdit,
-        TerminalSessionMode::Activity,
-        TerminalSessionMode::Free,
-        TerminalSessionMode::RemoteOps,
-    ]
-    .into_iter()
-    .map(|mode| {
-        match terminal_coordination_launch_target_with_mounts(
-            workspace_root,
-            Some(mounts),
-            None,
-            None,
-            selected_root_empty_for_git_bootstrap,
-            mode,
-        ) {
-            Ok(target) => json!({
-                "sessionMode": mode.as_str(),
-                "fileAuthority": mode.file_authority(),
-                "ok": true,
-                "targetRoot": workspace_path_display(&target.root),
-                "enforcementMode": target.enforcement_mode,
-                "requiresGitBootstrap": target.requires_git_bootstrap,
-                "allowsGitInit": target.allows_git_init,
-            }),
-            Err(error) => json!({
-                "sessionMode": mode.as_str(),
-                "fileAuthority": mode.file_authority(),
-                "ok": false,
-                "error": error,
-            }),
-        }
-    })
-    .collect()
-}
-
-#[tauri::command]
-async fn terminal_workspace_raw_scan(
-    state: State<'_, TerminalState>,
-    repo_path: String,
-    workspace_id: Option<String>,
-    workspace_name: Option<String>,
-    _include_folder_trace: Option<bool>,
-) -> Result<Value, String> {
-    ensure_app_not_shutting_down("workspace raw scan")?;
-    let requested_repo_path = repo_path.clone();
-    let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
-    let topology = terminal_workspace_topology_cached_scan(
-        &state.workspace_topology_cache,
-        &workspace_root,
-        terminal_now_ms(),
-    )
-    .await;
-    let workspace_kind = workspace_kind_for_mounts(&workspace_root, &topology.mounts);
-    let active_project_root = workspace_active_project_root_for_mounts(&topology.mounts);
-    let workspace_mounts =
-        workspace_mount_manifest_from_projects(&workspace_root, &topology.mounts);
-    let selected_root_mount =
-        workspace_selected_root_mount(&workspace_root, &topology.mounts).cloned();
-    let selected_project_kind = selected_root_mount
-        .as_ref()
-        .map(|mount| mount.project_kind.as_str())
-        .unwrap_or("none");
-    let selected_root_has_git = selected_root_mount
-        .as_ref()
-        .map(|mount| mount.has_git)
-        .unwrap_or(false);
-    let git_top_level = selected_root_mount
-        .as_ref()
-        .filter(|mount| mount.has_git)
-        .map(|mount| mount.project_root.clone())
-        .unwrap_or_default();
-    let launch_targets = terminal_raw_scan_launch_targets(&workspace_root, &topology.mounts, false);
-    let folder_trace_root = workspace_root.clone();
-    let folder_trace_mounts = topology.mounts.clone();
-    let folder_trace =
-        terminal_raw_scan_cached_folder_trace(&folder_trace_root, &folder_trace_mounts);
-    let generated_at_ms = terminal_now_ms();
-    let cache_age_ms = generated_at_ms.saturating_sub(topology.scanned_ms);
-    let cache_reason = match topology.cache_status {
-        "missing" => {
-            "No terminal startup topology has populated this workspace cache yet. Raw Scan does not rescan; it only displays the cached topology captured during terminal launch."
-        }
-        "stale_cached" => {
-            "The cached startup topology is older than the freshness window. Raw Scan is showing that stale cached topology without rescanning."
-        }
-        "hit" => "Fresh startup topology cache captured during terminal launch.",
-        _ => "Raw Scan is showing the current workspace topology cache without rescanning.",
-    };
-
-    Ok(json!({
-        "generatedAtMs": generated_at_ms,
-        "scanMode": "cached_topology",
-        "requestedRepoPath": requested_repo_path,
-        "workspaceId": workspace_id.unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
-        "root": workspace_path_display(&workspace_root),
-        "workspaceKind": workspace_kind,
-        "activeProjectRoot": active_project_root.unwrap_or_default(),
-        "selectedRoot": {
-            "projectKind": selected_project_kind,
-            "exactGitRoot": selected_root_has_git,
-            "gitTopLevel": git_top_level,
-            "broadArea": workspace_root_is_broad_area(&workspace_root, &topology.mounts),
-            "emptyDirectory": false,
-            "emptyForGitBootstrap": false,
-            "mount": selected_root_mount,
-        },
-        "cache": {
-            "key": topology.cache_key,
-            "status": topology.cache_status,
-            "hit": topology.cache_hit,
-            "fresh": cache_age_ms <= TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
-            "scannedAtMs": topology.scanned_ms,
-            "ageMs": cache_age_ms,
-            "previousAgeMs": topology.cache_age_ms,
-            "ttlMs": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
-            "reason": cache_reason,
-            "source": "workspace_topology_cache",
-        },
-        "limits": {
-            "projectMounts": MAX_WORKSPACE_PROJECT_MOUNTS,
-            "projectMountScanMaxDepth": WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH,
-            "topologyCacheFreshMs": TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS,
-        },
-        "projectMounts": topology.mounts,
-        "workspaceMounts": workspace_mounts,
-        "launchTargets": launch_targets,
-        "folderTrace": folder_trace,
-    }))
 }
 
 fn workspace_git_repo_root(repo_path: &str) -> Result<PathBuf, String> {
@@ -11599,60 +11370,6 @@ mod terminal_tests {
         assert_eq!(mount_paths.len(), 2);
         assert!(mount_paths.contains("frontend"));
         assert!(mount_paths.contains("backend"));
-    }
-
-    #[test]
-    fn terminal_workspace_raw_scan_cached_view_does_not_refresh_stale_topology() {
-        let container = terminal_test_directory("raw_scan_cached_topology");
-        let frontend = container.join("frontend");
-        fs::create_dir_all(&frontend).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .arg(&frontend)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let cache = Arc::new(RwLock::new(HashMap::new()));
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let first = runtime.block_on(terminal_workspace_topology_scan_for_launch_from_cache(
-            &cache,
-            &container,
-            1_000,
-            Some(1_000),
-        ));
-        assert_eq!(first.cache_status, "miss");
-        assert_eq!(first.mounts.len(), 1);
-
-        let backend = container.join("backend");
-        fs::create_dir_all(&backend).unwrap();
-        let status = Command::new("git")
-            .arg("init")
-            .arg(&backend)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let cached = runtime.block_on(terminal_workspace_topology_cached_scan(
-            &cache,
-            &container,
-            1_000 + TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS + 1,
-        ));
-        assert_eq!(cached.cache_status, "stale_cached");
-        assert_eq!(cached.cache_hit, true);
-        assert_eq!(cached.mounts.len(), 1);
-        assert_eq!(cached.mounts[0].workspace_relative_path, "frontend");
-
-        let trace = terminal_raw_scan_cached_folder_trace(&container, &cached.mounts);
-        assert_eq!(trace["source"].as_str(), Some("cached_topology"));
-        assert_eq!(trace["live"].as_bool(), Some(false));
-        let entries = trace["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1]["scanAction"].as_str(), Some("cached_mount"));
-        assert_eq!(entries[1]["relativePath"].as_str(), Some("frontend"));
     }
 
     #[test]
