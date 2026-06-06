@@ -2268,10 +2268,11 @@ function cloudDevicePlatformIcon(device) {
   return "device";
 }
 
-function normalizeCloudConnectedDevice(device, index = 0) {
+function normalizeCloudConnectedDevice(device, index = 0, options = {}) {
   if (!device || typeof device !== "object") {
     return null;
   }
+  const includeOffline = Boolean(options.includeOffline);
   const deviceId = safeCloudMcpText(
     device.device_id || device.deviceId || device.machine_id || device.machineId || device.id,
     "",
@@ -2290,6 +2291,15 @@ function normalizeCloudConnectedDevice(device, index = 0) {
       || device.deviceModel,
     index === 0 ? "Diff Forge client" : `Device ${index + 1}`,
   );
+  const statusText = normalizeCloudDeviceText(
+    device.status
+      || device.state
+      || device.connection_status
+      || device.connectionStatus,
+  );
+  const statusConnected = statusText
+    ? ["connected", "online", "open", "active", "ready"].includes(statusText)
+    : true;
   const connected = safeCloudMcpBool(
     device.connected
       ?? device.online
@@ -2297,9 +2307,9 @@ function normalizeCloudConnectedDevice(device, index = 0) {
       ?? device.nativeConnected
       ?? device.web_connected
       ?? device.webConnected,
-    true,
+    statusConnected,
   );
-  if (!connected) {
+  if (!connected && !includeOffline) {
     return null;
   }
   const platform = safeCloudMcpText(device.platform || device.os || device.system, "");
@@ -2324,23 +2334,28 @@ function normalizeCloudConnectedDevice(device, index = 0) {
       device.platform_label || device.platformLabel,
       "",
     ) || cloudDevicePlatformLabel(platform),
+    status: connected ? "connected" : "offline",
   };
 }
 
-function cloudConnectedDevicesFromRuntimeStatus(status) {
+function cloudDeviceCandidatesFromRuntimeStatus(status) {
   const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
   const clientConnection = liveRuntime?.client_connection || liveRuntime?.clientConnection || {};
   const machineSource = liveRuntime?.machines?.items
     || liveRuntime?.machines?.devices
     || liveRuntime?.machines
     || [];
-  const candidates = [
+  return [
     ...safeCloudMcpArray(liveRuntime?.devices),
     ...safeCloudMcpArray(machineSource),
     ...safeCloudMcpArray(
       clientConnection?.active_desktop_devices || clientConnection?.activeDesktopDevices,
     ),
   ];
+}
+
+function cloudConnectedDevicesFromRuntimeStatus(status) {
+  const candidates = cloudDeviceCandidatesFromRuntimeStatus(status);
   const byId = new Map();
   candidates.forEach((candidate, index) => {
     const device = normalizeCloudConnectedDevice(candidate, index);
@@ -2350,6 +2365,19 @@ function cloudConnectedDevicesFromRuntimeStatus(status) {
     byId.set(device.deviceId, { ...(byId.get(device.deviceId) || {}), ...device });
   });
   return Array.from(byId.values()).slice(0, 12);
+}
+
+function cloudKnownDevicesFromRuntimeStatus(status) {
+  const candidates = cloudDeviceCandidatesFromRuntimeStatus(status);
+  const byId = new Map();
+  candidates.forEach((candidate, index) => {
+    const device = normalizeCloudConnectedDevice(candidate, index, { includeOffline: true });
+    if (!device) {
+      return;
+    }
+    byId.set(device.deviceId, { ...(byId.get(device.deviceId) || {}), ...device });
+  });
+  return Array.from(byId.values()).slice(0, 48);
 }
 
 function cloudWorkspaceTodosFromRuntimeStatus(status) {
@@ -2577,6 +2605,7 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   attempt: 0,
   connectedDevices: [],
   detail: "Waiting for web sign-in.",
+  knownDevices: [],
   stage: "idle",
   status: "idle",
   title: "Cloud workspace",
@@ -3197,12 +3226,14 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const connected = Boolean(status?.connected && (status?.globalWsConnected || status?.global_ws_connected));
   const statusKey = globalStatus || runtimeStatus;
   const connectedDevices = cloudConnectedDevicesFromRuntimeStatus(status);
+  const knownDevices = cloudKnownDevicesFromRuntimeStatus(status);
   const workspaceTodos = cloudWorkspaceTodosFromRuntimeStatus(status);
 
   if (connected || statusKey === "connected") {
     return {
       connectedDevices,
       detail: "Your cloud workspace is connected and ready for live work.",
+      knownDevices,
       stage: "workspace_socket",
       status: "connected",
       title: "Cloud workspace ready",
@@ -3214,6 +3245,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Minting a short-lived Appwrite token for the desktop runtime.",
+      knownDevices,
       stage: "cloud_auth",
       status: "active",
       title: "Preparing cloud auth",
@@ -3225,6 +3257,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "Finding the personal or team backend assigned to this account.",
+      knownDevices,
       stage: "cloud_route",
       status: "active",
       title: "Finding your cloud route",
@@ -3236,6 +3269,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The backend is reachable; waiting for the workspace process to accept the live connection.",
+      knownDevices,
       stage: "cloud_instance",
       status: "active",
       title: "Setting up your instance",
@@ -3247,6 +3281,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The websocket is open; waiting for the cloud workspace ready frame.",
+      knownDevices,
       stage: "workspace_socket",
       status: "active",
       title: "Linking the live workspace",
@@ -3258,6 +3293,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     return {
       connectedDevices,
       detail: "The live workspace connection is being re-established.",
+      knownDevices,
       stage: "workspace_socket",
       status: "active",
       title: "Linking the live workspace",
@@ -3268,6 +3304,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   return {
     connectedDevices,
     detail: "Requesting the assigned cloud workspace and waiting for it to become ready.",
+    knownDevices,
     stage: "cloud_route",
     status: "active",
     title: "Preparing your cloud workspace",
@@ -3286,6 +3323,11 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     : Array.isArray(previous?.connectedDevices)
       ? previous.connectedDevices
       : [];
+  const knownDevices = Array.isArray(progress?.knownDevices)
+    ? progress.knownDevices
+    : Array.isArray(previous?.knownDevices)
+      ? previous.knownDevices
+      : connectedDevices;
   const workspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
     ? progress.workspaceTodos
     : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
@@ -3296,6 +3338,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     return {
       ...previous,
       connectedDevices,
+      knownDevices,
       updatedAt: Date.now(),
       workspaceTodos,
     };
@@ -3309,6 +3352,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
         Number(previous?.attempt ?? 0) || 0,
       ),
       connectedDevices,
+      knownDevices,
       updatedAt: Date.now(),
       workspaceTodos,
     };
@@ -3318,6 +3362,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
     connectedDevices,
     detail: String(progress?.detail || previous.detail || ""),
+    knownDevices,
     stage: nextStage,
     status: nextStatus,
     title: String(progress?.title || previous.title || "Cloud workspace"),
@@ -14474,6 +14519,16 @@ export default function App() {
       }
       return "";
     };
+    const remoteCommandObjectField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key];
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          return value;
+        }
+      }
+      return null;
+    };
     const hydrateRemoteCommandTodoText = async (event, workspaceId, currentText = "") => {
       const existingText = String(currentText || "").trim();
       if (existingText) {
@@ -15116,6 +15171,18 @@ export default function App() {
             "origin_workspace_id",
             "originWorkspaceId",
           ]);
+          const dispatchSource = remoteCommandObjectField(event, [
+            "dispatch_source",
+            "dispatchSource",
+            "source_context",
+            "sourceContext",
+          ]);
+          const dispatchTarget = remoteCommandObjectField(event, [
+            "dispatch_target",
+            "dispatchTarget",
+            "target_context",
+            "targetContext",
+          ]);
           const agentId = normalizeManagedAgentProviderId(
             event.target_agent_id
               || event.targetAgentId
@@ -15242,6 +15309,8 @@ export default function App() {
                 kind: "todo",
                 remoteCommand: {
                   commandId,
+                  ...(dispatchSource ? { dispatchSource } : {}),
+                  ...(dispatchTarget ? { dispatchTarget } : {}),
                   source: event.source || "next-diffforge",
                   todoDispatchId,
                   todoId,
@@ -19834,6 +19903,7 @@ export default function App() {
                             billingStatus={billingStatus}
                             connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}
+                            knownDevices={cloudWorkspaceProgress.knownDevices}
                             workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}

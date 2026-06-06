@@ -710,7 +710,7 @@ pub fn coordination_terminal_task_plan_edit_step_title(
             input["worktree_path"]
                 .as_str()
                 .or_else(|| input["worktreePath"].as_str()),
-            "user_edited_queued_step_title",
+            "user_edited_plan_step_title",
             &compact_plan,
         ) {
             Ok(value) => json!({"ok": true, "response": value}),

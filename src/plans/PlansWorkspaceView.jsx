@@ -226,8 +226,127 @@ function planCanContinue(plan) {
   return normalizedPlanStatus(plan?.status) === "interrupted";
 }
 
+function normalizedStepStatus(status) {
+  const normalized = cleanText(status).toLowerCase();
+  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
+    return "completed";
+  }
+  if ([
+    "active",
+    "current",
+    "in_progress",
+    "in-progress",
+    "running",
+    "working",
+  ].includes(normalized)) {
+    return "in_progress";
+  }
+  if (normalized === "blocked") {
+    return "blocked";
+  }
+  if (normalized === "skipped") {
+    return "skipped";
+  }
+  return "queued";
+}
+
+function planStepUserEditable(step, plan) {
+  if (!step || planIsTerminal(plan)) {
+    return false;
+  }
+  return step.editable === true
+    || ["queued", "blocked"].includes(normalizedStepStatus(step.status));
+}
+
 function planIdentity(plan) {
   return cleanText(plan?.plan_id) || cleanText(plan?.task_id);
+}
+
+function planStepSaveKey(taskId, stepIndex) {
+  const safeTaskId = cleanText(taskId);
+  const safeStepIndex = Number(stepIndex);
+  return safeTaskId && Number.isInteger(safeStepIndex) ? `${safeTaskId}:${safeStepIndex}` : "";
+}
+
+function planStepSaveForStep(pendingSaves, taskId, stepIndex) {
+  const key = planStepSaveKey(taskId, stepIndex);
+  return key ? pendingSaves?.[key] || null : null;
+}
+
+function withPlanStepTitle(plan, taskId, stepIndex, title, fields = {}) {
+  const safeTaskId = cleanText(taskId);
+  const safeStepIndex = Number(stepIndex);
+  const safeTitle = cleanText(title);
+  if (
+    !plan
+    || !safeTaskId
+    || !Number.isInteger(safeStepIndex)
+    || !safeTitle
+    || cleanText(plan.task_id || plan.taskId) !== safeTaskId
+    || !Array.isArray(plan.steps)
+  ) {
+    return plan;
+  }
+
+  let changed = false;
+  const nextSteps = plan.steps.map((step) => {
+    if (Number(step?.index) !== safeStepIndex) {
+      return step;
+    }
+    changed = true;
+    return {
+      ...step,
+      title: safeTitle,
+      ...(fields.source ? { source: fields.source } : {}),
+      ...(fields.pendingSync ? { pending_sync: true, pendingSync: true } : {}),
+      ...(fields.syncError ? { sync_error: fields.syncError, syncError: fields.syncError } : {}),
+    };
+  });
+
+  if (!changed) {
+    return plan;
+  }
+
+  return {
+    ...plan,
+    steps: nextSteps,
+    updated_at: fields.updatedAt || plan.updated_at,
+    updatedAt: fields.updatedAt || plan.updatedAt,
+  };
+}
+
+function withSnapshotPlanStepTitle(snapshot, taskId, stepIndex, title, fields = {}) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return snapshot || null;
+  }
+  const updatePlan = (plan) => withPlanStepTitle(plan, taskId, stepIndex, title, fields);
+  return {
+    ...snapshot,
+    selected_plan: updatePlan(snapshot.selected_plan || snapshot.selectedPlan || null),
+    history: Array.isArray(snapshot.history) ? snapshot.history.map(updatePlan) : [],
+  };
+}
+
+function applyPendingPlanStepSaves(snapshot, pendingSaves = {}) {
+  let nextSnapshot = snapshot;
+  Object.values(pendingSaves || {}).forEach((pendingSave) => {
+    if (!pendingSave?.title) {
+      return;
+    }
+    nextSnapshot = withSnapshotPlanStepTitle(
+      nextSnapshot,
+      pendingSave.taskId,
+      pendingSave.stepIndex,
+      pendingSave.title,
+      {
+        pendingSync: pendingSave.status !== "error",
+        source: "user",
+        syncError: pendingSave.status === "error" ? pendingSave.error || "Sync failed" : "",
+        updatedAt: pendingSave.updatedAt,
+      },
+    );
+  });
+  return nextSnapshot;
 }
 
 function planEventText(payload, keys) {
@@ -310,22 +429,14 @@ function mergePlanEventSnapshot(current, eventSnapshot) {
 }
 
 function stepStatusKind(status) {
-  const normalized = cleanText(status).toLowerCase();
-  if (["complete", "completed", "done", "finished", "success"].includes(normalized)) {
+  const normalized = normalizedStepStatus(status);
+  if (normalized === "completed") {
     return "completed";
   }
-  if ([
-    "active",
-    "current",
-    "in_progress",
-    "in-progress",
-    "pending",
-    "running",
-    "working",
-  ].includes(normalized)) {
+  if (normalized === "in_progress") {
     return "active";
   }
-  if (normalized === "blocked" || normalized === "interrupted") {
+  if (normalized === "blocked") {
     return "blocked";
   }
   if (normalized === "skipped") {
@@ -382,10 +493,12 @@ export default function PlansWorkspaceView({
   const [error, setError] = useState("");
   const [editingStepIndex, setEditingStepIndex] = useState(null);
   const [editingTitle, setEditingTitle] = useState("");
-  const [savingStepIndex, setSavingStepIndex] = useState(null);
+  const [pendingStepSaves, setPendingStepSaves] = useState({});
+  const pendingStepSavesRef = useRef({});
+  const stepSaveSequenceRef = useRef(0);
+  const skipStepEditBlurCommitRef = useRef(false);
   const snapshotRequestKeyRef = useRef("");
   const planEventStateRef = useRef({
-    editingStepIndex: null,
     loadSnapshot: null,
     rootPath: "",
     snapshotAgentId: "",
@@ -464,9 +577,55 @@ export default function PlansWorkspaceView({
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
   const titleMaxChars = Number(snapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
 
+  const setPendingStepSaveRecord = useCallback((key, record) => {
+    if (!key || !record) {
+      return pendingStepSavesRef.current;
+    }
+    const next = {
+      ...pendingStepSavesRef.current,
+      [key]: record,
+    };
+    pendingStepSavesRef.current = next;
+    setPendingStepSaves(next);
+    return next;
+  }, []);
+
+  const clearPendingStepSaveRecord = useCallback((key, sequence) => {
+    const current = pendingStepSavesRef.current;
+    if (!key || !current[key] || current[key].sequence !== sequence) {
+      return current;
+    }
+    const next = { ...current };
+    delete next[key];
+    pendingStepSavesRef.current = next;
+    setPendingStepSaves(next);
+    return next;
+  }, []);
+
+  const markPendingStepSaveError = useCallback((key, sequence, message) => {
+    const current = pendingStepSavesRef.current;
+    if (!key || !current[key] || current[key].sequence !== sequence) {
+      return current;
+    }
+    const next = {
+      ...current,
+      [key]: {
+        ...current[key],
+        error: cleanText(message) || "Sync failed",
+        status: "error",
+      },
+    };
+    pendingStepSavesRef.current = next;
+    setPendingStepSaves(next);
+    return next;
+  }, []);
+
   useEffect(() => {
     snapshotRequestKeyRef.current = activeSnapshotRequestKey;
-    setSnapshot(cachedPlanSnapshot(snapshotCacheKeys));
+    setSnapshot(applyPendingPlanStepSaves(
+      cachedPlanSnapshot(snapshotCacheKeys),
+      pendingStepSavesRef.current,
+    ));
     setError("");
   }, [activeSnapshotRequestKey, snapshotCacheKeys]);
 
@@ -519,7 +678,7 @@ export default function PlansWorkspaceView({
           planSnapshotRequests.set(requestKey, request);
         }
       }
-      const nextSnapshot = await request;
+      const nextSnapshot = applyPendingPlanStepSaves(await request, pendingStepSavesRef.current);
       if (snapshotRequestKeyRef.current !== activeSnapshotRequestKey) {
         return;
       }
@@ -555,7 +714,6 @@ export default function PlansWorkspaceView({
 
   useEffect(() => {
     planEventStateRef.current = {
-      editingStepIndex,
       loadSnapshot,
       rootPath: pathIdentity(activeRepoPath),
       snapshotAgentId,
@@ -565,7 +723,6 @@ export default function PlansWorkspaceView({
     };
   }, [
     activeRepoPath,
-    editingStepIndex,
     loadSnapshot,
     snapshotAgentId,
     snapshotCacheKeys,
@@ -584,7 +741,7 @@ export default function PlansWorkspaceView({
 
     listen(TERMINAL_TASK_PLAN_UPDATED_EVENT, (event) => {
       const state = planEventStateRef.current || {};
-      if (cancelled || state.editingStepIndex !== null) {
+      if (cancelled) {
         return;
       }
 
@@ -615,7 +772,10 @@ export default function PlansWorkspaceView({
       const eventSnapshot = planEventSnapshot(payload);
       if (eventSnapshot) {
         setSnapshot((current) => {
-          const nextSnapshot = mergePlanEventSnapshot(current, eventSnapshot);
+          const nextSnapshot = applyPendingPlanStepSaves(
+            mergePlanEventSnapshot(current, eventSnapshot),
+            pendingStepSavesRef.current,
+          );
           cachePlanSnapshot(state.snapshotCacheKeys, nextSnapshot);
           return nextSnapshot;
         });
@@ -644,6 +804,20 @@ export default function PlansWorkspaceView({
     setEditingTitle("");
   }, [displayedPlanId]);
 
+  useEffect(() => {
+    if (editingStepIndex === null) {
+      return;
+    }
+    const editingStep = Array.isArray(displayedPlan?.steps)
+      ? displayedPlan.steps.find((step) => Number(step?.index) === Number(editingStepIndex))
+      : null;
+    if (!planStepUserEditable(editingStep, displayedPlan)) {
+      skipStepEditBlurCommitRef.current = true;
+      setEditingStepIndex(null);
+      setEditingTitle("");
+    }
+  }, [displayedPlan, editingStepIndex]);
+
   const startEditing = useCallback((step) => {
     setEditingStepIndex(Number(step?.index));
     setEditingTitle(cleanText(step?.title));
@@ -654,64 +828,116 @@ export default function PlansWorkspaceView({
     setEditingTitle("");
   }, []);
 
-  const saveEditing = useCallback(async () => {
+  const saveEditing = useCallback(() => {
     const taskId = cleanText(displayedPlan?.task_id);
     const stepIndex = Number(editingStepIndex);
     const title = cleanText(editingTitle);
-    if (!taskId || !Number.isInteger(stepIndex) || !title || savingStepIndex !== null) {
+    if (!taskId || !Number.isInteger(stepIndex) || !title) {
       return;
     }
-    setSavingStepIndex(stepIndex);
+    const existingStep = Array.isArray(displayedPlan?.steps)
+      ? displayedPlan.steps.find((step) => Number(step?.index) === stepIndex)
+      : null;
+    if (!planStepUserEditable(existingStep, displayedPlan)) {
+      cancelEditing();
+      return;
+    }
+    const previousTitle = cleanText(existingStep?.title);
+    if (previousTitle === title) {
+      cancelEditing();
+      return;
+    }
+
+    const saveKey = planStepSaveKey(taskId, stepIndex);
+    const sequence = stepSaveSequenceRef.current + 1;
+    stepSaveSequenceRef.current = sequence;
+    const pendingRecord = {
+      taskId,
+      stepIndex,
+      title,
+      sequence,
+      status: "syncing",
+      updatedAt: new Date().toISOString(),
+    };
+    setPendingStepSaveRecord(saveKey, pendingRecord);
     setError("");
-    try {
-      const response = await invoke("coordination_terminal_task_plan_edit_step_title", {
-        repoPath: activeRepoPath,
-        ...(activeDbPath ? { dbPath: activeDbPath } : {}),
-        input: {
-	          agentId: snapshotAgentId || displayedPlan?.agent_id || "",
-	          sessionId: snapshotSessionId || displayedPlan?.session_id || "",
-          taskId,
-          stepIndex,
-          title,
-          workspaceId,
-        },
+
+    setSnapshot((current) => {
+      const nextSnapshot = withSnapshotPlanStepTitle(current, taskId, stepIndex, title, {
+        pendingSync: true,
+        source: "user",
+        updatedAt: pendingRecord.updatedAt,
       });
+      cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
+      return nextSnapshot;
+    });
+    cancelEditing();
+
+    void invoke("coordination_terminal_task_plan_edit_step_title", {
+      repoPath: activeRepoPath,
+      ...(activeDbPath ? { dbPath: activeDbPath } : {}),
+      input: {
+        agentId: snapshotAgentId || displayedPlan?.agent_id || "",
+        sessionId: snapshotSessionId || displayedPlan?.session_id || "",
+        taskId,
+        stepIndex,
+        title,
+        workspaceId,
+      },
+    }).then((response) => {
+      if (response?.ok === false) {
+        throw new Error(
+          cleanText(response?.error?.message)
+          || cleanText(response?.error)
+          || "Unable to save plan step.",
+        );
+      }
       const data = dataOf(response);
+      const remainingSaves = clearPendingStepSaveRecord(saveKey, sequence);
       if (data?.plan) {
         setSnapshot((current) => {
-          const nextSnapshot = {
+          const nextSnapshot = applyPendingPlanStepSaves({
             ...(current || {}),
             selected_plan: data.plan,
             history: current?.history || [],
             title_max_chars: current?.title_max_chars || titleMaxChars,
-          };
+          }, remainingSaves);
           cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
           return nextSnapshot;
         });
       }
-      setEditingStepIndex(null);
-      setEditingTitle("");
-    } catch (nextError) {
+    }).catch((nextError) => {
+      const message = cleanText(nextError?.message || nextError) || "Unable to save plan step.";
+      markPendingStepSaveError(saveKey, sequence, message);
       setError(cleanText(nextError?.message || nextError) || "Unable to save plan step.");
-    } finally {
-      setSavingStepIndex(null);
-    }
+    });
   }, [
-	    editingStepIndex,
-	    editingTitle,
     activeDbPath,
     activeRepoPath,
-	    displayedPlan?.agent_id,
-	    displayedPlan?.session_id,
-	    displayedPlan?.task_id,
-	    loadSnapshot,
-	    savingStepIndex,
+    cancelEditing,
+    clearPendingStepSaveRecord,
+    displayedPlan,
+    editingStepIndex,
+    editingTitle,
+    markPendingStepSaveError,
+    setPendingStepSaveRecord,
     snapshotAgentId,
     snapshotCacheKeys,
     snapshotSessionId,
     titleMaxChars,
     workspaceId,
   ]);
+
+  const handleStepEditBlur = useCallback((event) => {
+    if (event.currentTarget?.contains?.(event.relatedTarget)) {
+      return;
+    }
+    if (skipStepEditBlurCommitRef.current) {
+      skipStepEditBlurCommitRef.current = false;
+      return;
+    }
+    saveEditing();
+  }, [saveEditing]);
 
   const headerMeta = useMemo(() => {
 	    if (!target.paneId && !target.sessionId && !target.taskId && !activeRepoTarget) {
@@ -782,8 +1008,10 @@ export default function PlansWorkspaceView({
             {(displayedPlan.steps || []).map((step) => {
               const index = Number(step.index);
               const editing = editingStepIndex === index;
-              const editable = step.editable === true || cleanText(step.status).toLowerCase() === "queued";
-              const saving = savingStepIndex === index;
+              const pendingSave = planStepSaveForStep(pendingStepSaves, displayedPlan.task_id, index);
+              const syncing = pendingSave?.status === "syncing";
+              const syncFailed = pendingSave?.status === "error";
+              const editable = planStepUserEditable(step, displayedPlan) && !syncing;
               const statusKind = stepStatusKind(step.status);
               return (
                 <StepRow data-status={cleanText(step.status).toLowerCase()} key={step.id || index}>
@@ -792,7 +1020,7 @@ export default function PlansWorkspaceView({
                   </StepMarker>
                   <StepContent>
                     {editing ? (
-                      <StepEditRow>
+                      <StepEditRow onBlur={handleStepEditBlur}>
                         <StepInput
                           aria-label={`Step ${index + 1} title`}
                           autoFocus
@@ -804,6 +1032,7 @@ export default function PlansWorkspaceView({
                               saveEditing();
                             }
                             if (event.key === "Escape") {
+                              skipStepEditBlurCommitRef.current = true;
                               cancelEditing();
                             }
                           }}
@@ -811,8 +1040,11 @@ export default function PlansWorkspaceView({
                         />
                         <IconButton
                           aria-label="Save step title"
-                          disabled={saving || !cleanText(editingTitle)}
-                          onClick={saveEditing}
+                          disabled={!cleanText(editingTitle)}
+                          onClick={() => {
+                            skipStepEditBlurCommitRef.current = true;
+                            saveEditing();
+                          }}
                           title="Save"
                           type="button"
                         >
@@ -820,8 +1052,10 @@ export default function PlansWorkspaceView({
                         </IconButton>
                         <IconButton
                           aria-label="Cancel step edit"
-                          disabled={saving}
-                          onClick={cancelEditing}
+                          onClick={() => {
+                            skipStepEditBlurCommitRef.current = true;
+                            cancelEditing();
+                          }}
                           title="Cancel"
                           type="button"
                         >
@@ -833,7 +1067,6 @@ export default function PlansWorkspaceView({
                         <StepTitle>{step.title}</StepTitle>
                         {editable && (
                           <StepTextButton
-                            disabled={savingStepIndex !== null}
                             onClick={() => startEditing(step)}
                             type="button"
                           >
@@ -844,6 +1077,8 @@ export default function PlansWorkspaceView({
                     )}
                     <StepMeta>
                       <span>{stepStatusLabel(step.status)}</span>
+                      {syncing && <span>Syncing</span>}
+                      {syncFailed && <span>Sync failed</span>}
                       {step.detail && <span>{step.detail}</span>}
                     </StepMeta>
                   </StepContent>

@@ -1,5 +1,6 @@
 import {
   terminalActivityStatusIsBusy,
+  terminalActivityStatusIsPaused,
   terminalActivityStatusIsSendable,
 } from "./terminalActivityState.js";
 
@@ -273,6 +274,7 @@ export function evaluateTodoQueueInFlightPrompt({
       || liveTerminal?.activity_status
       || "",
   );
+  const terminalPaused = Boolean(terminalActivityStatusIsPaused(normalizedActivityStatus));
   const terminalReadyForNextPrompt = Boolean(
     liveTerminal
       && terminalActivityStatusIsSendable(normalizedActivityStatus)
@@ -356,6 +358,14 @@ export function evaluateTodoQueueInFlightPrompt({
   );
   const releaseReason = terminalConfirmedFinished
     ? "provider_turn_closed"
+    : terminalPaused
+      ? (
+        normalizedActivityStatus === "resume_ready"
+          ? "parked_task_resume_ready"
+          : normalizedActivityStatus === "resume_requested"
+            ? "resume_in_progress"
+            : "parked_task_waiting"
+      )
     : terminalClosed
       ? "terminal_closed"
       : terminalUnavailable

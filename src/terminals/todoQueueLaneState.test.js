@@ -142,6 +142,22 @@ test("queued prompt is released when its terminal disappears before acceptance",
   assert.equal(evaluation.releaseReason, "terminal_unavailable");
 });
 
+test("queued prompt pauses when its terminal is parked", () => {
+  const evaluation = baseEvaluation({
+    effectiveActivityStatus: "resume_ready",
+    terminalGroundTruth: {
+      agentInputReady: false,
+      completedTurnLooksSendable: false,
+      effectiveActivityStatus: "resume_ready",
+      effectiveLatestTurnState: "running",
+      hasPendingPrompt: false,
+      runningTurnLooksIdle: false,
+    },
+  });
+
+  assert.equal(evaluation.releaseReason, "parked_task_resume_ready");
+});
+
 test("queued prompt completes after its provider turn closes", () => {
   const evaluation = baseEvaluation({
     targetThread: {

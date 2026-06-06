@@ -2555,7 +2555,12 @@ async fn cloud_mcp_send_remote_command_status_event(
     let now = cloud_mcp_now_ms();
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
-    let status_kind = if matches!(status, "blocked" | "completed" | "failed" | "rejected") {
+    let status_kind = if matches!(
+        status,
+        "blocked" | "completed" | "failed" | "rejected" | "cancelled" | "canceled"
+            | "paused" | "parked" | "resume_ready" | "resume_requested" | "interrupted"
+            | "timed_out" | "timeout"
+    ) {
         "remote_command_result"
     } else {
         "remote_command_ack"
@@ -2662,6 +2667,26 @@ async fn cloud_mcp_send_remote_command_status_event(
         "rust_received_ms": now,
         "ts_ms": now,
     });
+    if let Some(dispatch_source) = cloud_mcp_payload_object(event, &["dispatch_source", "dispatchSource"])
+        .or_else(|| {
+            event.get("payload").and_then(|payload| {
+                cloud_mcp_payload_object(payload, &["dispatch_source", "dispatchSource"])
+            })
+        })
+    {
+        payload["dispatch_source"] = dispatch_source.clone();
+        payload["dispatchSource"] = dispatch_source;
+    }
+    if let Some(dispatch_target) = cloud_mcp_payload_object(event, &["dispatch_target", "dispatchTarget"])
+        .or_else(|| {
+            event.get("payload").and_then(|payload| {
+                cloud_mcp_payload_object(payload, &["dispatch_target", "dispatchTarget"])
+            })
+        })
+    {
+        payload["dispatch_target"] = dispatch_target.clone();
+        payload["dispatchTarget"] = dispatch_target;
+    }
     if let Some(details) = details {
         if !details.is_null() {
             payload["details"] = details.clone();
@@ -4995,6 +5020,20 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_payload_object(payload: &Value, path: &[&str]) -> Option<Value> {
+    for key in path {
+        if let Some(value) = payload.get(*key).filter(|value| value.is_object()) {
+            return Some(value.clone());
+        }
+    }
+
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.is_object().then(|| current.clone())
 }
 
 fn cloud_mcp_payload_u64(payload: &Value, path: &[&str]) -> Option<u64> {
@@ -7499,6 +7538,82 @@ async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
         "details": details,
         "ts_ms": cloud_mcp_now_ms(),
     });
+    if let Some(dispatch_source) = cloud_mcp_payload_object(
+        &details,
+        &[
+            "dispatchSource",
+            "dispatch_source",
+            "sourceContext",
+            "source_context",
+            "sourceEndpoint",
+            "source_endpoint",
+        ],
+    ) {
+        payload["dispatch_source"] = dispatch_source.clone();
+        payload["dispatchSource"] = dispatch_source;
+    }
+    if let Some(dispatch_target) = cloud_mcp_payload_object(
+        &details,
+        &[
+            "dispatchTarget",
+            "dispatch_target",
+            "targetContext",
+            "target_context",
+            "targetEndpoint",
+            "target_endpoint",
+        ],
+    ) {
+        payload["dispatch_target"] = dispatch_target.clone();
+        payload["dispatchTarget"] = dispatch_target;
+    }
+    for (target_key, source_keys) in [
+        (
+            "target_agent_id",
+            &["target_agent_id", "targetAgentId", "agent_id", "agentId"][..],
+        ),
+        (
+            "target_terminal_id",
+            &[
+                "target_terminal_id",
+                "targetTerminalId",
+                "terminal_id",
+                "terminalId",
+                "pane_id",
+                "paneId",
+            ][..],
+        ),
+        (
+            "target_terminal_index",
+            &[
+                "target_terminal_index",
+                "targetTerminalIndex",
+                "terminal_index",
+                "terminalIndex",
+            ][..],
+        ),
+        (
+            "target_thread_id",
+            &["target_thread_id", "targetThreadId", "thread_id", "threadId"][..],
+        ),
+        (
+            "target_color_slot",
+            &["target_color_slot", "targetColorSlot", "color_slot", "colorSlot"][..],
+        ),
+        (
+            "target_terminal_color",
+            &[
+                "target_terminal_color",
+                "targetTerminalColor",
+                "terminal_color",
+                "terminalColor",
+                "color",
+            ][..],
+        ),
+    ] {
+        if let Some(value) = cloud_mcp_payload_text(&details, source_keys) {
+            payload[target_key] = json!(value);
+        }
+    }
     cloud_mcp_limit_workspace_todo_sync_payload(&mut payload);
     if let Err(error) =
         cloud_mcp_post_event_endpoint(state, "workspace_todo_dispatch_status", &payload).await
@@ -10054,6 +10169,57 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
         workspace_name.clone(),
     );
     let device_profile = cloud_mcp_desktop_device_profile();
+    let workspace_name_value = workspace_name.clone().unwrap_or_default();
+    let dispatch_source = cloud_mcp_payload_object(
+        &todo,
+        &[
+            "dispatchSource",
+            "dispatch_source",
+            "sourceContext",
+            "source_context",
+            "sourceEndpoint",
+            "source_endpoint",
+        ],
+    )
+    .unwrap_or_else(|| {
+        json!({
+            "accountId": "",
+            "channel": "native_desktop",
+            "clientKind": "rust_desktop",
+            "clientType": "rust_desktop",
+            "deviceId": device_profile["device_id"].clone(),
+            "deviceName": device_profile["device_name"].clone(),
+            "formFactor": device_profile["form_factor"].clone(),
+            "origin": "todo_dispatch",
+            "platform": device_profile["platform"].clone(),
+            "surface": "rust-diffforge",
+            "workspaceId": workspace_id.clone(),
+            "workspaceName": workspace_name_value.clone(),
+        })
+    });
+    let dispatch_target = cloud_mcp_payload_object(
+        &target,
+        &[
+            "dispatchTarget",
+            "dispatch_target",
+            "targetContext",
+            "target_context",
+            "targetEndpoint",
+            "target_endpoint",
+        ],
+    )
+    .unwrap_or_else(|| {
+        json!({
+            "accountId": cloud_mcp_payload_text(&target, &["target_account_id", "targetAccountId", "account_id", "accountId"]).unwrap_or_default(),
+            "clientId": cloud_mcp_payload_text(&target, &["target_client_id", "targetClientId", "client_id", "clientId"]).unwrap_or_default(),
+            "clientKind": cloud_mcp_payload_text(&target, &["target_client_kind", "targetClientKind", "target_client_type", "targetClientType", "client_kind", "clientKind", "client_type", "clientType"]).unwrap_or_else(|| "rust_desktop".to_string()),
+            "deviceId": cloud_mcp_payload_text(&target, &["target_device_id", "targetDeviceId", "device_id", "deviceId"]).unwrap_or_default(),
+            "deviceName": cloud_mcp_payload_text(&target, &["target_device_name", "targetDeviceName", "device_name", "deviceName"]).unwrap_or_default(),
+            "surface": "native_rust_app",
+            "workspaceId": cloud_mcp_payload_text(&target, &["target_workspace_id", "targetWorkspaceId", "workspace_id", "workspaceId"]).unwrap_or_default(),
+            "workspaceName": cloud_mcp_payload_text(&target, &["target_workspace_name", "targetWorkspaceName", "workspace_name", "workspaceName"]).unwrap_or_default(),
+        })
+    });
     let mut payload = json!({
         "event_kind": "workspace_todo_dispatch_requested",
         "source": "rust-diffforge-todo-dispatch",
@@ -10061,10 +10227,16 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
         "repo_id": req.repo_id,
         "workspace_id": workspace_id,
         "workspaceId": workspace_id,
-        "workspace_name": workspace_name.clone().unwrap_or_default(),
-        "workspaceName": workspace_name.unwrap_or_default(),
+        "workspace_name": workspace_name_value.clone(),
+        "workspaceName": workspace_name_value,
         "requested_by_device_id": device_profile["device_id"].clone(),
         "requestedByDeviceId": device_profile["device_id"].clone(),
+        "dispatch_source": dispatch_source.clone(),
+        "dispatchSource": dispatch_source,
+        "dispatch_source_kind": "rust_desktop",
+        "dispatchSourceKind": "rust_desktop",
+        "dispatch_target": dispatch_target.clone(),
+        "dispatchTarget": dispatch_target,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
         "deviceId": device_profile["device_id"].clone(),
@@ -10136,6 +10308,93 @@ async fn cloud_mcp_record_todo_dispatch_status(
     });
     if let Some(details) = details {
         if !details.is_null() {
+            if let Some(dispatch_source) = cloud_mcp_payload_object(
+                &details,
+                &[
+                    "dispatchSource",
+                    "dispatch_source",
+                    "sourceContext",
+                    "source_context",
+                    "sourceEndpoint",
+                    "source_endpoint",
+                ],
+            ) {
+                payload["dispatch_source"] = dispatch_source.clone();
+                payload["dispatchSource"] = dispatch_source;
+            }
+            if let Some(dispatch_target) = cloud_mcp_payload_object(
+                &details,
+                &[
+                    "dispatchTarget",
+                    "dispatch_target",
+                    "targetContext",
+                    "target_context",
+                    "targetEndpoint",
+                    "target_endpoint",
+                ],
+            ) {
+                payload["dispatch_target"] = dispatch_target.clone();
+                payload["dispatchTarget"] = dispatch_target;
+            }
+            for (target_key, source_keys) in [
+                (
+                    "target_agent_id",
+                    &["target_agent_id", "targetAgentId", "agent_id", "agentId"][..],
+                ),
+                (
+                    "target_terminal_id",
+                    &[
+                        "target_terminal_id",
+                        "targetTerminalId",
+                        "terminal_id",
+                        "terminalId",
+                        "pane_id",
+                        "paneId",
+                    ][..],
+                ),
+                (
+                    "target_terminal_index",
+                    &[
+                        "target_terminal_index",
+                        "targetTerminalIndex",
+                        "terminal_index",
+                        "terminalIndex",
+                    ][..],
+                ),
+                (
+                    "target_thread_id",
+                    &[
+                        "target_thread_id",
+                        "targetThreadId",
+                        "thread_id",
+                        "threadId",
+                    ][..],
+                ),
+                (
+                    "target_color_slot",
+                    &["target_color_slot", "targetColorSlot", "color_slot", "colorSlot"][..],
+                ),
+                (
+                    "target_terminal_color",
+                    &[
+                        "target_terminal_color",
+                        "targetTerminalColor",
+                        "terminal_color",
+                        "terminalColor",
+                        "color",
+                    ][..],
+                ),
+                (
+                    "status_reason",
+                    &["status_reason", "statusReason", "reason", "message", "error"][..],
+                ),
+            ] {
+                if cloud_mcp_payload_text(&payload, &[target_key]).is_none() {
+                    if let Some(value) = cloud_mcp_payload_text(&details, source_keys) {
+                        payload[target_key] = json!(value);
+                    }
+                }
+            }
             payload["details"] = details;
         }
     }

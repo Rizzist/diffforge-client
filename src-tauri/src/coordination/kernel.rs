@@ -165,6 +165,13 @@ fn normalize_terminal_task_plan_step_status(status: &str) -> String {
     }
 }
 
+fn terminal_task_plan_step_user_editable(status: &str) -> bool {
+    matches!(
+        normalize_terminal_task_plan_step_status(status).as_str(),
+        "queued" | "blocked"
+    )
+}
+
 fn terminal_task_plan_is_terminal_status(status: &str) -> bool {
     matches!(
         normalize_terminal_task_plan_status(status).as_str(),
@@ -212,6 +219,100 @@ fn terminal_task_plan_step_detail_from_value(value: &Value) -> Option<String> {
         })
         .map(|value| compact_terminal_task_plan_text(value, 2000))
         .filter(|value| !value.is_empty())
+}
+
+#[derive(Clone, Debug)]
+struct TerminalTaskPlanStepUpdate {
+    step_index: i64,
+    title: Option<String>,
+    detail: Option<String>,
+    status: Option<String>,
+}
+
+fn terminal_task_plan_step_update_values(input: &Value) -> Vec<&Value> {
+    [
+        "step_updates",
+        "stepUpdates",
+        "plan_step_updates",
+        "planStepUpdates",
+        "plan_steps",
+        "planSteps",
+        "steps",
+    ]
+    .iter()
+    .find_map(|key| input.get(*key).and_then(Value::as_array))
+    .map(|values| values.iter().collect())
+    .unwrap_or_default()
+}
+
+fn terminal_task_plan_step_index_from_value(value: &Value, fallback: i64) -> i64 {
+    optional_i64_field(
+        value,
+        &[
+            "step_index",
+            "stepIndex",
+            "plan_step_index",
+            "planStepIndex",
+            "index",
+        ],
+    )
+    .or_else(|| {
+        optional_i64_field(value, &["ordinal", "stepOrdinal"])
+            .map(|ordinal| ordinal.saturating_sub(1))
+    })
+    .unwrap_or(fallback)
+}
+
+fn terminal_task_plan_step_updates_from_input(
+    input: &Value,
+    max_index: i64,
+) -> Vec<TerminalTaskPlanStepUpdate> {
+    terminal_task_plan_step_update_values(input)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, value)| {
+            let step_index = terminal_task_plan_step_index_from_value(value, position as i64)
+                .max(0)
+                .min(max_index);
+            let title = terminal_task_plan_step_title_from_value(value);
+            let detail = terminal_task_plan_step_detail_from_value(value);
+            let status = string_from_value_keys(
+                value,
+                &[
+                    "status",
+                    "step_status",
+                    "stepStatus",
+                    "plan_step_status",
+                    "planStepStatus",
+                ],
+            )
+            .map(|value| normalize_terminal_task_plan_step_status(&value));
+            (title.is_some() || detail.is_some() || status.is_some()).then_some(
+                TerminalTaskPlanStepUpdate {
+                    step_index,
+                    title,
+                    detail,
+                    status,
+                },
+            )
+        })
+        .collect()
+}
+
+fn terminal_task_plan_step_updates_payload(updates: &[TerminalTaskPlanStepUpdate]) -> Value {
+    Value::Array(
+        updates
+            .iter()
+            .map(|update| {
+                json!({
+                    "step_index": update.step_index,
+                    "title": update.title,
+                    "detail": update.detail,
+                    "status": update.status,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn string_from_value_keys(value: &Value, keys: &[&str]) -> Option<String> {
@@ -4856,6 +4957,23 @@ impl CoordinationKernel {
         )
         .map(|value| compact_terminal_task_plan_text(&value, 2000))
         .filter(|value| !value.is_empty());
+        let next_title = string_from_value_keys(
+            input,
+            &[
+                "next_step_title",
+                "nextStepTitle",
+                "current_step_title",
+                "currentStepTitle",
+                "plan_step_title",
+                "planStepTitle",
+                "step_title",
+                "stepTitle",
+            ],
+        )
+        .map(|value| {
+            compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS)
+        })
+        .filter(|value| !value.is_empty());
         let step_status = string_from_value_keys(
             input,
             &[
@@ -4876,12 +4994,15 @@ impl CoordinationKernel {
             ],
         )
         .map(|value| normalize_terminal_task_plan_status(&value));
+        let has_step_updates = !terminal_task_plan_step_update_values(input).is_empty();
 
         if requested_current.is_none()
             && completed_index.is_none()
             && next_detail.is_none()
+            && next_title.is_none()
             && step_status.is_none()
             && plan_status.is_none()
+            && !has_step_updates
         {
             return Ok(None);
         }
@@ -4898,6 +5019,8 @@ impl CoordinationKernel {
             .unwrap_or(current_before)
             .max(0)
             .min(max_index);
+        let step_updates = terminal_task_plan_step_updates_from_input(input, max_index);
+        let step_updates_payload = terminal_task_plan_step_updates_payload(&step_updates);
         let now = now_rfc3339();
         let actor_id = agent_id
             .filter(|value| !value.trim().is_empty())
@@ -4938,13 +5061,16 @@ impl CoordinationKernel {
                 .execute(
                     "UPDATE terminal_task_plan_steps
                      SET status=?1,
-                         detail=COALESCE(?2, detail),
-                         started_at=COALESCE(started_at, ?3),
-                         updated_at=?3,
+                         title=COALESCE(?2, title),
+                         detail=COALESCE(?3, detail),
+                         source='agent',
+                         started_at=COALESCE(started_at, ?4),
+                         updated_at=?4,
                          revision=revision + 1
-                     WHERE task_id=?4 AND step_index=?5",
+                     WHERE task_id=?5 AND step_index=?6",
                     params![
                         in_progress_status,
+                        next_title.as_deref(),
                         next_detail.as_deref(),
                         &now,
                         &task_id,
@@ -4964,6 +5090,39 @@ impl CoordinationKernel {
                 .map_err(|error| {
                     format!("Unable to update terminal task plan queued steps: {error}")
                 })?;
+            for update in &step_updates {
+                self.conn
+                    .execute(
+                        "UPDATE terminal_task_plan_steps
+                         SET title=COALESCE(?1, title),
+                             detail=COALESCE(?2, detail),
+                             status=COALESCE(?3, status),
+                             source='agent',
+                             started_at=CASE
+                                WHEN ?3 IN ('in_progress', 'completed') THEN COALESCE(started_at, ?4)
+                                ELSE started_at
+                             END,
+                             completed_at=CASE
+                                WHEN ?3='completed' THEN COALESCE(completed_at, ?4)
+                                WHEN ?3='queued' THEN NULL
+                                ELSE completed_at
+                             END,
+                             updated_at=?4,
+                             revision=revision + 1
+                         WHERE task_id=?5 AND step_index=?6",
+                        params![
+                            update.title.as_deref(),
+                            update.detail.as_deref(),
+                            update.status.as_deref(),
+                            &now,
+                            &task_id,
+                            update.step_index,
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to apply terminal task plan checkpoint step update: {error}")
+                    })?;
+            }
 
             let resolved_plan_status = plan_status.unwrap_or_else(|| {
                 if next_index == max_index && in_progress_status == "completed" {
@@ -5013,6 +5172,8 @@ impl CoordinationKernel {
                 json!({
                     "current_step_index": next_index,
                     "completed_step_index": completed_index,
+                    "step_title": next_title,
+                    "step_updates": step_updates_payload,
                     "plan_status": resolved_plan_status,
                     "source": "coordination-kernel.checkpoint",
                 }),
@@ -5048,10 +5209,10 @@ impl CoordinationKernel {
             "Plan step does not exist.",
         )?;
         let status = step["status"].as_str().unwrap_or_default();
-        if normalize_terminal_task_plan_step_status(status) != "queued" {
+        if !terminal_task_plan_step_user_editable(status) {
             return Ok(api_error(
                 "terminal_plan_step_not_editable",
-                "Only queued terminal plan step titles can be edited.",
+                "Only queued, pending, or blocked terminal plan step titles can be edited.",
                 json!({"task_id": task_id, "step_index": step_index, "status": status}),
             ));
         }
@@ -5405,7 +5566,7 @@ impl CoordinationKernel {
                 "completed_at": step["completed_at"].clone(),
                 "created_at": step["created_at"].clone(),
                 "updated_at": step["updated_at"].clone(),
-                "editable": normalize_terminal_task_plan_step_status(step["status"].as_str().unwrap_or_default()) == "queued",
+                "editable": terminal_task_plan_step_user_editable(step["status"].as_str().unwrap_or_default()),
             })
         })
         .collect::<Vec<_>>();
@@ -25575,6 +25736,139 @@ mod tests {
         assert_eq!(
             policy["integrator_reasoning_effort"].as_str(),
             Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn terminal_task_plan_user_edits_only_unlocked_steps() {
+        let repo = init_git_repo("terminal_plan_user_edit_locks");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Plan task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+
+        kernel
+            .create_terminal_task_plan(
+                task_id,
+                Some(agent_id),
+                None,
+                Some("Plan task"),
+                &json!(["Inspect", "Patch", "Verify"]),
+                Some(0),
+                None,
+            )
+            .unwrap();
+
+        let active_edit = kernel
+            .edit_terminal_task_plan_step_title(task_id, 0, "User active edit", Some("user"))
+            .unwrap();
+        assert_eq!(active_edit["ok"].as_bool(), Some(false));
+        assert_eq!(
+            active_edit["error"]["code"].as_str(),
+            Some("terminal_plan_step_not_editable")
+        );
+
+        let queued_edit = kernel
+            .edit_terminal_task_plan_step_title(task_id, 1, "User queued edit", Some("user"))
+            .unwrap();
+        assert_eq!(queued_edit["ok"].as_bool(), Some(true));
+        assert_eq!(
+            queued_edit["data"]["plan"]["steps"][1]["title"].as_str(),
+            Some("User queued edit")
+        );
+
+        kernel
+            .checkpoint_terminal_task_plan(
+                task_id,
+                Some(agent_id),
+                None,
+                &json!({
+                    "current_step_index": 1,
+                    "plan_step_status": "blocked"
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let blocked_edit = kernel
+            .edit_terminal_task_plan_step_title(task_id, 1, "User blocked edit", Some("user"))
+            .unwrap();
+        assert_eq!(blocked_edit["ok"].as_bool(), Some(true));
+        assert_eq!(
+            blocked_edit["data"]["plan"]["steps"][1]["title"].as_str(),
+            Some("User blocked edit")
+        );
+
+        let completed_edit = kernel
+            .edit_terminal_task_plan_step_title(task_id, 0, "User completed edit", Some("user"))
+            .unwrap();
+        assert_eq!(completed_edit["ok"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn terminal_task_plan_checkpoint_can_revise_step_titles() {
+        let repo = init_git_repo("terminal_plan_checkpoint_edits");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let task = kernel
+            .create_task("Plan task", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+
+        kernel
+            .create_terminal_task_plan(
+                task_id,
+                Some(agent_id),
+                None,
+                Some("Plan task"),
+                &json!(["Inspect", "Patch", "Verify"]),
+                Some(0),
+                None,
+            )
+            .unwrap();
+
+        let checkpoint = kernel
+            .checkpoint_terminal_task_plan(
+                task_id,
+                Some(agent_id),
+                None,
+                &json!({
+                    "current_step_index": 1,
+                    "current_step_title": "Patch the editor",
+                    "step_updates": [
+                        {
+                            "step_index": 2,
+                            "title": "Verify plan sync",
+                            "detail": "Run frontend and kernel checks"
+                        }
+                    ]
+                }),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            checkpoint["plan"]["steps"][1]["title"].as_str(),
+            Some("Patch the editor")
+        );
+        assert_eq!(
+            checkpoint["plan"]["steps"][1]["source"].as_str(),
+            Some("agent")
+        );
+        assert_eq!(
+            checkpoint["plan"]["steps"][2]["title"].as_str(),
+            Some("Verify plan sync")
+        );
+        assert_eq!(
+            checkpoint["plan"]["steps"][2]["detail"].as_str(),
+            Some("Run frontend and kernel checks")
+        );
+        assert_eq!(
+            checkpoint["compact_plan"]["steps"][2]["title"].as_str(),
+            Some("Verify plan sync")
         );
     }
 

@@ -4289,12 +4289,12 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
-        "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; queued step titles are user-editable in the Plans tab.".to_string(),
+        "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; future or blocked step titles are user-editable in the Plans tab.".to_string(),
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
-        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance the terminal plan with current/next/completed step fields. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
@@ -4385,7 +4385,10 @@ fn tool_input_schema(name: &str) -> Value {
                 "completed_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark completed."},
                 "next_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark current/in progress."},
                 "current_step_index": {"type": "integer", "description": "Optional zero-based plan step index to mark current/in progress."},
+                "current_step_title": {"type": "string", "description": "Optional title revision for the current/next step touched by this checkpoint."},
+                "next_step_title": {"type": "string", "description": "Optional title revision for the current/next step touched by this checkpoint."},
                 "next_step_detail": {"type": "string", "description": "Optional detail to attach to the next/current step when it begins."},
+                "step_updates": {"type": "array", "description": "Optional step title/detail/status revisions. Each item may include step_index, title, detail, and status."},
                 "plan_status": {"type": "string", "description": "Optional terminal plan status: active, completed, interrupted, or blocked."}
             },
             "required": ["task_id", "summary"],
