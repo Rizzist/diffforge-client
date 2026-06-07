@@ -1,7 +1,7 @@
 import styled, { createGlobalStyle, keyframes } from "styled-components";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { Add } from "@styled-icons/material-rounded/Add";
-import { Bolt } from "@styled-icons/material-rounded/Bolt";
+import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { CheckCircle } from "@styled-icons/material-rounded/CheckCircle";
 import { Close } from "@styled-icons/material-rounded/Close";
@@ -11806,7 +11806,7 @@ export const ButtonSettingsIcon = styled(Settings)`
   ${buttonIconSize}
 `;
 
-export const ButtonForgeIcon = styled(Bolt)`
+export const ButtonForgeIcon = styled(AccountTree)`
   ${buttonIconSize}
 `;
 

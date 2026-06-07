@@ -86,6 +86,7 @@ struct CloudMcpState {
     runtime_snapshots: Arc<Mutex<CloudMcpRuntimeSnapshots>>,
     terminal_lifecycle_seq: Arc<AtomicU64>,
     global_ws_started: Arc<AtomicBool>,
+    global_ws_registration_blocked: Arc<AtomicBool>,
     global_ws_epoch: Arc<AtomicU64>,
     global_ws_reconnect: Arc<tokio::sync::Notify>,
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
@@ -324,6 +325,7 @@ impl CloudMcpState {
             runtime_snapshots: Arc::new(Mutex::new(CloudMcpRuntimeSnapshots::default())),
             terminal_lifecycle_seq: Arc::new(AtomicU64::new(0)),
             global_ws_started: Arc::new(AtomicBool::new(false)),
+            global_ws_registration_blocked: Arc::new(AtomicBool::new(false)),
             global_ws_epoch: Arc::new(AtomicU64::new(0)),
             global_ws_reconnect: Arc::new(tokio::sync::Notify::new()),
             global_ws_tx: Arc::new(Mutex::new(None)),
@@ -1730,6 +1732,9 @@ async fn require_cloud_mcp_connected_state(
 }
 
 async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
+    if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+        return;
+    }
     if state.global_ws_started.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1759,12 +1764,20 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
         json!({}),
     );
     loop {
+        if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+            state.global_ws_started.store(false, Ordering::SeqCst);
+            return;
+        }
         let base_url = {
             let runtime = state.inner.lock().await;
             runtime.base_url.clone()
         };
         cloud_mcp_set_global_ws_phase(&state, "resolving_route", "resolving_route").await;
         let target = cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await;
+        if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+            state.global_ws_started.store(false, Ordering::SeqCst);
+            return;
+        }
         {
             let mut runtime = state.inner.lock().await;
             runtime.global_ws_connected = false;
@@ -1779,6 +1792,10 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
         match cloud_mcp_open_global_ws(&state, &base_url, &target).await {
             Ok(()) => {}
             Err(error) => {
+                if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+                    state.global_ws_started.store(false, Ordering::SeqCst);
+                    return;
+                }
                 {
                     let mut runtime = state.inner.lock().await;
                     runtime.connected = false;
@@ -2192,6 +2209,23 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         return;
     }
 
+    if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+        let message = {
+            let runtime = state.inner.lock().await;
+            let primary = runtime.global_ws_last_error.trim();
+            let fallback = runtime.last_error.trim();
+            if !primary.is_empty() {
+                primary.to_string()
+            } else if !fallback.is_empty() {
+                fallback.to_string()
+            } else {
+                "Device limit reached.".to_string()
+            }
+        };
+        cloud_mcp_fail_pending_ws_requests(state, &message).await;
+        return;
+    }
+
     let message = error
         .map(|value| clean_terminal_telemetry_text(value))
         .unwrap_or_else(|| "Cloud MCP app websocket disconnected.".to_string());
@@ -2221,6 +2255,9 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
 }
 
 async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &str) {
+    if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+        return;
+    }
     let message = clean_terminal_telemetry_text(error);
     state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
     {
@@ -2240,10 +2277,86 @@ async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &st
     state.global_ws_reconnect.notify_waiters();
 }
 
+fn cloud_mcp_registration_blocked_error(message: &Value) -> Option<(String, Value)> {
+    if message.get("kind").and_then(Value::as_str) != Some("error")
+        && message.get("ok").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let error = message.get("error").unwrap_or(&Value::Null);
+    let code = cloud_mcp_payload_text(error, &["code"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(
+        code.as_str(),
+        "device_limit_reached" | "device_limit_exceeded"
+    ) {
+        return None;
+    }
+    let details = error.get("details").cloned().unwrap_or(Value::Null);
+    let mut text = cloud_mcp_payload_text(error, &["message"]).unwrap_or_else(|| {
+        "Device limit reached. Open the Diff Forge dashboard and remove a registered device, then reconnect the Rust client.".to_string()
+    });
+    if let Some(dashboard_url) =
+        cloud_mcp_payload_text(&details, &["dashboard_url", "dashboardUrl"])
+    {
+        if !text.contains(&dashboard_url) {
+            text = format!("{text} Dashboard: {dashboard_url}");
+        }
+    }
+    Some((text, details))
+}
+
+fn cloud_mcp_error_text_is_device_limit(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("device_limit_reached")
+        || error.contains("device_limit_exceeded")
+        || error.contains("device limit reached")
+}
+
+async fn cloud_mcp_mark_registration_blocked(
+    state: &CloudMcpState,
+    message: String,
+    details: Value,
+) {
+    let message = clean_terminal_telemetry_text(&message);
+    state
+        .global_ws_registration_blocked
+        .store(true, Ordering::SeqCst);
+    state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut runtime = state.inner.lock().await;
+        runtime.connected = false;
+        runtime.status = "device_limit_reached".to_string();
+        runtime.last_error = message.clone();
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = "device_limit_reached".to_string();
+        runtime.global_ws_last_error = message.clone();
+        runtime.global_ws_connection_id = None;
+        runtime.global_ws_message_token = None;
+        runtime.live_runtime_status = None;
+    }
+    let _ = state.global_ws_tx.lock().await.take();
+    cloud_mcp_fail_pending_ws_requests(state, &message).await;
+    cloud_mcp_record_connection_diagnostic(
+        state,
+        "rust.cloud_mcp.device_registration",
+        "error",
+        &message,
+        details,
+    )
+    .await;
+    state.global_ws_reconnect.notify_waiters();
+}
+
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
         return;
     };
+    if let Some((error_message, details)) = cloud_mcp_registration_blocked_error(&message) {
+        cloud_mcp_mark_registration_blocked(state, error_message, details).await;
+        return;
+    }
     if message.get("kind").and_then(Value::as_str) == Some("cloud_app_ws_ready") {
         let connection_id = message["message_auth"]["connection_id"]
             .as_str()
@@ -3441,6 +3554,15 @@ async fn cloud_mcp_resolve_ws_target(
     let bearer = match cloud_mcp_authorization_bearer(state).await {
         Ok(token) => token,
         Err(error) => {
+            if cloud_mcp_error_text_is_device_limit(&error) {
+                cloud_mcp_mark_registration_blocked(
+                    state,
+                    error.clone(),
+                    json!({"source": "route.resolve"}),
+                )
+                .await;
+                return fallback;
+            }
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
@@ -3458,6 +3580,8 @@ async fn cloud_mcp_resolve_ws_target(
 
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
     let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
     cloud_mcp_set_global_ws_phase(state, "resolving_route", "resolving_route").await;
     match cloud_mcp_fetch_direct_route_async(
         base_url,
@@ -3467,6 +3591,7 @@ async fn cloud_mcp_resolve_ws_target(
         team_id.as_deref(),
         &plan_name,
         device_limit,
+        device_id.as_deref(),
     )
     .await
     {
@@ -3606,6 +3731,7 @@ async fn cloud_mcp_fetch_direct_route_async(
     team_id: Option<&str>,
     plan_name: &str,
     device_limit: Option<u64>,
+    device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({
@@ -3615,6 +3741,7 @@ async fn cloud_mcp_fetch_direct_route_async(
         "teamId": team_id,
         "planName": plan_name,
         "deviceLimit": device_limit,
+        "deviceId": device_id,
     });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -3631,6 +3758,11 @@ async fn cloud_mcp_fetch_direct_route_async(
             if let Some(device_limit) = device_limit {
                 if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_limit.to_string()) {
                     headers.insert("x-diffforge-device-limit", value);
+                }
+            }
+            if let Some(device_id) = device_id {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(device_id) {
+                    headers.insert("x-diffforge-device-id", value);
                 }
             }
             if billing_scope_type == "team" {
@@ -4028,6 +4160,19 @@ async fn cloud_mcp_wait_for_ws_sender(
 ) -> Result<mpsc::UnboundedSender<Value>, String> {
     let started = Instant::now();
     loop {
+        if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+            let runtime = state.inner.lock().await;
+            let primary = runtime.global_ws_last_error.trim();
+            let fallback = runtime.last_error.trim();
+            let detail = if !primary.is_empty() {
+                primary.to_string()
+            } else if !fallback.is_empty() {
+                fallback.to_string()
+            } else {
+                "Device limit reached. Open the Diff Forge dashboard and remove a registered device, then reconnect the Rust client.".to_string()
+            };
+            return Err(detail.to_string());
+        }
         let ready = {
             let runtime = state.inner.lock().await;
             runtime.global_ws_connected
@@ -8598,6 +8743,25 @@ async fn cloud_mcp_set_desktop_session_token(
         Some(plan_name),
         device_limit,
     );
+    if state
+        .global_ws_registration_blocked
+        .swap(false, Ordering::SeqCst)
+    {
+        let mut runtime = state.inner.lock().await;
+        if runtime.global_ws_status == "device_limit_reached" {
+            runtime.connected = false;
+            runtime.status = "starting".to_string();
+            runtime.last_error.clear();
+            runtime.global_ws_connected = false;
+            runtime.global_ws_status = "starting".to_string();
+            runtime.global_ws_last_error.clear();
+            runtime.global_ws_connection_id = None;
+            runtime.global_ws_message_token = None;
+            runtime.live_runtime_status = None;
+        }
+        drop(runtime);
+        state.global_ws_reconnect.notify_waiters();
+    }
 
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
 }
@@ -15346,6 +15510,8 @@ fn cloud_mcp_proxy_resolve_blocking_target(
     };
     let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
     let (plan_name, device_limit) = cloud_mcp_process_account_plan();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
     match cloud_mcp_fetch_direct_route_blocking(
         base_url,
         endpoint_path,
@@ -15354,6 +15520,7 @@ fn cloud_mcp_proxy_resolve_blocking_target(
         team_id.as_deref(),
         &plan_name,
         device_limit,
+        device_id.as_deref(),
     ) {
         Ok(Some(target)) => target,
         _ => fallback,
@@ -15368,6 +15535,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
     team_id: Option<&str>,
     plan_name: &str,
     device_limit: Option<u64>,
+    device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
     let body = json!({
@@ -15377,6 +15545,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
         "teamId": team_id,
         "planName": plan_name,
         "deviceLimit": device_limit,
+        "deviceId": device_id,
     });
     let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -15393,6 +15562,11 @@ fn cloud_mcp_fetch_direct_route_blocking(
             if let Some(device_limit) = device_limit {
                 if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_limit.to_string()) {
                     headers.insert("x-diffforge-device-limit", value);
+                }
+            }
+            if let Some(device_id) = device_id {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(device_id) {
+                    headers.insert("x-diffforge-device-id", value);
                 }
             }
             if billing_scope_type == "team" {

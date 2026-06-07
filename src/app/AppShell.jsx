@@ -3345,6 +3345,24 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     };
   }
 
+  if (["device_limit_reached", "device_limit_exceeded"].includes(statusKey)) {
+    return {
+      connectedDevices,
+      detail: String(
+        status?.globalWsLastError
+          || status?.global_ws_last_error
+          || status?.lastError
+          || status?.last_error
+          || "Open the Diff Forge dashboard and remove a registered device, then reconnect this desktop.",
+      ),
+      knownDevices,
+      stage: "workspace_socket",
+      status: "error",
+      title: "Device limit reached",
+      workspaceTodos,
+    };
+  }
+
   if (["blocked", "auth_missing", "websocket_auth_missing"].includes(statusKey)) {
     return {
       connectedDevices,
