@@ -184,6 +184,14 @@ const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
 const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 1100;
 const TERMINAL_BREAKOUT_ACTIVITY_CACHE_FRESH_MS = 900;
 const TERMINAL_BREAKOUT_ACTIVITY_CACHE_LIMIT = 96;
+const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT = Object.freeze({
+  height: 360,
+  width: 360,
+  x: 18,
+  y: 52,
+});
+const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MIN_WIDTH = 280;
+const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN = 10;
 const terminalBreakoutPlanCache = new Map();
 const terminalBreakoutPlanRequests = new Map();
 const terminalBreakoutActivityCache = new Map();
@@ -803,6 +811,11 @@ const TerminalSurfaceSlot = styled.div`
     filter 140ms ease,
     opacity 140ms ease;
   will-change: width, height, transform;
+
+  &[data-terminal-breakout="true"][data-terminal-interacting="true"],
+  &[data-terminal-dragging="true"] {
+    transition: none;
+  }
 
   html[data-forge-theme="light"] & {
     background: #ffffff;
@@ -1521,6 +1534,269 @@ const TerminalBreakoutPanPlane = styled.div`
   inset: 0;
   z-index: 1;
   cursor: grab;
+`;
+
+const TerminalBreakoutArchitectureWindow = styled.aside`
+  position: absolute;
+  top: var(--terminal-breakout-architecture-window-y, 52px);
+  left: var(--terminal-breakout-architecture-window-x, 18px);
+  z-index: 92;
+  display: flex;
+  width: min(var(--terminal-breakout-architecture-window-width, 360px), calc(100% - 20px));
+  max-height: calc(100% - 20px);
+  min-width: 0;
+  flex-direction: column;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: rgba(241, 245, 249, 0.94);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 12, 0.96)),
+    rgba(0, 0, 0, 0.94);
+  box-shadow:
+    0 22px 48px rgba(0, 0, 0, 0.36),
+    inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  overflow: hidden;
+  pointer-events: auto;
+  backdrop-filter: blur(18px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    color: #1f2937;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.92)),
+      rgba(255, 255, 255, 0.94);
+    box-shadow:
+      0 22px 44px rgba(15, 23, 42, 0.14),
+      inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  }
+`;
+
+const TerminalBreakoutArchitectureHeader = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 11px 9px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  cursor: grab;
+  user-select: none;
+
+  &[data-dragging="true"] {
+    cursor: grabbing;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.08);
+  }
+`;
+
+const TerminalBreakoutArchitectureTitleStack = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+`;
+
+const TerminalBreakoutArchitectureKicker = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(148, 163, 184, 0.78);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 9px;
+  font-weight: 920;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.78);
+  }
+`;
+
+const TerminalBreakoutArchitectureTitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.96);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 830;
+  line-height: 1.18;
+
+  html[data-forge-theme="light"] & {
+    color: #111827;
+  }
+`;
+
+const TerminalBreakoutArchitectureHeaderActions = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+`;
+
+const TerminalBreakoutArchitectureStatus = styled.span`
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid rgba(96, 165, 250, 0.24);
+  border-radius: 999px;
+  color: rgba(191, 219, 254, 0.94);
+  background: rgba(37, 99, 235, 0.12);
+  font-size: 9px;
+  font-weight: 860;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-status="queued"],
+  &[data-status="running"] {
+    border-color: rgba(96, 165, 250, 0.34);
+    color: rgba(219, 234, 254, 0.96);
+    background: rgba(37, 99, 235, 0.18);
+  }
+
+  &[data-status="done"] {
+    border-color: rgba(52, 211, 153, 0.28);
+    color: rgba(167, 243, 208, 0.95);
+    background: rgba(5, 150, 105, 0.14);
+  }
+
+  &[data-status="failed"],
+  &[data-status="awaiting"] {
+    border-color: rgba(251, 191, 36, 0.28);
+    color: rgba(253, 224, 71, 0.94);
+    background: rgba(180, 83, 9, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d4ed8;
+    background: rgba(37, 99, 235, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-status="done"] {
+    color: #047857;
+    background: rgba(5, 150, 105, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-status="failed"],
+  html[data-forge-theme="light"] &[data-status="awaiting"] {
+    color: #a16207;
+    background: rgba(217, 119, 6, 0.08);
+  }
+`;
+
+const TerminalBreakoutArchitectureCloseButton = styled.button`
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.78);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    color: #ffffff;
+    background: rgba(148, 163, 184, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #475569;
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-visible {
+    color: #0f172a;
+    background: rgba(15, 23, 42, 0.08);
+  }
+`;
+
+const TerminalBreakoutArchitectureBody = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 11px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+`;
+
+const TerminalBreakoutArchitectureSummary = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+`;
+
+const TerminalBreakoutArchitectureHeadline = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(226, 232, 240, 0.92);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 780;
+
+  html[data-forge-theme="light"] & {
+    color: #1e293b;
+  }
+`;
+
+const TerminalBreakoutArchitectureSubline = styled.div`
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(148, 163, 184, 0.86);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
+const TerminalBreakoutArchitectureDetailGrid = styled.dl`
+  display: grid;
+  grid-template-columns: minmax(72px, auto) minmax(0, 1fr);
+  gap: 6px 10px;
+  margin: 0;
+  padding: 9px 0 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  color: rgba(203, 213, 225, 0.86);
+  font-size: 10px;
+  line-height: 1.35;
+
+  dt,
+  dd {
+    min-width: 0;
+    margin: 0;
+  }
+
+  dt {
+    color: rgba(148, 163, 184, 0.7);
+    font-weight: 820;
+  }
+
+  dd {
+    overflow-wrap: anywhere;
+    font-weight: 660;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(15, 23, 42, 0.08);
+    color: #334155;
+  }
 `;
 
 const TerminalBreakoutTopBar = styled.div`
@@ -5186,6 +5462,422 @@ function terminalActivityProcessDetails(process) {
     ["CWD", process?.cwd],
     ["Command", process?.command || process?.executable],
   ]);
+}
+
+function terminalArchitectureObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function terminalArchitectureRemoteCommand(item) {
+  return terminalArchitectureObject(item?.remoteCommand)
+    || terminalArchitectureObject(item?.remote_command)
+    || {};
+}
+
+function terminalArchitectureRunFromItem(item) {
+  const remoteCommand = terminalArchitectureRemoteCommand(item);
+  return terminalArchitectureObject(item?.architectureRun)
+    || terminalArchitectureObject(item?.architecture_run)
+    || terminalArchitectureObject(remoteCommand.architectureRun)
+    || terminalArchitectureObject(remoteCommand.architecture_run)
+    || null;
+}
+
+function terminalArchitectureGraphIdentity(graph, fallback = {}) {
+  const rawGraph = terminalArchitectureObject(graph);
+  if (!rawGraph) {
+    return null;
+  }
+
+  const title = cleanTerminalBreakoutPlanText(
+    rawGraph.title
+      || rawGraph.name
+      || rawGraph.label
+      || rawGraph.graphTitle
+      || rawGraph.graph_title
+      || fallback.title,
+  );
+  const filePath = cleanTerminalBreakoutPlanText(
+    rawGraph.filePath
+      || rawGraph.file_path
+      || rawGraph.path
+      || rawGraph.graphFilePath
+      || rawGraph.graph_file_path
+      || fallback.filePath,
+  );
+  const id = cleanTerminalBreakoutPlanText(
+    rawGraph.id
+      || rawGraph.graphId
+      || rawGraph.graph_id
+      || rawGraph.architectureId
+      || rawGraph.architecture_id
+      || fallback.id,
+  );
+  const repoPath = cleanTerminalBreakoutPlanText(
+    rawGraph.repoPath
+      || rawGraph.repo_path
+      || fallback.repoPath,
+  );
+  const graphKey = cleanTerminalBreakoutPlanText(
+    rawGraph.graphKey
+      || rawGraph.graph_key
+      || fallback.graphKey,
+  );
+
+  if (!title && !filePath && !id && !graphKey) {
+    return null;
+  }
+
+  return {
+    filePath,
+    graphKey,
+    id,
+    repoPath,
+    title: title || filePath.split(/[\\/]/).filter(Boolean).pop() || "Architecture",
+  };
+}
+
+function terminalArchitectureGraphFromItem(item) {
+  const remoteCommand = terminalArchitectureRemoteCommand(item);
+  return terminalArchitectureGraphIdentity(
+    item?.architectureGraph
+      || item?.architecture_graph
+      || remoteCommand.architectureGraph
+      || remoteCommand.architecture_graph
+      || {
+        filePath: remoteCommand.graphFilePath || remoteCommand.graph_file_path,
+        id: remoteCommand.graphId || remoteCommand.graph_id,
+        repoPath: remoteCommand.repoPath || remoteCommand.repo_path,
+        title: remoteCommand.graphTitle || remoteCommand.graph_title,
+      },
+  );
+}
+
+function terminalArchitectureGraphFromSnapshot(snapshot) {
+  const body = terminalArchitectureObject(snapshot?.graph)
+    || terminalArchitectureObject(snapshot?.data?.graph)
+    || terminalArchitectureObject(snapshot?.snapshot?.graph)
+    || terminalArchitectureObject(snapshot);
+  return terminalArchitectureGraphIdentity(body, {
+    repoPath: snapshot?.repoPath || snapshot?.repo_path,
+  });
+}
+
+function terminalArchitectureSelectedGraphFromState(state) {
+  const graphState = terminalArchitectureObject(state);
+  if (!graphState) {
+    return null;
+  }
+
+  const selectedGraphId = cleanTerminalBreakoutPlanText(graphState.architectureSelectedGraphId);
+  const selectedRepoPath = cleanTerminalBreakoutPlanText(graphState.architectureSelectedRepoPath || graphState.repoPath);
+  const selectedRepoKey = terminalBreakoutPlanPathIdentity(selectedRepoPath);
+  const lists = terminalArchitectureObject(graphState.architectureGraphLists) || {};
+  const entries = Object.entries(lists);
+  const preferredEntry = entries.find(([repoKey, entry]) => (
+    terminalBreakoutPlanPathIdentity(repoKey) === selectedRepoKey
+      || terminalBreakoutPlanPathIdentity(entry?.repoPath || entry?.repo_path) === selectedRepoKey
+  ));
+  const orderedEntries = preferredEntry
+    ? [preferredEntry, ...entries.filter(([repoKey]) => repoKey !== preferredEntry[0])]
+    : entries;
+
+  for (const [, entry] of orderedEntries) {
+    const graphs = Array.isArray(entry?.graphs) ? entry.graphs : [];
+    const selectedGraph = selectedGraphId
+      ? graphs.find((graph) => cleanTerminalBreakoutPlanText(graph?.id || graph?.graphId || graph?.graph_id) === selectedGraphId)
+      : graphs[0];
+    const identity = terminalArchitectureGraphIdentity(selectedGraph, {
+      repoPath: entry?.repoPath || entry?.repo_path || selectedRepoPath,
+    });
+    if (identity) {
+      return identity;
+    }
+  }
+
+  return terminalArchitectureGraphFromSnapshot(graphState.architectureSnapshot);
+}
+
+function terminalArchitectureTimeMs(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function terminalArchitectureItemUpdatedMs(item, pendingItem = null) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  return Math.max(
+    terminalArchitectureTimeMs(pendingItem?.updatedAt || pendingItem?.updated_at),
+    terminalArchitectureTimeMs(item?.todoStatusUpdatedAt || item?.todo_status_updated_at),
+    terminalArchitectureTimeMs(item?.updatedAt || item?.updated_at),
+    terminalArchitectureTimeMs(queueState.updatedAt || queueState.updated_at),
+    terminalArchitectureTimeMs(queueState.queuedAt || queueState.queued_at),
+    terminalArchitectureTimeMs(item?.createdAt || item?.created_at),
+  );
+}
+
+function terminalArchitectureStatusKind(status) {
+  const normalized = normalizeTodoQueueLifecycleStatus(status);
+  if (["queued"].includes(normalized)) {
+    return "queued";
+  }
+  if (["running"].includes(normalized)) {
+    return "running";
+  }
+  if (["completed"].includes(normalized)) {
+    return "done";
+  }
+  if (["paused", "interrupted"].includes(normalized)) {
+    return "awaiting";
+  }
+  if (["cancelled", "failed", "timed_out"].includes(normalized)) {
+    return "failed";
+  }
+  return "ready";
+}
+
+function terminalArchitectureStatusLabel(kind) {
+  if (kind === "queued") return "Queued";
+  if (kind === "running") return "Running";
+  if (kind === "done") return "Done";
+  if (kind === "failed") return "Review";
+  if (kind === "awaiting") return "Paused";
+  return "Ready";
+}
+
+function terminalArchitectureRunTitle(run) {
+  const target = terminalArchitectureObject(run?.target) || {};
+  return cleanTerminalBreakoutPlanText(target.label || target.title || target.name || run?.label || run?.title)
+    || cleanTerminalBreakoutPlanText(target.action || run?.action)
+    || "Architecture run";
+}
+
+function terminalArchitectureRunDetails(run) {
+  const target = terminalArchitectureObject(run?.target) || {};
+  return terminalBreakoutActivityDetailPairs([
+    ["Run", terminalArchitectureRunTitle(run)],
+    ["Action", target.action || run?.action],
+    ["Environment", run?.environment || run?.env || target.defaultEnv || target.default_env],
+    ["Mode", run?.mode || target.defaultMode || target.default_mode],
+    ["Scope", target.scope],
+    ["Approval", target.requiresApproval || target.requires_approval],
+  ]);
+}
+
+function terminalArchitectureTodoItemDetails(item) {
+  return terminalBreakoutActivityDetailPairs([
+    ["Target", getTodoQueueTargetTerminalName(item) || getTodoQueueTargetAgentId(item)],
+    ["Terminal", getTodoQueueTargetTerminalId(item) || (
+      Number.isInteger(getTodoQueueTargetTerminalIndex(item))
+        ? `Terminal ${getTodoQueueTargetTerminalIndex(item) + 1}`
+        : ""
+    )],
+    ["Command", terminalArchitectureRemoteCommand(item).commandId || item?.id],
+  ]);
+}
+
+function terminalArchitectureDetailPairs(artifact) {
+  if (!artifact) {
+    return [];
+  }
+  return terminalBreakoutActivityDetailPairs([
+    ["Graph", artifact.graph?.title],
+    ["File", artifact.graph?.filePath],
+    ["Repo", artifact.graph?.repoPath],
+    ["Terminal", artifact.activity?.paneId],
+    ["Tool", artifact.activity?.toolName],
+    ["Phase", artifact.activity?.phase],
+    ...terminalArchitectureRunDetails(artifact.run),
+    ...terminalArchitectureTodoItemDetails(artifact.item),
+  ]);
+}
+
+function terminalArchitectureArtifactSignature(artifact) {
+  if (!artifact) {
+    return "";
+  }
+  return [
+    artifact.source,
+    artifact.statusKind,
+    artifact.graph?.id,
+    artifact.graph?.filePath,
+    artifact.run?.target?.id,
+    artifact.run?.environment,
+    artifact.run?.mode,
+    artifact.item?.id,
+    artifact.activity?.paneId,
+    artifact.activity?.graphFilePath,
+    artifact.activity?.phase,
+    artifact.activity?.observedAtMs,
+    artifact.updatedAtMs,
+  ].map((item) => cleanTerminalBreakoutPlanText(item)).join(":");
+}
+
+function terminalArchitectureWorkspaceItems(workspaceTodos, workspaceId) {
+  return workspaceTodoItemsForWorkspace(workspaceTodos, workspaceId)
+    .filter((item) => terminalArchitectureGraphFromItem(item));
+}
+
+function terminalArchitectureActivityStatusKind(activity) {
+  const phase = cleanTerminalBreakoutPlanText(activity?.phase);
+  if (phase === "graph_changed") return "done";
+  if (["graph_editing", "context", "history", "reference"].includes(phase)) return "running";
+  return "ready";
+}
+
+function terminalArchitectureActivityStatusLabel(activity, kind) {
+  const phase = cleanTerminalBreakoutPlanText(activity?.phase);
+  if (phase === "graph_changed") return "Updated";
+  if (phase === "graph_editing") return "Editing";
+  if (phase === "context") return "Context";
+  if (phase === "history") return "History";
+  if (phase === "reference") return "Reference";
+  return terminalArchitectureStatusLabel(kind);
+}
+
+function terminalArchitectureArtifactFromActivity(activity, architectureWorkspaceState = null) {
+  const source = terminalArchitectureObject(activity);
+  if (!source) return null;
+  const graph = terminalArchitectureGraphIdentity({
+    filePath: source.graphFilePath || source.graph_file_path,
+    id: source.graphId || source.graph_id,
+    repoPath: source.repoPath || source.repo_path,
+    title: source.graphTitle || source.graph_title || "Architecture activity",
+  }) || terminalArchitectureSelectedGraphFromState(architectureWorkspaceState);
+  if (!graph) return null;
+  const statusKind = terminalArchitectureActivityStatusKind(source);
+  const headline = source.graphTitle
+    || graph.title
+    || (source.graphFilePath || "").split(/[\\/]/).filter(Boolean).pop()
+    || "Architecture activity";
+  return {
+    activity: source,
+    graph,
+    headline,
+    item: null,
+    run: null,
+    source: "terminal-activity",
+    statusKind,
+    statusLabel: terminalArchitectureActivityStatusLabel(source, statusKind),
+    subline: source.graphFilePath || graph.filePath || source.repoPath || graph.repoPath || "Terminal architecture activity",
+    updatedAtMs: Number(source.observedAtMs || source.observed_at_ms || 0),
+  };
+}
+
+function buildTerminalBreakoutArchitectureArtifact({
+  architectureTerminalActivity = null,
+  architectureWorkspaceState = null,
+  pendingItems = {},
+  queueItems = [],
+  workspaceId = "",
+  workspaceTodos = null,
+} = {}) {
+  const queueCandidates = [
+    ...terminalActivityArray(queueItems),
+    ...terminalArchitectureWorkspaceItems(workspaceTodos, workspaceId),
+  ]
+    .map((item) => {
+      const graph = terminalArchitectureGraphFromItem(item);
+      if (!graph) {
+        return null;
+      }
+      const pendingItem = pendingItems[item?.id] || null;
+      const status = getTodoQueueItemCloudStatus(item, pendingItem);
+      const statusKind = terminalArchitectureStatusKind(status);
+      const run = terminalArchitectureRunFromItem(item);
+      const updatedAtMs = terminalArchitectureItemUpdatedMs(item, pendingItem);
+      return {
+        graph,
+        item,
+        run,
+        source: run ? "run" : "queue",
+        statusKind,
+        statusLabel: terminalArchitectureStatusLabel(statusKind),
+        updatedAtMs,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => {
+      const rank = { running: 5, queued: 4, awaiting: 3, ready: 2, failed: 1, done: 0 };
+      const leftRank = rank[left.statusKind] ?? 0;
+      const rightRank = rank[right.statusKind] ?? 0;
+      if (leftRank !== rightRank) {
+        return rightRank - leftRank;
+      }
+      return right.updatedAtMs - left.updatedAtMs;
+    });
+
+  const activeQueueCandidate = queueCandidates.find((candidate) => (
+    !["done", "failed"].includes(candidate.statusKind)
+  ));
+  const recentInactiveQueueCandidate = queueCandidates.find((candidate) => (
+    ["done", "failed"].includes(candidate.statusKind)
+      && candidate.updatedAtMs
+      && Date.now() - candidate.updatedAtMs < 10 * 60 * 1000
+  ));
+  const queueArtifact = activeQueueCandidate || recentInactiveQueueCandidate || null;
+  if (queueArtifact) {
+    const artifact = queueArtifact;
+    return {
+      ...artifact,
+      headline: artifact.run
+        ? terminalArchitectureRunTitle(artifact.run)
+        : normalizeTodoQueueText(artifact.item?.text).slice(0, 96),
+      subline: artifact.graph?.title || artifact.graph?.filePath || "Architecture graph",
+    };
+  }
+
+  const activityArtifact = terminalArchitectureArtifactFromActivity(
+    architectureTerminalActivity,
+    architectureWorkspaceState,
+  );
+  if (activityArtifact) {
+    return activityArtifact;
+  }
+
+  const selectedGraph = terminalArchitectureSelectedGraphFromState(architectureWorkspaceState);
+  if (!selectedGraph) {
+    return null;
+  }
+  return {
+    graph: selectedGraph,
+    headline: selectedGraph.title,
+    item: null,
+    run: null,
+    source: "selected",
+    statusKind: "ready",
+    statusLabel: "Ready",
+    subline: selectedGraph.filePath || selectedGraph.repoPath || "Selected architecture graph",
+    updatedAtMs: 0,
+  };
+}
+
+function clampTerminalBreakoutArchitectureWindowLayout(layout, containerRect = null) {
+  const source = layout && typeof layout === "object" ? layout : {};
+  const containerWidth = Math.max(0, Number(containerRect?.width || 0));
+  const containerHeight = Math.max(0, Number(containerRect?.height || 0));
+  const width = Math.max(
+    TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MIN_WIDTH,
+    Number(source.width || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.width),
+  );
+  const maxX = containerWidth
+    ? Math.max(TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN, containerWidth - width - TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN)
+    : Number(source.x || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.x);
+  const maxY = containerHeight
+    ? Math.max(TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN, containerHeight - 120)
+    : Number(source.y || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.y);
+  return {
+    height: Number(source.height || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.height),
+    width,
+    x: containerWidth
+      ? Math.max(TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN, Math.min(maxX, Number(source.x || 0)))
+      : Number(source.x || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.x),
+    y: containerHeight
+      ? Math.max(TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN, Math.min(maxY, Number(source.y || 0)))
+      : Number(source.y || TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT.y),
+  };
 }
 
 function terminalBreakoutPlanEventText(payload, keys) {
@@ -12300,6 +12992,9 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
 function TerminalView({
   accountKey = "",
+  architectureTerminalActivity = null,
+  architectureWorkspaceRoot = "",
+  architectureWorkspaceState = null,
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
@@ -12402,6 +13097,11 @@ function TerminalView({
   const [terminalBreakoutActivitySnapshots, setTerminalBreakoutActivitySnapshots] = useState({});
   const [terminalBreakoutActivityExpandedRows, setTerminalBreakoutActivityExpandedRows] = useState({});
   const [terminalBreakoutActivityStopState, setTerminalBreakoutActivityStopState] = useState({});
+  const [terminalBreakoutArchitectureWindowOpen, setTerminalBreakoutArchitectureWindowOpen] = useState(true);
+  const [terminalBreakoutArchitectureWindowDragging, setTerminalBreakoutArchitectureWindowDragging] = useState(false);
+  const [terminalBreakoutArchitectureWindowLayout, setTerminalBreakoutArchitectureWindowLayout] = useState(
+    TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT,
+  );
   const [terminalBreakoutViewport, setTerminalBreakoutViewport] = useState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
@@ -12450,6 +13150,9 @@ function TerminalView({
   const terminalBreakoutTransitionTimerRef = useRef(0);
   const terminalBreakoutPanStateRef = useRef(null);
   const terminalBreakoutPanCleanupRef = useRef(null);
+  const terminalBreakoutArchitectureWindowDragCleanupRef = useRef(null);
+  const terminalBreakoutArchitectureWindowDragRef = useRef(null);
+  const terminalBreakoutArchitectureWindowAutoOpenSignatureRef = useRef("");
   const terminalBreakoutBackgroundCanvasRef = useRef(null);
   const terminalBreakoutBackgroundDrawRef = useRef(null);
   const terminalBreakoutPlacementsRef = useRef({});
@@ -12533,6 +13236,33 @@ function TerminalView({
   const workspaceTodoDispatchTargets = useMemo(
     () => normalizeWorkspaceTodoDispatchTargets(workspaceTodos, terminalWorkspace?.id),
     [terminalWorkspace?.id, workspaceTodos],
+  );
+  const terminalBreakoutArchitectureArtifact = useMemo(() => (
+    buildTerminalBreakoutArchitectureArtifact({
+      architectureTerminalActivity,
+      architectureWorkspaceRoot,
+      architectureWorkspaceState,
+      pendingItems: todoQueuePendingItems,
+      queueItems: todoQueueItems,
+      workspaceId: terminalWorkspace?.id || "",
+      workspaceTodos,
+    })
+  ), [
+    architectureTerminalActivity,
+    architectureWorkspaceRoot,
+    architectureWorkspaceState,
+    terminalWorkspace?.id,
+    todoQueueItems,
+    todoQueuePendingItems,
+    workspaceTodos,
+  ]);
+  const terminalBreakoutArchitectureDetails = useMemo(
+    () => terminalArchitectureDetailPairs(terminalBreakoutArchitectureArtifact),
+    [terminalBreakoutArchitectureArtifact],
+  );
+  const terminalBreakoutArchitectureSignature = useMemo(
+    () => terminalArchitectureArtifactSignature(terminalBreakoutArchitectureArtifact),
+    [terminalBreakoutArchitectureArtifact],
   );
 
   const replaceTodoQueuePendingItems = useCallback((nextPendingItems) => {
@@ -12686,6 +13416,10 @@ function TerminalView({
   }, [logicalTerminalIndexSignature]);
 
   useEffect(() => {
+    if (terminalBreakoutPanning || terminalDragActive) {
+      return undefined;
+    }
+
     if (terminalBreakoutLayoutWriteTimerRef.current) {
       window.clearTimeout(terminalBreakoutLayoutWriteTimerRef.current);
     }
@@ -12697,7 +13431,7 @@ function TerminalView({
         terminalScale: terminalBreakoutTerminalScaleRef.current,
         viewport: terminalBreakoutViewportRef.current,
       });
-    }, terminalBreakoutPanning || terminalDragActive ? 220 : 80);
+    }, 80);
 
     return () => {
       if (terminalBreakoutLayoutWriteTimerRef.current) {
@@ -13596,6 +14330,99 @@ function TerminalView({
       stopTerminalBreakoutActivityProcess(paneId, process)
     )));
   }, [stopTerminalBreakoutActivityProcess]);
+
+  const stopTerminalBreakoutArchitectureWindowDrag = useCallback(() => {
+    terminalBreakoutArchitectureWindowDragCleanupRef.current?.();
+    terminalBreakoutArchitectureWindowDragCleanupRef.current = null;
+    terminalBreakoutArchitectureWindowDragRef.current = null;
+    setTerminalBreakoutArchitectureWindowDragging(false);
+  }, []);
+
+  const beginTerminalBreakoutArchitectureWindowDrag = useCallback((event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    stopTerminalBreakoutArchitectureWindowDrag();
+
+    const containerRect = getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.())
+      || terminalPanelRectRef.current;
+    const startLayout = clampTerminalBreakoutArchitectureWindowLayout(
+      terminalBreakoutArchitectureWindowLayout,
+      containerRect,
+    );
+    const pointerId = event.pointerId;
+    terminalBreakoutArchitectureWindowDragRef.current = {
+      containerRect,
+      pointerId,
+      startClientX: Number(event.clientX || 0),
+      startClientY: Number(event.clientY || 0),
+      startLayout,
+    };
+    setTerminalBreakoutArchitectureWindowDragging(true);
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handlePointerMove = (moveEvent) => {
+      const dragState = terminalBreakoutArchitectureWindowDragRef.current;
+      if (!dragState || moveEvent.pointerId !== dragState.pointerId) {
+        return;
+      }
+      moveEvent.preventDefault();
+      const nextLayout = clampTerminalBreakoutArchitectureWindowLayout({
+        ...dragState.startLayout,
+        x: dragState.startLayout.x + Number(moveEvent.clientX || 0) - dragState.startClientX,
+        y: dragState.startLayout.y + Number(moveEvent.clientY || 0) - dragState.startClientY,
+      }, dragState.containerRect);
+      setTerminalBreakoutArchitectureWindowLayout(nextLayout);
+    };
+
+    const handlePointerUp = (upEvent) => {
+      if (
+        terminalBreakoutArchitectureWindowDragRef.current
+        && upEvent.pointerId !== terminalBreakoutArchitectureWindowDragRef.current.pointerId
+      ) {
+        return;
+      }
+      stopTerminalBreakoutArchitectureWindowDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp, { passive: true });
+    window.addEventListener("pointercancel", handlePointerUp, { passive: true });
+    terminalBreakoutArchitectureWindowDragCleanupRef.current = () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, [
+    stopTerminalBreakoutArchitectureWindowDrag,
+    terminalBreakoutArchitectureWindowLayout,
+  ]);
+
+  useEffect(() => stopTerminalBreakoutArchitectureWindowDrag, [
+    stopTerminalBreakoutArchitectureWindowDrag,
+  ]);
+
+  useEffect(() => {
+    if (!terminalBreakoutLayoutActive || !terminalBreakoutArchitectureSignature) {
+      return;
+    }
+    if (terminalBreakoutArchitectureWindowAutoOpenSignatureRef.current === terminalBreakoutArchitectureSignature) {
+      return;
+    }
+    terminalBreakoutArchitectureWindowAutoOpenSignatureRef.current = terminalBreakoutArchitectureSignature;
+    setTerminalBreakoutArchitectureWindowOpen(true);
+  }, [
+    terminalBreakoutArchitectureSignature,
+    terminalBreakoutLayoutActive,
+  ]);
 
   useEffect(() => {
     if (!terminalBreakoutLayoutActive || !terminalBreakoutPlanTargets.length) {
@@ -16311,12 +17138,12 @@ function TerminalView({
   }, [terminalBreakoutVisible]);
 
   useEffect(() => {
-    if (!terminalBreakoutVisible) {
+    if (!terminalBreakoutVisible || terminalBreakoutPanning) {
       return;
     }
 
     terminalBreakoutBackgroundDrawRef.current?.();
-  }, [terminalBreakoutVisible, terminalBreakoutViewport, terminalPanelRect]);
+  }, [terminalBreakoutPanning, terminalBreakoutVisible, terminalBreakoutViewport, terminalPanelRect]);
 
   useEffect(() => {
     let cancelled = false;
@@ -21600,6 +22427,11 @@ function TerminalView({
   const todoDragImage = getTodoQueueItemImage(todoDragState);
   const todoDragNote = getTodoQueueItemNote(todoDragState);
   const todoDragHasPreview = Boolean(todoDragImage || todoDragNote);
+  const terminalBreakoutCanvasInteracting = Boolean(
+    terminalBreakoutPanning
+      || terminalDragState?.mode === "canvas"
+      || terminalDragState?.mode === "canvas-resize",
+  );
   const terminalWorkspaceContent = hasVisibleWorkspaceTerminalPanes ? (
     <WorkspaceTerminalPanels
       data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
@@ -21681,6 +22513,76 @@ function TerminalView({
           ref={terminalBreakoutBackgroundCanvasRef}
         />
         <TerminalBreakoutPanPlane onPointerDown={handleBreakoutPanPointerDown} />
+        {terminalBreakoutLayoutActive
+          && terminalBreakoutArchitectureWindowOpen
+          && terminalBreakoutArchitectureArtifact && (
+          <TerminalBreakoutArchitectureWindow
+            aria-label="Architecture workspace"
+            data-terminal-control="true"
+            onPointerDown={(event) => event.stopPropagation()}
+            style={{
+              "--terminal-breakout-architecture-window-width": `${Math.round(terminalBreakoutArchitectureWindowLayout.width)}px`,
+              "--terminal-breakout-architecture-window-x": `${Math.round(terminalBreakoutArchitectureWindowLayout.x)}px`,
+              "--terminal-breakout-architecture-window-y": `${Math.round(terminalBreakoutArchitectureWindowLayout.y)}px`,
+            }}
+          >
+            <TerminalBreakoutArchitectureHeader
+              data-dragging={terminalBreakoutArchitectureWindowDragging ? "true" : "false"}
+              onPointerDown={beginTerminalBreakoutArchitectureWindowDrag}
+            >
+              <TerminalBreakoutArchitectureTitleStack>
+                <TerminalBreakoutArchitectureKicker>
+                  Architecture
+                </TerminalBreakoutArchitectureKicker>
+                <TerminalBreakoutArchitectureTitle title={terminalBreakoutArchitectureArtifact.graph?.title || ""}>
+                  {terminalBreakoutArchitectureArtifact.graph?.title || "Architecture"}
+                </TerminalBreakoutArchitectureTitle>
+              </TerminalBreakoutArchitectureTitleStack>
+              <TerminalBreakoutArchitectureHeaderActions>
+                <TerminalBreakoutArchitectureStatus
+                  data-status={terminalBreakoutArchitectureArtifact.statusKind}
+                >
+                  {terminalBreakoutArchitectureArtifact.statusLabel}
+                </TerminalBreakoutArchitectureStatus>
+                <TerminalBreakoutArchitectureCloseButton
+                  aria-label="Close architecture window"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setTerminalBreakoutArchitectureWindowOpen(false);
+                  }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  title="Close architecture window"
+                  type="button"
+                >
+                  <Close aria-hidden="true" />
+                </TerminalBreakoutArchitectureCloseButton>
+              </TerminalBreakoutArchitectureHeaderActions>
+            </TerminalBreakoutArchitectureHeader>
+            <TerminalBreakoutArchitectureBody>
+              <TerminalBreakoutArchitectureSummary>
+                <TerminalBreakoutArchitectureHeadline title={terminalBreakoutArchitectureArtifact.headline || ""}>
+                  {terminalBreakoutArchitectureArtifact.headline || terminalBreakoutArchitectureArtifact.graph?.title || "Architecture"}
+                </TerminalBreakoutArchitectureHeadline>
+                {terminalBreakoutArchitectureArtifact.subline && (
+                  <TerminalBreakoutArchitectureSubline title={terminalBreakoutArchitectureArtifact.subline}>
+                    {terminalBreakoutArchitectureArtifact.subline}
+                  </TerminalBreakoutArchitectureSubline>
+                )}
+              </TerminalBreakoutArchitectureSummary>
+              {terminalBreakoutArchitectureDetails.length > 0 && (
+                <TerminalBreakoutArchitectureDetailGrid>
+                  {terminalBreakoutArchitectureDetails.map(([label, value]) => (
+                    <Fragment key={`architecture-window:${label}:${value}`}>
+                      <dt>{label}</dt>
+                      <dd>{value}</dd>
+                    </Fragment>
+                  ))}
+                </TerminalBreakoutArchitectureDetailGrid>
+              )}
+            </TerminalBreakoutArchitectureBody>
+          </TerminalBreakoutArchitectureWindow>
+        )}
       </TerminalBreakoutCanvas>
       <TerminalSurfaceLayer
         aria-hidden={false}
@@ -21719,6 +22621,7 @@ function TerminalView({
               data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
               data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
               data-terminal-index={terminalIndex}
+              data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
               data-terminal-surface-slot="true"
               key={`${terminalWorkspace.id}-${terminalIndex}`}
               onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}

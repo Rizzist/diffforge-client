@@ -4557,7 +4557,7 @@ export const TerminalRestartPill = styled.div`
   left: 50%;
   z-index: 80;
   display: grid;
-  grid-template-columns: minmax(0, max-content) auto auto;
+  grid-template-columns: minmax(0, auto) auto auto;
   width: max-content;
   max-width: 92%;
   min-height: 26px;
@@ -4574,7 +4574,7 @@ export const TerminalRestartPill = styled.div`
   transform: translateX(-50%);
   backdrop-filter: blur(10px);
 
-  @container (max-width: 420px) {
+  @container (max-width: 250px) {
     grid-template-columns: minmax(0, 1fr) auto;
     min-height: 48px;
     gap: 1px 5px;
@@ -4596,7 +4596,7 @@ export const TerminalRailIdentity = styled.span`
 export const TerminalAgentLabel = styled.span`
   display: inline-block;
   min-width: 0;
-  max-width: clamp(44px, 28vw, 168px);
+  max-width: clamp(36px, 16cqi, 168px);
   overflow: hidden;
   color: rgba(226, 232, 240, 0.9);
   font-size: 10px;
@@ -4741,7 +4741,7 @@ export const TerminalAgentDot = styled.span`
 
 export const TerminalStateDebugBadge = styled.span`
   display: inline-flex;
-  max-width: 88px;
+  max-width: clamp(42px, 15cqi, 88px);
   height: 18px;
   align-items: center;
   padding: 0 6px;

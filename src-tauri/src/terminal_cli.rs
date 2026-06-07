@@ -2024,6 +2024,72 @@ fn write_diff_forge_activity_hook_debug(
     }
 }
 
+fn diff_forge_architecture_graph_path_from_text(value: &str) -> String {
+    let haystack = value.trim();
+    if haystack.is_empty() {
+        return String::new();
+    }
+    let lower = haystack.to_ascii_lowercase();
+    let markers = [
+        ".agents/architectures/graphs/",
+        ".agents\\architectures\\graphs\\",
+    ];
+    let Some((marker_index, _marker)) = markers
+        .iter()
+        .find_map(|marker| lower.find(marker).map(|index| (index, *marker)))
+    else {
+        return String::new();
+    };
+    let is_boundary = |ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ',')
+    };
+    let mut start = 0usize;
+    for (index, ch) in haystack[..marker_index].char_indices() {
+        if is_boundary(ch) {
+            start = index + ch.len_utf8();
+        }
+    }
+    let mut end = haystack.len();
+    for (offset, ch) in haystack[marker_index..].char_indices() {
+        if is_boundary(ch) {
+            end = marker_index + offset;
+            break;
+        }
+    }
+    let path = haystack[start..end]
+        .trim_matches(|ch: char| matches!(ch, ':' | ';'))
+        .to_string();
+    if path.to_ascii_lowercase().ends_with(".arch") {
+        path
+    } else {
+        String::new()
+    }
+}
+
+fn diff_forge_architecture_graph_path_from_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            if text.len() > 256_000 {
+                let sample = text.chars().take(256_000).collect::<String>();
+                diff_forge_architecture_graph_path_from_text(&sample)
+            } else {
+                diff_forge_architecture_graph_path_from_text(text)
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .map(diff_forge_architecture_graph_path_from_value)
+            .find(|path| !path.is_empty())
+            .unwrap_or_default(),
+        Value::Object(object) => object
+            .values()
+            .map(diff_forge_architecture_graph_path_from_value)
+            .find(|path| !path.is_empty())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 fn diff_forge_activity_hook_record(
     provider: &str,
     pane_id: &str,
@@ -2110,6 +2176,13 @@ fn diff_forge_activity_hook_record(
         tool_string(&["tool_use_id", "toolUseId"]),
     ]);
     let command = tool_string(&["command"]);
+    let mut tool_paths = Vec::new();
+    claude_guard_collect_tool_paths(tool_input, &mut tool_paths);
+    let graph_file_path = tool_paths
+        .iter()
+        .map(|path| diff_forge_architecture_graph_path_from_text(path))
+        .find(|path| !path.is_empty())
+        .unwrap_or_else(|| diff_forge_architecture_graph_path_from_value(tool_input));
     let approval_id = first_string(vec![
         hook_string(&["approval_id", "approvalId"]),
         tool_string(&["approval_id", "approvalId"]),
@@ -2177,6 +2250,8 @@ fn diff_forge_activity_hook_record(
         "toolName": tool_name,
         "toolUseId": tool_use_id,
         "command": command,
+        "filePath": tool_paths.first().cloned().unwrap_or_default(),
+        "graphFilePath": graph_file_path,
         "approvalId": approval_id,
         "permissionPromptId": permission_prompt_id,
         "permissionRequestId": permission_request_id,

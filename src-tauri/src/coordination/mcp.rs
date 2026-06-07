@@ -3148,6 +3148,16 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let start_plan = optional_start_task_text(input).ok_or_else(|| {
         "start_task requires a short plan explaining what the agent is about to do.".to_string()
     })?;
+    if start_task_plan_is_direct_architecture_graph_work(&start_plan) {
+        return Ok(api_error(
+            "architecture_graph_direct_edit",
+            "Do not create a normal task for architecture graph-only work. Call architecture_context/list/reference as needed, edit .agents/architectures/graphs/*.arch directly in the visible repo root, and report the graph path when done. If this work also edits code or docs, call start_task again with a plan naming the non-architecture files.",
+            json!({
+                "direct_artifact_root": ".agents/architectures/graphs",
+                "plan": start_plan,
+            }),
+        ));
+    }
     let agent_id = input["agent_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
@@ -3993,6 +4003,49 @@ fn optional_start_task_text(input: &Value) -> Option<String> {
     .map(str::trim)
     .filter(|value| !value.is_empty())
     .map(str::to_string)
+}
+
+fn start_task_plan_is_direct_architecture_graph_work(plan: &str) -> bool {
+    let normalized = plan.to_ascii_lowercase();
+    let graph_intent = [
+        ".agents/architectures/graphs",
+        ".arch",
+        "architecture graph",
+        "architecture diagram",
+        "system graph",
+        "system map",
+        "deployment diagram",
+        "data-flow diagram",
+        "data flow diagram",
+        "control graph",
+        "state machine",
+        "dependency graph",
+        "api corridor",
+        "api pathway",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    if !graph_intent {
+        return false;
+    }
+    let non_graph_intent = [
+        "implement code",
+        "edit code",
+        "modify code",
+        "change code",
+        "update code",
+        "source code",
+        "code file",
+        "src/",
+        "package.json",
+        "cargo.toml",
+        "index.html",
+        "readme",
+        "docs/",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term));
+    !non_graph_intent
 }
 
 fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -4953,6 +5006,22 @@ mod tests {
             cloud_start_task_id(&response).as_deref(),
             Some("server-task-123")
         );
+    }
+
+    #[test]
+    fn architecture_graph_only_start_task_plan_is_direct_live_work() {
+        assert!(start_task_plan_is_direct_architecture_graph_work(
+            "Create a new architecture graph for the React context auth flow."
+        ));
+        assert!(start_task_plan_is_direct_architecture_graph_work(
+            "Update .agents/architectures/graphs/auth-flow.arch with the new API corridor."
+        ));
+        assert!(!start_task_plan_is_direct_architecture_graph_work(
+            "Implement code for the auth flow based on the architecture graph."
+        ));
+        assert!(!start_task_plan_is_direct_architecture_graph_work(
+            "Run architecture target Deploy and update src/deploy.ts."
+        ));
     }
 
     #[test]

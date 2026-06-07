@@ -34,6 +34,7 @@ import {
 } from "../terminals/terminalPromptSubmission.js";
 import {
   TERMINAL_ACTIVITY_HOOK_EVENT,
+  TERMINAL_ARCHITECTURE_ACTIVITY_EVENT,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
 import {
   getProviderTurnCompletionIntent,
@@ -4862,6 +4863,79 @@ function workspaceArchitectureGraphId(graph) {
   return graphText(graph?.id || graph?.architectureId || graph?.architecture_id || graph?.graphId || graph?.graph_id);
 }
 
+function workspaceArchitectureGraphFilePath(graph) {
+  return graphText(
+    graph?.filePath
+      || graph?.file_path
+      || graph?.path
+      || graph?.graphFilePath
+      || graph?.graph_file_path,
+  );
+}
+
+function workspaceArchitectureGraphFileStem(path) {
+  return graphText(path)
+    .replaceAll("\\", "/")
+    .split("/")
+    .filter(Boolean)
+    .pop()
+    ?.replace(/\.[^.]+$/, "")
+    || "";
+}
+
+function normalizeTerminalArchitectureActivity(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const workspaceId = graphText(payload.workspaceId || payload.workspace_id);
+  const repoPath = cleanWorkspaceRootDirectory(payload.repoPath || payload.repo_path || payload.cwd);
+  const graphFilePath = graphText(
+    payload.graphFilePath
+      || payload.graph_file_path
+      || payload.filePath
+      || payload.file_path,
+  );
+  const graphId = graphText(
+    payload.graphId
+      || payload.graph_id
+      || payload.architectureGraphId
+      || payload.architecture_graph_id
+      || workspaceArchitectureGraphFileStem(graphFilePath),
+  );
+  const paneId = graphText(payload.paneId || payload.pane_id);
+  const terminalIndex = Number(payload.terminalIndex ?? payload.terminal_index);
+  if (!workspaceId && !repoPath) return null;
+  return {
+    agentId: graphText(payload.agentId || payload.agent_id),
+    agentKind: graphText(payload.agentKind || payload.agent_kind),
+    graphFilePath,
+    graphId,
+    graphTitle: graphText(payload.graphTitle || payload.graph_title),
+    hookEventName: graphText(payload.hookEventName || payload.hook_event_name),
+    instanceId: Number(payload.instanceId ?? payload.instance_id ?? 0) || 0,
+    observedAtMs: Number(payload.observedAtMs ?? payload.observed_at_ms ?? Date.now()) || Date.now(),
+    paneId,
+    phase: graphText(payload.phase, graphFilePath ? "graph_editing" : "context"),
+    provider: graphText(payload.provider),
+    repoPath,
+    source: graphText(payload.source, "terminal-hook"),
+    terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+    threadId: graphText(payload.threadId || payload.thread_id),
+    toolName: graphText(payload.toolName || payload.tool_name),
+    workspaceId,
+    workspaceName: graphText(payload.workspaceName || payload.workspace_name),
+  };
+}
+
+function workspaceArchitectureGraphMatchesActivity(graph, activity) {
+  if (!graph || !activity) return false;
+  const graphId = workspaceArchitectureGraphId(graph);
+  if (activity.graphId && graphId && activity.graphId === graphId) return true;
+  const graphFilePath = normalizeGraphWorkspacePath(workspaceArchitectureGraphFilePath(graph));
+  const activityFilePath = normalizeGraphWorkspacePath(activity.graphFilePath);
+  if (graphFilePath && activityFilePath && graphFilePath === activityFilePath) return true;
+  const graphStem = workspaceArchitectureGraphFileStem(workspaceArchitectureGraphFilePath(graph));
+  return Boolean(activity.graphId && graphStem && activity.graphId === graphStem);
+}
+
 function workspaceArchitectureGraphUpdatedMs(graph) {
   const raw = graph?.updatedAt || graph?.updated_at || graph?.createdAt || graph?.created_at || 0;
   const number = Number(raw);
@@ -5403,6 +5477,7 @@ export default function App() {
   const [audioWidgetVisible, setAudioWidgetVisible] = useState(false);
   const [workspaces, setWorkspaces] = useState([]);
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
+  const [workspaceArchitectureTerminalActivity, setWorkspaceArchitectureTerminalActivity] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
@@ -15011,6 +15086,113 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let unlistenArchitectureActivity = null;
+    const refreshTimers = new Set();
+
+    const handleArchitectureActivity = (event) => {
+      if (cancelled) return;
+      const normalizedActivity = normalizeTerminalArchitectureActivity(event?.payload);
+      if (!normalizedActivity) return;
+      const workspaceId = normalizedActivity.workspaceId;
+      const workspace = workspaceId ? findWorkspaceById(workspacesRef.current, workspaceId) : null;
+      const workspaceName = normalizedActivity.workspaceName || workspace?.name || "";
+      const workspaceRootDirectory = cleanWorkspaceRootDirectory(
+        getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId)
+          || normalizedActivity.repoPath
+          || defaultWorkingDirectoryRef.current,
+      );
+      const repoPath = cleanWorkspaceRootDirectory(
+        normalizedActivity.repoPath
+          || workspaceRootDirectory
+          || defaultWorkingDirectoryRef.current,
+      );
+      if (!workspaceId || !repoPath) return;
+      const activity = {
+        ...normalizedActivity,
+        repoPath,
+        workspaceName,
+        workspaceRootDirectory,
+      };
+      const itemKey = activity.paneId
+        || (Number.isInteger(activity.terminalIndex) ? `terminal:${activity.terminalIndex}` : "")
+        || `${activity.agentId || activity.agentKind || "agent"}:${activity.instanceId || activity.observedAtMs}`;
+
+      setWorkspaceArchitectureTerminalActivity((current) => {
+        const previous = current[workspaceId] || {};
+        const previousItems = previous.items && typeof previous.items === "object"
+          ? previous.items
+          : {};
+        const entries = Object.entries({
+          ...previousItems,
+          [itemKey]: activity,
+        })
+          .sort(([, left], [, right]) => Number(right?.observedAtMs || 0) - Number(left?.observedAtMs || 0))
+          .slice(0, 16);
+        return {
+          ...current,
+          [workspaceId]: {
+            items: Object.fromEntries(entries),
+            latest: activity,
+            updatedAt: activity.observedAtMs || Date.now(),
+          },
+        };
+      });
+
+      const refresh = () => {
+        if (cancelled) return;
+        void refreshWorkspaceArchitectureGraphList(workspaceId, repoPath, {
+          refresh: true,
+          reason: "terminal_architecture_activity",
+          silent: true,
+          workspaceName,
+          workspaceRootDirectory,
+        }).then((graphs) => {
+          if (cancelled) return;
+          const matchedGraph = jsonArray(graphs).find((graph) => (
+            workspaceArchitectureGraphMatchesActivity(graph, activity)
+          ));
+          const graphId = workspaceArchitectureGraphId(matchedGraph) || activity.graphId;
+          if (!graphId && !activity.graphFilePath) return;
+          setWorkspaceArchitectureSelection(workspaceId, {
+            graphId,
+            repoPath,
+            workspaceRootDirectory,
+          });
+        }).catch(() => {});
+      };
+      const delayMs = activity.graphFilePath ? 180 : 0;
+      const timer = window.setTimeout(() => {
+        refreshTimers.delete(timer);
+        refresh();
+      }, delayMs);
+      refreshTimers.add(timer);
+    };
+
+    listen(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, handleArchitectureActivity)
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenArchitectureActivity = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenArchitectureActivity) {
+        unlistenArchitectureActivity();
+      }
+      refreshTimers.forEach((timer) => window.clearTimeout(timer));
+      refreshTimers.clear();
+    };
+  }, [
+    refreshWorkspaceArchitectureGraphList,
+    setWorkspaceArchitectureSelection,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
     let unlistenTaskHistory = null;
     let unlistenWorkspaceTodos = null;
     let workspaceTodoRefreshTimer = 0;
@@ -20635,6 +20817,13 @@ export default function App() {
                           && !runtimeIsDeactivating
                           && runtimeDescriptor.agentTerminalEntries.length > 0,
                       );
+                      const runtimeArchitectureGraphStateKey = workspaceGraphStateKey(
+                        runtimeDescriptor.workingDirectory,
+                        runtimeWorkspace.id,
+                      );
+                      const runtimeArchitectureGraphState = runtimeArchitectureGraphStateKey
+                        ? workspaceGraphState[runtimeArchitectureGraphStateKey] || {}
+                        : {};
 
                       return (
                         <WorkspaceRuntimeLayer
@@ -20644,6 +20833,9 @@ export default function App() {
                         >
                           <TerminalView
                             accountKey={user?.id || user?.email || ""}
+                            architectureTerminalActivity={workspaceArchitectureTerminalActivity[runtimeWorkspace.id]?.latest || null}
+                            architectureWorkspaceRoot={runtimeDescriptor.workingDirectory}
+                            architectureWorkspaceState={runtimeArchitectureGraphState}
                             billingStatus={billingStatus}
                             connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}

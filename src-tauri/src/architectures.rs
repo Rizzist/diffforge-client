@@ -24,6 +24,8 @@ Architecture graphs are general system graphs. One `.arch` graph may contain mul
 
 Call `coordination-kernel.architecture_context` before architecture, diagram, deployment, flow, or subsystem visualization work. Use `coordination-kernel.architecture_list` to discover existing graphs and `coordination-kernel.architecture_icon_reference` when choosing icons. Create or modify `.agents/architectures/graphs/*.arch` with normal file edits so the Architecture tab reloads file changes live.
 
+Architecture graph-only work is live artifact work, not a managed patch task. If the only edits are `.agents/architectures/graphs/*.arch`, do not call `coordination-kernel.start_task`, do not acquire a normal file lease, and do not call `coordination-kernel.submit_patch`.
+
 1. Inspect `.agents/architectures/index.json` and existing `graphs/*.arch` files before creating a new graph.
 2. Prefer modifying the most relevant existing graph when the work changes a known subsystem.
 3. Create a new graph file only when there is no relevant existing graph.
@@ -1891,6 +1893,7 @@ pub(crate) fn architecture_context_value(repo_path: String) -> Result<Value, Str
             ],
             "workflow": [
                 "Call architecture_context or architecture_list before creating or updating architecture/system graph artifacts.",
+                "For architecture graph-only work, do not call start_task, acquire_lease, checkpoint, or submit_patch; .agents/architectures/graphs/*.arch files are direct live artifacts.",
                 "Read the closest existing .agents/architectures/graphs/*.arch file directly before modifying a known subsystem.",
                 "Create or update .agents/architectures/graphs/*.arch with normal file edits using the eraser-like DSL.",
                 "One .arch graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",

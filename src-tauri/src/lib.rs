@@ -151,6 +151,7 @@ const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
+const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const TERMINAL_TASK_PLAN_UPDATED_EVENT: &str = "forge-terminal-task-plan-updated";
@@ -1744,6 +1745,30 @@ struct TerminalActivityHookPayload {
     hook_timestamp_ms: u64,
     observed_at_ms: u64,
     completion_evidence: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalArchitectureActivityPayload {
+    pane_id: String,
+    instance_id: u64,
+    workspace_id: String,
+    workspace_name: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+    provider: String,
+    hook_event_name: String,
+    tool_name: String,
+    phase: String,
+    repo_path: String,
+    cwd: String,
+    graph_file_path: String,
+    graph_id: String,
+    graph_title: String,
+    source: String,
+    observed_at_ms: u64,
 }
 
 #[derive(Serialize, Clone)]

@@ -8169,6 +8169,179 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
     )
 }
 
+fn terminal_architecture_graph_path_from_text(value: &str) -> String {
+    let haystack = value.trim();
+    if haystack.is_empty() {
+        return String::new();
+    }
+    let lower = haystack.to_ascii_lowercase();
+    let markers = [
+        ".agents/architectures/graphs/",
+        ".agents\\architectures\\graphs\\",
+    ];
+    let Some(marker_index) = markers.iter().find_map(|marker| lower.find(marker)) else {
+        return String::new();
+    };
+    let is_boundary = |ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ',')
+    };
+    let mut start = 0usize;
+    for (index, ch) in haystack[..marker_index].char_indices() {
+        if is_boundary(ch) {
+            start = index + ch.len_utf8();
+        }
+    }
+    let mut end = haystack.len();
+    for (offset, ch) in haystack[marker_index..].char_indices() {
+        if is_boundary(ch) {
+            end = marker_index + offset;
+            break;
+        }
+    }
+    let path = haystack[start..end].trim_matches(|ch: char| matches!(ch, ':' | ';'));
+    if path.to_ascii_lowercase().ends_with(".arch") {
+        path.to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn terminal_architecture_graph_path_from_event(event: &Value) -> String {
+    [
+        "graphFilePath",
+        "graph_file_path",
+        "architectureGraphFilePath",
+        "architecture_graph_file_path",
+        "filePath",
+        "file_path",
+        "path",
+        "command",
+        "description",
+        "message",
+        "prompt",
+    ]
+    .iter()
+    .find_map(|key| {
+        event
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(terminal_architecture_graph_path_from_text)
+            .filter(|path| !path.is_empty())
+    })
+    .unwrap_or_default()
+}
+
+fn terminal_architecture_graph_id_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn terminal_architecture_graph_title_from_id(graph_id: &str) -> String {
+    graph_id
+        .replace(['_', '-'], " ")
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn terminal_architecture_activity_payload(
+    instance: &TerminalInstance,
+    event: &Value,
+) -> Option<TerminalArchitectureActivityPayload> {
+    let hook_event_name = terminal_activity_hook_string(
+        event,
+        &[
+            "hookEventName",
+            "hook_event_name",
+            "eventName",
+            "event_name",
+        ],
+    )?;
+    let tool_name =
+        terminal_activity_hook_string(event, &["toolName", "tool_name"]).unwrap_or_default();
+    let tool_key = terminal_activity_hook_name_key(&tool_name);
+    let graph_file_path = terminal_architecture_graph_path_from_event(event);
+    let is_architecture_tool = tool_key.contains("architecturecontext")
+        || tool_key.contains("architecturelist")
+        || tool_key.contains("architectureiconreference")
+        || tool_key.contains("architecturerevision");
+    if !is_architecture_tool && graph_file_path.is_empty() {
+        return None;
+    }
+
+    let hook_key = terminal_activity_hook_name_key(&hook_event_name);
+    let phase = if !graph_file_path.is_empty() {
+        if hook_key.contains("post") || hook_key.contains("stop") {
+            "graph_changed"
+        } else {
+            "graph_editing"
+        }
+    } else if tool_key.contains("architecturecontext") || tool_key.contains("architecturelist") {
+        "context"
+    } else if tool_key.contains("architecturerevision") {
+        "history"
+    } else {
+        "reference"
+    };
+    let metadata = instance.metadata.clone();
+    let repo_path = instance
+        .coordination
+        .as_ref()
+        .map(|coordination| coordination.repo_path.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| instance.working_directory.display().to_string());
+    let cwd = terminal_activity_hook_string(event, &["cwd"]).unwrap_or_else(|| repo_path.clone());
+    let graph_id = terminal_activity_hook_string(
+        event,
+        &["graphId", "graph_id", "architectureGraphId", "architecture_graph_id"],
+    )
+    .unwrap_or_else(|| terminal_architecture_graph_id_from_path(&graph_file_path));
+    let graph_title = terminal_activity_hook_string(
+        event,
+        &[
+            "graphTitle",
+            "graph_title",
+            "architectureGraphTitle",
+            "architecture_graph_title",
+        ],
+    )
+    .unwrap_or_else(|| terminal_architecture_graph_title_from_id(&graph_id));
+
+    Some(TerminalArchitectureActivityPayload {
+        pane_id: metadata.pane_id,
+        instance_id: instance.id,
+        workspace_id: metadata.workspace_id,
+        workspace_name: metadata.workspace_name,
+        terminal_index: metadata.terminal_index,
+        thread_id: metadata.thread_id,
+        agent_id: metadata.agent_id,
+        agent_kind: metadata.agent_kind,
+        provider: terminal_activity_hook_string(event, &["provider"]).unwrap_or_default(),
+        hook_event_name,
+        tool_name,
+        phase: phase.to_string(),
+        repo_path,
+        cwd,
+        graph_file_path,
+        graph_id,
+        graph_title,
+        source: "terminal-hook".to_string(),
+        observed_at_ms: terminal_now_ms(),
+    })
+}
+
 fn terminal_activity_hook_payload(
     instance: &TerminalInstance,
     event: &Value,
@@ -8441,8 +8614,13 @@ fn spawn_terminal_activity_hook_watcher(
                             let Ok(event) = serde_json::from_str::<Value>(line) else {
                                 continue;
                             };
+                            let architecture_payload =
+                                terminal_architecture_activity_payload(&instance, &event);
                             let Some(payload) = terminal_activity_hook_payload(&instance, &event)
                             else {
+                                if let Some(payload) = architecture_payload {
+                                    let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
+                                }
                                 let hook_event_name = terminal_activity_hook_string(
                                     &event,
                                     &[
@@ -8505,6 +8683,9 @@ fn spawn_terminal_activity_hook_watcher(
                                 .await;
                             });
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
+                            if let Some(payload) = architecture_payload {
+                                let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
+                            }
                         }
                     }
                 }
