@@ -59,6 +59,9 @@ const CLAUDE_AUTO_APPROVED_REPO_VIEW_TOOLS: &[&str] = &["Read", "Glob", "Grep", 
 const WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
+    "workspace_mcp__search_tools",
+    "workspace_mcp__list_tools",
+    "workspace_mcp__get_tool_schema",
     "workspace_mcp__get_server_status",
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
@@ -70,6 +73,9 @@ const WORKSPACE_MCP_SECRETS_TOOLS: &[&str] =
     &["secrets__list", "secrets__get", "secrets__write_env_file"];
 const WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW: &str = "always_allow";
 const WORKSPACE_MCP_APPROVAL_PROMPT: &str = "prompt";
+const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
+const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
+const WORKSPACE_MCP_EXPOSURE_HIDDEN: &str = "hidden";
 const WORKTREE_DIFF_UNTRACKED_MAX_BYTES: u64 = 1_000_000;
 pub const TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS: usize = 96;
 const TERMINAL_TASK_PLAN_MAX_STEPS: usize = 24;
@@ -462,6 +468,20 @@ fn workspace_mcp_approval_policy(value: Option<&str>) -> &'static str {
     }
 }
 
+fn workspace_mcp_exposure_mode(value: Option<&str>) -> &'static str {
+    match value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(WORKSPACE_MCP_EXPOSURE_LAZY)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pinned" | "direct" | "direct_tools" | "direct-tools" => WORKSPACE_MCP_EXPOSURE_PINNED,
+        "hidden" | "none" | "off" => WORKSPACE_MCP_EXPOSURE_HIDDEN,
+        _ => WORKSPACE_MCP_EXPOSURE_LAZY,
+    }
+}
+
 fn config_value_present(config_values: &Value, key: &str) -> bool {
     let Some(value) = config_values.get(key) else {
         return false;
@@ -629,6 +649,7 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
         "install_state": "installed",
         "workspace_enabled": true,
         "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+        "exposure_mode": WORKSPACE_MCP_EXPOSURE_PINNED,
         "agent_config_access_enabled": true,
         "agent_secret_config_access_enabled": false,
         "agent_env_file_write_enabled": true,
@@ -666,6 +687,7 @@ fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value)
         "install_state": "installed",
         "workspace_enabled": true,
         "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
+        "exposure_mode": WORKSPACE_MCP_EXPOSURE_PINNED,
         "agent_config_access_enabled": true,
         "agent_secret_config_access_enabled": true,
         "agent_env_file_write_enabled": true,
@@ -734,6 +756,7 @@ fn workspace_mcp_public_server(row: Value, client_mount_summary: &Value) -> Valu
         "install_state": install_state,
         "workspace_enabled": workspace_enabled,
         "approval_policy": workspace_mcp_approval_policy(row["approval_policy"].as_str()),
+        "exposure_mode": workspace_mcp_exposure_mode(row["exposure_mode"].as_str()),
         "agent_config_access_enabled": row["agent_config_access_enabled"].as_i64().unwrap_or(1) != 0,
         "agent_secret_config_access_enabled": row["agent_secret_config_access_enabled"].as_i64().unwrap_or_default() != 0,
         "agent_env_file_write_enabled": row["agent_env_file_write_enabled"].as_i64().unwrap_or(1) != 0,
@@ -755,7 +778,7 @@ fn workspace_mcp_public_server(row: Value, client_mount_summary: &Value) -> Valu
             client_mount_summary,
             false,
         ),
-        "runtime_note": "Installed and configurable; exposed through the workspace MCP gateway when enabled.",
+        "runtime_note": "Installed and configurable; lazy through the workspace MCP gateway by default, with optional pinned direct tools.",
         "created_at": row["created_at"].clone(),
         "updated_at": row["updated_at"].clone(),
     })
@@ -7956,7 +7979,8 @@ impl CoordinationKernel {
                  WHERE workspace_id=?1
                    AND install_state='installed'
                    AND workspace_enabled=1
-                   AND COALESCE(approval_policy, 'always_allow')='always_allow'",
+                   AND COALESCE(approval_policy, 'always_allow')='always_allow'
+                   AND COALESCE(exposure_mode, 'lazy')='pinned'",
                 &[&workspace_id],
             )
         } else {
@@ -7964,7 +7988,8 @@ impl CoordinationKernel {
                 "SELECT server_key, tools_json FROM workspace_mcp_servers
                  WHERE install_state='installed'
                    AND workspace_enabled=1
-                   AND COALESCE(approval_policy, 'always_allow')='always_allow'",
+                   AND COALESCE(approval_policy, 'always_allow')='always_allow'
+                   AND COALESCE(exposure_mode, 'lazy')='pinned'",
                 &[],
             )
         }
@@ -8497,6 +8522,7 @@ impl CoordinationKernel {
         let tools_json = json_text_or_default(input.get("tools"), json!([]))?;
         let workspace_enabled = bool_i64(input["workspace_enabled"].as_bool().unwrap_or(false));
         let approval_policy = workspace_mcp_approval_policy(input["approval_policy"].as_str());
+        let exposure_mode = workspace_mcp_exposure_mode(input["exposure_mode"].as_str());
         let agent_config_access_enabled = bool_i64(
             input["agent_config_access_enabled"]
                 .as_bool()
@@ -8545,7 +8571,7 @@ impl CoordinationKernel {
                     id, workspace_id, server_key, name, source_kind, source_label,
                     package_ref, version, transport, command, args_json, url,
                     env_schema_json, config_values_json, tools_json, install_state,
-                    workspace_enabled, approval_policy,
+                    workspace_enabled, approval_policy, exposure_mode,
                     agent_config_access_enabled, agent_secret_config_access_enabled,
                     agent_env_file_write_enabled, last_probe_status, last_probe_message,
                     created_at, updated_at
@@ -8554,7 +8580,7 @@ impl CoordinationKernel {
                     ?7, ?8, ?9, ?10, ?11, ?12,
                     ?13, ?14, ?15, 'installed',
                     ?16, ?17, ?18, ?19,
-                    ?20, ?21, ?22, ?23, ?23
+                    ?20, ?21, ?22, ?23, ?24, ?24
                 )
                 ON CONFLICT(workspace_id, server_key) DO UPDATE SET
                     name=excluded.name,
@@ -8572,6 +8598,7 @@ impl CoordinationKernel {
                     install_state='installed',
                     workspace_enabled=excluded.workspace_enabled,
                     approval_policy=excluded.approval_policy,
+                    exposure_mode=excluded.exposure_mode,
                     agent_config_access_enabled=excluded.agent_config_access_enabled,
                     agent_secret_config_access_enabled=excluded.agent_secret_config_access_enabled,
                     agent_env_file_write_enabled=excluded.agent_env_file_write_enabled,
@@ -8596,6 +8623,7 @@ impl CoordinationKernel {
                     tools_json,
                     workspace_enabled,
                     approval_policy,
+                    exposure_mode,
                     agent_config_access_enabled,
                     agent_secret_config_access_enabled,
                     agent_env_file_write_enabled,
@@ -8722,6 +8750,7 @@ impl CoordinationKernel {
                 "source_kind": source_kind,
                 "workspace_enabled": workspace_enabled,
                 "approval_policy": approval_policy,
+                "exposure_mode": exposure_mode,
             }),
         )?;
         self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
@@ -8753,6 +8782,11 @@ impl CoordinationKernel {
             .and_then(Value::as_str)
             .map(|value| workspace_mcp_approval_policy(Some(value)))
             .unwrap_or_else(|| workspace_mcp_approval_policy(current["approval_policy"].as_str()));
+        let exposure_mode = input
+            .get("exposure_mode")
+            .and_then(Value::as_str)
+            .map(|value| workspace_mcp_exposure_mode(Some(value)))
+            .unwrap_or_else(|| workspace_mcp_exposure_mode(current["exposure_mode"].as_str()));
         let agent_config_access_enabled = input["agent_config_access_enabled"]
             .as_bool()
             .map(bool_i64)
@@ -8817,18 +8851,20 @@ impl CoordinationKernel {
                      config_values_json=?2,
                      tools_json=?3,
                      approval_policy=?4,
-                     agent_config_access_enabled=?5,
-                     agent_secret_config_access_enabled=?6,
-                     agent_env_file_write_enabled=?7,
-                     last_probe_status=?8,
-                     last_probe_message=?9,
-                     updated_at=?10
-                 WHERE workspace_id=?11 AND id=?12",
+                     exposure_mode=?5,
+                     agent_config_access_enabled=?6,
+                     agent_secret_config_access_enabled=?7,
+                     agent_env_file_write_enabled=?8,
+                     last_probe_status=?9,
+                     last_probe_message=?10,
+                     updated_at=?11
+                 WHERE workspace_id=?12 AND id=?13",
                 params![
                     workspace_enabled,
                     config_values_json,
                     tools_json,
                     approval_policy,
+                    exposure_mode,
                     agent_config_access_enabled,
                     agent_secret_config_access_enabled,
                     agent_env_file_write_enabled,
@@ -8871,6 +8907,7 @@ impl CoordinationKernel {
                 "server_id": server_id,
                 "workspace_enabled": workspace_enabled,
                 "approval_policy": approval_policy,
+                "exposure_mode": exposure_mode,
                 "agent_config_access_enabled": agent_config_access_enabled,
                 "agent_secret_config_access_enabled": agent_secret_config_access_enabled,
                 "agent_env_file_write_enabled": agent_env_file_write_enabled,
@@ -8895,6 +8932,7 @@ impl CoordinationKernel {
                 params![workspace_id, server_id],
             )
             .map_err(|error| format!("Unable to uninstall workspace MCP server: {error}"))?;
+        self.schedule_workspace_mcp_config_rewrite(workspace_id, None, "server_uninstalled");
         self.emit_event(
             "workspace_mcp_server_uninstalled",
             "kernel",
@@ -27423,8 +27461,30 @@ command = "diffforge --diff-forge-write-guard"
         let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
         let tool_section =
             "[mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools]";
-        assert!(config.contains(tool_section));
+        assert!(!config.contains(tool_section));
+        assert!(config
+            .contains("[mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__search_tools]"));
+        assert!(config
+            .contains("[mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__get_tool_schema]"));
+        assert!(
+            !config.contains("[mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__call_tool]")
+        );
         assert!(!repo.join(".claude").join("settings.local.json").exists());
+
+        kernel
+            .conn
+            .execute(
+                "UPDATE workspace_mcp_servers
+                 SET exposure_mode='pinned', updated_at=?1
+                 WHERE workspace_id='workspace-server-uuid' AND server_key='appwrite-api'",
+                rusqlite::params![now_rfc3339()],
+            )
+            .unwrap();
+        let status = kernel
+            .ensure_workspace_mcp_config(Some("workspace-server-uuid"), Some("Workspace"))
+            .unwrap();
+        let config = fs::read_to_string(status["codex_config_path"].as_str().unwrap()).unwrap();
+        assert!(config.contains(tool_section));
 
         kernel
             .conn

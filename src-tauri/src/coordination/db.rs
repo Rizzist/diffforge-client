@@ -23,6 +23,7 @@ use super::schema::{
     TERMINAL_TASK_PLAN_SCHEMA_SQL, WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
     WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
     WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME, WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
+    WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME, WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION,
     WORKSPACE_MCP_INDEX_MIGRATION_NAME, WORKSPACE_MCP_INDEX_MIGRATION_VERSION,
     WORKSPACE_MCP_INDEX_SCHEMA_SQL, WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
     WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION, WORKSPACE_MCP_REGISTRY_SCHEMA_SQL,
@@ -518,6 +519,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_terminal_task_plan_migration(connection)?);
     diagnostics.push(apply_task_source_todo_refs_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_secrets_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_exposure_mode_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -934,6 +936,45 @@ fn apply_workspace_mcp_agent_config_access_migration(
         WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
     )?;
     migration.details.splice(0..0, details);
+    Ok(migration)
+}
+
+fn apply_workspace_mcp_exposure_mode_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION,
+            WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry("Unable to initialize workspace MCP registry schema", || {
+        connection.execute_batch(WORKSPACE_MCP_REGISTRY_SCHEMA_SQL)
+    })?;
+    let added = ensure_column(
+        connection,
+        "workspace_mcp_servers",
+        "exposure_mode",
+        "TEXT NOT NULL DEFAULT 'lazy'",
+    )?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION,
+        WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        [
+            "WORKSPACE_MCP_REGISTRY_SCHEMA_SQL executed idempotently".to_string(),
+            format!(
+                "workspace_mcp_servers.exposure_mode {}",
+                if added { "added" } else { "already_present" }
+            ),
+        ],
+    );
     Ok(migration)
 }
 

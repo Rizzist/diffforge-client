@@ -32,9 +32,11 @@ const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
 const CLOUD_MCP_TODO_BODY_CACHE_FILE: &str = "todo-body-cache.json";
-const CLOUD_MCP_TODO_MIRROR_CACHE_FILE: &str = "workspace-todo-mirror.json";
+const CLOUD_MCP_TODO_MIRROR_DB_FILE: &str = "workspace-todo-mirror.sqlite";
+const CLOUD_MCP_TODO_MIRROR_ROWS_TABLE: &str = "workspace_todo_mirror_rows";
+const CLOUD_MCP_TODO_HISTORY_ROWS_TABLE: &str = "workspace_todo_history_rows";
 const CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS: usize = 2048;
-const CLOUD_MCP_TODO_MIRROR_FRESH_MS: u64 = 15_000;
+const CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS: usize = 500;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -101,7 +103,6 @@ struct CloudMcpState {
     task_history_cache: Arc<Mutex<HashMap<String, Value>>>,
     task_history_refreshes: Arc<Mutex<HashSet<String>>>,
     todo_body_cache: Arc<Mutex<HashMap<String, Value>>>,
-    todo_mirror_cache: Arc<Mutex<Value>>,
     background_sync: CloudMcpBackgroundSync,
 }
 
@@ -342,7 +343,6 @@ impl CloudMcpState {
             task_history_cache: Arc::new(Mutex::new(HashMap::new())),
             task_history_refreshes: Arc::new(Mutex::new(HashSet::new())),
             todo_body_cache: Arc::new(Mutex::new(cloud_mcp_load_todo_body_cache())),
-            todo_mirror_cache: Arc::new(Mutex::new(cloud_mcp_load_todo_mirror_cache())),
             background_sync: CloudMcpBackgroundSync {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 notify: Arc::new(tokio::sync::Notify::new()),
@@ -1651,15 +1651,7 @@ async fn cloud_mcp_status_snapshot(state: &CloudMcpState) -> CloudMcpStatus {
     let mut snapshot = cloud_mcp_snapshot(&runtime);
     drop(runtime);
     if snapshot.workspace_todos.is_none() {
-        let mut mirror = state.todo_mirror_cache.lock().await;
-        snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos(&mirror);
-        if snapshot.workspace_todos.is_none() {
-            let file_mirror = cloud_mcp_load_todo_mirror_cache();
-            snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos(&file_mirror);
-            if snapshot.workspace_todos.is_some() {
-                *mirror = file_mirror;
-            }
-        }
+        snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos_from_store();
     }
     snapshot
 }
@@ -11440,71 +11432,15 @@ fn cloud_mcp_extract_workspace_todos(value: &Value) -> Option<Value> {
     None
 }
 
-fn cloud_mcp_todo_mirror_cache_path() -> Option<PathBuf> {
+fn cloud_mcp_todo_mirror_db_path() -> Option<PathBuf> {
     let base = env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("APPDATA").map(PathBuf::from))?;
     Some(
         base.join(".diffforge")
             .join("cache")
-            .join(CLOUD_MCP_TODO_MIRROR_CACHE_FILE),
+            .join(CLOUD_MCP_TODO_MIRROR_DB_FILE),
     )
-}
-
-fn cloud_mcp_empty_todo_mirror_cache() -> Value {
-    json!({
-        "version": 1,
-        "updatedAtMs": 0,
-        "entries": {},
-    })
-}
-
-fn cloud_mcp_load_todo_mirror_cache() -> Value {
-    let Some(path) = cloud_mcp_todo_mirror_cache_path() else {
-        return cloud_mcp_empty_todo_mirror_cache();
-    };
-    let Ok(text) = fs::read_to_string(path) else {
-        return cloud_mcp_empty_todo_mirror_cache();
-    };
-    let mut cache =
-        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| cloud_mcp_empty_todo_mirror_cache());
-    cloud_mcp_ensure_todo_mirror_shape(&mut cache);
-    cache
-}
-
-fn cloud_mcp_save_todo_mirror_cache(cache: &Value) {
-    let Some(path) = cloud_mcp_todo_mirror_cache_path() else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    if let Ok(text) = serde_json::to_string(cache) {
-        let _ = fs::write(path, text);
-    }
-}
-
-fn cloud_mcp_ensure_todo_mirror_shape(cache: &mut Value) {
-    if !cache.is_object() {
-        *cache = cloud_mcp_empty_todo_mirror_cache();
-    }
-    let Some(object) = cache.as_object_mut() else {
-        return;
-    };
-    object
-        .entry("version".to_string())
-        .or_insert_with(|| json!(1));
-    object
-        .entry("updatedAtMs".to_string())
-        .or_insert_with(|| json!(0));
-    if !object
-        .get("entries")
-        .is_some_and(|entries| entries.is_object())
-    {
-        object.insert("entries".to_string(), json!({}));
-    }
 }
 
 fn cloud_mcp_todo_mirror_entry_key(
@@ -11521,26 +11457,126 @@ fn cloud_mcp_todo_mirror_entry_key(
     format!("todo-mirror-{}", cloud_mcp_short_hash(&key_material))
 }
 
-fn cloud_mcp_todo_mirror_workspace_todos(cache: &Value) -> Option<Value> {
-    let entries = cache
-        .get("entries")
-        .and_then(Value::as_object)?;
-    entries
-        .values()
-        .filter_map(|entry| {
-            let updated_ms = entry
-                .get("updatedAtMs")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let workspace_todos = entry
-                .get("workspaceTodos")
-                .or_else(|| entry.get("workspace_todos"))
-                .filter(|value| value.is_object())
-                .cloned()?;
-            Some((updated_ms, workspace_todos))
-        })
-        .max_by_key(|(updated_ms, _)| *updated_ms)
-        .map(|(_, workspace_todos)| workspace_todos)
+fn cloud_mcp_todo_mirror_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS workspace_todo_mirror_rows(
+            key TEXT PRIMARY KEY,
+            row_kind TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            todo_batch_id TEXT NOT NULL DEFAULT '',
+            dispatch_id TEXT NOT NULL DEFAULT '',
+            command_id TEXT NOT NULL DEFAULT '',
+            todo_id TEXT NOT NULL DEFAULT '',
+            target_device_id TEXT NOT NULL DEFAULT '',
+            target_workspace_id TEXT NOT NULL DEFAULT '',
+            origin_device_id TEXT NOT NULL DEFAULT '',
+            origin_workspace_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT '',
+            row_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_todo_history_rows(
+            key TEXT PRIMARY KEY,
+            row_kind TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            todo_batch_id TEXT NOT NULL DEFAULT '',
+            dispatch_id TEXT NOT NULL DEFAULT '',
+            command_id TEXT NOT NULL DEFAULT '',
+            todo_id TEXT NOT NULL DEFAULT '',
+            target_device_id TEXT NOT NULL DEFAULT '',
+            target_workspace_id TEXT NOT NULL DEFAULT '',
+            origin_device_id TEXT NOT NULL DEFAULT '',
+            origin_workspace_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT '',
+            row_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_todo_mirror_snapshots(
+            entry_key TEXT PRIMARY KEY,
+            base_url TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_workspace
+            ON workspace_todo_mirror_rows(workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_batch
+            ON workspace_todo_mirror_rows(todo_batch_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_dispatch
+            ON workspace_todo_mirror_rows(dispatch_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_command
+            ON workspace_todo_mirror_rows(command_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_todo
+            ON workspace_todo_mirror_rows(todo_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_target_device
+            ON workspace_todo_mirror_rows(target_device_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_target_workspace
+            ON workspace_todo_mirror_rows(target_workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_origin_workspace
+            ON workspace_todo_mirror_rows(origin_workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_status
+            ON workspace_todo_mirror_rows(status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_updated
+            ON workspace_todo_mirror_rows(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_seen
+            ON workspace_todo_mirror_rows(last_seen_ms);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_workspace
+            ON workspace_todo_history_rows(workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_batch
+            ON workspace_todo_history_rows(todo_batch_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_dispatch
+            ON workspace_todo_history_rows(dispatch_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_command
+            ON workspace_todo_history_rows(command_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_todo
+            ON workspace_todo_history_rows(todo_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_target_device
+            ON workspace_todo_history_rows(target_device_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_target_workspace
+            ON workspace_todo_history_rows(target_workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_origin_workspace
+            ON workspace_todo_history_rows(origin_workspace_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_status
+            ON workspace_todo_history_rows(status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_updated
+            ON workspace_todo_history_rows(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_todo_history_seen
+            ON workspace_todo_history_rows(last_seen_ms);
+        CREATE INDEX IF NOT EXISTS idx_todo_mirror_snapshots_updated
+            ON workspace_todo_mirror_snapshots(updated_at_ms);
+        ",
+    )
+}
+
+fn cloud_mcp_open_todo_mirror_conn() -> Result<rusqlite::Connection, String> {
+    let path = cloud_mcp_todo_mirror_db_path()
+        .ok_or_else(|| "Todo mirror cache path is unavailable.".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create todo mirror cache directory: {error}"))?;
+    }
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("Unable to open todo mirror SQLite cache: {error}"))?;
+    conn.busy_timeout(Duration::from_millis(2_500))
+        .map_err(|error| format!("Unable to configure todo mirror SQLite cache: {error}"))?;
+    cloud_mcp_todo_mirror_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
+    Ok(conn)
 }
 
 fn cloud_mcp_todo_mirror_text_values(input: &Value, keys: &[&str]) -> HashSet<String> {
@@ -11583,8 +11619,22 @@ fn cloud_mcp_todo_mirror_has_status_filters(input: &Value) -> bool {
         "todoIds",
         "target_device_id",
         "targetDeviceId",
+        "target_device_ids",
+        "targetDeviceIds",
         "target_workspace_id",
         "targetWorkspaceId",
+        "target_workspace_ids",
+        "targetWorkspaceIds",
+        "origin_device_id",
+        "originDeviceId",
+        "origin_device_ids",
+        "originDeviceIds",
+        "origin_workspace_id",
+        "originWorkspaceId",
+        "origin_workspace_ids",
+        "originWorkspaceIds",
+        "dispatch_status",
+        "dispatchStatus",
         "status",
         "statuses",
     ]
@@ -11756,11 +11806,18 @@ fn cloud_mcp_todo_mirror_dispatch_status_is_quiescent(status: &str) -> bool {
 }
 
 fn cloud_mcp_todo_mirror_enrich_status_row(mut row: Value) -> Value {
-    let status = cloud_mcp_payload_text(&row, &["dispatch_status", "dispatchStatus", "status"])
-        .unwrap_or_else(|| "queued".to_string());
+    let row_kind = cloud_mcp_todo_mirror_row_kind(&row);
+    let status = if row_kind == "dispatch" {
+        cloud_mcp_payload_text(&row, &["dispatch_status", "dispatchStatus", "status"])
+            .unwrap_or_else(|| "queued".to_string())
+    } else {
+        cloud_mcp_payload_text(&row, &["todo_status", "todoStatus", "status"])
+            .unwrap_or_else(|| "listed".to_string())
+    };
     let terminal = cloud_mcp_todo_mirror_dispatch_status_is_terminal(&status);
     let quiescent = cloud_mcp_todo_mirror_dispatch_status_is_quiescent(&status);
     if let Some(object) = row.as_object_mut() {
+        object.insert("mirror_row_kind".to_string(), json!(row_kind.as_str()));
         if let Some(dispatch_id) =
             cloud_mcp_payload_text(&Value::Object(object.clone()), &["todo_dispatch_id", "todoDispatchId"])
         {
@@ -11772,8 +11829,13 @@ fn cloud_mcp_todo_mirror_enrich_status_row(mut row: Value) -> Value {
                 .or_insert_with(|| json!(dispatch_id));
         }
         object.insert("status".to_string(), json!(status.as_str()));
-        object.insert("dispatch_status".to_string(), json!(status.as_str()));
-        object.insert("dispatchStatus".to_string(), json!(status.as_str()));
+        if row_kind == "dispatch" {
+            object.insert("dispatch_status".to_string(), json!(status.as_str()));
+            object.insert("dispatchStatus".to_string(), json!(status.as_str()));
+        } else {
+            object.insert("todo_status".to_string(), json!(status.as_str()));
+            object.insert("todoStatus".to_string(), json!(status.as_str()));
+        }
         object.insert("terminal".to_string(), json!(terminal));
         object.insert("is_terminal".to_string(), json!(terminal));
         object.insert("isTerminal".to_string(), json!(terminal));
@@ -11809,18 +11871,83 @@ fn cloud_mcp_todo_mirror_enrich_status_row(mut row: Value) -> Value {
     row
 }
 
+fn cloud_mcp_todo_mirror_row_kind(row: &Value) -> String {
+    if cloud_mcp_payload_text(row, &["mirror_row_kind", "mirrorRowKind"]).as_deref()
+        == Some("todo")
+    {
+        return "todo".to_string();
+    }
+    if cloud_mcp_payload_text(
+        row,
+        &[
+            "dispatch_id",
+            "dispatchId",
+            "todo_dispatch_id",
+            "todoDispatchId",
+            "command_id",
+            "commandId",
+            "dispatch_status",
+            "dispatchStatus",
+        ],
+    )
+    .is_some()
+    {
+        "dispatch".to_string()
+    } else {
+        "todo".to_string()
+    }
+}
+
 fn cloud_mcp_todo_mirror_status_row_key(row: &Value) -> Option<String> {
-    cloud_mcp_payload_text(row, &["dispatch_id", "dispatchId", "todo_dispatch_id", "todoDispatchId"])
+    let row_kind = cloud_mcp_todo_mirror_row_kind(row);
+    let key = if row_kind == "dispatch" {
+        cloud_mcp_payload_text(
+            row,
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+            ],
+        )
         .or_else(|| cloud_mcp_payload_text(row, &["command_id", "commandId"]))
         .or_else(|| {
-            let batch_id = cloud_mcp_payload_text(row, &["todo_batch_id", "todoBatchId", "batch_id", "batchId"])?;
-            let todo_id = cloud_mcp_payload_text(row, &["todo_id", "todoId", "id"]).unwrap_or_default();
+            let batch_id = cloud_mcp_payload_text(
+                row,
+                &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+            )?;
+            let todo_id =
+                cloud_mcp_payload_text(row, &["todo_id", "todoId", "id"]).unwrap_or_default();
             let target_device_id =
-                cloud_mcp_payload_text(row, &["target_device_id", "targetDeviceId"]).unwrap_or_default();
+                cloud_mcp_payload_text(row, &["target_device_id", "targetDeviceId"])
+                    .unwrap_or_default();
             let target_workspace_id =
-                cloud_mcp_payload_text(row, &["target_workspace_id", "targetWorkspaceId"]).unwrap_or_default();
-            Some(format!("{batch_id}::{todo_id}::{target_device_id}::{target_workspace_id}"))
+                cloud_mcp_payload_text(row, &["target_workspace_id", "targetWorkspaceId"])
+                    .unwrap_or_default();
+            Some(format!(
+                "{batch_id}::{todo_id}::{target_device_id}::{target_workspace_id}"
+            ))
         })
+    } else {
+        let todo_id = cloud_mcp_payload_text(row, &["todo_id", "todoId", "id"])?;
+        let workspace_id = cloud_mcp_payload_text(
+            row,
+            &[
+                "todo_workspace_id",
+                "todoWorkspaceId",
+                "workspace_id",
+                "workspaceId",
+            ],
+        )
+        .unwrap_or_default();
+        let device_id = cloud_mcp_payload_text(
+            row,
+            &["todo_device_id", "todoDeviceId", "device_id", "deviceId"],
+        )
+        .unwrap_or_default();
+        Some(format!("{workspace_id}::{device_id}::{todo_id}"))
+    }?;
+    Some(format!("{row_kind}::{key}"))
 }
 
 fn cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(
@@ -11846,6 +11973,54 @@ fn cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(
             for entry in entries {
                 if let Some(items) = entry.get("items").and_then(Value::as_array) {
                     rows.extend(items.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
+fn cloud_mcp_todo_mirror_collect_workspace_todo_rows(workspace_todos: &Value, rows: &mut Vec<Value>) {
+    for key in ["items", "todos", "workspaceItems", "workspace_items"] {
+        if let Some(items) = workspace_todos
+            .get(key)
+            .and_then(|value| value.get("items").or(Some(value)))
+            .and_then(Value::as_array)
+        {
+            rows.extend(items.iter().cloned().map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("mirror_row_kind".to_string(), json!("todo"));
+                }
+                item
+            }));
+        }
+    }
+    for key in [
+        "items_by_workspace",
+        "itemsByWorkspace",
+        "todos_by_workspace",
+        "todosByWorkspace",
+        "workspaceItemsByWorkspace",
+        "workspace_items_by_workspace",
+    ] {
+        if let Some(entries) = workspace_todos.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                let observer_workspace_id =
+                    cloud_mcp_payload_text(entry, &["workspace_id", "workspaceId"]);
+                if let Some(items) = entry.get("items").and_then(Value::as_array) {
+                    rows.extend(items.iter().cloned().map(|mut item| {
+                        if let Some(object) = item.as_object_mut() {
+                            object.insert("mirror_row_kind".to_string(), json!("todo"));
+                            if let Some(workspace_id) = observer_workspace_id.as_deref() {
+                                object
+                                    .entry("workspace_id".to_string())
+                                    .or_insert_with(|| json!(workspace_id));
+                                object
+                                    .entry("workspaceId".to_string())
+                                    .or_insert_with(|| json!(workspace_id));
+                            }
+                        }
+                        item
+                    }));
                 }
             }
         }
@@ -11896,6 +12071,74 @@ fn cloud_mcp_todo_mirror_collect_status_rows(value: &Value, rows: &mut Vec<Value
     }
 }
 
+fn cloud_mcp_todo_mirror_rows_from_response(value: &Value) -> Vec<Value> {
+    let mut rows = cloud_mcp_todo_mirror_status_rows_from_response(value);
+    if let Some(workspace_todos) = cloud_mcp_extract_workspace_todos(value) {
+        cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(&workspace_todos, &mut rows);
+        cloud_mcp_todo_mirror_collect_workspace_todo_rows(&workspace_todos, &mut rows);
+    }
+    cloud_mcp_todo_mirror_dedupe_rows(rows)
+}
+
+fn cloud_mcp_compact_workspace_todos_metadata(workspace_todos: &Value) -> Value {
+    let mut metadata = workspace_todos.clone();
+    let Some(object) = metadata.as_object_mut() else {
+        return json!({});
+    };
+    for key in [
+        "items",
+        "todos",
+        "workspaceItems",
+        "workspace_items",
+        "dispatches",
+        "workspaceDispatches",
+        "workspace_dispatches",
+    ] {
+        if let Some(value) = object.get_mut(key) {
+            let count = value
+                .get("count")
+                .and_then(Value::as_u64)
+                .or_else(|| value.get("items").and_then(Value::as_array).map(|items| items.len() as u64))
+                .or_else(|| value.as_array().map(|items| items.len() as u64))
+                .unwrap_or(0);
+            *value = json!({
+                "known": count > 0,
+                "count": count,
+                "items": [],
+                "itemsStoredIn": "sqlite",
+            });
+        }
+    }
+    for key in [
+        "items_by_workspace",
+        "itemsByWorkspace",
+        "todos_by_workspace",
+        "todosByWorkspace",
+        "workspaceItemsByWorkspace",
+        "workspace_items_by_workspace",
+        "dispatches_by_workspace",
+        "dispatchesByWorkspace",
+        "workspaceDispatchesByWorkspace",
+        "workspace_dispatches_by_workspace",
+    ] {
+        if let Some(entries) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for entry in entries {
+                if let Some(entry_object) = entry.as_object_mut() {
+                    let count = entry_object
+                        .get("count")
+                        .and_then(Value::as_u64)
+                        .or_else(|| entry_object.get("items").and_then(Value::as_array).map(|items| items.len() as u64))
+                        .unwrap_or(0);
+                    entry_object.insert("count".to_string(), json!(count));
+                    entry_object.insert("items".to_string(), json!([]));
+                    entry_object.insert("itemsStoredIn".to_string(), json!("sqlite"));
+                }
+            }
+        }
+    }
+    metadata
+}
+
 fn cloud_mcp_todo_mirror_dedupe_rows(rows: Vec<Value>) -> Vec<Value> {
     let mut keyed = HashMap::<String, Value>::new();
     let mut unkeyed = Vec::new();
@@ -11926,64 +12169,244 @@ fn cloud_mcp_todo_mirror_status_rows_from_response(value: &Value) -> Vec<Value> 
     cloud_mcp_todo_mirror_dedupe_rows(rows)
 }
 
-fn cloud_mcp_update_todo_mirror_cache(
-    cache: &mut Value,
+fn cloud_mcp_todo_mirror_row_column(row: &Value, keys: &[&str]) -> String {
+    cloud_mcp_payload_text(row, keys)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_todo_mirror_upsert_rows_into(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    source: &str,
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    rows: &[Value],
+    now_ms: u64,
+) -> Result<(), String> {
+    let table_name = match table_name {
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE | CLOUD_MCP_TODO_HISTORY_ROWS_TABLE => table_name,
+        _ => return Err("Invalid todo mirror table name.".to_string()),
+    };
+    let base_url = base_url.unwrap_or_default();
+    let repo_id = repo_id.unwrap_or_default();
+    let observer_workspace_id = workspace_id.unwrap_or_default();
+    for row in rows {
+        let row_kind = cloud_mcp_todo_mirror_row_kind(row);
+        let Some(key) = cloud_mcp_todo_mirror_status_row_key(row) else {
+            continue;
+        };
+        let key = format!(
+            "{}::{}::{}::{}",
+            cloud_mcp_todo_mirror_entry_key(Some(base_url), Some(repo_id), Some(observer_workspace_id)),
+            row_kind,
+            repo_id,
+            key
+        );
+        let todo_batch_id = cloud_mcp_todo_mirror_row_column(
+            row,
+            &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+        );
+        let dispatch_id = cloud_mcp_todo_mirror_row_column(
+            row,
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+            ],
+        );
+        let command_id = cloud_mcp_todo_mirror_row_column(row, &["command_id", "commandId"]);
+        let todo_id = cloud_mcp_todo_mirror_row_column(row, &["todo_id", "todoId", "id"]);
+        let target_device_id =
+            cloud_mcp_todo_mirror_row_column(row, &["target_device_id", "targetDeviceId"]);
+        let target_workspace_id =
+            cloud_mcp_todo_mirror_row_column(row, &["target_workspace_id", "targetWorkspaceId"]);
+        let origin_device_id = cloud_mcp_todo_mirror_row_column(
+            row,
+            &[
+                "todo_device_id",
+                "todoDeviceId",
+                "requested_by_device_id",
+                "requestedByDeviceId",
+                "device_id",
+                "deviceId",
+            ],
+        );
+        let origin_workspace_id = cloud_mcp_todo_mirror_row_column(
+            row,
+            &[
+                "todo_workspace_id",
+                "todoWorkspaceId",
+                "requested_by_workspace_id",
+                "requestedByWorkspaceId",
+                "workspace_id",
+                "workspaceId",
+            ],
+        );
+        let status = if row_kind == "dispatch" {
+            cloud_mcp_todo_mirror_row_column(row, &["status", "dispatch_status", "dispatchStatus"])
+        } else {
+            cloud_mcp_todo_mirror_row_column(row, &["status", "todo_status", "todoStatus"])
+        };
+        let updated_at = cloud_mcp_todo_mirror_row_column(
+            row,
+            &[
+                "updated_at",
+                "updatedAt",
+                "last_seen_at",
+                "lastSeenAt",
+                "completed_at",
+                "completedAt",
+                "created_at",
+                "createdAt",
+            ],
+        );
+        let row_json = serde_json::to_string(row).unwrap_or_else(|_| "{}".to_string());
+        let sql = format!(
+            "INSERT INTO {table_name}(
+                key, row_kind, base_url, repo_id, workspace_id,
+                todo_batch_id, dispatch_id, command_id, todo_id,
+                target_device_id, target_workspace_id, origin_device_id, origin_workspace_id,
+                status, updated_at, mirror_updated_at_ms, last_seen_ms, source, row_json
+             ) VALUES(
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19
+             )
+             ON CONFLICT(key) DO UPDATE SET
+                row_kind=excluded.row_kind,
+                base_url=excluded.base_url,
+                repo_id=excluded.repo_id,
+                workspace_id=excluded.workspace_id,
+                todo_batch_id=excluded.todo_batch_id,
+                dispatch_id=excluded.dispatch_id,
+                command_id=excluded.command_id,
+                todo_id=excluded.todo_id,
+                target_device_id=excluded.target_device_id,
+                target_workspace_id=excluded.target_workspace_id,
+                origin_device_id=excluded.origin_device_id,
+                origin_workspace_id=excluded.origin_workspace_id,
+                status=excluded.status,
+                updated_at=excluded.updated_at,
+                mirror_updated_at_ms=excluded.mirror_updated_at_ms,
+                last_seen_ms=excluded.last_seen_ms,
+                source=excluded.source,
+                row_json=excluded.row_json"
+        );
+        conn.execute(
+            &sql,
+            rusqlite::params![
+                key,
+                row_kind,
+                base_url,
+                repo_id,
+                observer_workspace_id,
+                todo_batch_id,
+                dispatch_id,
+                command_id,
+                todo_id,
+                target_device_id,
+                target_workspace_id,
+                origin_device_id,
+                origin_workspace_id,
+                status,
+                updated_at,
+                now_ms,
+                now_ms,
+                source,
+                row_json,
+            ],
+        )
+        .map_err(|error| format!("Unable to upsert todo mirror row: {error}"))?;
+    }
+    Ok(())
+}
+
+fn cloud_mcp_todo_mirror_upsert_rows(
+    conn: &rusqlite::Connection,
+    source: &str,
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    rows: &[Value],
+    now_ms: u64,
+) -> Result<(), String> {
+    cloud_mcp_todo_mirror_upsert_rows_into(
+        conn,
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+        source,
+        base_url,
+        repo_id,
+        workspace_id,
+        rows,
+        now_ms,
+    )
+}
+
+fn cloud_mcp_update_todo_mirror_conn(
+    conn: &rusqlite::Connection,
     source: &str,
     base_url: Option<&str>,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
     response: &Value,
-) -> bool {
-    cloud_mcp_ensure_todo_mirror_shape(cache);
+) -> Result<bool, String> {
+    cloud_mcp_todo_mirror_init_conn(conn)
+        .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
     let workspace_todos = cloud_mcp_extract_workspace_todos(response);
-    let new_status_rows = cloud_mcp_todo_mirror_status_rows_from_response(response);
-    if workspace_todos.is_none() && new_status_rows.is_empty() {
-        return false;
+    let rows = cloud_mcp_todo_mirror_rows_from_response(response);
+    if workspace_todos.is_none() && rows.is_empty() {
+        return Ok(false);
     }
     let now_ms = cloud_mcp_now_ms();
     let key = cloud_mcp_todo_mirror_entry_key(base_url, repo_id, workspace_id);
-    let Some(entries) = cache
-        .get_mut("entries")
-        .and_then(Value::as_object_mut)
-    else {
-        return false;
-    };
-    let entry = entries.entry(key.clone()).or_insert_with(|| json!({}));
-    if !entry.is_object() {
-        *entry = json!({});
-    }
-    let Some(object) = entry.as_object_mut() else {
-        return false;
-    };
-    object.insert("key".to_string(), json!(key));
-    object.insert("source".to_string(), json!(source));
-    object.insert("baseUrl".to_string(), json!(base_url.unwrap_or_default()));
-    object.insert("repoId".to_string(), json!(repo_id.unwrap_or_default()));
-    object.insert(
-        "workspaceId".to_string(),
-        json!(workspace_id.unwrap_or_default()),
-    );
-    object.insert("updatedAtMs".to_string(), json!(now_ms));
     if let Some(workspace_todos) = workspace_todos {
-        object.insert("workspaceTodos".to_string(), workspace_todos.clone());
-        object.insert("workspace_todos".to_string(), workspace_todos);
+        let metadata = cloud_mcp_compact_workspace_todos_metadata(&workspace_todos);
+        let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT INTO workspace_todo_mirror_snapshots(
+                entry_key, base_url, repo_id, workspace_id, source, updated_at_ms, metadata_json
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(entry_key) DO UPDATE SET
+                base_url=excluded.base_url,
+                repo_id=excluded.repo_id,
+                workspace_id=excluded.workspace_id,
+                source=excluded.source,
+                updated_at_ms=excluded.updated_at_ms,
+                metadata_json=excluded.metadata_json",
+            rusqlite::params![
+                key,
+                base_url.unwrap_or_default(),
+                repo_id.unwrap_or_default(),
+                workspace_id.unwrap_or_default(),
+                source,
+                now_ms,
+                metadata_json,
+            ],
+        )
+        .map_err(|error| format!("Unable to upsert todo mirror snapshot: {error}"))?;
     }
-    if !new_status_rows.is_empty() {
-        let mut rows = object
-            .get("statusRows")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        rows.extend(new_status_rows);
-        let rows = cloud_mcp_todo_mirror_dedupe_rows(rows);
-        object.insert("statusRows".to_string(), json!(rows.clone()));
-        object.insert("status_rows".to_string(), json!(rows));
-    }
-    if let Some(cache_object) = cache.as_object_mut() {
-        cache_object.insert("updatedAtMs".to_string(), json!(now_ms));
-        cache_object.insert("updated_at_ms".to_string(), json!(now_ms));
-    }
-    true
+    cloud_mcp_todo_mirror_upsert_rows(conn, source, base_url, repo_id, workspace_id, &rows, now_ms)?;
+    let history_rows = rows
+        .iter()
+        .filter(|row| cloud_mcp_todo_mirror_row_kind(row) == "dispatch")
+        .cloned()
+        .collect::<Vec<_>>();
+    cloud_mcp_todo_mirror_upsert_rows_into(
+        conn,
+        CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+        source,
+        base_url,
+        repo_id,
+        workspace_id,
+        &history_rows,
+        now_ms,
+    )?;
+    Ok(true)
 }
 
 async fn cloud_mcp_update_todo_mirror_from_response(
@@ -11995,7 +12418,7 @@ async fn cloud_mcp_update_todo_mirror_from_response(
 ) {
     let should_consider = endpoint == "/v1/status" || endpoint.contains("/workspace/todos");
     let workspace_todos = cloud_mcp_extract_workspace_todos(response);
-    let has_status_rows = !cloud_mcp_todo_mirror_status_rows_from_response(response).is_empty();
+    let has_status_rows = !cloud_mcp_todo_mirror_rows_from_response(response).is_empty();
     if !should_consider && workspace_todos.is_none() && !has_status_rows {
         return;
     }
@@ -12009,16 +12432,15 @@ async fn cloud_mcp_update_todo_mirror_from_response(
     let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspaceId"]));
-    let mut cache = state.todo_mirror_cache.lock().await;
-    if cloud_mcp_update_todo_mirror_cache(
-        &mut cache,
-        source,
-        Some(&base_url),
-        repo_id.as_deref(),
-        workspace_id.as_deref(),
-        response,
-    ) {
-        cloud_mcp_save_todo_mirror_cache(&cache);
+    if let Ok(conn) = cloud_mcp_open_todo_mirror_conn() {
+        let _ = cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            source,
+            Some(&base_url),
+            repo_id.as_deref(),
+            workspace_id.as_deref(),
+            response,
+        );
     }
 }
 
@@ -12029,16 +12451,9 @@ fn cloud_mcp_update_todo_mirror_file_from_response(
     workspace_id: Option<&str>,
     response: &Value,
 ) {
-    let mut cache = cloud_mcp_load_todo_mirror_cache();
-    if cloud_mcp_update_todo_mirror_cache(
-        &mut cache,
-        source,
-        base_url,
-        repo_id,
-        workspace_id,
-        response,
-    ) {
-        cloud_mcp_save_todo_mirror_cache(&cache);
+    if let Ok(conn) = cloud_mcp_open_todo_mirror_conn() {
+        let _ =
+            cloud_mcp_update_todo_mirror_conn(&conn, source, base_url, repo_id, workspace_id, response);
     }
 }
 
@@ -12103,8 +12518,217 @@ fn cloud_mcp_todo_mirror_aggregate(rows: &[Value]) -> Value {
     })
 }
 
-fn cloud_mcp_todo_mirror_status_from_cache(
-    cache: &Value,
+fn cloud_mcp_todo_mirror_push_in_clause(
+    clauses: &mut Vec<String>,
+    params: &mut Vec<String>,
+    columns: &[&str],
+    filters: HashSet<String>,
+) {
+    if filters.is_empty() {
+        return;
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(filters.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let column_clause = columns
+        .iter()
+        .map(|column| format!("{column} IN ({placeholders})"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    clauses.push(format!("({column_clause})"));
+    let values = filters.into_iter().collect::<Vec<_>>();
+    for _ in columns {
+        params.extend(values.iter().cloned());
+    }
+}
+
+fn cloud_mcp_todo_mirror_dispatch_rows_from_conn(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+    limit: usize,
+    max_age_ms: Option<u64>,
+) -> Option<(Vec<Value>, u64)> {
+    let table_name = match table_name {
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE | CLOUD_MCP_TODO_HISTORY_ROWS_TABLE => table_name,
+        _ => return None,
+    };
+    cloud_mcp_todo_mirror_init_conn(conn).ok()?;
+    let now_ms = cloud_mcp_now_ms();
+    let mut clauses = vec!["row_kind='dispatch'".to_string()];
+    let mut params = Vec::<String>::new();
+    if let Some(max_age_ms) = max_age_ms {
+        clauses.push("last_seen_ms>=?".to_string());
+        params.push(now_ms.saturating_sub(max_age_ms).to_string());
+    }
+    if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
+        clauses.push("repo_id=?".to_string());
+        params.push(repo_id.to_string());
+    }
+    let include_all = cloud_mcp_payload_bool(input, &["include_all"], false)
+        || cloud_mcp_payload_bool(input, &["includeAll"], false);
+    if !include_all {
+        if let Some(workspace_id) = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            clauses.push(
+                "(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string(),
+            );
+            params.push(workspace_id.to_string());
+            params.push(workspace_id.to_string());
+            params.push(workspace_id.to_string());
+        }
+    }
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["todo_batch_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["dispatch_id", "command_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+                "dispatch_ids",
+                "dispatchIds",
+            ],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["todo_id"],
+        cloud_mcp_todo_mirror_text_values(input, &["todo_id", "todoId", "todo_ids", "todoIds"]),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["target_device_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "target_device_id",
+                "targetDeviceId",
+                "target_device_ids",
+                "targetDeviceIds",
+            ],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["target_workspace_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "target_workspace_id",
+                "targetWorkspaceId",
+                "target_workspace_ids",
+                "targetWorkspaceIds",
+            ],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["origin_device_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "origin_device_id",
+                "originDeviceId",
+                "origin_device_ids",
+                "originDeviceIds",
+            ],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["origin_workspace_id"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "origin_workspace_id",
+                "originWorkspaceId",
+                "origin_workspace_ids",
+                "originWorkspaceIds",
+            ],
+        ),
+    );
+    cloud_mcp_todo_mirror_push_in_clause(
+        &mut clauses,
+        &mut params,
+        &["status"],
+        cloud_mcp_todo_mirror_text_values(
+            input,
+            &["status", "statuses", "dispatch_status", "dispatchStatus"],
+        ),
+    );
+    let query_limit = ((limit * 4).clamp(limit, CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS)) as i64;
+    let sql = format!(
+        "SELECT row_json, last_seen_ms
+         FROM {table_name}
+         WHERE {}
+         ORDER BY updated_at DESC, last_seen_ms DESC
+         LIMIT {}",
+        clauses.join(" AND "),
+        query_limit,
+    );
+    let mut statement = conn.prepare(&sql).ok()?;
+    let rows_iter = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let row_json: String = row.get(0)?;
+            let last_seen_ms: i64 = row.get(1)?;
+            Ok((row_json, last_seen_ms))
+        })
+        .ok()?;
+    let mut latest_updated_ms = 0u64;
+    let mut rows = Vec::new();
+    for row in rows_iter.flatten() {
+        let (row_json, last_seen_ms) = row;
+        latest_updated_ms = latest_updated_ms.max(last_seen_ms.max(0) as u64);
+        if let Ok(value) = serde_json::from_str::<Value>(&row_json) {
+            rows.push(value);
+        }
+    }
+    let mut rows = cloud_mcp_todo_mirror_dedupe_rows(rows)
+        .into_iter()
+        .filter(|row| cloud_mcp_todo_mirror_row_matches_request(row, workspace_id, input))
+        .take(limit)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let left_time = cloud_mcp_payload_text(
+            left,
+            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+        )
+        .unwrap_or_default();
+        let right_time = cloud_mcp_payload_text(
+            right,
+            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+        )
+        .unwrap_or_default();
+        right_time.cmp(&left_time)
+    });
+    Some((rows, latest_updated_ms))
+}
+
+fn cloud_mcp_todo_mirror_status_from_conn(
+    conn: &rusqlite::Connection,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
     input: &Value,
@@ -12113,60 +12737,18 @@ fn cloud_mcp_todo_mirror_status_from_cache(
     let limit = cloud_mcp_payload_i64(input, &["limit"])
         .unwrap_or(100)
         .clamp(1, 500) as usize;
-    let entries = cache.get("entries").and_then(Value::as_object)?;
-    let now_ms = cloud_mcp_now_ms();
-    let mut rows = Vec::new();
-    let mut latest_updated_ms = 0u64;
-    for entry in entries.values() {
-        let entry_updated_ms = entry
-            .get("updatedAtMs")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if max_age_ms.is_some_and(|max_age_ms| now_ms.saturating_sub(entry_updated_ms) > max_age_ms)
-        {
-            continue;
-        }
-        let entry_repo_id = cloud_mcp_payload_text(entry, &["repoId", "repo_id"]);
-        if let Some(repo_id) = repo_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            if entry_repo_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some_and(|entry_repo_id| entry_repo_id != repo_id)
-            {
-                continue;
-            }
-        }
-        latest_updated_ms = latest_updated_ms.max(entry_updated_ms);
-        if let Some(status_rows) = entry.get("statusRows").and_then(Value::as_array) {
-            rows.extend(status_rows.iter().cloned());
-        }
-        if let Some(workspace_todos) = entry
-            .get("workspaceTodos")
-            .or_else(|| entry.get("workspace_todos"))
-        {
-            cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(workspace_todos, &mut rows);
-        }
-    }
-    let mut rows = cloud_mcp_todo_mirror_dedupe_rows(rows)
-        .into_iter()
-        .filter(|row| cloud_mcp_todo_mirror_row_matches_request(row, workspace_id, input))
-        .take(limit)
-        .collect::<Vec<_>>();
+    let (rows, latest_updated_ms) = cloud_mcp_todo_mirror_dispatch_rows_from_conn(
+        conn,
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+        repo_id,
+        workspace_id,
+        input,
+        limit,
+        max_age_ms,
+    )?;
     if rows.is_empty() {
         return None;
     }
-    rows.sort_by(|left, right| {
-        let left_time = cloud_mcp_payload_text(left, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
-            .unwrap_or_default();
-        let right_time =
-            cloud_mcp_payload_text(right, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
-                .unwrap_or_default();
-        right_time.cmp(&left_time)
-    });
     let count = rows.len();
     let aggregate = cloud_mcp_todo_mirror_aggregate(&rows);
     let terminal = aggregate
@@ -12202,37 +12784,555 @@ fn cloud_mcp_todo_mirror_status_from_cache(
     }))
 }
 
-fn cloud_mcp_todo_mirror_status_from_file(
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
-    input: &Value,
-) -> Option<Value> {
-    let cache = cloud_mcp_load_todo_mirror_cache();
-    cloud_mcp_todo_mirror_status_from_cache(
-        &cache,
-        repo_id,
-        workspace_id,
-        input,
-        Some(CLOUD_MCP_TODO_MIRROR_FRESH_MS),
-    )
+fn cloud_mcp_todo_status_empty_response(input: &Value, error: Option<String>) -> Value {
+    let aggregate = cloud_mcp_todo_mirror_aggregate(&[]);
+    let mut response = json!({
+        "kind": "todo_status",
+        "items": [],
+        "count": 0,
+        "aggregate": aggregate,
+        "terminal": false,
+        "watch_cursor": "",
+        "watchCursor": "",
+        "body_transport": "refs",
+        "bodyTransport": "refs",
+        "source": "local_todo_mirror",
+        "freshness": "local",
+        "local_only": true,
+        "localOnly": true,
+        "mirror_fresh": false,
+        "mirrorFresh": false,
+        "mirror_updated_at_ms": 0,
+        "mirrorUpdatedAtMs": 0,
+        "has_filters": cloud_mcp_todo_mirror_has_status_filters(input),
+        "hasFilters": cloud_mcp_todo_mirror_has_status_filters(input),
+    });
+    if let Some(error) = error {
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "mirror_error".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+            object.insert(
+                "mirrorError".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+        }
+    }
+    response
 }
 
-fn cloud_mcp_todo_mirror_stale_status_from_file(
+fn cloud_mcp_todo_status_from_file(
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
     input: &Value,
-) -> Option<Value> {
-    let cache = cloud_mcp_load_todo_mirror_cache();
-    cloud_mcp_todo_mirror_status_from_cache(&cache, repo_id, workspace_id, input, None).map(
-        |mut value| {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("freshness".to_string(), json!("stale"));
-                object.insert("mirror_fresh".to_string(), json!(false));
-                object.insert("mirrorFresh".to_string(), json!(false));
+) -> Value {
+    match cloud_mcp_open_todo_mirror_conn() {
+        Ok(conn) => {
+            let mut status = cloud_mcp_todo_mirror_status_from_conn(
+                &conn,
+                repo_id,
+                workspace_id,
+                input,
+                None,
+            )
+            .unwrap_or_else(|| cloud_mcp_todo_status_empty_response(input, None));
+            if let Some(object) = status.as_object_mut() {
+                object.insert("freshness".to_string(), json!("local"));
+                object.insert("local_only".to_string(), json!(true));
+                object.insert("localOnly".to_string(), json!(true));
             }
-            value
+            status
+        }
+        Err(error) => cloud_mcp_todo_status_empty_response(input, Some(error)),
+    }
+}
+
+fn cloud_mcp_todo_history_empty_response(input: &Value, error: Option<String>) -> Value {
+    let rows = Vec::<Value>::new();
+    let mut response = json!({
+        "kind": "todo_history",
+        "items": rows,
+        "count": 0,
+        "aggregate": cloud_mcp_todo_mirror_aggregate(&[]),
+        "body_transport": "refs",
+        "bodyTransport": "refs",
+        "source": "local_todo_history",
+        "history_source": "sqlite",
+        "historySource": "sqlite",
+        "local_only": true,
+        "localOnly": true,
+        "has_filters": cloud_mcp_todo_mirror_has_status_filters(input),
+        "hasFilters": cloud_mcp_todo_mirror_has_status_filters(input),
+    });
+    if let Some(error) = error {
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "mirror_error".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+            object.insert(
+                "mirrorError".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+        }
+    }
+    response
+}
+
+fn cloud_mcp_todo_history_from_conn(
+    conn: &rusqlite::Connection,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+) -> Value {
+    let limit = cloud_mcp_payload_i64(input, &["limit"])
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let (mut rows, mut latest_updated_ms, mut history_source) =
+        match cloud_mcp_todo_mirror_dispatch_rows_from_conn(
+            conn,
+            CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+            repo_id,
+            workspace_id,
+            input,
+            limit,
+            None,
+        ) {
+            Some((rows, latest_updated_ms)) => {
+                (rows, latest_updated_ms, "sqlite_history".to_string())
+            }
+            None => (Vec::new(), 0, "sqlite_history".to_string()),
+        };
+    if rows.is_empty() {
+        if let Some((fallback_rows, fallback_updated_ms)) =
+            cloud_mcp_todo_mirror_dispatch_rows_from_conn(
+                conn,
+                CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+                repo_id,
+                workspace_id,
+                input,
+                limit,
+                None,
+            )
+        {
+            if !fallback_rows.is_empty() {
+                rows = fallback_rows;
+                latest_updated_ms = fallback_updated_ms;
+                history_source = "sqlite_status_mirror".to_string();
+            }
+        }
+    }
+    let count = rows.len();
+    let aggregate = cloud_mcp_todo_mirror_aggregate(&rows);
+    json!({
+        "kind": "todo_history",
+        "items": rows,
+        "count": count,
+        "aggregate": aggregate,
+        "body_transport": "refs",
+        "bodyTransport": "refs",
+        "source": "local_todo_history",
+        "history_source": history_source.clone(),
+        "historySource": history_source,
+        "local_only": true,
+        "localOnly": true,
+        "mirror_updated_at_ms": latest_updated_ms,
+        "mirrorUpdatedAtMs": latest_updated_ms,
+        "has_filters": cloud_mcp_todo_mirror_has_status_filters(input),
+        "hasFilters": cloud_mcp_todo_mirror_has_status_filters(input),
+    })
+}
+
+fn cloud_mcp_todo_history_from_file(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+) -> Value {
+    match cloud_mcp_open_todo_mirror_conn() {
+        Ok(conn) => cloud_mcp_todo_history_from_conn(&conn, repo_id, workspace_id, input),
+        Err(error) => cloud_mcp_todo_history_empty_response(input, Some(error)),
+    }
+}
+
+fn cloud_mcp_todo_targets_empty_response(
+    workspace_id: Option<&str>,
+    error: Option<String>,
+) -> Value {
+    let mut response = json!({
+        "kind": "todo_targets",
+        "mode_support": ["listed", "queued"],
+        "workspace_id": workspace_id.unwrap_or_default(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "targets": [],
+        "target_count": 0,
+        "targetCount": 0,
+        "workspace_todos": {},
+        "workspaceTodos": {},
+        "source": "local_todo_mirror",
+        "local_only": true,
+        "localOnly": true,
+        "mirror_present": false,
+        "mirrorPresent": false,
+    });
+    if let Some(error) = error {
+        if let Some(object) = response.as_object_mut() {
+            object.insert(
+                "mirror_error".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+            object.insert(
+                "mirrorError".to_string(),
+                json!(clean_terminal_telemetry_text(&error)),
+            );
+        }
+    }
+    response
+}
+
+fn cloud_mcp_todo_targets_from_conn(
+    conn: &rusqlite::Connection,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Value {
+    let Some(workspace_todos) =
+        cloud_mcp_todo_mirror_workspace_todos_from_conn(conn, repo_id, workspace_id)
+    else {
+        return cloud_mcp_todo_targets_empty_response(workspace_id, None);
+    };
+    let targets = cloud_mcp_proxy_todo_targets_from_workspace_todos(&workspace_todos, workspace_id);
+    let target_count = targets.len();
+    json!({
+        "kind": "todo_targets",
+        "mode_support": ["listed", "queued"],
+        "workspace_id": workspace_id.unwrap_or_default(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "targets": targets,
+        "target_count": target_count,
+        "targetCount": target_count,
+        "workspace_todos": workspace_todos.clone(),
+        "workspaceTodos": workspace_todos,
+        "source": "local_todo_mirror",
+        "local_only": true,
+        "localOnly": true,
+        "mirror_present": true,
+        "mirrorPresent": true,
+    })
+}
+
+fn cloud_mcp_todo_targets_from_file(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Value {
+    match cloud_mcp_open_todo_mirror_conn() {
+        Ok(conn) => cloud_mcp_todo_targets_from_conn(&conn, repo_id, workspace_id),
+        Err(error) => cloud_mcp_todo_targets_empty_response(workspace_id, Some(error)),
+    }
+}
+
+fn cloud_mcp_todo_mirror_snapshot_metadata(
+    conn: &rusqlite::Connection,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> (Value, u64) {
+    let mut clauses = Vec::<String>::new();
+    let mut params = Vec::<String>::new();
+    if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
+        clauses.push("repo_id=?".to_string());
+        params.push(repo_id.to_string());
+    }
+    if let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        clauses.push("workspace_id=?".to_string());
+        params.push(workspace_id.to_string());
+    }
+    let sql = if clauses.is_empty() {
+        "SELECT metadata_json, updated_at_ms
+         FROM workspace_todo_mirror_snapshots
+         ORDER BY updated_at_ms DESC
+         LIMIT 1"
+            .to_string()
+    } else {
+        format!(
+            "SELECT metadata_json, updated_at_ms
+             FROM workspace_todo_mirror_snapshots
+             WHERE {}
+             ORDER BY updated_at_ms DESC
+             LIMIT 1",
+            clauses.join(" AND ")
+        )
+    };
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(_) => return (json!({}), 0),
+    };
+    statement
+        .query_row(rusqlite::params_from_iter(params.iter()), |row| {
+            let text: String = row.get(0)?;
+            let updated_at_ms: i64 = row.get(1)?;
+            Ok((text, updated_at_ms))
+        })
+        .ok()
+        .map(|(text, updated_at_ms)| {
+            (
+                serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({})),
+                updated_at_ms.max(0) as u64,
+            )
+        })
+        .unwrap_or_else(|| (json!({}), 0))
+}
+
+fn cloud_mcp_todo_mirror_snapshot_rows(
+    conn: &rusqlite::Connection,
+    row_kind: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    limit: usize,
+) -> Vec<(Value, String)> {
+    let mut clauses = vec!["row_kind=?".to_string()];
+    let mut params = vec![row_kind.to_string()];
+    if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
+        clauses.push("repo_id=?".to_string());
+        params.push(repo_id.to_string());
+    }
+    if let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        clauses.push(
+            "(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string(),
+        );
+        params.push(workspace_id.to_string());
+        params.push(workspace_id.to_string());
+        params.push(workspace_id.to_string());
+    }
+    params.push(limit.max(1).to_string());
+    let sql = format!(
+        "SELECT row_json,
+                COALESCE(NULLIF(workspace_id, ''), NULLIF(origin_workspace_id, ''), target_workspace_id, '') AS group_workspace_id
+         FROM workspace_todo_mirror_rows
+         WHERE {}
+         ORDER BY last_seen_ms DESC, updated_at DESC
+         LIMIT ?",
+        clauses.join(" AND ")
+    );
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let mapped = match statement.query_map(
+        rusqlite::params_from_iter(params.iter()),
+        |row| {
+            let row_json: String = row.get(0)?;
+            let workspace_id: String = row.get(1)?;
+            Ok((row_json, workspace_id))
         },
-    )
+    ) {
+        Ok(mapped) => mapped,
+        Err(_) => return Vec::new(),
+    };
+    mapped
+        .flatten()
+        .filter_map(|(row_json, workspace_id)| {
+            serde_json::from_str::<Value>(&row_json)
+                .ok()
+                .map(|value| (value, workspace_id))
+        })
+        .collect()
+}
+
+fn cloud_mcp_todo_mirror_count_rows(
+    conn: &rusqlite::Connection,
+    row_kind: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> usize {
+    let mut clauses = vec!["row_kind=?".to_string()];
+    let mut params = vec![row_kind.to_string()];
+    if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
+        clauses.push("repo_id=?".to_string());
+        params.push(repo_id.to_string());
+    }
+    if let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        clauses.push(
+            "(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string(),
+        );
+        params.push(workspace_id.to_string());
+        params.push(workspace_id.to_string());
+        params.push(workspace_id.to_string());
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM workspace_todo_mirror_rows WHERE {}",
+        clauses.join(" AND ")
+    );
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(_) => return 0,
+    };
+    statement
+        .query_row(rusqlite::params_from_iter(params.iter()), |row| {
+            row.get::<_, i64>(0)
+        })
+        .ok()
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0)
+}
+
+fn cloud_mcp_todo_mirror_group_rows_by_workspace(rows: &[(Value, String)]) -> Vec<Value> {
+    let mut grouped = HashMap::<String, Vec<Value>>::new();
+    for (row, workspace_id) in rows {
+        grouped
+            .entry(workspace_id.trim().to_string())
+            .or_default()
+            .push(row.clone());
+    }
+    let mut entries = grouped
+        .into_iter()
+        .map(|(workspace_id, items)| {
+            json!({
+                "workspace_id": workspace_id,
+                "workspaceId": workspace_id,
+                "observer_workspace_id": workspace_id,
+                "observerWorkspaceId": workspace_id,
+                "known": !items.is_empty(),
+                "count": items.len(),
+                "items": items,
+            })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        let left_id = cloud_mcp_payload_text(left, &["workspace_id"]).unwrap_or_default();
+        let right_id = cloud_mcp_payload_text(right, &["workspace_id"]).unwrap_or_default();
+        left_id.cmp(&right_id)
+    });
+    entries
+}
+
+fn cloud_mcp_todo_mirror_workspace_todos_from_conn(
+    conn: &rusqlite::Connection,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Option<Value> {
+    let (metadata, metadata_updated_at_ms) =
+        cloud_mcp_todo_mirror_snapshot_metadata(conn, repo_id, workspace_id);
+    let metadata_is_empty = metadata
+        .as_object()
+        .map(|object| object.is_empty())
+        .unwrap_or(true);
+    let todo_rows = cloud_mcp_todo_mirror_snapshot_rows(
+        conn,
+        "todo",
+        repo_id,
+        workspace_id,
+        CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS,
+    );
+    let dispatch_rows = cloud_mcp_todo_mirror_snapshot_rows(
+        conn,
+        "dispatch",
+        repo_id,
+        workspace_id,
+        CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS,
+    );
+    if metadata_is_empty && todo_rows.is_empty() && dispatch_rows.is_empty() {
+        return None;
+    }
+    let todo_count = cloud_mcp_todo_mirror_count_rows(conn, "todo", repo_id, workspace_id);
+    let dispatch_count =
+        cloud_mcp_todo_mirror_count_rows(conn, "dispatch", repo_id, workspace_id);
+    let todo_items = todo_rows
+        .iter()
+        .map(|(row, _)| row.clone())
+        .collect::<Vec<_>>();
+    let dispatch_items = dispatch_rows
+        .iter()
+        .map(|(row, _)| row.clone())
+        .collect::<Vec<_>>();
+    let mut workspace_todos = metadata;
+    if !workspace_todos.is_object() {
+        workspace_todos = json!({});
+    }
+    let Some(object) = workspace_todos.as_object_mut() else {
+        return None;
+    };
+    object.insert("known".to_string(), json!(todo_count > 0 || dispatch_count > 0));
+    object.insert("count".to_string(), json!(todo_count));
+    object.insert("dispatch_count".to_string(), json!(dispatch_count));
+    object.insert("dispatchCount".to_string(), json!(dispatch_count));
+    object.insert("mirror_source".to_string(), json!("sqlite"));
+    object.insert("mirrorSource".to_string(), json!("sqlite"));
+    object.insert(
+        "mirror_updated_at_ms".to_string(),
+        json!(metadata_updated_at_ms),
+    );
+    object.insert(
+        "mirrorUpdatedAtMs".to_string(),
+        json!(metadata_updated_at_ms),
+    );
+    object.insert(
+        "mirror_truncated".to_string(),
+        json!(
+            todo_count > CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS
+                || dispatch_count > CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS
+        ),
+    );
+    object.insert(
+        "mirrorTruncated".to_string(),
+        object
+            .get("mirror_truncated")
+            .cloned()
+            .unwrap_or_else(|| json!(false)),
+    );
+    object.insert(
+        "items".to_string(),
+        json!({
+            "known": !todo_items.is_empty(),
+            "count": todo_count,
+            "items": todo_items,
+            "limit": CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS,
+        }),
+    );
+    object.insert(
+        "dispatches".to_string(),
+        json!({
+            "known": !dispatch_items.is_empty(),
+            "count": dispatch_count,
+            "items": dispatch_items,
+            "limit": CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS,
+        }),
+    );
+    object.insert(
+        "items_by_workspace".to_string(),
+        json!(cloud_mcp_todo_mirror_group_rows_by_workspace(&todo_rows)),
+    );
+    object.insert(
+        "itemsByWorkspace".to_string(),
+        object
+            .get("items_by_workspace")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    );
+    object.insert(
+        "dispatches_by_workspace".to_string(),
+        json!(cloud_mcp_todo_mirror_group_rows_by_workspace(&dispatch_rows)),
+    );
+    object.insert(
+        "dispatchesByWorkspace".to_string(),
+        object
+            .get("dispatches_by_workspace")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    );
+    Some(workspace_todos)
+}
+
+fn cloud_mcp_todo_mirror_workspace_todos_from_store() -> Option<Value> {
+    let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, None, None)
 }
 
 fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
@@ -12903,7 +14003,8 @@ mod cloud_mcp_tests {
 
     #[test]
     fn todo_mirror_status_filters_cached_workspace_dispatches() {
-        let mut cache = cloud_mcp_empty_todo_mirror_cache();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let response = json!({
             "workspaceTodos": {
                 "dispatchesByWorkspace": [{
@@ -12922,21 +14023,22 @@ mod cloud_mcp_tests {
                 }]
             }
         });
-        assert!(cloud_mcp_update_todo_mirror_cache(
-            &mut cache,
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
             "test",
             Some("https://cloud.example"),
             Some("repo-1"),
             Some("workspace-a"),
             &response,
-        ));
+        )
+        .unwrap());
 
-        let status = cloud_mcp_todo_mirror_status_from_cache(
-            &cache,
+        let status = cloud_mcp_todo_mirror_status_from_conn(
+            &conn,
             Some("repo-1"),
             Some("workspace-a"),
             &json!({"batch_id": "batch-1"}),
-            Some(CLOUD_MCP_TODO_MIRROR_FRESH_MS),
+            None,
         )
         .expect("cached status");
 
@@ -12944,6 +14046,115 @@ mod cloud_mcp_tests {
         assert_eq!(status["count"].as_u64(), Some(1));
         assert_eq!(status["aggregate"]["status"].as_str(), Some("running"));
         assert_eq!(status["terminal"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn todo_status_empty_response_stays_local_only() {
+        let status = cloud_mcp_todo_status_empty_response(&json!({"batch_id": "missing"}), None);
+
+        assert_eq!(status["kind"].as_str(), Some("todo_status"));
+        assert_eq!(status["source"].as_str(), Some("local_todo_mirror"));
+        assert_eq!(status["local_only"].as_bool(), Some(true));
+        assert_eq!(status["count"].as_u64(), Some(0));
+        assert_eq!(status["aggregate"]["status"].as_str(), Some("empty"));
+        assert_eq!(status["terminal"].as_bool(), Some(false));
+        assert_eq!(status["has_filters"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn todo_targets_read_sqlite_snapshot_locally() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "workspaceTodos": {
+                "dispatchTargetsByWorkspace": [{
+                    "workspaceId": "workspace-a",
+                    "items": [{
+                        "targetDeviceId": "device-b",
+                        "targetWorkspaceId": "workspace-b",
+                        "targetDeviceName": "Laptop",
+                        "targetWorkspaceName": "Cloud Repo"
+                    }]
+                }]
+            }
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &response,
+        )
+        .unwrap());
+
+        let targets = cloud_mcp_todo_targets_from_conn(
+            &conn,
+            Some("repo-1"),
+            Some("workspace-a"),
+        );
+
+        assert_eq!(targets["kind"].as_str(), Some("todo_targets"));
+        assert_eq!(targets["source"].as_str(), Some("local_todo_mirror"));
+        assert_eq!(targets["local_only"].as_bool(), Some(true));
+        assert_eq!(targets["target_count"].as_u64(), Some(1));
+        assert_eq!(
+            targets["targets"][0]["target_device_id"].as_str(),
+            Some("device-b")
+        );
+        assert_eq!(
+            targets["targets"][0]["target_workspace_id"].as_str(),
+            Some("workspace-b")
+        );
+    }
+
+    #[test]
+    fn todo_history_reads_sqlite_rows_locally() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "kind": "todo_history",
+            "items": [{
+                "todoBatchId": "batch-1",
+                "dispatchId": "dispatch-1",
+                "commandId": "command-1",
+                "todoId": "todo-1",
+                "todoWorkspaceId": "workspace-a",
+                "targetWorkspaceId": "workspace-b",
+                "targetDeviceId": "device-b",
+                "dispatchStatus": "completed",
+                "updatedAt": "2026-06-07T00:00:00Z"
+            }]
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &response,
+        )
+        .unwrap());
+
+        let history = cloud_mcp_todo_history_from_conn(
+            &conn,
+            Some("repo-1"),
+            Some("workspace-a"),
+            &json!({"batch_id": "batch-1"}),
+        );
+
+        assert_eq!(history["kind"].as_str(), Some("todo_history"));
+        assert_eq!(history["source"].as_str(), Some("local_todo_history"));
+        assert_eq!(
+            history["history_source"].as_str(),
+            Some("sqlite_history")
+        );
+        assert_eq!(history["local_only"].as_bool(), Some(true));
+        assert_eq!(history["count"].as_u64(), Some(1));
+        assert_eq!(
+            history["aggregate"]["status"].as_str(),
+            Some("completed")
+        );
     }
 
     #[tokio::test]
@@ -13557,11 +14768,11 @@ impl CloudMcpProxyIdentity {
 
 pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
     repo_path: Option<&str>,
-    db_path: Option<&Path>,
+    _db_path: Option<&Path>,
     workspace_id: Option<&str>,
-    base_url_override: Option<&str>,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
+    _base_url_override: Option<&str>,
+    _agent_id: Option<&str>,
+    _session_id: Option<&str>,
 ) -> Result<Value, String> {
     let repo_path_text = repo_path
         .map(str::trim)
@@ -13570,98 +14781,10 @@ pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
     let repo_id = repo_path_text
         .as_deref()
         .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
-    let base_url = base_url_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(cloud_mcp_base_url);
-    let identity = CloudMcpProxyIdentity {
-        base_url: Some(base_url.clone()),
-        repo_path: repo_path_text.as_ref().map(PathBuf::from),
-        repo_id,
-        workspace_id: workspace_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        workspace_name: None,
-        agent_id: agent_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        session_id: session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        coordination_db_path: db_path.map(Path::to_path_buf),
-        pane_id: None,
-        terminal_instance_id: None,
-        slot_key: None,
-        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
-        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
-    };
-    let request = cloud_mcp_proxy_agent_base_payload(
-        &identity,
-        "rust-diffforge-agent-list-todo-targets",
-    );
-    identity.log(
-        "cloud_mcp.agent_list_todo_targets.start",
-        "list_todo_targets",
-        json!({
-            "activity": "agent list todo targets",
-            "baseUrl": base_url,
-        }),
-    );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/status", &request.to_string()) {
-        Ok(response) => {
-            let parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            let data = parsed.get("data").cloned().unwrap_or(parsed);
-            cloud_mcp_update_todo_mirror_file_from_response(
-                "list_todo_targets",
-                Some(&base_url),
-                identity.repo_id.as_deref(),
-                identity.workspace_id.as_deref(),
-                &data,
-            );
-            let workspace_todos = data
-                .get("workspace_todos")
-                .or_else(|| data.get("workspaceTodos"))
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let targets = cloud_mcp_proxy_todo_targets_from_workspace_todos(
-                &workspace_todos,
-                identity.workspace_id.as_deref(),
-            );
-            identity.log(
-                "cloud_mcp.agent_list_todo_targets.done",
-                "list_todo_targets",
-                json!({
-                    "activity": "agent todo targets listed",
-                    "baseUrl": base_url,
-                    "targetCount": targets.len(),
-                }),
-            );
-            Ok(json!({
-                "kind": "todo_targets",
-                "mode_support": ["listed", "queued"],
-                "workspace_id": identity.workspace_id,
-                "targets": targets,
-                "workspace_todos": workspace_todos,
-            }))
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_list_todo_targets.error",
-                "list_todo_targets",
-                json!({
-                    "activity": "agent list todo targets failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
-    }
+    Ok(cloud_mcp_todo_targets_from_file(
+        repo_id.as_deref(),
+        workspace_id,
+    ))
 }
 
 pub(crate) fn cloud_mcp_forward_agent_send_todos(
@@ -13689,11 +14812,11 @@ pub(crate) fn cloud_mcp_forward_agent_send_todos(
 
 pub(crate) fn cloud_mcp_forward_agent_get_todo_status(
     repo_path: Option<&str>,
-    db_path: Option<&Path>,
+    _db_path: Option<&Path>,
     workspace_id: Option<&str>,
-    base_url_override: Option<&str>,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
+    _base_url_override: Option<&str>,
+    _agent_id: Option<&str>,
+    _session_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
     let repo_path_text = repo_path
@@ -13703,62 +14826,34 @@ pub(crate) fn cloud_mcp_forward_agent_get_todo_status(
     let repo_id = repo_path_text
         .as_deref()
         .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
-    if let Some(local) =
-        cloud_mcp_todo_mirror_status_from_file(repo_id.as_deref(), workspace_id, input)
-    {
-        return Ok(local);
-    }
-    let remote = cloud_mcp_forward_agent_todo_request(
-        repo_path,
-        db_path,
+    Ok(cloud_mcp_todo_status_from_file(
+        repo_id.as_deref(),
         workspace_id,
-        base_url_override,
-        agent_id,
-        session_id,
         input,
-        "/v1/workspace/todos/status",
-        "get_todo_status",
-        "rust-diffforge-agent-get-todo-status",
-    );
-    match remote {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            if let Some(mut stale) =
-                cloud_mcp_todo_mirror_stale_status_from_file(repo_id.as_deref(), workspace_id, input)
-            {
-                if let Some(object) = stale.as_object_mut() {
-                    object.insert("refresh_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                    object.insert("refreshError".to_string(), json!(clean_terminal_telemetry_text(&error)));
-                }
-                Ok(stale)
-            } else {
-                Err(error)
-            }
-        }
-    }
+    ))
 }
 
 pub(crate) fn cloud_mcp_forward_agent_list_todo_history(
     repo_path: Option<&str>,
-    db_path: Option<&Path>,
+    _db_path: Option<&Path>,
     workspace_id: Option<&str>,
-    base_url_override: Option<&str>,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
+    _base_url_override: Option<&str>,
+    _agent_id: Option<&str>,
+    _session_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
-    cloud_mcp_forward_agent_todo_request(
-        repo_path,
-        db_path,
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    Ok(cloud_mcp_todo_history_from_file(
+        repo_id.as_deref(),
         workspace_id,
-        base_url_override,
-        agent_id,
-        session_id,
         input,
-        "/v1/workspace/todos/history",
-        "list_todo_history",
-        "rust-diffforge-agent-list-todo-history",
-    )
+    ))
 }
 
 pub(crate) fn cloud_mcp_forward_agent_wait_for_todos(
@@ -14156,7 +15251,12 @@ fn cloud_mcp_proxy_push_todo_target(
     }
     if let Some(object) = item.as_object_mut() {
         object.insert("targetDeviceId".to_string(), json!(target_device_id));
+        object.insert("target_device_id".to_string(), json!(target_device_id));
         object.insert("targetWorkspaceId".to_string(), json!(target_workspace_id));
+        object.insert(
+            "target_workspace_id".to_string(),
+            json!(target_workspace_id),
+        );
         object.insert("sameAccount".to_string(), json!(true));
         object.insert("same_account".to_string(), json!(true));
         object.insert("supportsListed".to_string(), json!(true));

@@ -45,6 +45,10 @@ pub const TOOL_NAMES: &[&str] = &[
 const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
+    "workspace_mcp__search_tools",
+    "workspace_mcp__list_tools",
+    "workspace_mcp__get_tool_schema",
+    "workspace_mcp__call_tool",
     "workspace_mcp__get_server_status",
     "workspace_mcp__get_server_config",
     "workspace_mcp__write_env_file",
@@ -52,6 +56,9 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "secrets__get",
     "secrets__write_env_file",
 ];
+const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
+const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
+const WORKSPACE_MCP_EXPOSURE_HIDDEN: &str = "hidden";
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -975,42 +982,17 @@ fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
     for server in servers
         .iter()
         .filter(|server| workspace_gateway_server_runtime_enabled(server))
+        .filter(|server| workspace_gateway_server_pinned(server))
     {
         let server_key = server["server_key"].as_str().unwrap_or_default();
         if server_key.is_empty() {
             continue;
         }
-        let child_tools = match workspace_gateway_child_list_tools(server) {
-            Ok(child_tools) => {
-                let tools = child_tools
-                    .iter()
-                    .filter_map(|tool| tool["name"].as_str().filter(|value| !value.is_empty()))
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                let _ = kernel.record_workspace_mcp_probe_result(
-                    &workspace_id,
-                    server_key,
-                    "healthy",
-                    &format!(
-                        "Workspace gateway listed {} tool{} from this MCP.",
-                        tools.len(),
-                        if tools.len() == 1 { "" } else { "s" }
-                    ),
-                    Some(json!(tools)),
-                );
-                child_tools
-            }
-            Err(error) => {
-                let _ = kernel.record_workspace_mcp_probe_result(
-                    &workspace_id,
-                    server_key,
-                    workspace_gateway_connection_error_status(&error),
-                    &error,
-                    Some(json!([])),
-                );
-                continue;
-            }
-        };
+        let child_tools =
+            match workspace_gateway_refresh_child_tools(&kernel, &workspace_id, server) {
+                Ok(child_tools) => child_tools,
+                Err(_) => continue,
+            };
         for tool in child_tools {
             let Some(tool_name) = tool["name"].as_str().filter(|value| !value.is_empty()) else {
                 continue;
@@ -1079,6 +1061,24 @@ fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value
                 "generation": manifest["generation"],
                 "servers": manifest["servers"],
             })),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__search_tools" => match workspace_gateway_search_tools(context, &input) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__list_tools" => match workspace_gateway_list_tools(context, &input) {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__get_tool_schema" => {
+            match workspace_gateway_get_tool_schema(context, &input) {
+                Ok(result) => workspace_gateway_content(result),
+                Err(error) => workspace_gateway_error_content(error),
+            }
+        }
+        "workspace_mcp__call_tool" => match workspace_gateway_call_tool(context, &input) {
+            Ok(result) => result,
             Err(error) => workspace_gateway_error_content(error),
         },
         "workspace_mcp__get_server_status" => match workspace_gateway_manifest(context) {
@@ -1157,6 +1157,16 @@ fn workspace_gateway_external_tool(context: &McpContext, tool: &str, input: Valu
             "Workspace MCP `{server_key}` is not enabled or configured for this workspace. Call workspace_mcp__sync_manifest for current MCPs."
         ));
     }
+    if workspace_gateway_server_hidden(&server) {
+        return workspace_gateway_error_content(format!(
+            "Workspace MCP `{server_key}` is hidden from coding agents."
+        ));
+    }
+    if !workspace_gateway_server_pinned(&server) {
+        return workspace_gateway_error_content(format!(
+            "Workspace MCP `{server_key}` is in lazy exposure mode. Use workspace_mcp__call_tool with server_key `{server_key}` and tool_name `{child_tool}`."
+        ));
+    }
     match workspace_gateway_child_call_tool(&server, child_tool, input) {
         Ok(result) => result,
         Err(error) => {
@@ -1178,6 +1188,18 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "Refresh the agent's knowledge of enabled workspace MCPs, their namespaces, and config status."
         }
         "workspace_mcp__list_servers" => "List installed workspace MCP servers and runtime status.",
+        "workspace_mcp__search_tools" => {
+            "Search enabled lazy or pinned workspace MCP tools by server, name, or description without loading every tool schema into model context."
+        }
+        "workspace_mcp__list_tools" => {
+            "List compact tool metadata for enabled lazy or pinned workspace MCPs. Use get_tool_schema for one full schema when needed."
+        }
+        "workspace_mcp__get_tool_schema" => {
+            "Return the full child MCP tool schema for exactly one enabled workspace MCP tool."
+        }
+        "workspace_mcp__call_tool" => {
+            "Call one enabled workspace MCP child tool by server_key and tool_name. Use search_tools or get_tool_schema first when arguments are unclear."
+        }
         "workspace_mcp__get_server_status" => "Inspect one workspace MCP server by server_key.",
         "workspace_mcp__get_server_config" => {
             "Read agent-visible workspace MCP configuration. Non-secret values are exposed by default; secret values are redacted unless explicitly enabled for that MCP."
@@ -1200,6 +1222,42 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
 
 fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
     match tool {
+        "workspace_mcp__search_tools" => json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional search text matched against server names, tool names, and descriptions."},
+                "server_key": {"type": "string", "description": "Optional workspace MCP server key to restrict search."},
+                "limit": {"type": "integer", "description": "Maximum compact results to return.", "default": 25, "maximum": 100}
+            },
+            "additionalProperties": true
+        }),
+        "workspace_mcp__list_tools" => json!({
+            "type": "object",
+            "properties": {
+                "server_key": {"type": "string", "description": "Optional workspace MCP server key. Omit to list compact tools for all enabled MCPs."},
+                "limit": {"type": "integer", "description": "Maximum compact results to return.", "default": 100, "maximum": 200}
+            },
+            "additionalProperties": true
+        }),
+        "workspace_mcp__get_tool_schema" => json!({
+            "type": "object",
+            "properties": {
+                "server_key": {"type": "string", "description": "Required workspace MCP server key unless qualified_name is provided."},
+                "tool_name": {"type": "string", "description": "Required child MCP tool name unless qualified_name is provided."},
+                "qualified_name": {"type": "string", "description": "Optional namespaced tool name formatted as server_key__tool_name."}
+            },
+            "additionalProperties": true
+        }),
+        "workspace_mcp__call_tool" => json!({
+            "type": "object",
+            "properties": {
+                "server_key": {"type": "string", "description": "Required workspace MCP server key unless qualified_name is provided."},
+                "tool_name": {"type": "string", "description": "Required child MCP tool name unless qualified_name is provided."},
+                "qualified_name": {"type": "string", "description": "Optional namespaced tool name formatted as server_key__tool_name."},
+                "arguments": {"type": "object", "description": "Arguments passed to the child MCP tool.", "additionalProperties": true}
+            },
+            "additionalProperties": true
+        }),
         "workspace_mcp__get_server_status" | "workspace_mcp__get_server_config" => json!({
             "type": "object",
             "properties": {
@@ -1258,6 +1316,316 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
         }),
         _ => json!({"type": "object", "properties": {}}),
     }
+}
+
+fn workspace_gateway_search_tools(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let query = input["query"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let terms = query
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let server_key = input["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = workspace_gateway_limit(input, 25, 100);
+    let mut rows = workspace_gateway_collect_tool_rows(context, server_key, 200)?;
+    if !terms.is_empty() {
+        rows.retain(|row| {
+            let haystack = [
+                row["server_key"].as_str().unwrap_or_default(),
+                row["server_name"].as_str().unwrap_or_default(),
+                row["tool_name"].as_str().unwrap_or_default(),
+                row["qualified_name"].as_str().unwrap_or_default(),
+                row["description"].as_str().unwrap_or_default(),
+            ]
+            .join(" ")
+            .to_ascii_lowercase();
+            terms.iter().all(|term| haystack.contains(term))
+        });
+    }
+    let total_matches = rows.len();
+    rows.truncate(limit);
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "query": query,
+        "server_key": server_key,
+        "total_matches": total_matches,
+        "returned_count": rows.len(),
+        "tools": rows,
+        "schema_hint": "Call workspace_mcp__get_tool_schema for the full schema of one result, then workspace_mcp__call_tool to invoke it."
+    }))
+}
+
+fn workspace_gateway_list_tools(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let server_key = input["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let limit = workspace_gateway_limit(input, 100, 200);
+    let rows = workspace_gateway_collect_tool_rows(context, server_key, limit)?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server_key": server_key,
+        "returned_count": rows.len(),
+        "tools": rows,
+        "schema_hint": "Compact rows omit full inputSchema. Call workspace_mcp__get_tool_schema for one tool."
+    }))
+}
+
+fn workspace_gateway_get_tool_schema(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let (server_key, tool_name) = workspace_gateway_tool_identity(input)?;
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let server = workspace_gateway_required_callable_server(&kernel, &workspace_id, &server_key)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let child_tools = workspace_gateway_refresh_child_tools(&kernel, &workspace_id, &server)?;
+    let tool = child_tools
+        .into_iter()
+        .find(|tool| tool["name"].as_str() == Some(tool_name.as_str()))
+        .ok_or_else(|| format!("Workspace MCP `{server_key}` has no tool `{tool_name}`."))?;
+    Ok(json!({
+        "ok": true,
+        "workspace_id": workspace_id,
+        "generation": generation,
+        "server": workspace_gateway_server_public(&server),
+        "tool": {
+            "server_key": server_key,
+            "server_name": server["name"].as_str().unwrap_or(server_key.as_str()),
+            "tool_name": tool_name,
+            "qualified_name": workspace_gateway_tool_name(&server_key, tool["name"].as_str().unwrap_or_default()),
+            "description": tool["description"].as_str().unwrap_or(""),
+            "inputSchema": tool.get("inputSchema").cloned().unwrap_or_else(|| json!({"type": "object"})),
+        }
+    }))
+}
+
+fn workspace_gateway_call_tool(context: &McpContext, input: &Value) -> Result<Value, String> {
+    let (server_key, tool_name) = workspace_gateway_tool_identity(input)?;
+    let arguments = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let server = workspace_gateway_required_callable_server(&kernel, &workspace_id, &server_key)?;
+    match workspace_gateway_child_call_tool(&server, &tool_name, arguments) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let _ = kernel.record_workspace_mcp_probe_result(
+                &workspace_id,
+                &server_key,
+                workspace_gateway_connection_error_status(&error),
+                &error,
+                None,
+            );
+            Err(error)
+        }
+    }
+}
+
+fn workspace_gateway_collect_tool_rows(
+    context: &McpContext,
+    server_key_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Value>, String> {
+    let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
+    let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
+    let explicit_server = server_key_filter.is_some();
+    let servers =
+        workspace_gateway_candidate_tool_servers(&kernel, &workspace_id, server_key_filter)?;
+    let mut rows = Vec::new();
+    for server in servers {
+        let child_tools =
+            match workspace_gateway_refresh_child_tools(&kernel, &workspace_id, &server) {
+                Ok(child_tools) => child_tools,
+                Err(error) if explicit_server => return Err(error),
+                Err(_) => continue,
+            };
+        for tool in child_tools {
+            let Some(tool_name) = tool["name"].as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            rows.push(workspace_gateway_compact_tool_row(
+                &server,
+                &tool,
+                &generation,
+                tool_name,
+            ));
+            if rows.len() >= limit {
+                return Ok(rows);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn workspace_gateway_candidate_tool_servers(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+    server_key_filter: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    if let Some(server_key) = server_key_filter {
+        let server = workspace_gateway_required_callable_server(kernel, workspace_id, server_key)?;
+        return Ok(vec![server]);
+    }
+    let servers = workspace_gateway_servers(kernel, workspace_id)?
+        .into_iter()
+        .filter(|server| workspace_gateway_server_agent_callable(server))
+        .collect::<Vec<_>>();
+    Ok(servers)
+}
+
+fn workspace_gateway_required_callable_server(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+    server_key: &str,
+) -> Result<Value, String> {
+    let server = workspace_gateway_server_by_key(kernel, workspace_id, server_key)?
+        .ok_or_else(|| format!("Workspace MCP `{server_key}` is not installed."))?;
+    if !workspace_gateway_server_runtime_enabled(&server) {
+        return Err(format!(
+            "Workspace MCP `{server_key}` is not enabled or configured for this workspace."
+        ));
+    }
+    if workspace_gateway_server_hidden(&server) {
+        return Err(format!(
+            "Workspace MCP `{server_key}` is hidden from coding agents."
+        ));
+    }
+    Ok(server)
+}
+
+fn workspace_gateway_refresh_child_tools(
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+    server: &Value,
+) -> Result<Vec<Value>, String> {
+    let server_key = server["server_key"].as_str().unwrap_or_default();
+    match workspace_gateway_child_list_tools(server) {
+        Ok(child_tools) => {
+            let tools = child_tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().filter(|value| !value.is_empty()))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let _ = kernel.record_workspace_mcp_probe_result(
+                workspace_id,
+                server_key,
+                "healthy",
+                &format!(
+                    "Workspace gateway listed {} tool{} from this MCP.",
+                    tools.len(),
+                    if tools.len() == 1 { "" } else { "s" }
+                ),
+                Some(json!(tools)),
+            );
+            Ok(child_tools)
+        }
+        Err(error) => {
+            let _ = kernel.record_workspace_mcp_probe_result(
+                workspace_id,
+                server_key,
+                workspace_gateway_connection_error_status(&error),
+                &error,
+                Some(json!([])),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn workspace_gateway_compact_tool_row(
+    server: &Value,
+    tool: &Value,
+    generation: &str,
+    tool_name: &str,
+) -> Value {
+    let server_key = server["server_key"].as_str().unwrap_or_default();
+    json!({
+        "server_key": server_key,
+        "server_name": server["name"].as_str().unwrap_or(server_key),
+        "tool_name": tool_name,
+        "qualified_name": workspace_gateway_tool_name(server_key, tool_name),
+        "description": tool["description"].as_str().unwrap_or(""),
+        "exposure_mode": workspace_gateway_server_exposure_mode(server),
+        "generation": generation,
+        "input_summary": workspace_gateway_input_schema_summary(tool.get("inputSchema")),
+    })
+}
+
+fn workspace_gateway_input_schema_summary(schema: Option<&Value>) -> Value {
+    let Some(schema) = schema else {
+        return json!({"type": "object", "property_count": 0});
+    };
+    let properties = schema["properties"]
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .take(12)
+                .map(|(name, value)| {
+                    json!({
+                        "name": name,
+                        "type": value["type"].as_str().unwrap_or("unknown"),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "type": schema["type"].as_str().unwrap_or("object"),
+        "property_count": schema["properties"].as_object().map(|object| object.len()).unwrap_or_default(),
+        "properties": properties,
+        "required": schema["required"].as_array().cloned().unwrap_or_default(),
+        "additional_properties": schema["additionalProperties"].clone(),
+    })
+}
+
+fn workspace_gateway_tool_identity(input: &Value) -> Result<(String, String), String> {
+    if let Some(qualified) = input["qualified_name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some((server_key, tool_name)) = qualified.split_once("__") {
+            if !server_key.trim().is_empty() && !tool_name.trim().is_empty() {
+                return Ok((server_key.trim().to_string(), tool_name.trim().to_string()));
+            }
+        }
+        return Err("qualified_name must be formatted as server_key__tool_name.".to_string());
+    }
+
+    let server_key = input["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let tool_name = input["tool_name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (server_key, tool_name) {
+        (Some(server_key), Some(tool_name)) => Ok((server_key.to_string(), tool_name.to_string())),
+        _ => Err(
+            "server_key and tool_name are required unless qualified_name is provided.".to_string(),
+        ),
+    }
+}
+
+fn workspace_gateway_limit(input: &Value, default: usize, maximum: usize) -> usize {
+    input["limit"]
+        .as_u64()
+        .map(|value| value as usize)
+        .unwrap_or(default)
+        .clamp(1, maximum)
 }
 
 fn workspace_gateway_builtin_server(
@@ -1847,6 +2215,8 @@ fn workspace_gateway_manifest(context: &McpContext) -> Result<Value, String> {
             "server_name": "diffforge-workspace-mcp-gateway",
             "tool_namespace_separator": "__",
             "hot_reload": "enabled",
+            "default_exposure_mode": WORKSPACE_MCP_EXPOSURE_LAZY,
+            "lazy_tools": ["workspace_mcp__search_tools", "workspace_mcp__list_tools", "workspace_mcp__get_tool_schema", "workspace_mcp__call_tool"],
         },
         "summary": {
             "installed_count": public_servers.len(),
@@ -1917,10 +2287,13 @@ fn workspace_gateway_server_public(server: &Value) -> Value {
         "transport": server["transport"].clone(),
         "workspace_enabled": workspace_enabled,
         "approval_policy": server["approval_policy"].clone(),
+        "exposure_mode": workspace_gateway_server_exposure_mode(server),
         "agent_config_access_enabled": workspace_gateway_agent_config_access_enabled(server),
         "agent_secret_config_access_enabled": workspace_gateway_agent_secret_config_access_enabled(server),
         "agent_env_file_write_enabled": workspace_gateway_agent_env_file_write_enabled(server),
         "runtime_status": runtime_status,
+        "agent_callable": workspace_gateway_server_agent_callable(server),
+        "direct_tools_exposed": workspace_gateway_server_pinned(server),
         "missing_required_config": missing,
         "tool_namespace": server_key,
         "tool_prefix": format!("{server_key}__"),
@@ -1958,6 +2331,30 @@ fn workspace_gateway_server_runtime_enabled(server: &Value) -> bool {
     server["workspace_enabled"].as_i64().unwrap_or_default() != 0
         && workspace_gateway_missing_required_config(server).is_empty()
         && server["install_state"].as_str().unwrap_or("installed") == "installed"
+}
+
+fn workspace_gateway_server_agent_callable(server: &Value) -> bool {
+    workspace_gateway_server_runtime_enabled(server) && !workspace_gateway_server_hidden(server)
+}
+
+fn workspace_gateway_server_pinned(server: &Value) -> bool {
+    workspace_gateway_server_exposure_mode(server) == WORKSPACE_MCP_EXPOSURE_PINNED
+}
+
+fn workspace_gateway_server_hidden(server: &Value) -> bool {
+    workspace_gateway_server_exposure_mode(server) == WORKSPACE_MCP_EXPOSURE_HIDDEN
+}
+
+fn workspace_gateway_server_exposure_mode(server: &Value) -> &'static str {
+    workspace_gateway_exposure_mode(server["exposure_mode"].as_str())
+}
+
+fn workspace_gateway_exposure_mode(value: Option<&str>) -> &'static str {
+    match value.unwrap_or(WORKSPACE_MCP_EXPOSURE_LAZY).trim() {
+        WORKSPACE_MCP_EXPOSURE_PINNED => WORKSPACE_MCP_EXPOSURE_PINNED,
+        WORKSPACE_MCP_EXPOSURE_HIDDEN => WORKSPACE_MCP_EXPOSURE_HIDDEN,
+        _ => WORKSPACE_MCP_EXPOSURE_LAZY,
+    }
 }
 
 fn workspace_gateway_missing_required_config(server: &Value) -> Vec<Value> {
@@ -4812,11 +5209,11 @@ fn tool_description(name: &str) -> String {
         "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
         "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),
         "architecture_revision_restore" => "Restore one local-only architecture revision into .agents/architectures/graphs/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
-        "list_todo_targets" => "List same-account device/workspace targets that can receive a cloud todo from this workspace. Use this before send_todos instead of guessing device ids.".to_string(),
+        "list_todo_targets" => "List same-account device/workspace targets from the local Rust SQLite todo mirror. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call. Use this before send_todos instead of guessing device ids.".to_string(),
         "send_todos" => "Send one or more cloud todos to one or more same-account device/workspace targets and return a batch id plus child dispatch ids. Supports single text/target shortcuts and multi-item/multi-target fanout. mode=listed leaves normal listed todos; mode=queued actively queues online targets and lets Cloud fall back for offline targets.".to_string(),
-        "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters. Reads the local Rust todo mirror first, refreshes Cloud when missing or stale, and returns body refs/previews only.".to_string(),
-        "wait_for_todos" => "Wait inside the local Rust proxy until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
-        "list_todo_history" => "List compact recent todo dispatch history for this workspace/repo, including origin/target devices, statuses, dispatch ids, batch ids, and body refs/previews.".to_string(),
+        "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters from the local Rust SQLite todo mirror only. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
+        "wait_for_todos" => "Wait inside the local Rust proxy over local SQLite todo status until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
+        "list_todo_history" => "List compact recent todo dispatch history from the local Rust SQLite mirror for this workspace/repo, including origin/target devices, statuses, dispatch ids, batch ids, and body refs/previews. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),

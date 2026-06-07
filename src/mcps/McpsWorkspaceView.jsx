@@ -57,6 +57,9 @@ const EDITOR_MARKETPLACE = "marketplace";
 const SECRETS_SERVER_KEY = "secrets";
 const APPROVAL_ALWAYS_ALLOW = "always_allow";
 const APPROVAL_PROMPT = "prompt";
+const EXPOSURE_LAZY = "lazy";
+const EXPOSURE_PINNED = "pinned";
+const EXPOSURE_HIDDEN = "hidden";
 
 const APPROVAL_POLICY_OPTIONS = [
   {
@@ -68,6 +71,24 @@ const APPROVAL_POLICY_OPTIONS = [
     value: APPROVAL_PROMPT,
     label: "Prompt",
     description: "Ask before running tools from this MCP.",
+  },
+];
+
+const EXPOSURE_MODE_OPTIONS = [
+  {
+    value: EXPOSURE_LAZY,
+    label: "Lazy",
+    description: "Discover and call tools through the stable gateway broker.",
+  },
+  {
+    value: EXPOSURE_PINNED,
+    label: "Pinned",
+    description: "Expose this MCP's child tools directly to coding agents.",
+  },
+  {
+    value: EXPOSURE_HIDDEN,
+    label: "Hidden",
+    description: "Keep this MCP configured but unavailable to coding agents.",
   },
 ];
 
@@ -359,6 +380,12 @@ function approvalPolicy(server) {
   return server?.approval_policy === APPROVAL_PROMPT ? APPROVAL_PROMPT : APPROVAL_ALWAYS_ALLOW;
 }
 
+function exposureMode(server) {
+  if (server?.exposure_mode === EXPOSURE_PINNED) return EXPOSURE_PINNED;
+  if (server?.exposure_mode === EXPOSURE_HIDDEN) return EXPOSURE_HIDDEN;
+  return EXPOSURE_LAZY;
+}
+
 function booleanSetting(server, key, fallback = true) {
   if (!server || typeof server[key] === "undefined" || server[key] === null) return fallback;
   return Boolean(server[key]);
@@ -366,6 +393,11 @@ function booleanSetting(server, key, fallback = true) {
 
 function isSecretsServer(server) {
   return server?.server_key === SECRETS_SERVER_KEY || server?.id === SECRETS_SERVER_KEY;
+}
+
+function toolDisplayName(tool) {
+  if (typeof tool === "string") return tool;
+  return tool?.name || tool?.tool_name || tool?.qualified_name || "tool";
 }
 
 function actionCopy(actionState, context = {}) {
@@ -410,6 +442,11 @@ function actionCopy(actionState, context = {}) {
       return {
         title: `Saving ${name}`,
         detail: "Updating tool approval policy for this workspace MCP.",
+      };
+    case "saving_exposure":
+      return {
+        title: `Saving ${name}`,
+        detail: "Updating lazy or pinned agent exposure for this workspace MCP.",
       };
     case "saving_access":
       return {
@@ -953,6 +990,7 @@ export default function McpsWorkspaceView({
             tools: item.tools || [],
             workspace_enabled: false,
             approval_policy: APPROVAL_ALWAYS_ALLOW,
+            exposure_mode: EXPOSURE_LAZY,
             agent_config_access_enabled: true,
             agent_secret_config_access_enabled: false,
             agent_env_file_write_enabled: true,
@@ -1022,6 +1060,7 @@ export default function McpsWorkspaceView({
           tools: parseTools(manualDraft.tools),
           workspace_enabled: false,
           approval_policy: APPROVAL_ALWAYS_ALLOW,
+          exposure_mode: EXPOSURE_LAZY,
           agent_config_access_enabled: true,
           agent_secret_config_access_enabled: false,
           agent_env_file_write_enabled: true,
@@ -1115,6 +1154,8 @@ export default function McpsWorkspaceView({
             : "disabling_mcp"
           : typeof next.approval_policy === "string"
             ? "saving_approval"
+            : typeof next.exposure_mode === "string"
+              ? "saving_exposure"
             : [
                   "agent_config_access_enabled",
                   "agent_secret_config_access_enabled",
@@ -1787,6 +1828,7 @@ export default function McpsWorkspaceView({
     );
     const selectedConnectionMessage = connectionMessage(selectedServer, selectedStatus);
     const currentApprovalPolicy = approvalPolicy(selectedServer);
+    const currentExposureMode = exposureMode(selectedServer);
     const configAccessEnabled = booleanSetting(
       selectedServer,
       "agent_config_access_enabled",
@@ -1859,6 +1901,7 @@ export default function McpsWorkspaceView({
             </McpAccessTopline>
             <McpToolList>
               <McpToolChip>{selectedServer.transport || "stdio"}</McpToolChip>
+              <McpToolChip>{currentExposureMode}</McpToolChip>
               <McpToolChip>{selectedServer.config_status || "configured"}</McpToolChip>
               <McpToolChip>{selectedServer.install_state || "installed"}</McpToolChip>
             </McpToolList>
@@ -1883,6 +1926,41 @@ export default function McpsWorkspaceView({
             </McpEmptyAccess>
           </McpAccessPanel>
         </McpAccessGrid>
+
+        {!selectedServer.built_in && (
+          <McpAccessPanel>
+            <McpAccessTopline>
+              <span>
+                <ButtonHubIcon aria-hidden="true" />
+                Agent exposure
+              </span>
+              <McpStatusBadge data-state={currentExposureMode === EXPOSURE_HIDDEN ? "planned" : "enabled"}>
+                {EXPOSURE_MODE_OPTIONS.find((option) => option.value === currentExposureMode)?.label || "Lazy"}
+              </McpStatusBadge>
+            </McpAccessTopline>
+            <McpTransportTabs aria-label="MCP agent exposure mode" data-columns="3">
+              {EXPOSURE_MODE_OPTIONS.map((option) => (
+                <McpTransportButton
+                  data-active={currentExposureMode === option.value}
+                  disabled={actionState !== "idle" || currentExposureMode === option.value}
+                  key={option.value}
+                  onClick={() => updateSelected({ exposure_mode: option.value })}
+                  title={option.description}
+                  type="button"
+                >
+                  {buttonContent(
+                    actionState === "saving_exposure" && currentExposureMode !== option.value,
+                    option.label,
+                    "Saving",
+                  )}
+                </McpTransportButton>
+              ))}
+            </McpTransportTabs>
+            <McpEmptyAccess>
+              Lazy keeps the coding-agent tool list stable and calls tools through the gateway. Pinned exposes child tools directly and increases context.
+            </McpEmptyAccess>
+          </McpAccessPanel>
+        )}
 
         {!selectedServer.built_in && (
           <McpAccessPanel>
@@ -2046,14 +2124,14 @@ export default function McpsWorkspaceView({
           {selectedTools.length ? (
             <McpToolList>
               {selectedTools.map((tool) => (
-                <McpToolChip key={tool}>{tool}</McpToolChip>
+                <McpToolChip key={toolDisplayName(tool)}>{toolDisplayName(tool)}</McpToolChip>
               ))}
             </McpToolList>
           ) : (
             <McpEmptyAccess>
               {selectedServer.built_in
                 ? "No coordination tools are exposed to coding agents."
-                : "Tool discovery will run through the workspace gateway later."}
+                : "Tool discovery runs lazily through the workspace gateway."}
             </McpEmptyAccess>
           )}
         </McpAccessPanel>
