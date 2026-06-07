@@ -37,6 +37,10 @@ const CLOUD_MCP_TODO_MIRROR_ROWS_TABLE: &str = "workspace_todo_mirror_rows";
 const CLOUD_MCP_TODO_HISTORY_ROWS_TABLE: &str = "workspace_todo_history_rows";
 const CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS: usize = 2048;
 const CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS: usize = 500;
+const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
+const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
+const CLOUD_MCP_OUTBOX_DRAIN_LIMIT: usize = 24;
+const CLOUD_MCP_OUTBOX_DEAD_LETTER_ATTEMPTS: i64 = 25;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -74,6 +78,15 @@ struct CloudMcpBackgroundSyncJob {
     payload: Value,
     priority: u8,
     reason: String,
+}
+
+#[derive(Clone)]
+struct CloudMcpOutboxRow {
+    outbox_id: String,
+    idempotency_key: String,
+    event_kind: String,
+    payload_json: String,
+    attempt_count: i64,
 }
 
 #[derive(Clone)]
@@ -248,6 +261,10 @@ struct CloudMcpStatus {
     connection_contract: String,
     live_runtime_status: Option<Value>,
     workspace_todos: Option<Value>,
+    outbox_pending_count: usize,
+    outbox_retrying_count: usize,
+    outbox_dead_letter_count: usize,
+    outbox_oldest_pending_ms: Option<u64>,
     registered_workspace_count: usize,
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
 }
@@ -384,6 +401,510 @@ fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
     });
 }
 
+fn cloud_mcp_outbox_db_path() -> Option<PathBuf> {
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))?;
+    Some(
+        base.join(".diffforge")
+            .join("cache")
+            .join(CLOUD_MCP_OUTBOX_DB_FILE),
+    )
+}
+
+fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let reset_inflight_sql = format!(
+        "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+         SET status='retrying', next_attempt_at_ms=0
+         WHERE status='in_flight';"
+    );
+    conn.execute_batch(&format!(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS {CLOUD_MCP_OUTBOX_TABLE}(
+            outbox_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            coalesce_key TEXT NOT NULL DEFAULT '',
+            event_kind TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 1,
+            payload_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            cloud_event_id TEXT NOT NULL DEFAULT '',
+            response_json TEXT NOT NULL DEFAULT '',
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            acked_at_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_cloud_sync_outbox_ready
+            ON {CLOUD_MCP_OUTBOX_TABLE}(status, next_attempt_at_ms, priority, created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_cloud_sync_outbox_coalesce
+            ON {CLOUD_MCP_OUTBOX_TABLE}(coalesce_key, status, updated_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_cloud_sync_outbox_event
+            ON {CLOUD_MCP_OUTBOX_TABLE}(event_kind, status, updated_at_ms);
+        {reset_inflight_sql}
+        "
+    ))
+}
+
+fn cloud_mcp_open_outbox_conn() -> Result<rusqlite::Connection, String> {
+    let path = cloud_mcp_outbox_db_path()
+        .ok_or_else(|| "Cloud sync outbox cache path is unavailable.".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create Cloud sync outbox directory: {error}"))?;
+    }
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("Unable to open Cloud sync outbox SQLite cache: {error}"))?;
+    conn.busy_timeout(Duration::from_millis(2_500))
+        .map_err(|error| format!("Unable to configure Cloud sync outbox SQLite cache: {error}"))?;
+    cloud_mcp_outbox_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize Cloud sync outbox SQLite cache: {error}"))?;
+    Ok(conn)
+}
+
+fn cloud_mcp_outbox_payload_hash(payload: &Value) -> String {
+    let digest = Sha256::digest(payload.to_string().as_bytes());
+    format!("{digest:x}")
+}
+
+fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> Option<String> {
+    let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    let is_snapshot = matches!(
+        normalized_kind.as_str(),
+        "agent_installation_snapshot"
+            | "device_workspace_snapshot"
+            | "device_workspace_catalog_snapshot"
+            | "terminal_presence_snapshot"
+            | "workspace_mcp_snapshot"
+            | "workspace_mcp_status_snapshot"
+            | "workspace_mcps_snapshot"
+            | "workspace_todo_snapshot"
+            | "workspace_todos_snapshot"
+            | "todo_queue_snapshot"
+            | "todo_queue_state"
+            | "tokenomics_hourly_usage_snapshot"
+            | "tokenomics_delta"
+            | "workspace_architecture_snapshot"
+            | "workspace_architectures_snapshot"
+            | "workspace_architecture_updated"
+            | "workspace_architecture_graph_updated"
+            | "architecture_graph_updated"
+    );
+    if !is_snapshot {
+        return None;
+    }
+    let device_id = cloud_mcp_payload_text(payload, &["device_id", "deviceId", "machine_id", "machineId"])
+        .unwrap_or_default();
+    let repo_id = cloud_mcp_payload_text(payload, &["repo_id", "repoId"]).unwrap_or_default();
+    let workspace_id =
+        cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let graph_id = cloud_mcp_payload_text(payload, &["graph_id", "graphId", "architecture_id", "architectureId"])
+        .unwrap_or_default();
+    let scope = cloud_mcp_payload_text(payload, &["billing_scope_key", "billingScopeKey"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"]))
+        .unwrap_or_default();
+    Some(format!(
+        "snapshot:{normalized_kind}:{device_id}:{repo_id}:{workspace_id}:{graph_id}:{scope}"
+    ))
+}
+
+fn cloud_mcp_outbox_idempotency_key(
+    event_kind: &str,
+    payload: &Value,
+    payload_hash: &str,
+    coalesce_key: Option<&str>,
+) -> String {
+    if let Some(key) = cloud_mcp_payload_text(payload, &["idempotency_key", "idempotencyKey"]) {
+        return key;
+    }
+    if let Some(key) = cloud_mcp_payload_text(payload, &["client_request_id", "clientRequestId"]) {
+        return format!("client-request:{event_kind}:{key}");
+    }
+    if let Some(coalesce_key) = coalesce_key.filter(|value| !value.is_empty()) {
+        return format!("{coalesce_key}:{payload_hash}");
+    }
+    let mut parts = Vec::new();
+    for keys in [
+        &["todo_dispatch_id", "todoDispatchId", "dispatch_id", "dispatchId"][..],
+        &["command_id", "commandId"][..],
+        &["todo_batch_id", "todoBatchId", "batch_id", "batchId"][..],
+        &["todo_id", "todoId", "id"][..],
+        &["target_device_id", "targetDeviceId"][..],
+        &["target_workspace_id", "targetWorkspaceId"][..],
+        &["task_id", "taskId"][..],
+        &["checkpoint_id", "checkpointId"][..],
+        &["lane", "lane_id", "laneId"][..],
+        &["event_id", "eventId"][..],
+        &["turn_id", "turnId"][..],
+        &["status_seq", "statusSeq"][..],
+        &["device_id", "deviceId", "machine_id", "machineId"][..],
+        &["workspace_id", "workspaceId"][..],
+        &["repo_id", "repoId"][..],
+    ] {
+        if let Some(value) = cloud_mcp_payload_text(payload, keys) {
+            parts.push(value);
+        }
+    }
+    if parts.is_empty() {
+        format!("event:{event_kind}:{payload_hash}")
+    } else {
+        format!("event:{event_kind}:{}", parts.join(":"))
+    }
+}
+
+fn cloud_mcp_outbox_payload_with_idempotency(
+    event_kind: &str,
+    payload: &Value,
+) -> (Value, String, String, String) {
+    let mut payload = payload.clone();
+    let coalesce_key = cloud_mcp_outbox_snapshot_coalesce_key(event_kind, &payload)
+        .unwrap_or_default();
+    let hash_seed = payload.clone();
+    let payload_hash = cloud_mcp_payload_text(&payload, &["payload_hash", "payloadHash"])
+        .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(&hash_seed));
+    let idempotency_key = cloud_mcp_outbox_idempotency_key(
+        event_kind,
+        &payload,
+        &payload_hash,
+        (!coalesce_key.is_empty()).then_some(coalesce_key.as_str()),
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("idempotency_key".to_string())
+            .or_insert_with(|| json!(idempotency_key.clone()));
+        object
+            .entry("idempotencyKey".to_string())
+            .or_insert_with(|| json!(idempotency_key.clone()));
+        object
+            .entry("payload_hash".to_string())
+            .or_insert_with(|| json!(payload_hash.clone()));
+        object
+            .entry("payloadHash".to_string())
+            .or_insert_with(|| json!(payload_hash.clone()));
+    }
+    (payload, idempotency_key, payload_hash, coalesce_key)
+}
+
+fn cloud_mcp_outbox_row_from_statement_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMcpOutboxRow> {
+    Ok(CloudMcpOutboxRow {
+        outbox_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        event_kind: row.get(2)?,
+        payload_json: row.get(3)?,
+        attempt_count: row.get(4)?,
+    })
+}
+
+fn cloud_mcp_outbox_enqueue_event(
+    event_kind: &str,
+    payload: &Value,
+    priority: u8,
+    reason: &str,
+) -> Result<CloudMcpOutboxRow, String> {
+    let (payload, idempotency_key, payload_hash, coalesce_key) =
+        cloud_mcp_outbox_payload_with_idempotency(event_kind, payload);
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    if !coalesce_key.is_empty() {
+        conn.execute(
+            &format!(
+                "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                 SET status='superseded', updated_at_ms=?1
+                 WHERE coalesce_key=?2
+                   AND idempotency_key<>?3
+                   AND status IN ('queued', 'retrying', 'in_flight')"
+            ),
+            rusqlite::params![now, coalesce_key, idempotency_key],
+        )
+        .map_err(|error| format!("Unable to coalesce Cloud sync outbox row: {error}"))?;
+    }
+    let outbox_id = format!("outbox-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
+    conn.execute(
+        &format!(
+            "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
+                outbox_id, idempotency_key, coalesce_key, event_kind, priority,
+                payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
+                last_error, cloud_event_id, response_json, created_at_ms, updated_at_ms, acked_at_ms
+             )
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, 0, '', '', '', ?8, ?8, 0)
+             ON CONFLICT(idempotency_key) DO UPDATE SET
+                coalesce_key=excluded.coalesce_key,
+                priority=MIN(priority, excluded.priority),
+                payload_hash=excluded.payload_hash,
+                payload_json=excluded.payload_json,
+                status=CASE
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN 'acked'
+                    ELSE 'queued'
+                END,
+                next_attempt_at_ms=CASE
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN {CLOUD_MCP_OUTBOX_TABLE}.next_attempt_at_ms
+                    ELSE 0
+                END,
+                last_error=CASE
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN {CLOUD_MCP_OUTBOX_TABLE}.last_error
+                    ELSE ''
+                END,
+                updated_at_ms=excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            outbox_id,
+            idempotency_key,
+            coalesce_key,
+            event_kind,
+            priority as i64,
+            payload_hash,
+            payload.to_string(),
+            now
+        ],
+    )
+    .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
+    conn.query_row(
+        &format!(
+            "SELECT outbox_id, idempotency_key, event_kind, payload_json, attempt_count
+             FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE idempotency_key=?1"
+        ),
+        rusqlite::params![idempotency_key],
+        cloud_mcp_outbox_row_from_statement_row,
+    )
+    .map_err(|error| format!("Unable to read queued Cloud sync outbox row: {error}"))
+}
+
+fn cloud_mcp_outbox_claim_due_rows(limit: usize) -> Result<Vec<CloudMcpOutboxRow>, String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+             SET status='in_flight', updated_at_ms=?1
+             WHERE outbox_id IN (
+                SELECT outbox_id
+                FROM {CLOUD_MCP_OUTBOX_TABLE}
+                WHERE status IN ('queued', 'retrying')
+                  AND next_attempt_at_ms<=?1
+                ORDER BY priority ASC, created_at_ms ASC
+                LIMIT ?2
+             )"
+        ),
+        rusqlite::params![now, limit as i64],
+    )
+    .map_err(|error| format!("Unable to claim Cloud sync outbox rows: {error}"))?;
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT outbox_id, idempotency_key, event_kind, payload_json, attempt_count
+             FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE status='in_flight'
+             ORDER BY priority ASC, created_at_ms ASC
+             LIMIT ?1"
+        ))
+        .map_err(|error| format!("Unable to prepare Cloud sync outbox drain query: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![limit as i64], cloud_mcp_outbox_row_from_statement_row)
+        .map_err(|error| format!("Unable to read Cloud sync outbox rows: {error}"))?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(row.map_err(|error| format!("Unable to decode Cloud sync outbox row: {error}"))?);
+    }
+    Ok(values)
+}
+
+fn cloud_mcp_outbox_next_due_delay_ms() -> Option<u64> {
+    let conn = cloud_mcp_open_outbox_conn().ok()?;
+    let next_due = conn
+        .query_row(
+            &format!(
+                "SELECT MIN(next_attempt_at_ms)
+                 FROM {CLOUD_MCP_OUTBOX_TABLE}
+                 WHERE status IN ('queued', 'retrying')"
+            ),
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()??;
+    let now = cloud_mcp_now_ms() as i64;
+    Some(next_due.saturating_sub(now).max(0) as u64)
+}
+
+fn cloud_mcp_outbox_status_counts() -> (usize, usize, usize, Option<u64>) {
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return (0, 0, 0, None);
+    };
+    let row = conn.query_row(
+        &format!(
+            "SELECT
+                SUM(CASE WHEN status IN ('queued', 'retrying', 'in_flight') THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='retrying' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status='dead_letter' THEN 1 ELSE 0 END),
+                MIN(CASE WHEN status IN ('queued', 'retrying', 'in_flight') THEN created_at_ms ELSE NULL END)
+             FROM {CLOUD_MCP_OUTBOX_TABLE}"
+        ),
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as usize,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as usize,
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as usize,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        },
+    );
+    match row {
+        Ok((pending, retrying, dead_letter, oldest_ms)) => {
+            let now = cloud_mcp_now_ms();
+            let oldest_pending_ms = oldest_ms
+                .filter(|value| *value > 0)
+                .map(|value| now.saturating_sub(value as u64));
+            (pending, retrying, dead_letter, oldest_pending_ms)
+        }
+        Err(_) => (0, 0, 0, None),
+    }
+}
+
+fn cloud_mcp_outbox_cloud_event_id(response: &Value) -> String {
+    cloud_mcp_payload_text(response, &["cloud_event_id", "cloudEventId"])
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "cloud_event_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "cloudEventId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "event_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "eventId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["event_id", "eventId", "id"]))
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Result<(), String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+             SET status='acked',
+                 cloud_event_id=?1,
+                 response_json=?2,
+                 updated_at_ms=?3,
+                 acked_at_ms=?3,
+                 last_error=''
+             WHERE outbox_id=?4"
+        ),
+        rusqlite::params![
+            cloud_mcp_outbox_cloud_event_id(response),
+            response.to_string(),
+            now,
+            row.outbox_id
+        ],
+    )
+    .map_err(|error| format!("Unable to mark Cloud sync outbox row acked: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_outbox_retry_delay_ms(attempt_count: i64, idempotency_key: &str) -> i64 {
+    let base = match attempt_count {
+        0 | 1 => 1_000,
+        2 => 2_000,
+        3 => 5_000,
+        4 => 15_000,
+        5 => 30_000,
+        6 => 60_000,
+        7 => 120_000,
+        _ => 300_000,
+    };
+    let jitter = cloud_mcp_short_hash(idempotency_key)
+        .chars()
+        .filter_map(|ch| ch.to_digit(16))
+        .fold(0i64, |sum, value| sum + value as i64)
+        % 500;
+    base + jitter
+}
+
+fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(), String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    let next_attempt_count = row.attempt_count.saturating_add(1);
+    let status = if next_attempt_count >= CLOUD_MCP_OUTBOX_DEAD_LETTER_ATTEMPTS {
+        "dead_letter"
+    } else {
+        "retrying"
+    };
+    let next_attempt_at = if status == "dead_letter" {
+        0
+    } else {
+        now.saturating_add(cloud_mcp_outbox_retry_delay_ms(
+            next_attempt_count,
+            &row.idempotency_key,
+        ))
+    };
+    conn.execute(
+        &format!(
+            "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+             SET status=?1,
+                 attempt_count=?2,
+                 next_attempt_at_ms=?3,
+                 last_error=?4,
+                 updated_at_ms=?5
+             WHERE outbox_id=?6"
+        ),
+        rusqlite::params![
+            status,
+            next_attempt_count,
+            next_attempt_at,
+            clean_terminal_telemetry_text(error),
+            now,
+            row.outbox_id
+        ],
+    )
+    .map_err(|error| format!("Unable to mark Cloud sync outbox row retrying: {error}"))?;
+    Ok(())
+}
+
+fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
+    match event_kind.trim().to_ascii_lowercase().as_str() {
+        "workspace_todo_dispatch_requested"
+        | "todo_dispatch_requested"
+        | "workspace_todo_dispatch_status"
+        | "todo_dispatch_status"
+        | "todo_dispatch_update"
+        | "remote_command_ack"
+        | "remote_command_result"
+        | "lane_claim"
+        | "lane_claimed"
+        | "lane_release"
+        | "lane_released" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        "terminal_presence_snapshot"
+        | "terminal_status_event"
+        | "terminal_lifecycle_delta"
+        | "checkpoint"
+        | "checkpoint_recorded"
+        | "subtask_checkpoint" => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM,
+        _ => CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+    }
+}
+
+fn cloud_mcp_outbox_queued_response(row: &CloudMcpOutboxRow, error: Option<&str>) -> Value {
+    let mut response = json!({
+        "ok": true,
+        "queued": true,
+        "durable": true,
+        "background": true,
+        "kind": "cloud_sync_outbox_queued",
+        "event_kind": row.event_kind.clone(),
+        "eventKind": row.event_kind.clone(),
+        "outbox_id": row.outbox_id.clone(),
+        "outboxId": row.outbox_id.clone(),
+        "idempotency_key": row.idempotency_key.clone(),
+        "idempotencyKey": row.idempotency_key.clone(),
+        "attempt_count": row.attempt_count,
+        "attemptCount": row.attempt_count,
+    });
+    if let Some(error) = error {
+        response["last_error"] = json!(clean_terminal_telemetry_text(error));
+        response["lastError"] = json!(clean_terminal_telemetry_text(error));
+    }
+    response
+}
+
 async fn cloud_mcp_enqueue_background_sync(
     state: &CloudMcpState,
     key: impl Into<String>,
@@ -397,17 +918,38 @@ async fn cloud_mcp_enqueue_background_sync(
     let key = key.into();
     let event_kind = event_kind.into();
     let reason = reason.into();
-    let job = CloudMcpBackgroundSyncJob {
-        enqueued_ms: cloud_mcp_now_ms(),
-        event_kind,
-        key: key.clone(),
-        payload,
-        priority,
-        reason,
-    };
-    {
-        let mut pending = state.background_sync.pending.lock().await;
-        pending.insert(key, job);
+    match cloud_mcp_outbox_enqueue_event(&event_kind, &payload, priority, &reason) {
+        Ok(row) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.queued",
+                json!({
+                    "event_kind": event_kind,
+                    "key": key,
+                    "reason": reason,
+                    "outbox_id": row.outbox_id,
+                    "idempotency_key": row.idempotency_key,
+                }),
+            );
+        }
+        Err(error) => {
+            let job = CloudMcpBackgroundSyncJob {
+                enqueued_ms: cloud_mcp_now_ms(),
+                event_kind,
+                key: key.clone(),
+                payload,
+                priority,
+                reason,
+            };
+            let mut pending = state.background_sync.pending.lock().await;
+            pending.insert(key.clone(), job);
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.queue_error",
+                json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                    "key": key,
+                }),
+            );
+        }
     }
     state.background_sync.notify.notify_one();
 }
@@ -418,6 +960,54 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
         sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS)).await;
 
         loop {
+            let mut drained_any = false;
+            match cloud_mcp_outbox_claim_due_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT) {
+                Ok(rows) => {
+                    if !rows.is_empty() {
+                        drained_any = true;
+                    }
+                    for row in rows {
+                        let result = cloud_mcp_send_outbox_row_now(&state, &row).await;
+                        match result {
+                            Ok(response) => {
+                                let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+                                log_terminal_status_event(
+                                    "backend.cloud_mcp.outbox.done",
+                                    json!({
+                                        "event_kind": row.event_kind,
+                                        "outbox_id": row.outbox_id,
+                                        "idempotency_key": row.idempotency_key,
+                                        "response": response,
+                                    }),
+                                );
+                            }
+                            Err(error) => {
+                                let _ = cloud_mcp_outbox_mark_retry(&row, &error);
+                                log_terminal_status_event(
+                                    "backend.cloud_mcp.outbox.error",
+                                    json!({
+                                        "error": clean_terminal_telemetry_text(&error),
+                                        "event_kind": row.event_kind,
+                                        "outbox_id": row.outbox_id,
+                                        "idempotency_key": row.idempotency_key,
+                                    }),
+                                );
+                            }
+                        }
+                        sleep(Duration::from_millis(
+                            CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
+                        ))
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.outbox.drain_error",
+                        json!({"error": clean_terminal_telemetry_text(&error)}),
+                    );
+                }
+            }
+
             let jobs = {
                 let mut pending = state.background_sync.pending.lock().await;
                 if pending.is_empty() {
@@ -434,12 +1024,32 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
             };
 
             if jobs.is_empty() {
-                break;
+                if !drained_any {
+                    if let Some(delay_ms) = cloud_mcp_outbox_next_due_delay_ms() {
+                        let delay_ms = delay_ms.clamp(250, 300_000);
+                        let notify = state.background_sync.notify.clone();
+                        tauri::async_runtime::spawn(async move {
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            notify.notify_one();
+                        });
+                    }
+                    break;
+                }
+                continue;
             }
 
             for job in jobs {
-                let result =
-                    cloud_mcp_post_event_endpoint(&state, &job.event_kind, &job.payload).await;
+                let result = match cloud_mcp_outbox_enqueue_event(
+                    &job.event_kind,
+                    &job.payload,
+                    job.priority,
+                    &job.reason,
+                ) {
+                    Ok(row) => cloud_mcp_send_outbox_row_now(&state, &row).await.inspect(|response| {
+                        let _ = cloud_mcp_outbox_mark_acked(&row, response);
+                    }),
+                    Err(_) => cloud_mcp_send_event_now(&state, &job.event_kind, &job.payload).await,
+                };
                 match result {
                     Ok(response) => {
                         log_terminal_status_event(
@@ -1625,6 +2235,12 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         .cloned()
         .collect::<Vec<_>>();
     registered_workspaces.sort_by(|left, right| left.root.cmp(&right.root));
+    let (
+        outbox_pending_count,
+        outbox_retrying_count,
+        outbox_dead_letter_count,
+        outbox_oldest_pending_ms,
+    ) = cloud_mcp_outbox_status_counts();
     CloudMcpStatus {
         base_url: runtime.base_url.clone(),
         connected: runtime.connected,
@@ -1641,6 +2257,10 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
             .live_runtime_status
             .as_ref()
             .and_then(cloud_mcp_extract_workspace_todos),
+        outbox_pending_count,
+        outbox_retrying_count,
+        outbox_dead_letter_count,
+        outbox_oldest_pending_ms,
         registered_workspace_count: registered_workspaces.len(),
         registered_workspaces,
     }
@@ -1678,9 +2298,11 @@ async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus
         json!({}),
     )
     .await;
+    cloud_mcp_background_sync_ensure_started(state);
     cloud_mcp_start_global_ws(state).await;
     match cloud_mcp_wait_for_ws_sender(state).await {
         Ok(_) => {
+            state.background_sync.notify.notify_one();
             let snapshot = cloud_mcp_status_snapshot(state).await;
             cloud_mcp_record_signin_diagnostic(
                 state,
@@ -2495,6 +3117,8 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             Some("websocket_ready"),
         )
         .await;
+        cloud_mcp_background_sync_ensure_started(state);
+        state.background_sync.notify.notify_one();
         let _ = cloud_mcp_send_device_workspace_snapshot_event_with_auth(
             state,
             &connection_id,
@@ -5291,16 +5915,58 @@ async fn cloud_mcp_post_event_endpoint(
     event_kind: &str,
     payload: &Value,
 ) -> Result<Value, String> {
-    if cloud_mcp_is_workspace_todo_wake_event(event_kind, payload) {
+    let (payload, idempotency_key, _payload_hash, _coalesce_key) =
+        cloud_mcp_outbox_payload_with_idempotency(event_kind, payload);
+    if cloud_mcp_is_workspace_todo_wake_event(event_kind, &payload) {
         cloud_mcp_update_todo_mirror_from_response(
             state,
             "local_workspace_todo_event",
             "/v1/events",
-            payload,
-            payload,
+            &payload,
+            &payload,
         )
         .await;
     }
+    cloud_mcp_background_sync_ensure_started(state);
+    let row = cloud_mcp_outbox_enqueue_event(
+        event_kind,
+        &payload,
+        cloud_mcp_outbox_priority_for_event(event_kind),
+        "direct_event",
+    )?;
+    state.background_sync.notify.notify_one();
+    match cloud_mcp_send_outbox_row_now(state, &row).await {
+        Ok(response) => {
+            let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+            Ok(response)
+        }
+        Err(error) => {
+            let _ = cloud_mcp_outbox_mark_retry(&row, &error);
+            Ok(cloud_mcp_outbox_queued_response(
+                &CloudMcpOutboxRow {
+                    idempotency_key,
+                    ..row
+                },
+                Some(&error),
+            ))
+        }
+    }
+}
+
+async fn cloud_mcp_send_outbox_row_now(
+    state: &CloudMcpState,
+    row: &CloudMcpOutboxRow,
+) -> Result<Value, String> {
+    let payload = serde_json::from_str::<Value>(&row.payload_json)
+        .map_err(|error| format!("Unable to decode Cloud sync outbox payload: {error}"))?;
+    cloud_mcp_send_event_now(state, &row.event_kind, &payload).await
+}
+
+async fn cloud_mcp_send_event_now(
+    state: &CloudMcpState,
+    event_kind: &str,
+    payload: &Value,
+) -> Result<Value, String> {
     let envelope = cloud_mcp_event_envelope(event_kind, payload);
     cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
 }
@@ -5366,15 +6032,26 @@ fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
     }
     let primary_workspace_id = (workspace_ids.len() == 1).then(|| workspace_ids[0].clone());
     let primary_repo_id = (repo_ids.len() == 1).then(|| repo_ids[0].clone());
-    json!({
+    let idempotency_key = cloud_mcp_payload_text(payload, &["idempotency_key", "idempotencyKey"]);
+    let payload_hash = cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash"])
+        .unwrap_or_else(|| cloud_mcp_outbox_payload_hash(payload));
+    let mut envelope = json!({
         "event_kind": event_kind,
         "payload": payload,
+        "idempotency_key": idempotency_key.clone(),
+        "idempotencyKey": idempotency_key,
+        "payload_hash": payload_hash.clone(),
+        "payloadHash": payload_hash,
         "repo_id": primary_repo_id,
         "repo_ids": repo_ids,
         "ts_ms": cloud_mcp_now_ms(),
         "workspace_id": primary_workspace_id,
         "workspace_ids": workspace_ids,
-    })
+    });
+    if let Some(object) = envelope.as_object_mut() {
+        object.retain(|_, value| !value.is_null());
+    }
+    envelope
 }
 
 fn cloud_mcp_post_log_context(
