@@ -5222,6 +5222,9 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/context/pack" => Some("context_pack"),
         "/v1/task/history" => Some("task_history"),
         "/v1/workspace/todos/hydrate" => Some("workspace_todo_hydrate"),
+        "/v1/workspace/todos/batch" => Some("workspace_todo_batch"),
+        "/v1/workspace/todos/status" => Some("workspace_todo_status"),
+        "/v1/workspace/todos/history" => Some("workspace_todo_history"),
         "/v1/workspace/architectures/list" => Some("workspace_architectures_list"),
         "/v1/workspace/architectures/hydrate" => Some("workspace_architecture_hydrate"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
@@ -5352,6 +5355,9 @@ fn cloud_mcp_post_log_context(
         "/v1/context/pack" => "cloud_get_context_pack",
         "/v1/task/history" => "cloud_get_task_history",
         "/v1/workspace/todos/hydrate" => "cloud_hydrate_workspace_todos",
+        "/v1/workspace/todos/batch" => "cloud_workspace_todo_batch",
+        "/v1/workspace/todos/status" => "cloud_workspace_todo_status",
+        "/v1/workspace/todos/history" => "cloud_workspace_todo_history",
         "/v1/workspace/architectures/list" => "cloud_get_workspace_architectures",
         "/v1/workspace/architectures/hydrate" => "cloud_hydrate_workspace_architecture",
         "/v1/events" => payload
@@ -5396,6 +5402,26 @@ fn cloud_mcp_payload_text(payload: &Value, path: &[&str]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_payload_i64(payload: &Value, path: &[&str]) -> Option<i64> {
+    for key in path {
+        if let Some(value) = payload.get(*key).and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+        }) {
+            return Some(value);
+        }
+    }
+
+    let mut current = payload;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_i64()
+        .or_else(|| current.as_str()?.trim().parse::<i64>().ok())
 }
 
 fn cloud_mcp_terminal_nickname_key(value: &str) -> String {
@@ -12947,6 +12973,277 @@ pub(crate) fn cloud_mcp_forward_agent_send_todo_to_device(
                     "mode": mode,
                     "targetDeviceId": target_device_id,
                     "targetWorkspaceId": target_workspace_id,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn cloud_mcp_forward_agent_send_todo_batch(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+) -> Result<Value, String> {
+    cloud_mcp_forward_agent_todo_request(
+        repo_path,
+        db_path,
+        workspace_id,
+        base_url_override,
+        agent_id,
+        session_id,
+        input,
+        "/v1/workspace/todos/batch",
+        "send_todo_batch",
+        "rust-diffforge-agent-send-todo-batch",
+    )
+}
+
+pub(crate) fn cloud_mcp_forward_agent_get_todo_status(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+) -> Result<Value, String> {
+    cloud_mcp_forward_agent_todo_request(
+        repo_path,
+        db_path,
+        workspace_id,
+        base_url_override,
+        agent_id,
+        session_id,
+        input,
+        "/v1/workspace/todos/status",
+        "get_todo_status",
+        "rust-diffforge-agent-get-todo-status",
+    )
+}
+
+pub(crate) fn cloud_mcp_forward_agent_list_todo_history(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+) -> Result<Value, String> {
+    cloud_mcp_forward_agent_todo_request(
+        repo_path,
+        db_path,
+        workspace_id,
+        base_url_override,
+        agent_id,
+        session_id,
+        input,
+        "/v1/workspace/todos/history",
+        "list_todo_history",
+        "rust-diffforge-agent-list-todo-history",
+    )
+}
+
+pub(crate) fn cloud_mcp_forward_agent_wait_for_todos(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+) -> Result<Value, String> {
+    let timeout_ms = cloud_mcp_payload_i64(input, &["timeout_ms", "timeoutMs"])
+        .unwrap_or(120_000)
+        .clamp(1_000, 600_000) as u64;
+    let until = cloud_mcp_payload_text(input, &["until"])
+        .unwrap_or_else(|| "terminal".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    let started = std::time::Instant::now();
+    let mut delay_ms = 250u64;
+    loop {
+        let status = cloud_mcp_forward_agent_get_todo_status(
+            repo_path,
+            db_path,
+            workspace_id,
+            base_url_override,
+            agent_id,
+            session_id,
+            input,
+        )?;
+        let aggregate_status = status
+            .get("aggregate")
+            .and_then(|aggregate| aggregate.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let terminal = status
+            .get("terminal")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                status
+                    .get("aggregate")
+                    .and_then(|aggregate| aggregate.get("terminal"))
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false);
+        let satisfied = match until.as_str() {
+            "accepted" => matches!(
+                aggregate_status,
+                "accepted" | "running" | "attention_required" | "completed" | "partial_failed"
+            ) || terminal,
+            "running" => matches!(
+                aggregate_status,
+                "running" | "attention_required" | "completed" | "partial_failed"
+            ) || terminal,
+            _ => terminal,
+        };
+        if satisfied {
+            let mut response = status;
+            if let Some(object) = response.as_object_mut() {
+                object.insert("kind".to_string(), json!("todo_wait"));
+                object.insert("wait_status".to_string(), json!("satisfied"));
+                object.insert("waitStatus".to_string(), json!("satisfied"));
+                object.insert(
+                    "elapsed_ms".to_string(),
+                    json!(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
+                object.insert(
+                    "elapsedMs".to_string(),
+                    json!(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
+            }
+            return Ok(response);
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(timeout_ms) {
+            let mut response = status;
+            if let Some(object) = response.as_object_mut() {
+                object.insert("kind".to_string(), json!("todo_wait"));
+                object.insert("wait_status".to_string(), json!("timed_out"));
+                object.insert("waitStatus".to_string(), json!("timed_out"));
+                object.insert("timeout_ms".to_string(), json!(timeout_ms));
+                object.insert("timeoutMs".to_string(), json!(timeout_ms));
+                object.insert(
+                    "elapsed_ms".to_string(),
+                    json!(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
+                object.insert(
+                    "elapsedMs".to_string(),
+                    json!(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                );
+            }
+            return Ok(response);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms.saturating_mul(2)).min(5_000);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_forward_agent_todo_request(
+    repo_path: Option<&str>,
+    db_path: Option<&Path>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+    endpoint: &str,
+    tool_name: &str,
+    source: &str,
+) -> Result<Value, String> {
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let base_url = base_url_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(cloud_mcp_base_url);
+    let identity = CloudMcpProxyIdentity {
+        base_url: Some(base_url.clone()),
+        repo_path: repo_path_text.as_ref().map(PathBuf::from),
+        repo_id,
+        workspace_id: workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_name: None,
+        agent_id: agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        session_id: session_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        coordination_db_path: db_path.map(Path::to_path_buf),
+        pane_id: None,
+        terminal_instance_id: None,
+        slot_key: None,
+        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
+        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
+    };
+    let mut request = cloud_mcp_proxy_agent_base_payload(&identity, source);
+    if let Some(object) = request.as_object_mut() {
+        if let Some(input_object) = input.as_object() {
+            for (key, value) in input_object {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(repo_path) = repo_path_text.as_deref() {
+            object.insert("repo_path".to_string(), json!(repo_path));
+            object.insert("workspace_root".to_string(), json!(repo_path));
+        }
+        if let Some(workspace_id) = identity.workspace_id.as_deref() {
+            object.insert("workspace_id".to_string(), json!(workspace_id));
+            object.insert("workspaceId".to_string(), json!(workspace_id));
+        }
+    }
+    identity.log(
+        &format!("cloud_mcp.{tool_name}.start"),
+        tool_name,
+        json!({
+            "activity": tool_name,
+            "baseUrl": base_url,
+            "endpoint": endpoint,
+        }),
+    );
+    match cloud_mcp_proxy_post_json_endpoint(&base_url, endpoint, &request.to_string()) {
+        Ok(response) => {
+            let parsed = serde_json::from_str::<Value>(&response)
+                .unwrap_or_else(|_| json!({"raw_response": response}));
+            let data = parsed.get("data").cloned().unwrap_or(parsed);
+            identity.log(
+                &format!("cloud_mcp.{tool_name}.done"),
+                tool_name,
+                json!({
+                    "activity": tool_name,
+                    "baseUrl": base_url,
+                    "endpoint": endpoint,
+                }),
+            );
+            Ok(data)
+        }
+        Err(error) => {
+            identity.log(
+                &format!("cloud_mcp.{tool_name}.error"),
+                tool_name,
+                json!({
+                    "activity": tool_name,
+                    "baseUrl": base_url,
+                    "endpoint": endpoint,
                     "error": clean_terminal_telemetry_text(&error),
                 }),
             );

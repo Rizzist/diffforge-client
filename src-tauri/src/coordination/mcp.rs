@@ -33,6 +33,10 @@ pub const TOOL_NAMES: &[&str] = &[
     "architecture_revision_restore",
     "list_todo_targets",
     "send_todo_to_device",
+    "send_todo_batch",
+    "get_todo_status",
+    "wait_for_todos",
+    "list_todo_history",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -2843,6 +2847,10 @@ fn dispatch_tool_result(
         "architecture_revision_restore" => kernel_architecture_revision_restore(&kernel, &input),
         "list_todo_targets" => kernel_list_todo_targets(&kernel, &input),
         "send_todo_to_device" => kernel_send_todo_to_device(&kernel, &input),
+        "send_todo_batch" => kernel_send_todo_batch(&kernel, &input),
+        "get_todo_status" => kernel_get_todo_status(&kernel, &input),
+        "wait_for_todos" => kernel_wait_for_todos(&kernel, &input),
+        "list_todo_history" => kernel_list_todo_history(&kernel, &input),
         "acquire_lease" => kernel_acquire_lease(&kernel, &input),
         "checkpoint" => kernel_checkpoint(&kernel, &input),
         "complete_task" => kernel_complete_task(&kernel, &input),
@@ -3116,6 +3124,94 @@ fn kernel_send_todo_to_device(kernel: &CoordinationKernel, input: &Value) -> Res
             ],
         )
         .as_deref(),
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn kernel_send_todo_batch(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let has_items = input
+        .get("items")
+        .or_else(|| input.get("todos"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+        || mcp_input_text(input, &["text", "body", "prompt", "message"]).is_some();
+    if !has_items {
+        return Err("send_todo_batch requires items[] or text.".to_string());
+    }
+    let has_targets = input
+        .get("targets")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+        || mcp_input_text(input, &["target_device_id", "targetDeviceId"]).is_some();
+    if !has_targets {
+        return Err(
+            "send_todo_batch requires targets[] or target_device_id/target_workspace_id."
+                .to_string(),
+        );
+    }
+    let cloud = crate::cloud_mcp_forward_agent_send_todo_batch(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input,
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn kernel_get_todo_status(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let cloud = crate::cloud_mcp_forward_agent_get_todo_status(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input,
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn kernel_wait_for_todos(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let cloud = crate::cloud_mcp_forward_agent_wait_for_todos(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input,
+    )?;
+    Ok(api_ok(cloud))
+}
+
+fn kernel_list_todo_history(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    let cloud = crate::cloud_mcp_forward_agent_list_todo_history(
+        Some(repo_path),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input,
     )?;
     Ok(api_ok(cloud))
 }
@@ -4852,6 +4948,10 @@ fn tool_description(name: &str) -> String {
         "architecture_revision_restore" => "Restore one local-only architecture revision into .agents/architectures/graphs/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
         "list_todo_targets" => "List same-account device/workspace targets that can receive a cloud todo from this workspace. Use this before send_todo_to_device instead of guessing device ids.".to_string(),
         "send_todo_to_device" => "Send a cloud todo to a same-account target device/workspace. mode=listed leaves a normal listed todo. mode=queued actively queues it only when the target client is online; offline targets fall back to a listed todo.".to_string(),
+        "send_todo_batch" => "Send one or more cloud todos to one or more same-account device/workspace targets and return a batch id plus child dispatch ids. Prefer this over looping send_todo_to_device for multi-device delegation.".to_string(),
+        "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters. Rows include source/target metadata, status, timestamps, and body refs/previews only.".to_string(),
+        "wait_for_todos" => "Wait inside the local Rust proxy until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
+        "list_todo_history" => "List compact recent todo dispatch history for this workspace/repo, including origin/target devices, statuses, dispatch ids, batch ids, and body refs/previews.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
         "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
@@ -4990,6 +5090,68 @@ fn tool_input_schema(name: &str) -> Value {
                 "client_request_id": {"type": "string", "description": "Optional caller-provided request id. Reusing it creates stable command/dispatch ids."}
             },
             "required": ["text", "target_device_id", "target_workspace_id"],
+            "additionalProperties": true
+        }),
+        "send_todo_batch" => json!({
+            "type": "object",
+            "properties": {
+                "client_request_id": {"type": "string", "description": "Optional caller label for retrying the same batch. When omitted, Cloud derives stable ids from the synced todo text and targets."},
+                "batch_id": {"type": "string", "description": "Optional stable batch id. When omitted, Cloud derives one and returns it as todo_batch_id/batch_id."},
+                "mode": {"type": "string", "enum": ["queued", "listed"], "description": "queued creates remote dispatches. listed creates listed todos only.", "default": "queued"},
+                "fanout": {"type": "string", "enum": ["matrix", "pairs"], "description": "matrix sends every item to every target; pairs zips items and targets.", "default": "matrix"},
+                "items": {
+                    "type": "array",
+                    "description": "Todo items. Each item should include text/body/prompt and optional item_id/title/todo_id.",
+                    "items": {"type": "object", "additionalProperties": true}
+                },
+                "targets": {
+                    "type": "array",
+                    "description": "Targets from list_todo_targets. Each target requires target_device_id and target_workspace_id.",
+                    "items": {"type": "object", "additionalProperties": true}
+                },
+                "text": {"type": "string", "description": "Shortcut for a single-item batch."},
+                "target_device_id": {"type": "string", "description": "Shortcut for a single-target batch."},
+                "target_workspace_id": {"type": "string", "description": "Shortcut for a single-target batch."},
+                "workspace_id": {"type": "string", "description": "Optional source workspace id."}
+            },
+            "additionalProperties": true
+        }),
+        "get_todo_status" => json!({
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "description": "Optional batch id returned by send_todo_batch."},
+                "dispatch_id": {"type": "string", "description": "Optional dispatch id."},
+                "dispatch_ids": {"type": "array", "items": {"type": "string"}},
+                "todo_id": {"type": "string", "description": "Optional todo id."},
+                "target_device_id": {"type": "string"},
+                "target_workspace_id": {"type": "string"},
+                "status": {"type": "string"},
+                "limit": {"type": "integer", "description": "Maximum compact rows to return.", "default": 100}
+            },
+            "additionalProperties": true
+        }),
+        "wait_for_todos" => json!({
+            "type": "object",
+            "properties": {
+                "batch_id": {"type": "string", "description": "Batch id returned by send_todo_batch."},
+                "dispatch_id": {"type": "string", "description": "Optional single dispatch id."},
+                "dispatch_ids": {"type": "array", "items": {"type": "string"}},
+                "until": {"type": "string", "enum": ["terminal", "accepted", "running"], "default": "terminal"},
+                "timeout_ms": {"type": "integer", "description": "Bounded wait timeout.", "default": 120000}
+            },
+            "additionalProperties": true
+        }),
+        "list_todo_history" => json!({
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Maximum recent compact rows.", "default": 50},
+                "batch_id": {"type": "string"},
+                "target_device_id": {"type": "string"},
+                "target_workspace_id": {"type": "string"},
+                "origin_device_id": {"type": "string"},
+                "origin_workspace_id": {"type": "string"},
+                "status": {"type": "string"}
+            },
             "additionalProperties": true
         }),
         "checkpoint" => json!({
