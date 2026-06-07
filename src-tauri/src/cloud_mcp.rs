@@ -32,6 +32,9 @@ const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
 const CLOUD_MCP_TODO_BODY_CACHE_FILE: &str = "todo-body-cache.json";
+const CLOUD_MCP_TODO_MIRROR_CACHE_FILE: &str = "workspace-todo-mirror.json";
+const CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS: usize = 2048;
+const CLOUD_MCP_TODO_MIRROR_FRESH_MS: u64 = 15_000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -98,6 +101,7 @@ struct CloudMcpState {
     task_history_cache: Arc<Mutex<HashMap<String, Value>>>,
     task_history_refreshes: Arc<Mutex<HashSet<String>>>,
     todo_body_cache: Arc<Mutex<HashMap<String, Value>>>,
+    todo_mirror_cache: Arc<Mutex<Value>>,
     background_sync: CloudMcpBackgroundSync,
 }
 
@@ -242,6 +246,7 @@ struct CloudMcpStatus {
     global_ws_last_connected_ms: Option<u64>,
     connection_contract: String,
     live_runtime_status: Option<Value>,
+    workspace_todos: Option<Value>,
     registered_workspace_count: usize,
     registered_workspaces: Vec<CloudMcpWorkspaceStatus>,
 }
@@ -337,6 +342,7 @@ impl CloudMcpState {
             task_history_cache: Arc::new(Mutex::new(HashMap::new())),
             task_history_refreshes: Arc::new(Mutex::new(HashSet::new())),
             todo_body_cache: Arc::new(Mutex::new(cloud_mcp_load_todo_body_cache())),
+            todo_mirror_cache: Arc::new(Mutex::new(cloud_mcp_load_todo_mirror_cache())),
             background_sync: CloudMcpBackgroundSync {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 notify: Arc::new(tokio::sync::Notify::new()),
@@ -1631,6 +1637,10 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         global_ws_last_connected_ms: runtime.global_ws_last_connected_ms,
         connection_contract: "diffforge.app_ws.v1".to_string(),
         live_runtime_status: runtime.live_runtime_status.clone(),
+        workspace_todos: runtime
+            .live_runtime_status
+            .as_ref()
+            .and_then(cloud_mcp_extract_workspace_todos),
         registered_workspace_count: registered_workspaces.len(),
         registered_workspaces,
     }
@@ -1638,7 +1648,20 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
 
 async fn cloud_mcp_status_snapshot(state: &CloudMcpState) -> CloudMcpStatus {
     let runtime = state.inner.lock().await;
-    cloud_mcp_snapshot(&runtime)
+    let mut snapshot = cloud_mcp_snapshot(&runtime);
+    drop(runtime);
+    if snapshot.workspace_todos.is_none() {
+        let mut mirror = state.todo_mirror_cache.lock().await;
+        snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos(&mirror);
+        if snapshot.workspace_todos.is_none() {
+            let file_mirror = cloud_mcp_load_todo_mirror_cache();
+            snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos(&file_mirror);
+            if snapshot.workspace_todos.is_some() {
+                *mirror = file_mirror;
+            }
+        }
+    }
+    snapshot
 }
 
 async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) -> CloudMcpStatus {
@@ -2395,6 +2418,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .await;
             return;
         };
+        let initial_live_runtime = message
+            .get("initial_live_runtime")
+            .cloned()
+            .filter(|value| !value.is_null());
         {
             let mut runtime = state.inner.lock().await;
             runtime.connected = true;
@@ -2407,10 +2434,17 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
             runtime.global_ws_connection_id = Some(connection_id.clone());
             runtime.global_ws_message_token = Some(message_token.clone());
-            runtime.live_runtime_status = message
-                .get("initial_live_runtime")
-                .cloned()
-                .filter(|value| !value.is_null());
+            runtime.live_runtime_status = initial_live_runtime.clone();
+        }
+        if let Some(initial_live_runtime) = initial_live_runtime {
+            cloud_mcp_update_todo_mirror_from_response(
+                state,
+                "global_ws_ready",
+                "/v1/status",
+                &json!({}),
+                &initial_live_runtime,
+            )
+            .await;
         }
         cloud_mcp_record_signin_diagnostic(
             state,
@@ -2504,6 +2538,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         } else {
             None
         };
+        let live_runtime_snapshot_for_mirror = live_runtime_snapshot.clone();
         if event_kind.starts_with("voice_agent_") {
             cloud_mcp_log_voice_shared_ws(
                 "voice_agent.shared_ws.event_received",
@@ -2533,6 +2568,25 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             if let Some(data) = live_runtime_snapshot {
                 runtime.live_runtime_status = Some(data);
             }
+        }
+        if let Some(data) = live_runtime_snapshot_for_mirror {
+            cloud_mcp_update_todo_mirror_from_response(
+                state,
+                "live_runtime_snapshot",
+                "/v1/status",
+                &event,
+                &data,
+            )
+            .await;
+        } else if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
+            cloud_mcp_update_todo_mirror_from_response(
+                state,
+                "workspace_todo_event",
+                "/v1/events",
+                &event,
+                &event,
+            )
+            .await;
         }
         let _ = state.global_ws_events.send(event);
     }
@@ -5182,6 +5236,14 @@ async fn cloud_mcp_post_json_endpoint(
 
     match cloud_mcp_ws_request(state, ws_kind, payload).await {
         Ok(value) => {
+            cloud_mcp_update_todo_mirror_from_response(
+                state,
+                "app_websocket_response",
+                endpoint,
+                payload,
+                &value,
+            )
+            .await;
             if let Some((root, workspace_id, workspace_name, fields)) = &log_context {
                 let mut fields = fields.clone();
                 fields["transport"] = json!("app_websocket");
@@ -5237,6 +5299,16 @@ async fn cloud_mcp_post_event_endpoint(
     event_kind: &str,
     payload: &Value,
 ) -> Result<Value, String> {
+    if cloud_mcp_is_workspace_todo_wake_event(event_kind, payload) {
+        cloud_mcp_update_todo_mirror_from_response(
+            state,
+            "local_workspace_todo_event",
+            "/v1/events",
+            payload,
+            payload,
+        )
+        .await;
+    }
     let envelope = cloud_mcp_event_envelope(event_kind, payload);
     cloud_mcp_post_json_endpoint(state, "/v1/events", &envelope).await
 }
@@ -11344,6 +11416,825 @@ fn cloud_mcp_todo_body_refs_array(value: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn cloud_mcp_extract_workspace_todos(value: &Value) -> Option<Value> {
+    if let Some(workspace_todos) = value
+        .get("workspace_todos")
+        .or_else(|| value.get("workspaceTodos"))
+        .filter(|item| item.is_object())
+    {
+        return Some(workspace_todos.clone());
+    }
+    for key in [
+        "data",
+        "payload",
+        "status",
+        "live_runtime_status",
+        "liveRuntimeStatus",
+        "initial_live_runtime",
+        "initialLiveRuntime",
+    ] {
+        if let Some(found) = value.get(key).and_then(cloud_mcp_extract_workspace_todos) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn cloud_mcp_todo_mirror_cache_path() -> Option<PathBuf> {
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("APPDATA").map(PathBuf::from))?;
+    Some(
+        base.join(".diffforge")
+            .join("cache")
+            .join(CLOUD_MCP_TODO_MIRROR_CACHE_FILE),
+    )
+}
+
+fn cloud_mcp_empty_todo_mirror_cache() -> Value {
+    json!({
+        "version": 1,
+        "updatedAtMs": 0,
+        "entries": {},
+    })
+}
+
+fn cloud_mcp_load_todo_mirror_cache() -> Value {
+    let Some(path) = cloud_mcp_todo_mirror_cache_path() else {
+        return cloud_mcp_empty_todo_mirror_cache();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return cloud_mcp_empty_todo_mirror_cache();
+    };
+    let mut cache =
+        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| cloud_mcp_empty_todo_mirror_cache());
+    cloud_mcp_ensure_todo_mirror_shape(&mut cache);
+    cache
+}
+
+fn cloud_mcp_save_todo_mirror_cache(cache: &Value) {
+    let Some(path) = cloud_mcp_todo_mirror_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(text) = serde_json::to_string(cache) {
+        let _ = fs::write(path, text);
+    }
+}
+
+fn cloud_mcp_ensure_todo_mirror_shape(cache: &mut Value) {
+    if !cache.is_object() {
+        *cache = cloud_mcp_empty_todo_mirror_cache();
+    }
+    let Some(object) = cache.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("version".to_string())
+        .or_insert_with(|| json!(1));
+    object
+        .entry("updatedAtMs".to_string())
+        .or_insert_with(|| json!(0));
+    if !object
+        .get("entries")
+        .is_some_and(|entries| entries.is_object())
+    {
+        object.insert("entries".to_string(), json!({}));
+    }
+}
+
+fn cloud_mcp_todo_mirror_entry_key(
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> String {
+    let key_material = format!(
+        "{}::{}::{}",
+        base_url.unwrap_or_default().trim(),
+        repo_id.unwrap_or_default().trim(),
+        workspace_id.unwrap_or_default().trim()
+    );
+    format!("todo-mirror-{}", cloud_mcp_short_hash(&key_material))
+}
+
+fn cloud_mcp_todo_mirror_workspace_todos(cache: &Value) -> Option<Value> {
+    let entries = cache
+        .get("entries")
+        .and_then(Value::as_object)?;
+    entries
+        .values()
+        .filter_map(|entry| {
+            let updated_ms = entry
+                .get("updatedAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let workspace_todos = entry
+                .get("workspaceTodos")
+                .or_else(|| entry.get("workspace_todos"))
+                .filter(|value| value.is_object())
+                .cloned()?;
+            Some((updated_ms, workspace_todos))
+        })
+        .max_by_key(|(updated_ms, _)| *updated_ms)
+        .map(|(_, workspace_todos)| workspace_todos)
+}
+
+fn cloud_mcp_todo_mirror_text_values(input: &Value, keys: &[&str]) -> HashSet<String> {
+    let mut values = HashSet::new();
+    for key in keys {
+        let Some(value) = input.get(*key) else {
+            continue;
+        };
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if !text.is_empty() {
+                values.insert(text.to_string());
+            }
+            continue;
+        }
+        if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(text) = item.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+                    values.insert(text.to_string());
+                }
+            }
+        }
+    }
+    values
+}
+
+fn cloud_mcp_todo_mirror_has_status_filters(input: &Value) -> bool {
+    [
+        "todo_batch_id",
+        "todoBatchId",
+        "batch_id",
+        "batchId",
+        "dispatch_id",
+        "dispatchId",
+        "dispatch_ids",
+        "dispatchIds",
+        "todo_id",
+        "todoId",
+        "todo_ids",
+        "todoIds",
+        "target_device_id",
+        "targetDeviceId",
+        "target_workspace_id",
+        "targetWorkspaceId",
+        "status",
+        "statuses",
+    ]
+    .iter()
+    .any(|key| input.get(*key).is_some())
+}
+
+fn cloud_mcp_todo_mirror_filter_matches(
+    row: &Value,
+    filters: &HashSet<String>,
+    keys: &[&str],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    keys.iter().any(|key| {
+        row.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| filters.contains(value))
+    })
+}
+
+fn cloud_mcp_todo_mirror_row_workspace_matches(row: &Value, workspace_id: Option<&str>) -> bool {
+    let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    [
+        "todo_workspace_id",
+        "todoWorkspaceId",
+        "requested_by_workspace_id",
+        "requestedByWorkspaceId",
+        "target_workspace_id",
+        "targetWorkspaceId",
+        "workspace_id",
+        "workspaceId",
+    ]
+    .iter()
+    .any(|key| {
+        row.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            == Some(workspace_id)
+    })
+}
+
+fn cloud_mcp_todo_mirror_row_matches_request(
+    row: &Value,
+    workspace_id: Option<&str>,
+    input: &Value,
+) -> bool {
+    let include_all = cloud_mcp_payload_bool(input, &["include_all"], false)
+        || cloud_mcp_payload_bool(input, &["includeAll"], false);
+    if !include_all && !cloud_mcp_todo_mirror_row_workspace_matches(row, workspace_id) {
+        return false;
+    }
+    cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+        ),
+        &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+                "dispatch_ids",
+                "dispatchIds",
+            ],
+        ),
+        &[
+            "dispatch_id",
+            "dispatchId",
+            "todo_dispatch_id",
+            "todoDispatchId",
+            "command_id",
+            "commandId",
+        ],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(input, &["todo_id", "todoId", "todo_ids", "todoIds"]),
+        &["todo_id", "todoId", "id"],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &["target_device_id", "targetDeviceId", "target_device_ids", "targetDeviceIds"],
+        ),
+        &["target_device_id", "targetDeviceId"],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "target_workspace_id",
+                "targetWorkspaceId",
+                "target_workspace_ids",
+                "targetWorkspaceIds",
+            ],
+        ),
+        &["target_workspace_id", "targetWorkspaceId"],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &["origin_device_id", "originDeviceId", "origin_device_ids", "originDeviceIds"],
+        ),
+        &[
+            "todo_device_id",
+            "todoDeviceId",
+            "requested_by_device_id",
+            "requestedByDeviceId",
+        ],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &[
+                "origin_workspace_id",
+                "originWorkspaceId",
+                "origin_workspace_ids",
+                "originWorkspaceIds",
+            ],
+        ),
+        &[
+            "todo_workspace_id",
+            "todoWorkspaceId",
+            "requested_by_workspace_id",
+            "requestedByWorkspaceId",
+        ],
+    ) && cloud_mcp_todo_mirror_filter_matches(
+        row,
+        &cloud_mcp_todo_mirror_text_values(
+            input,
+            &["status", "statuses", "dispatch_status", "dispatchStatus"],
+        ),
+        &["status", "dispatch_status", "dispatchStatus"],
+    )
+}
+
+fn cloud_mcp_todo_mirror_dispatch_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "completed"
+            | "failed"
+            | "cancelled"
+            | "canceled"
+            | "timed_out"
+            | "timeout"
+            | "rejected"
+            | "duplicate_ignored"
+    )
+}
+
+fn cloud_mcp_todo_mirror_dispatch_status_is_quiescent(status: &str) -> bool {
+    matches!(
+        status,
+        "paused" | "interrupted" | "attention_required" | "blocked" | "parked"
+    )
+}
+
+fn cloud_mcp_todo_mirror_enrich_status_row(mut row: Value) -> Value {
+    let status = cloud_mcp_payload_text(&row, &["dispatch_status", "dispatchStatus", "status"])
+        .unwrap_or_else(|| "queued".to_string());
+    let terminal = cloud_mcp_todo_mirror_dispatch_status_is_terminal(&status);
+    let quiescent = cloud_mcp_todo_mirror_dispatch_status_is_quiescent(&status);
+    if let Some(object) = row.as_object_mut() {
+        if let Some(dispatch_id) =
+            cloud_mcp_payload_text(&Value::Object(object.clone()), &["todo_dispatch_id", "todoDispatchId"])
+        {
+            object
+                .entry("dispatch_id".to_string())
+                .or_insert_with(|| json!(dispatch_id.as_str()));
+            object
+                .entry("dispatchId".to_string())
+                .or_insert_with(|| json!(dispatch_id));
+        }
+        object.insert("status".to_string(), json!(status.as_str()));
+        object.insert("dispatch_status".to_string(), json!(status.as_str()));
+        object.insert("dispatchStatus".to_string(), json!(status.as_str()));
+        object.insert("terminal".to_string(), json!(terminal));
+        object.insert("is_terminal".to_string(), json!(terminal));
+        object.insert("isTerminal".to_string(), json!(terminal));
+        object.insert("quiescent".to_string(), json!(quiescent));
+        object.insert("active".to_string(), json!(!terminal && !quiescent));
+        let origin = json!({
+            "device_id": object.get("todo_device_id").cloned().unwrap_or(Value::Null),
+            "deviceId": object.get("todoDeviceId").cloned().unwrap_or(Value::Null),
+            "workspace_id": object.get("todo_workspace_id").cloned().unwrap_or(Value::Null),
+            "workspaceId": object.get("todoWorkspaceId").cloned().unwrap_or(Value::Null),
+            "requested_by_device_id": object.get("requested_by_device_id").cloned().unwrap_or(Value::Null),
+            "requestedByDeviceId": object.get("requestedByDeviceId").cloned().unwrap_or(Value::Null),
+        });
+        let target = json!({
+            "device_id": object.get("target_device_id").cloned().unwrap_or(Value::Null),
+            "deviceId": object.get("targetDeviceId").cloned().unwrap_or(Value::Null),
+            "device_name": object.get("target_device_name").cloned().unwrap_or(Value::Null),
+            "deviceName": object.get("targetDeviceName").cloned().unwrap_or(Value::Null),
+            "workspace_id": object.get("target_workspace_id").cloned().unwrap_or(Value::Null),
+            "workspaceId": object.get("targetWorkspaceId").cloned().unwrap_or(Value::Null),
+            "workspace_name": object.get("target_workspace_name").cloned().unwrap_or(Value::Null),
+            "workspaceName": object.get("targetWorkspaceName").cloned().unwrap_or(Value::Null),
+            "agent_id": object.get("target_agent_id").cloned().unwrap_or(Value::Null),
+            "agentId": object.get("targetAgentId").cloned().unwrap_or(Value::Null),
+            "terminal_id": object.get("target_terminal_id").cloned().unwrap_or(Value::Null),
+            "terminalId": object.get("targetTerminalId").cloned().unwrap_or(Value::Null),
+            "thread_id": object.get("target_thread_id").cloned().unwrap_or(Value::Null),
+            "threadId": object.get("targetThreadId").cloned().unwrap_or(Value::Null),
+        });
+        object.entry("origin".to_string()).or_insert(origin);
+        object.entry("target".to_string()).or_insert(target);
+    }
+    row
+}
+
+fn cloud_mcp_todo_mirror_status_row_key(row: &Value) -> Option<String> {
+    cloud_mcp_payload_text(row, &["dispatch_id", "dispatchId", "todo_dispatch_id", "todoDispatchId"])
+        .or_else(|| cloud_mcp_payload_text(row, &["command_id", "commandId"]))
+        .or_else(|| {
+            let batch_id = cloud_mcp_payload_text(row, &["todo_batch_id", "todoBatchId", "batch_id", "batchId"])?;
+            let todo_id = cloud_mcp_payload_text(row, &["todo_id", "todoId", "id"]).unwrap_or_default();
+            let target_device_id =
+                cloud_mcp_payload_text(row, &["target_device_id", "targetDeviceId"]).unwrap_or_default();
+            let target_workspace_id =
+                cloud_mcp_payload_text(row, &["target_workspace_id", "targetWorkspaceId"]).unwrap_or_default();
+            Some(format!("{batch_id}::{todo_id}::{target_device_id}::{target_workspace_id}"))
+        })
+}
+
+fn cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(
+    workspace_todos: &Value,
+    rows: &mut Vec<Value>,
+) {
+    for key in ["dispatches", "workspaceDispatches", "workspace_dispatches"] {
+        if let Some(items) = workspace_todos
+            .get(key)
+            .and_then(|value| value.get("items").or(Some(value)))
+            .and_then(Value::as_array)
+        {
+            rows.extend(items.iter().cloned());
+        }
+    }
+    for key in [
+        "dispatches_by_workspace",
+        "dispatchesByWorkspace",
+        "workspaceDispatchesByWorkspace",
+        "workspace_dispatches_by_workspace",
+    ] {
+        if let Some(entries) = workspace_todos.get(key).and_then(Value::as_array) {
+            for entry in entries {
+                if let Some(items) = entry.get("items").and_then(Value::as_array) {
+                    rows.extend(items.iter().cloned());
+                }
+            }
+        }
+    }
+}
+
+fn cloud_mcp_todo_mirror_collect_status_rows(value: &Value, rows: &mut Vec<Value>, depth: u8) {
+    if depth > 5 {
+        return;
+    }
+    if cloud_mcp_payload_text(
+        value,
+        &[
+            "dispatch_id",
+            "dispatchId",
+            "todo_dispatch_id",
+            "todoDispatchId",
+            "command_id",
+            "commandId",
+        ],
+    )
+    .is_some()
+        && cloud_mcp_payload_text(value, &["status", "dispatch_status", "dispatchStatus"])
+            .is_some()
+    {
+        rows.push(value.clone());
+    }
+    let kind = cloud_mcp_payload_text(value, &["kind"]).unwrap_or_default();
+    if kind == "todo_status" || kind == "todo_history" {
+        if let Some(items) = value.get("items").and_then(Value::as_array) {
+            rows.extend(items.iter().cloned());
+        }
+    }
+    if let Some(items) = value.get("dispatches").and_then(Value::as_array) {
+        rows.extend(items.iter().cloned());
+    }
+    if let Some(items) = value
+        .get("payload")
+        .and_then(|payload| payload.get("dispatches"))
+        .and_then(Value::as_array)
+    {
+        rows.extend(items.iter().cloned());
+    }
+    for key in ["data", "status", "result", "payload"] {
+        if let Some(child) = value.get(key).filter(|child| child.is_object()) {
+            cloud_mcp_todo_mirror_collect_status_rows(child, rows, depth + 1);
+        }
+    }
+}
+
+fn cloud_mcp_todo_mirror_dedupe_rows(rows: Vec<Value>) -> Vec<Value> {
+    let mut keyed = HashMap::<String, Value>::new();
+    let mut unkeyed = Vec::new();
+    for row in rows {
+        let row = cloud_mcp_todo_mirror_enrich_status_row(row);
+        if let Some(key) = cloud_mcp_todo_mirror_status_row_key(&row) {
+            keyed.insert(key, row);
+        } else {
+            unkeyed.push(row);
+        }
+    }
+    let mut rows = keyed.into_values().chain(unkeyed).collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        let left_time = cloud_mcp_payload_text(left, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
+            .unwrap_or_default();
+        let right_time =
+            cloud_mcp_payload_text(right, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
+                .unwrap_or_default();
+        right_time.cmp(&left_time)
+    });
+    rows.truncate(CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS);
+    rows
+}
+
+fn cloud_mcp_todo_mirror_status_rows_from_response(value: &Value) -> Vec<Value> {
+    let mut rows = Vec::new();
+    cloud_mcp_todo_mirror_collect_status_rows(value, &mut rows, 0);
+    cloud_mcp_todo_mirror_dedupe_rows(rows)
+}
+
+fn cloud_mcp_update_todo_mirror_cache(
+    cache: &mut Value,
+    source: &str,
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    response: &Value,
+) -> bool {
+    cloud_mcp_ensure_todo_mirror_shape(cache);
+    let workspace_todos = cloud_mcp_extract_workspace_todos(response);
+    let new_status_rows = cloud_mcp_todo_mirror_status_rows_from_response(response);
+    if workspace_todos.is_none() && new_status_rows.is_empty() {
+        return false;
+    }
+    let now_ms = cloud_mcp_now_ms();
+    let key = cloud_mcp_todo_mirror_entry_key(base_url, repo_id, workspace_id);
+    let Some(entries) = cache
+        .get_mut("entries")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let entry = entries.entry(key.clone()).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let Some(object) = entry.as_object_mut() else {
+        return false;
+    };
+    object.insert("key".to_string(), json!(key));
+    object.insert("source".to_string(), json!(source));
+    object.insert("baseUrl".to_string(), json!(base_url.unwrap_or_default()));
+    object.insert("repoId".to_string(), json!(repo_id.unwrap_or_default()));
+    object.insert(
+        "workspaceId".to_string(),
+        json!(workspace_id.unwrap_or_default()),
+    );
+    object.insert("updatedAtMs".to_string(), json!(now_ms));
+    if let Some(workspace_todos) = workspace_todos {
+        object.insert("workspaceTodos".to_string(), workspace_todos.clone());
+        object.insert("workspace_todos".to_string(), workspace_todos);
+    }
+    if !new_status_rows.is_empty() {
+        let mut rows = object
+            .get("statusRows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        rows.extend(new_status_rows);
+        let rows = cloud_mcp_todo_mirror_dedupe_rows(rows);
+        object.insert("statusRows".to_string(), json!(rows.clone()));
+        object.insert("status_rows".to_string(), json!(rows));
+    }
+    if let Some(cache_object) = cache.as_object_mut() {
+        cache_object.insert("updatedAtMs".to_string(), json!(now_ms));
+        cache_object.insert("updated_at_ms".to_string(), json!(now_ms));
+    }
+    true
+}
+
+async fn cloud_mcp_update_todo_mirror_from_response(
+    state: &CloudMcpState,
+    source: &str,
+    endpoint: &str,
+    payload: &Value,
+    response: &Value,
+) {
+    let should_consider = endpoint == "/v1/status" || endpoint.contains("/workspace/todos");
+    let workspace_todos = cloud_mcp_extract_workspace_todos(response);
+    let has_status_rows = !cloud_mcp_todo_mirror_status_rows_from_response(response).is_empty();
+    if !should_consider && workspace_todos.is_none() && !has_status_rows {
+        return;
+    }
+    let base_url = {
+        let runtime = state.inner.lock().await;
+        runtime.base_url.clone()
+    };
+    let repo_id = cloud_mcp_payload_text(payload, &["repo_id", "repoId"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_id"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repoId"]));
+    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspaceId"]));
+    let mut cache = state.todo_mirror_cache.lock().await;
+    if cloud_mcp_update_todo_mirror_cache(
+        &mut cache,
+        source,
+        Some(&base_url),
+        repo_id.as_deref(),
+        workspace_id.as_deref(),
+        response,
+    ) {
+        cloud_mcp_save_todo_mirror_cache(&cache);
+    }
+}
+
+fn cloud_mcp_update_todo_mirror_file_from_response(
+    source: &str,
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    response: &Value,
+) {
+    let mut cache = cloud_mcp_load_todo_mirror_cache();
+    if cloud_mcp_update_todo_mirror_cache(
+        &mut cache,
+        source,
+        base_url,
+        repo_id,
+        workspace_id,
+        response,
+    ) {
+        cloud_mcp_save_todo_mirror_cache(&cache);
+    }
+}
+
+fn cloud_mcp_todo_mirror_aggregate(rows: &[Value]) -> Value {
+    let mut status_counts = HashMap::<String, usize>::new();
+    let mut latest_cursor = String::new();
+    let mut terminal_count = 0usize;
+    let mut completed_count = 0usize;
+    let mut quiescent_count = 0usize;
+    for row in rows {
+        let status = cloud_mcp_payload_text(row, &["status", "dispatch_status", "dispatchStatus"])
+            .unwrap_or_else(|| "queued".to_string());
+        *status_counts.entry(status.clone()).or_insert(0) += 1;
+        if cloud_mcp_todo_mirror_dispatch_status_is_terminal(&status) {
+            terminal_count += 1;
+        }
+        if status == "completed" {
+            completed_count += 1;
+        }
+        if cloud_mcp_todo_mirror_dispatch_status_is_quiescent(&status) {
+            quiescent_count += 1;
+        }
+        if let Some(updated_at) = cloud_mcp_payload_text(row, &["updated_at", "updatedAt"]) {
+            if updated_at > latest_cursor {
+                latest_cursor = updated_at;
+            }
+        }
+    }
+    let count = rows.len();
+    let terminal = count > 0 && terminal_count == count;
+    let status = if count == 0 {
+        "empty"
+    } else if terminal && completed_count == count {
+        "completed"
+    } else if terminal {
+        "partial_failed"
+    } else if quiescent_count > 0 {
+        "attention_required"
+    } else if status_counts.contains_key("running") {
+        "running"
+    } else if status_counts.contains_key("accepted") {
+        "accepted"
+    } else if status_counts.contains_key("queued") {
+        "queued"
+    } else {
+        "listed"
+    };
+    json!({
+        "status": status,
+        "count": count,
+        "terminal": terminal,
+        "terminal_count": terminal_count,
+        "terminalCount": terminal_count,
+        "completed_count": completed_count,
+        "completedCount": completed_count,
+        "quiescent_count": quiescent_count,
+        "quiescentCount": quiescent_count,
+        "status_counts": status_counts.clone(),
+        "statusCounts": status_counts,
+        "watch_cursor": latest_cursor,
+        "watchCursor": latest_cursor,
+    })
+}
+
+fn cloud_mcp_todo_mirror_status_from_cache(
+    cache: &Value,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+    max_age_ms: Option<u64>,
+) -> Option<Value> {
+    let limit = cloud_mcp_payload_i64(input, &["limit"])
+        .unwrap_or(100)
+        .clamp(1, 500) as usize;
+    let entries = cache.get("entries").and_then(Value::as_object)?;
+    let now_ms = cloud_mcp_now_ms();
+    let mut rows = Vec::new();
+    let mut latest_updated_ms = 0u64;
+    for entry in entries.values() {
+        let entry_updated_ms = entry
+            .get("updatedAtMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if max_age_ms.is_some_and(|max_age_ms| now_ms.saturating_sub(entry_updated_ms) > max_age_ms)
+        {
+            continue;
+        }
+        let entry_repo_id = cloud_mcp_payload_text(entry, &["repoId", "repo_id"]);
+        if let Some(repo_id) = repo_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if entry_repo_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|entry_repo_id| entry_repo_id != repo_id)
+            {
+                continue;
+            }
+        }
+        latest_updated_ms = latest_updated_ms.max(entry_updated_ms);
+        if let Some(status_rows) = entry.get("statusRows").and_then(Value::as_array) {
+            rows.extend(status_rows.iter().cloned());
+        }
+        if let Some(workspace_todos) = entry
+            .get("workspaceTodos")
+            .or_else(|| entry.get("workspace_todos"))
+        {
+            cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(workspace_todos, &mut rows);
+        }
+    }
+    let mut rows = cloud_mcp_todo_mirror_dedupe_rows(rows)
+        .into_iter()
+        .filter(|row| cloud_mcp_todo_mirror_row_matches_request(row, workspace_id, input))
+        .take(limit)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    rows.sort_by(|left, right| {
+        let left_time = cloud_mcp_payload_text(left, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
+            .unwrap_or_default();
+        let right_time =
+            cloud_mcp_payload_text(right, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
+                .unwrap_or_default();
+        right_time.cmp(&left_time)
+    });
+    let count = rows.len();
+    let aggregate = cloud_mcp_todo_mirror_aggregate(&rows);
+    let terminal = aggregate
+        .get("terminal")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let watch_cursor = aggregate
+        .get("watch_cursor")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let watch_cursor_camel = aggregate
+        .get("watchCursor")
+        .cloned()
+        .unwrap_or_else(|| watch_cursor.clone());
+    Some(json!({
+        "kind": "todo_status",
+        "items": rows,
+        "count": count,
+        "aggregate": aggregate,
+        "terminal": terminal,
+        "watch_cursor": watch_cursor,
+        "watchCursor": watch_cursor_camel,
+        "body_transport": "refs",
+        "bodyTransport": "refs",
+        "source": "local_todo_mirror",
+        "freshness": "fresh",
+        "mirror_fresh": max_age_ms.is_some(),
+        "mirrorFresh": max_age_ms.is_some(),
+        "mirror_updated_at_ms": latest_updated_ms,
+        "mirrorUpdatedAtMs": latest_updated_ms,
+        "has_filters": cloud_mcp_todo_mirror_has_status_filters(input),
+        "hasFilters": cloud_mcp_todo_mirror_has_status_filters(input),
+    }))
+}
+
+fn cloud_mcp_todo_mirror_status_from_file(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+) -> Option<Value> {
+    let cache = cloud_mcp_load_todo_mirror_cache();
+    cloud_mcp_todo_mirror_status_from_cache(
+        &cache,
+        repo_id,
+        workspace_id,
+        input,
+        Some(CLOUD_MCP_TODO_MIRROR_FRESH_MS),
+    )
+}
+
+fn cloud_mcp_todo_mirror_stale_status_from_file(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+) -> Option<Value> {
+    let cache = cloud_mcp_load_todo_mirror_cache();
+    cloud_mcp_todo_mirror_status_from_cache(&cache, repo_id, workspace_id, input, None).map(
+        |mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("freshness".to_string(), json!("stale"));
+                object.insert("mirror_fresh".to_string(), json!(false));
+                object.insert("mirrorFresh".to_string(), json!(false));
+            }
+            value
+        },
+    )
+}
+
 fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
     let todo_id = cloud_mcp_payload_text(value, &["todo_id", "todoId", "id"])?;
     let device_id = cloud_mcp_payload_text(
@@ -12008,6 +12899,51 @@ mod cloud_mcp_tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn todo_mirror_status_filters_cached_workspace_dispatches() {
+        let mut cache = cloud_mcp_empty_todo_mirror_cache();
+        let response = json!({
+            "workspaceTodos": {
+                "dispatchesByWorkspace": [{
+                    "workspaceId": "workspace-a",
+                    "items": [{
+                        "todoBatchId": "batch-1",
+                        "dispatchId": "dispatch-1",
+                        "commandId": "command-1",
+                        "todoId": "todo-1",
+                        "todoWorkspaceId": "workspace-a",
+                        "targetWorkspaceId": "workspace-b",
+                        "targetDeviceId": "device-b",
+                        "dispatchStatus": "running",
+                        "updatedAt": "2026-06-07T00:00:00Z"
+                    }]
+                }]
+            }
+        });
+        assert!(cloud_mcp_update_todo_mirror_cache(
+            &mut cache,
+            "test",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &response,
+        ));
+
+        let status = cloud_mcp_todo_mirror_status_from_cache(
+            &cache,
+            Some("repo-1"),
+            Some("workspace-a"),
+            &json!({"batch_id": "batch-1"}),
+            Some(CLOUD_MCP_TODO_MIRROR_FRESH_MS),
+        )
+        .expect("cached status");
+
+        assert_eq!(status["source"].as_str(), Some("local_todo_mirror"));
+        assert_eq!(status["count"].as_u64(), Some(1));
+        assert_eq!(status["aggregate"]["status"].as_str(), Some("running"));
+        assert_eq!(status["terminal"].as_bool(), Some(false));
     }
 
     #[tokio::test]
@@ -12680,6 +13616,13 @@ pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
             let parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
             let data = parsed.get("data").cloned().unwrap_or(parsed);
+            cloud_mcp_update_todo_mirror_file_from_response(
+                "list_todo_targets",
+                Some(&base_url),
+                identity.repo_id.as_deref(),
+                identity.workspace_id.as_deref(),
+                &data,
+            );
             let workspace_todos = data
                 .get("workspace_todos")
                 .or_else(|| data.get("workspaceTodos"))
@@ -12721,267 +13664,7 @@ pub(crate) fn cloud_mcp_forward_agent_list_todo_targets(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn cloud_mcp_forward_agent_send_todo_to_device(
-    repo_path: Option<&str>,
-    db_path: Option<&Path>,
-    workspace_id: Option<&str>,
-    base_url_override: Option<&str>,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
-    mode: &str,
-    text: &str,
-    title: Option<&str>,
-    target_device_id: &str,
-    target_workspace_id: &str,
-    target_workspace_name: Option<&str>,
-    target_device_name: Option<&str>,
-    target_client_id: Option<&str>,
-    target_agent_id: Option<&str>,
-    target_terminal_id: Option<&str>,
-    target_terminal_index: Option<i64>,
-    target_thread_id: Option<&str>,
-    target_color_slot: Option<i64>,
-    target_terminal_color: Option<&str>,
-    todo_id: Option<&str>,
-    client_request_id: Option<&str>,
-) -> Result<Value, String> {
-    let mode = cloud_mcp_proxy_normalize_todo_send_mode(mode)?;
-    let text = cloud_mcp_clean_prompt_text(text);
-    if text.trim().is_empty() {
-        return Err("send_todo_to_device requires non-empty text.".to_string());
-    }
-    let target_device_id = target_device_id.trim();
-    if target_device_id.is_empty() {
-        return Err("send_todo_to_device requires target_device_id.".to_string());
-    }
-    let target_workspace_id = target_workspace_id.trim();
-    if target_workspace_id.is_empty() {
-        return Err("send_todo_to_device requires target_workspace_id.".to_string());
-    }
-    let repo_path_text = repo_path
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let repo_id = repo_path_text
-        .as_deref()
-        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
-    let base_url = base_url_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(cloud_mcp_base_url);
-    let identity = CloudMcpProxyIdentity {
-        base_url: Some(base_url.clone()),
-        repo_path: repo_path_text.as_ref().map(PathBuf::from),
-        repo_id,
-        workspace_id: workspace_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        workspace_name: None,
-        agent_id: agent_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        session_id: session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        coordination_db_path: db_path.map(Path::to_path_buf),
-        pane_id: None,
-        terminal_instance_id: None,
-        slot_key: None,
-        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
-        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
-    };
-    let source_workspace_id = identity.workspace_id.as_deref().unwrap_or_default();
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let source_device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-        .unwrap_or_else(|| "desktop-primary".to_string());
-    let request_id = client_request_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let todo_id = todo_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("agent-todo-{request_id}"));
-    let title = title
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| cloud_mcp_prompt_summary(&text));
-    let mut payload = cloud_mcp_proxy_agent_base_payload(
-        &identity,
-        if mode == "queued" {
-            "cloud-agent-todo-dispatch"
-        } else {
-            "cloud-agent-listed-todo"
-        },
-    );
-    if let Some(object) = payload.as_object_mut() {
-        object.insert(
-            "event_kind".to_string(),
-            json!(if mode == "queued" {
-                "workspace_todo_dispatch_requested"
-            } else {
-                "workspace_todo_listed_created"
-            }),
-        );
-        object.insert("mode".to_string(), json!(mode.as_str()));
-        object.insert("todo_id".to_string(), json!(todo_id.as_str()));
-        object.insert("todoId".to_string(), json!(todo_id.as_str()));
-        object.insert("title".to_string(), json!(title.as_str()));
-        object.insert("text".to_string(), json!(text.as_str()));
-        object.insert("body".to_string(), json!(text.as_str()));
-        object.insert("target_device_id".to_string(), json!(target_device_id));
-        object.insert("targetDeviceId".to_string(), json!(target_device_id));
-        object.insert(
-            "target_workspace_id".to_string(),
-            json!(target_workspace_id),
-        );
-        object.insert(
-            "targetWorkspaceId".to_string(),
-            json!(target_workspace_id),
-        );
-        object.insert("requested_by_device_id".to_string(), json!(source_device_id));
-        object.insert("requestedByDeviceId".to_string(), json!(source_device_id));
-        if !source_workspace_id.is_empty() {
-            object.insert(
-                "requested_by_workspace_id".to_string(),
-                json!(source_workspace_id),
-            );
-            object.insert(
-                "requestedByWorkspaceId".to_string(),
-                json!(source_workspace_id),
-            );
-            object.insert("todo_workspace_id".to_string(), json!(source_workspace_id));
-            object.insert("todoWorkspaceId".to_string(), json!(source_workspace_id));
-        }
-        object.insert("todo_device_id".to_string(), json!(source_device_id));
-        object.insert("todoDeviceId".to_string(), json!(source_device_id));
-        if let Some(value) = target_workspace_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("target_workspace_name".to_string(), json!(value));
-            object.insert("targetWorkspaceName".to_string(), json!(value));
-        }
-        if let Some(value) = target_device_name
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("target_device_name".to_string(), json!(value));
-            object.insert("targetDeviceName".to_string(), json!(value));
-        }
-        if let Some(value) = target_client_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            object.insert("target_client_id".to_string(), json!(value));
-            object.insert("targetClientId".to_string(), json!(value));
-        }
-        cloud_mcp_proxy_insert_todo_assignment(
-            object,
-            target_agent_id,
-            target_terminal_id,
-            target_terminal_index,
-            target_thread_id,
-            target_color_slot,
-            target_terminal_color,
-        );
-        let todo_id_value = object.get("todoId").cloned().unwrap_or(Value::Null);
-        object.insert(
-            "todo".to_string(),
-            json!({
-                "id": todo_id_value.clone(),
-                "todoId": todo_id_value,
-                "title": title.as_str(),
-                "text": text.as_str(),
-            }),
-        );
-        object.insert(
-            "target".to_string(),
-            json!({
-                "targetDeviceId": target_device_id,
-                "targetWorkspaceId": target_workspace_id,
-                "targetWorkspaceName": target_workspace_name.unwrap_or_default(),
-                "targetDeviceName": target_device_name.unwrap_or_default(),
-                "targetClientId": target_client_id.unwrap_or_default(),
-            }),
-        );
-        if mode == "queued" {
-            let dispatch_id = format!("todo-dispatch-{request_id}");
-            let command_id = format!("todo-command-{request_id}");
-            object.insert("dispatch_id".to_string(), json!(dispatch_id.as_str()));
-            object.insert("dispatchId".to_string(), json!(dispatch_id.as_str()));
-            object.insert("command_id".to_string(), json!(command_id.as_str()));
-            object.insert("commandId".to_string(), json!(command_id.as_str()));
-            object.insert("dispatch_kind".to_string(), json!("remote"));
-            object.insert("dispatchKind".to_string(), json!("remote"));
-        }
-    }
-
-    let event_kind = payload["event_kind"]
-        .as_str()
-        .unwrap_or("workspace_todo_listed_created");
-    let request = cloud_mcp_event_envelope(event_kind, &payload);
-    identity.log(
-        "cloud_mcp.agent_send_todo_to_device.start",
-        "send_todo_to_device",
-        json!({
-            "activity": "agent send todo to device",
-            "baseUrl": base_url,
-            "mode": mode,
-            "targetDeviceId": target_device_id,
-            "targetWorkspaceId": target_workspace_id,
-        }),
-    );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            let parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            identity.log(
-                "cloud_mcp.agent_send_todo_to_device.done",
-                "send_todo_to_device",
-                json!({
-                    "activity": "agent sent todo to device",
-                    "baseUrl": base_url,
-                    "mode": mode,
-                    "targetDeviceId": target_device_id,
-                    "targetWorkspaceId": target_workspace_id,
-                }),
-            );
-            Ok(json!({
-                "mode": mode,
-                "event_kind": event_kind,
-                "target_device_id": target_device_id,
-                "target_workspace_id": target_workspace_id,
-                "response": parsed,
-            }))
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_send_todo_to_device.error",
-                "send_todo_to_device",
-                json!({
-                    "activity": "agent send todo to device failed",
-                    "baseUrl": base_url,
-                    "mode": mode,
-                    "targetDeviceId": target_device_id,
-                    "targetWorkspaceId": target_workspace_id,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
-    }
-}
-
-pub(crate) fn cloud_mcp_forward_agent_send_todo_batch(
+pub(crate) fn cloud_mcp_forward_agent_send_todos(
     repo_path: Option<&str>,
     db_path: Option<&Path>,
     workspace_id: Option<&str>,
@@ -12999,8 +13682,8 @@ pub(crate) fn cloud_mcp_forward_agent_send_todo_batch(
         session_id,
         input,
         "/v1/workspace/todos/batch",
-        "send_todo_batch",
-        "rust-diffforge-agent-send-todo-batch",
+        "send_todos",
+        "rust-diffforge-agent-send-todos",
     )
 }
 
@@ -13013,7 +13696,19 @@ pub(crate) fn cloud_mcp_forward_agent_get_todo_status(
     session_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
-    cloud_mcp_forward_agent_todo_request(
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    if let Some(local) =
+        cloud_mcp_todo_mirror_status_from_file(repo_id.as_deref(), workspace_id, input)
+    {
+        return Ok(local);
+    }
+    let remote = cloud_mcp_forward_agent_todo_request(
         repo_path,
         db_path,
         workspace_id,
@@ -13024,7 +13719,23 @@ pub(crate) fn cloud_mcp_forward_agent_get_todo_status(
         "/v1/workspace/todos/status",
         "get_todo_status",
         "rust-diffforge-agent-get-todo-status",
-    )
+    );
+    match remote {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if let Some(mut stale) =
+                cloud_mcp_todo_mirror_stale_status_from_file(repo_id.as_deref(), workspace_id, input)
+            {
+                if let Some(object) = stale.as_object_mut() {
+                    object.insert("refresh_error".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                    object.insert("refreshError".to_string(), json!(clean_terminal_telemetry_text(&error)));
+                }
+                Ok(stale)
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 pub(crate) fn cloud_mcp_forward_agent_list_todo_history(
@@ -13059,9 +13770,11 @@ pub(crate) fn cloud_mcp_forward_agent_wait_for_todos(
     session_id: Option<&str>,
     input: &Value,
 ) -> Result<Value, String> {
+    const DEFAULT_TODO_WAIT_TIMEOUT_MS: i64 = 30_000;
+    const MAX_TODO_WAIT_TIMEOUT_MS: i64 = 30_000;
     let timeout_ms = cloud_mcp_payload_i64(input, &["timeout_ms", "timeoutMs"])
-        .unwrap_or(120_000)
-        .clamp(1_000, 600_000) as u64;
+        .unwrap_or(DEFAULT_TODO_WAIT_TIMEOUT_MS)
+        .clamp(1_000, MAX_TODO_WAIT_TIMEOUT_MS) as u64;
     let until = cloud_mcp_payload_text(input, &["until"])
         .unwrap_or_else(|| "terminal".to_string())
         .trim()
@@ -13225,6 +13938,13 @@ fn cloud_mcp_forward_agent_todo_request(
             let parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
             let data = parsed.get("data").cloned().unwrap_or(parsed);
+            cloud_mcp_update_todo_mirror_file_from_response(
+                tool_name,
+                Some(&base_url),
+                identity.repo_id.as_deref(),
+                identity.workspace_id.as_deref(),
+                &data,
+            );
             identity.log(
                 &format!("cloud_mcp.{tool_name}.done"),
                 tool_name,
@@ -13291,55 +14011,7 @@ fn cloud_mcp_proxy_normalize_todo_send_mode(mode: &str) -> Result<String, String
         "queue" | "queued" | "dispatch" | "active_queue" | "run_if_online" => {
             Ok("queued".to_string())
         }
-        _ => Err("send_todo_to_device mode must be listed or queued.".to_string()),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cloud_mcp_proxy_insert_todo_assignment(
-    object: &mut serde_json::Map<String, Value>,
-    target_agent_id: Option<&str>,
-    target_terminal_id: Option<&str>,
-    target_terminal_index: Option<i64>,
-    target_thread_id: Option<&str>,
-    target_color_slot: Option<i64>,
-    target_terminal_color: Option<&str>,
-) {
-    if let Some(value) = target_agent_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        object.insert("target_agent_id".to_string(), json!(value));
-        object.insert("targetAgentId".to_string(), json!(value));
-    }
-    if let Some(value) = target_terminal_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        object.insert("target_terminal_id".to_string(), json!(value));
-        object.insert("targetTerminalId".to_string(), json!(value));
-    }
-    if let Some(value) = target_terminal_index {
-        object.insert("target_terminal_index".to_string(), json!(value));
-        object.insert("targetTerminalIndex".to_string(), json!(value));
-    }
-    if let Some(value) = target_thread_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        object.insert("target_thread_id".to_string(), json!(value));
-        object.insert("targetThreadId".to_string(), json!(value));
-    }
-    if let Some(value) = target_color_slot {
-        object.insert("target_color_slot".to_string(), json!(value));
-        object.insert("targetColorSlot".to_string(), json!(value));
-    }
-    if let Some(value) = target_terminal_color
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        object.insert("target_terminal_color".to_string(), json!(value));
-        object.insert("targetTerminalColor".to_string(), json!(value));
+        _ => Err("todo send mode must be listed or queued.".to_string()),
     }
 }
 
