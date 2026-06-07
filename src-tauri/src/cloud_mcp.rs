@@ -425,10 +425,6 @@ fn cloud_mcp_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn cloud_mcp_legacy_local_root() -> Option<PathBuf> {
-    cloud_mcp_home_dir().map(|home| home.join(".diffforge"))
-}
-
 fn cloud_mcp_native_cache_root() -> Option<PathBuf> {
     if let Some(path) = cloud_mcp_env_path(CLOUD_MCP_LOCAL_CACHE_DIR_ENV) {
         return Some(path);
@@ -460,7 +456,7 @@ fn cloud_mcp_native_cache_root() -> Option<PathBuf> {
             return Some(home.join(".cache").join("diffforge"));
         }
     }
-    cloud_mcp_legacy_local_root().map(|root| root.join("cache"))
+    None
 }
 
 fn cloud_mcp_native_data_root() -> Option<PathBuf> {
@@ -498,37 +494,15 @@ fn cloud_mcp_native_data_root() -> Option<PathBuf> {
             return Some(home.join(".local").join("share").join("diffforge"));
         }
     }
-    cloud_mcp_legacy_local_root()
+    None
 }
 
 fn cloud_mcp_local_cache_file_path(filename: &str) -> Option<PathBuf> {
-    let native = cloud_mcp_native_cache_root()?.join(filename);
-    if cloud_mcp_env_path(CLOUD_MCP_LOCAL_CACHE_DIR_ENV).is_none()
-        && cloud_mcp_env_path(CLOUD_MCP_LOCAL_HOME_ENV).is_none()
-    {
-        if let Some(legacy) = cloud_mcp_legacy_local_root()
-            .map(|root| root.join("cache").join(filename))
-            .filter(|path| path.exists() && !native.exists())
-        {
-            return Some(legacy);
-        }
-    }
-    Some(native)
+    Some(cloud_mcp_native_cache_root()?.join(filename))
 }
 
 fn cloud_mcp_local_data_file_path(filename: &str) -> Option<PathBuf> {
-    let native = cloud_mcp_native_data_root()?.join(filename);
-    if cloud_mcp_env_path(CLOUD_MCP_LOCAL_DATA_DIR_ENV).is_none()
-        && cloud_mcp_env_path(CLOUD_MCP_LOCAL_HOME_ENV).is_none()
-    {
-        if let Some(legacy) = cloud_mcp_legacy_local_root()
-            .map(|root| root.join(filename))
-            .filter(|path| path.exists() && !native.exists())
-        {
-            return Some(legacy);
-        }
-    }
-    Some(native)
+    Some(cloud_mcp_native_data_root()?.join(filename))
 }
 
 fn cloud_mcp_outbox_db_path() -> Option<PathBuf> {
@@ -19512,7 +19486,7 @@ fn cloud_mcp_forward_isolated_work_pruned(
     let cache_prune = json!({
         "ok": true,
         "skipped": true,
-        "reason": "legacy_local_cache_removed",
+        "reason": "local_cache_prune_unavailable",
     });
     match response {
         Ok(response) => {
