@@ -11778,6 +11778,10 @@ export const ButtonBrowserIcon = styled(OpenInBrowser)`
   ${buttonIconSize}
 `;
 
+export const ButtonAssetsIcon = styled(CloudDone)`
+  ${buttonIconSize}
+`;
+
 export const ButtonCloseIcon = styled(Close)`
   ${buttonIconSize}
 `;

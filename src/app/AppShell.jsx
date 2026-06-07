@@ -482,6 +482,7 @@ import {
   ButtonAddIcon,
   ButtonLoginIcon,
   ButtonBrowserIcon,
+  ButtonAssetsIcon,
   ButtonCloseIcon,
   ButtonDarkModeIcon,
   ButtonDeleteIcon,
@@ -508,7 +509,7 @@ import {
 } from "./appStyles";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
+import ArchitectureWorkspaceView, { AccountAssetsView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
@@ -20730,6 +20731,17 @@ export default function App() {
                   )}
                   <RailGlobalActions aria-label="Global controls">
                     <RailActionButton
+                      aria-label="Assets"
+                      data-active={activeView === "assets"}
+                      data-scope="global"
+                      onClick={() => showView("assets")}
+                      title="Assets"
+                      type="button"
+                    >
+                      <ButtonAssetsIcon aria-hidden="true" />
+                      <span>Assets</span>
+                    </RailActionButton>
+                    <RailActionButton
                       aria-label="Processes"
                       data-active={activeView === "processes"}
                       data-scope="global"
@@ -21527,6 +21539,14 @@ export default function App() {
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
+                </ForgeWorkspace>
+              ) : visibleView === "assets" ? (
+                <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
+                  <AccountAssetsView
+                    defaultWorkingDirectory={defaultWorkingDirectory}
+                    rootDirectory={selectedWorkspaceFileRoot}
+                    workspace={selectedWorkspace}
+                  />
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (
                 <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>

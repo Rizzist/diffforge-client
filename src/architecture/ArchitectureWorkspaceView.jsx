@@ -558,6 +558,18 @@ function assetLocalPath(asset) {
   return text(asset?.localPath || asset?.local_path || asset?.path);
 }
 
+function assetWorkspaceId(asset) {
+  return text(asset?.workspaceId || asset?.workspace_id || asset?.workspace?.id);
+}
+
+function assetWorkspaceName(asset) {
+  return text(asset?.workspaceName || asset?.workspace_name || asset?.workspace?.name);
+}
+
+function assetRepoPath(asset) {
+  return text(asset?.repoPath || asset?.repo_path || asset?.workspaceRoot || asset?.workspace_root || asset?.rootPath || asset?.root_path);
+}
+
 function assetSha(asset) {
   return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
 }
@@ -4922,9 +4934,6 @@ export default function ArchitectureWorkspaceView({
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
   const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
   const [finishedPlanTaskIds, setFinishedPlanTaskIds] = useState(() => new Set());
-  const [assetLibrary, setAssetLibrary] = useState(null);
-  const [assetLibraryLoading, setAssetLibraryLoading] = useState(false);
-  const [assetLibraryError, setAssetLibraryError] = useState("");
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
@@ -4932,7 +4941,6 @@ export default function ArchitectureWorkspaceView({
     () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId),
     [activeWorkspaceId, workspaceTodos],
   );
-  const assetItems = useMemo(() => assetLibraryItems(assetLibrary), [assetLibrary]);
   const visibleTasks = useMemo(() => {
     if (!finishedPlanTaskIds.size) return tasks;
     return tasks.map((task, index) => {
@@ -4943,8 +4951,6 @@ export default function ArchitectureWorkspaceView({
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "architectures"
     ? `Architectures · repo scoped · ${repoLabel}`
-    : viewMode === "assets"
-      ? `Assets · ${assetItems.length} item${assetItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "todoHistory"
       ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "scannedResult"
@@ -5007,81 +5013,6 @@ export default function ArchitectureWorkspaceView({
     setFinishedPlanTaskIds(new Set());
     setFinishPlanState({ error: "", taskId: "" });
   }, [repoPath, activeWorkspaceId]);
-
-  const refreshAssetLibrary = useCallback(({ silent = false } = {}) => {
-    if (!repoPath || !activeWorkspaceId) {
-      setAssetLibrary(null);
-      return Promise.resolve(null);
-    }
-    if (!silent) setAssetLibraryLoading(true);
-    setAssetLibraryError("");
-    return invoke("cloud_mcp_list_workspace_assets", {
-      limit: 500,
-      repoPath,
-      workspaceId: activeWorkspaceId,
-      workspaceName: activeWorkspaceName,
-    })
-      .then((result) => {
-        setAssetLibrary(result);
-        return result;
-      })
-      .catch((error) => {
-        const message = error?.message || String(error || "Unable to load assets.");
-        setAssetLibraryError(message);
-        return null;
-      })
-      .finally(() => {
-        if (!silent) setAssetLibraryLoading(false);
-      });
-  }, [activeWorkspaceId, activeWorkspaceName, repoPath]);
-
-  useEffect(() => {
-    void refreshAssetLibrary({ silent: true });
-  }, [refreshAssetLibrary]);
-
-  useEffect(() => {
-    if (!repoPath || !activeWorkspaceId) {
-      return undefined;
-    }
-
-    let cancelled = false;
-    let unlistenAssets = null;
-    listen(ARCHITECTURE_ASSETS_UPDATED_EVENT, (event) => {
-      if (cancelled) return;
-      const payload = jsonObject(event?.payload) || {};
-      const nestedPayload = jsonObject(payload.payload) || {};
-      const eventWorkspaceId = text(
-        payload.workspaceId
-          || payload.workspace_id
-          || nestedPayload.workspaceId
-          || nestedPayload.workspace_id,
-      );
-      const workspaceIds = jsonArray(payload.workspace_ids || payload.workspaceIds || nestedPayload.workspace_ids || nestedPayload.workspaceIds)
-        .map((item) => text(item))
-        .filter(Boolean);
-      if (
-        eventWorkspaceId
-        && eventWorkspaceId !== activeWorkspaceId
-        && !workspaceIds.includes(activeWorkspaceId)
-      ) {
-        return;
-      }
-      void refreshAssetLibrary({ silent: true });
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenAssets = unlisten;
-    }).catch(() => {});
-
-    return () => {
-      cancelled = true;
-      if (unlistenAssets) {
-        unlistenAssets();
-      }
-    };
-  }, [activeWorkspaceId, refreshAssetLibrary, repoPath]);
 
   const refreshTaskHistorySnapshot = useCallback(() => {
     if (!repoPath || !activeWorkspaceId) {
@@ -5159,13 +5090,6 @@ export default function ArchitectureWorkspaceView({
             Architectures
           </ViewToggleButton>
           <ViewToggleButton
-            data-active={viewMode === "assets" ? "true" : "false"}
-            onClick={() => setViewMode("assets")}
-            type="button"
-          >
-            Assets
-          </ViewToggleButton>
-          <ViewToggleButton
             data-active={viewMode === "todoHistory" ? "true" : "false"}
             onClick={() => setViewMode("todoHistory")}
             type="button"
@@ -5205,17 +5129,6 @@ export default function ArchitectureWorkspaceView({
           workspaceSelectedGraphId={architectureSelectedGraphId}
           workspaceSelectedRepoPath={architectureSelectedRepoPath}
           tasks={visibleTasks}
-        />
-      ) : viewMode === "assets" ? (
-        <AssetsPanel
-          error={assetLibraryError}
-          library={assetLibrary}
-          loading={assetLibraryLoading}
-          onRefresh={refreshAssetLibrary}
-          repoLabel={repoLabel}
-          repoPath={repoPath}
-          workspaceId={activeWorkspaceId}
-          workspaceName={activeWorkspaceName}
         />
       ) : viewMode === "todoHistory" ? (
         <TodosHistoryPanel
@@ -8689,7 +8602,87 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
   );
 }
 
+export function AccountAssetsView({
+  defaultWorkingDirectory = "",
+  rootDirectory = "",
+  workspace = null,
+}) {
+  const activeWorkspaceId = workspace?.id || "";
+  const activeWorkspaceName = workspace?.name || "";
+  const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const [assetLibrary, setAssetLibrary] = useState(null);
+  const [assetLibraryLoading, setAssetLibraryLoading] = useState(false);
+  const [assetLibraryError, setAssetLibraryError] = useState("");
+
+  const refreshAssetLibrary = useCallback(({ silent = false } = {}) => {
+    if (!silent) setAssetLibraryLoading(true);
+    setAssetLibraryError("");
+    return invoke("cloud_mcp_list_workspace_assets", {
+      includeAllWorkspaces: true,
+      limit: 500,
+      repoPath,
+      workspaceId: activeWorkspaceId || undefined,
+      workspaceName: activeWorkspaceName || undefined,
+    })
+      .then((result) => {
+        setAssetLibrary(result);
+        return result;
+      })
+      .catch((error) => {
+        const message = error?.message || String(error || "Unable to load assets.");
+        setAssetLibraryError(message);
+        return null;
+      })
+      .finally(() => {
+        if (!silent) setAssetLibraryLoading(false);
+      });
+  }, [activeWorkspaceId, activeWorkspaceName, repoPath]);
+
+  useEffect(() => {
+    void refreshAssetLibrary({ silent: true });
+  }, [refreshAssetLibrary]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenAssets = null;
+    listen(ARCHITECTURE_ASSETS_UPDATED_EVENT, () => {
+      if (cancelled) return;
+      void refreshAssetLibrary({ silent: true });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenAssets = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenAssets) {
+        unlistenAssets();
+      }
+    };
+  }, [refreshAssetLibrary]);
+
+  return (
+    <ArchitectureSurface aria-label="Account Assets" data-state={assetLibraryLoading ? "loading" : "ready"}>
+      <AssetsPanel
+        accountScope
+        error={assetLibraryError}
+        library={assetLibrary}
+        loading={assetLibraryLoading}
+        onRefresh={refreshAssetLibrary}
+        repoLabel="Account assets"
+        repoPath={repoPath}
+        workspaceId={activeWorkspaceId}
+        workspaceName={activeWorkspaceName}
+      />
+    </ArchitectureSurface>
+  );
+}
+
 function AssetsPanel({
+  accountScope = false,
   error = "",
   library = null,
   loading = false,
@@ -8708,6 +8701,7 @@ function AssetsPanel({
   const [actionError, setActionError] = useState("");
   const cloudCount = items.filter((item) => ["done", "active"].includes(assetStatusKind(assetStatus(item)))).length;
   const localCount = items.filter((item) => assetLocalPath(item)).length;
+  const canRegister = Boolean(repoPath && workspaceId);
   const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
     || transfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
 
@@ -8718,11 +8712,11 @@ function AssetsPanel({
   const registerAsset = useCallback((event) => {
     event.preventDefault();
     const path = draftPath.trim();
-    if (!path || !repoPath || !workspaceId) return;
+    if (!path || !canRegister) return;
     setBusyKey("register");
     setActionError("");
     invoke("cloud_mcp_register_workspace_asset", {
-      metadata: { source: "architecture_assets_tab" },
+      metadata: { source: accountScope ? "account_assets_view" : "workspace_assets_view" },
       path,
       repoPath,
       upload: registerUpload,
@@ -8739,11 +8733,14 @@ function AssetsPanel({
       .finally(() => {
         setBusyKey((current) => (current === "register" ? "" : current));
       });
-  }, [draftPath, refresh, registerUpload, repoPath, workspaceId, workspaceName]);
+  }, [accountScope, canRegister, draftPath, refresh, registerUpload, repoPath, workspaceId, workspaceName]);
 
   const runAssetAction = useCallback((action, asset) => {
     const id = assetId(asset);
-    if (!id || !repoPath || !workspaceId) return;
+    const actionRepoPath = assetRepoPath(asset) || repoPath;
+    const actionWorkspaceId = assetWorkspaceId(asset) || workspaceId;
+    const actionWorkspaceName = assetWorkspaceName(asset) || workspaceName;
+    if (!id || !actionRepoPath || !actionWorkspaceId) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
     setActionError("");
@@ -8757,9 +8754,9 @@ function AssetsPanel({
     invoke(command, {
       assetId: id,
       deleteFile: action === "deleteLocal" ? true : undefined,
-      repoPath,
-      workspaceId,
-      workspaceName,
+      repoPath: actionRepoPath,
+      workspaceId: actionWorkspaceId,
+      workspaceName: actionWorkspaceName,
     })
       .then(() => refresh({ silent: true }))
       .catch((nextError) => {
@@ -8770,7 +8767,7 @@ function AssetsPanel({
       });
   }, [refresh, repoPath, workspaceId, workspaceName]);
 
-  if (!repoPath || !workspaceId) {
+  if (!accountScope && (!repoPath || !workspaceId)) {
     return (
       <HistoryPane>
         <EmptyState>No workspace selected.</EmptyState>
@@ -8782,7 +8779,7 @@ function AssetsPanel({
     <HistoryPane>
       <TimelineHeader>
         <div>
-          <TimelineKicker>Workspace assets</TimelineKicker>
+          <TimelineKicker>{accountScope ? "Account assets" : "Workspace assets"}</TimelineKicker>
           <TimelineTitle>{repoLabel}</TimelineTitle>
         </div>
         <AssetHeaderActions>
@@ -8804,15 +8801,15 @@ function AssetsPanel({
       <AssetRegisterForm onSubmit={registerAsset}>
         <ArchitectureInput
           aria-label="Local asset path"
-          disabled={busyKey === "register"}
+          disabled={!canRegister || busyKey === "register"}
           onChange={(event) => setDraftPath(event.target.value)}
-          placeholder="Local file path"
+          placeholder={canRegister ? "Local file path" : "Select a workspace to register an asset"}
           value={draftPath}
         />
         <AssetToggle>
           <input
             checked={registerUpload}
-            disabled={busyKey === "register"}
+            disabled={!canRegister || busyKey === "register"}
             onChange={(event) => setRegisterUpload(event.target.checked)}
             type="checkbox"
           />
@@ -8821,7 +8818,7 @@ function AssetsPanel({
         <AssetIconButton
           aria-label="Register asset"
           data-primary="true"
-          disabled={!draftPath.trim() || busyKey === "register"}
+          disabled={!draftPath.trim() || !canRegister || busyKey === "register"}
           title="Register asset"
           type="submit"
         >
@@ -8842,6 +8839,8 @@ function AssetsPanel({
             const sha = assetSha(asset);
             const size = formatBytes(assetSizeBytes(asset));
             const kind = assetKind(asset);
+            const rowWorkspaceLabel = assetWorkspaceName(asset) || assetWorkspaceId(asset);
+            const canRunAssetAction = Boolean((assetRepoPath(asset) || repoPath) && (assetWorkspaceId(asset) || workspaceId));
             const updatedMs = assetUpdatedMs(asset);
             const updated = formatRelativeTimeMs(updatedMs) || "unknown";
             const created = formatTime(updatedMs) || "";
@@ -8863,6 +8862,7 @@ function AssetsPanel({
                     </StatusPill>
                   </AssetTitleLine>
                   <AssetMeta>
+                    {accountScope && rowWorkspaceLabel && <TodoHistoryMetaChip>{rowWorkspaceLabel}</TodoHistoryMetaChip>}
                     <TodoHistoryMetaChip>{kind}</TodoHistoryMetaChip>
                     {size && <TodoHistoryMetaChip>{size}</TodoHistoryMetaChip>}
                     {sha && <TodoHistoryMetaChip>{shortLabel(sha, 18)}</TodoHistoryMetaChip>}
@@ -8873,7 +8873,7 @@ function AssetsPanel({
                 <AssetActions>
                   <AssetIconButton
                     aria-label={`Upload ${name}`}
-                    disabled={!localPath || uploadBusy || Boolean(busyKey && !uploadBusy)}
+                    disabled={!canRunAssetAction || !localPath || uploadBusy || Boolean(busyKey && !uploadBusy)}
                     onClick={() => runAssetAction("upload", asset)}
                     title="Upload to Cloud"
                     type="button"
@@ -8882,7 +8882,7 @@ function AssetsPanel({
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Download ${name}`}
-                    disabled={downloadBusy || Boolean(busyKey && !downloadBusy)}
+                    disabled={!canRunAssetAction || downloadBusy || Boolean(busyKey && !downloadBusy)}
                     onClick={() => runAssetAction("download", asset)}
                     title="Download asset"
                     type="button"
@@ -8892,7 +8892,7 @@ function AssetsPanel({
                   <AssetIconButton
                     aria-label={`Delete Cloud copy of ${name}`}
                     data-danger="true"
-                    disabled={deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
+                    disabled={!canRunAssetAction || deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
                     onClick={() => runAssetAction("deleteCloud", asset)}
                     title="Delete Cloud copy"
                     type="button"
@@ -8902,7 +8902,7 @@ function AssetsPanel({
                   <AssetIconButton
                     aria-label={`Delete local copy of ${name}`}
                     data-danger="true"
-                    disabled={!localPath || deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
+                    disabled={!canRunAssetAction || !localPath || deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
                     onClick={() => runAssetAction("deleteLocal", asset)}
                     title="Delete local copy"
                     type="button"

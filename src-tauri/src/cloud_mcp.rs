@@ -110,6 +110,7 @@ struct CloudMcpState {
     auth: Arc<Mutex<CloudMcpAuthRuntime>>,
     runtime_snapshots: Arc<Mutex<CloudMcpRuntimeSnapshots>>,
     terminal_lifecycle_seq: Arc<AtomicU64>,
+    workspace_runtime_seq: Arc<AtomicU64>,
     global_ws_started: Arc<AtomicBool>,
     global_ws_registration_blocked: Arc<AtomicBool>,
     global_ws_epoch: Arc<AtomicU64>,
@@ -287,6 +288,9 @@ struct CloudMcpWorkspaceStatus {
     root: String,
     workspace_id: String,
     workspace_name: String,
+    dashboard_workspace: bool,
+    workspace_role: String,
+    display_surface: String,
     last_registered_ms: Option<u64>,
     last_synced_ms: Option<u64>,
     last_error: String,
@@ -359,6 +363,7 @@ impl CloudMcpState {
             auth: Arc::new(Mutex::new(CloudMcpAuthRuntime::default())),
             runtime_snapshots: Arc::new(Mutex::new(CloudMcpRuntimeSnapshots::default())),
             terminal_lifecycle_seq: Arc::new(AtomicU64::new(0)),
+            workspace_runtime_seq: Arc::new(AtomicU64::new(0)),
             global_ws_started: Arc::new(AtomicBool::new(false)),
             global_ws_registration_blocked: Arc::new(AtomicBool::new(false)),
             global_ws_epoch: Arc::new(AtomicU64::new(0)),
@@ -4161,6 +4166,9 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                     "repo_id": repo_id,
                     "workspace_name": cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"]),
                     "workspace_root": root_display,
+                    "dashboard_workspace": true,
+                    "workspace_role": "desktop_workspace",
+                    "display_surface": "dashboard_workspace",
                     "workspace_location_fingerprint": cloud_mcp_payload_text(
                         workspace,
                         &[
@@ -4190,6 +4198,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                         .cloned()
                         .unwrap_or_else(|| json!(false)),
                 });
+                cloud_mcp_copy_workspace_runtime_ordering(&mut workspace_value, workspace);
                 cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
                 workspaces.push(workspace_value);
             }
@@ -4209,6 +4218,9 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             "repo_id": repo_id,
             "workspace_name": workspace.workspace_name,
             "workspace_root": workspace.root,
+            "dashboard_workspace": true,
+            "workspace_role": "desktop_workspace",
+            "display_surface": "dashboard_workspace",
             "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(Path::new(&workspace.root)),
             "workspace_active": false,
             "workspace_reported_active": false,
@@ -6642,6 +6654,9 @@ async fn cloud_mcp_register_prepared_workspace(
         root: prepared.root_display.clone(),
         workspace_id: prepared.workspace_id.clone(),
         workspace_name: prepared.workspace_name.clone(),
+        dashboard_workspace: true,
+        workspace_role: "desktop_workspace".to_string(),
+        display_surface: "dashboard_workspace".to_string(),
         last_registered_ms: if reason == "workspace_registration" {
             Some(now_ms)
         } else {
@@ -6665,6 +6680,9 @@ async fn cloud_mcp_register_prepared_workspace(
             "workspace_name": prepared.workspace_name.clone(),
             "workspace_root": prepared.root_display.clone(),
             "workspace_kind": prepared.workspace_kind.clone(),
+            "dashboard_workspace": true,
+            "workspace_role": "desktop_workspace",
+            "display_surface": "dashboard_workspace",
             "project_mounts": prepared.project_mounts.clone(),
             "file_count": workspace_status.file_count,
             "filetree_truncated": prepared.filetree_truncated,
@@ -6689,12 +6707,18 @@ async fn cloud_mcp_register_prepared_workspace(
             "workspace_id": prepared.workspace_id.clone(),
             "workspace_name": prepared.workspace_name.clone(),
             "workspace_root": prepared.root_display.clone(),
+            "dashboard_workspace": true,
+            "workspace_role": "desktop_workspace",
+            "display_surface": "dashboard_workspace",
             "summary": format!("Workspace {} opened; reconciling stale terminal agent presence.", prepared.workspace_name),
             "payload": {
                 "reason": "workspace_registration",
                 "workspace_id": prepared.workspace_id.clone(),
                 "workspace_name": prepared.workspace_name.clone(),
                 "workspace_root": prepared.root_display.clone(),
+                "dashboard_workspace": true,
+                "workspace_role": "desktop_workspace",
+                "display_surface": "dashboard_workspace",
                 "managed_by": "rust-diffforge",
             }
         });
@@ -6772,28 +6796,20 @@ async fn cloud_mcp_register_prepared_workspace_bundle(
     reason: &str,
 ) -> Result<CloudMcpWorkspaceRegistrationResult, String> {
     let mut result = cloud_mcp_register_prepared_workspace(state, bundle.primary, reason).await?;
-    let mut child_workspaces = Vec::new();
-    let mut child_responses = Vec::new();
+    let project_mount_count = bundle.children.len();
 
-    for child in bundle.children {
-        let child_result = cloud_mcp_register_prepared_workspace(state, child, reason).await?;
-        child_workspaces.push(child_result.workspace);
-        child_responses.push(child_result.server_response);
-    }
-
-    if !child_workspaces.is_empty() {
+    if project_mount_count > 0 {
         if let Some(object) = result.server_response.as_object_mut() {
             object.insert(
-                "childWorkspaceRegistrations".to_string(),
-                Value::Array(child_responses),
+                "projectMountCount".to_string(),
+                json!(project_mount_count),
             );
         }
         result.message = format!(
-            "Workspace container synced with {} child project{}.",
-            child_workspaces.len(),
-            if child_workspaces.len() == 1 { "" } else { "s" }
+            "Workspace synced with {} project mount{}.",
+            project_mount_count,
+            if project_mount_count == 1 { "" } else { "s" }
         );
-        result.child_workspaces = child_workspaces;
     }
 
     Ok(result)
@@ -6810,6 +6826,9 @@ async fn cloud_mcp_ws_send_workspace_registration(
         "repo_id": repo_id,
         "workspace_id": workspace.workspace_id,
         "workspace_name": workspace.workspace_name,
+        "dashboard_workspace": workspace.dashboard_workspace,
+        "workspace_role": workspace.workspace_role,
+        "display_surface": workspace.display_surface,
         "workspace_location_fingerprint": cloud_mcp_workspace_location_fingerprint(root),
         "workspace_root": workspace.root,
         "schema_version": 1,
@@ -10123,6 +10142,8 @@ async fn cloud_mcp_sync_terminal_presence(
             .collect::<Vec<_>>();
 
         let terminal_count = terminals.len();
+        let (workspace_runtime_seq, workspace_runtime_epoch) =
+            cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
         let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
@@ -10138,6 +10159,10 @@ async fn cloud_mcp_sync_terminal_presence(
             "workspace_id": req.workspace_id,
             "workspace_name": req.workspace_name,
             "workspace_status": workspace_status,
+            "workspace_runtime_seq": workspace_runtime_seq,
+            "workspaceRuntimeSeq": workspace_runtime_seq,
+            "workspace_runtime_epoch": workspace_runtime_epoch,
+            "workspaceRuntimeEpoch": workspace_runtime_epoch,
             "terminal_count": terminal_count,
             "terminals": terminals,
         });
@@ -10346,6 +10371,82 @@ fn cloud_mcp_next_terminal_lifecycle_seq(state: &CloudMcpState, candidate: Optio
     }
 }
 
+fn cloud_mcp_next_workspace_runtime_seq(state: &CloudMcpState, candidate: Option<u64>) -> u64 {
+    let now = cloud_mcp_now_ms();
+    let candidate = candidate.unwrap_or(0).max(now);
+    let mut previous = state.workspace_runtime_seq.load(Ordering::SeqCst);
+    loop {
+        let next = previous.saturating_add(1).max(candidate);
+        match state.workspace_runtime_seq.compare_exchange(
+            previous,
+            next,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return next,
+            Err(current) => previous = current,
+        }
+    }
+}
+
+fn cloud_mcp_workspace_runtime_epoch(state: &CloudMcpState) -> String {
+    let epoch = state.global_ws_epoch.load(Ordering::SeqCst).max(1);
+    format!("workspace-runtime-{epoch}")
+}
+
+fn cloud_mcp_workspace_runtime_ordering(
+    state: &CloudMcpState,
+    workspace: &Value,
+) -> (u64, String) {
+    let seq = cloud_mcp_next_workspace_runtime_seq(
+        state,
+        cloud_mcp_payload_u64(
+            workspace,
+            &[
+                "workspace_runtime_seq",
+                "workspaceRuntimeSeq",
+                "runtime_seq",
+                "runtimeSeq",
+            ],
+        ),
+    );
+    let epoch = cloud_mcp_payload_text(
+        workspace,
+        &[
+            "workspace_runtime_epoch",
+            "workspaceRuntimeEpoch",
+            "runtime_epoch",
+            "runtimeEpoch",
+        ],
+    )
+    .unwrap_or_else(|| cloud_mcp_workspace_runtime_epoch(state));
+    (seq, epoch)
+}
+
+fn cloud_mcp_copy_workspace_runtime_ordering(target: &mut Value, source: &Value) {
+    let seq = source
+        .get("workspace_runtime_seq")
+        .or_else(|| source.get("workspaceRuntimeSeq"))
+        .or_else(|| source.get("runtime_seq"))
+        .or_else(|| source.get("runtimeSeq"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let epoch = source
+        .get("workspace_runtime_epoch")
+        .or_else(|| source.get("workspaceRuntimeEpoch"))
+        .or_else(|| source.get("runtime_epoch"))
+        .or_else(|| source.get("runtimeEpoch"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let Some(object) = target.as_object_mut() else {
+        return;
+    };
+    object.insert("workspace_runtime_seq".to_string(), seq.clone());
+    object.insert("workspaceRuntimeSeq".to_string(), seq);
+    object.insert("workspace_runtime_epoch".to_string(), epoch.clone());
+    object.insert("workspaceRuntimeEpoch".to_string(), epoch);
+}
+
 async fn cloud_mcp_enqueue_terminal_lifecycle_delta(
     state: &CloudMcpState,
     payload: Value,
@@ -10411,6 +10512,9 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         cloud_mcp_terminal_lifecycle_turn_status(&payload.event_type, "", state_value);
     let readiness = cloud_mcp_terminal_lifecycle_readiness(state_value, Some(payload.input_ready));
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(payload.observed_at_ms));
+    let workspace_runtime_seq =
+        cloud_mcp_next_workspace_runtime_seq(state, Some(payload.observed_at_ms));
+    let workspace_runtime_epoch = cloud_mcp_workspace_runtime_epoch(state);
     let reason = payload.source.as_str();
     let delta = json!({
         "source": "rust-diffforge-activity-hook",
@@ -10420,6 +10524,10 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "workspace_root": workspace_root,
         "workspace_id": payload.workspace_id,
         "workspace_name": payload.workspace_name,
+        "workspace_runtime_seq": workspace_runtime_seq,
+        "workspaceRuntimeSeq": workspace_runtime_seq,
+        "workspace_runtime_epoch": workspace_runtime_epoch,
+        "workspaceRuntimeEpoch": workspace_runtime_epoch,
         "terminal_id": terminal_id,
         "pane_id": terminal_id,
         "terminal_instance_id": payload.instance_id,
@@ -10670,6 +10778,8 @@ async fn cloud_mcp_sync_terminal_status_event(
         .unwrap_or_else(cloud_mcp_now_ms);
     let terminal_epoch = cloud_mcp_payload_text(&terminal, &["terminal_epoch", "terminalEpoch"])
         .unwrap_or_else(|| format!("{terminal_id}:{terminal_instance_id}"));
+    let (workspace_runtime_seq, workspace_runtime_epoch) =
+        cloud_mcp_workspace_runtime_ordering(state.inner(), &workspace);
     let terminal_nickname = cloud_mcp_terminal_nickname_text(
         &terminal,
         &[
@@ -10693,6 +10803,10 @@ async fn cloud_mcp_sync_terminal_status_event(
         "workspace_id": req.workspace_id,
         "workspace_name": req.workspace_name,
         "workspace_status": workspace_status,
+        "workspace_runtime_seq": workspace_runtime_seq,
+        "workspaceRuntimeSeq": workspace_runtime_seq,
+        "workspace_runtime_epoch": workspace_runtime_epoch,
+        "workspaceRuntimeEpoch": workspace_runtime_epoch,
         "display_name": terminal_nickname.clone(),
         "terminal_id": terminal_id,
         "pane_id": pane_id,
@@ -10898,6 +11012,8 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
 
         let server_count = servers.len();
         let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
+        let (workspace_runtime_seq, workspace_runtime_epoch) =
+            cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
         let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
@@ -10913,6 +11029,10 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             "workspace_active": workspace_active,
             "workspace_name": req.workspace_name,
             "workspace_status": workspace_status,
+            "workspace_runtime_seq": workspace_runtime_seq,
+            "workspaceRuntimeSeq": workspace_runtime_seq,
+            "workspace_runtime_epoch": workspace_runtime_epoch,
+            "workspaceRuntimeEpoch": workspace_runtime_epoch,
             "server_count": server_count,
             "servers": servers,
         });
@@ -12389,19 +12509,45 @@ async fn cloud_mcp_list_workspace_assets(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     limit: Option<u64>,
+    include_all_workspaces: Option<bool>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
+    let include_all_workspaces = include_all_workspaces.unwrap_or(false);
+    let effective_limit = limit
+        .unwrap_or(100)
+        .clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS as u64);
+    let local_repo_id = if include_all_workspaces {
+        None
+    } else {
+        Some(req.repo_id.as_str())
+    };
+    let local_workspace_id = if include_all_workspaces {
+        None
+    } else {
+        workspace_id.as_deref()
+    };
     let local = cloud_mcp_asset_library_from_file(
-        Some(&req.repo_id),
-        workspace_id.as_deref(),
-        limit.unwrap_or(100) as usize,
+        local_repo_id,
+        local_workspace_id,
+        effective_limit as usize,
     );
-    let payload = cloud_mcp_asset_payload_base(
+    let mut payload = cloud_mcp_asset_payload_base(
         &req,
         workspace_id.as_deref().unwrap_or_default(),
         workspace_name.as_deref(),
         "asset_library_list",
     );
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "include_all_workspaces".to_string(),
+            json!(include_all_workspaces),
+        );
+        object.insert(
+            "includeAllWorkspaces".to_string(),
+            json!(include_all_workspaces),
+        );
+        object.insert("limit".to_string(), json!(effective_limit));
+    }
     match cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/list", &payload).await {
         Ok(response) => Ok(response.get("data").cloned().unwrap_or(response)),
         Err(_) => Ok(local),
