@@ -21,8 +21,11 @@ import { AllInbox } from "@styled-icons/material-rounded/AllInbox";
 import { Api } from "@styled-icons/material-rounded/Api";
 import { Cached } from "@styled-icons/material-rounded/Cached";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
+import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { Computer } from "@styled-icons/material-rounded/Computer";
+import { Delete } from "@styled-icons/material-rounded/Delete";
 import { Dns } from "@styled-icons/material-rounded/Dns";
+import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { Folder } from "@styled-icons/material-rounded/Folder";
 import { Groups } from "@styled-icons/material-rounded/Groups";
 import { Http } from "@styled-icons/material-rounded/Http";
@@ -126,6 +129,7 @@ function architectureRevisionTimestamp(revision) {
 
 const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
 const ARCHITECTURE_CLOUD_UPDATED_EVENT = "cloud-mcp-workspace-architectures-updated";
+const ARCHITECTURE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
 const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
@@ -477,6 +481,113 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
         || left.title.localeCompare(right.title)
     ))
     .slice(0, 200);
+}
+
+function assetLibraryItems(value) {
+  const object = jsonObject(value) || {};
+  const data = jsonObject(object.data) || object;
+  return (jsonArray(data.items).length ? jsonArray(data.items) : jsonArray(data.assets));
+}
+
+function assetLibraryTransfers(value) {
+  const object = jsonObject(value) || {};
+  const data = jsonObject(object.data) || object;
+  return jsonArray(data.transfers);
+}
+
+function assetLibraryAggregate(value) {
+  const object = jsonObject(value) || {};
+  const data = jsonObject(object.data) || object;
+  return jsonObject(data.aggregate) || {};
+}
+
+function assetId(asset, fallback = "") {
+  return text(asset?.assetId || asset?.asset_id || asset?.id, fallback);
+}
+
+function assetName(asset, fallback = "asset") {
+  return text(asset?.name || asset?.filename || asset?.fileName || asset?.file_name, fallback);
+}
+
+function assetKind(asset) {
+  return text(asset?.kind || asset?.assetKind || asset?.asset_kind || asset?.mimeType || asset?.mime_type, "asset");
+}
+
+function assetStatus(asset) {
+  return text(
+    asset?.status
+      || asset?.assetStatus
+      || asset?.asset_status
+      || asset?.cloudStatus
+      || asset?.cloud_status
+      || asset?.localStatus
+      || asset?.local_status,
+    "local_only",
+  );
+}
+
+function assetStatusKind(status) {
+  const normalized = text(status).toLowerCase().replace(/[_\s]+/gu, "-");
+  if (["cloud-available", "uploaded", "complete", "completed", "ready", "synced"].includes(normalized)) return "done";
+  if (["uploading", "downloading", "prepared", "queued", "verifying", "transferring", "warming-cache", "cache-warming"].includes(normalized)) return "active";
+  if (["failed", "error", "hash-mismatch"].includes(normalized)) return "failed";
+  if (["deleted", "cloud-deleted-local-kept"].includes(normalized)) return "cancelled";
+  if (["local-only", "local-available", "registered"].includes(normalized)) return "parked";
+  return "queued";
+}
+
+function assetStatusLabel(status) {
+  const normalized = text(status, "local_only").toLowerCase().replace(/[_\s]+/gu, "-");
+  if (normalized === "cloud-available") return "Cloud";
+  if (normalized === "cloud-deleted-local-kept") return "Local";
+  if (normalized === "local-available") return "Local";
+  return normalized
+    .replace(/-/gu, " ")
+    .replace(/\b\w/gu, (match) => match.toUpperCase());
+}
+
+function assetTransferStatusKind(transfer) {
+  return assetStatusKind(transfer?.status || transfer?.transferStatus || transfer?.transfer_status);
+}
+
+function assetUpdatedMs(asset) {
+  return parseTimeMs(asset?.updatedAt || asset?.updated_at || asset?.createdAt || asset?.created_at);
+}
+
+function assetLocalPath(asset) {
+  return text(asset?.localPath || asset?.local_path || asset?.path);
+}
+
+function assetSha(asset) {
+  return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
+}
+
+function assetSizeBytes(asset) {
+  return numberValue(asset?.sizeBytes ?? asset?.size_bytes ?? asset?.bytes, 0);
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = bytes / 1024;
+  let unitIndex = 0;
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024;
+    unitIndex += 1;
+  }
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function assetTransferSummary(transfers, asset) {
+  const id = assetId(asset);
+  if (!id) return "";
+  const transfer = transfers.find((item) => text(item?.assetId || item?.asset_id) === id);
+  if (!transfer) return "";
+  const direction = text(transfer?.direction || transfer?.kind || transfer?.transferKind || transfer?.transfer_kind);
+  const status = text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status);
+  return [direction, status].filter(Boolean).join(" ");
 }
 
 function taskStatus(task) {
@@ -4811,6 +4922,9 @@ export default function ArchitectureWorkspaceView({
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
   const [finishPlanState, setFinishPlanState] = useState({ error: "", taskId: "" });
   const [finishedPlanTaskIds, setFinishedPlanTaskIds] = useState(() => new Set());
+  const [assetLibrary, setAssetLibrary] = useState(null);
+  const [assetLibraryLoading, setAssetLibraryLoading] = useState(false);
+  const [assetLibraryError, setAssetLibraryError] = useState("");
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
@@ -4818,6 +4932,7 @@ export default function ArchitectureWorkspaceView({
     () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId),
     [activeWorkspaceId, workspaceTodos],
   );
+  const assetItems = useMemo(() => assetLibraryItems(assetLibrary), [assetLibrary]);
   const visibleTasks = useMemo(() => {
     if (!finishedPlanTaskIds.size) return tasks;
     return tasks.map((task, index) => {
@@ -4828,6 +4943,8 @@ export default function ArchitectureWorkspaceView({
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "architectures"
     ? `Architectures · repo scoped · ${repoLabel}`
+    : viewMode === "assets"
+      ? `Assets · ${assetItems.length} item${assetItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "todoHistory"
       ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "scannedResult"
@@ -4890,6 +5007,81 @@ export default function ArchitectureWorkspaceView({
     setFinishedPlanTaskIds(new Set());
     setFinishPlanState({ error: "", taskId: "" });
   }, [repoPath, activeWorkspaceId]);
+
+  const refreshAssetLibrary = useCallback(({ silent = false } = {}) => {
+    if (!repoPath || !activeWorkspaceId) {
+      setAssetLibrary(null);
+      return Promise.resolve(null);
+    }
+    if (!silent) setAssetLibraryLoading(true);
+    setAssetLibraryError("");
+    return invoke("cloud_mcp_list_workspace_assets", {
+      limit: 500,
+      repoPath,
+      workspaceId: activeWorkspaceId,
+      workspaceName: activeWorkspaceName,
+    })
+      .then((result) => {
+        setAssetLibrary(result);
+        return result;
+      })
+      .catch((error) => {
+        const message = error?.message || String(error || "Unable to load assets.");
+        setAssetLibraryError(message);
+        return null;
+      })
+      .finally(() => {
+        if (!silent) setAssetLibraryLoading(false);
+      });
+  }, [activeWorkspaceId, activeWorkspaceName, repoPath]);
+
+  useEffect(() => {
+    void refreshAssetLibrary({ silent: true });
+  }, [refreshAssetLibrary]);
+
+  useEffect(() => {
+    if (!repoPath || !activeWorkspaceId) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let unlistenAssets = null;
+    listen(ARCHITECTURE_ASSETS_UPDATED_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = jsonObject(event?.payload) || {};
+      const nestedPayload = jsonObject(payload.payload) || {};
+      const eventWorkspaceId = text(
+        payload.workspaceId
+          || payload.workspace_id
+          || nestedPayload.workspaceId
+          || nestedPayload.workspace_id,
+      );
+      const workspaceIds = jsonArray(payload.workspace_ids || payload.workspaceIds || nestedPayload.workspace_ids || nestedPayload.workspaceIds)
+        .map((item) => text(item))
+        .filter(Boolean);
+      if (
+        eventWorkspaceId
+        && eventWorkspaceId !== activeWorkspaceId
+        && !workspaceIds.includes(activeWorkspaceId)
+      ) {
+        return;
+      }
+      void refreshAssetLibrary({ silent: true });
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenAssets = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenAssets) {
+        unlistenAssets();
+      }
+    };
+  }, [activeWorkspaceId, refreshAssetLibrary, repoPath]);
 
   const refreshTaskHistorySnapshot = useCallback(() => {
     if (!repoPath || !activeWorkspaceId) {
@@ -4967,6 +5159,13 @@ export default function ArchitectureWorkspaceView({
             Architectures
           </ViewToggleButton>
           <ViewToggleButton
+            data-active={viewMode === "assets" ? "true" : "false"}
+            onClick={() => setViewMode("assets")}
+            type="button"
+          >
+            Assets
+          </ViewToggleButton>
+          <ViewToggleButton
             data-active={viewMode === "todoHistory" ? "true" : "false"}
             onClick={() => setViewMode("todoHistory")}
             type="button"
@@ -5006,6 +5205,17 @@ export default function ArchitectureWorkspaceView({
           workspaceSelectedGraphId={architectureSelectedGraphId}
           workspaceSelectedRepoPath={architectureSelectedRepoPath}
           tasks={visibleTasks}
+        />
+      ) : viewMode === "assets" ? (
+        <AssetsPanel
+          error={assetLibraryError}
+          library={assetLibrary}
+          loading={assetLibraryLoading}
+          onRefresh={refreshAssetLibrary}
+          repoLabel={repoLabel}
+          repoPath={repoPath}
+          workspaceId={activeWorkspaceId}
+          workspaceName={activeWorkspaceName}
         />
       ) : viewMode === "todoHistory" ? (
         <TodosHistoryPanel
@@ -8479,6 +8689,240 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
   );
 }
 
+function AssetsPanel({
+  error = "",
+  library = null,
+  loading = false,
+  onRefresh,
+  repoLabel,
+  repoPath,
+  workspaceId,
+  workspaceName,
+}) {
+  const items = useMemo(() => assetLibraryItems(library), [library]);
+  const transfers = useMemo(() => assetLibraryTransfers(library), [library]);
+  const aggregate = useMemo(() => assetLibraryAggregate(library), [library]);
+  const [draftPath, setDraftPath] = useState("");
+  const [registerUpload, setRegisterUpload] = useState(false);
+  const [busyKey, setBusyKey] = useState("");
+  const [actionError, setActionError] = useState("");
+  const cloudCount = items.filter((item) => ["done", "active"].includes(assetStatusKind(assetStatus(item)))).length;
+  const localCount = items.filter((item) => assetLocalPath(item)).length;
+  const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
+    || transfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
+
+  const refresh = useCallback((options = { silent: true }) => (
+    typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
+  ), [onRefresh]);
+
+  const registerAsset = useCallback((event) => {
+    event.preventDefault();
+    const path = draftPath.trim();
+    if (!path || !repoPath || !workspaceId) return;
+    setBusyKey("register");
+    setActionError("");
+    invoke("cloud_mcp_register_workspace_asset", {
+      metadata: { source: "architecture_assets_tab" },
+      path,
+      repoPath,
+      upload: registerUpload,
+      workspaceId,
+      workspaceName,
+    })
+      .then(() => {
+        setDraftPath("");
+        return refresh({ silent: true });
+      })
+      .catch((nextError) => {
+        setActionError(nextError?.message || String(nextError || "Unable to register asset."));
+      })
+      .finally(() => {
+        setBusyKey((current) => (current === "register" ? "" : current));
+      });
+  }, [draftPath, refresh, registerUpload, repoPath, workspaceId, workspaceName]);
+
+  const runAssetAction = useCallback((action, asset) => {
+    const id = assetId(asset);
+    if (!id || !repoPath || !workspaceId) return;
+    const key = `${action}:${id}`;
+    setBusyKey(key);
+    setActionError("");
+    const command = action === "upload"
+      ? "cloud_mcp_upload_workspace_asset"
+      : action === "download"
+        ? "cloud_mcp_download_workspace_asset"
+        : action === "deleteLocal"
+          ? "cloud_mcp_delete_local_workspace_asset"
+          : "cloud_mcp_delete_cloud_workspace_asset";
+    invoke(command, {
+      assetId: id,
+      deleteFile: action === "deleteLocal" ? true : undefined,
+      repoPath,
+      workspaceId,
+      workspaceName,
+    })
+      .then(() => refresh({ silent: true }))
+      .catch((nextError) => {
+        setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
+      })
+      .finally(() => {
+        setBusyKey((current) => (current === key ? "" : current));
+      });
+  }, [refresh, repoPath, workspaceId, workspaceName]);
+
+  if (!repoPath || !workspaceId) {
+    return (
+      <HistoryPane>
+        <EmptyState>No workspace selected.</EmptyState>
+      </HistoryPane>
+    );
+  }
+
+  return (
+    <HistoryPane>
+      <TimelineHeader>
+        <div>
+          <TimelineKicker>Workspace assets</TimelineKicker>
+          <TimelineTitle>{repoLabel}</TimelineTitle>
+        </div>
+        <AssetHeaderActions>
+          <TimelineSummary>
+            {items.length} asset{items.length === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud
+            {activeTransfers ? ` · ${activeTransfers} active` : ""}
+          </TimelineSummary>
+          <AssetIconButton
+            aria-label="Refresh assets"
+            disabled={loading}
+            onClick={() => refresh({ silent: false })}
+            title="Refresh assets"
+            type="button"
+          >
+            <Cached aria-hidden="true" />
+          </AssetIconButton>
+        </AssetHeaderActions>
+      </TimelineHeader>
+      <AssetRegisterForm onSubmit={registerAsset}>
+        <ArchitectureInput
+          aria-label="Local asset path"
+          disabled={busyKey === "register"}
+          onChange={(event) => setDraftPath(event.target.value)}
+          placeholder="Local file path"
+          value={draftPath}
+        />
+        <AssetToggle>
+          <input
+            checked={registerUpload}
+            disabled={busyKey === "register"}
+            onChange={(event) => setRegisterUpload(event.target.checked)}
+            type="checkbox"
+          />
+          <span>Upload</span>
+        </AssetToggle>
+        <AssetIconButton
+          aria-label="Register asset"
+          data-primary="true"
+          disabled={!draftPath.trim() || busyKey === "register"}
+          title="Register asset"
+          type="submit"
+        >
+          <Add aria-hidden="true" />
+        </AssetIconButton>
+      </AssetRegisterForm>
+      {(error || actionError) && <TaskActionError>{actionError || error}</TaskActionError>}
+      {!items.length ? (
+        <EmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</EmptyState>
+      ) : (
+        <AssetList aria-label="Asset library list">
+          {items.map((asset, index) => {
+            const id = assetId(asset, `asset-${index}`);
+            const name = assetName(asset, `Asset ${index + 1}`);
+            const status = assetStatus(asset);
+            const statusKind = assetStatusKind(status);
+            const localPath = assetLocalPath(asset);
+            const sha = assetSha(asset);
+            const size = formatBytes(assetSizeBytes(asset));
+            const kind = assetKind(asset);
+            const updatedMs = assetUpdatedMs(asset);
+            const updated = formatRelativeTimeMs(updatedMs) || "unknown";
+            const created = formatTime(updatedMs) || "";
+            const transfer = assetTransferSummary(transfers, asset);
+            const uploadBusy = busyKey === `upload:${id}`;
+            const downloadBusy = busyKey === `download:${id}`;
+            const deleteLocalBusy = busyKey === `deleteLocal:${id}`;
+            const deleteCloudBusy = busyKey === `deleteCloud:${id}`;
+            return (
+              <AssetRow data-status={statusKind} key={id} title={localPath || sha || name}>
+                <AssetKindIcon data-status={statusKind} aria-hidden="true">
+                  {localPath ? <InsertDriveFile /> : <Cloud />}
+                </AssetKindIcon>
+                <AssetBody>
+                  <AssetTitleLine>
+                    <AssetTitle>{name}</AssetTitle>
+                    <StatusPill data-status={statusKind} title={`Actual status: ${status}`}>
+                      {assetStatusLabel(status)}
+                    </StatusPill>
+                  </AssetTitleLine>
+                  <AssetMeta>
+                    <TodoHistoryMetaChip>{kind}</TodoHistoryMetaChip>
+                    {size && <TodoHistoryMetaChip>{size}</TodoHistoryMetaChip>}
+                    {sha && <TodoHistoryMetaChip>{shortLabel(sha, 18)}</TodoHistoryMetaChip>}
+                    {transfer && <TodoHistoryMetaChip>{transfer}</TodoHistoryMetaChip>}
+                    {localPath && <TodoHistoryMetaChip>{localPath}</TodoHistoryMetaChip>}
+                  </AssetMeta>
+                </AssetBody>
+                <AssetActions>
+                  <AssetIconButton
+                    aria-label={`Upload ${name}`}
+                    disabled={!localPath || uploadBusy || Boolean(busyKey && !uploadBusy)}
+                    onClick={() => runAssetAction("upload", asset)}
+                    title="Upload to Cloud"
+                    type="button"
+                  >
+                    <CloudUpload aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Download ${name}`}
+                    disabled={downloadBusy || Boolean(busyKey && !downloadBusy)}
+                    onClick={() => runAssetAction("download", asset)}
+                    title="Download asset"
+                    type="button"
+                  >
+                    <FileDownload aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Delete Cloud copy of ${name}`}
+                    data-danger="true"
+                    disabled={deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
+                    onClick={() => runAssetAction("deleteCloud", asset)}
+                    title="Delete Cloud copy"
+                    type="button"
+                  >
+                    <Cloud aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Delete local copy of ${name}`}
+                    data-danger="true"
+                    disabled={!localPath || deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
+                    onClick={() => runAssetAction("deleteLocal", asset)}
+                    title="Delete local copy"
+                    type="button"
+                  >
+                    <Delete aria-hidden="true" />
+                  </AssetIconButton>
+                </AssetActions>
+                <TodoHistoryTime>
+                  <strong>{updated}</strong>
+                  {created && <span>{created}</span>}
+                </TodoHistoryTime>
+              </AssetRow>
+            );
+          })}
+        </AssetList>
+      )}
+    </HistoryPane>
+  );
+}
+
 function TaskDetailPanel({
   finishPlanError = "",
   finishingPlanTaskId = "",
@@ -11406,6 +11850,219 @@ const TodoHistoryTime = styled.div`
     grid-column: 2;
     align-items: flex-start;
     text-align: left;
+  }
+`;
+
+const AssetHeaderActions = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 700px) {
+    width: 100%;
+    justify-content: space-between;
+  }
+`;
+
+const AssetRegisterForm = styled.form`
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto 32px;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding-bottom: 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+
+  @media (max-width: 700px) {
+    grid-template-columns: minmax(0, 1fr) auto;
+
+    ${ArchitectureInput} {
+      grid-column: 1 / -1;
+    }
+  }
+`;
+
+const AssetToggle = styled.label`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 7px;
+  color: rgba(203, 213, 225, 0.82);
+  background: rgba(15, 23, 42, 0.38);
+  font-size: 10px;
+  font-weight: 850;
+  white-space: nowrap;
+
+  input {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    accent-color: #2dd4bf;
+  }
+`;
+
+const AssetList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const AssetRow = styled.div`
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto minmax(92px, 126px);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  color: var(--forge-text);
+
+  &[data-status="active"] {
+    background: linear-gradient(90deg, rgba(37, 99, 235, 0.08), transparent 62%);
+  }
+
+  &[data-status="parked"] {
+    background: linear-gradient(90deg, rgba(217, 119, 6, 0.06), transparent 62%);
+  }
+
+  &[data-status="failed"] {
+    background: linear-gradient(90deg, rgba(127, 29, 29, 0.09), transparent 62%);
+  }
+
+  @media (max-width: 820px) {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+
+    ${TodoHistoryTime} {
+      grid-column: 2 / -1;
+      align-items: flex-start;
+      text-align: left;
+    }
+  }
+`;
+
+const AssetKindIcon = styled.span`
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 7px;
+  color: rgba(203, 213, 225, 0.78);
+  background: rgba(2, 6, 23, 0.3);
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &[data-status="done"] {
+    border-color: rgba(52, 211, 153, 0.2);
+    color: rgba(167, 243, 208, 0.82);
+    background: rgba(6, 78, 59, 0.14);
+  }
+
+  &[data-status="active"] {
+    border-color: rgba(96, 165, 250, 0.22);
+    color: rgba(191, 219, 254, 0.82);
+    background: rgba(30, 64, 175, 0.14);
+  }
+`;
+
+const AssetBody = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const AssetTitleLine = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const AssetTitle = styled.strong`
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(241, 245, 249, 0.94);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 840;
+  line-height: 1.25;
+`;
+
+const AssetMeta = styled(TodoHistoryMeta)`
+  ${TodoHistoryMetaChip} {
+    max-width: 300px;
+  }
+`;
+
+const AssetActions = styled.div`
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  min-width: 0;
+`;
+
+const AssetIconButton = styled.button`
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(15, 23, 42, 0.5);
+  font: inherit;
+  cursor: pointer;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.14);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.32);
+    color: rgba(204, 251, 241, 0.95);
+    background: rgba(13, 148, 136, 0.22);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.18);
+    color: rgba(254, 205, 211, 0.86);
+    background: rgba(127, 29, 29, 0.16);
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      border-color: rgba(251, 113, 133, 0.32);
+      background: rgba(190, 18, 60, 0.18);
+    }
   }
 `;
 
