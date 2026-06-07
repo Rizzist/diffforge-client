@@ -8844,10 +8844,6 @@ export default function App() {
       || cleanWorkspaceRootDirectory(defaultWorkingDirectoryRef.current)
     );
 
-    if (!repoPath) {
-      return null;
-    }
-
     return {
       repoPath,
       workspaceId,

@@ -1820,6 +1820,10 @@ fn ensure_workspace_git_ready_for_coordination(root: &Path) -> Result<WorkspaceG
     })
 }
 
+pub(crate) fn ensure_workspace_git_ready_for_late_coordination(root: &Path) -> Result<(), String> {
+    ensure_workspace_git_ready_for_coordination(root).map(|_| ())
+}
+
 fn ensure_workspace_git_identity(root: &Path) -> Result<(), String> {
     let has_name = run_git_text(
         root,

@@ -22175,6 +22175,99 @@ impl CoordinationKernel {
         }))
     }
 
+    pub fn promote_late_git_direct_session_file_authority(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let session = self.ensure_session_active(session_id, agent_id)?;
+        let enforcement_mode = session["enforcement_mode"]
+            .as_str()
+            .unwrap_or("coordination_only");
+        if enforcement_mode != "bounded_direct_edit" {
+            let file_authority = match enforcement_mode {
+                "worktree_required" => "git_worktree_patch",
+                "general_worker" => "task_scoped",
+                "bounded_direct_edit" => "bounded_direct_edit",
+                "remote_unmanaged" => "remote_unmanaged",
+                _ => "none",
+            };
+            return Ok(json!({
+                "changed": false,
+                "enforcement_mode": enforcement_mode,
+                "file_authority": file_authority,
+                "worktree_id": session["worktree_id"].clone(),
+                "write_root": session["write_root"].clone(),
+                "reason": "session_not_bounded_direct_edit",
+            }));
+        }
+
+        if !repo_has_git(&self.paths.repo_path) {
+            return Ok(json!({
+                "changed": false,
+                "enforcement_mode": "bounded_direct_edit",
+                "file_authority": "bounded_direct_edit",
+                "completion_mode": "complete_task",
+                "write_root": session["write_root"].clone(),
+                "reason": "repo_not_git",
+            }));
+        }
+
+        crate::ensure_workspace_git_ready_for_late_coordination(&self.paths.repo_path).map_err(
+            |error| {
+                format!("Unable to prepare late-created Git repository for coordination: {error}")
+            },
+        )?;
+
+        let worktree = self.create_worktree_for_session(agent_id, session_id, task_id)?;
+        let worktree_id = worktree["id"].as_str().unwrap_or_default().to_string();
+        let worktree_path = worktree["path"].as_str().unwrap_or_default().to_string();
+        let branch_name = worktree["branchName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        self.emit_event(
+            "session_file_authority_promoted",
+            "kernel",
+            REPO_ID,
+            EventRefs {
+                agent_id: Some(agent_id.to_string()),
+                session_id: Some(session_id.to_string()),
+                task_id: task_id
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string),
+                agent_slot_id: worktree["agentSlotId"].as_str().map(str::to_string),
+                ..EventRefs::default()
+            },
+            json!({
+                "from_enforcement_mode": "bounded_direct_edit",
+                "to_enforcement_mode": "worktree_required",
+                "file_authority": "git_worktree_patch",
+                "completion_mode": "submit_patch",
+                "reason": "git_repo_detected_after_terminal_launch",
+                "worktree_id": worktree_id,
+                "worktree_path": worktree_path.clone(),
+                "agent_branch_root": worktree_path.clone(),
+                "branch_name": branch_name.clone(),
+            }),
+        )?;
+
+        Ok(json!({
+            "changed": true,
+            "enforcement_mode": "worktree_required",
+            "file_authority": "git_worktree_patch",
+            "completion_mode": "submit_patch",
+            "session_mode": "managed_patch",
+            "task_id": task_id,
+            "worktree_id": worktree_id,
+            "worktree_path": worktree_path,
+            "agent_branch_root": worktree_path,
+            "branch_name": branch_name,
+            "reason": "git_repo_detected_after_terminal_launch",
+        }))
+    }
+
     fn branch_exists(&self, branch: &str) -> Result<bool, String> {
         if crate::app_shutdown_requested() {
             return Err(crate::app_shutdown_blocked_message("git branch inspection"));
@@ -27964,6 +28057,160 @@ Appwrite > Session Store: create session
             .query_json("SELECT * FROM leases WHERE task_id=?1", &[&task_id])
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn agent_mcp_start_task_promotes_late_git_direct_session_to_worktree() {
+        let repo = temp_repo("mcp_start_task_late_git_promote");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-late-git-start"),
+                Some("workspace-late-git-start"),
+                Some("Late Git Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-late-git-start"),
+                Some("bounded_direct_edit"),
+            )
+            .unwrap();
+        assert_eq!(context.enforcement_mode, "bounded_direct_edit");
+        assert!(context.worktree_id.is_none());
+
+        run(&repo, "git", &["init"]);
+        let cloud_url = fake_cloud_mcp_url("cloud-late-git-start", false);
+        let started = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(context.agent_id.clone()),
+                session_id: Some(context.session_id.clone()),
+                enforcement_mode: Some("bounded_direct_edit".to_string()),
+                file_authority: Some("bounded_direct_edit".to_string()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "start_task",
+            json!({
+                "cloud_mcp_base_url": cloud_url.as_str(),
+                "plan": "Edit files after Git was initialized in the already-open workspace."
+            }),
+        );
+
+        assert_eq!(started["ok"].as_bool(), Some(true));
+        assert_eq!(
+            started["data"]["authority"]["changed"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            started["data"]["authority"]["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        let worktree_path = started["data"]["authority"]["worktree_path"]
+            .as_str()
+            .unwrap();
+        assert!(PathBuf::from(worktree_path).exists());
+        assert!(repo.join(".gitignore").exists());
+
+        let session = kernel
+            .query_one(
+                "SELECT enforcement_mode, worktree_id, write_root FROM agent_sessions WHERE id=?1",
+                &[&context.session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(
+            session["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        assert!(session["worktree_id"].as_str().is_some());
+        assert_eq!(session["write_root"].as_str(), Some(worktree_path));
+    }
+
+    #[test]
+    fn agent_mcp_acquire_lease_promotes_late_git_direct_session_to_worktree() {
+        let repo = temp_repo("mcp_acquire_late_git_promote");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-late-git-lease"),
+                Some("workspace-late-git-lease"),
+                Some("Late Git Lease Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-late-git-lease"),
+                Some("bounded_direct_edit"),
+            )
+            .unwrap();
+        let task = kernel
+            .create_task("Late Git lease", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        kernel
+            .claim_task(&task_id, &context.agent_id, &context.session_id)
+            .unwrap();
+        kernel
+            .emit_event(
+                "mcp_agent_tool_called",
+                "agent_mcp_client",
+                &context.agent_id,
+                EventRefs {
+                    task_id: Some(task_id.clone()),
+                    agent_id: Some(context.agent_id.clone()),
+                    session_id: Some(context.session_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({"details": {"tool": "start_task", "ok": true}}),
+            )
+            .unwrap();
+
+        run(&repo, "git", &["init"]);
+        let lease = crate::coordination::mcp::dispatch_tool(
+            &crate::coordination::mcp::McpContext {
+                repo_path: Some(process_path_text(&repo)),
+                agent_id: Some(context.agent_id.clone()),
+                session_id: Some(context.session_id.clone()),
+                enforcement_mode: Some("bounded_direct_edit".to_string()),
+                file_authority: Some("bounded_direct_edit".to_string()),
+                ..crate::coordination::mcp::McpContext::default()
+            },
+            "acquire_lease",
+            json!({
+                "task_id": task_id,
+                "resource_key": "file:index.html",
+                "reason": "Edit after Git appeared"
+            }),
+        );
+
+        assert_eq!(lease["ok"].as_bool(), Some(true));
+        assert_eq!(lease["data"]["authority"]["changed"].as_bool(), Some(true));
+        assert_eq!(
+            lease["data"]["authority"]["file_authority"].as_str(),
+            Some("git_worktree_patch")
+        );
+        let worktree_path = lease["data"]["authority"]["worktree_path"]
+            .as_str()
+            .unwrap();
+        assert!(PathBuf::from(worktree_path).exists());
+        let session = kernel
+            .query_one(
+                "SELECT enforcement_mode, worktree_id, write_root FROM agent_sessions WHERE id=?1",
+                &[&context.session_id],
+                "missing session",
+            )
+            .unwrap();
+        assert_eq!(
+            session["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        assert!(session["worktree_id"].as_str().is_some());
+        assert_eq!(session["write_root"].as_str(), Some(worktree_path));
     }
 
     #[test]

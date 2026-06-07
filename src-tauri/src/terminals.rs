@@ -13263,6 +13263,96 @@ mod terminal_tests {
     }
 
     #[test]
+    fn diff_forge_write_guard_promotes_late_git_direct_session_and_denies_root_edit() {
+        let repo = terminal_test_directory("write_guard_late_git_direct");
+        let kernel = crate::coordination::CoordinationKernel::init(&repo, None).unwrap();
+        let session = kernel
+            .create_terminal_session_for_slot_key(
+                "slot1",
+                "Codex",
+                "codex",
+                None,
+                None,
+                Some("terminal-slot1"),
+                true,
+                None,
+                None,
+                Some("test-launch"),
+                Some("bounded_direct_edit"),
+            )
+            .unwrap();
+        assert_eq!(
+            session["enforcementMode"].as_str(),
+            Some("bounded_direct_edit")
+        );
+        let agent_id = session["agentId"].as_str().unwrap().to_string();
+        let session_id = session["id"].as_str().unwrap().to_string();
+        let task = kernel
+            .create_task("Late Git guarded edit", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap().to_string();
+        kernel.claim_task(&task_id, &agent_id, &session_id).unwrap();
+        kernel
+            .acquire_lease(
+                &task_id,
+                &agent_id,
+                &session_id,
+                "file:pricing.html",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+
+        terminal_test_git(&repo, &["init"]);
+        let identity = DiffForgeWriteGuardIdentity::new(
+            Some(agent_id),
+            Some(session_id.clone()),
+            Some(kernel.paths.db_path.clone()),
+        );
+        let hook_input = json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "cwd": repo.display().to_string(),
+            "tool_input": {
+                "file_path": repo.join("pricing.html").display().to_string()
+            }
+        });
+
+        let error = diff_forge_write_guard_decision(
+            "codex",
+            &hook_input,
+            &repo,
+            "slot1",
+            "codex",
+            &identity,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("direct Git repository edit"));
+        assert!(error.contains(".agents/worktrees/slot1"));
+        let session = kernel
+            .query_json(
+                "SELECT enforcement_mode, worktree_id, write_root FROM agent_sessions WHERE id=?1",
+                &[&session_id],
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            session["enforcement_mode"].as_str(),
+            Some("worktree_required")
+        );
+        assert!(session["worktree_id"].as_str().is_some());
+        assert!(
+            session["write_root"]
+                .as_str()
+                .is_some_and(|value| value.contains(".agents/worktrees/slot1"))
+        );
+    }
+
+    #[test]
     fn diff_forge_write_guard_allows_architecture_graph_direct_root_edit_without_task() {
         let repo = terminal_test_repo_with_commit("write_guard_architecture_root_edit");
         let hook_input = json!({

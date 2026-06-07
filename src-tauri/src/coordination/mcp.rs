@@ -3304,6 +3304,28 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         ));
     }
 
+    let start_authority_resolution = if let (Some(agent_id), Some(session_id)) =
+        (agent_id, session_id)
+    {
+        match kernel.promote_late_git_direct_session_file_authority(
+                agent_id,
+                session_id,
+                Some(&started_task_id),
+            ) {
+                Ok(resolution) if resolution["changed"].as_bool() == Some(true) => resolution,
+                Ok(_) => Value::Null,
+                Err(error) => {
+                    return Ok(api_error(
+                        "late_git_promotion_failed",
+                        "Git appeared after this terminal launched, but Diff Forge could not promote the running session to an isolated worktree. Do not edit the visible repo root.",
+                        json!({"error": error, "task_id": started_task_id}),
+                    ))
+                }
+            }
+    } else {
+        Value::Null
+    };
+
     let source_todo_refs = cloud_start_task_source_refs(&cloud);
     let attached_source_refs = if value_has_content(&source_todo_refs) {
         let attached = kernel.attach_task_source_refs(&started_task_id, &source_todo_refs)?;
@@ -3314,10 +3336,16 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     } else {
         None
     };
+    let refreshed_brief = if !start_authority_resolution.is_null() {
+        Some(kernel.get_brief(agent_id, session_id, Some(&started_task_id), None)?["data"].clone())
+    } else {
+        None
+    };
 
     if let Some(object) = data.as_object_mut() {
-        let brief = object
-            .get("brief")
+        let brief = refreshed_brief
+            .as_ref()
+            .or_else(|| object.get("brief"))
             .cloned()
             .map(|brief| start_task_brief_for_agent(&brief))
             .unwrap_or_else(|| json!({}));
@@ -3325,6 +3353,9 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         object.insert("start_plan".to_string(), json!(start_plan));
         object.insert("cloud".to_string(), cloud_start_task_for_agent(&cloud));
         object.insert("cloud_task_id".to_string(), json!(cloud_task_id));
+        if !start_authority_resolution.is_null() {
+            object.insert("authority".to_string(), start_authority_resolution);
+        }
         if let Some(attached) = attached_source_refs.as_ref() {
             insert_if_present(object, "source_todo", attached["source_todo"].clone());
             insert_if_present(object, "task", attached["task"].clone());
@@ -3819,6 +3850,28 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
             .filter(|value| !value.trim().is_empty())
         {
             file_authority = value.to_string();
+        }
+    }
+    if enforcement_mode == "bounded_direct_edit" && cloud_file_resource_key(resource_key) {
+        let resolution = kernel.promote_late_git_direct_session_file_authority(
+            agent_id,
+            session_id,
+            Some(task_id),
+        )?;
+        if resolution["changed"].as_bool() == Some(true) {
+            if let Some(value) = resolution["enforcement_mode"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                enforcement_mode = value.to_string();
+            }
+            if let Some(value) = resolution["file_authority"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+            {
+                file_authority = value.to_string();
+            }
+            authority_resolution = resolution;
         }
     }
     let no_local_file_authority = matches!(

@@ -6270,6 +6270,43 @@ function normalizeTodoQueueDispatchAction(value) {
   return action;
 }
 
+function normalizeTodoQueueDeviceSendMode(value, fallback = "listed") {
+  const mode = String(value || "").trim().toLowerCase().replace(/[-\s.]+/g, "_");
+  if (!mode) {
+    return fallback === "queued" ? "queued" : "listed";
+  }
+  if (["queue", "queued", "dispatch", "active_queue", "run_if_online"].includes(mode)) {
+    return "queued";
+  }
+  return "listed";
+}
+
+function encodeTodoQueueDeviceSendValue(mode, targetId) {
+  return JSON.stringify({
+    mode: normalizeTodoQueueDeviceSendMode(mode),
+    targetId: String(targetId || "").trim(),
+  });
+}
+
+function parseTodoQueueDeviceSendValue(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return { mode: "listed", targetId: "" };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      return {
+        mode: normalizeTodoQueueDeviceSendMode(parsed.mode),
+        targetId: String(parsed.targetId || parsed.target_id || "").trim(),
+      };
+    }
+  } catch (_) {
+    // Older select values were bare target ids and meant queued dispatch.
+  }
+  return { mode: "queued", targetId: raw };
+}
+
 function todoQueueDispatchActionIsResume(value) {
   return normalizeTodoQueueDispatchAction(value) === "resume";
 }
@@ -12154,7 +12191,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const showTodoDispatchTargets = workspaceTodoDispatchTargets.length > 0
     && typeof onDispatchTodoToTarget === "function";
   const handleDispatchTargetChange = useCallback((event, item, source) => {
-    const targetId = String(event.target.value || "").trim();
+    const { mode, targetId } = parseTodoQueueDeviceSendValue(event.target.value);
     event.target.value = "";
     if (!targetId || typeof onDispatchTodoToTarget !== "function") {
       return;
@@ -12163,7 +12200,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     if (!target) {
       return;
     }
-    onDispatchTodoToTarget(item, target, { source });
+    onDispatchTodoToTarget(item, target, { mode, source });
   }, [onDispatchTodoToTarget, workspaceTodoDispatchTargets]);
 
   return (
@@ -12415,7 +12452,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                         )}
                         {!isEditing && !isSending && showTodoDispatchTargets && (
                           <TodoQueueDispatchSelect
-                            aria-label="Queue todo on device"
+                            aria-label="Send todo to device"
                             data-todo-control="true"
                             data-visible="true"
                             defaultValue=""
@@ -12423,14 +12460,17 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             onPointerDown={(event) => {
                               event.stopPropagation();
                             }}
-                            title="Queue on device"
+                            title="Send listed or queued on device"
                           >
                             <option value="">&gt;</option>
-                            {workspaceTodoDispatchTargets.map((target) => (
-                              <option key={target.id} value={target.id}>
-                                {target.label}
-                              </option>
-                            ))}
+                            {workspaceTodoDispatchTargets.flatMap((target) => ([
+                              <option key={`${target.id}:listed`} value={encodeTodoQueueDeviceSendValue("listed", target.id)}>
+                                {`List on ${target.label}`}
+                              </option>,
+                              <option key={`${target.id}:queued`} value={encodeTodoQueueDeviceSendValue("queued", target.id)}>
+                                {`Queue on ${target.label}`}
+                              </option>,
+                            ]))}
                           </TodoQueueDispatchSelect>
                         )}
                         {isPending && (
@@ -12524,7 +12564,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                       >
                         {showTodoDispatchTargets && (
                           <TodoQueueDispatchSelect
-                            aria-label="Queue peer todo on device"
+                            aria-label="Send peer todo to device"
                             data-todo-control="true"
                             data-visible="true"
                             defaultValue=""
@@ -12532,14 +12572,17 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             onPointerDown={(event) => {
                               event.stopPropagation();
                             }}
-                            title="Queue on device"
+                            title="Send listed or queued on device"
                           >
                             <option value="">&gt;</option>
-                            {workspaceTodoDispatchTargets.map((target) => (
-                              <option key={target.id} value={target.id}>
-                                {target.label}
-                              </option>
-                            ))}
+                            {workspaceTodoDispatchTargets.flatMap((target) => ([
+                              <option key={`${target.id}:listed`} value={encodeTodoQueueDeviceSendValue("listed", target.id)}>
+                                {`List on ${target.label}`}
+                              </option>,
+                              <option key={`${target.id}:queued`} value={encodeTodoQueueDeviceSendValue("queued", target.id)}>
+                                {`Queue on ${target.label}`}
+                              </option>,
+                            ]))}
                           </TodoQueueDispatchSelect>
                         )}
                         {running && (
@@ -17596,6 +17639,8 @@ function TerminalView({
     if (!text || !todoId || !targetDeviceId || !targetWorkspaceId || !workspaceId || !repoPath) {
       return;
     }
+    const sendMode = normalizeTodoQueueDeviceSendMode(options.mode, "queued");
+    const queuedMode = sendMode === "queued";
 
     const randomSuffix = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -17622,7 +17667,7 @@ function TerminalView({
       channel: "native_desktop",
       clientKind: "rust_desktop",
       deviceId: sourceDeviceId,
-      origin: options.source === "peer" ? "peer_todo_dispatch" : "todo_dispatch",
+      origin: options.source === "peer" ? `peer_todo_${sendMode}` : `todo_${sendMode}`,
       surface: "rust-diffforge",
       workspaceId: sourceWorkspaceId || workspaceId,
       workspaceName: String(item?.workspaceName || item?.workspace_name || terminalWorkspace?.name || "").trim(),
@@ -17641,7 +17686,7 @@ function TerminalView({
       commandId,
       dispatchSource,
       dispatchTarget,
-      source: "cloud-diffforge-todo-dispatch",
+      source: queuedMode ? "cloud-diffforge-todo-dispatch" : "cloud-diffforge-listed-todo",
       todoDeviceId: sourceDeviceId,
       todoDispatchId: dispatchId,
       todoId,
@@ -17650,7 +17695,11 @@ function TerminalView({
     const todoPayload = {
       commandId,
       dispatchId,
+      body: text,
+      mode: sendMode,
+      source: queuedMode ? "rust-diffforge-todo-dispatch" : "rust-diffforge-listed-todo",
       text,
+      title: text.slice(0, 96),
       todoId,
       todoWorkspaceId: sourceWorkspaceId,
       dispatchSource,
@@ -17668,7 +17717,7 @@ function TerminalView({
       ...(target.accountId ? { targetAccountId: target.accountId } : {}),
     };
 
-    if (targetIsCurrentWorkspace) {
+    if (targetIsCurrentWorkspace && queuedMode) {
       const queuedItem = normalizeTodoQueueItem(
         options.source === "peer"
           ? createTodoQueueItem(text, {
@@ -17704,9 +17753,18 @@ function TerminalView({
       }
     }
 
+    let dispatchReason = "todo_listed_remote_create";
+    if (queuedMode && targetIsCurrentWorkspace) {
+      dispatchReason = "todo_dispatch_local_queue";
+    } else if (queuedMode) {
+      dispatchReason = "todo_dispatch_remote_queue";
+    } else if (targetIsCurrentWorkspace) {
+      dispatchReason = "todo_listed_local_create";
+    }
     void invoke("cloud_mcp_request_workspace_todo_dispatch", {
       dispatchKind: targetIsCurrentWorkspace ? "local" : "remote",
-      reason: targetIsCurrentWorkspace ? "todo_dispatch_local_queue" : "todo_dispatch_remote_queue",
+      mode: sendMode,
+      reason: dispatchReason,
       repoPath,
       target: targetPayload,
       todo: todoPayload,
@@ -17715,12 +17773,13 @@ function TerminalView({
     }).catch((error) => {
       logTerminalStatus("frontend.todo_queue.dispatch_request_error", {
         message: error?.message || String(error || ""),
+        mode: sendMode,
         targetDeviceId,
         targetWorkspaceId,
         todoId,
         workspaceId,
       });
-      if (targetIsCurrentWorkspace) {
+      if (targetIsCurrentWorkspace && queuedMode) {
         void invoke("cloud_mcp_record_todo_dispatch_status", {
           commandId,
           details: {

@@ -3102,24 +3102,43 @@ fn diff_forge_active_git_write_authority(
                 .to_string(),
         );
     }
-    let Some(_worktree_id) = session["worktree_id"]
+    let session_enforcement_mode = session["enforcement_mode"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let session_worktree_id = session["worktree_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty())
-    else {
+        .map(str::to_string);
+    let mut worktree_path = session["recorded_worktree_path"]
+        .as_str()
+        .or_else(|| session["write_root"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    if session_worktree_id.is_none() {
+        if session_enforcement_mode == "bounded_direct_edit" {
+            let promotion = kernel.promote_late_git_direct_session_file_authority(
+                agent_id,
+                session_id,
+                Some(task_id),
+            )?;
+            if promotion["changed"].as_bool() == Some(true) {
+                worktree_path = promotion["worktree_path"]
+                    .as_str()
+                    .or_else(|| promotion["agent_branch_root"].as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string);
+            }
+        }
+    }
+    let Some(worktree_path) = worktree_path else {
         return Err(
             "Diff Forge denied this Git write because this task has no assigned worktree. Call acquire_lease for the file before editing."
                 .to_string(),
         );
     };
-    let worktree_path = session["recorded_worktree_path"]
-        .as_str()
-        .or_else(|| session["write_root"].as_str())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            "Diff Forge denied this Git write because this task has no recorded worktree path."
-                .to_string()
-        })?;
-    let worktree_root = claude_guard_existing_or_parent_canonical_path(Path::new(worktree_path));
+    let worktree_root = claude_guard_existing_or_parent_canonical_path(Path::new(&worktree_path));
     if !diff_forge_path_is_slot_worktree_root(&worktree_root, slot_key) {
         return Err(format!(
             "Diff Forge denied this Git write because {} is not this terminal slot's assigned worktree.",

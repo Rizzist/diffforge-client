@@ -8843,13 +8843,24 @@ async fn cloud_mcp_sync_agent_installations(
     let workspace_id = clean_option(workspace_id);
     let workspace_name = clean_option(workspace_name);
     let reason = clean_option(reason).unwrap_or_else(|| "agent_status_refresh".to_string());
-    let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let snapshot_id = format!(
         "agent-installations-{}-{}",
         cloud_mcp_now_ms(),
         uuid::Uuid::new_v4()
     );
     let device_profile = cloud_mcp_desktop_device_profile();
+    let req = if repo_path.trim().is_empty() {
+        let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+            .unwrap_or_else(|| "desktop".to_string());
+        CloudMcpRepoRequest {
+            root_display: "device-agent-inventory".to_string(),
+            repo_id: format!("repo-device-agents-{}", cloud_mcp_short_hash(&device_id)),
+            workspace_id: workspace_id.clone(),
+            workspace_name: workspace_name.clone(),
+        }
+    } else {
+        cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone())
+    };
     let mut tagged_agent_statuses = agent_statuses;
     let agent_items = tagged_agent_statuses
         .as_array_mut()
@@ -11029,7 +11040,25 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
     target: Value,
     dispatch_kind: Option<String>,
     reason: Option<String>,
+    mode: Option<String>,
 ) -> Result<Value, String> {
+    let send_mode = cloud_mcp_proxy_normalize_todo_send_mode(mode.as_deref().unwrap_or("queued"))?;
+    let queued_mode = send_mode == "queued";
+    let event_kind = if queued_mode {
+        "workspace_todo_dispatch_requested"
+    } else {
+        "workspace_todo_listed_created"
+    };
+    let event_source = if queued_mode {
+        "rust-diffforge-todo-dispatch"
+    } else {
+        "rust-diffforge-listed-todo"
+    };
+    let default_reason = if queued_mode {
+        "todo_dispatch_requested"
+    } else {
+        "todo_listed_created"
+    };
     let req = cloud_mcp_repo_request(
         repo_path.clone(),
         Some(workspace_id.clone()),
@@ -11088,9 +11117,12 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
         })
     });
     let mut payload = json!({
-        "event_kind": "workspace_todo_dispatch_requested",
-        "source": "rust-diffforge-todo-dispatch",
-        "reason": reason.unwrap_or_else(|| "todo_dispatch_requested".to_string()),
+        "event_kind": event_kind,
+        "source": event_source,
+        "reason": reason.unwrap_or_else(|| default_reason.to_string()),
+        "mode": send_mode.as_str(),
+        "send_mode": send_mode.as_str(),
+        "sendMode": send_mode.as_str(),
         "repo_id": req.repo_id,
         "workspace_id": workspace_id,
         "workspaceId": workspace_id,
@@ -11130,18 +11162,15 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
     log_terminal_status_event(
         "backend.workspace_todos.dispatch_request",
         json!({
+            "eventKind": event_kind,
+            "mode": send_mode,
             "workspaceId": workspace_id,
             "targetDeviceId": cloud_mcp_payload_text(&payload, &["target_device_id", "targetDeviceId"]),
             "targetWorkspaceId": cloud_mcp_payload_text(&payload, &["target_workspace_id", "targetWorkspaceId"]),
             "todoId": cloud_mcp_payload_text(&payload, &["todo_id", "todoId", "id"]),
         }),
     );
-    cloud_mcp_post_event_endpoint(
-        state.inner(),
-        "workspace_todo_dispatch_requested",
-        &payload,
-    )
-    .await
+    cloud_mcp_post_event_endpoint(state.inner(), event_kind, &payload).await
 }
 
 #[tauri::command]
