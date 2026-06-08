@@ -4618,21 +4618,52 @@ async fn terminal_open(
     })
 }
 
-#[tauri::command]
-async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result<Value, String> {
-    let mut requested_roots = roots.unwrap_or_default();
+struct TerminalCrashRecoveryTarget {
+    repo_path: PathBuf,
+    db_path: Option<PathBuf>,
+    label: String,
+    source: String,
+}
+
+fn terminal_crash_recovery_targets(
+    roots: Option<Vec<String>>,
+) -> (Vec<TerminalCrashRecoveryTarget>, Vec<Value>) {
+    let requested_roots = roots.unwrap_or_default();
+    let mut targets = Vec::new();
+    let mut errors = Vec::new();
 
     if requested_roots.is_empty() {
-        requested_roots.push(String::new());
-    }
+        match crate::coordination::db::remembered_initialized_kernel_storages() {
+            Ok(storages) => {
+                for storage in storages {
+                    let db_label = workspace_path_display(&storage.db_path);
+                    if !storage.db_path.exists() {
+                        errors.push(json!({
+                            "source": "initialized_kernel_registry",
+                            "dbPath": db_label,
+                            "repoPath": workspace_path_display(&storage.repo_path),
+                            "error": "Coordination database no longer exists.",
+                        }));
+                        continue;
+                    }
+                    targets.push(TerminalCrashRecoveryTarget {
+                        label: workspace_path_display(&storage.repo_path),
+                        repo_path: storage.repo_path,
+                        db_path: Some(storage.db_path),
+                        source: "initialized_kernel_registry".to_string(),
+                    });
+                }
+            }
+            Err(error) => {
+                errors.push(json!({
+                    "source": "initialized_kernel_registry",
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
+            }
+        }
 
-    let mut seen_roots = HashSet::new();
-    let mut workspace_reports = Vec::new();
-    let mut interrupted_tasks = Vec::new();
-    let mut errors = Vec::new();
-    let mut scanned_sessions = 0u64;
-    let mut idle_sessions_interrupted = 0u64;
-    let mut finished_sessions_interrupted = 0u64;
+        return (targets, errors);
+    }
 
     for root in requested_roots {
         let root_option = if root.trim().is_empty() {
@@ -4665,54 +4696,148 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
         };
 
         for recovery_root in recovery_roots {
-            let root_key = workspace_path_display(&recovery_root);
+            targets.push(TerminalCrashRecoveryTarget {
+                label: workspace_path_display(&recovery_root),
+                repo_path: recovery_root,
+                db_path: None,
+                source: "requested_root".to_string(),
+            });
+        }
+    }
 
-            if !seen_roots.insert(root_key.clone()) {
-                continue;
-            }
+    (targets, errors)
+}
 
-            match crate::coordination::CoordinationKernel::init(&recovery_root, None)
-                .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
-            {
-                Ok(mut report) => {
-                    scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
-                    idle_sessions_interrupted +=
-                        report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
-                    finished_sessions_interrupted +=
-                        report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
+fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Result<Value, String> {
+    let (targets, mut errors) = terminal_crash_recovery_targets(roots);
+    let mut seen_targets = HashSet::new();
+    let mut workspace_reports = Vec::new();
+    let mut interrupted_tasks = Vec::new();
+    let mut crashed_terminals = Vec::new();
+    let mut scanned_sessions = 0u64;
+    let mut idle_sessions_interrupted = 0u64;
+    let mut finished_sessions_interrupted = 0u64;
 
-                    if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
-                        for task in tasks.iter_mut() {
-                            if let Some(object) = task.as_object_mut() {
-                                object.insert("repoPath".to_string(), json!(root_key.clone()));
+    for target in targets {
+        let target_key = target
+            .db_path
+            .as_ref()
+            .map(|path| format!("db:{}", workspace_path_display(path)))
+            .unwrap_or_else(|| format!("repo:{}", workspace_path_display(&target.repo_path)));
+        if !seen_targets.insert(target_key) {
+            continue;
+        }
+
+        let repo_key = target.label.clone();
+        let db_key = target.db_path.as_ref().map(|path| workspace_path_display(path));
+        match crate::coordination::CoordinationKernel::init(&target.repo_path, target.db_path.clone())
+            .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
+        {
+            Ok(mut report) => {
+                scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
+                idle_sessions_interrupted +=
+                    report["idleSessionsInterrupted"].as_u64().unwrap_or(0);
+                finished_sessions_interrupted +=
+                    report["finishedSessionsInterrupted"].as_u64().unwrap_or(0);
+
+                if let Some(tasks) = report["interruptedTasks"].as_array_mut() {
+                    for task in tasks.iter_mut() {
+                        if let Some(object) = task.as_object_mut() {
+                            object.insert("repoPath".to_string(), json!(repo_key.clone()));
+                            if let Some(db_key) = &db_key {
+                                object.insert("dbPath".to_string(), json!(db_key));
                             }
-                            interrupted_tasks.push(task.clone());
+                            object.insert(
+                                "recoverySource".to_string(),
+                                json!(target.source.clone()),
+                            );
                         }
+                        interrupted_tasks.push(task.clone());
                     }
+                }
 
-                    if let Some(object) = report.as_object_mut() {
-                        object.insert("repoPath".to_string(), json!(root_key));
+                if let Some(terminals) = report["crashedTerminals"].as_array_mut() {
+                    for terminal in terminals.iter_mut() {
+                        if let Some(object) = terminal.as_object_mut() {
+                            object.insert("repoPath".to_string(), json!(repo_key.clone()));
+                            if let Some(db_key) = &db_key {
+                                object.insert("dbPath".to_string(), json!(db_key));
+                            }
+                            object.insert(
+                                "recoverySource".to_string(),
+                                json!(target.source.clone()),
+                            );
+                        }
+                        crashed_terminals.push(terminal.clone());
                     }
-                    workspace_reports.push(report);
                 }
-                Err(error) => {
-                    errors.push(json!({
-                        "root": root_key,
-                        "error": clean_terminal_telemetry_text(&error),
-                    }));
+
+                if let Some(object) = report.as_object_mut() {
+                    object.insert("repoPath".to_string(), json!(repo_key));
+                    if let Some(db_key) = db_key {
+                        object.insert("dbPath".to_string(), json!(db_key));
+                    }
+                    object.insert(
+                        "recoverySource".to_string(),
+                        json!(target.source.clone()),
+                    );
                 }
+                workspace_reports.push(report);
+            }
+            Err(error) => {
+                errors.push(json!({
+                    "root": repo_key,
+                    "dbPath": db_key,
+                    "source": target.source,
+                    "error": clean_terminal_telemetry_text(&error),
+                }));
             }
         }
     }
 
     Ok(json!({
         "interruptedTasks": interrupted_tasks,
+        "crashedTerminals": crashed_terminals,
         "idleSessionsInterrupted": idle_sessions_interrupted,
         "finishedSessionsInterrupted": finished_sessions_interrupted,
         "scannedSessions": scanned_sessions,
         "workspaceReports": workspace_reports,
         "errors": errors,
     }))
+}
+
+fn terminal_recover_crashed_sessions_on_startup() {
+    thread::spawn(|| {
+        let report = terminal_recover_crashed_sessions_report(None);
+        match report {
+            Ok(report) => log_terminal_crash_forensics_event(
+                "terminal.crash_recovery.startup_scan",
+                json!({
+                    "ok": true,
+                    "scanned_sessions": report["scannedSessions"].as_u64().unwrap_or(0),
+                    "crashed_terminal_count": report["crashedTerminals"].as_array().map(Vec::len).unwrap_or(0),
+                    "interrupted_task_count": report["interruptedTasks"].as_array().map(Vec::len).unwrap_or(0),
+                    "idle_sessions_interrupted": report["idleSessionsInterrupted"].as_u64().unwrap_or(0),
+                    "finished_sessions_interrupted": report["finishedSessionsInterrupted"].as_u64().unwrap_or(0),
+                    "workspace_report_count": report["workspaceReports"].as_array().map(Vec::len).unwrap_or(0),
+                    "error_count": report["errors"].as_array().map(Vec::len).unwrap_or(0),
+                    "crashed_terminals": report["crashedTerminals"].clone(),
+                }),
+            ),
+            Err(error) => log_terminal_crash_forensics_event(
+                "terminal.crash_recovery.startup_scan",
+                json!({
+                    "ok": false,
+                    "error": clean_terminal_telemetry_text(&error),
+                }),
+            ),
+        }
+    });
+}
+
+#[tauri::command]
+async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result<Value, String> {
+    terminal_recover_crashed_sessions_report(roots)
 }
 
 #[tauri::command]

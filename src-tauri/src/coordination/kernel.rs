@@ -17,8 +17,8 @@ use uuid::Uuid;
 use super::{
     alignment,
     db::{
-        canonical_repo_path, open_connection, process_path_text, SchemaMigrationDiagnostics,
-        StoragePaths, REPO_ID,
+        canonical_repo_path, open_connection, process_path_text,
+        remember_initialized_kernel_storage, SchemaMigrationDiagnostics, StoragePaths, REPO_ID,
     },
     dependency_graph::DependencyEdgeInput,
     events,
@@ -2225,6 +2225,7 @@ fn remember_initialized_kernel_db(paths: &StoragePaths) -> Result<(), String> {
         .lock()
         .map_err(|_| "Unable to lock initialized coordination DB cache.".to_string())?
         .insert(key);
+    let _ = remember_initialized_kernel_storage(paths);
     Ok(())
 }
 
@@ -7162,6 +7163,7 @@ impl CoordinationKernel {
         )?;
         let scanned_sessions = sessions.len();
         let mut interrupted_tasks = Vec::new();
+        let mut crashed_terminals = Vec::new();
         let mut idle_sessions_interrupted = 0usize;
         let mut finished_sessions_interrupted = 0usize;
 
@@ -7188,6 +7190,27 @@ impl CoordinationKernel {
                 session["startup_cleared_lease_count"].as_i64().unwrap_or(0);
             let active_work_signal_count = active_lease_count + startup_cleared_lease_count;
             let active_crashed_task = unfinished_task && active_work_signal_count > 0;
+            let mut crashed_terminal = json!({
+                "sessionId": session_id,
+                "agentId": session["agent_id"].as_str().unwrap_or_default(),
+                "agentName": session["agent_name"].as_str().unwrap_or("Agent"),
+                "agentKind": session["agent_kind"].as_str().unwrap_or("agent"),
+                "agentSlotId": session["agent_slot_id"].as_str(),
+                "slotKey": session["slot_key"].as_str(),
+                "taskId": task_id,
+                "taskTitle": session["task_title"].as_str(),
+                "taskStatus": task_status,
+                "claimedSessionId": claimed_session_id,
+                "ptyId": session["pty_id"].as_str(),
+                "writeRoot": session["write_root"].as_str(),
+                "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
+                "sessionUpdatedAt": session["session_updated_at"].as_str(),
+                "activeLeaseCount": active_lease_count,
+                "startupClearedLeaseCount": startup_cleared_lease_count,
+                "activeWorkSignalCount": active_work_signal_count,
+                "unfinishedTask": unfinished_task,
+                "activeCrashedTask": active_crashed_task,
+            });
 
             if let Some(task_id) = task_id.filter(|_| active_crashed_task) {
                 let task_title = session["task_title"]
@@ -7225,6 +7248,16 @@ impl CoordinationKernel {
                     .map_err(|error| {
                         format!("Unable to mark crashed terminal task intents interrupted: {error}")
                     })?;
+                if let Some(object) = crashed_terminal.as_object_mut() {
+                    object.insert("cleanupReason".to_string(), json!("app_crash_recovery"));
+                    object.insert(
+                        "recoveryAction".to_string(),
+                        json!("interrupted_active_task"),
+                    );
+                    object.insert("taskUpdated".to_string(), json!(task_updates > 0));
+                    object.insert("updatedResourceIntents".to_string(), json!(intent_updates));
+                    object.insert("interruptResult".to_string(), interrupt_result.clone());
+                }
 
                 self.emit_event(
                     "terminal_crash_recovery_interrupted_task",
@@ -7245,7 +7278,9 @@ impl CoordinationKernel {
                         "task_updated": task_updates > 0,
                         "updated_resource_intents": intent_updates,
                         "reason": "app_crash_recovery",
-                        "ui_policy": "show_manual_resume_modal_only_when_active_work_was_interrupted",
+                        "ui_policy": "no_crash_recovery_modal",
+                        "recovery_policy": "quietly_record_crashed_terminals_and_mark_stale_work_interrupted",
+                        "crashed_terminal": crashed_terminal.clone(),
                     }),
                 )?;
 
@@ -7271,6 +7306,7 @@ impl CoordinationKernel {
                     "updatedResourceIntents": intent_updates,
                     "interruptResult": interrupt_result,
                 }));
+                crashed_terminals.push(crashed_terminal);
             } else {
                 let cleanup_reason = if unfinished_task {
                     idle_sessions_interrupted += 1;
@@ -7282,11 +7318,21 @@ impl CoordinationKernel {
                     idle_sessions_interrupted += 1;
                     "app_crash_idle_session_cleanup"
                 };
-                let _ = self.interrupt_session(session_id, cleanup_reason)?;
+                let interrupt_result = self.interrupt_session(session_id, cleanup_reason)?;
+                if let Some(object) = crashed_terminal.as_object_mut() {
+                    object.insert("cleanupReason".to_string(), json!(cleanup_reason));
+                    object.insert(
+                        "recoveryAction".to_string(),
+                        json!("interrupted_stale_session"),
+                    );
+                    object.insert("interruptResult".to_string(), interrupt_result);
+                }
+                crashed_terminals.push(crashed_terminal);
             }
         }
 
         if scanned_sessions > 0 {
+            let crashed_terminal_count = crashed_terminals.len();
             self.emit_event(
                 "terminal_crash_recovery_completed",
                 "kernel",
@@ -7295,15 +7341,19 @@ impl CoordinationKernel {
                 json!({
                     "scanned_sessions": scanned_sessions,
                     "interrupted_tasks": interrupted_tasks.len(),
+                    "crashed_terminal_count": crashed_terminal_count,
+                    "crashed_terminals": crashed_terminals.clone(),
                     "idle_sessions_interrupted": idle_sessions_interrupted,
                     "finished_sessions_interrupted": finished_sessions_interrupted,
-                    "modal_policy": "only_show_when_unfinished_task_sessions_have_active_work_signals",
+                    "ui_policy": "no_crash_recovery_modal",
+                    "recovery_policy": "quietly_record_crashed_terminals_and_mark_stale_work_interrupted",
                 }),
             )?;
         }
 
         Ok(json!({
             "interruptedTasks": interrupted_tasks,
+            "crashedTerminals": crashed_terminals,
             "idleSessionsInterrupted": idle_sessions_interrupted,
             "finishedSessionsInterrupted": finished_sessions_interrupted,
             "scannedSessions": scanned_sessions,
@@ -30410,7 +30460,7 @@ Appwrite > Session Store: create session
     }
 
     #[test]
-    fn crash_recovery_suppresses_modal_for_idle_claimed_tasks_without_leases() {
+    fn crash_recovery_tracks_idle_claimed_tasks_without_prompting() {
         let repo = init_git_repo("crash_recovery_idle_claimed_task");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
@@ -30428,6 +30478,18 @@ Appwrite > Session Store: create session
         let report = kernel.recover_crashed_terminal_sessions().unwrap();
 
         assert_eq!(report["interruptedTasks"].as_array().unwrap().len(), 0);
+        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        assert_eq!(crashed_terminals.len(), 1);
+        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(
+            crashed_terminals[0]["cleanupReason"].as_str(),
+            Some("app_crash_idle_claimed_task_cleanup")
+        );
+        assert_eq!(
+            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            Some(false)
+        );
         assert_eq!(report["idleSessionsInterrupted"].as_u64(), Some(1));
         let session = kernel
             .query_one(
@@ -30481,6 +30543,18 @@ Appwrite > Session Store: create session
         assert_eq!(interrupted_tasks.len(), 1);
         assert_eq!(interrupted_tasks[0]["taskId"].as_str(), Some(task_id));
         assert_eq!(interrupted_tasks[0]["activeLeaseCount"].as_i64(), Some(1));
+        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        assert_eq!(crashed_terminals.len(), 1);
+        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(
+            crashed_terminals[0]["cleanupReason"].as_str(),
+            Some("app_crash_recovery")
+        );
+        assert_eq!(
+            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            Some(true)
+        );
         let task = kernel
             .query_one(
                 "SELECT status FROM tasks WHERE id=?1",
@@ -30552,6 +30626,18 @@ Appwrite > Session Store: create session
         assert_eq!(
             interrupted_tasks[0]["activeWorkSignalCount"].as_i64(),
             Some(1)
+        );
+        let crashed_terminals = report["crashedTerminals"].as_array().unwrap();
+        assert_eq!(crashed_terminals.len(), 1);
+        assert_eq!(crashed_terminals[0]["sessionId"].as_str(), Some(session_id));
+        assert_eq!(crashed_terminals[0]["taskId"].as_str(), Some(task_id));
+        assert_eq!(
+            crashed_terminals[0]["startupClearedLeaseCount"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            crashed_terminals[0]["activeCrashedTask"].as_bool(),
+            Some(true)
         );
         let task = kernel
             .query_one(

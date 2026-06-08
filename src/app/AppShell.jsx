@@ -1030,7 +1030,6 @@ const APP_THEME_OPTIONS = [
   },
 ];
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
-const WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS = 240;
 const WORKSPACE_ACTIVE_SWITCH_OPENING_MS = 90;
 const WORKSPACE_APP_STARTUP_SCAN_IDLE_DELAY_MS = 700;
 const WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS = 450;
@@ -5546,7 +5545,6 @@ export default function App() {
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
-  const [crashRecoveryModal, setCrashRecoveryModal] = useState(null);
   const [activatedWorkspaceId, setActivatedWorkspaceId] = useState("");
   const [workspacePendingActivationId, setWorkspacePendingActivationId] = useState("");
   const [defaultWorkingDirectory, setDefaultWorkingDirectory] = useState("");
@@ -5643,7 +5641,6 @@ export default function App() {
     workspaceId: "",
   });
   const preparedTerminalsRef = useRef(new Map());
-  const crashRecoveryScanRef = useRef(false);
   const workspaceAgentBatchInFlightKeyRef = useRef("");
   const workspaceAgentBatchWaitLogKeyRef = useRef("");
   const workspaceAgentBatchSentKeyRef = useRef("");
@@ -9360,34 +9357,6 @@ export default function App() {
       setWorkspaceSyncState("idle");
       setWorkspaceListHydrated(true);
 
-      if (!crashRecoveryScanRef.current) {
-        crashRecoveryScanRef.current = true;
-        window.setTimeout(async () => {
-          const localWorkspaceSettings = readWorkspaceSettings();
-          const recoveryRoots = Array.from(new Set(nextWorkspaces
-            .map((workspace) => getWorkspaceRootDirectory(localWorkspaceSettings, workspace.id))
-            .filter(Boolean)));
-
-          try {
-            const recoveryReport = await invoke("terminal_recover_crashed_sessions", {
-              roots: recoveryRoots,
-            });
-            const interruptedTasks = Array.isArray(recoveryReport?.interruptedTasks)
-              ? recoveryReport.interruptedTasks
-              : [];
-
-            if (interruptedTasks.length > 0) {
-              setCrashRecoveryModal({
-                interruptedTasks,
-                idleSessionsInterrupted: recoveryReport?.idleSessionsInterrupted || 0,
-                finishedSessionsInterrupted: recoveryReport?.finishedSessionsInterrupted || 0,
-                scannedSessions: recoveryReport?.scannedSessions || 0,
-              });
-            }
-          } catch {
-          }
-        }, WORKSPACE_BACKGROUND_HYDRATION_DELAY_MS);
-      }
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -9422,7 +9391,6 @@ export default function App() {
     setWorkspaceSyncState("loading");
     setWorkspaceListHydrated(false);
     setWorkspaceHydrationReady(false);
-    crashRecoveryScanRef.current = false;
     loadWorkspaces();
   }, [activeAccountScopeKey, authState, loadWorkspaces, user]);
 
@@ -11644,7 +11612,6 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    setCrashRecoveryModal(null);
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -11657,7 +11624,6 @@ export default function App() {
     workspaceRuntimeSelectionLogKeyRef.current = "";
     workspaceMcpStartupIndexEmptyKeyRef.current = "";
     workspaceCoordinationTargetsStateKeyRef.current = "";
-    crashRecoveryScanRef.current = false;
     preparedTerminalsRef.current.clear();
     setStartupAgentGateState("idle");
     setStartupAgentUpdateMessage("");
@@ -16634,20 +16600,6 @@ export default function App() {
     };
   }, [activateWorkspace, agentStatuses, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
 
-  const chooseCrashRecoveryPath = useCallback((choice) => {
-    const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)
-      ? crashRecoveryModal.interruptedTasks
-      : [];
-
-    setCrashRecoveryModal(null);
-
-    if (choice === "resume") {
-      showView(DEFAULT_WORKSPACE_VIEW, {
-        telemetrySource: "crash_recovery_resume",
-        telemetryWorkspaceId: activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current,
-      });
-    }
-  }, [crashRecoveryModal, showView]);
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {
       openWorkspaceSettings(selectedWorkspace.id);
@@ -22360,70 +22312,6 @@ export default function App() {
                     {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
                   </WorkspaceSettingsDialog>
                 </WorkspaceSettingsOverlay>
-              )}
-              {crashRecoveryModal?.interruptedTasks?.length > 0 && (
-                <CrashRecoveryOverlay aria-label="Crash recovery modal">
-                  <CrashRecoveryDialog
-                    aria-labelledby="crash-recovery-title"
-                    aria-modal="true"
-                    role="dialog"
-                  >
-                    <WorkspaceSettingsDialogHeader>
-                      <WorkspaceSettingsHeaderMain>
-                        <div>
-                          <PanelKicker>Crash recovery</PanelKicker>
-                          <PanelHeading id="crash-recovery-title">Some agents were interrupted</PanelHeading>
-                        </div>
-                        <CrashRecoveryIntro>
-                          <p>
-                            Diff Forge found agent work that was still active when the desktop app stopped unexpectedly.
-                            Those sessions were marked <strong>interrupted</strong> so stale leases and protected sessions do not block new work.
-                          </p>
-                          <p>
-                            Choose <strong>Resume agents</strong> to open the terminal workspace and continue manually.
-                            Nothing will be typed or submitted to an agent automatically.
-                          </p>
-                        </CrashRecoveryIntro>
-                      </WorkspaceSettingsHeaderMain>
-                    </WorkspaceSettingsDialogHeader>
-
-                    <CrashRecoveryList>
-                      {crashRecoveryModal.interruptedTasks.map((task) => {
-                        const taskBody = String(task.body || "");
-
-                        return (
-                          <CrashRecoveryItem key={`${task.sessionId || "session"}-${task.taskId || "task"}`}>
-                            <CrashRecoveryItemTitle>
-                              {task.title || "Interrupted agent task"}
-                            </CrashRecoveryItemTitle>
-                            {taskBody && (
-                              <CrashRecoveryItemBody>
-                                {taskBody.slice(0, 220)}
-                                {taskBody.length > 220 ? "..." : ""}
-                              </CrashRecoveryItemBody>
-                            )}
-                            <CrashRecoveryMeta>
-                              <span>{task.agentName || task.agentKind || "Agent"}</span>
-                              {task.slotKey && <span>{task.slotKey}</span>}
-                              {task.repoPath && <span>{task.repoPath}</span>}
-                              {task.previousTaskStatus && <span>was {task.previousTaskStatus}</span>}
-                            </CrashRecoveryMeta>
-                          </CrashRecoveryItem>
-                        );
-                      })}
-                    </CrashRecoveryList>
-
-                    <CrashRecoveryActions>
-                      <SecondaryButton onClick={() => chooseCrashRecoveryPath("fresh")} type="button">
-                        <span>Start fresh</span>
-                      </SecondaryButton>
-                      <PrimaryButton onClick={() => chooseCrashRecoveryPath("resume")} type="button">
-                        <ButtonTerminalIcon aria-hidden="true" />
-                        <span>Resume agents</span>
-                      </PrimaryButton>
-                    </CrashRecoveryActions>
-                  </CrashRecoveryDialog>
-                </CrashRecoveryOverlay>
               )}
               </DashboardShell>
               {lowCreditToastVisible && (

@@ -3590,6 +3590,7 @@ pub fn run() {
             "windows_build_number": terminal_windows_build_number(),
         }),
     );
+    terminal_recover_crashed_sessions_on_startup();
     log_audio_diagnostic_event(
         "audio.debug.process_start",
         json!({

@@ -79,6 +79,8 @@ static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
     std::sync::mpsc::Sender<(String, CloudMcpOutboxRow)>,
 > = OnceLock::new();
+static CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER: OnceLock<tokio::sync::broadcast::Sender<Value>> =
+    OnceLock::new();
 
 #[derive(Clone)]
 struct CloudMcpBackgroundSync {
@@ -359,6 +361,7 @@ struct CloudMcpPreparedWorkspaceBundle {
 impl CloudMcpState {
     fn new() -> Self {
         let (global_ws_events, _) = tokio::sync::broadcast::channel(8192);
+        let _ = CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER.set(global_ws_events.clone());
         Self {
             inner: Arc::new(Mutex::new(CloudMcpRuntime {
                 base_url: cloud_mcp_base_url(),
@@ -3249,6 +3252,11 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .get("initial_live_runtime")
             .cloned()
             .filter(|value| !value.is_null());
+        let initial_asset_transfer_snapshot = message
+            .get("initial_asset_transfer_snapshot")
+            .or_else(|| message.get("initialAssetTransferSnapshot"))
+            .cloned()
+            .filter(|value| !value.is_null());
         {
             let mut runtime = state.inner.lock().await;
             runtime.connected = true;
@@ -3272,6 +3280,20 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 &initial_live_runtime,
             )
             .await;
+        }
+        if let Some(initial_asset_transfer_snapshot) = initial_asset_transfer_snapshot {
+            cloud_mcp_update_asset_library_from_response(
+                "global_ws_ready_assets",
+                Some("/v1/events"),
+                &json!({"include_all_workspaces": true, "includeAllWorkspaces": true}),
+                &initial_asset_transfer_snapshot,
+            );
+            let _ = state.global_ws_events.send(json!({
+                "kind": "workspace_assets_snapshot",
+                "event_kind": "workspace_assets_snapshot",
+                "eventKind": "workspace_assets_snapshot",
+                "payload": initial_asset_transfer_snapshot,
+            }));
         }
         cloud_mcp_record_signin_diagnostic(
             state,
@@ -19004,11 +19026,160 @@ pub(crate) fn cloud_mcp_forward_agent_list_assets(
     let repo_id = (!repo_path_text.is_empty())
         .then(|| format!("repo-{}", cloud_mcp_short_hash(&repo_path_text)));
     let limit = cloud_mcp_payload_i64(input, &["limit"]).unwrap_or(100).max(1) as usize;
-    Ok(cloud_mcp_asset_library_from_file(
+    let library = cloud_mcp_asset_library_from_file(
         repo_id.as_deref(),
         workspace_id,
         limit,
+    );
+    Ok(cloud_mcp_filter_asset_library_for_agent(
+        repo_id.as_deref(),
+        workspace_id,
+        input,
+        library,
     ))
+}
+
+fn cloud_mcp_filter_asset_library_for_agent(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    input: &Value,
+    library: Value,
+) -> Value {
+    let asset_ids =
+        cloud_mcp_todo_mirror_text_values(input, &["asset_id", "assetId", "asset_ids", "assetIds"]);
+    let transfer_ids = cloud_mcp_todo_mirror_text_values(
+        input,
+        &["transfer_id", "transferId", "transfer_ids", "transferIds"],
+    );
+    let device_ids = cloud_mcp_todo_mirror_text_values(
+        input,
+        &[
+            "device_id",
+            "deviceId",
+            "device_ids",
+            "deviceIds",
+            "machine_id",
+            "machineId",
+        ],
+    );
+    let direction = cloud_mcp_payload_text(input, &["direction"])
+        .map(|value| value.trim().to_ascii_lowercase());
+    let transfer_status = cloud_mcp_payload_text(input, &["transfer_status", "transferStatus"])
+        .map(|value| value.trim().to_ascii_lowercase())
+        .or_else(|| {
+            cloud_mcp_payload_bool(input, &["active_only", "activeOnly"], false)
+                .then(|| "active".to_string())
+        });
+    let asset_status = cloud_mcp_payload_text(input, &["status"])
+        .map(|value| value.trim().to_ascii_lowercase());
+    let kind = cloud_mcp_payload_text(input, &["kind"])
+        .map(|value| value.trim().to_ascii_lowercase());
+
+    let mut rows = library
+        .get("items")
+        .or_else(|| library.get("assets"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    rows.retain(|row| {
+        if !asset_ids.is_empty() {
+            let row_asset_id = cloud_mcp_asset_row_text(row, &["asset_id", "assetId", "id"]);
+            if !asset_ids.contains(&row_asset_id) {
+                return false;
+            }
+        }
+        if let Some(asset_status) = asset_status.as_deref() {
+            let row_status = cloud_mcp_asset_row_text(
+                row,
+                &["cloud_status", "cloudStatus", "local_status", "localStatus", "status"],
+            )
+            .to_ascii_lowercase();
+            if row_status != asset_status {
+                return false;
+            }
+        }
+        if let Some(kind) = kind.as_deref() {
+            let row_kind =
+                cloud_mcp_asset_row_text(row, &["kind", "asset_kind", "assetKind"]).to_ascii_lowercase();
+            if row_kind != kind {
+                return false;
+            }
+        }
+        if !device_ids.is_empty() {
+            let row_device_id = cloud_mcp_asset_row_text(
+                row,
+                &["origin_device_id", "originDeviceId", "device_id", "deviceId"],
+            );
+            if !device_ids.contains(&row_device_id) {
+                return false;
+            }
+        }
+        true
+    });
+
+    let visible_asset_ids = rows
+        .iter()
+        .map(|row| cloud_mcp_asset_row_text(row, &["asset_id", "assetId", "id"]))
+        .filter(|asset_id| !asset_id.is_empty())
+        .collect::<HashSet<_>>();
+    let mut transfers = library
+        .get("transfers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    transfers.retain(|transfer| {
+        let transfer_asset_id = cloud_mcp_asset_row_text(transfer, &["asset_id", "assetId"]);
+        if !asset_ids.is_empty() && !asset_ids.contains(&transfer_asset_id) {
+            return false;
+        }
+        let transfer_id = cloud_mcp_asset_row_text(transfer, &["transfer_id", "transferId", "id"]);
+        if !transfer_ids.is_empty() && !transfer_ids.contains(&transfer_id) {
+            return false;
+        }
+        if !visible_asset_ids.is_empty() && !visible_asset_ids.contains(&transfer_asset_id) {
+            return false;
+        }
+        if let Some(direction) = direction.as_deref() {
+            if cloud_mcp_asset_row_text(transfer, &["direction"]).to_ascii_lowercase() != direction {
+                return false;
+            }
+        }
+        if !device_ids.is_empty() {
+            let transfer_device_id = cloud_mcp_asset_row_text(
+                transfer,
+                &["device_id", "deviceId", "machine_id", "machineId"],
+            );
+            if !device_ids.contains(&transfer_device_id) {
+                return false;
+            }
+        }
+        if let Some(status) = transfer_status.as_deref() {
+            let row_status = cloud_mcp_asset_row_text(transfer, &["status"]).to_ascii_lowercase();
+            if status == "active" {
+                if !cloud_mcp_asset_transfer_status_is_active(&row_status) {
+                    return false;
+                }
+            } else if row_status != status {
+                return false;
+            }
+        }
+        true
+    });
+    cloud_mcp_asset_library_response_from_rows(repo_id, workspace_id, rows, transfers, None)
+}
+
+fn cloud_mcp_asset_transfer_status_is_active(status: &str) -> bool {
+    matches!(
+        status,
+        "queued"
+            | "preparing"
+            | "prepared"
+            | "uploading"
+            | "downloading"
+            | "verifying"
+            | "committing"
+            | "warming_cache"
+    )
 }
 
 pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
@@ -19112,59 +19283,116 @@ fn cloud_mcp_forward_agent_asset_transfer_status(
     direction: &str,
     reason: &str,
 ) -> Result<Value, String> {
-    let repo_path_text = repo_path.unwrap_or_default().trim().to_string();
-    let req = cloud_mcp_repo_request(
-        repo_path_text,
-        workspace_id.map(str::to_string),
-        cloud_mcp_payload_text(input, &["workspace_name", "workspaceName"]),
-    );
-    let mut payload = cloud_mcp_asset_payload_base(
-        &req,
-        workspace_id.unwrap_or_default(),
-        req.workspace_name.as_deref(),
+    let _ = (repo_path, workspace_id, base_url_override);
+    let limit = cloud_mcp_payload_i64(input, &["limit"])
+        .unwrap_or(100)
+        .clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS as i64) as usize;
+    let library = cloud_mcp_asset_library_from_file(None, None, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS);
+    Ok(cloud_mcp_asset_transfer_status_from_local(
+        input,
+        direction,
         reason,
+        library,
+        limit,
+    ))
+}
+
+fn cloud_mcp_asset_transfer_status_from_local(
+    input: &Value,
+    direction: &str,
+    reason: &str,
+    library: Value,
+    limit: usize,
+) -> Value {
+    let asset_ids =
+        cloud_mcp_todo_mirror_text_values(input, &["asset_id", "assetId", "asset_ids", "assetIds"]);
+    let transfer_ids = cloud_mcp_todo_mirror_text_values(
+        input,
+        &["transfer_id", "transferId", "transfer_ids", "transferIds"],
     );
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("direction".to_string(), json!(direction));
-        object.insert("include_all_workspaces".to_string(), json!(true));
-        object.insert("includeAllWorkspaces".to_string(), json!(true));
-        for key in [
-            "asset_id",
-            "assetId",
-            "asset_ids",
-            "assetIds",
-            "transfer_id",
-            "transferId",
-            "transfer_ids",
-            "transferIds",
-            "status",
-            "limit",
-        ] {
-            if let Some(value) = input.get(key) {
-                object.insert(key.to_string(), value.clone());
+    let device_ids = cloud_mcp_todo_mirror_text_values(
+        input,
+        &[
+            "device_id",
+            "deviceId",
+            "device_ids",
+            "deviceIds",
+            "machine_id",
+            "machineId",
+        ],
+    );
+    let status = cloud_mcp_payload_text(input, &["status", "transfer_status", "transferStatus"])
+        .map(|value| value.trim().to_ascii_lowercase())
+        .or_else(|| {
+            cloud_mcp_payload_bool(input, &["active_only", "activeOnly"], false)
+                .then(|| "active".to_string())
+        });
+    let mut transfers = library
+        .get("transfers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    transfers.retain(|transfer| {
+        if cloud_mcp_asset_row_text(transfer, &["direction"]).to_ascii_lowercase() != direction {
+            return false;
+        }
+        let transfer_asset_id = cloud_mcp_asset_row_text(transfer, &["asset_id", "assetId"]);
+        if !asset_ids.is_empty() && !asset_ids.contains(&transfer_asset_id) {
+            return false;
+        }
+        let transfer_id = cloud_mcp_asset_row_text(transfer, &["transfer_id", "transferId", "id"]);
+        if !transfer_ids.is_empty() && !transfer_ids.contains(&transfer_id) {
+            return false;
+        }
+        if !device_ids.is_empty() {
+            let transfer_device_id = cloud_mcp_asset_row_text(
+                transfer,
+                &["device_id", "deviceId", "machine_id", "machineId"],
+            );
+            if !device_ids.contains(&transfer_device_id) {
+                return false;
             }
         }
+        if let Some(status) = status.as_deref() {
+            let row_status = cloud_mcp_asset_row_text(transfer, &["status"]).to_ascii_lowercase();
+            if status == "active" {
+                if !cloud_mcp_asset_transfer_status_is_active(&row_status) {
+                    return false;
+                }
+            } else if row_status != status {
+                return false;
+            }
+        }
+        true
+    });
+    transfers.truncate(limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS));
+    let transfer_asset_ids = transfers
+        .iter()
+        .map(|transfer| cloud_mcp_asset_row_text(transfer, &["asset_id", "assetId"]))
+        .filter(|asset_id| !asset_id.is_empty())
+        .collect::<HashSet<_>>();
+    let mut assets = library
+        .get("items")
+        .or_else(|| library.get("assets"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assets.retain(|asset| {
+        let asset_id = cloud_mcp_asset_row_text(asset, &["asset_id", "assetId", "id"]);
+        (!asset_ids.is_empty() && asset_ids.contains(&asset_id))
+            || transfer_asset_ids.contains(&asset_id)
+    });
+    let mut response =
+        cloud_mcp_asset_library_response_from_rows(None, None, assets, transfers, None);
+    if let Some(object) = response.as_object_mut() {
+        object.insert("kind".to_string(), json!("workspace_asset_status"));
+        object.insert("source".to_string(), json!("local_asset_library"));
+        object.insert("status_source".to_string(), json!("local_rust_mirror"));
+        object.insert("statusSource".to_string(), json!("local_rust_mirror"));
+        object.insert("reason".to_string(), json!(reason));
+        object.insert("direction".to_string(), json!(direction));
     }
-    let base_url = base_url_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(cloud_mcp_base_url);
-    let response = cloud_mcp_proxy_post_json_endpoint(
-        &base_url,
-        "/v1/workspace/assets/status",
-        &payload.to_string(),
-    )?;
-    let parsed = serde_json::from_str::<Value>(&response)
-        .unwrap_or_else(|_| json!({"raw_response": response}));
-    let data = parsed.get("data").cloned().unwrap_or(parsed);
-    cloud_mcp_update_asset_library_from_response(
-        reason,
-        Some("/v1/workspace/assets/status"),
-        &payload,
-        &data,
-    );
-    Ok(data)
+    response
 }
 
 pub(crate) fn cloud_mcp_forward_agent_upload_asset_status(
@@ -19442,7 +19670,18 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         .unwrap_or_else(|| format!("{asset_id}.asset"));
     let name = cloud_mcp_sanitize_asset_filename(&raw_name, &format!("{asset_id}.asset"));
     let target_path = cloud_mcp_available_asset_download_path(&target_dir, &name);
-    let download = cloud_mcp_download_asset_streaming_blocking(
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<Value>();
+    let progress_base_url = base_url.clone();
+    let progress_thread = std::thread::spawn(move || {
+        while let Some(progress) = progress_rx.blocking_recv() {
+            let _ = cloud_mcp_proxy_post_json_endpoint(
+                &progress_base_url,
+                "/v1/workspace/assets/report-transfer-progress",
+                &progress.to_string(),
+            );
+        }
+    });
+    let download_result = cloud_mcp_download_asset_streaming_blocking(
         http_target.url,
         headers,
         &target_path,
@@ -19452,8 +19691,10 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         workspace_id.unwrap_or_default().to_string(),
         asset_id.clone(),
         transfer_id,
-        None,
-    )?;
+        Some(progress_tx),
+    );
+    let _ = progress_thread.join();
+    let download = download_result?;
     let mut local_asset = asset;
     if let Some(object) = local_asset.as_object_mut() {
         object.insert(
@@ -19504,14 +19745,39 @@ fn cloud_mcp_asset_store_local_transfer_progress(
         bytes_done,
         error,
     );
-    cloud_mcp_update_asset_library_conn(
+    let update = cloud_mcp_update_asset_library_conn(
         &conn,
         "local_asset_transfer_progress",
         Some(cloud_mcp_base_url().as_str()),
         Some(repo_id),
         Some(workspace_id),
-        &json!({"transfers": [row]}),
-    )
+        &json!({"transfers": [row.clone()]}),
+    );
+    if update.is_ok() {
+        if let Some(sender) = CLOUD_MCP_ASSET_LOCAL_EVENT_SENDER.get() {
+            let event_kind = if matches!(status, "failed" | "interrupted") {
+                "workspace_asset_transfer_failed"
+            } else {
+                "workspace_asset_transfer_progress"
+            };
+            let _ = sender.send(json!({
+                "kind": event_kind,
+                "event_kind": event_kind,
+                "eventKind": event_kind,
+                "asset_id": asset_id,
+                "assetId": asset_id,
+                "transfer_id": transfer_id,
+                "transferId": transfer_id,
+                "payload": {
+                    "kind": event_kind,
+                    "transfers": [row.clone()],
+                    "transfer": row.clone(),
+                },
+                "transfer": row,
+            }));
+        }
+    }
+    update
 }
 
 fn cloud_mcp_asset_transfer_progress_row(
@@ -19747,10 +20013,41 @@ fn cloud_mcp_download_asset_streaming_blocking(
     let fail_workspace_id = workspace_id.clone();
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
-    let response = match reqwest::blocking::Client::builder()
+    let failure_reporter = reporter.clone();
+    let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS))
         .build()
-        .map_err(|error| format!("Unable to create asset download client: {error}"))?
+    {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
+                &fail_repo_id,
+                &fail_workspace_id,
+                &fail_asset_id,
+                &fail_transfer_id,
+                "download",
+                "failed",
+                expected_size,
+                0,
+                Some(&format!("Unable to create asset download client: {error}")),
+            );
+            if let Some(reporter) = failure_reporter.as_ref() {
+                let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+                    &fail_repo_id,
+                    &fail_workspace_id,
+                    &fail_asset_id,
+                    &fail_transfer_id,
+                    "download",
+                    "failed",
+                    expected_size,
+                    0,
+                    Some(&format!("Unable to create asset download client: {error}")),
+                ));
+            }
+            return Err(format!("Unable to create asset download client: {error}"));
+        }
+    };
+    let response = match client
         .get(url)
         .headers(headers)
         .send()
@@ -19768,6 +20065,19 @@ fn cloud_mcp_download_asset_streaming_blocking(
                 0,
                 Some(&format!("Asset download failed: {error}")),
             );
+            if let Some(reporter) = failure_reporter.as_ref() {
+                let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+                    &fail_repo_id,
+                    &fail_workspace_id,
+                    &fail_asset_id,
+                    &fail_transfer_id,
+                    "download",
+                    "failed",
+                    expected_size,
+                    0,
+                    Some(&format!("Asset download failed: {error}")),
+                ));
+            }
             return Err(format!("Asset download failed: {error}"));
         }
     };
@@ -19784,6 +20094,19 @@ fn cloud_mcp_download_asset_streaming_blocking(
             0,
             Some("Asset download returned an error response."),
         );
+        if let Some(reporter) = failure_reporter.as_ref() {
+            let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+                &fail_repo_id,
+                &fail_workspace_id,
+                &fail_asset_id,
+                &fail_transfer_id,
+                "download",
+                "failed",
+                expected_size,
+                0,
+                Some("Asset download returned an error response."),
+            ));
+        }
         return Err(format!("Asset download returned {}", status.as_u16()));
     }
     cloud_mcp_write_download_response_to_file(
@@ -19811,31 +20134,76 @@ fn cloud_mcp_write_download_response_to_file(
     mut progress: CloudMcpAssetTransferProgress,
 ) -> Result<(), String> {
     if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Unable to create asset download directory: {error}"))?;
+        if let Err(error) = fs::create_dir_all(parent) {
+            progress.report(
+                "failed",
+                progress.bytes_done,
+                true,
+                Some("Unable to create asset download directory."),
+            );
+            return Err(format!(
+                "Unable to create asset download directory: {error}"
+            ));
+        }
     }
     let staging = target_path.with_extension(format!("download-{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = fs::File::create(&staging)
-        .map_err(|error| format!("Unable to create downloaded asset: {error}"))?;
+    let mut file = match fs::File::create(&staging) {
+        Ok(file) => file,
+        Err(error) => {
+            progress.report(
+                "failed",
+                progress.bytes_done,
+                true,
+                Some("Unable to create downloaded asset."),
+            );
+            return Err(format!("Unable to create downloaded asset: {error}"));
+        }
+    };
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 256 * 1024];
     let mut bytes_done = 0_i64;
     progress.report("downloading", 0, true, None);
     loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|error| format!("Unable to read asset download bytes: {error}"))?;
+        let read = match response.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = fs::remove_file(&staging);
+                progress.report(
+                    "failed",
+                    bytes_done,
+                    true,
+                    Some("Unable to read asset download bytes."),
+                );
+                return Err(format!("Unable to read asset download bytes: {error}"));
+            }
+        };
         if read == 0 {
             break;
         }
-        file.write_all(&buffer[..read])
-            .map_err(|error| format!("Unable to write downloaded asset: {error}"))?;
+        if let Err(error) = file.write_all(&buffer[..read]) {
+            let _ = fs::remove_file(&staging);
+            progress.report(
+                "failed",
+                bytes_done,
+                true,
+                Some("Unable to write downloaded asset."),
+            );
+            return Err(format!("Unable to write downloaded asset: {error}"));
+        }
         hasher.update(&buffer[..read]);
         bytes_done = bytes_done.saturating_add(read as i64);
         progress.report("downloading", bytes_done, false, None);
     }
-    file.flush()
-        .map_err(|error| format!("Unable to flush downloaded asset: {error}"))?;
+    if let Err(error) = file.flush() {
+        let _ = fs::remove_file(&staging);
+        progress.report(
+            "failed",
+            bytes_done,
+            true,
+            Some("Unable to flush downloaded asset."),
+        );
+        return Err(format!("Unable to flush downloaded asset: {error}"));
+    }
     if expected_size >= 0 && expected_size != bytes_done {
         let _ = fs::remove_file(&staging);
         progress.report(
@@ -19863,8 +20231,16 @@ fn cloud_mcp_write_download_response_to_file(
             ));
         }
     }
-    fs::rename(&staging, target_path)
-        .map_err(|error| format!("Unable to finalize downloaded asset: {error}"))?;
+    if let Err(error) = fs::rename(&staging, target_path) {
+        let _ = fs::remove_file(&staging);
+        progress.report(
+            "failed",
+            bytes_done,
+            true,
+            Some("Unable to finalize downloaded asset."),
+        );
+        return Err(format!("Unable to finalize downloaded asset: {error}"));
+    }
     progress.report("completed", bytes_done, true, None);
     Ok(())
 }

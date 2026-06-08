@@ -102,6 +102,45 @@ function assetTransferUpdatedAt(transfer) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function assetTransferDeviceName(transfer) {
+  const device = transfer?.device && typeof transfer.device === "object" ? transfer.device : {};
+  return text(
+    device.displayName
+      || device.display_name
+      || device.deviceName
+      || device.device_name
+      || transfer?.deviceName
+      || transfer?.device_name
+      || device.machineName
+      || device.machine_name
+      || transfer?.machineName
+      || transfer?.machine_name
+      || device.deviceId
+      || device.device_id
+      || transfer?.deviceId
+      || transfer?.device_id,
+    "device",
+  );
+}
+
+function assetTransferDeviceSummary(transfers) {
+  const seen = new Set();
+  const labels = [];
+  transfers.forEach((transfer) => {
+    if (assetTransferStatusKind(transfer) !== "active") return;
+    const direction = text(transfer?.direction, "syncing").toLowerCase();
+    const device = assetTransferDeviceName(transfer);
+    const label = `${direction} on ${device}`;
+    const key = label.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      labels.push(label);
+    }
+  });
+  if (labels.length <= 2) return labels.join(" · ");
+  return `${labels.slice(0, 2).join(" · ")} · +${labels.length - 2} more`;
+}
+
 function latestAssetTransfer(transfers, asset) {
   const id = assetId(asset);
   if (!id) return null;
@@ -360,6 +399,10 @@ function AssetsPanel({
     ? visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length
     : numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
       || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
+  const activeTransferSummary = useMemo(
+    () => assetTransferDeviceSummary(visibleTransfers),
+    [visibleTransfers],
+  );
   const hasWorkspaceFilters = selectedWorkspaceFilterKeys.length > 0;
   const assetCountPluralBase = hasWorkspaceFilters ? items.length : filteredItems.length;
 
@@ -421,10 +464,10 @@ function AssetsPanel({
           <AssetsKicker>Library</AssetsKicker>
           <AssetHeadingLine>
             <AssetsTitle>{repoLabel}</AssetsTitle>
-            {syncing && (
-              <AssetSyncPill aria-live="polite">
-                <AssetSyncSpinner aria-hidden="true" />
-                Syncing
+            {(syncing || (!loading && !error)) && (
+              <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "synced"}>
+                {syncing && <AssetSyncSpinner aria-hidden="true" />}
+                {syncing ? "Syncing" : "Synced"}
               </AssetSyncPill>
             )}
           </AssetHeadingLine>
@@ -433,6 +476,7 @@ function AssetsPanel({
           <AssetsSummary>
             {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud
             {activeTransfers ? ` · ${activeTransfers} active` : ""}
+            {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
           </AssetsSummary>
           <AssetIconButton
             aria-label="Refresh assets"
@@ -687,6 +731,12 @@ const AssetSyncPill = styled.span`
   font-weight: 850;
   line-height: 1;
   text-transform: uppercase;
+
+  &[data-state="synced"] {
+    border-color: rgba(45, 212, 191, 0.2);
+    color: rgba(204, 251, 241, 0.82);
+    background: rgba(13, 148, 136, 0.12);
+  }
 `;
 
 const AssetSyncSpinner = styled.i`

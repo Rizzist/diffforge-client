@@ -2,7 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{Connection, Error as SqliteError, ErrorCode};
@@ -33,6 +33,7 @@ use super::schema::{
 };
 
 pub const REPO_ID: &str = "local";
+const INITIALIZED_KERNELS_REGISTRY_FILE: &str = "initialized-kernels.json";
 
 #[derive(Debug, Clone, Default)]
 pub struct StorageEnsureDiagnostics {
@@ -126,6 +127,12 @@ pub struct StoragePaths {
     pub worktrees_root: PathBuf,
     pub mcp_root: PathBuf,
     pub cloud_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct RememberedKernelStorage {
+    pub repo_path: PathBuf,
+    pub db_path: PathBuf,
 }
 
 impl StoragePaths {
@@ -351,6 +358,109 @@ fn coordination_private_state_root() -> PathBuf {
             .join("coordination");
     }
     env::temp_dir().join("diffforge").join("coordination")
+}
+
+fn initialized_kernels_registry_path() -> PathBuf {
+    coordination_private_state_root().join(INITIALIZED_KERNELS_REGISTRY_FILE)
+}
+
+fn initialized_kernel_registry_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn read_initialized_kernel_registry_entries(path: &Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read initialized kernel registry: {error}"))?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parsed = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!([]));
+    Ok(parsed.as_array().cloned().unwrap_or_default())
+}
+
+pub fn remember_initialized_kernel_storage(paths: &StoragePaths) -> Result<(), String> {
+    let registry_path = initialized_kernels_registry_path();
+    if let Some(parent) = registry_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create initialized kernel registry directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let repo_path = process_path_text(&paths.repo_path);
+    let db_path = process_path_text(&paths.db_path);
+    let mut entries = read_initialized_kernel_registry_entries(&registry_path)?;
+    entries.retain(|entry| {
+        entry
+            .get("db_path")
+            .and_then(Value::as_str)
+            .map(|value| value != db_path)
+            .unwrap_or(true)
+    });
+    entries.push(json!({
+        "repo_path": repo_path,
+        "db_path": db_path,
+        "updated_at_ms": initialized_kernel_registry_now_ms(),
+    }));
+    if entries.len() > 256 {
+        entries.drain(0..entries.len() - 256);
+    }
+
+    let text = serde_json::to_string_pretty(&entries)
+        .map_err(|error| format!("Unable to serialize initialized kernel registry: {error}"))?;
+    fs::write(&registry_path, text).map_err(|error| {
+        format!(
+            "Unable to write initialized kernel registry {}: {error}",
+            registry_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+pub fn remembered_initialized_kernel_storages() -> Result<Vec<RememberedKernelStorage>, String> {
+    let registry_path = initialized_kernels_registry_path();
+    let entries = read_initialized_kernel_registry_entries(&registry_path)?;
+    let mut storages = Vec::new();
+    let mut seen_db_paths = Vec::new();
+
+    for entry in entries {
+        let Some(repo_path) = entry
+            .get("repo_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(db_path) = entry
+            .get("db_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if seen_db_paths.iter().any(|seen| seen == db_path) {
+            continue;
+        }
+        seen_db_paths.push(db_path.to_string());
+        storages.push(RememberedKernelStorage {
+            repo_path: PathBuf::from(repo_path),
+            db_path: PathBuf::from(db_path),
+        });
+    }
+
+    Ok(storages)
 }
 
 fn coordination_repo_state_id(repo_path: &Path) -> String {
