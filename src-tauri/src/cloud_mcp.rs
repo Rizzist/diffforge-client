@@ -65,6 +65,8 @@ const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_MEDIUM: u8 = 1;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW: u8 = 2;
 const CLOUD_MCP_TOKENOMICS_BACKGROUND_SCAN_DEBOUNCE_MS: u64 = 350;
+const CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT: usize = 32;
+const CLOUD_MCP_WORKSPACE_MCP_TEXT_LIMIT: usize = 96;
 const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
     "Al", "Bo", "Cy", "Ed", "Ev", "Jo", "Li", "Mo", "Oz", "Ty", "Ada", "Ali", "Amy",
     "Ari", "Ava", "Bea", "Ben", "Bob", "Cal", "Dan", "Eli", "Eva", "Gia", "Gus",
@@ -160,6 +162,7 @@ struct CloudMcpProcessAuthCache {
 
 #[derive(Clone, Default)]
 struct CloudMcpRuntimeSnapshots {
+    workspace_catalog: Option<Value>,
     terminal_presence: Option<Value>,
     workspace_mcps: Option<Value>,
     tokenomics: Option<Value>,
@@ -4017,6 +4020,208 @@ async fn cloud_mcp_sync_device_workspace_snapshot(
     }))
 }
 
+fn cloud_mcp_workspace_catalog_repo_id(
+    workspace_id: &str,
+    repo_path: &str,
+    workspace: &Value,
+) -> String {
+    cloud_mcp_payload_text(workspace, &["repo_id", "repoId"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if repo_path.trim().is_empty() {
+                format!("workspace-catalog-{}", cloud_mcp_short_hash(workspace_id))
+            } else {
+                cloud_mcp_repo_id_for_root(Path::new(repo_path))
+            }
+        })
+}
+
+fn cloud_mcp_normalize_workspace_catalog_items(
+    state: &CloudMcpState,
+    workspaces: &Value,
+) -> Result<Vec<Value>, String> {
+    let workspace_items = workspaces
+        .as_array()
+        .ok_or_else(|| "Device workspace catalog sync requires a workspaces array.".to_string())?;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut normalized_workspaces = Vec::new();
+    let mut seen = HashSet::new();
+
+    for workspace in workspace_items.iter().take(64) {
+        let Some(workspace_id) =
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(workspace_id.clone()) {
+            continue;
+        }
+
+        let workspace_name =
+            cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
+                .unwrap_or_else(|| workspace_id.clone());
+        let repo_path = cloud_mcp_payload_text(
+            workspace,
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "workspace_root_directory",
+                "workspaceRootDirectory",
+                "workingDirectory",
+                "rootDirectory",
+            ],
+        )
+        .unwrap_or_default();
+        let workspace_active = workspace
+            .get("workspace_active")
+            .or_else(|| workspace.get("workspaceActive"))
+            .or_else(|| workspace.get("active"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let workspace_status = cloud_mcp_payload_text(
+            workspace,
+            &["workspace_status", "workspaceStatus", "status", "state"],
+        )
+        .unwrap_or_else(|| {
+            if workspace_active {
+                "active".to_string()
+            } else {
+                "deactivated".to_string()
+            }
+        });
+        let repo_id = cloud_mcp_workspace_catalog_repo_id(&workspace_id, &repo_path, workspace);
+        let terminal_count = workspace
+            .get("terminal_count")
+            .or_else(|| workspace.get("terminalCount"))
+            .or_else(|| workspace.get("logical_terminal_count"))
+            .or_else(|| workspace.get("logicalTerminalCount"))
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        let mcp_server_count = workspace
+            .get("mcp_server_count")
+            .or_else(|| workspace.get("mcpServerCount"))
+            .or_else(|| workspace.get("server_count"))
+            .or_else(|| workspace.get("serverCount"))
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        let (workspace_runtime_seq, workspace_runtime_epoch) =
+            cloud_mcp_workspace_runtime_ordering(state, workspace);
+        let mut workspace_value = json!({
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "device_name": device_profile["device_name"].clone(),
+            "machine_id": device_profile["device_id"].clone(),
+            "machine_name": device_profile["machine_name"].clone(),
+            "platform": device_profile["platform"].clone(),
+            "form_factor": device_profile["form_factor"].clone(),
+            "client_kind": device_profile["client_kind"].clone(),
+            "repo_id": repo_id,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "workspace_root": repo_path.clone(),
+            "dashboard_workspace": true,
+            "workspace_role": "desktop_workspace",
+            "display_surface": "dashboard_workspace",
+            "workspace_active": workspace_active,
+            "workspace_reported_active": workspace_active,
+            "workspace_status": workspace_status,
+            "workspace_runtime_seq": workspace_runtime_seq,
+            "workspaceRuntimeSeq": workspace_runtime_seq,
+            "workspace_runtime_epoch": workspace_runtime_epoch,
+            "workspaceRuntimeEpoch": workspace_runtime_epoch,
+            "terminal_count": terminal_count,
+            "mcp_server_count": mcp_server_count,
+        });
+        if !repo_path.trim().is_empty() {
+            let root = Path::new(&repo_path);
+            let git_identity = cloud_mcp_git_repo_identity_for_path(root);
+            cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
+            if let Some(object) = workspace_value.as_object_mut() {
+                object.insert(
+                    "workspace_location_fingerprint".to_string(),
+                    json!(cloud_mcp_workspace_location_fingerprint(root)),
+                );
+            }
+        }
+        normalized_workspaces.push(workspace_value);
+    }
+
+    Ok(normalized_workspaces)
+}
+
+#[tauri::command]
+async fn cloud_mcp_sync_device_workspace_catalog(
+    state: State<'_, CloudMcpState>,
+    workspaces: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "device_workspace_catalog_snapshot".to_string());
+    let normalized_workspaces =
+        cloud_mcp_normalize_workspace_catalog_items(state.inner(), &workspaces)?;
+    let workspace_count = normalized_workspaces.len();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-device-workspace-catalog",
+        "event_kind": "device_workspace_catalog_snapshot",
+        "reason": reason.clone(),
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "snapshot_id": format!("device-workspace-catalog-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
+        "snapshot_full": true,
+        "authoritative": true,
+        "workspace_count": workspace_count,
+        "workspaces": normalized_workspaces,
+        "summary": "Desktop workspace catalog synced.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    {
+        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        snapshots.workspace_catalog = Some(payload.clone());
+    }
+
+    let sync_key = "device_workspace_catalog_snapshot".to_string();
+    cloud_mcp_enqueue_background_sync(
+        state.inner(),
+        sync_key.clone(),
+        "device_workspace_catalog_snapshot",
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+        reason.clone(),
+    )
+    .await;
+    let live_result =
+        cloud_mcp_send_device_workspace_snapshot_event(state.inner(), &reason).await;
+    Ok(cloud_mcp_background_sync_ack(
+        "device_workspace_catalog_snapshot",
+        &sync_key,
+        &reason,
+        json!({
+            "sent": live_result.is_ok(),
+            "send_error": live_result.err(),
+            "stored": {
+                "stored_count": workspace_count,
+                "workspace_count": workspace_count,
+            },
+            "stored_count": workspace_count,
+            "workspace_count": workspace_count,
+        }),
+    ))
+}
+
 fn cloud_mcp_desktop_device_profile() -> Value {
     static DEVICE_PROFILE: OnceLock<Value> = OnceLock::new();
     DEVICE_PROFILE
@@ -4552,6 +4757,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
         for snapshot in [
             snapshots.terminal_presence.as_ref(),
             snapshots.workspace_mcps.as_ref(),
+            snapshots.workspace_catalog.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -4565,8 +4771,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                         .unwrap_or_default();
                 let repo_id =
                     cloud_mcp_payload_text(workspace, &["repo_id", "repoId"]).unwrap_or_default();
-                let key = format!("{workspace_id}::{repo_id}");
-                if workspace_id.is_empty() || repo_id.is_empty() || !seen.insert(key) {
+                if workspace_id.is_empty() || !seen.insert(workspace_id.clone()) {
                     continue;
                 }
                 let root_display = cloud_mcp_payload_text(workspace, &["workspace_root", "workspaceRoot", "repo_path", "repoPath"])
@@ -4619,8 +4824,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
     let runtime = state.inner.lock().await;
     for workspace in runtime.registered_workspaces.values() {
         let repo_id = cloud_mcp_repo_id_for_root(Path::new(&workspace.root));
-        let key = format!("{}::{}", workspace.workspace_id, repo_id);
-        if !seen.insert(key) {
+        if !seen.insert(workspace.workspace_id.clone()) {
             continue;
         }
         let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&workspace.root));
@@ -5259,6 +5463,9 @@ async fn cloud_mcp_replay_runtime_snapshots(
         snapshots.clone()
     };
     let mut replay_items = Vec::new();
+    if let Some(payload) = snapshots.workspace_catalog {
+        replay_items.push(("device_workspace_catalog_snapshot", payload));
+    }
     if let Some(payload) = snapshots.terminal_presence {
         replay_items.push(("terminal_presence_snapshot", payload));
     }
@@ -7171,6 +7378,35 @@ fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
         }
     }
     Vec::new()
+}
+
+fn cloud_mcp_workspace_mcp_tool_names(server: &Value) -> Vec<Value> {
+    server
+        .get("tools")
+        .or_else(|| server.get("tools_json"))
+        .or_else(|| server.get("toolsJson"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(CLOUD_MCP_WORKSPACE_MCP_TOOL_NAME_LIMIT)
+        .filter_map(|tool| {
+            let name = if let Some(text) = tool.as_str() {
+                text.trim().to_string()
+            } else {
+                cloud_mcp_payload_text(&tool, &["name", "id"]).unwrap_or_default()
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(json!(name
+                    .chars()
+                    .take(CLOUD_MCP_WORKSPACE_MCP_TEXT_LIMIT)
+                    .collect::<String>()))
+            }
+        })
+        .collect()
 }
 
 async fn cloud_mcp_register_prepared_workspace(
@@ -10379,81 +10615,15 @@ async fn cloud_mcp_sync_agent_installations(
     } else {
         cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone())
     };
-    let mut tagged_agent_statuses = agent_statuses;
-    let agent_items = tagged_agent_statuses
-        .as_array_mut()
+    let agent_items = agent_statuses
+        .as_array()
         .ok_or_else(|| "Agent installation sync requires an agentStatuses array.".to_string())?;
-    let agent_count = agent_items.len();
-    for agent in agent_items {
-        let Some(object) = agent.as_object_mut() else {
-            continue;
-        };
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "device_id",
-            device_profile["device_id"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "deviceId",
-            device_profile["device_id"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "machine_id",
-            device_profile["device_id"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "machineId",
-            device_profile["device_id"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "device_name",
-            device_profile["device_name"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "deviceName",
-            device_profile["device_name"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "machine_name",
-            device_profile["machine_name"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "machineName",
-            device_profile["machine_name"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "platform",
-            device_profile["platform"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "form_factor",
-            device_profile["form_factor"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "formFactor",
-            device_profile["form_factor"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "client_kind",
-            device_profile["client_kind"].clone(),
-        );
-        cloud_mcp_set_missing_agent_device_field(
-            object,
-            "clientKind",
-            device_profile["client_kind"].clone(),
-        );
-    }
+    let coding_agents = agent_items
+        .iter()
+        .take(64)
+        .filter_map(cloud_mcp_sanitize_coding_agent_status)
+        .collect::<Vec<_>>();
+    let agent_count = coding_agents.len();
     let payload = json!({
         "source": "rust-diffforge-agent-installation-sync",
         "event_kind": "agent_installation_snapshot",
@@ -10475,26 +10645,51 @@ async fn cloud_mcp_sync_agent_installations(
         "reason": reason,
         "snapshot_id": snapshot_id,
         "agent_count": agent_count,
-        "agents": tagged_agent_statuses,
-        "summary": "Desktop installed agent inventory synced.",
+        "agents": coding_agents,
+        "summary": "Desktop coding agent capabilities synced.",
         "ts_ms": cloud_mcp_now_ms(),
     });
 
     cloud_mcp_post_event_endpoint(state.inner(), "agent_installation_snapshot", &payload).await
 }
 
-fn cloud_mcp_set_missing_agent_device_field(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    value: Value,
-) {
-    let has_value = object.get(key).is_some_and(|current| match current {
-        Value::String(text) => !text.trim().is_empty(),
-        Value::Null => false,
-        _ => true,
-    });
-    if !has_value {
-        object.insert(key.to_string(), value);
+fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
+    let raw_id = cloud_mcp_payload_text(agent, &["id", "agent_id", "agentId"])?;
+    let id = cloud_mcp_canonical_coding_agent_id(&raw_id)?;
+    let label = cloud_mcp_payload_text(agent, &["label", "agent_label", "agentLabel"])
+        .unwrap_or_else(|| cloud_mcp_coding_agent_label(&id).to_string())
+        .trim()
+        .chars()
+        .take(80)
+        .collect::<String>();
+    Some(json!({
+        "id": id.clone(),
+        "label": if label.is_empty() { cloud_mcp_coding_agent_label(&id) } else { label.as_str() },
+        "installed": cloud_mcp_payload_bool(agent, &["installed"], false),
+        "authenticated": cloud_mcp_payload_bool(agent, &["authenticated"], false),
+    }))
+}
+
+fn cloud_mcp_canonical_coding_agent_id(value: &str) -> Option<String> {
+    match value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-")
+        .as_str()
+    {
+        "codex" | "openai-codex" => Some("codex".to_string()),
+        "claude" | "claude-code" | "claudecode" => Some("claude".to_string()),
+        "opencode" | "open-code" | "opencode-ai" | "open-code-ai" => Some("opencode".to_string()),
+        _ => None,
+    }
+}
+
+fn cloud_mcp_coding_agent_label(agent_id: &str) -> &'static str {
+    match agent_id {
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        "opencode" => "OpenCode",
+        _ => "Coding Agent",
     }
 }
 
@@ -11497,66 +11692,30 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
                     &["name", "label", "display_name", "displayName"],
                 )
                 .unwrap_or_else(|| server_key.clone());
+                let name = name
+                    .chars()
+                    .take(CLOUD_MCP_WORKSPACE_MCP_TEXT_LIMIT)
+                    .collect::<String>();
+                let tools = cloud_mcp_workspace_mcp_tool_names(server);
+                let tool_count = tools.len();
                 Some(json!({
-                    "id": cloud_mcp_payload_text(server, &["id"]).unwrap_or_else(|| server_key.clone()),
                     "server_key": server_key,
                     "name": name,
-                    "source_kind": cloud_mcp_payload_text(server, &["source_kind", "sourceKind"]),
-                    "source_label": cloud_mcp_payload_text(server, &["source_label", "sourceLabel"]),
-                    "package_ref": cloud_mcp_payload_text(server, &["package_ref", "packageRef"]),
-                    "version": cloud_mcp_payload_text(server, &["version"]),
-                    "transport": cloud_mcp_payload_text(server, &["transport"]).unwrap_or_else(|| "stdio".to_string()),
-                    "built_in": cloud_mcp_payload_bool(server, &["built_in"], false)
-                        || cloud_mcp_payload_bool(server, &["builtIn"], false),
-                    "install_state": cloud_mcp_payload_text(server, &["install_state", "installState"]).unwrap_or_else(|| "installed".to_string()),
                     "workspace_enabled": cloud_mcp_payload_bool(server, &["workspace_enabled"], true)
                         && cloud_mcp_payload_bool(server, &["workspaceEnabled"], true),
-                    "approval_policy": cloud_mcp_payload_text(server, &["approval_policy", "approvalPolicy"]).unwrap_or_else(|| "always_allow".to_string()),
-                    "agent_config_access_enabled": cloud_mcp_payload_bool(server, &["agent_config_access_enabled"], true)
-                        && cloud_mcp_payload_bool(server, &["agentConfigAccessEnabled"], true),
-                    "agent_secret_config_access_enabled": cloud_mcp_payload_bool(server, &["agent_secret_config_access_enabled"], false)
-                        || cloud_mcp_payload_bool(server, &["agentSecretConfigAccessEnabled"], false),
-                    "agent_env_file_write_enabled": cloud_mcp_payload_bool(server, &["agent_env_file_write_enabled"], true)
-                        && cloud_mcp_payload_bool(server, &["agentEnvFileWriteEnabled"], true),
-                    "last_probe_status": cloud_mcp_payload_text(server, &["last_probe_status", "lastProbeStatus"]),
-                    "last_probe_message": cloud_mcp_payload_text(server, &["last_probe_message", "lastProbeMessage"]),
-                    "config_schema": server
-                        .get("config_schema")
-                        .or_else(|| server.get("configSchema"))
-                        .or_else(|| server.get("env_schema_json"))
-                        .or_else(|| server.get("envSchema"))
-                        .cloned()
-                        .unwrap_or_else(|| json!([])),
-                    "tools": server
-                        .get("tools")
-                        .or_else(|| server.get("tools_json"))
-                        .or_else(|| server.get("toolsJson"))
-                        .cloned()
-                        .unwrap_or_else(|| json!([])),
-                    "config_summary": server
-                        .get("config_summary")
-                        .or_else(|| server.get("configSummary"))
-                        .cloned()
-                        .unwrap_or_else(|| json!({})),
+                    "tools": tools,
+                    "tool_count": tool_count,
                 }))
             })
             .collect::<Vec<_>>();
 
         let server_count = servers.len();
-        let git_identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
-        let mut workspace_value = json!({
-            "device": device_profile.clone(),
+        let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
-            "device_name": device_profile["device_name"].clone(),
             "machine_id": device_profile["device_id"].clone(),
-            "machine_name": device_profile["machine_name"].clone(),
-            "platform": device_profile["platform"].clone(),
-            "form_factor": device_profile["form_factor"].clone(),
-            "client_kind": device_profile["client_kind"].clone(),
             "repo_id": req.repo_id,
-            "workspace_root": req.root_display,
             "workspace_id": req.workspace_id,
             "workspace_active": workspace_active,
             "workspace_name": req.workspace_name,
@@ -11568,7 +11727,6 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             "server_count": server_count,
             "servers": servers,
         });
-        cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
         normalized_workspaces.push(workspace_value);
     }
 

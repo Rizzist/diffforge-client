@@ -2179,7 +2179,9 @@ const WORKSPACE_DEACTIVATE_RUNTIME_TIMEOUT_MS = 30000;
 const WORKSPACE_SETTINGS_TERMINAL_CLEANUP_TIMEOUT_MS = 18000;
 const WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP = !TERMINAL_IS_WINDOWS_HOST;
 const WORKSPACE_SHARED_MCP_TIMEOUT_MS = 8000;
-const WORKSPACE_MCP_SYNC_INTERVAL_MS = 45000;
+const WORKSPACE_MCP_SYNC_INTERVAL_MS = 120000;
+const WORKSPACE_MCP_SYNC_TOOL_NAME_LIMIT = 32;
+const WORKSPACE_MCP_SYNC_TEXT_LIMIT = 96;
 const WORKSPACE_MCP_BACKGROUND_JOB_EVENT = "workspace-mcp-background-job";
 const WORKSPACE_MCP_REGISTRY_UPDATED_EVENT = "diffforge:workspace-mcp-registry-updated";
 function unwrapCloudCommandData(response, fallback = {}) {
@@ -2415,78 +2417,18 @@ function sanitizeWorkspaceMcpServerForCloud(server) {
     return null;
   }
 
-  const configValues =
-    server.config_values_json && typeof server.config_values_json === "object"
-      ? server.config_values_json
-      : {};
-  const agentConfigAccessEnabled = safeCloudMcpBool(
-    server.agent_config_access_enabled,
-    true,
-  );
-  const agentSecretConfigAccessEnabled = safeCloudMcpBool(
-    server.agent_secret_config_access_enabled,
-    false,
-  );
-  const agentEnvFileWriteEnabled = safeCloudMcpBool(
-    server.agent_env_file_write_enabled,
-    true,
-  );
-  const configSchema = safeCloudMcpArray(server.env_schema_json)
-    .slice(0, 64)
-    .map((item) => {
-      if (!item || typeof item !== "object") {
-        return null;
-      }
-      const key = safeCloudMcpText(item.key || item.name, "");
-      if (!key) {
-        return null;
-      }
-      const configured = Object.prototype.hasOwnProperty.call(configValues, key)
-        && String(configValues[key] ?? "").trim().length > 0;
-      const secret = safeCloudMcpBool(item.secret, false);
-      return {
-        key,
-        label: safeCloudMcpText(item.label, key),
-        required: safeCloudMcpBool(item.required, false),
-        secret,
-        configured,
-        agent_readable: secret ? agentSecretConfigAccessEnabled : agentConfigAccessEnabled,
-      };
-    })
-    .filter(Boolean);
-  const tools = safeCloudMcpArray(server.tools_json)
-    .slice(0, 64)
+  const tools = safeCloudMcpArray(server.tools_json || server.tools || server.toolsJson)
+    .slice(0, WORKSPACE_MCP_SYNC_TOOL_NAME_LIMIT)
     .map((tool) => safeCloudMcpText(
       typeof tool === "string" ? tool : tool?.name || tool?.id,
       "",
-    ))
+    ).slice(0, WORKSPACE_MCP_SYNC_TEXT_LIMIT))
     .filter(Boolean);
 
   return {
-    id: safeCloudMcpText(server.id, serverKey),
     server_key: serverKey,
-    name: safeCloudMcpText(server.name, serverKey),
-    source_kind: safeCloudMcpText(server.source_kind || server.sourceKind, ""),
-    source_label: safeCloudMcpText(server.source_label || server.sourceLabel, ""),
-    package_ref: safeCloudMcpText(server.package_ref || server.packageRef, ""),
-    version: safeCloudMcpText(server.version, ""),
-    transport: safeCloudMcpText(server.transport, "stdio"),
-    built_in: safeCloudMcpBool(server.built_in ?? server.builtIn, false),
-    install_state: safeCloudMcpText(server.install_state || server.installState, "installed"),
+    name: safeCloudMcpText(server.name, serverKey).slice(0, WORKSPACE_MCP_SYNC_TEXT_LIMIT),
     workspace_enabled: safeCloudMcpBool(server.workspace_enabled ?? server.workspaceEnabled, true),
-    approval_policy: safeCloudMcpText(server.approval_policy || server.approvalPolicy, "always_allow"),
-    agent_config_access_enabled: agentConfigAccessEnabled,
-    agent_secret_config_access_enabled: agentSecretConfigAccessEnabled,
-    agent_env_file_write_enabled: agentEnvFileWriteEnabled,
-    last_probe_status: safeCloudMcpText(server.last_probe_status || server.lastProbeStatus, ""),
-    last_probe_message: safeCloudMcpText(server.last_probe_message || server.lastProbeMessage, ""),
-    config_schema: configSchema,
-    config_summary: {
-      config_count: configSchema.length,
-      configured_count: configSchema.filter((item) => item.configured).length,
-      secret_config_count: configSchema.filter((item) => item.secret).length,
-      secret_configured_count: configSchema.filter((item) => item.secret && item.configured).length,
-    },
     tools,
     tool_count: tools.length,
   };
@@ -2716,6 +2658,37 @@ const DEFAULT_AGENT_STATUSES = AGENT_PROVIDERS.map((provider) => ({
 
 function getDefaultAgentStatus(providerId) {
   return DEFAULT_AGENT_STATUSES.find((status) => status.id === providerId);
+}
+
+function canonicalCodingAgentId(value) {
+  const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (normalized === "codex" || normalized === "openai-codex") {
+    return "codex";
+  }
+  if (normalized === "claude" || normalized === "claude-code" || normalized === "claudecode") {
+    return "claude";
+  }
+  if (normalized === "opencode" || normalized === "open-code" || normalized === "open-code-ai" || normalized === "opencode-ai") {
+    return "opencode";
+  }
+  return "";
+}
+
+function sanitizeCodingAgentStatusForCloud(status) {
+  if (!status || typeof status !== "object") {
+    return null;
+  }
+  const id = canonicalCodingAgentId(status.id || status.agent_id || status.agentId);
+  const provider = AGENT_PROVIDERS.find((item) => item.id === id);
+  if (!provider) {
+    return null;
+  }
+  return {
+    id,
+    label: safeCloudMcpText(status.label || status.agent_label || status.agentLabel, provider.label).slice(0, 80),
+    installed: Boolean(status.installed),
+    authenticated: Boolean(status.authenticated),
+  };
 }
 
 function getAgentStatusReportedModel(status) {
@@ -5653,6 +5626,7 @@ export default function App() {
   const terminalStatusEventSyncInFlightRef = useRef(new Set());
   const remoteCommandReceiptsRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
+  const workspaceCatalogSyncKeyRef = useRef("");
   const workspaceCloudSyncKeyRef = useRef("");
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
@@ -5935,6 +5909,7 @@ export default function App() {
 
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
+    workspaceCatalogSyncKeyRef.current = "";
     workspaceCloudSyncKeyRef.current = "";
     tokenomicsSyncCursorRef.current = "";
     tokenomicsSyncInFlightRef.current = false;
@@ -7390,6 +7365,7 @@ export default function App() {
     agentInitialStatusUserRef.current = "";
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
+    workspaceCatalogSyncKeyRef.current = "";
     workspaceCloudSyncKeyRef.current = "";
     tokenomicsSyncCursorRef.current = "";
     tokenomicsSyncInFlightRef.current = false;
@@ -7433,6 +7409,7 @@ export default function App() {
     });
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
+    workspaceCatalogSyncKeyRef.current = "";
     workspaceCloudSyncKeyRef.current = "";
     tokenomicsSyncCursorRef.current = "";
     tokenomicsSyncInFlightRef.current = false;
@@ -8445,6 +8422,7 @@ export default function App() {
       ));
       terminalPresenceSyncKeyRef.current = "";
       workspaceMcpSyncKeyRef.current = "";
+      workspaceCatalogSyncKeyRef.current = "";
       workspaceCloudSyncKeyRef.current = "";
 
       if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
@@ -8856,10 +8834,13 @@ export default function App() {
     const syncStatuses = Array.isArray(statuses)
       ? statuses.filter((status) => status && typeof status === "object")
       : [];
+    const codingAgents = syncStatuses
+      .map(sanitizeCodingAgentStatusForCloud)
+      .filter(Boolean);
     const hasCheckedStatus = syncStatuses.some((status) => (
       !status.cached && String(status.version || "").trim() !== "Not checked"
     ));
-    if (!syncStatuses.length || !hasCheckedStatus || syncStatuses.every((status) => status.cached)) {
+    if (!codingAgents.length || !hasCheckedStatus || syncStatuses.every((status) => status.cached)) {
       return;
     }
 
@@ -8870,17 +8851,7 @@ export default function App() {
 
     const syncKey = JSON.stringify({
       scope: "connected-device-agent-installations",
-      agents: syncStatuses.map((status) => ({
-        id: status.id,
-        installed: Boolean(status.installed),
-        authenticated: Boolean(status.authenticated),
-        version: status.version || "",
-        npmPackageVersion: status.npmPackageVersion || "",
-        npmLatestVersion: status.npmLatestVersion || "",
-        npmUpdateAvailable: Boolean(status.npmUpdateAvailable),
-        activeModel: status.activeModel || "",
-        activeModelSupportsImages: Boolean(status.activeModelSupportsImages),
-      })),
+      agents: codingAgents,
     });
     if (agentInstallationSyncKeyRef.current === syncKey) {
       return;
@@ -8891,7 +8862,7 @@ export default function App() {
       repoPath: target.repoPath,
       workspaceId: target.workspaceId || null,
       workspaceName: target.workspaceName || null,
-      agentStatuses: syncStatuses,
+      agentStatuses: codingAgents,
       reason,
     }).catch((error) => {
       agentInstallationSyncKeyRef.current = "";
@@ -8899,7 +8870,7 @@ export default function App() {
         message: getErrorMessage(error, "Unable to sync installed agent inventory."),
         repoPath: target.repoPath,
         workspaceId: target.workspaceId,
-        agentCount: syncStatuses.length,
+        agentCount: codingAgents.length,
         reason,
       });
     });
@@ -13236,7 +13207,7 @@ export default function App() {
   useEffect(() => {
     terminalStatusEventEmitterRef.current = emitTerminalStatusEvent;
   }, [emitTerminalStatusEvent]);
-  const workspaceMcpSyncTargets = useMemo(() => {
+  const workspaceCatalogSyncTargets = useMemo(() => {
     if (shouldShowWorkspaceSetup) {
       return [];
     }
@@ -13244,10 +13215,9 @@ export default function App() {
     const targets = [];
     const seen = new Set();
     const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
-    const addTarget = (workspace, repoPath, activeOverride = null) => {
+    const addTarget = (workspace, activeOverride = null) => {
       const workspaceId = String(workspace?.id || "").trim();
-      const rootDirectory = String(repoPath || "").trim();
-      if (!workspaceId || !rootDirectory) {
+      if (!workspaceId) {
         return;
       }
       const key = workspaceId;
@@ -13255,30 +13225,33 @@ export default function App() {
         return;
       }
       seen.add(key);
+      let rootDirectory = getWorkspaceRootDirectory(workspaceSettings, workspaceId);
+      if (!rootDirectory && String(selectedWorkspace?.id || "").trim() === workspaceId) {
+        rootDirectory = selectedWorkspaceRootDirectory || defaultWorkingDirectory;
+      }
+      rootDirectory = cleanWorkspaceRootDirectory(rootDirectory || "");
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
       targets.push({
+        dashboardWorkspace: true,
+        displaySurface: "dashboard_workspace",
+        logicalTerminalCount: getWorkspaceTerminalCount(workspaceSettings, workspaceId),
         mountId: "",
         projectName: "",
         repoPath: rootDirectory,
         workspaceActive,
         workspaceId,
         workspaceName: workspace?.name || workspaceId,
+        workspaceRole: "desktop_workspace",
+        workspaceRoot: rootDirectory,
         workspaceStatus: workspaceActive ? "active" : "deactivated",
       });
     };
 
-    addTarget(
-      selectedWorkspace,
-      selectedWorkspaceRootDirectory || defaultWorkingDirectory,
-      activeWorkspaceIds.has(String(selectedWorkspace?.id || "").trim()),
-    );
-
     workspaces.forEach((workspace) => {
       addTarget(
         workspace,
-        getWorkspaceRootDirectory(workspaceSettings, workspace?.id),
         activeWorkspaceIds.has(String(workspace?.id || "").trim()),
       );
     });
@@ -13293,10 +13266,145 @@ export default function App() {
     workspaceSettings,
     workspaces,
   ]);
+  const workspaceCatalogSyncKey = useMemo(
+    () => JSON.stringify(workspaceCatalogSyncTargets),
+    [workspaceCatalogSyncTargets],
+  );
+  const workspaceMcpSyncTargets = useMemo(
+    () => workspaceCatalogSyncTargets.filter((target) => String(target?.repoPath || "").trim()),
+    [workspaceCatalogSyncTargets],
+  );
   const workspaceMcpSyncTargetKey = useMemo(
     () => JSON.stringify(workspaceMcpSyncTargets),
     [workspaceMcpSyncTargets],
   );
+
+  useEffect(() => {
+    if (
+      authState !== "authenticated"
+      || !isPaidUser(user)
+      || !workspaceHydrationReady
+      || workspaceActivationDeferred
+      || shouldShowWorkspaceSetup
+      || workspaceSyncState === "loading"
+      || workspaceSyncState === "creating"
+    ) {
+      return undefined;
+    }
+
+    const targets = workspaceCatalogSyncTargets.filter((target) => target?.workspaceId);
+    if (targets.length === 0) {
+      return undefined;
+    }
+
+    const accountKey = user?.id || user?.email || "paid-user";
+    const syncKey = JSON.stringify({
+      accountKey,
+      targets: targets.map((target) => ({
+        active: Boolean(target.workspaceActive),
+        repoPath: getWorkspaceRootIdentity(target.repoPath || ""),
+        terminalCount: Number(target.logicalTerminalCount || 0),
+        workspaceId: target.workspaceId,
+        workspaceName: target.workspaceName || "",
+      })),
+    });
+
+    if (workspaceCatalogSyncKeyRef.current === syncKey) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let syncTimer = 0;
+    const diagnosticToken = authStore.getToken();
+
+    const syncWorkspaceCatalog = async () => {
+      const hotDelayMs = getTerminalInputHotDelayMs(1000);
+      if (hotDelayMs > 0) {
+        syncTimer = window.setTimeout(() => {
+          syncTimer = 0;
+          void syncWorkspaceCatalog().catch((error) => {
+            if (!disposed) {
+              workspaceCatalogSyncKeyRef.current = "";
+              logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_catalog_sync.failed", {
+                message: getErrorMessage(error, "Unable to sync workspace catalog."),
+                workspaceCount: targets.length,
+              });
+            }
+          });
+        }, hotDelayMs);
+        return;
+      }
+
+      workspaceCatalogSyncKeyRef.current = syncKey;
+      void recordCloudConnectionDiagnostic(diagnosticToken, {
+        channel: "rust-client-sync",
+        step: "rust.sync.workspace_catalog",
+        status: "start",
+        message: "Rust client is syncing the desktop workspace catalog to cloud.",
+        details: {
+          workspaceCount: targets.length,
+        },
+      });
+
+      try {
+        await invoke("cloud_mcp_sync_device_workspace_catalog", {
+          reason: "desktop_workspace_catalog",
+          workspaces: targets,
+        });
+        if (disposed) {
+          return;
+        }
+        await recordCloudConnectionDiagnostic(diagnosticToken, {
+          channel: "rust-client-sync",
+          step: "rust.sync.workspace_catalog",
+          status: "ok",
+          message: "Rust client workspace catalog sync completed.",
+          details: {
+            workspaceCount: targets.length,
+          },
+        });
+      } catch (error) {
+        if (!disposed) {
+          workspaceCatalogSyncKeyRef.current = "";
+          logBigViewSyncDiagnosticEvent("cloud_mcp.workspace_catalog_sync.failed", {
+            message: getErrorMessage(error, "Unable to sync workspace catalog."),
+            workspaceCount: targets.length,
+          });
+          await recordCloudConnectionDiagnostic(diagnosticToken, {
+            channel: "rust-client-sync",
+            step: "rust.sync.workspace_catalog",
+            status: "error",
+            message: getErrorMessage(error, "Unable to sync workspace catalog."),
+            details: {
+              workspaceCount: targets.length,
+            },
+          });
+        }
+      }
+    };
+
+    syncTimer = window.setTimeout(() => {
+      syncTimer = 0;
+      void syncWorkspaceCatalog();
+    }, 500);
+
+    return () => {
+      disposed = true;
+      if (syncTimer) {
+        window.clearTimeout(syncTimer);
+      }
+    };
+  }, [
+    authState,
+    getTerminalInputHotDelayMs,
+    shouldShowWorkspaceSetup,
+    user,
+    workspaceCatalogSyncKey,
+    workspaceCatalogSyncTargets,
+    workspaceHydrationReady,
+    workspaceActivationDeferred,
+    workspaceSyncState,
+  ]);
 
   useEffect(() => {
     if (
