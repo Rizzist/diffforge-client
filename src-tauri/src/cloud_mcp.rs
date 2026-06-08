@@ -14,6 +14,7 @@ const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
 const CLOUD_MCP_APPWRITE_JWT_MAX_TTL_SECS: u64 = 3600;
 const CLOUD_MCP_APPWRITE_JWT_REFRESH_MARGIN_MS: u64 = 60_000;
+const CLOUD_MCP_DEVICE_HEARTBEAT_INTERVAL_MS: u64 = 15_000;
 const CLOUD_MCP_MAX_BEARER_TOKEN_LENGTH: usize = 8192;
 const CLOUD_MCP_FILETREE_LIMIT: usize = 2_000;
 const CLOUD_MCP_FILETREE_MAX_DEPTH: usize = 8;
@@ -169,6 +170,7 @@ struct CloudMcpRuntime {
     global_ws_connection_id: Option<String>,
     global_ws_message_token: Option<String>,
     live_runtime_status: Option<Value>,
+    last_device_heartbeat_ms: Option<u64>,
     registered_workspaces: HashMap<String, CloudMcpWorkspaceStatus>,
     terminal_contexts: HashMap<String, CloudMcpTerminalContextState>,
 }
@@ -357,6 +359,7 @@ impl CloudMcpState {
                 global_ws_connection_id: None,
                 global_ws_message_token: None,
                 live_runtime_status: None,
+                last_device_heartbeat_ms: None,
                 registered_workspaces: HashMap::new(),
                 terminal_contexts: HashMap::new(),
             })),
@@ -4395,6 +4398,18 @@ async fn cloud_mcp_resolve_ws_target(
     let (plan_name, device_limit) = cloud_mcp_account_plan(state).await;
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
+    let _ = cloud_mcp_send_device_heartbeat_if_due(
+        state,
+        base_url,
+        &bearer,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &plan_name,
+        device_limit,
+        &device_profile,
+        "connected",
+    )
+    .await;
     cloud_mcp_set_global_ws_phase(state, "resolving_route", "resolving_route").await;
     match cloud_mcp_fetch_direct_route_async(
         base_url,
@@ -4583,6 +4598,112 @@ fn cloud_mcp_ws_target_reachable_blocking(ws_url: &str) -> bool {
     addrs
         .into_iter()
         .any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
+}
+
+async fn cloud_mcp_send_device_heartbeat_if_due(
+    state: &CloudMcpState,
+    base_url: &str,
+    bearer: &str,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    plan_name: &str,
+    device_limit: Option<u64>,
+    device_profile: &Value,
+    status: &str,
+) -> Result<(), String> {
+    let now = cloud_mcp_now_ms();
+    {
+        let mut runtime = state.inner.lock().await;
+        if runtime
+            .last_device_heartbeat_ms
+            .is_some_and(|last| now.saturating_sub(last) < CLOUD_MCP_DEVICE_HEARTBEAT_INTERVAL_MS)
+        {
+            return Ok(());
+        }
+        runtime.last_device_heartbeat_ms = Some(now);
+    }
+
+    cloud_mcp_send_device_heartbeat_async(
+        base_url,
+        bearer,
+        billing_scope_type,
+        team_id,
+        plan_name,
+        device_limit,
+        device_profile,
+        status,
+    )
+    .await
+}
+
+async fn cloud_mcp_send_device_heartbeat_async(
+    base_url: &str,
+    bearer: &str,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    plan_name: &str,
+    device_limit: Option<u64>,
+    device_profile: &Value,
+    status: &str,
+) -> Result<(), String> {
+    let url = format!("{}/v1/devices/heartbeat", base_url.trim_end_matches('/'));
+    let device_id = cloud_mcp_payload_text(device_profile, &["device_id", "deviceId"])
+        .ok_or_else(|| "Device heartbeat requires a stable device id.".to_string())?;
+    let body = json!({
+        "billingScopeType": billing_scope_type,
+        "scopeType": billing_scope_type,
+        "teamId": team_id,
+        "planName": plan_name,
+        "deviceLimit": device_limit,
+        "deviceId": device_id,
+        "deviceName": cloud_mcp_payload_text(device_profile, &["device_name", "deviceName"]),
+        "machineName": cloud_mcp_payload_text(device_profile, &["machine_name", "machineName"]),
+        "hostname": cloud_mcp_payload_text(device_profile, &["hostname"]),
+        "platform": cloud_mcp_payload_text(device_profile, &["platform"]),
+        "os": cloud_mcp_payload_text(device_profile, &["os"]),
+        "formFactor": cloud_mcp_payload_text(device_profile, &["form_factor", "formFactor"]),
+        "deviceType": cloud_mcp_payload_text(device_profile, &["device_type", "deviceType"]),
+        "status": status,
+    });
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("Unable to create device heartbeat client: {error}"))?
+        .post(url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
+        .header("x-diffforge-billing-scope-type", billing_scope_type)
+        .header("x-diffforge-scope-type", billing_scope_type)
+        .header("x-diffforge-plan-name", plan_name)
+        .headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Some(device_limit) = device_limit {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_limit.to_string()) {
+                    headers.insert("x-diffforge-device-limit", value);
+                }
+            }
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&device_id) {
+                headers.insert("x-diffforge-device-id", value);
+            }
+            if billing_scope_type == "team" {
+                if let Some(team_id) = team_id {
+                    if let Ok(value) = reqwest::header::HeaderValue::from_str(team_id) {
+                        headers.insert("x-diffforge-team-id", value);
+                    }
+                }
+            }
+            headers
+        })
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| format!("Device heartbeat request failed: {error}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("Device heartbeat returned {status}: {text}"));
+    }
+    Ok(())
 }
 
 async fn cloud_mcp_fetch_direct_route_async(
