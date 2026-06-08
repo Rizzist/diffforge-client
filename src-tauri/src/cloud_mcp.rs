@@ -31,6 +31,7 @@ const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-workspace-assets-updated";
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
+const CLOUD_MCP_DEVICE_KEY_FILE: &str = "device-key";
 const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
@@ -4016,11 +4017,16 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             let platform = cloud_mcp_desktop_platform();
             let device_name = cloud_mcp_desktop_device_name();
             let device_id = cloud_mcp_stable_desktop_device_id(&device_name, platform);
+            let (device_key_id, device_public_key) =
+                cloud_mcp_stable_desktop_device_key_metadata(&device_id);
             json!({
                 "device_id": device_id,
                 "device_name": device_name,
                 "machine_name": device_name,
                 "hostname": device_name,
+                "device_key_id": device_key_id,
+                "device_public_key": device_public_key,
+                "device_key_algorithm": "sha256-local-anchor-v1",
                 "platform": platform,
                 "os": platform,
                 "form_factor": "desktop",
@@ -4061,6 +4067,53 @@ fn cloud_mcp_stable_desktop_device_id(device_name: &str, platform: &str) -> Stri
 
 fn cloud_mcp_desktop_device_id_path() -> Option<PathBuf> {
     cloud_mcp_local_data_file_path(CLOUD_MCP_DEVICE_ID_FILE)
+}
+
+fn cloud_mcp_desktop_device_key_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path(CLOUD_MCP_DEVICE_KEY_FILE)
+}
+
+fn cloud_mcp_valid_device_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    (24..=200).contains(&trimmed.len())
+        && trimmed
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+}
+
+fn cloud_mcp_stable_desktop_device_secret(device_id: &str) -> String {
+    if let Some(path) = cloud_mcp_desktop_device_key_path() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if cloud_mcp_valid_device_secret(trimmed) {
+                return trimmed.to_string();
+            }
+        }
+
+        let generated = format!("native-key-{}-{}", device_id, uuid::Uuid::new_v4());
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::write(&path, generated.as_bytes()).is_ok() {
+            return generated;
+        }
+    }
+
+    format!("native-key-fallback-{}-{}", device_id, cloud_mcp_short_hash(device_id))
+}
+
+fn cloud_mcp_stable_desktop_device_key_metadata(device_id: &str) -> (String, String) {
+    let secret = cloud_mcp_stable_desktop_device_secret(device_id);
+    cloud_mcp_desktop_device_key_metadata_for_secret(device_id, &secret)
+}
+
+fn cloud_mcp_desktop_device_key_metadata_for_secret(device_id: &str, secret: &str) -> (String, String) {
+    let digest = Sha256::digest(
+        format!("diffforge-native-device-anchor-v1:{device_id}:{secret}").as_bytes(),
+    );
+    let public_key = format!("{digest:x}");
+    let key_id_suffix = public_key.chars().take(24).collect::<String>();
+    (format!("df-native-key-{key_id_suffix}"), public_key)
 }
 
 fn cloud_mcp_valid_device_id(value: &str) -> bool {
@@ -4659,6 +4712,9 @@ async fn cloud_mcp_send_device_heartbeat_async(
         "deviceName": cloud_mcp_payload_text(device_profile, &["device_name", "deviceName"]),
         "machineName": cloud_mcp_payload_text(device_profile, &["machine_name", "machineName"]),
         "hostname": cloud_mcp_payload_text(device_profile, &["hostname"]),
+        "deviceKeyId": cloud_mcp_payload_text(device_profile, &["device_key_id", "deviceKeyId"]),
+        "devicePublicKey": cloud_mcp_payload_text(device_profile, &["device_public_key", "devicePublicKey"]),
+        "deviceKeyAlgorithm": cloud_mcp_payload_text(device_profile, &["device_key_algorithm", "deviceKeyAlgorithm"]),
         "platform": cloud_mcp_payload_text(device_profile, &["platform"]),
         "os": cloud_mcp_payload_text(device_profile, &["os"]),
         "formFactor": cloud_mcp_payload_text(device_profile, &["form_factor", "formFactor"]),
@@ -16470,6 +16526,30 @@ mod cloud_mcp_tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn desktop_device_key_metadata_is_stable_and_namespaced() {
+        let (key_id, public_key) = cloud_mcp_desktop_device_key_metadata_for_secret(
+            "macos-native-1",
+            "native-key-secret-1234567890",
+        );
+        let (same_key_id, same_public_key) = cloud_mcp_desktop_device_key_metadata_for_secret(
+            "macos-native-1",
+            "native-key-secret-1234567890",
+        );
+        let (other_key_id, other_public_key) = cloud_mcp_desktop_device_key_metadata_for_secret(
+            "macos-native-2",
+            "native-key-secret-1234567890",
+        );
+
+        assert!(key_id.starts_with("df-native-key-"));
+        assert_eq!(key_id.len(), "df-native-key-".len() + 24);
+        assert_eq!(public_key.len(), 64);
+        assert_eq!(key_id, same_key_id);
+        assert_eq!(public_key, same_public_key);
+        assert_ne!(key_id, other_key_id);
+        assert_ne!(public_key, other_public_key);
     }
 
     #[test]

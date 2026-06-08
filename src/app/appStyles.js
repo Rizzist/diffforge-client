@@ -4556,16 +4556,17 @@ export const TerminalRestartPill = styled.div`
   top: 5px;
   left: 50%;
   z-index: 80;
-  display: grid;
-  grid-template-columns: minmax(0, auto) auto auto;
-  width: max-content;
+  display: inline-flex;
+  width: fit-content;
   max-width: 92%;
   min-height: 26px;
   height: auto;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   align-content: center;
-  gap: 2px 3px;
+  column-gap: 3px;
+  row-gap: 1px;
   padding: 2px 5px;
   border: 0;
   border-radius: 14px;
@@ -4573,24 +4574,16 @@ export const TerminalRestartPill = styled.div`
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
   transform: translateX(-50%);
   backdrop-filter: blur(10px);
-
-  @container (max-width: 250px) {
-    grid-template-columns: minmax(0, 1fr) auto;
-    min-height: 48px;
-    gap: 1px 5px;
-    padding: 3px 6px 4px;
-  }
 `;
 
 export const TerminalRailIdentity = styled.span`
   display: inline-flex;
-  min-width: 0;
+  min-width: min-content;
   max-width: 100%;
   align-items: center;
   justify-content: flex-start;
+  flex: 1 1 auto;
   gap: 4px;
-  grid-column: 1;
-  grid-row: 1;
 `;
 
 export const TerminalAgentLabel = styled.span`
@@ -4617,30 +4610,15 @@ export const TerminalRailControls = styled.span`
   min-width: 0;
   align-items: center;
   justify-content: center;
+  flex: 0 0 auto;
   gap: 2px;
 
   &[data-rail-row="primary"] {
-    grid-column: 3;
-    grid-row: 1;
-    justify-self: end;
+    order: 3;
   }
 
   &[data-rail-row="secondary"] {
-    grid-column: 2;
-    grid-row: 1;
-    justify-self: center;
-  }
-
-  @container (max-width: 420px) {
-    &[data-rail-row="primary"] {
-      grid-column: 2;
-      grid-row: 1;
-    }
-
-    &[data-rail-row="secondary"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
-    }
+    order: 2;
   }
 `;
 
