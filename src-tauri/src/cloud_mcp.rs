@@ -614,13 +614,19 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
     if !is_snapshot {
         return None;
     }
-    let device_id = cloud_mcp_payload_text(payload, &["device_id", "deviceId", "machine_id", "machineId"])
-        .unwrap_or_default();
+    let device_id = cloud_mcp_payload_text(
+        payload,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .unwrap_or_default();
     let repo_id = cloud_mcp_payload_text(payload, &["repo_id", "repoId"]).unwrap_or_default();
     let workspace_id =
         cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]).unwrap_or_default();
-    let graph_id = cloud_mcp_payload_text(payload, &["graph_id", "graphId", "architecture_id", "architectureId"])
-        .unwrap_or_default();
+    let graph_id = cloud_mcp_payload_text(
+        payload,
+        &["graph_id", "graphId", "architecture_id", "architectureId"],
+    )
+    .unwrap_or_default();
     let scope = cloud_mcp_payload_text(payload, &["billing_scope_key", "billingScopeKey"])
         .or_else(|| cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"]))
         .unwrap_or_default();
@@ -646,7 +652,12 @@ fn cloud_mcp_outbox_idempotency_key(
     }
     let mut parts = Vec::new();
     for keys in [
-        &["todo_dispatch_id", "todoDispatchId", "dispatch_id", "dispatchId"][..],
+        &[
+            "todo_dispatch_id",
+            "todoDispatchId",
+            "dispatch_id",
+            "dispatchId",
+        ][..],
         &["command_id", "commandId"][..],
         &["todo_batch_id", "todoBatchId", "batch_id", "batchId"][..],
         &["todo_id", "todoId", "id"][..],
@@ -706,7 +717,9 @@ fn cloud_mcp_outbox_payload_with_idempotency(
     (payload, idempotency_key, payload_hash, coalesce_key)
 }
 
-fn cloud_mcp_outbox_row_from_statement_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMcpOutboxRow> {
+fn cloud_mcp_outbox_row_from_statement_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CloudMcpOutboxRow> {
     Ok(CloudMcpOutboxRow {
         outbox_id: row.get(0)?,
         idempotency_key: row.get(1)?,
@@ -820,11 +833,15 @@ fn cloud_mcp_outbox_claim_due_rows(limit: usize) -> Result<Vec<CloudMcpOutboxRow
         ))
         .map_err(|error| format!("Unable to prepare Cloud sync outbox drain query: {error}"))?;
     let rows = statement
-        .query_map(rusqlite::params![limit as i64], cloud_mcp_outbox_row_from_statement_row)
+        .query_map(
+            rusqlite::params![limit as i64],
+            cloud_mcp_outbox_row_from_statement_row,
+        )
         .map_err(|error| format!("Unable to read Cloud sync outbox rows: {error}"))?;
     let mut values = Vec::new();
     for row in rows {
-        values.push(row.map_err(|error| format!("Unable to decode Cloud sync outbox row: {error}"))?);
+        values
+            .push(row.map_err(|error| format!("Unable to decode Cloud sync outbox row: {error}"))?);
     }
     Ok(values)
 }
@@ -1161,9 +1178,13 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                     job.priority,
                     &job.reason,
                 ) {
-                    Ok(row) => cloud_mcp_send_outbox_row_now(&state, &row).await.inspect(|response| {
-                        let _ = cloud_mcp_outbox_mark_acked(&row, response);
-                    }),
+                    Ok(row) => {
+                        cloud_mcp_send_outbox_row_now(&state, &row)
+                            .await
+                            .inspect(|response| {
+                                let _ = cloud_mcp_outbox_mark_acked(&row, response);
+                            })
+                    }
                     Err(_) => cloud_mcp_send_event_now(&state, &job.event_kind, &job.payload).await,
                 };
                 match result {
@@ -3925,7 +3946,10 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
     }
     event
         .get("data")
-        .and_then(|data| data.get("workspace_todos").or_else(|| data.get("workspaceTodos")))
+        .and_then(|data| {
+            data.get("workspace_todos")
+                .or_else(|| data.get("workspaceTodos"))
+        })
         .is_some()
 }
 
@@ -3963,6 +3987,8 @@ fn cloud_mcp_is_workspace_asset_wake_event(event_kind: &str, event: &Value) -> b
             | "workspace_asset_download_prepared"
             | "workspace_asset_cache_available"
             | "workspace_asset_cloud_deleted"
+            | "workspace_asset_transfer_progress"
+            | "workspace_asset_transfer_failed"
     ) {
         return true;
     }
@@ -4309,10 +4335,15 @@ async fn cloud_mcp_local_device_bridge_loop() -> Result<(), String> {
 
 async fn cloud_mcp_handle_local_device_bridge_request(mut stream: TcpStream) -> Result<(), String> {
     let Some(request) = cloud_mcp_read_local_bridge_http_request(&mut stream).await else {
-        return cloud_mcp_write_local_bridge_response(&mut stream, 400, None, json!({
-            "ok": false,
-            "error": "invalid_request",
-        }))
+        return cloud_mcp_write_local_bridge_response(
+            &mut stream,
+            400,
+            None,
+            json!({
+                "ok": false,
+                "error": "invalid_request",
+            }),
+        )
         .await;
     };
 
@@ -4327,18 +4358,28 @@ async fn cloud_mcp_handle_local_device_bridge_request(mut stream: TcpStream) -> 
     }
 
     if request.method != "POST" || request.path != DIFFFORGE_LOCAL_DEVICE_BRIDGE_PATH {
-        return cloud_mcp_write_local_bridge_response(&mut stream, 404, allowed_origin, json!({
-            "ok": false,
-            "error": "not_found",
-        }))
+        return cloud_mcp_write_local_bridge_response(
+            &mut stream,
+            404,
+            allowed_origin,
+            json!({
+                "ok": false,
+                "error": "not_found",
+            }),
+        )
         .await;
     }
 
     if allowed_origin.is_none() {
-        return cloud_mcp_write_local_bridge_response(&mut stream, 403, None, json!({
-            "ok": false,
-            "error": "origin_not_allowed",
-        }))
+        return cloud_mcp_write_local_bridge_response(
+            &mut stream,
+            403,
+            None,
+            json!({
+                "ok": false,
+                "error": "origin_not_allowed",
+            }),
+        )
         .await;
     }
 
@@ -4360,12 +4401,17 @@ async fn cloud_mcp_handle_local_device_bridge_request(mut stream: TcpStream) -> 
     .unwrap_or_default();
 
     let proof = cloud_mcp_local_device_bridge_proof(&nonce, &web_device_id, &web_session_id);
-    cloud_mcp_write_local_bridge_response(&mut stream, 200, allowed_origin, json!({
-        "ok": true,
-        "contract": "diffforge.local_device_bridge.v1",
-        "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
-        "proof": proof,
-    }))
+    cloud_mcp_write_local_bridge_response(
+        &mut stream,
+        200,
+        allowed_origin,
+        json!({
+            "ok": true,
+            "contract": "diffforge.local_device_bridge.v1",
+            "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
+            "proof": proof,
+        }),
+    )
     .await
 }
 
@@ -4658,9 +4704,9 @@ fn cloud_mcp_desktop_device_key_path() -> Option<PathBuf> {
 fn cloud_mcp_valid_device_secret(value: &str) -> bool {
     let trimmed = value.trim();
     (24..=200).contains(&trimmed.len())
-        && trimmed
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        && trimmed.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 fn cloud_mcp_stable_desktop_device_secret(device_id: &str) -> String {
@@ -4689,7 +4735,10 @@ fn cloud_mcp_stable_desktop_device_key_metadata(device_id: &str) -> (String, Str
     cloud_mcp_desktop_device_key_metadata_for_secret(device_id, &secret)
 }
 
-fn cloud_mcp_desktop_device_key_metadata_for_secret(device_id: &str, secret: &str) -> (String, String) {
+fn cloud_mcp_desktop_device_key_metadata_for_secret(
+    device_id: &str,
+    secret: &str,
+) -> (String, String) {
     let digest = Sha256::digest(
         format!("diffforge-native-device-anchor-v1:{device_id}:{secret}").as_bytes(),
     );
@@ -4796,9 +4845,13 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                 if workspace_id.is_empty() || !seen.insert(workspace_id.clone()) {
                     continue;
                 }
-                let root_display = cloud_mcp_payload_text(workspace, &["workspace_root", "workspaceRoot", "repo_path", "repoPath"])
-                    .unwrap_or_default();
-                let git_identity = cloud_mcp_git_identity_from_workspace_or_path(workspace, &root_display);
+                let root_display = cloud_mcp_payload_text(
+                    workspace,
+                    &["workspace_root", "workspaceRoot", "repo_path", "repoPath"],
+                )
+                .unwrap_or_default();
+                let git_identity =
+                    cloud_mcp_git_identity_from_workspace_or_path(workspace, &root_display);
                 let mut workspace_value = json!({
                     "workspace_id": workspace_id,
                     "repo_id": repo_id,
@@ -6814,7 +6867,11 @@ async fn cloud_mcp_post_json_endpoint(
             )
             .await;
             cloud_mcp_update_asset_library_from_response(
-                "app_websocket_response",
+                if endpoint == "/v1/workspace/assets/list" {
+                    "asset_library_list_snapshot"
+                } else {
+                    "app_websocket_response"
+                },
                 Some(endpoint),
                 payload,
                 &value,
@@ -6871,6 +6928,9 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/workspace/assets/prepare-download" => Some("workspace_asset_prepare_download"),
         "/v1/workspace/assets/delete-cloud" => Some("workspace_asset_delete_cloud"),
         "/v1/workspace/assets/status" => Some("workspace_asset_status"),
+        "/v1/workspace/assets/report-transfer-progress" => {
+            Some("workspace_asset_report_transfer_progress")
+        }
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -7074,6 +7134,7 @@ fn cloud_mcp_post_log_context(
         "/v1/workspace/assets/prepare-download" => "cloud_prepare_asset_download",
         "/v1/workspace/assets/delete-cloud" => "cloud_delete_cloud_asset",
         "/v1/workspace/assets/status" => "cloud_get_asset_status",
+        "/v1/workspace/assets/report-transfer-progress" => "cloud_report_asset_transfer_progress",
         "/v1/events" => payload
             .get("event_kind")
             .and_then(Value::as_str)
@@ -7590,10 +7651,7 @@ async fn cloud_mcp_register_prepared_workspace_bundle(
 
     if project_mount_count > 0 {
         if let Some(object) = result.server_response.as_object_mut() {
-            object.insert(
-                "projectMountCount".to_string(),
-                json!(project_mount_count),
-            );
+            object.insert("projectMountCount".to_string(), json!(project_mount_count));
         }
         result.message = format!(
             "Workspace synced with {} project mount{}.",
@@ -7624,12 +7682,7 @@ async fn cloud_mcp_ws_send_workspace_registration(
         "schema_version": 1,
     });
     cloud_mcp_apply_git_identity_to_value(&mut payload, &git_identity);
-    cloud_mcp_ws_request(
-        state,
-        "workspace_register",
-        &payload,
-    )
-    .await
+    cloud_mcp_ws_request(state, "workspace_register", &payload).await
 }
 
 fn cloud_mcp_response_data(value: &Value) -> Value {
@@ -9785,11 +9838,21 @@ async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
         ),
         (
             "target_thread_id",
-            &["target_thread_id", "targetThreadId", "thread_id", "threadId"][..],
+            &[
+                "target_thread_id",
+                "targetThreadId",
+                "thread_id",
+                "threadId",
+            ][..],
         ),
         (
             "target_color_slot",
-            &["target_color_slot", "targetColorSlot", "color_slot", "colorSlot"][..],
+            &[
+                "target_color_slot",
+                "targetColorSlot",
+                "color_slot",
+                "colorSlot",
+            ][..],
         ),
         (
             "target_terminal_color",
@@ -9867,10 +9930,13 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         &prompt,
         &prompt_metadata,
     );
-    let effective_todo_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_id)
-        .or_else(|| direct_prompt_todo_refs.as_ref().map(|refs| refs.todo_id.clone()));
-    let effective_todo_dispatch_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id)
-        .or_else(|| {
+    let effective_todo_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_id).or_else(|| {
+        direct_prompt_todo_refs
+            .as_ref()
+            .map(|refs| refs.todo_id.clone())
+    });
+    let effective_todo_dispatch_id =
+        cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id).or_else(|| {
             direct_prompt_todo_refs
                 .as_ref()
                 .map(|refs| refs.dispatch_id.clone())
@@ -11240,10 +11306,7 @@ fn cloud_mcp_workspace_runtime_epoch(state: &CloudMcpState) -> String {
     format!("workspace-runtime-{epoch}")
 }
 
-fn cloud_mcp_workspace_runtime_ordering(
-    state: &CloudMcpState,
-    workspace: &Value,
-) -> (u64, String) {
+fn cloud_mcp_workspace_runtime_ordering(state: &CloudMcpState, workspace: &Value) -> (u64, String) {
     let seq = cloud_mcp_next_workspace_runtime_seq(
         state,
         cloud_mcp_payload_u64(
@@ -12812,7 +12875,11 @@ async fn cloud_mcp_hydrate_workspace_architecture(
     workspace_name: Option<String>,
     refs: Value,
 ) -> Result<Value, String> {
-    let req = cloud_mcp_repo_request(repo_path.clone(), workspace_id.clone(), workspace_name.clone());
+    let req = cloud_mcp_repo_request(
+        repo_path.clone(),
+        workspace_id.clone(),
+        workspace_name.clone(),
+    );
     let refs_array = cloud_mcp_architecture_refs_array(&refs);
     if refs_array.is_empty() {
         return Ok(json!({
@@ -12832,9 +12899,12 @@ async fn cloud_mcp_hydrate_workspace_architecture(
     if let Some(object) = payload.as_object_mut() {
         object.insert("refs".to_string(), json!(refs_array));
     }
-    let response =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/hydrate", &payload)
-            .await?;
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/architectures/hydrate",
+        &payload,
+    )
+    .await?;
     let mut data = response.get("data").cloned().unwrap_or(response);
     let hydrated_items = data
         .get("items")
@@ -13616,6 +13686,7 @@ async fn cloud_mcp_list_workspace_assets(
     workspace_name: Option<String>,
     limit: Option<u64>,
     include_all_workspaces: Option<bool>,
+    local_only: Option<bool>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
     let include_all_workspaces = include_all_workspaces.unwrap_or(false);
@@ -13637,6 +13708,9 @@ async fn cloud_mcp_list_workspace_assets(
         local_workspace_id,
         effective_limit as usize,
     );
+    if local_only.unwrap_or(false) {
+        return Ok(local);
+    }
     let mut payload = cloud_mcp_asset_payload_base(
         &req,
         workspace_id.as_deref().unwrap_or_default(),
@@ -13700,7 +13774,9 @@ async fn cloud_mcp_register_workspace_asset(
     )
     .await
     {
-        Ok(response) => json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)}),
+        Ok(response) => {
+            json!({"ok": true, "response": response.get("data").cloned().unwrap_or(response)})
+        }
         Err(error) => json!({"ok": false, "error": error}),
     };
     if upload.unwrap_or(false) {
@@ -13766,9 +13842,12 @@ async fn cloud_mcp_upload_workspace_asset(
             }
         }
     }
-    let prepared =
-        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/assets/prepare-upload", &payload)
-            .await?;
+    let prepared = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/workspace/assets/prepare-upload",
+        &payload,
+    )
+    .await?;
     let data = prepared.get("data").cloned().unwrap_or(prepared.clone());
     let upload_required = data
         .get("upload_required")
@@ -13888,9 +13967,11 @@ async fn cloud_mcp_download_workspace_asset(
     let raw_name = cloud_mcp_payload_text(&asset, &["name", "filename"])
         .unwrap_or_else(|| format!("{asset_id}.asset"));
     let name = cloud_mcp_sanitize_asset_filename(&raw_name, &format!("{asset_id}.asset"));
-    let target_dir = target_directory
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&req.root_display).join(".diffforge").join("assets"));
+    let target_dir = target_directory.map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(&req.root_display)
+            .join(".diffforge")
+            .join("assets")
+    });
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("Unable to create asset download directory: {error}"))?;
     let target_path = cloud_mcp_available_asset_download_path(&target_dir, &name);
@@ -13899,6 +13980,18 @@ async fn cloud_mcp_download_workspace_asset(
     let repo_id_for_download = req.repo_id.clone();
     let workspace_id_for_download = workspace_id.clone();
     let asset_id_for_download = asset_id.clone();
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<Value>();
+    let progress_state = state.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = cloud_mcp_post_json_endpoint(
+                &progress_state,
+                "/v1/workspace/assets/report-transfer-progress",
+                &progress,
+            )
+            .await;
+        }
+    });
     tauri::async_runtime::spawn_blocking(move || {
         cloud_mcp_download_asset_streaming_blocking(
             download_url,
@@ -13910,14 +14003,21 @@ async fn cloud_mcp_download_workspace_asset(
             workspace_id_for_download,
             asset_id_for_download,
             transfer_id,
+            Some(progress_tx),
         )
     })
     .await
     .map_err(|error| format!("Asset download worker failed: {error}"))??;
     let mut local_asset = asset;
     if let Some(object) = local_asset.as_object_mut() {
-        object.insert("local_path".to_string(), json!(target_path.display().to_string()));
-        object.insert("localPath".to_string(), json!(target_path.display().to_string()));
+        object.insert(
+            "local_path".to_string(),
+            json!(target_path.display().to_string()),
+        );
+        object.insert(
+            "localPath".to_string(),
+            json!(target_path.display().to_string()),
+        );
         object.insert("local_status".to_string(), json!("local_available"));
         object.insert("localStatus".to_string(), json!("local_available"));
         object.insert("updated_at".to_string(), json!(cloud_mcp_rfc3339_now()));
@@ -14059,10 +14159,19 @@ async fn cloud_mcp_sync_workspace_todos(
         object.insert("device".to_string(), device_profile.clone());
         object.insert("device_id".to_string(), device_profile["device_id"].clone());
         object.insert("deviceId".to_string(), device_profile["device_id"].clone());
-        object.insert("machine_id".to_string(), device_profile["device_id"].clone());
+        object.insert(
+            "machine_id".to_string(),
+            device_profile["device_id"].clone(),
+        );
         object.insert("machineId".to_string(), device_profile["device_id"].clone());
-        object.insert("device_name".to_string(), device_profile["device_name"].clone());
-        object.insert("machine_name".to_string(), device_profile["machine_name"].clone());
+        object.insert(
+            "device_name".to_string(),
+            device_profile["device_name"].clone(),
+        );
+        object.insert(
+            "machine_name".to_string(),
+            device_profile["machine_name"].clone(),
+        );
         object.insert("snapshot_full".to_string(), json!(true));
         object.insert("snapshotFull".to_string(), json!(true));
         object.insert("prune_missing".to_string(), json!(false));
@@ -14082,12 +14191,8 @@ async fn cloud_mcp_sync_workspace_todos(
                 .unwrap_or(0),
         }),
     );
-    let result = cloud_mcp_post_event_endpoint(
-        state.inner(),
-        "workspace_todo_snapshot",
-        &payload,
-    )
-    .await;
+    let result =
+        cloud_mcp_post_event_endpoint(state.inner(), "workspace_todo_snapshot", &payload).await;
     match &result {
         Ok(value) => log_terminal_status_event(
             "backend.workspace_todos.sync_result",
@@ -14346,7 +14451,12 @@ async fn cloud_mcp_record_todo_dispatch_status(
                 ),
                 (
                     "target_color_slot",
-                    &["target_color_slot", "targetColorSlot", "color_slot", "colorSlot"][..],
+                    &[
+                        "target_color_slot",
+                        "targetColorSlot",
+                        "color_slot",
+                        "colorSlot",
+                    ][..],
                 ),
                 (
                     "target_terminal_color",
@@ -14360,7 +14470,13 @@ async fn cloud_mcp_record_todo_dispatch_status(
                 ),
                 (
                     "status_reason",
-                    &["status_reason", "statusReason", "reason", "message", "error"][..],
+                    &[
+                        "status_reason",
+                        "statusReason",
+                        "reason",
+                        "message",
+                        "error",
+                    ][..],
                 ),
             ] {
                 if cloud_mcp_payload_text(&payload, &[target_key]).is_none() {
@@ -14538,7 +14654,14 @@ fn cloud_mcp_asset_items_from_response(value: &Value) -> Vec<Value> {
             items.push(item.clone());
         }
     }
-    for key in ["data", "payload", "result", "stored", "workspace_assets", "workspaceAssets"] {
+    for key in [
+        "data",
+        "payload",
+        "result",
+        "stored",
+        "workspace_assets",
+        "workspaceAssets",
+    ] {
         if let Some(child) = value.get(key) {
             items.extend(cloud_mcp_asset_items_from_response(child));
         }
@@ -14554,7 +14677,14 @@ fn cloud_mcp_asset_transfers_from_response(value: &Value) -> Vec<Value> {
     if let Some(item) = value.get("transfer").filter(|item| item.is_object()) {
         transfers.push(item.clone());
     }
-    for key in ["data", "payload", "result", "stored", "workspace_assets", "workspaceAssets"] {
+    for key in [
+        "data",
+        "payload",
+        "result",
+        "stored",
+        "workspace_assets",
+        "workspaceAssets",
+    ] {
         if let Some(child) = value.get(key) {
             transfers.extend(cloud_mcp_asset_transfers_from_response(child));
         }
@@ -14578,6 +14708,97 @@ fn cloud_mcp_asset_row_i64(row: &Value, keys: &[&str]) -> i64 {
     0
 }
 
+fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
+    let (Some(remote), Some(local)) = (remote.as_object_mut(), local.as_object()) else {
+        return;
+    };
+    for key in [
+        "local_path",
+        "localPath",
+        "path",
+        "local_status",
+        "localStatus",
+        "workspace_name",
+        "workspaceName",
+        "workspace_id",
+        "workspaceId",
+        "repo_id",
+        "repoId",
+    ] {
+        if let Some(value) = local
+            .get(key)
+            .filter(|value| !value.as_str().unwrap_or_default().trim().is_empty())
+        {
+            remote.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn cloud_mcp_asset_merge_transfer_progress_row(incoming: &mut Value, existing: &Value) {
+    let existing_done = cloud_mcp_asset_row_i64(existing, &["bytes_done", "bytesDone"]);
+    let incoming_done = cloud_mcp_asset_row_i64(incoming, &["bytes_done", "bytesDone"]);
+    let existing_status = cloud_mcp_asset_row_text(existing, &["status"]);
+    let incoming_status = cloud_mcp_asset_row_text(incoming, &["status"]);
+    let existing_terminal = matches!(
+        existing_status.as_str(),
+        "completed" | "failed" | "interrupted" | "cancelled" | "canceled"
+    );
+    let incoming_terminal = matches!(
+        incoming_status.as_str(),
+        "completed" | "failed" | "interrupted" | "cancelled" | "canceled"
+    );
+    let preserve_existing = existing_done > incoming_done || (existing_terminal && !incoming_terminal);
+    if !preserve_existing {
+        return;
+    }
+    let (Some(incoming), Some(existing)) = (incoming.as_object_mut(), existing.as_object()) else {
+        return;
+    };
+    for key in [
+        "status",
+        "bytes_done",
+        "bytesDone",
+        "bytes_total",
+        "bytesTotal",
+        "error",
+        "updated_at",
+        "updatedAt",
+        "completed_at",
+        "completedAt",
+        "failed_at",
+        "failedAt",
+        "interrupted_at",
+        "interruptedAt",
+    ] {
+        if let Some(value) = existing.get(key) {
+            incoming.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+fn cloud_mcp_asset_response_bool(value: &Value, keys: &[&str]) -> bool {
+    for key in keys {
+        if let Some(value) = value.get(*key).and_then(Value::as_bool) {
+            return value;
+        }
+    }
+    for key in [
+        "data",
+        "payload",
+        "result",
+        "stored",
+        "workspace_assets",
+        "workspaceAssets",
+    ] {
+        if let Some(child) = value.get(key) {
+            if cloud_mcp_asset_response_bool(child, keys) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn cloud_mcp_update_asset_library_conn(
     conn: &rusqlite::Connection,
     source: &str,
@@ -14588,11 +14809,49 @@ fn cloud_mcp_update_asset_library_conn(
 ) -> Result<(), String> {
     cloud_mcp_asset_library_init_conn(conn)
         .map_err(|error| format!("Unable to initialize asset cache: {error}"))?;
+    conn.execute_batch("SAVEPOINT workspace_asset_cache_update")
+        .map_err(|error| format!("Unable to start asset cache update: {error}"))?;
+    let result = cloud_mcp_update_asset_library_conn_inner(
+        conn,
+        source,
+        base_url,
+        repo_id,
+        workspace_id,
+        response,
+    );
+    match result {
+        Ok(()) => conn
+            .execute_batch("RELEASE SAVEPOINT workspace_asset_cache_update")
+            .map_err(|error| format!("Unable to commit asset cache update: {error}")),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT workspace_asset_cache_update;
+                 RELEASE SAVEPOINT workspace_asset_cache_update;",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_update_asset_library_conn_inner(
+    conn: &rusqlite::Connection,
+    source: &str,
+    base_url: Option<&str>,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    response: &Value,
+) -> Result<(), String> {
     let now_ms = cloud_mcp_now_ms() as i64;
     let asset_items = cloud_mcp_asset_items_from_response(response);
     let transfers = cloud_mcp_asset_transfers_from_response(response);
     let workspace_assets = cloud_mcp_extract_workspace_assets(response);
-    if asset_items.is_empty() && transfers.is_empty() && workspace_assets.is_none() {
+    let authoritative_full_snapshot = source == "asset_library_list_snapshot"
+        && cloud_mcp_asset_response_bool(response, &["snapshot_full", "snapshotFull"]);
+    if asset_items.is_empty()
+        && transfers.is_empty()
+        && workspace_assets.is_none()
+        && !authoritative_full_snapshot
+    {
         return Ok(());
     }
     if let Some(workspace_assets) = workspace_assets {
@@ -14619,10 +14878,24 @@ fn cloud_mcp_update_asset_library_conn(
         )
         .map_err(|error| format!("Unable to update asset snapshot cache: {error}"))?;
     }
-    for item in asset_items {
+    let authoritative_asset_ids = asset_items
+        .iter()
+        .map(|item| cloud_mcp_asset_row_text(item, &["asset_id", "assetId", "id"]))
+        .filter(|asset_id| !asset_id.is_empty())
+        .collect::<HashSet<_>>();
+    for mut item in asset_items {
         let asset_id = cloud_mcp_asset_row_text(&item, &["asset_id", "assetId", "id"]);
         if asset_id.is_empty() {
             continue;
+        }
+        if let Ok(existing_json) = conn.query_row(
+            "SELECT row_json FROM workspace_asset_items WHERE asset_id=?1 LIMIT 1",
+            [&asset_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(existing) = serde_json::from_str::<Value>(&existing_json) {
+                cloud_mcp_asset_merge_local_overlay_row(&mut item, &existing);
+            }
         }
         let row_repo_id = cloud_mcp_asset_row_text(&item, &["repo_id", "repoId"]);
         let row_workspace_id = cloud_mcp_asset_row_text(&item, &["workspace_id", "workspaceId"]);
@@ -14682,10 +14955,19 @@ fn cloud_mcp_update_asset_library_conn(
         )
         .map_err(|error| format!("Unable to update asset item cache from {source}: {error}"))?;
     }
-    for transfer in transfers {
+    for mut transfer in transfers {
         let transfer_id = cloud_mcp_asset_row_text(&transfer, &["transfer_id", "transferId", "id"]);
         if transfer_id.is_empty() {
             continue;
+        }
+        if let Ok(existing_json) = conn.query_row(
+            "SELECT row_json FROM workspace_asset_transfers WHERE transfer_id=?1 LIMIT 1",
+            [&transfer_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(existing) = serde_json::from_str::<Value>(&existing_json) {
+                cloud_mcp_asset_merge_transfer_progress_row(&mut transfer, &existing);
+            }
         }
         conn.execute(
             "INSERT INTO workspace_asset_transfers(
@@ -14722,6 +15004,67 @@ fn cloud_mcp_update_asset_library_conn(
         )
         .map_err(|error| format!("Unable to update asset transfer cache from {source}: {error}"))?;
     }
+    if authoritative_full_snapshot {
+        let mut sql = "SELECT asset_id, local_path, row_json FROM workspace_asset_items WHERE 1=1"
+            .to_string();
+        let mut scope_params = Vec::<String>::new();
+        if let Some(repo_id) = repo_id.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND repo_id=?");
+            scope_params.push(repo_id.to_string());
+        }
+        if let Some(workspace_id) = workspace_id.filter(|value| !value.trim().is_empty()) {
+            sql.push_str(" AND workspace_id=?");
+            scope_params.push(workspace_id.to_string());
+        }
+        let dyn_params = scope_params
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect::<Vec<_>>();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| format!("Unable to prepare stale asset reconciliation: {error}"))?;
+        let mapped = stmt
+            .query_map(rusqlite::params_from_iter(dyn_params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| format!("Unable to read stale asset reconciliation rows: {error}"))?;
+        let stale_rows = mapped.filter_map(Result::ok).collect::<Vec<_>>();
+        drop(stmt);
+        for (asset_id, local_path, row_json) in stale_rows {
+            if authoritative_asset_ids.contains(&asset_id) {
+                continue;
+            }
+            if local_path.trim().is_empty() {
+                conn.execute(
+                    "DELETE FROM workspace_asset_items WHERE asset_id=?1",
+                    [&asset_id],
+                )
+                .map_err(|error| format!("Unable to prune stale cloud asset: {error}"))?;
+                continue;
+            }
+            let mut row = serde_json::from_str::<Value>(&row_json).unwrap_or_else(|_| json!({}));
+            if let Some(object) = row.as_object_mut() {
+                object.insert("cloud_status".to_string(), json!("local_only"));
+                object.insert("cloudStatus".to_string(), json!("local_only"));
+                object.insert("blob_id".to_string(), json!(""));
+                object.insert("blobId".to_string(), json!(""));
+                object.insert("object_key".to_string(), json!(""));
+                object.insert("objectKey".to_string(), json!(""));
+            }
+            conn.execute(
+                "UPDATE workspace_asset_items
+                 SET cloud_status='local_only', blob_id='', object_key='', row_json=?1,
+                     mirror_updated_at_ms=?2
+                 WHERE asset_id=?3",
+                rusqlite::params![row.to_string(), now_ms, asset_id],
+            )
+            .map_err(|error| format!("Unable to preserve local-only stale asset: {error}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -14732,10 +15075,23 @@ fn cloud_mcp_update_asset_library_from_response(
     response: &Value,
 ) {
     let base_url = Some(cloud_mcp_base_url());
-    let repo_id = cloud_mcp_payload_text(response, &["repo_id", "repoId"])
-        .or_else(|| cloud_mcp_payload_text(request, &["repo_id", "repoId"]));
-    let workspace_id = cloud_mcp_payload_text(response, &["workspace_id", "workspaceId"])
-        .or_else(|| cloud_mcp_payload_text(request, &["workspace_id", "workspaceId"]));
+    let include_all_workspaces = cloud_mcp_payload_bool(
+        request,
+        &["include_all_workspaces", "includeAllWorkspaces"],
+        false,
+    );
+    let repo_id = (!include_all_workspaces)
+        .then(|| {
+            cloud_mcp_payload_text(response, &["repo_id", "repoId"])
+                .or_else(|| cloud_mcp_payload_text(request, &["repo_id", "repoId"]))
+        })
+        .flatten();
+    let workspace_id = (!include_all_workspaces)
+        .then(|| {
+            cloud_mcp_payload_text(response, &["workspace_id", "workspaceId"])
+                .or_else(|| cloud_mcp_payload_text(request, &["workspace_id", "workspaceId"]))
+        })
+        .flatten();
     if !endpoint.unwrap_or_default().contains("/assets")
         && !cloud_mcp_is_workspace_asset_wake_event(
             cloud_mcp_payload_text(response, &["event_kind", "eventKind", "kind"])
@@ -14780,14 +15136,18 @@ fn cloud_mcp_asset_library_rows_from_conn(
     }
     sql.push_str(" ORDER BY updated_at DESC, mirror_updated_at_ms DESC LIMIT ?");
     let limit = limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS) as i64;
-    let mut dyn_params: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let mut dyn_params: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
     dyn_params.push(&limit);
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| format!("Unable to query asset library cache: {error}"))?;
     let mapped = stmt
-        .query_map(rusqlite::params_from_iter(dyn_params), |row| row.get::<_, String>(0))
+        .query_map(rusqlite::params_from_iter(dyn_params), |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| format!("Unable to read asset library cache: {error}"))?;
     let mut rows = Vec::new();
     for row in mapped {
@@ -14825,14 +15185,18 @@ fn cloud_mcp_asset_library_transfers_from_conn(
     }
     sql.push_str(" ORDER BY updated_at DESC, mirror_updated_at_ms DESC LIMIT ?");
     let limit = limit.clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS) as i64;
-    let mut dyn_params: Vec<&dyn rusqlite::ToSql> =
-        params.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+    let mut dyn_params: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
     dyn_params.push(&limit);
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|error| format!("Unable to query asset transfer cache: {error}"))?;
     let mapped = stmt
-        .query_map(rusqlite::params_from_iter(dyn_params), |row| row.get::<_, String>(0))
+        .query_map(rusqlite::params_from_iter(dyn_params), |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|error| format!("Unable to read asset transfer cache: {error}"))?;
     let mut rows = Vec::new();
     for row in mapped {
@@ -14905,9 +15269,10 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
         if local_id.is_empty() {
             continue;
         }
-        if let Some(existing) = items.iter_mut().find(|item| {
-            cloud_mcp_asset_row_text(item, &["asset_id", "assetId", "id"]) == local_id
-        }) {
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|item| cloud_mcp_asset_row_text(item, &["asset_id", "assetId", "id"]) == local_id)
+        {
             if let (Some(existing_object), Some(local_object)) =
                 (existing.as_object_mut(), local_item.as_object())
             {
@@ -15214,12 +15579,7 @@ fn cloud_mcp_todo_mirror_row_workspace_matches(row: &Value, workspace_id: Option
         "workspaceId",
     ]
     .iter()
-    .any(|key| {
-        row.get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            == Some(workspace_id)
-    })
+    .any(|key| row.get(*key).and_then(Value::as_str).map(str::trim) == Some(workspace_id))
 }
 
 fn cloud_mcp_todo_mirror_row_matches_request(
@@ -15268,7 +15628,12 @@ fn cloud_mcp_todo_mirror_row_matches_request(
         row,
         &cloud_mcp_todo_mirror_text_values(
             input,
-            &["target_device_id", "targetDeviceId", "target_device_ids", "targetDeviceIds"],
+            &[
+                "target_device_id",
+                "targetDeviceId",
+                "target_device_ids",
+                "targetDeviceIds",
+            ],
         ),
         &["target_device_id", "targetDeviceId"],
     ) && cloud_mcp_todo_mirror_filter_matches(
@@ -15287,7 +15652,12 @@ fn cloud_mcp_todo_mirror_row_matches_request(
         row,
         &cloud_mcp_todo_mirror_text_values(
             input,
-            &["origin_device_id", "originDeviceId", "origin_device_ids", "originDeviceIds"],
+            &[
+                "origin_device_id",
+                "originDeviceId",
+                "origin_device_ids",
+                "originDeviceIds",
+            ],
         ),
         &[
             "todo_device_id",
@@ -15356,9 +15726,10 @@ fn cloud_mcp_todo_mirror_enrich_status_row(mut row: Value) -> Value {
     let quiescent = cloud_mcp_todo_mirror_dispatch_status_is_quiescent(&status);
     if let Some(object) = row.as_object_mut() {
         object.insert("mirror_row_kind".to_string(), json!(row_kind.as_str()));
-        if let Some(dispatch_id) =
-            cloud_mcp_payload_text(&Value::Object(object.clone()), &["todo_dispatch_id", "todoDispatchId"])
-        {
+        if let Some(dispatch_id) = cloud_mcp_payload_text(
+            &Value::Object(object.clone()),
+            &["todo_dispatch_id", "todoDispatchId"],
+        ) {
             object
                 .entry("dispatch_id".to_string())
                 .or_insert_with(|| json!(dispatch_id.as_str()));
@@ -15517,7 +15888,10 @@ fn cloud_mcp_todo_mirror_collect_workspace_dispatch_rows(
     }
 }
 
-fn cloud_mcp_todo_mirror_collect_workspace_todo_rows(workspace_todos: &Value, rows: &mut Vec<Value>) {
+fn cloud_mcp_todo_mirror_collect_workspace_todo_rows(
+    workspace_todos: &Value,
+    rows: &mut Vec<Value>,
+) {
     for key in ["items", "todos", "workspaceItems", "workspace_items"] {
         if let Some(items) = workspace_todos
             .get(key)
@@ -15636,7 +16010,12 @@ fn cloud_mcp_compact_workspace_todos_metadata(workspace_todos: &Value) -> Value 
             let count = value
                 .get("count")
                 .and_then(Value::as_u64)
-                .or_else(|| value.get("items").and_then(Value::as_array).map(|items| items.len() as u64))
+                .or_else(|| {
+                    value
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .map(|items| items.len() as u64)
+                })
                 .or_else(|| value.as_array().map(|items| items.len() as u64))
                 .unwrap_or(0);
             *value = json!({
@@ -15665,7 +16044,12 @@ fn cloud_mcp_compact_workspace_todos_metadata(workspace_todos: &Value) -> Value 
                     let count = entry_object
                         .get("count")
                         .and_then(Value::as_u64)
-                        .or_else(|| entry_object.get("items").and_then(Value::as_array).map(|items| items.len() as u64))
+                        .or_else(|| {
+                            entry_object
+                                .get("items")
+                                .and_then(Value::as_array)
+                                .map(|items| items.len() as u64)
+                        })
                         .unwrap_or(0);
                     entry_object.insert("count".to_string(), json!(count));
                     entry_object.insert("items".to_string(), json!([]));
@@ -15690,11 +16074,16 @@ fn cloud_mcp_todo_mirror_dedupe_rows(rows: Vec<Value>) -> Vec<Value> {
     }
     let mut rows = keyed.into_values().chain(unkeyed).collect::<Vec<_>>();
     rows.sort_by(|left, right| {
-        let left_time = cloud_mcp_payload_text(left, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
-            .unwrap_or_default();
-        let right_time =
-            cloud_mcp_payload_text(right, &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"])
-                .unwrap_or_default();
+        let left_time = cloud_mcp_payload_text(
+            left,
+            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+        )
+        .unwrap_or_default();
+        let right_time = cloud_mcp_payload_text(
+            right,
+            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+        )
+        .unwrap_or_default();
         right_time.cmp(&left_time)
     });
     rows.truncate(CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS);
@@ -15928,7 +16317,15 @@ fn cloud_mcp_update_todo_mirror_conn(
         )
         .map_err(|error| format!("Unable to upsert todo mirror snapshot: {error}"))?;
     }
-    cloud_mcp_todo_mirror_upsert_rows(conn, source, base_url, repo_id, workspace_id, &rows, now_ms)?;
+    cloud_mcp_todo_mirror_upsert_rows(
+        conn,
+        source,
+        base_url,
+        repo_id,
+        workspace_id,
+        &rows,
+        now_ms,
+    )?;
     let history_rows = rows
         .iter()
         .filter(|row| cloud_mcp_todo_mirror_row_kind(row) == "dispatch")
@@ -15990,8 +16387,14 @@ fn cloud_mcp_update_todo_mirror_file_from_response(
     response: &Value,
 ) {
     if let Ok(conn) = cloud_mcp_open_todo_mirror_conn() {
-        let _ =
-            cloud_mcp_update_todo_mirror_conn(&conn, source, base_url, repo_id, workspace_id, response);
+        let _ = cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            source,
+            base_url,
+            repo_id,
+            workspace_id,
+            response,
+        );
     }
 }
 
@@ -16367,14 +16770,9 @@ fn cloud_mcp_todo_status_from_file(
 ) -> Value {
     match cloud_mcp_open_todo_mirror_conn() {
         Ok(conn) => {
-            let mut status = cloud_mcp_todo_mirror_status_from_conn(
-                &conn,
-                repo_id,
-                workspace_id,
-                input,
-                None,
-            )
-            .unwrap_or_else(|| cloud_mcp_todo_status_empty_response(input, None));
+            let mut status =
+                cloud_mcp_todo_mirror_status_from_conn(&conn, repo_id, workspace_id, input, None)
+                    .unwrap_or_else(|| cloud_mcp_todo_status_empty_response(input, None));
             if let Some(object) = status.as_object_mut() {
                 object.insert("freshness".to_string(), json!("local"));
                 object.insert("local_only".to_string(), json!(true));
@@ -16558,10 +16956,7 @@ fn cloud_mcp_todo_targets_from_conn(
     })
 }
 
-fn cloud_mcp_todo_targets_from_file(
-    repo_id: Option<&str>,
-    workspace_id: Option<&str>,
-) -> Value {
+fn cloud_mcp_todo_targets_from_file(repo_id: Option<&str>, workspace_id: Option<&str>) -> Value {
     match cloud_mcp_open_todo_mirror_conn() {
         Ok(conn) => cloud_mcp_todo_targets_from_conn(&conn, repo_id, workspace_id),
         Err(error) => cloud_mcp_todo_targets_empty_response(workspace_id, Some(error)),
@@ -16639,9 +17034,8 @@ fn cloud_mcp_todo_mirror_snapshot_rows(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        clauses.push(
-            "(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string(),
-        );
+        clauses
+            .push("(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string());
         params.push(workspace_id.to_string());
         params.push(workspace_id.to_string());
         params.push(workspace_id.to_string());
@@ -16660,14 +17054,11 @@ fn cloud_mcp_todo_mirror_snapshot_rows(
         Ok(statement) => statement,
         Err(_) => return Vec::new(),
     };
-    let mapped = match statement.query_map(
-        rusqlite::params_from_iter(params.iter()),
-        |row| {
-            let row_json: String = row.get(0)?;
-            let workspace_id: String = row.get(1)?;
-            Ok((row_json, workspace_id))
-        },
-    ) {
+    let mapped = match statement.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        let row_json: String = row.get(0)?;
+        let workspace_id: String = row.get(1)?;
+        Ok((row_json, workspace_id))
+    }) {
         Ok(mapped) => mapped,
         Err(_) => return Vec::new(),
     };
@@ -16697,9 +17088,8 @@ fn cloud_mcp_todo_mirror_count_rows(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        clauses.push(
-            "(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string(),
-        );
+        clauses
+            .push("(workspace_id=? OR origin_workspace_id=? OR target_workspace_id=?)".to_string());
         params.push(workspace_id.to_string());
         params.push(workspace_id.to_string());
         params.push(workspace_id.to_string());
@@ -16797,7 +17187,10 @@ fn cloud_mcp_todo_mirror_workspace_todos_from_conn(
     let Some(object) = workspace_todos.as_object_mut() else {
         return None;
     };
-    object.insert("known".to_string(), json!(todo_count > 0 || dispatch_count > 0));
+    object.insert(
+        "known".to_string(),
+        json!(todo_count > 0 || dispatch_count > 0),
+    );
     object.insert("count".to_string(), json!(todo_count));
     object.insert("dispatch_count".to_string(), json!(dispatch_count));
     object.insert("dispatchCount".to_string(), json!(dispatch_count));
@@ -16922,8 +17315,16 @@ fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {
     if revision.trim().is_empty() && body_hash.trim().is_empty() {
         return None;
     }
-    let account_id = cloud_mcp_payload_text(value, &["todo_account_id", "todoAccountId", "account_id", "accountId"])
-        .unwrap_or_default();
+    let account_id = cloud_mcp_payload_text(
+        value,
+        &[
+            "todo_account_id",
+            "todoAccountId",
+            "account_id",
+            "accountId",
+        ],
+    )
+    .unwrap_or_default();
     Some(format!(
         "{}::{}::{}::{}::{}::{}",
         account_id, device_id, workspace_id, todo_id, revision, body_hash
@@ -17129,10 +17530,8 @@ fn cloud_mcp_limit_workspace_todo_sync_payload(value: &mut Value) {
                     "text" | "title" | "body" | "prompt" | "notetext" | "note_text"
                 ) {
                     if let Value::String(text) = child {
-                        *text = cloud_mcp_truncate_chars(
-                            text,
-                            CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS,
-                        );
+                        *text =
+                            cloud_mcp_truncate_chars(text, CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS);
                     }
                     continue;
                 }
@@ -17713,6 +18112,77 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn asset_snapshot_preserves_local_overlay_and_atomically_reconciles_cloud_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_update_asset_library_conn(
+            &conn,
+            "local_asset",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &json!({
+                "assets": [{
+                    "asset_id": "asset-1",
+                    "repo_id": "repo-1",
+                    "workspace_id": "workspace-1",
+                    "name": "image.png",
+                    "local_path": "/tmp/image.png",
+                    "local_status": "local_available",
+                    "cloud_status": "local_only"
+                }]
+            }),
+        )
+        .unwrap();
+
+        cloud_mcp_update_asset_library_conn(
+            &conn,
+            "asset_library_list_snapshot",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &json!({
+                "snapshot_full": true,
+                "assets": [{
+                    "asset_id": "asset-1",
+                    "repo_id": "repo-1",
+                    "workspace_id": "workspace-1",
+                    "name": "image.png",
+                    "size_bytes": 42,
+                    "blob_id": "blob-1",
+                    "object_key": "objects/blob-1",
+                    "cloud_status": "cloud_available"
+                }]
+            }),
+        )
+        .unwrap();
+
+        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["local_path"].as_str(), Some("/tmp/image.png"));
+        assert_eq!(rows[0]["size_bytes"].as_i64(), Some(42));
+        assert_eq!(rows[0]["cloud_status"].as_str(), Some("cloud_available"));
+
+        cloud_mcp_update_asset_library_conn(
+            &conn,
+            "asset_library_list_snapshot",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &json!({
+                "snapshot_full": true,
+                "assets": []
+            }),
+        )
+        .unwrap();
+
+        let rows = cloud_mcp_asset_library_rows_from_conn(&conn, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["local_path"].as_str(), Some("/tmp/image.png"));
+        assert_eq!(rows[0]["cloud_status"].as_str(), Some("local_only"));
+        assert_eq!(rows[0]["blob_id"].as_str(), Some(""));
+    }
+
+    #[test]
     fn todo_targets_read_sqlite_snapshot_locally() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
@@ -17739,11 +18209,7 @@ mod cloud_mcp_tests {
         )
         .unwrap());
 
-        let targets = cloud_mcp_todo_targets_from_conn(
-            &conn,
-            Some("repo-1"),
-            Some("workspace-a"),
-        );
+        let targets = cloud_mcp_todo_targets_from_conn(&conn, Some("repo-1"), Some("workspace-a"));
 
         assert_eq!(targets["kind"].as_str(), Some("todo_targets"));
         assert_eq!(targets["source"].as_str(), Some("local_todo_mirror"));
@@ -18895,11 +19361,18 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
         workspace_id.unwrap_or_default().to_string(),
         asset_id.clone(),
         transfer_id,
+        None,
     )?;
     let mut local_asset = asset;
     if let Some(object) = local_asset.as_object_mut() {
-        object.insert("local_path".to_string(), json!(target_path.display().to_string()));
-        object.insert("localPath".to_string(), json!(target_path.display().to_string()));
+        object.insert(
+            "local_path".to_string(),
+            json!(target_path.display().to_string()),
+        );
+        object.insert(
+            "localPath".to_string(),
+            json!(target_path.display().to_string()),
+        );
         object.insert("local_status".to_string(), json!("local_available"));
         object.insert("localStatus".to_string(), json!("local_available"));
     }
@@ -18929,8 +19402,40 @@ fn cloud_mcp_asset_store_local_transfer_progress(
     error: Option<&str>,
 ) -> Result<(), String> {
     let conn = cloud_mcp_open_asset_library_conn()?;
+    let row = cloud_mcp_asset_transfer_progress_row(
+        repo_id,
+        workspace_id,
+        asset_id,
+        transfer_id,
+        direction,
+        status,
+        bytes_total,
+        bytes_done,
+        error,
+    );
+    cloud_mcp_update_asset_library_conn(
+        &conn,
+        "local_asset_transfer_progress",
+        Some(cloud_mcp_base_url().as_str()),
+        Some(repo_id),
+        Some(workspace_id),
+        &json!({"transfers": [row]}),
+    )
+}
+
+fn cloud_mcp_asset_transfer_progress_row(
+    repo_id: &str,
+    workspace_id: &str,
+    asset_id: &str,
+    transfer_id: &str,
+    direction: &str,
+    status: &str,
+    bytes_total: i64,
+    bytes_done: i64,
+    error: Option<&str>,
+) -> Value {
     let now = cloud_mcp_rfc3339_now();
-    let row = json!({
+    json!({
         "transfer_id": transfer_id,
         "transferId": transfer_id,
         "asset_id": asset_id,
@@ -18948,15 +19453,7 @@ fn cloud_mcp_asset_store_local_transfer_progress(
         "error": error.unwrap_or_default(),
         "updated_at": now,
         "updatedAt": now,
-    });
-    cloud_mcp_update_asset_library_conn(
-        &conn,
-        "local_asset_transfer_progress",
-        Some(cloud_mcp_base_url().as_str()),
-        Some(repo_id),
-        Some(workspace_id),
-        &json!({"transfers": [row]}),
-    )
+    })
 }
 
 struct CloudMcpAssetTransferProgress {
@@ -18969,6 +19466,7 @@ struct CloudMcpAssetTransferProgress {
     bytes_done: i64,
     last_report_bytes: i64,
     last_report_at: Instant,
+    reporter: Option<mpsc::UnboundedSender<Value>>,
 }
 
 impl CloudMcpAssetTransferProgress {
@@ -18979,6 +19477,7 @@ impl CloudMcpAssetTransferProgress {
         transfer_id: String,
         direction: &str,
         bytes_total: i64,
+        reporter: Option<mpsc::UnboundedSender<Value>>,
     ) -> Self {
         Self {
             repo_id,
@@ -18990,6 +19489,7 @@ impl CloudMcpAssetTransferProgress {
             bytes_done: 0,
             last_report_bytes: 0,
             last_report_at: Instant::now(),
+            reporter,
         }
     }
 
@@ -19011,6 +19511,19 @@ impl CloudMcpAssetTransferProgress {
             self.bytes_done,
             error,
         );
+        if let Some(reporter) = self.reporter.as_ref() {
+            let _ = reporter.send(cloud_mcp_asset_transfer_progress_row(
+                &self.repo_id,
+                &self.workspace_id,
+                &self.asset_id,
+                &self.transfer_id,
+                &self.direction,
+                status,
+                self.bytes_total,
+                self.bytes_done,
+                error,
+            ));
+        }
         self.last_report_bytes = self.bytes_done;
         self.last_report_at = Instant::now();
     }
@@ -19046,10 +19559,19 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     let fail_workspace_id = workspace_id.clone();
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
-    let file = fs::File::open(local_path)
-        .map_err(|error| format!("Unable to open asset file {}: {error}", local_path.display()))?;
+    let file = fs::File::open(local_path).map_err(|error| {
+        format!(
+            "Unable to open asset file {}: {error}",
+            local_path.display()
+        )
+    })?;
     let length = fs::metadata(local_path)
-        .map_err(|error| format!("Unable to inspect asset file {}: {error}", local_path.display()))?
+        .map_err(|error| {
+            format!(
+                "Unable to inspect asset file {}: {error}",
+                local_path.display()
+            )
+        })?
         .len();
     headers.insert(
         reqwest::header::CONTENT_LENGTH,
@@ -19063,6 +19585,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
         transfer_id,
         "upload",
         bytes_total,
+        None,
     );
     progress.report("uploading", 0, true, None);
     let reader = CloudMcpAssetProgressReader { file, progress };
@@ -19132,6 +19655,7 @@ fn cloud_mcp_download_asset_streaming_blocking(
     workspace_id: String,
     asset_id: String,
     transfer_id: String,
+    reporter: Option<mpsc::UnboundedSender<Value>>,
 ) -> Result<(), String> {
     let fail_repo_id = repo_id.clone();
     let fail_workspace_id = workspace_id.clone();
@@ -19188,6 +19712,7 @@ fn cloud_mcp_download_asset_streaming_blocking(
             transfer_id,
             "download",
             expected_size,
+            reporter,
         ),
     )
 }
@@ -19374,14 +19899,18 @@ pub(crate) fn cloud_mcp_forward_agent_wait_for_todos(
             })
             .unwrap_or(false);
         let satisfied = match until.as_str() {
-            "accepted" => matches!(
-                aggregate_status,
-                "accepted" | "running" | "attention_required" | "completed" | "partial_failed"
-            ) || terminal,
-            "running" => matches!(
-                aggregate_status,
-                "running" | "attention_required" | "completed" | "partial_failed"
-            ) || terminal,
+            "accepted" => {
+                matches!(
+                    aggregate_status,
+                    "accepted" | "running" | "attention_required" | "completed" | "partial_failed"
+                ) || terminal
+            }
+            "running" => {
+                matches!(
+                    aggregate_status,
+                    "running" | "attention_required" | "completed" | "partial_failed"
+                ) || terminal
+            }
             _ => terminal,
         };
         if satisfied {
@@ -19681,7 +20210,12 @@ fn cloud_mcp_proxy_push_todo_target(
 ) {
     let target_device_id = cloud_mcp_payload_text(
         &item,
-        &["targetDeviceId", "target_device_id", "deviceId", "device_id"],
+        &[
+            "targetDeviceId",
+            "target_device_id",
+            "deviceId",
+            "device_id",
+        ],
     )
     .unwrap_or_default();
     let target_workspace_id = cloud_mcp_payload_text(

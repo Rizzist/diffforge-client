@@ -5534,6 +5534,12 @@ fn run_agent_thread_turn_for_context(
     }
 
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
+    if matches!(provider, AgentProvider::Codex) && !requested_provider_session_id.is_empty() {
+        let _ = prepare_codex_rollout_for_resume(
+            &requested_provider_session_id,
+            &working_directory.to_string_lossy(),
+        );
+    }
     let mut output_path = None;
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {

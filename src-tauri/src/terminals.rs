@@ -75,15 +75,9 @@ fn terminal_size_from_request(cols: Option<u16>, rows: Option<u16>) -> Result<Pt
     )
 }
 
-fn terminal_launch(
-    kind: &str,
-    provider: Option<String>,
-    model: Option<String>,
-    provider_session_id: Option<String>,
-) -> Result<(Vec<String>, Vec<String>, String), String> {
-    let provider = match kind {
+fn terminal_launch_provider(kind: &str, provider: Option<&str>) -> Result<AgentProvider, String> {
+    Ok(match kind {
         "console" => provider
-            .as_deref()
             .map(parse_agent_provider)
             .transpose()?
             .unwrap_or(AgentProvider::Codex),
@@ -92,12 +86,21 @@ fn terminal_launch(
         "opencode" => AgentProvider::OpenCode,
         _ => {
             if let Some(provider) = provider {
-                parse_agent_provider(&provider)?
+                parse_agent_provider(provider)?
             } else {
                 return Err("Terminal kind is invalid.".to_string());
             }
         }
-    };
+    })
+}
+
+fn terminal_launch(
+    kind: &str,
+    provider: Option<String>,
+    model: Option<String>,
+    provider_session_id: Option<String>,
+) -> Result<(Vec<String>, Vec<String>, String), String> {
+    let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
     let mut args = Vec::new();
     if let Some(session_id) = provider_session_id
@@ -4204,6 +4207,21 @@ async fn terminal_open(
                 return Err(error);
             }
         };
+    if !is_prewarm_pty && !plain_shell {
+        let launch_provider = terminal_launch_provider(&kind, provider.as_deref())?;
+        if matches!(launch_provider, AgentProvider::Codex) {
+            if let Some(provider_session_id) = provider_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let _ = prepare_codex_rollout_for_resume(
+                    provider_session_id,
+                    &working_directory.to_string_lossy(),
+                );
+            }
+        }
+    }
     let mut terminal_project_root = working_directory.clone();
     let mut process_working_directory = workspace_path_for_process(&working_directory);
     let mut launch_worktree: Option<Value> = None;
@@ -4908,6 +4926,19 @@ async fn start_terminal_agent_in_prepared_pty(
             message: "Terminal session is not running.".to_string(),
         };
     };
+    if matches!(provider, AgentProvider::Codex) {
+        if let Some(provider_session_id) = request
+            .provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let _ = prepare_codex_rollout_for_resume(
+                provider_session_id,
+                &instance.working_directory.to_string_lossy(),
+            );
+        }
+    }
 
     if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
         return TerminalStartAgentPaneResult {

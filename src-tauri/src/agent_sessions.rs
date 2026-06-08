@@ -1704,6 +1704,47 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn codex_resume_sanitizer_removes_only_unresumable_image_response_items() {
+        let image_event = json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "image_generation_end",
+                "call_id": "ig_image",
+                "saved_path": "/tmp/generated/ig_image.png"
+            }
+        })
+        .to_string();
+        let image_response_item = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "image_generation_call",
+                "id": "ig_image",
+                "result": "base64-image"
+            }
+        })
+        .to_string();
+        let assistant_message = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Created."}]
+            }
+        })
+        .to_string();
+        let body = format!("{image_event}\n{image_response_item}\n{assistant_message}\n");
+
+        let (sanitized, removed) = sanitize_codex_rollout_for_resume(&body);
+
+        assert_eq!(removed, 1);
+        assert!(sanitized.contains("image_generation_end"));
+        assert!(sanitized.contains("/tmp/generated/ig_image.png"));
+        assert!(sanitized.contains("Created."));
+        assert!(!sanitized.contains("image_generation_call"));
+        assert!(!sanitized.contains("base64-image"));
+    }
+
+    #[test]
     fn developer_imagegen_response_item_yields_generated_dir_artifact() {
         let root = unique_test_dir("codex-developer-imagegen-artifact");
         let image_dir = root
@@ -1829,6 +1870,58 @@ fn find_codex_rollout(
     }
 
     Err("No Codex transcript matched this thread session.".to_string())
+}
+
+fn codex_rollout_line_is_unresumable_image_item(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return false;
+    }
+
+    let payload = value.get("payload").unwrap_or(&Value::Null);
+    payload.get("type").and_then(Value::as_str) == Some("image_generation_call")
+        && payload
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.trim().starts_with("ig_"))
+}
+
+fn sanitize_codex_rollout_for_resume(body: &str) -> (String, usize) {
+    let mut sanitized = String::with_capacity(body.len());
+    let mut removed = 0usize;
+
+    for line in body.split_inclusive('\n') {
+        if codex_rollout_line_is_unresumable_image_item(line) {
+            removed += 1;
+        } else {
+            sanitized.push_str(line);
+        }
+    }
+
+    (sanitized, removed)
+}
+
+fn prepare_codex_rollout_for_resume(provider_session_id: &str, cwd: &str) -> Result<usize, String> {
+    if provider_session_id.trim().is_empty() {
+        return Ok(0);
+    }
+
+    let (path, _, _) = find_codex_rollout(provider_session_id, cwd)?;
+    let body = fs::read_to_string(&path)
+        .map_err(|error| format!("Unable to read Codex rollout {}: {error}", path.display()))?;
+    let (sanitized, removed) = sanitize_codex_rollout_for_resume(&body);
+    if removed > 0 {
+        fs::write(&path, sanitized).map_err(|error| {
+            format!(
+                "Unable to repair Codex rollout {} before resume: {error}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(removed)
 }
 
 fn claude_home_dir() -> Option<PathBuf> {
