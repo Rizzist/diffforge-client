@@ -17819,6 +17819,267 @@ function TerminalView({
     updateTodoQueueItems,
   ]);
 
+  const materializeTerminalDirectTodoFromLifecycle = useCallback((event = {}) => {
+    const eventType = todoQueueTerminalDirectLifecycleEventType(
+      event.type || event.eventType || event.event_type,
+    );
+    if (eventType !== "message-submitted") {
+      return;
+    }
+    if (todoQueueLifecycleEventHasTodoQueueOwner(event)) {
+      return;
+    }
+    const sourceEligible = [
+      event.source,
+      event.messageSource,
+      event.message_source,
+      event.promptEventSource,
+      event.prompt_event_source,
+    ].some(todoQueueTerminalDirectSourceIsEligible);
+    if (!sourceEligible) {
+      return;
+    }
+
+    const text = getTodoQueueTerminalDirectLifecycleText(event);
+    if (!text) {
+      logTerminalStatus("frontend.todo_queue.terminal_direct_skip", {
+        reason: "empty_text",
+        source: event.source || event.messageSource || "",
+        terminalIndex: event.terminalIndex ?? event.terminal_index ?? "",
+        workspaceId: event.workspaceId || event.workspace_id || terminalWorkspace?.id || "",
+      });
+      return;
+    }
+
+    const eventPaneId = normalizeTodoTerminalIdentity(event.paneId || event.pane_id || "");
+    let targetTerminalIndex = normalizeTodoTerminalIndex(event.terminalIndex ?? event.terminal_index);
+    if (targetTerminalIndex == null && eventPaneId) {
+      targetTerminalIndex = logicalTerminalIndexes.find((candidateIndex) => (
+        getTerminalPaneId(candidateIndex) === eventPaneId
+      ));
+    }
+    if (!Number.isInteger(targetTerminalIndex) || !logicalTerminalIndexes.includes(targetTerminalIndex)) {
+      logTerminalStatus("frontend.todo_queue.terminal_direct_skip", {
+        paneId: eventPaneId,
+        reason: "missing_terminal",
+        source: event.source || event.messageSource || "",
+        terminalIndex: event.terminalIndex ?? event.terminal_index ?? "",
+        workspaceId: event.workspaceId || event.workspace_id || terminalWorkspace?.id || "",
+      });
+      return;
+    }
+
+    const agentId = normalizeTodoTerminalAgentId(
+      event.agentId
+        || event.agent_id
+        || event.agentKind
+        || event.agent_kind
+        || getTerminalRole(targetTerminalIndex),
+    );
+    if (!TODO_QUEUE_AGENT_ROLES.has(agentId)) {
+      logTerminalStatus("frontend.todo_queue.terminal_direct_skip", {
+        agentId,
+        paneId: eventPaneId,
+        reason: "unsupported_role",
+        source: event.source || event.messageSource || "",
+        terminalIndex: targetTerminalIndex,
+        workspaceId: event.workspaceId || event.workspace_id || terminalWorkspace?.id || "",
+      });
+      return;
+    }
+
+    const submittedAt = String(
+      event.promptEventSubmittedAt
+        || event.prompt_event_submitted_at
+        || event.messageCreatedAt
+        || event.message_created_at
+        || event.createdAt
+        || event.created_at
+        || new Date().toISOString(),
+    ).trim() || new Date().toISOString();
+    const promptId = getTodoQueueTerminalDirectPromptId(event, targetTerminalIndex, text, submittedAt);
+    const itemId = getTodoQueueTerminalDirectItemId(promptId);
+
+    if (terminalDirectTodoPromptIdsRef.current.has(promptId)) {
+      return;
+    }
+
+    const existingInFlight = Array.from(todoQueueTerminalInFlightPromptsRef.current.values()).some((prompt) => (
+      String(prompt?.promptId || "").trim() === promptId
+        || String(prompt?.itemId || "").trim() === itemId
+    ));
+    const existingPending = Object.values(todoQueuePendingItemsRef.current || {}).some((pendingItem) => (
+      String(pendingItem?.promptId || "").trim() === promptId
+        || String(pendingItem?.itemId || "").trim() === itemId
+    ));
+    const existingItem = todoQueueItemsRef.current.some((item) => {
+      const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+      return String(item?.id || "").trim() === itemId
+        || String(queueState.promptId || queueState.promptEventId || "").trim() === promptId;
+    });
+    if (existingInFlight || existingPending || existingItem) {
+      terminalDirectTodoPromptIdsRef.current.add(promptId);
+      return;
+    }
+
+    if (terminalDirectTodoPromptIdsRef.current.size > 500) {
+      terminalDirectTodoPromptIdsRef.current.clear();
+    }
+    terminalDirectTodoPromptIdsRef.current.add(promptId);
+
+    const paneId = eventPaneId || getTerminalPaneId(targetTerminalIndex);
+    const targetThread = getTerminalThread(targetTerminalIndex) || null;
+    const threadId = normalizeTodoTerminalIdentity(event.threadId || event.thread_id || targetThread?.id || "");
+    const workspaceId = String(event.workspaceId || event.workspace_id || terminalWorkspace?.id || "").trim();
+    const targetColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
+    const targetTerminalColor = terminalColorForSlot(targetColorSlot ?? targetTerminalIndex);
+    const terminalAssignmentFields = {
+      targetAgentId: agentId,
+      targetColorSlot,
+      targetTerminalColor,
+      targetTerminalId: paneId,
+      targetTerminalIndex,
+      targetThreadId: threadId,
+    };
+    const directPromptSafeId = String(itemId).replace(/^terminal-direct-/, "");
+    const directDispatchId = `terminal-direct-dispatch-${directPromptSafeId}`;
+    const directCommandId = `terminal-direct-command-${directPromptSafeId}`;
+    const baseItem = createTodoQueueItem(text, {
+      createdAt: submittedAt,
+      id: itemId,
+      source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+      todoStatus: "running",
+      todoStatusReason: "terminal_prompt_submitted",
+      todoStatusUpdatedAt: submittedAt,
+      workspaceId,
+      ...terminalAssignmentFields,
+    });
+    const queueItem = getTodoQueueItemWithCloudStatus(
+      getTodoQueueItemWithPersistedQueueState(baseItem, "sending", {
+        ...terminalAssignmentFields,
+        promptId,
+        reason: "terminal_prompt_submitted",
+        source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+        targetExplicit: true,
+        todoAction: "dispatch",
+        todoId: itemId,
+        dispatchId: directDispatchId,
+        commandId: directCommandId,
+      }),
+      "running",
+      {
+        reason: "terminal_prompt_submitted",
+        updatedAt: submittedAt,
+      },
+    );
+    const itemSummary = getTodoQueueItemLogSummary([queueItem])[0] || null;
+
+    updateTodoQueueItems((currentItems) => {
+      const alreadyPresent = currentItems.some((item) => {
+        const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+        return String(item?.id || "").trim() === itemId
+          || String(queueState.promptId || queueState.promptEventId || "").trim() === promptId;
+      });
+      return alreadyPresent ? currentItems : currentItems.concat([queueItem]);
+    }, {
+      force: true,
+      immediate: true,
+      reason: "terminal_direct_prompt_materialized",
+    });
+
+    setTodoQueueItemPending(itemId, {
+      item: itemSummary,
+      phase: "sending",
+      paneId,
+      promptId,
+      reason: "terminal_prompt_submitted",
+      source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+      submitConfirmed: true,
+      commandId: directCommandId,
+      dispatchId: directDispatchId,
+      targetAgentId: agentId,
+      targetColorSlot,
+      targetTerminalColor,
+      targetTerminalId: paneId,
+      targetRole: agentId,
+      targetTerminalIndex,
+      targetThreadId: threadId,
+      targetExplicit: true,
+      timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
+      workspaceId,
+    });
+
+    todoQueueTerminalInFlightPromptsRef.current.set(targetTerminalIndex, {
+      accepted: Boolean(
+        event.providerSessionId
+          || event.provider_session_id
+          || event.nativeSessionId
+          || event.native_session_id
+          || event.sessionId
+          || event.session_id,
+      ),
+      agentId,
+      commandId: directCommandId,
+      dispatchId: directDispatchId,
+      itemId,
+      lifecycleSource: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+      paneId,
+      promptId,
+      promptEventSubmittedAt: submittedAt,
+      promptText: text,
+      source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+      startedAtMs: Date.parse(submittedAt) || Date.now(),
+      submittedAt,
+      submittedAtMs: Date.parse(submittedAt) || Date.now(),
+      targetTerminalIndex,
+      terminalInstanceId: event.instanceId || event.instance_id || "",
+      terminalText: String(event.expectedUserMessage || event.expected_user_message || text),
+      threadMessageText: text,
+      threadId,
+      workspaceId,
+      ...(event.providerSessionId || event.provider_session_id || event.nativeSessionId || event.native_session_id || event.sessionId || event.session_id
+        ? {
+          sessionId: event.providerSessionId
+            || event.provider_session_id
+            || event.nativeSessionId
+            || event.native_session_id
+            || event.sessionId
+            || event.session_id
+            || "",
+        }
+        : {}),
+    });
+    setTodoQueueDispatchRevision((revision) => revision + 1);
+    logTerminalStatus("frontend.todo_queue.terminal_direct_materialized", {
+      agentId,
+      item: itemSummary,
+      paneId,
+      promptEventId: promptId,
+      source: event.source || event.messageSource || "",
+      targetTerminalIndex,
+      threadId,
+      workspaceId,
+    });
+  }, [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    setTodoQueueItemPending,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
+  const handleWorkspaceTerminalLifecycle = useCallback((event) => {
+    recordTodoQueueTerminalLifecycle(event);
+    materializeTerminalDirectTodoFromLifecycle(event);
+    onThreadTerminalLifecycle?.(event);
+  }, [
+    materializeTerminalDirectTodoFromLifecycle,
+    onThreadTerminalLifecycle,
+    recordTodoQueueTerminalLifecycle,
+  ]);
+
   const dispatchTodoQueueItemToTarget = useCallback((item, target, options = {}) => {
     const text = normalizeTodoQueueText(item?.text || "");
     const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();

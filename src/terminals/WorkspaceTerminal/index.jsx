@@ -9615,6 +9615,10 @@ function WorkspaceTerminal({
           const promptEventRevision = Number.parseInt(promptMetadata?.promptEventRevision, 10);
           const promptEventSource = String(promptMetadata?.promptEventSource || "").trim();
           const promptEventSubmittedAt = String(promptMetadata?.promptEventSubmittedAt || "").trim();
+          const todoAction = String(promptMetadata?.todoAction || "").trim();
+          const todoCommandId = String(promptMetadata?.todoCommandId || "").trim();
+          const todoDispatchId = String(promptMetadata?.todoDispatchId || "").trim();
+          const todoId = String(promptMetadata?.todoId || "").trim();
           const isEscapeInput = String(data || "").includes("\x1b");
           const isSubmitInput = terminalInputDataIsSubmit(textData);
           const isFocusEventInput = textData.includes("\x1b[I") || textData.includes("\x1b[O");
@@ -9758,6 +9762,10 @@ function WorkspaceTerminal({
               promptEventSource: promptEventSource || undefined,
               promptEventSubmittedAt: promptEventSubmittedAt || undefined,
               promptEventText: promptEventText || undefined,
+              todoAction: todoAction || undefined,
+              todoCommandId: todoCommandId || undefined,
+              todoDispatchId: todoDispatchId || undefined,
+              todoId: todoId || undefined,
               threadId: terminalThreadIdRef.current,
             }, {
               waitForAck: serializeInputWrite,
@@ -10785,9 +10793,11 @@ function WorkspaceTerminal({
             ) {
               const promptId = createThreadProjectionToken("terminal-prompt");
               const startedAt = new Date().toISOString();
-              const promptEventSource = submitPromptResolution.usedTerminalScreen
+              const observedPromptEventSource = submitPromptResolution.usedTerminalScreen
                 ? `tui-manual-input:${submitPromptResolution.source}`
                 : "tui-manual-input";
+              const promptEventSource = TODO_QUEUE_SOURCE_TERMINAL_DIRECT;
+              const terminalDirectTodoRefs = getTerminalDirectTodoRefs(promptId);
               const promptSnapshot = getTerminalComposerSnapshot(terminalSubmittedComposerState, {
                 promptEventId: promptId,
                 source: promptEventSource,
@@ -10825,6 +10835,10 @@ function WorkspaceTerminal({
                 submittedWaiterReady,
                 syncKey,
                 threadId,
+                todoAction: terminalDirectTodoRefs?.todoAction || "",
+                todoCommandId: terminalDirectTodoRefs?.todoCommandId || "",
+                todoDispatchId: terminalDirectTodoRefs?.todoDispatchId || "",
+                todoId: terminalDirectTodoRefs?.todoId || "",
                 turnId,
                 workspaceId,
               };
@@ -10835,6 +10849,7 @@ function WorkspaceTerminal({
                 promptEventId: promptId,
                 promptRevision: promptSnapshot.revision,
                 promptSource: promptSnapshot.source,
+                observedPromptSource: observedPromptEventSource,
                 promptResolutionSource: submitPromptResolution.source,
                 screenPrompt: getBigViewTextDiagnosticFields(
                   submitPromptResolution.lineSnapshot?.promptText || "",
@@ -10968,6 +10983,10 @@ function WorkspaceTerminal({
                 promptEventSource: bridge.promptEventSource,
                 promptEventSubmittedAt: bridge.promptEventSubmittedAt,
                 promptEventText: bridge.promptEventText,
+                todoAction: bridge.todoAction || undefined,
+                todoCommandId: bridge.todoCommandId || undefined,
+                todoDispatchId: bridge.todoDispatchId || undefined,
+                todoId: bridge.todoId || undefined,
               };
               logTerminalStatus("frontend.tui_submit.enter_write_start", {
                 agentId: terminalAgentKind,

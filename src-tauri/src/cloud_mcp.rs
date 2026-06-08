@@ -2007,11 +2007,13 @@ fn cloud_mcp_prompt_source_has_existing_todo(source: Option<&str>) -> bool {
             .as_deref(),
         Some(
             "todo-auto-queue"
+                | "terminal-direct-input"
                 | "voice-agent-queue"
                 | "voice-plan-queue"
                 | "remote-control"
                 | "terminal-view-drop"
                 | "tui-todo-auto-queue"
+                | "tui-terminal-direct-input"
                 | "tui-voice-agent-queue"
                 | "tui-voice-plan-queue"
                 | "next-remote-control"
@@ -2039,6 +2041,9 @@ fn cloud_mcp_direct_prompt_todo_refs(
     let prompt = prompt.trim();
     if workspace_id.is_empty()
         || prompt.is_empty()
+        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_id).is_some()
+        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id).is_some()
+        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id).is_some()
         || cloud_mcp_prompt_source_has_existing_todo(prompt_metadata.prompt_event_source.as_deref())
     {
         return None;
