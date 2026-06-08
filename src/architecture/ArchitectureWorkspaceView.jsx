@@ -286,12 +286,16 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
     architectureWorkspaceTodoCollection(
       workspaceTodos,
       workspaceId,
-      ["history", "todoHistory", "todo_history", "items", "todos"],
+      ["history", "todoHistory", "todo_history", "dispatches", "todoDispatches", "todo_dispatches", "items", "todos"],
       [
         "historyByWorkspace",
         "history_by_workspace",
         "todoHistoryByWorkspace",
         "todo_history_by_workspace",
+        "dispatchesByWorkspace",
+        "dispatches_by_workspace",
+        "todoDispatchesByWorkspace",
+        "todo_dispatches_by_workspace",
         "itemsByWorkspace",
         "items_by_workspace",
         "todosByWorkspace",
@@ -309,7 +313,20 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
   const seen = new Set();
   return collections.flatMap(architectureTodoArrayFromCollection).filter((item, index) => {
     if (!item || typeof item !== "object") return false;
-    const id = text(item.todoId || item.todo_id || item.id || item.clientTodoId || item.client_todo_id, `todo-${index}`);
+    const id = text(
+      item.todoDispatchId
+        || item.todo_dispatch_id
+        || item.dispatchId
+        || item.dispatch_id
+        || item.commandId
+        || item.command_id
+        || item.todoId
+        || item.todo_id
+        || item.id
+        || item.clientTodoId
+        || item.client_todo_id,
+      `todo-${index}`,
+    );
     const sourceDeviceId = text(item.deviceId || item.device_id || item.sourceDeviceId || item.source_device_id);
     const key = `${sourceDeviceId}::${id}`;
     if (seen.has(key)) return false;
@@ -398,6 +415,97 @@ function architectureTodoSourceLabel(item) {
   return source.replace(/[-_]+/gu, " ");
 }
 
+function architectureTodoNestedObject(item, keys) {
+  return keys
+    .map((key) => jsonObject(item?.[key]))
+    .find(Boolean) || {};
+}
+
+function architectureTodoEndpointLabel(endpoint, fallback = "unknown") {
+  const device = text(endpoint.deviceName || endpoint.deviceId);
+  const workspace = text(endpoint.workspaceName || endpoint.workspaceId);
+  if (device && workspace) return `${device} / ${workspace}`;
+  return device || workspace || fallback;
+}
+
+function architectureTodoSourceEndpoint(item) {
+  const dispatchSource = architectureTodoNestedObject(item, [
+    "dispatchSource",
+    "dispatch_source",
+    "sourceContext",
+    "source_context",
+    "sourceEndpoint",
+    "source_endpoint",
+    "origin",
+  ]);
+  const device = jsonObject(item?.device) || {};
+  const deviceId = text(
+    dispatchSource.deviceId
+      || dispatchSource.device_id
+      || item?.todoDeviceId
+      || item?.todo_device_id
+      || item?.requestedByDeviceId
+      || item?.requested_by_device_id
+      || item?.sourceDeviceId
+      || item?.source_device_id
+      || item?.deviceId
+      || item?.device_id
+      || device.deviceId
+      || device.device_id,
+  );
+  const deviceName = text(
+    dispatchSource.deviceName
+      || dispatchSource.device_name
+      || item?.todoDeviceName
+      || item?.todo_device_name
+      || item?.requestedByDeviceName
+      || item?.requested_by_device_name
+      || item?.sourceDeviceName
+      || item?.source_device_name
+      || item?.deviceName
+      || item?.device_name
+      || item?.machineName
+      || item?.machine_name
+      || device.deviceName
+      || device.device_name
+      || device.machineName
+      || device.machine_name,
+  );
+  const workspaceId = text(
+    dispatchSource.workspaceId
+      || dispatchSource.workspace_id
+      || item?.todoWorkspaceId
+      || item?.todo_workspace_id
+      || item?.requestedByWorkspaceId
+      || item?.requested_by_workspace_id
+      || item?.sourceWorkspaceId
+      || item?.source_workspace_id
+      || item?.workspaceId
+      || item?.workspace_id,
+  );
+  const workspaceName = text(
+    dispatchSource.workspaceName
+      || dispatchSource.workspace_name
+      || item?.todoWorkspaceName
+      || item?.todo_workspace_name
+      || item?.requestedByWorkspaceName
+      || item?.requested_by_workspace_name
+      || item?.sourceWorkspaceName
+      || item?.source_workspace_name
+      || item?.workspaceName
+      || item?.workspace_name,
+  );
+  return {
+    clientId: text(dispatchSource.clientId || dispatchSource.client_id || item?.sourceClientId || item?.source_client_id),
+    clientKind: text(dispatchSource.clientKind || dispatchSource.client_kind || item?.sourceClientKind || item?.source_client_kind),
+    deviceId,
+    deviceName,
+    label: architectureTodoEndpointLabel({ deviceId, deviceName, workspaceId, workspaceName }, "source device"),
+    workspaceId,
+    workspaceName,
+  };
+}
+
 function architectureTodoTargetLabel(item) {
   const targetWorkspace = text(
     item?.targetWorkspaceName
@@ -423,6 +531,65 @@ function architectureTodoTargetLabel(item) {
   return targetDevice || targetWorkspace || "workspace";
 }
 
+function architectureTodoTargetEndpoint(item) {
+  const dispatchTarget = architectureTodoNestedObject(item, [
+    "dispatchTarget",
+    "dispatch_target",
+    "targetContext",
+    "target_context",
+    "targetEndpoint",
+    "target_endpoint",
+    "target",
+  ]);
+  const deviceId = text(
+    dispatchTarget.deviceId
+      || dispatchTarget.device_id
+      || item?.targetDeviceId
+      || item?.target_device_id
+      || item?.deviceId
+      || item?.device_id,
+  );
+  const deviceName = text(
+    dispatchTarget.deviceName
+      || dispatchTarget.device_name
+      || item?.targetDeviceName
+      || item?.target_device_name
+      || item?.machineName
+      || item?.machine_name
+      || item?.deviceName
+      || item?.device_name,
+  );
+  const workspaceId = text(
+    dispatchTarget.workspaceId
+      || dispatchTarget.workspace_id
+      || item?.targetWorkspaceId
+      || item?.target_workspace_id
+      || item?.workspaceId
+      || item?.workspace_id,
+  );
+  const workspaceName = text(
+    dispatchTarget.workspaceName
+      || dispatchTarget.workspace_name
+      || item?.targetWorkspaceName
+      || item?.target_workspace_name
+      || item?.workspaceName
+      || item?.workspace_name,
+  );
+  return {
+    agentId: text(dispatchTarget.agentId || dispatchTarget.agent_id || item?.targetAgentId || item?.target_agent_id),
+    clientId: text(dispatchTarget.clientId || dispatchTarget.client_id || item?.targetClientId || item?.target_client_id),
+    clientKind: text(dispatchTarget.clientKind || dispatchTarget.client_kind || item?.targetClientKind || item?.target_client_kind),
+    deviceId,
+    deviceName,
+    label: architectureTodoEndpointLabel({ deviceId, deviceName, workspaceId, workspaceName }, architectureTodoTargetLabel(item)),
+    terminalId: text(dispatchTarget.terminalId || dispatchTarget.terminal_id || item?.targetTerminalId || item?.target_terminal_id),
+    terminalIndex: item?.targetTerminalIndex ?? item?.target_terminal_index ?? dispatchTarget.terminalIndex ?? dispatchTarget.terminal_index,
+    threadId: text(dispatchTarget.threadId || dispatchTarget.thread_id || item?.targetThreadId || item?.target_thread_id),
+    workspaceId,
+    workspaceName,
+  };
+}
+
 function architectureTodoCreatedMs(item) {
   return parseTimeMs(item?.createdAt || item?.created_at || item?.queuedAt || item?.queued_at);
 }
@@ -438,7 +605,148 @@ function architectureTodoFinishedMs(item, status) {
   return 0;
 }
 
-function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspaceId) {
+function architectureTodoRefs(item, fallbackId = "") {
+  const todoId = text(item?.todoId || item?.todo_id || item?.id || item?.clientTodoId || item?.client_todo_id);
+  const dispatchId = text(
+    item?.dispatchId
+      || item?.dispatch_id
+      || item?.todoDispatchId
+      || item?.todo_dispatch_id,
+  );
+  const commandId = text(item?.commandId || item?.command_id);
+  const promptEventId = text(item?.promptEventId || item?.prompt_event_id);
+  const batchId = text(item?.todoBatchId || item?.todo_batch_id || item?.batchId || item?.batch_id);
+  const historyId = text(dispatchId || commandId || promptEventId || todoId || batchId, fallbackId);
+  return {
+    batchId,
+    commandId,
+    dispatchId,
+    historyId,
+    promptEventId,
+    todoId,
+  };
+}
+
+function architectureTaskSourceRefs(task) {
+  const metadata = jsonObject(task?.metadata_json || task?.metadata) || {};
+  const source = jsonObject(task?.source_todo || task?.sourceTodo || metadata.source_todo || metadata.sourceTodo) || {};
+  return {
+    commandId: text(
+      task?.source_command_id
+        || task?.sourceCommandId
+        || task?.command_id
+        || task?.commandId
+        || source.command_id
+        || source.commandId,
+    ),
+    dispatchId: text(
+      task?.source_todo_dispatch_id
+        || task?.sourceTodoDispatchId
+        || task?.todo_dispatch_id
+        || task?.todoDispatchId
+        || source.todo_dispatch_id
+        || source.todoDispatchId,
+    ),
+    promptEventId: text(
+      task?.source_prompt_event_id
+        || task?.sourcePromptEventId
+        || task?.prompt_event_id
+        || task?.promptEventId
+        || source.prompt_event_id
+        || source.promptEventId,
+    ),
+    todoId: text(
+      task?.source_todo_id
+        || task?.sourceTodoId
+        || task?.todo_id
+        || task?.todoId
+        || source.todo_id
+        || source.todoId,
+    ),
+  };
+}
+
+function architectureTaskMatchesTodo(task, todoRefs) {
+  const taskRefs = architectureTaskSourceRefs(task);
+  return Boolean(
+    (todoRefs.todoId && taskRefs.todoId === todoRefs.todoId)
+      || (todoRefs.dispatchId && taskRefs.dispatchId === todoRefs.dispatchId)
+      || (todoRefs.commandId && taskRefs.commandId === todoRefs.commandId)
+      || (todoRefs.promptEventId && taskRefs.promptEventId === todoRefs.promptEventId),
+  );
+}
+
+function architectureTasksForTodo(todoRefs, tasks) {
+  return jsonArray(tasks)
+    .filter((task) => architectureTaskMatchesTodo(task, todoRefs))
+    .sort((left, right) => taskUpdatedMs(right) - taskUpdatedMs(left));
+}
+
+function architecturePlanSteps(plan) {
+  return jsonArray(plan?.steps).length
+    ? jsonArray(plan.steps)
+    : jsonArray(plan?.planSteps).length
+      ? jsonArray(plan.planSteps)
+      : jsonArray(plan?.plan_steps).length
+        ? jsonArray(plan.plan_steps)
+        : jsonArray(plan?.items);
+}
+
+function architecturePlanTitle(plan, fallback = "Plan") {
+  return text(plan?.title || plan?.name || plan?.objective || plan?.summary, fallback);
+}
+
+function architecturePlanDescription(plan) {
+  return text(plan?.description || plan?.detail || plan?.details || plan?.summary || plan?.result);
+}
+
+function architectureTodoPlanEntries(item, relatedTasks = []) {
+  const entries = [];
+  const seen = new Set();
+  const addPlan = (plan, sourceLabel, keyHint, task = null) => {
+    const normalized = jsonObject(plan);
+    if (!normalized) return;
+    const key = text(
+      normalized.plan_id
+        || normalized.planId
+        || normalized.id
+        || keyHint
+        || `${sourceLabel}-${entries.length}`,
+    );
+    const dedupeKey = `${sourceLabel}:${key}:${architecturePlanTitle(normalized)}`;
+    if (seen.has(dedupeKey)) return;
+    seen.add(dedupeKey);
+    entries.push({
+      key: dedupeKey,
+      plan: normalized,
+      sourceLabel,
+      task,
+      title: architecturePlanTitle(normalized, task ? taskDisplayTitle(task) : "Todo plan"),
+    });
+  };
+
+  [
+    item?.terminal_task_plan,
+    item?.terminalTaskPlan,
+    item?.terminalPlan,
+    item?.terminal_plan,
+    item?.plan,
+    item?.planTask,
+    item?.plan_task,
+  ].forEach((plan, index) => addPlan(plan, "Todo", `todo-inline-${index}`));
+  jsonArray(item?.plans).forEach((plan, index) => addPlan(plan, "Todo", `todo-plan-${index}`));
+  jsonArray(item?.terminalPlans || item?.terminal_plans).forEach((plan, index) => (
+    addPlan(plan, "Todo", `todo-terminal-plan-${index}`)
+  ));
+  relatedTasks.forEach((task, index) => {
+    const plan = taskTerminalPlan(task);
+    if (plan) addPlan(plan, "Task", taskPlanTaskId(task, `task-${index}`), task);
+  });
+
+  return entries;
+}
+
+function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspaceId, tasks = []) {
   return architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId)
     .map((item, index) => {
       const status = architectureNormalizeTodoStatus(
@@ -455,20 +763,36 @@ function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspac
         || createdMs;
       const body = architectureTodoText(item);
       const bodyTitle = architectureTodoPreviewText(body);
-      const id = text(item.todoId || item.todo_id || item.id || item.clientTodoId || item.client_todo_id, `todo-${index}`);
+      const refs = architectureTodoRefs(item, `todo-${index}`);
+      const relatedTasks = architectureTasksForTodo(refs, tasks);
+      const relatedPlans = architectureTodoPlanEntries(item, relatedTasks);
+      const sourceDevice = architectureTodoSourceEndpoint(item);
+      const targetDevice = architectureTodoTargetEndpoint(item);
       return {
+        batchId: refs.batchId,
         body,
+        commandId: refs.commandId,
         createdMs,
+        dispatchId: refs.dispatchId,
         duration: formatTimelineDuration(createdMs, finishedMs || updatedMs, status === "running"),
-        id,
+        id: refs.historyId,
+        planCount: relatedPlans.length,
+        promptEventId: refs.promptEventId,
+        raw: item,
         rawStatus: text(item.todoStatus || item.todo_status || item.status || item.cloudStatus || item.cloud_status, status),
+        relatedPlans,
+        relatedTasks,
         source: architectureTodoSourceLabel(item),
+        sourceDevice,
         status,
         statusKind: architectureTodoStatusKind(status),
         statusLabel: architectureTodoStatusLabel(status),
-        target: architectureTodoTargetLabel(item),
+        target: targetDevice.label || architectureTodoTargetLabel(item),
+        targetDevice,
+        taskCount: relatedTasks.length,
         title: architectureTodoTitle(item, `Todo ${index + 1}`),
         titleFromBody: Boolean(bodyTitle),
+        todoId: refs.todoId,
         updatedMs,
       };
     })
@@ -4814,10 +5138,6 @@ export default function ArchitectureWorkspaceView({
   const activeArchitectureSnapshot = localArchitectureSnapshot || architectureSnapshot;
   const taskHistory = useMemo(() => taskHistoryFromSnapshot(activeArchitectureSnapshot), [activeArchitectureSnapshot]);
   const tasks = useMemo(() => jsonArray(taskHistory.tasks), [taskHistory]);
-  const todoHistoryItems = useMemo(
-    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId),
-    [activeWorkspaceId, workspaceTodos],
-  );
   const visibleTasks = useMemo(() => {
     if (!finishedPlanTaskIds.size) return tasks;
     return tasks.map((task, index) => {
@@ -4825,6 +5145,10 @@ export default function ArchitectureWorkspaceView({
       return finishedPlanTaskIds.has(taskId) ? taskWithCompletedTerminalPlan(task) : task;
     });
   }, [finishedPlanTaskIds, tasks]);
+  const todoHistoryItems = useMemo(
+    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId, visibleTasks),
+    [activeWorkspaceId, visibleTasks, workspaceTodos],
+  );
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "architectures"
     ? `Architectures · repo scoped · ${repoLabel}`
@@ -8416,6 +8740,22 @@ function HistoryTimeline({
 }
 
 function TodosHistoryPanel({ items = [], repoLabel }) {
+  const [selectedTodoId, setSelectedTodoId] = useState("");
+
+  useEffect(() => {
+    if (!items.length) {
+      if (selectedTodoId) setSelectedTodoId("");
+      return;
+    }
+    if (!items.some((item) => item.id === selectedTodoId)) {
+      setSelectedTodoId(items[0].id);
+    }
+  }, [items, selectedTodoId]);
+
+  const selectedItem = items.find((item) => item.id === selectedTodoId)
+    || items[0]
+    || null;
+
   if (!items.length) {
     return (
       <HistoryPane>
@@ -8433,49 +8773,228 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
         </div>
         <TimelineSummary>{items.length} todo{items.length === 1 ? "" : "s"} · newest first</TimelineSummary>
       </TimelineHeader>
-      <TodoHistoryList aria-label="Todos history list">
-        {items.map((item) => {
-          const updated = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
-          const created = formatTime(item.createdMs) || "";
-          const detail = [item.target, item.source, created].filter(Boolean).join(" · ");
-          const isLive = item.statusKind === "active" || item.statusKind === "queued";
-          return (
-            <TodoHistoryRow
-              data-live={isLive ? "true" : "false"}
-              data-status={item.statusKind}
-              key={item.id}
-              title={detail}
-            >
-              <TodoHistoryStatusDot
-                aria-hidden="true"
+      <HistorySplit>
+        <TodoHistoryList aria-label="Todos history list">
+          {items.map((item) => {
+            const updated = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
+            const created = formatTime(item.createdMs) || "";
+            const detail = [item.targetDevice?.label, item.sourceDevice?.label, created].filter(Boolean).join(" -> ");
+            const isLive = item.statusKind === "active" || item.statusKind === "queued";
+            const selected = selectedItem?.id === item.id;
+            return (
+              <TodoHistoryRow
+                aria-pressed={selected}
                 data-live={isLive ? "true" : "false"}
+                data-selected={selected ? "true" : "false"}
                 data-status={item.statusKind}
-              />
-              <TodoHistoryBody>
-                <TodoHistoryTitleLine>
-                  <TodoHistoryTitle>{item.title}</TodoHistoryTitle>
-                  <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
-                    {item.statusLabel}
-                  </StatusPill>
-                </TodoHistoryTitleLine>
-                {item.body && !item.titleFromBody && item.body !== item.title && (
-                  <TodoHistoryText>{item.body}</TodoHistoryText>
-                )}
-                <TodoHistoryMeta>
-                  <TodoHistoryMetaChip>{item.target}</TodoHistoryMetaChip>
-                  <TodoHistoryMetaChip>{item.source}</TodoHistoryMetaChip>
-                  {item.duration && <TodoHistoryMetaChip>{item.duration}</TodoHistoryMetaChip>}
-                </TodoHistoryMeta>
-              </TodoHistoryBody>
-              <TodoHistoryTime>
-                <strong>{updated}</strong>
-                {created && <span>{created}</span>}
-              </TodoHistoryTime>
-            </TodoHistoryRow>
-          );
-        })}
-      </TodoHistoryList>
+                key={item.id}
+                onClick={() => setSelectedTodoId(item.id)}
+                title={detail}
+                type="button"
+              >
+                <TodoHistoryStatusDot
+                  aria-hidden="true"
+                  data-live={isLive ? "true" : "false"}
+                  data-status={item.statusKind}
+                />
+                <TodoHistoryBody>
+                  <TodoHistoryTitleLine>
+                    <TodoHistoryTitle>{item.title}</TodoHistoryTitle>
+                    <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
+                      {item.statusLabel}
+                    </StatusPill>
+                  </TodoHistoryTitleLine>
+                  {item.body && !item.titleFromBody && item.body !== item.title && (
+                    <TodoHistoryText>{item.body}</TodoHistoryText>
+                  )}
+                  <TodoHistoryMeta>
+                    <TodoHistoryMetaChip>{item.taskCount} task{item.taskCount === 1 ? "" : "s"}</TodoHistoryMetaChip>
+                    <TodoHistoryMetaChip>{item.planCount} plan{item.planCount === 1 ? "" : "s"}</TodoHistoryMetaChip>
+                    <TodoHistoryMetaChip>{item.sourceDevice?.label || "source device"}</TodoHistoryMetaChip>
+                    <TodoHistoryMetaChip>{item.targetDevice?.label || item.target}</TodoHistoryMetaChip>
+                    {item.duration && <TodoHistoryMetaChip>{item.duration}</TodoHistoryMetaChip>}
+                  </TodoHistoryMeta>
+                </TodoHistoryBody>
+                <TodoHistoryTime>
+                  <strong>{updated}</strong>
+                  {created && <span>{created}</span>}
+                </TodoHistoryTime>
+              </TodoHistoryRow>
+            );
+          })}
+        </TodoHistoryList>
+        <TodoDetailPanel
+          item={selectedItem}
+          repoLabel={repoLabel}
+        />
+      </HistorySplit>
     </HistoryPane>
+  );
+}
+
+function TodoDetailPanel({ item, repoLabel }) {
+  if (!item) {
+    return (
+      <TaskDetails>
+        <EmptyState>Select a todo to inspect it.</EmptyState>
+      </TaskDetails>
+    );
+  }
+
+  const updatedRelative = formatRelativeTimeMs(item.updatedMs || item.createdMs) || "unknown";
+  const created = formatTime(item.createdMs) || "unknown";
+  const sourceDevice = item.sourceDevice || {};
+  const targetDevice = item.targetDevice || {};
+  const todoIds = [
+    ["Todo", item.todoId],
+    ["Dispatch", item.dispatchId],
+    ["Command", item.commandId],
+    ["Batch", item.batchId],
+    ["Prompt", item.promptEventId],
+  ].filter(([, value]) => text(value));
+
+  return (
+    <TaskDetails aria-label="Selected todo details">
+      <TaskDetailsHeader>
+        <div>
+          <TimelineKicker>{repoLabel}</TimelineKicker>
+          <TaskDetailsTitle>{item.title}</TaskDetailsTitle>
+        </div>
+        <TaskDetailsHeaderActions>
+          <TaskDetailsUpdated>Updated {updatedRelative}</TaskDetailsUpdated>
+          <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
+            {item.statusLabel}
+          </StatusPill>
+        </TaskDetailsHeaderActions>
+      </TaskDetailsHeader>
+      <TaskMetaStrip>
+        <TaskMetaChip>
+          <span>Source Device</span>
+          <strong>{sourceDevice.label || "unknown"}</strong>
+        </TaskMetaChip>
+        <TaskMetaChip>
+          <span>Target Device</span>
+          <strong>{targetDevice.label || item.target || "unknown"}</strong>
+        </TaskMetaChip>
+        <TaskMetaChip>
+          <span>Tasks</span>
+          <strong>{item.taskCount}</strong>
+        </TaskMetaChip>
+        <TaskMetaChip>
+          <span>Plans</span>
+          <strong>{item.planCount}</strong>
+        </TaskMetaChip>
+      </TaskMetaStrip>
+      <TodoDeviceGrid>
+        <TodoDeviceCard>
+          <span>Source</span>
+          <strong>{sourceDevice.deviceName || sourceDevice.deviceId || "unknown device"}</strong>
+          <em>{sourceDevice.workspaceName || sourceDevice.workspaceId || "unknown workspace"}</em>
+          {sourceDevice.clientKind && <em>{sourceDevice.clientKind}</em>}
+        </TodoDeviceCard>
+        <TodoDeviceCard>
+          <span>Target</span>
+          <strong>{targetDevice.deviceName || targetDevice.deviceId || "unknown device"}</strong>
+          <em>{targetDevice.workspaceName || targetDevice.workspaceId || "unknown workspace"}</em>
+          {targetDevice.agentId && <em>{targetDevice.agentId}</em>}
+          {Number.isInteger(Number(targetDevice.terminalIndex)) && <em>Terminal {Number(targetDevice.terminalIndex) + 1}</em>}
+        </TodoDeviceCard>
+      </TodoDeviceGrid>
+      <TaskInputPanel>
+        <TaskInputBlock>
+          <span>Todo</span>
+          <p>{item.body || item.title || "No todo body recorded."}</p>
+        </TaskInputBlock>
+        <TaskInputBlock>
+          <span>Dispatch</span>
+          <TodoIdList>
+            {todoIds.length ? todoIds.map(([label, value]) => (
+              <TodoIdChip key={`${label}-${value}`}>
+                <span>{label}</span>
+                <strong>{value}</strong>
+              </TodoIdChip>
+            )) : <TodoEmptyInline>No dispatch identifiers recorded.</TodoEmptyInline>}
+          </TodoIdList>
+        </TaskInputBlock>
+      </TaskInputPanel>
+      <TodoDetailSection>
+        <TodoDetailSectionHeader>
+          <span>Tasks under this todo</span>
+          <strong>{item.relatedTasks.length}</strong>
+        </TodoDetailSectionHeader>
+        {item.relatedTasks.length ? (
+          <TodoTaskList>
+            {item.relatedTasks.map((task, index) => {
+              const taskId = taskPlanTaskId(task, `task-${index}`);
+              const updated = formatRelativeTimeMs(taskUpdatedMs(task)) || "unknown";
+              return (
+                <TodoTaskRow key={taskId}>
+                  <div>
+                    <strong>{taskDisplayTitle(task)}</strong>
+                    <span>{taskId}</span>
+                  </div>
+                  <TodoTaskMeta>
+                    <StatusPill data-status={taskStatusKind(task)} title={`Actual status: ${taskStatusLabel(task)}`}>
+                      {taskTimelineStatusLabel(task)}
+                    </StatusPill>
+                    {taskAgentLabel(task) && <em>{taskAgentLabel(task)}</em>}
+                    <em>{updated}</em>
+                  </TodoTaskMeta>
+                </TodoTaskRow>
+              );
+            })}
+          </TodoTaskList>
+        ) : (
+          <TodoEmptyInline>No matching task records yet.</TodoEmptyInline>
+        )}
+      </TodoDetailSection>
+      <TodoDetailSection>
+        <TodoDetailSectionHeader>
+          <span>Plans under this todo</span>
+          <strong>{item.relatedPlans.length}</strong>
+        </TodoDetailSectionHeader>
+        {item.relatedPlans.length ? item.relatedPlans.map((entry) => {
+          const planSteps = architecturePlanSteps(entry.plan);
+          const planDetail = architecturePlanDescription(entry.plan);
+          return (
+            <TaskPlanCard key={entry.key}>
+              <TaskPlanHeader>
+                <span>{entry.sourceLabel} plan</span>
+                <strong>{entry.title}</strong>
+              </TaskPlanHeader>
+              {entry.task && <TaskPlanDescription>Task: {taskDisplayTitle(entry.task)}</TaskPlanDescription>}
+              {planDetail && <TaskPlanDescription>{planDetail}</TaskPlanDescription>}
+              {planSteps.length > 0 ? (
+                <TaskPlanSteps>
+                  {planSteps.map((step, index) => {
+                    const stepStatus = planStepStatusKind(step);
+                    const stepDetail = planStepDetail(step);
+                    return (
+                      <TaskPlanStep data-status={stepStatus} key={`${entry.key}-step-${text(step?.id || step?.index, index)}`}>
+                        <TaskPlanStepMarker aria-hidden="true" data-status={stepStatus}>
+                          <span />
+                        </TaskPlanStepMarker>
+                        <TaskPlanStepContent>
+                          <TaskPlanStepTitleRow>
+                            <strong>{planStepTitle(step, index)}</strong>
+                            <TaskPlanStepBadge data-status={stepStatus}>{planStepStatusLabel(step)}</TaskPlanStepBadge>
+                          </TaskPlanStepTitleRow>
+                          {stepDetail && <p>{stepDetail}</p>}
+                        </TaskPlanStepContent>
+                      </TaskPlanStep>
+                    );
+                  })}
+                </TaskPlanSteps>
+              ) : (
+                <TodoEmptyInline>No plan steps recorded.</TodoEmptyInline>
+              )}
+            </TaskPlanCard>
+          );
+        }) : (
+          <TodoEmptyInline>No matching plans recorded yet.</TodoEmptyInline>
+        )}
+      </TodoDetailSection>
+    </TaskDetails>
   );
 }
 
@@ -11222,15 +11741,36 @@ const todoHistoryDotSpin = keyframes`
   }
 `;
 
-const TodoHistoryRow = styled.div`
+const TodoHistoryRow = styled.button`
   position: relative;
   display: grid;
   grid-template-columns: 20px minmax(0, 1fr) minmax(92px, 126px);
   gap: 10px;
+  width: 100%;
   min-width: 0;
   padding: 10px 0;
+  border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
   color: var(--forge-text);
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease, box-shadow 140ms ease;
+
+  &:hover {
+    background: rgba(148, 163, 184, 0.055);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(96, 165, 250, 0.7);
+    outline-offset: -2px;
+  }
+
+  &[data-selected="true"] {
+    background: rgba(37, 99, 235, 0.13);
+    box-shadow: inset 2px 0 0 rgba(96, 165, 250, 0.75);
+  }
 
   &[data-status="active"] {
     background: linear-gradient(90deg, rgba(37, 99, 235, 0.08), transparent 62%);
@@ -11238,6 +11778,14 @@ const TodoHistoryRow = styled.div`
 
   &[data-status="queued"] {
     background: linear-gradient(90deg, rgba(14, 165, 233, 0.055), transparent 62%);
+  }
+
+  &[data-selected="true"][data-status="active"] {
+    background: linear-gradient(90deg, rgba(37, 99, 235, 0.17), rgba(37, 99, 235, 0.05) 62%);
+  }
+
+  &[data-selected="true"][data-status="queued"] {
+    background: linear-gradient(90deg, rgba(14, 165, 233, 0.14), rgba(14, 165, 233, 0.035) 62%);
   }
 
   &[data-live="true"]::before {
@@ -12072,6 +12620,204 @@ const TaskInputBlock = styled.div`
     font-weight: 700;
     line-height: 1.4;
     overflow-wrap: anywhere;
+  }
+`;
+
+const TodoDeviceGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 700px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const TodoDeviceCard = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.22);
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  strong,
+  em {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.94);
+    font-size: 12px;
+    font-weight: 850;
+  }
+
+  em {
+    color: rgba(203, 213, 225, 0.7);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 720;
+  }
+`;
+
+const TodoIdList = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+`;
+
+const TodoIdChip = styled.div`
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.11);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.36);
+
+  span {
+    color: rgba(148, 163, 184, 0.78);
+    font-size: 8px;
+    font-weight: 900;
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(226, 232, 240, 0.88);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9px;
+    font-weight: 760;
+  }
+`;
+
+const TodoEmptyInline = styled.span`
+  display: block;
+  color: rgba(148, 163, 184, 0.72);
+  font-size: 10px;
+  font-weight: 720;
+  line-height: 1.35;
+`;
+
+const TodoDetailSection = styled.section`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const TodoDetailSectionHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 2px;
+
+  span {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  strong {
+    display: inline-grid;
+    place-items: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border: 1px solid rgba(96, 165, 250, 0.18);
+    border-radius: 999px;
+    color: rgba(191, 219, 254, 0.86);
+    background: rgba(30, 64, 175, 0.12);
+    font-size: 10px;
+    font-weight: 900;
+  }
+`;
+
+const TodoTaskList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const TodoTaskRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.2);
+
+  > div:first-child {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.94);
+    font-size: 11px;
+    font-weight: 820;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.76);
+    font-size: 9px;
+    font-weight: 720;
+  }
+
+  @media (max-width: 700px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const TodoTaskMeta = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+
+  em {
+    max-width: 120px;
+    overflow: hidden;
+    color: rgba(203, 213, 225, 0.68);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 720;
+  }
+
+  @media (max-width: 700px) {
+    justify-content: flex-start;
   }
 `;
 
