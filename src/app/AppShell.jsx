@@ -12537,7 +12537,7 @@ export default function App() {
             ).trim().toLowerCase();
             const statusActivity = rawActivity
               || (liveStatus === "error" ? "error" : "")
-              || (liveStatus === "starting" ? "thinking" : "");
+              || (liveStatus === "starting" ? "starting" : "");
             const status = terminalPresenceStatusFromActivityStatus(statusActivity, {
               fallbackStatus: "idle",
               liveStatus: ["closed", "closing", "exited", "offline"].includes(liveStatus)
@@ -15707,20 +15707,110 @@ export default function App() {
         ...(details && typeof details === "object" ? { details } : {}),
       }).catch(() => {})
     );
-    const syncRemoteControlState = async (reason) => {
-      await new Promise((resolve) => window.setTimeout(resolve, 180));
+    const remoteControlWorkspaceCatalogTargets = (lifecycleOverride = null) => {
+      const overrideWorkspaceId = String(lifecycleOverride?.workspaceId || "").trim();
+      const activeWorkspaceIds = new Set(normalizeEnabledWorkspaceIds([
+        ...normalizeEnabledWorkspaceIds(workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds),
+        activatedWorkspaceIdRef.current,
+      ]));
+      if (overrideWorkspaceId) {
+        if (lifecycleOverride?.active) {
+          activeWorkspaceIds.add(overrideWorkspaceId);
+        } else {
+          activeWorkspaceIds.delete(overrideWorkspaceId);
+        }
+      }
+      return (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+        .map((workspace) => {
+          const workspaceId = String(workspace?.id || "").trim();
+          if (!workspaceId) {
+            return null;
+          }
+          const rootDirectory = cleanWorkspaceRootDirectory(
+            getWorkspaceRootDirectory(workspaceSettingsRef.current, workspaceId)
+              || defaultWorkingDirectoryRef.current
+              || "",
+          );
+          const workspaceActive = activeWorkspaceIds.has(workspaceId);
+          return {
+            dashboardWorkspace: true,
+            displaySurface: "dashboard_workspace",
+            logicalTerminalCount: getWorkspaceTerminalCount(workspaceSettingsRef.current, workspaceId),
+            mountId: "",
+            projectName: "",
+            repoPath: rootDirectory,
+            workspaceActive,
+            workspaceId,
+            workspaceName: workspace?.name || workspaceId,
+            workspaceRole: "desktop_workspace",
+            workspaceRoot: rootDirectory,
+            workspaceStatus: workspaceActive ? "active" : "deactivated",
+          };
+        })
+        .filter(Boolean);
+    };
+    const applyRemoteControlWorkspaceOverride = (workspacesSnapshot, lifecycleOverride = null) => {
+      const overrideWorkspaceId = String(lifecycleOverride?.workspaceId || "").trim();
+      if (!overrideWorkspaceId) {
+        return workspacesSnapshot;
+      }
+      const catalogTarget = remoteControlWorkspaceCatalogTargets(lifecycleOverride)
+        .find((workspace) => String(workspace?.workspaceId || "").trim() === overrideWorkspaceId);
+      if (!catalogTarget) {
+        return workspacesSnapshot;
+      }
+      let matched = false;
+      const adjusted = workspacesSnapshot.map((workspace) => {
+        const workspaceId = String(workspace?.workspaceId || workspace?.workspace_id || "").trim();
+        if (workspaceId !== overrideWorkspaceId) {
+          return workspace;
+        }
+        matched = true;
+        return {
+          ...workspace,
+          repoPath: workspace?.repoPath || workspace?.repo_path || catalogTarget.repoPath,
+          workspaceActive: Boolean(lifecycleOverride.active),
+          workspaceId: overrideWorkspaceId,
+          workspaceName: workspace?.workspaceName || workspace?.workspace_name || catalogTarget.workspaceName,
+          workspaceStatus: lifecycleOverride.active ? "active" : "deactivated",
+          ...(lifecycleOverride.active ? {} : { terminals: [] }),
+        };
+      });
+      if (matched) {
+        return adjusted;
+      }
+      return [
+        ...adjusted,
+        {
+          ...catalogTarget,
+          terminals: [],
+        },
+      ];
+    };
+    const syncRemoteControlState = async (reason, lifecycleOverride = null) => {
+      await new Promise((resolve) => window.setTimeout(resolve, lifecycleOverride ? 40 : 180));
       const workspacesSnapshot = Array.isArray(terminalPresenceWorkspacesRef.current)
         ? terminalPresenceWorkspacesRef.current
         : [];
-      if (workspacesSnapshot.length > 0) {
-        await invoke("cloud_mcp_sync_terminal_presence", {
+      const catalogTargets = remoteControlWorkspaceCatalogTargets(lifecycleOverride);
+      if (catalogTargets.length > 0) {
+        await invoke("cloud_mcp_sync_device_workspace_catalog", {
           reason,
-          workspaces: workspacesSnapshot,
+          workspaces: catalogTargets,
         }).catch(() => {});
       }
-      await invoke("cloud_mcp_sync_device_workspace_snapshot", {
-        reason,
-      }).catch(() => {});
+      const adjustedWorkspaces = applyRemoteControlWorkspaceOverride(workspacesSnapshot, lifecycleOverride);
+      if (adjustedWorkspaces.length > 0) {
+        await invoke("cloud_mcp_sync_terminal_presence", {
+          reason,
+          workspaces: adjustedWorkspaces,
+        }).catch(() => {});
+      }
+      if (!lifecycleOverride) {
+        await invoke("cloud_mcp_sync_device_workspace_snapshot", {
+          reason,
+        }).catch(() => {});
+      }
     };
     const remoteControlTerminalText = (terminal, keys) => {
       for (const key of keys) {
@@ -16069,8 +16159,19 @@ export default function App() {
         return;
       }
       if (normalizedKind === "workspace_activate" || normalizedKind === "activate_workspace") {
-        activateWorkspace(workspaceId, "remote_control");
-        await syncRemoteControlState("remote_workspace_activate");
+        const activated = activateWorkspace(workspaceId, "remote_control");
+        if (!activated) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace could not be activated on this desktop.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        await syncRemoteControlState("remote_workspace_activate", {
+          active: true,
+          workspaceId,
+        });
         await recordRemoteCommandStatus(event, "completed", "Workspace activated from the web dashboard.", {
           commandId,
           commandKind,
@@ -16144,7 +16245,10 @@ export default function App() {
           return;
         }
         await deactivateWorkspace(workspaceId, "remote_control");
-        await syncRemoteControlState("remote_workspace_deactivate_if_idle");
+        await syncRemoteControlState("remote_workspace_deactivate_if_idle", {
+          active: false,
+          workspaceId,
+        });
         await recordRemoteCommandStatus(event, "completed", "Workspace deactivated from the web dashboard.", {
           commandId,
           commandKind,

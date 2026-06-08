@@ -20,6 +20,7 @@ const TERMINAL_ACTIVITY_THINKING_STATES = new Set([
   "resumed",
   "running",
   "shell",
+  "starting",
   "subagent",
   "subagent_completed",
   "subagent_running",
