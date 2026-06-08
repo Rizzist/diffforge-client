@@ -2683,11 +2683,53 @@ function sanitizeCodingAgentStatusForCloud(status) {
   if (!provider) {
     return null;
   }
+  const installed = Boolean(status.installed);
+  const authenticated = Boolean(status.authenticated);
+  const npmAvailable = Boolean(status.npmAvailable);
+  const npmInstalled = Boolean(status.npmInstalled);
+  const npmPackageVersion = safeCloudMcpText(status.npmPackageVersion, "").slice(0, 120);
+  const npmLatestVersion = safeCloudMcpText(status.npmLatestVersion, "").slice(0, 120);
+  const npmUpdateAvailable = Boolean(installed && npmInstalled && status.npmUpdateAvailable);
+  const npmPackageVersionKnown = Boolean(
+    npmPackageVersion
+      && npmPackageVersion !== "Not checked"
+      && npmPackageVersion !== "Detected",
+  );
+  const npmLatestVersionKnown = Boolean(npmLatestVersion && npmLatestVersion !== "Not checked");
+  const updateKnown = Boolean(installed && npmInstalled && npmPackageVersionKnown && npmLatestVersionKnown);
+  const upToDate = Boolean(updateKnown && !npmUpdateAvailable);
+  const operation = safeCloudMcpText(status.packageOperation || status.operation, "").slice(0, 40);
+  const installing = operation === "installing" || Boolean(status.installing);
+  const updating = operation === "updating" || Boolean(status.updating);
+  const packageStatus = installing
+    ? "installing"
+    : updating
+      ? "updating"
+      : npmUpdateAvailable
+        ? "update_available"
+        : upToDate
+          ? "up_to_date"
+          : installed
+            ? "installed"
+            : "missing";
   return {
     id,
     label: safeCloudMcpText(status.label || status.agent_label || status.agentLabel, provider.label).slice(0, 80),
-    installed: Boolean(status.installed),
-    authenticated: Boolean(status.authenticated),
+    installed,
+    authenticated,
+    version: safeCloudMcpText(status.version, "").slice(0, 120),
+    npmAvailable,
+    npmInstalled,
+    npmPackageVersion,
+    npmLatestVersion,
+    npmUpdateAvailable,
+    updateAvailable: npmUpdateAvailable,
+    updateKnown,
+    upToDate,
+    installing,
+    updating,
+    operation: installing ? "installing" : updating ? "updating" : operation,
+    packageStatus,
   };
 }
 
@@ -8830,12 +8872,15 @@ export default function App() {
     };
   }, []);
 
-  const syncAgentInstallationsToCloud = useCallback((statuses, reason = "agent_status_refresh") => {
+  const syncAgentInstallationsToCloud = useCallback((statuses, reason = "agent_status_refresh", packageState = {}) => {
     const syncStatuses = Array.isArray(statuses)
       ? statuses.filter((status) => status && typeof status === "object")
       : [];
     const codingAgents = syncStatuses
-      .map(sanitizeCodingAgentStatusForCloud)
+      .map((status) => sanitizeCodingAgentStatusForCloud({
+        ...status,
+        packageOperation: packageState[status.id] || "",
+      }))
       .filter(Boolean);
     const hasCheckedStatus = syncStatuses.some((status) => (
       !status.cached && String(status.version || "").trim() !== "Not checked"
@@ -9073,6 +9118,7 @@ export default function App() {
 
   const installAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "installing" }));
+    syncAgentInstallationsToCloud(agentStatuses, "agent_install_start", { [provider]: "installing" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -9099,11 +9145,13 @@ export default function App() {
       }));
     } finally {
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+      syncAgentInstallationsToCloud(agentStatuses, "agent_install_idle", { [provider]: "idle" });
     }
-  }, [refreshAgentStatuses]);
+  }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
   const updateAgentWithNpm = useCallback(async (provider) => {
     setAgentInstallState((state) => ({ ...state, [provider]: "updating" }));
+    syncAgentInstallationsToCloud(agentStatuses, "agent_update_start", { [provider]: "updating" });
     setAgentStatusError("");
     setAgentInstallResults((results) => {
       const nextResults = { ...results };
@@ -9130,8 +9178,9 @@ export default function App() {
       }));
     } finally {
       setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+      syncAgentInstallationsToCloud(agentStatuses, "agent_update_idle", { [provider]: "idle" });
     }
-  }, [refreshAgentStatuses]);
+  }, [agentStatuses, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
   const finishStartupAgentGate = useCallback((statuses = agentStatuses, reason = "complete") => {
     const nextStatuses = Array.isArray(statuses) && statuses.length ? statuses : agentStatuses;
@@ -9162,6 +9211,7 @@ export default function App() {
     for (const agent of updates) {
       setStartupAgentUpdateMessage(`Updating ${agent.label}...`);
       setAgentInstallState((state) => ({ ...state, [agent.id]: "updating" }));
+      syncAgentInstallationsToCloud(agentStatuses, "startup_agent_update_start", { [agent.id]: "updating" });
       setAgentInstallResults((results) => {
         const nextResults = { ...results };
         delete nextResults[agent.id];
@@ -9183,13 +9233,14 @@ export default function App() {
         }));
       } finally {
         setAgentInstallState((state) => ({ ...state, [agent.id]: "idle" }));
+        syncAgentInstallationsToCloud(agentStatuses, "startup_agent_update_idle", { [agent.id]: "idle" });
       }
     }
 
     setStartupAgentUpdateMessage("Refreshing terminal CLI status...");
     const nextStatuses = await refreshAgentStatuses();
     finishStartupAgentGate(nextStatuses || agentStatuses, "updated");
-  }, [agentStatuses, finishStartupAgentGate, refreshAgentStatuses]);
+  }, [agentStatuses, finishStartupAgentGate, refreshAgentStatuses, syncAgentInstallationsToCloud]);
 
   const openAgentNativeInstaller = useCallback(async (agent) => {
     const guide = AGENT_INSTALL_GUIDES[agent.id] || {};
@@ -15923,6 +15974,9 @@ export default function App() {
       }
 
       setAgentInstallState((state) => ({ ...state, [provider]: updating ? "updating" : "installing" }));
+      syncAgentInstallationsToCloud(agentStatuses, updating ? "remote_agent_update_start" : "remote_agent_install_start", {
+        [provider]: updating ? "updating" : "installing",
+      });
       setAgentInstallResults((results) => {
         const nextResults = { ...results };
         delete nextResults[provider];
@@ -15978,6 +16032,9 @@ export default function App() {
         });
       } finally {
         setAgentInstallState((state) => ({ ...state, [provider]: "idle" }));
+        syncAgentInstallationsToCloud(agentStatuses, updating ? "remote_agent_update_idle" : "remote_agent_install_idle", {
+          [provider]: "idle",
+        });
       }
     };
     const handleRemoteLifecycleControl = async ({
@@ -16433,7 +16490,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, workspaces]);
+  }, [activateWorkspace, agentStatuses, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
 
   const chooseCrashRecoveryPath = useCallback((choice) => {
     const interruptedTasks = Array.isArray(crashRecoveryModal?.interruptedTasks)

@@ -10662,11 +10662,91 @@ fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
         .chars()
         .take(80)
         .collect::<String>();
+    let installed = cloud_mcp_payload_bool(agent, &["installed"], false);
+    let authenticated = cloud_mcp_payload_bool(agent, &["authenticated"], false);
+    let npm_available = cloud_mcp_payload_bool(
+        agent,
+        &["npmAvailable"],
+        cloud_mcp_payload_bool(agent, &["npm_available"], false),
+    );
+    let npm_installed = cloud_mcp_payload_bool(
+        agent,
+        &["npmInstalled"],
+        cloud_mcp_payload_bool(agent, &["npm_installed"], false),
+    );
+    let npm_package_version = cloud_mcp_payload_text(agent, &["npmPackageVersion"])
+        .or_else(|| cloud_mcp_payload_text(agent, &["npm_package_version"]))
+        .unwrap_or_default();
+    let npm_latest_version = cloud_mcp_payload_text(agent, &["npmLatestVersion"])
+        .or_else(|| cloud_mcp_payload_text(agent, &["npm_latest_version"]))
+        .unwrap_or_default();
+    let npm_update_available = cloud_mcp_payload_bool(
+        agent,
+        &["npmUpdateAvailable"],
+        cloud_mcp_payload_bool(agent, &["npm_update_available"], false),
+    );
+    let update_available = cloud_mcp_payload_bool(
+        agent,
+        &["updateAvailable"],
+        cloud_mcp_payload_bool(agent, &["update_available"], npm_update_available),
+    );
+    let update_known = cloud_mcp_payload_bool(
+        agent,
+        &["updateKnown"],
+        cloud_mcp_payload_bool(agent, &["update_known"], false),
+    );
+    let up_to_date = cloud_mcp_payload_bool(
+        agent,
+        &["upToDate"],
+        cloud_mcp_payload_bool(agent, &["up_to_date"], false),
+    );
+    let installing = cloud_mcp_payload_bool(agent, &["installing"], false);
+    let updating = cloud_mcp_payload_bool(agent, &["updating"], false);
+    let operation = cloud_mcp_payload_text(agent, &["operation"]).unwrap_or_default();
+    let package_status = cloud_mcp_payload_text(agent, &["packageStatus"])
+        .or_else(|| cloud_mcp_payload_text(agent, &["package_status"]))
+        .unwrap_or_else(|| {
+            if installing {
+                "installing".to_string()
+            } else if updating {
+                "updating".to_string()
+            } else if update_available {
+                "update_available".to_string()
+            } else if up_to_date {
+                "up_to_date".to_string()
+            } else if installed {
+                "installed".to_string()
+            } else {
+                "missing".to_string()
+            }
+        });
     Some(json!({
         "id": id.clone(),
         "label": if label.is_empty() { cloud_mcp_coding_agent_label(&id) } else { label.as_str() },
-        "installed": cloud_mcp_payload_bool(agent, &["installed"], false),
-        "authenticated": cloud_mcp_payload_bool(agent, &["authenticated"], false),
+        "installed": installed,
+        "authenticated": authenticated,
+        "version": cloud_mcp_payload_text(agent, &["version"]).unwrap_or_default(),
+        "npm_available": npm_available,
+        "npmAvailable": npm_available,
+        "npm_installed": npm_installed,
+        "npmInstalled": npm_installed,
+        "npm_package_version": npm_package_version.clone(),
+        "npmPackageVersion": npm_package_version,
+        "npm_latest_version": npm_latest_version.clone(),
+        "npmLatestVersion": npm_latest_version,
+        "npm_update_available": npm_update_available,
+        "npmUpdateAvailable": npm_update_available,
+        "update_available": update_available,
+        "updateAvailable": update_available,
+        "update_known": update_known,
+        "updateKnown": update_known,
+        "up_to_date": up_to_date,
+        "upToDate": up_to_date,
+        "installing": installing,
+        "updating": updating,
+        "operation": operation,
+        "package_status": package_status.clone(),
+        "packageStatus": package_status,
     }))
 }
 
