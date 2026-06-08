@@ -4047,7 +4047,7 @@ fn cloud_mcp_normalize_workspace_catalog_items(
     let mut normalized_workspaces = Vec::new();
     let mut seen = HashSet::new();
 
-    for workspace in workspace_items.iter().take(64) {
+    for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
         let Some(workspace_id) =
             cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
                 .filter(|value| !value.trim().is_empty())
@@ -4109,6 +4109,19 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             .unwrap_or_else(|| json!(0));
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state, workspace);
+        let workspace_order = cloud_mcp_payload_u64(
+            workspace,
+            &[
+                "workspace_order",
+                "workspaceOrder",
+                "workspace_index",
+                "workspaceIndex",
+                "sort_order",
+                "sortOrder",
+                "order",
+            ],
+        )
+        .unwrap_or(workspace_index as u64);
         let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
@@ -4132,6 +4145,10 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspaceRuntimeEpoch": workspace_runtime_epoch,
+            "workspace_order": workspace_order,
+            "workspaceOrder": workspace_order,
+            "workspace_index": workspace_order,
+            "workspaceIndex": workspace_order,
             "terminal_count": terminal_count,
             "mcp_server_count": mcp_server_count,
         });
@@ -10791,7 +10808,7 @@ async fn cloud_mcp_sync_terminal_presence(
     let mut normalized_workspaces = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
-    for workspace in workspace_items.iter().take(64) {
+    for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
         let repo_path = cloud_mcp_payload_text(
             workspace,
             &[
@@ -10951,6 +10968,19 @@ async fn cloud_mcp_sync_terminal_presence(
         let terminal_count = terminals.len();
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
+        let workspace_order = cloud_mcp_payload_u64(
+            workspace,
+            &[
+                "workspace_order",
+                "workspaceOrder",
+                "workspace_index",
+                "workspaceIndex",
+                "sort_order",
+                "sortOrder",
+                "order",
+            ],
+        )
+        .unwrap_or(workspace_index as u64);
         let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
@@ -10970,6 +11000,10 @@ async fn cloud_mcp_sync_terminal_presence(
             "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspaceRuntimeEpoch": workspace_runtime_epoch,
+            "workspace_order": workspace_order,
+            "workspaceOrder": workspace_order,
+            "workspace_index": workspace_order,
+            "workspaceIndex": workspace_order,
             "terminal_count": terminal_count,
             "terminals": terminals,
         });
@@ -11245,6 +11279,16 @@ fn cloud_mcp_copy_workspace_runtime_ordering(target: &mut Value, source: &Value)
         .or_else(|| source.get("runtimeEpoch"))
         .cloned()
         .unwrap_or(Value::Null);
+    let order = source
+        .get("workspace_order")
+        .or_else(|| source.get("workspaceOrder"))
+        .or_else(|| source.get("workspace_index"))
+        .or_else(|| source.get("workspaceIndex"))
+        .or_else(|| source.get("sort_order"))
+        .or_else(|| source.get("sortOrder"))
+        .or_else(|| source.get("order"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let Some(object) = target.as_object_mut() else {
         return;
     };
@@ -11252,6 +11296,10 @@ fn cloud_mcp_copy_workspace_runtime_ordering(target: &mut Value, source: &Value)
     object.insert("workspaceRuntimeSeq".to_string(), seq);
     object.insert("workspace_runtime_epoch".to_string(), epoch.clone());
     object.insert("workspaceRuntimeEpoch".to_string(), epoch);
+    object.insert("workspace_order".to_string(), order.clone());
+    object.insert("workspaceOrder".to_string(), order.clone());
+    object.insert("workspace_index".to_string(), order.clone());
+    object.insert("workspaceIndex".to_string(), order);
 }
 
 async fn cloud_mcp_enqueue_terminal_lifecycle_delta(
@@ -11699,7 +11747,7 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
     let mut normalized_workspaces = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
-    for workspace in workspace_items.iter().take(64) {
+    for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
         let repo_path = cloud_mcp_payload_text(
             workspace,
             &[
@@ -11792,6 +11840,19 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
         let server_count = servers.len();
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
+        let workspace_order = cloud_mcp_payload_u64(
+            workspace,
+            &[
+                "workspace_order",
+                "workspaceOrder",
+                "workspace_index",
+                "workspaceIndex",
+                "sort_order",
+                "sortOrder",
+                "order",
+            ],
+        )
+        .unwrap_or(workspace_index as u64);
         let workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
             "machine_id": device_profile["device_id"].clone(),
@@ -11804,6 +11865,10 @@ async fn cloud_mcp_sync_workspace_mcp_snapshot(
             "workspaceRuntimeSeq": workspace_runtime_seq,
             "workspace_runtime_epoch": workspace_runtime_epoch,
             "workspaceRuntimeEpoch": workspace_runtime_epoch,
+            "workspace_order": workspace_order,
+            "workspaceOrder": workspace_order,
+            "workspace_index": workspace_order,
+            "workspaceIndex": workspace_order,
             "server_count": server_count,
             "servers": servers,
         });

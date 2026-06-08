@@ -2440,7 +2440,9 @@ function sanitizeWorkspaceMcpRegistryForCloud(registry, target) {
     repoPath: target.repoPath,
     workspaceActive: Boolean(target.workspaceActive),
     workspaceId: target.workspaceId,
+    workspaceIndex: target.workspaceIndex,
     workspaceName: target.workspaceName,
+    workspaceOrder: target.workspaceOrder,
     workspaceStatus: target.workspaceStatus || (target.workspaceActive ? "active" : "deactivated"),
     servers: safeCloudMcpArray(data.servers)
       .map(sanitizeWorkspaceMcpServerForCloud)
@@ -9442,7 +9444,7 @@ export default function App() {
     event.preventDefault();
 
     const token = authStore.getToken();
-    const name = workspaceName.trim();
+    const name = workspaceName;
     const requestedRoot = cleanWorkspaceRootDirectory(newWorkspaceRootDraft)
       || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
 
@@ -9595,7 +9597,7 @@ export default function App() {
     }
 
     const token = authStore.getToken();
-    const workspaceNameValue = workspaceNameDraft.replace(/[\u0000-\u001F\u007F]/g, "").trim();
+    const workspaceNameValue = workspaceNameDraft;
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
       workspaceTerminalRolesDraft,
@@ -12468,6 +12470,16 @@ export default function App() {
       )) || null
       : null
   ), [enabledWorkspaceRuntimeDescriptors, selectedWorkspace?.id]);
+  const workspaceSidebarOrderById = useMemo(() => {
+    const order = new Map();
+    (workspaces || []).forEach((workspace, index) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      if (workspaceId && !order.has(workspaceId)) {
+        order.set(workspaceId, index);
+      }
+    });
+    return order;
+  }, [workspaces]);
   const terminalPresenceWorkspaces = useMemo(() => (
     enabledWorkspaceRuntimeDescriptors
       .map((descriptor) => {
@@ -12638,7 +12650,9 @@ export default function App() {
           repoPath,
           workspaceActive: true,
           workspaceId,
+          workspaceIndex: workspaceSidebarOrderById.get(workspaceId) ?? 0,
           workspaceName: descriptor.workspace?.name || workspaceId,
+          workspaceOrder: workspaceSidebarOrderById.get(workspaceId) ?? 0,
           workspaceStatus: "active",
           terminals,
         };
@@ -12646,6 +12660,7 @@ export default function App() {
       .filter(Boolean)
   ), [
     enabledWorkspaceRuntimeDescriptors,
+    workspaceSidebarOrderById,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
@@ -13266,7 +13281,7 @@ export default function App() {
     const targets = [];
     const seen = new Set();
     const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
-    const addTarget = (workspace, activeOverride = null) => {
+    const addTarget = (workspace, activeOverride = null, workspaceIndex = 0) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
         return;
@@ -13293,17 +13308,20 @@ export default function App() {
         repoPath: rootDirectory,
         workspaceActive,
         workspaceId,
+        workspaceIndex,
         workspaceName: workspace?.name || workspaceId,
+        workspaceOrder: workspaceIndex,
         workspaceRole: "desktop_workspace",
         workspaceRoot: rootDirectory,
         workspaceStatus: workspaceActive ? "active" : "deactivated",
       });
     };
 
-    workspaces.forEach((workspace) => {
+    workspaces.forEach((workspace, workspaceIndex) => {
       addTarget(
         workspace,
         activeWorkspaceIds.has(String(workspace?.id || "").trim()),
+        workspaceIndex,
       );
     });
 
@@ -22076,6 +22094,7 @@ export default function App() {
                             <WorkspaceSettingsInput
                               disabled={isWorkspaceSettingsBusy}
                               maxLength={80}
+                              minLength={1}
                               onChange={(event) => {
                                 setWorkspaceNameDraft(event.target.value);
                                 setWorkspaceSettingsError("");
@@ -22263,6 +22282,7 @@ export default function App() {
                             <WorkspaceSettingsInput
                               disabled={workspaceSyncState === "creating"}
                               maxLength={80}
+                              minLength={1}
                               onChange={(event) => {
                                 setWorkspaceName(event.target.value);
                                 setWorkspaceError("");

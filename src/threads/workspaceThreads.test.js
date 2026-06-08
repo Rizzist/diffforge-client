@@ -1656,3 +1656,141 @@ test("provider turn interruption settles running thread and keeps terminal input
   assert.equal(thread.providerBindings.codex.activityStatus, "idle");
   assert.equal(next[workspaceId].terminals[0].inputReady, true);
 });
+
+test("session transcript preserves generated image artifacts through hydration", () => {
+  const workspaceId = "workspace-test";
+  const threadId = "thread-image-test";
+  const promptId = "prompt-image-test";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-06-08T17:00:00.000Z";
+  const completedAt = "2026-06-08T17:00:05.000Z";
+  const sessionId = "session-image-test";
+  const artifact = {
+    kind: "image",
+    mimeType: "image/svg+xml",
+    path: "/tmp/diffforge/chocolate.svg",
+    prompt: "dark chocolate squares on a slate plate",
+    title: "Chocolate preview",
+    url: "file:///tmp/diffforge/chocolate.svg",
+  };
+
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          activityStatus: "thinking",
+          currentAgent: "codex",
+          latestTurn: {
+            messageId: promptId,
+            promptEpoch: 2,
+            startedAt: submittedAt,
+            state: "running",
+            turnId,
+          },
+          messages: [{
+            createdAt: submittedAt,
+            id: promptId,
+            role: "user",
+            text: "make an image of chocolate",
+            turnId,
+          }],
+          projectionEvents: [{
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "turn-start",
+            messageId: promptId,
+            promptEpoch: 2,
+            status: "running",
+            turnId,
+            type: "thread.turn.started",
+          }, {
+            agentId: "codex",
+            createdAt: submittedAt,
+            id: "user-message",
+            messageId: promptId,
+            role: "user",
+            status: "submitted",
+            text: "make an image of chocolate",
+            turnId,
+            type: "thread.message.user",
+          }],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              inputReady: false,
+              nativeSessionId: sessionId,
+              nativeSessionKind: "session",
+              status: "active",
+            },
+          },
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId: "pane-image-test",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          transcriptSessionId: sessionId,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const nextState = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "codex",
+    allowTranscriptTurnCompletion: true,
+    completedAt,
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: "make an image of chocolate",
+    latestTimestamp: completedAt,
+    matchedBy: "sessionId",
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: "make an image of chocolate",
+    }, {
+      artifacts: [artifact],
+      createdAt: completedAt,
+      id: "generated-image",
+      kind: "image_generation",
+      role: "activity",
+      text: "",
+      title: "Generated image",
+    }, {
+      createdAt: completedAt,
+      id: "task-complete",
+      kind: "task_complete",
+      role: "assistant",
+      text: "Generated a fresh chocolate image preview.",
+    }],
+    promptAccepted: true,
+    promptEpoch: 2,
+    promptEventId: promptId,
+    providerSessionId: sessionId,
+    sessionId,
+    source: "codex-session",
+    submittedAt,
+    transcriptExplicitCompletionCanSettleTurn: true,
+    turnCompleteSeen: true,
+    workspaceId,
+    threadId,
+  });
+
+  const nextThread = nextState[workspaceId].threads[threadId];
+  const imageMessage = nextThread.messages.find((message) => message.id === "generated-image");
+  assert.equal(imageMessage?.role, "activity");
+  assert.equal(imageMessage?.kind, "image_generation");
+  assert.equal(imageMessage?.artifacts?.length, 1);
+  assert.equal(imageMessage.artifacts[0].mimeType, "image/svg+xml");
+  assert.equal(imageMessage.artifacts[0].url, "file:///tmp/diffforge/chocolate.svg");
+
+  const imageProjectionEvent = nextThread.projectionEvents.find((event) => event.messageId === "generated-image");
+  assert.equal(imageProjectionEvent?.type, "thread.activity");
+  assert.equal(imageProjectionEvent?.artifacts?.length, 1);
+  assert.equal(imageProjectionEvent.artifacts[0].path, "/tmp/diffforge/chocolate.svg");
+});

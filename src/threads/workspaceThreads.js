@@ -12,6 +12,7 @@ const WORKSPACE_THREAD_DETAIL_VISIBILITY_REGISTRY_KEY = "__diffforgeWorkspaceThr
 export const WORKSPACE_THREAD_DETAIL_VISIBILITY_EVENT = "diffforge:workspace-thread-detail-visibility";
 const MAX_THREAD_PROJECTION_EVENTS = 900;
 const MAX_THREAD_MESSAGES = 360;
+const MAX_THREAD_ARTIFACTS = 16;
 const MAX_PERSISTED_THREAD_PROJECTION_EVENTS = 64;
 const MAX_PERSISTED_THREAD_MESSAGES = 64;
 const MAX_PERSISTED_THREAD_TEXT_CHARS = 1800;
@@ -435,6 +436,79 @@ function cleanMessageText(value, fallback = "") {
     .trim();
 
   return text || fallback;
+}
+
+function normalizeThreadArtifact(artifact) {
+  if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
+    return null;
+  }
+
+  const mimeType = cleanText(artifact.mimeType || artifact.mime_type || artifact.contentType || artifact.content_type);
+  const path = cleanText(artifact.path || artifact.filePath || artifact.file_path || artifact.localPath || artifact.local_path);
+  const url = cleanText(artifact.url || artifact.uri || artifact.fileUrl || artifact.file_url || artifact.imageUrl || artifact.image_url);
+  const reference = url || path;
+  if (!reference) {
+    return null;
+  }
+
+  const kind = cleanText(
+    artifact.kind || artifact.type,
+    mimeType.toLowerCase().startsWith("image/") ? "image" : "file",
+  )
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "-")
+    .slice(0, 48);
+
+  return {
+    kind: kind || "file",
+    mimeType,
+    name: cleanText(artifact.name || artifact.filename || artifact.fileName || artifact.file_name),
+    path,
+    prompt: cleanMessageText(artifact.prompt),
+    title: cleanText(artifact.title || artifact.label),
+    url,
+  };
+}
+
+function normalizeThreadArtifacts(value) {
+  const artifacts = Array.isArray(value) ? value : [];
+  const normalized = [];
+  const seen = new Set();
+
+  artifacts.forEach((artifact) => {
+    const normalizedArtifact = normalizeThreadArtifact(artifact);
+    if (!normalizedArtifact) {
+      return;
+    }
+    const key = normalizedArtifact.url || normalizedArtifact.path;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    normalized.push(normalizedArtifact);
+  });
+
+  return normalized.slice(0, MAX_THREAD_ARTIFACTS);
+}
+
+function threadArtifactsSignature(artifacts) {
+  return normalizeThreadArtifacts(artifacts)
+    .map((artifact) => [
+      artifact.kind,
+      artifact.mimeType,
+      artifact.url,
+      artifact.path,
+      artifact.title,
+      artifact.prompt,
+    ].join(":"))
+    .join("|");
+}
+
+function mergeThreadArtifacts(...artifactGroups) {
+  return normalizeThreadArtifacts(
+    artifactGroups
+      .flatMap((artifacts) => (Array.isArray(artifacts) ? artifacts : [])),
+  );
 }
 
 const ATTACHMENT_MARKER_PATTERN = /\[(?:image|file)-attached(?:\s+\d+)?\]/i;
@@ -1354,6 +1428,7 @@ function normalizeThreadMessage(message) {
   const text = safeRole === "user"
     ? normalizeAttachmentEchoText(rawText)
     : cleanMessageText(rawText);
+  const artifacts = normalizeThreadArtifacts(message.artifacts || message.attachments);
   const status = cleanText(message.status, "submitted");
   const isTurnCompleteMessage = safeRole === "assistant"
     && (
@@ -1363,7 +1438,7 @@ function normalizeThreadMessage(message) {
     );
   if (
     !id
-    || (!text && !isTurnCompleteMessage)
+    || (!text && !isTurnCompleteMessage && !artifacts.length)
     || kind === "live_output"
     || source === "terminal-live"
     || (safeRole === "user" && isTerminalArtifactMessage(message.text || message.message))
@@ -1373,6 +1448,7 @@ function normalizeThreadMessage(message) {
 
   return {
     agentId: cleanAgentId(message.agentId || message.agent_id, ""),
+    artifacts,
     callId: cleanText(message.callId || message.call_id),
     createdAt: cleanText(message.createdAt || message.created_at, nowIso()),
     id,
@@ -1519,11 +1595,13 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
     ? normalizeAttachmentEchoText(rawText)
     : cleanMessageText(rawText);
   const title = cleanText(event.title);
+  const artifacts = normalizeThreadArtifacts(event.artifacts || event.attachments);
   if (
     (!messageId || (isTurnProjectionEventType(type) && !(turnId || messageId)))
     || (
       !text
       && !delta
+      && !artifacts.length
       && type !== "thread.message.assistant.complete"
       && !isTurnProjectionEventType(type)
     )
@@ -1547,6 +1625,7 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
 
   return {
     agentId: cleanAgentId(event.agentId || event.agent_id, ""),
+    artifacts,
     callId: cleanText(event.callId || event.call_id),
     createdAt: cleanText(event.createdAt || event.created_at, nowIso()),
     completedAt: cleanText(event.completedAt || event.completed_at),
@@ -1664,6 +1743,7 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
   messagesById.set(matchingMessageId, {
     ...existingMessage,
     ...normalizedMessage,
+    artifacts: mergeThreadArtifacts(existingMessage?.artifacts, normalizedMessage.artifacts),
     id: matchingMessageId,
     text: chooseProjectedMessageText(existingMessage?.text, normalizedMessage.text),
   });
@@ -1692,6 +1772,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
     if (event.type === "thread.message.user" || event.type === "thread.message.system") {
       upsertProjectedMessage(messagesById, messageOrder, {
         agentId: event.agentId,
+        artifacts: event.artifacts,
         createdAt: event.createdAt,
         id: event.messageId,
         kind: "message",
@@ -1717,6 +1798,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
       }
       upsertProjectedMessage(messagesById, messageOrder, {
         agentId: event.agentId,
+        artifacts: event.artifacts,
         createdAt: event.createdAt,
         id: event.messageId,
         kind: event.kind || "message",
@@ -1731,7 +1813,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
 
     if (event.type === "thread.message.assistant.complete") {
       const existing = messagesById.get(event.messageId);
-      if (!existing && !(event.text || event.delta)) {
+      if (!existing && !(event.text || event.delta || event.artifacts?.length)) {
         return;
       }
 
@@ -1748,6 +1830,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
       upsertProjectedMessage(messagesById, messageOrder, {
         ...(existing || {}),
         agentId: event.agentId || existing?.agentId || "",
+        artifacts: mergeThreadArtifacts(existing?.artifacts, event.artifacts),
         createdAt: event.createdAt || existing?.createdAt,
         id: event.messageId,
         kind: event.kind || existing?.kind || "message",
@@ -1763,6 +1846,7 @@ function projectThreadProjectionMessagesFromNormalizedEvents(projectionEvents, f
     if (isActivityProjectionEventType(event.type)) {
       upsertProjectedMessage(messagesById, messageOrder, {
         agentId: event.agentId,
+        artifacts: event.artifacts,
         callId: event.callId,
         createdAt: event.createdAt,
         id: event.messageId,
@@ -1793,7 +1877,8 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
 function threadMessageProjectionEventId(prefix, message, suffix = "") {
   const id = cleanText(message?.id, createRandomId("message"));
   const text = cleanMessageText(message?.text);
-  const hash = stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}`);
+  const artifacts = threadArtifactsSignature(message?.artifacts);
+  const hash = stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}:${artifacts}`);
   return [
     prefix,
     safeKey(id, "message"),
@@ -1810,6 +1895,7 @@ function projectionEventsFromMessages(messages, options = {}) {
     const messageId = cleanText(message.id, createRandomId("message"));
     const base = {
       agentId: message.agentId || agentId,
+      artifacts: message.artifacts,
       callId: message.callId,
       createdAt: message.createdAt,
       kind: message.kind,
@@ -2290,6 +2376,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       : "";
     const incomingMessageTurnId = cleanText(message.turnId || message.turn_id);
     const shouldContinueCurrentTranscriptTurn = Boolean(message.role !== "user" && currentTurnId);
+    const messageArtifacts = normalizeThreadArtifacts(message.artifacts);
+    const messageArtifactsSignature = threadArtifactsSignature(messageArtifacts);
     const messageTurnId = cleanText(
       (shouldContinueCurrentTranscriptTurn ? currentTurnId : "")
         || expectedPromptTurnForMessage
@@ -2300,6 +2388,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     );
     const eventBase = {
       agentId: message.agentId || agentId,
+      artifacts: messageArtifacts,
       callId: message.callId,
       createdAt,
       kind: message.kind,
@@ -2346,7 +2435,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     } else if (message.role === "assistant") {
       const nextText = cleanMessageText(message.text);
       const turnComplete = isTranscriptTurnCompleteMessage(message);
-      if (!nextText) {
+      if (!nextText && !messageArtifacts.length) {
         if (
           allowTranscriptTurnCompletion
           && turnComplete
@@ -2374,6 +2463,8 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       const messageProjectionTarget = duplicateFinalAssistant || projectedMessage;
       const shouldProjectAssistant = !duplicateFinalAssistant;
       const effectivePreviousText = cleanMessageText(messageProjectionTarget?.text);
+      const projectionArtifactsChanged = messageArtifactsSignature
+        && threadArtifactsSignature(messageProjectionTarget?.artifacts) !== messageArtifactsSignature;
       let delta = nextText;
       let replaceText = false;
       if (effectivePreviousText && nextText.startsWith(effectivePreviousText)) {
@@ -2392,7 +2483,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
             "projection-assistant-delta",
             safeKey(messageId, "message"),
             nextText.length,
-            stableProjectionHash(nextText),
+            stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
           ].join("-"),
           replaceText,
           text: replaceText ? nextText : "",
@@ -2401,7 +2492,12 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       }
       if (
         shouldProjectAssistant
-        && (!messageProjectionTarget || messageProjectionTarget.status !== "complete" || messageProjectionTarget.text !== nextText)
+        && (
+          !messageProjectionTarget
+          || messageProjectionTarget.status !== "complete"
+          || messageProjectionTarget.text !== nextText
+          || projectionArtifactsChanged
+        )
       ) {
         events.push({
           ...eventBase,
@@ -2409,7 +2505,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
             "projection-assistant-complete",
             safeKey(messageId, "message"),
             nextText.length,
-            stableProjectionHash(nextText),
+            stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
           ].join("-"),
           text: nextText,
           type: "thread.message.assistant.complete",
@@ -2431,7 +2527,12 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         });
       }
     } else if (message.role === "activity") {
-      if (projectedMessage && projectedMessage.text === message.text && projectedMessage.title === message.title) {
+      if (
+        projectedMessage
+        && projectedMessage.text === message.text
+        && projectedMessage.title === message.title
+        && threadArtifactsSignature(projectedMessage.artifacts) === messageArtifactsSignature
+      ) {
         return;
       }
       events.push({
@@ -2439,7 +2540,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         id: [
           "projection-activity",
           safeKey(messageId, "message"),
-          stableProjectionHash(`${message.kind}:${message.title}:${message.text}`),
+          stableProjectionHash(`${message.kind}:${message.title}:${message.text}:${messageArtifactsSignature}`),
         ].join("-"),
         status: message.status || "complete",
         text: message.text,

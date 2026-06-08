@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
@@ -1030,6 +1030,141 @@ const TranscriptActivityJsonBody = styled.pre`
 
   html[data-forge-theme="light"] &::-webkit-scrollbar-thumb {
     background: rgba(0, 102, 204, 0.2);
+  }
+`;
+
+const TranscriptArtifactList = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin: 7px 0 8px;
+`;
+
+const TranscriptArtifactCard = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.035);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.09);
+    background: rgba(255, 255, 255, 0.72);
+  }
+`;
+
+const TranscriptArtifactPreviewButton = styled.button`
+  display: grid;
+  min-width: 0;
+  width: 100%;
+  max-width: min(100%, 560px);
+  place-items: center;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  padding: 0;
+  background: rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.045);
+  }
+`;
+
+const TranscriptArtifactImage = styled.img`
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  max-height: 340px;
+  object-fit: contain;
+`;
+
+const TranscriptArtifactFallback = styled.div`
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--thread-muted);
+  font-size: var(--thread-detail-small-font-size);
+  line-height: 1.45;
+`;
+
+const TranscriptArtifactMeta = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+`;
+
+const TranscriptArtifactText = styled.div`
+  min-width: 0;
+  overflow: hidden;
+`;
+
+const TranscriptArtifactTitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--thread-fg);
+  font-size: var(--thread-detail-small-font-size);
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const TranscriptArtifactSubtitle = styled.div`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--thread-muted-soft);
+  font-size: var(--thread-detail-mini-font-size);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const TranscriptArtifactActions = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 4px;
+`;
+
+const TranscriptArtifactActionButton = styled.button`
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  padding: 0;
+  color: var(--thread-muted);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    background 130ms ease,
+    color 130ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    background: rgba(0, 0, 0, 0.06);
   }
 `;
 
@@ -4037,6 +4172,10 @@ function getToolCallLabel(message) {
     return title;
   }
 
+  if (String(message?.kind || "").toLowerCase() === "image_generation") {
+    return "Generated image";
+  }
+
   if (String(message?.kind || "").toLowerCase() === "tool_output") {
     return "Command run complete";
   }
@@ -4147,20 +4286,22 @@ function buildTranscriptItems(messages) {
 
 function getMessageCopyText(message) {
   const text = String(message?.text || "");
-  if (text) {
-    return text;
-  }
-
-  return String(message?.title || "").trim();
+  const artifactLines = getArtifactCopyLines(message);
+  return [
+    text || String(message?.title || "").trim(),
+    artifactLines.length ? artifactLines.join("\n") : "",
+  ].filter(Boolean).join("\n");
 }
 
 function getActivityCopyText(message) {
   const label = getToolCallLabel(message);
   const status = getActivityStatusLabel(message);
   const body = String(message?.text || "").trim();
+  const artifactLines = getArtifactCopyLines(message);
   return [
     [label, status ? `(${status})` : ""].filter(Boolean).join(" "),
     body,
+    artifactLines.length ? artifactLines.join("\n") : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -4179,7 +4320,10 @@ function getAssistantBlockCopyText(items) {
     if (item?.type === "activity-group") {
       const activityParts = (Array.isArray(item.messages) ? item.messages : []).map((message) => {
         const text = getActivityCopyText(message);
-        return text ? `Tool call:\n${text}` : "";
+        const label = String(message?.kind || "").toLowerCase() === "image_generation"
+          ? "Image generation"
+          : "Tool call";
+        return text ? `${label}:\n${text}` : "";
       }).filter(Boolean);
 
       if (activityParts.length) {
@@ -4216,6 +4360,232 @@ async function copyTextToClipboard(text) {
   } finally {
     textarea.remove();
   }
+}
+
+function cleanArtifactText(value) {
+  return String(value || "").trim();
+}
+
+function getArtifactReference(artifact) {
+  return cleanArtifactText(
+    artifact?.url
+      || artifact?.uri
+      || artifact?.fileUrl
+      || artifact?.file_url
+      || artifact?.imageUrl
+      || artifact?.image_url
+      || artifact?.path
+      || artifact?.filePath
+      || artifact?.file_path
+      || artifact?.localPath
+      || artifact?.local_path,
+  );
+}
+
+function normalizeRenderableArtifacts(artifacts) {
+  const seen = new Set();
+  return (Array.isArray(artifacts) ? artifacts : [])
+    .map((artifact) => {
+      if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
+        return null;
+      }
+      const reference = getArtifactReference(artifact);
+      if (!reference) {
+        return null;
+      }
+      const normalized = {
+        kind: cleanArtifactText(artifact.kind || artifact.type).toLowerCase(),
+        mimeType: cleanArtifactText(artifact.mimeType || artifact.mime_type || artifact.contentType || artifact.content_type),
+        name: cleanArtifactText(artifact.name || artifact.filename || artifact.fileName || artifact.file_name),
+        path: cleanArtifactText(artifact.path || artifact.filePath || artifact.file_path || artifact.localPath || artifact.local_path),
+        prompt: cleanArtifactText(artifact.prompt),
+        reference,
+        title: cleanArtifactText(artifact.title || artifact.label),
+        url: cleanArtifactText(artifact.url || artifact.uri || artifact.fileUrl || artifact.file_url || artifact.imageUrl || artifact.image_url),
+      };
+      const key = normalized.url || normalized.path || normalized.reference;
+      if (seen.has(key)) {
+        return null;
+      }
+      seen.add(key);
+      return normalized;
+    })
+    .filter(Boolean);
+}
+
+function artifactExtension(reference) {
+  const cleanReference = cleanArtifactText(reference).split(/[?#]/)[0].toLowerCase();
+  const match = cleanReference.match(/\.([a-z0-9]+)$/);
+  return match?.[1] || "";
+}
+
+function isRenderableImageArtifact(artifact) {
+  const mimeType = cleanArtifactText(artifact?.mimeType || artifact?.mime_type).toLowerCase();
+  if (mimeType.startsWith("image/")) {
+    return true;
+  }
+  if (cleanArtifactText(artifact?.kind || artifact?.type).toLowerCase() === "image") {
+    return true;
+  }
+  return ["svg", "png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"].includes(
+    artifactExtension(getArtifactReference(artifact)),
+  );
+}
+
+function fileUrlToPath(reference) {
+  const value = cleanArtifactText(reference);
+  if (!value.startsWith("file://")) {
+    return "";
+  }
+  try {
+    return decodeURIComponent(new URL(value).pathname);
+  } catch {
+    return decodeURIComponent(value.replace(/^file:\/\//i, ""));
+  }
+}
+
+function artifactDisplaySrc(artifact) {
+  const reference = getArtifactReference(artifact);
+  if (!reference) {
+    return "";
+  }
+  if (/^(https?:|data:|blob:)/i.test(reference)) {
+    return reference;
+  }
+  if (/^file:\/\//i.test(reference)) {
+    const path = fileUrlToPath(reference);
+    return path ? convertFileSrc(path) : reference;
+  }
+  const path = cleanArtifactText(artifact?.path || artifact?.filePath || artifact?.file_path || reference);
+  if (path.startsWith("/") || path.startsWith("~/")) {
+    return convertFileSrc(path);
+  }
+  return reference;
+}
+
+function artifactOpenTarget(artifact) {
+  const reference = getArtifactReference(artifact);
+  if (!reference) {
+    return "";
+  }
+  if (/^(https?:|file:|data:|blob:)/i.test(reference)) {
+    return reference;
+  }
+  const path = cleanArtifactText(artifact?.path || artifact?.filePath || artifact?.file_path || reference);
+  if (path.startsWith("/") || path.startsWith("~/")) {
+    return `file://${path}`;
+  }
+  return reference;
+}
+
+function artifactCopyText(artifact) {
+  return [
+    cleanArtifactText(artifact?.title || artifact?.name),
+    cleanArtifactText(artifact?.prompt),
+    getArtifactReference(artifact),
+  ].filter(Boolean).join("\n");
+}
+
+function artifactDisplayTitle(artifact, index) {
+  return cleanArtifactText(artifact?.title || artifact?.name)
+    || (isRenderableImageArtifact(artifact) ? `Image ${index + 1}` : `Artifact ${index + 1}`);
+}
+
+function artifactDisplaySubtitle(artifact) {
+  return cleanArtifactText(artifact?.prompt || artifact?.mimeType || artifact?.mime_type)
+    || getArtifactReference(artifact);
+}
+
+function getMessageArtifacts(message) {
+  return normalizeRenderableArtifacts(message?.artifacts || message?.attachments);
+}
+
+function getArtifactCopyLines(message) {
+  return getMessageArtifacts(message)
+    .map((artifact, index) => {
+      const title = artifactDisplayTitle(artifact, index);
+      const reference = getArtifactReference(artifact);
+      return [title, reference].filter(Boolean).join(": ");
+    })
+    .filter(Boolean);
+}
+
+function MessageArtifactList({ artifacts }) {
+  const items = normalizeRenderableArtifacts(artifacts);
+  const [copiedKey, setCopiedKey] = useState("");
+
+  if (!items.length) {
+    return null;
+  }
+
+  return (
+    <TranscriptArtifactList>
+      {items.map((artifact, index) => {
+        const key = getArtifactReference(artifact) || `artifact-${index}`;
+        const title = artifactDisplayTitle(artifact, index);
+        const subtitle = artifactDisplaySubtitle(artifact);
+        const openTarget = artifactOpenTarget(artifact);
+        const imageSrc = isRenderableImageArtifact(artifact) ? artifactDisplaySrc(artifact) : "";
+        return (
+          <TranscriptArtifactCard key={key}>
+            {imageSrc ? (
+              <TranscriptArtifactPreviewButton
+                aria-label={`Open ${title}`}
+                onClick={() => {
+                  if (openTarget) {
+                    openUrl(openTarget);
+                  }
+                }}
+                title={openTarget || title}
+                type="button"
+              >
+                <TranscriptArtifactImage alt={title} src={imageSrc} />
+              </TranscriptArtifactPreviewButton>
+            ) : (
+              <TranscriptArtifactFallback title={openTarget || title}>
+                {openTarget || title}
+              </TranscriptArtifactFallback>
+            )}
+            <TranscriptArtifactMeta>
+              <TranscriptArtifactText>
+                <TranscriptArtifactTitle title={title}>{title}</TranscriptArtifactTitle>
+                {subtitle ? (
+                  <TranscriptArtifactSubtitle title={subtitle}>{subtitle}</TranscriptArtifactSubtitle>
+                ) : null}
+              </TranscriptArtifactText>
+              <TranscriptArtifactActions>
+                {openTarget ? (
+                  <TranscriptArtifactActionButton
+                    aria-label={`Open ${title}`}
+                    onClick={() => openUrl(openTarget)}
+                    title="Open"
+                    type="button"
+                  >
+                    <OpenInNew aria-hidden="true" />
+                  </TranscriptArtifactActionButton>
+                ) : null}
+                <TranscriptArtifactActionButton
+                  aria-label={copiedKey === key ? "Copied" : `Copy ${title}`}
+                  data-copied={copiedKey === key ? "true" : "false"}
+                  onClick={async () => {
+                    const copied = await copyTextToClipboard(artifactCopyText(artifact));
+                    if (copied) {
+                      setCopiedKey(key);
+                      window.setTimeout(() => setCopiedKey(""), 1400);
+                    }
+                  }}
+                  title={copiedKey === key ? "Copied" : "Copy"}
+                  type="button"
+                >
+                  {copiedKey === key ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+                </TranscriptArtifactActionButton>
+              </TranscriptArtifactActions>
+            </TranscriptArtifactMeta>
+          </TranscriptArtifactCard>
+        );
+      })}
+    </TranscriptArtifactList>
+  );
 }
 
 function isChatProjectionMessage(message) {
@@ -4370,7 +4740,15 @@ function ActivityToolBody({ body, expanded }) {
 }
 
 function ActivityToolRow({ message }) {
-  const [expanded, setExpanded] = useState(false);
+  const artifacts = getMessageArtifacts(message);
+  const artifactKey = artifacts.map(getArtifactReference).join("|");
+  const [expanded, setExpanded] = useState(() => artifacts.length > 0);
+
+  useEffect(() => {
+    if (artifacts.length) {
+      setExpanded(true);
+    }
+  }, [artifacts.length, artifactKey]);
 
   if (!message) {
     return null;
@@ -4381,17 +4759,19 @@ function ActivityToolRow({ message }) {
   const body = String(message.text || "").trim();
   const kind = String(message.kind || "activity").trim().toLowerCase();
   const hasBody = Boolean(body);
+  const hasArtifacts = artifacts.length > 0;
+  const expandable = hasBody || hasArtifacts;
 
   return (
     <TranscriptActivityTool data-kind={kind} data-status={status || "complete"}>
       <TranscriptActivityHeader
-        aria-expanded={hasBody ? expanded : undefined}
-        aria-label={hasBody ? `${expanded ? "Collapse" : "Expand"} ${label}` : label}
+        aria-expanded={expandable ? expanded : undefined}
+        aria-label={expandable ? `${expanded ? "Collapse" : "Expand"} ${label}` : label}
         data-expanded={expanded ? "true" : "false"}
         data-nested="true"
-        disabled={!hasBody}
+        disabled={!expandable}
         onClick={() => {
-          if (hasBody) {
+          if (expandable) {
             setExpanded((value) => !value);
           }
         }}
@@ -4400,16 +4780,17 @@ function ActivityToolRow({ message }) {
       >
         <TranscriptActivityTitle title={label}>{label}</TranscriptActivityTitle>
         <TranscriptActivityToggle data-expanded={expanded ? "true" : "false"}>
-          {hasBody ? <ExpandMore aria-hidden="true" /> : null}
+          {expandable ? <ExpandMore aria-hidden="true" /> : null}
         </TranscriptActivityToggle>
       </TranscriptActivityHeader>
-      {hasBody ? (
+      {expandable ? (
         <TranscriptActivityDisclosure
           aria-hidden={expanded ? "false" : "true"}
           data-expanded={expanded ? "true" : "false"}
         >
           <TranscriptActivityDisclosureInner>
-            <ActivityToolBody body={body} expanded={expanded} />
+            {hasArtifacts ? <MessageArtifactList artifacts={artifacts} /> : null}
+            {hasBody ? <ActivityToolBody body={body} expanded={expanded} /> : null}
           </TranscriptActivityDisclosureInner>
         </TranscriptActivityDisclosure>
       ) : null}
@@ -4418,19 +4799,31 @@ function ActivityToolRow({ message }) {
 }
 
 function ActivityMessage({ message, messages }) {
-  const [expanded, setExpanded] = useState(false);
   const groupMessages = Array.isArray(messages) && messages.length
     ? messages
     : message
       ? [message]
       : [];
+  const groupArtifactKey = groupMessages
+    .flatMap((groupMessage) => getMessageArtifacts(groupMessage).map(getArtifactReference))
+    .join("|");
+  const hasArtifacts = Boolean(groupArtifactKey);
+  const [expanded, setExpanded] = useState(() => hasArtifacts);
+
+  useEffect(() => {
+    if (hasArtifacts) {
+      setExpanded(true);
+    }
+  }, [hasArtifacts, groupArtifactKey]);
 
   if (!groupMessages.length) {
     return null;
   }
 
   const activityCount = groupMessages.length;
-  const label = `${activityCount} ${activityCount === 1 ? "tool call" : "tool calls"}`;
+  const label = activityCount === 1
+    ? getToolCallLabel(groupMessages[0])
+    : `${activityCount} activities`;
   const status = getActivityGroupStatus(groupMessages);
 
   return (
@@ -4489,6 +4882,7 @@ function ThreadMessage({
   const copyText = getMessageCopyText(message);
   const canCopy = showCopy && Boolean(copyText);
   const copyTitle = isCopied ? "Copied" : "Copy";
+  const messageArtifacts = getMessageArtifacts(message);
   const copyButton = canCopy ? (
     <MessageCopyButton
       aria-label={copyTitle}
@@ -4513,6 +4907,7 @@ function ThreadMessage({
           {copyButton}
           <MessageBody>
             <AssistantMarkdownContent message={message} workspace={workspace} />
+            {messageArtifacts.length ? <MessageArtifactList artifacts={messageArtifacts} /> : null}
           </MessageBody>
         </ChatMessageFrame>
       </AssistantCell>
@@ -4532,6 +4927,7 @@ function ThreadMessage({
           <MessageText>
             <MessageTextContent message={message} workspace={workspace} />
           </MessageText>
+          {messageArtifacts.length ? <MessageArtifactList artifacts={messageArtifacts} /> : null}
         </MessageBody>
       </ChatMessageFrame>
     </UserCell>

@@ -1796,6 +1796,28 @@ function WorkspaceTerminal({
     workspaceId: workspace?.id || "",
     ...fields,
   });
+  const setTerminalAudioInputTarget = useCallback((active, instanceId = terminalInstanceIdRef.current || 0, reason = "terminal_audio_target") => {
+    const safeInstanceId = Number(instanceId || 0);
+    if (!paneId || !safeInstanceId) {
+      return;
+    }
+
+    invoke("set_terminal_audio_input_target", {
+      active: Boolean(active),
+      instanceId: safeInstanceId,
+      paneId,
+    }).catch((error) => {
+      logTerminalDiagnosticEvent("frontend.audio_input_target.set_error", {
+        active: Boolean(active),
+        instanceId: safeInstanceId,
+        message: error?.message || String(error || ""),
+        paneId,
+        reason,
+        terminalIndex,
+        workspaceId: workspace?.id || "",
+      });
+    });
+  }, [paneId, terminalIndex, workspace?.id]);
   const resetTerminalReadinessForEpoch = ({
     activityStatus = "idle",
     instanceId = terminalInstanceIdRef.current,
@@ -3983,6 +4005,7 @@ function WorkspaceTerminal({
     } else if (focusKeyboard) {
       setActiveTerminalKeyboardTarget(paneId, instanceId);
     }
+    setTerminalAudioInputTarget(true, instanceId, source);
 
     if (focusKeyboard) {
       focusTerminalKeyboardInput(true);
@@ -3991,6 +4014,7 @@ function WorkspaceTerminal({
     focusTerminalKeyboardInput,
     onActivateTerminal,
     paneId,
+    setTerminalAudioInputTarget,
     terminalIndex,
     updateTerminalInteractiveState,
     workspace?.id,
@@ -4136,16 +4160,20 @@ function WorkspaceTerminal({
     updateTerminalInteractiveState(nextActive);
 
     if (nextActive) {
-      setActiveTerminalKeyboardTarget(paneId, terminalInstanceIdRef.current || 0);
+      const instanceId = terminalInstanceIdRef.current || 0;
+      setActiveTerminalKeyboardTarget(paneId, instanceId);
+      setTerminalAudioInputTarget(true, instanceId, "terminal_active_prop");
       if (!wasActiveProp) {
         attachDeferredWebglRef.current?.("terminal_activated");
       }
       return undefined;
     }
 
-    clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceIdRef.current || 0);
+    const instanceId = terminalInstanceIdRef.current || 0;
+    clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
+    setTerminalAudioInputTarget(false, instanceId, "terminal_inactive_prop");
     return undefined;
-  }, [isActive, paneId, updateTerminalInteractiveState]);
+  }, [isActive, paneId, setTerminalAudioInputTarget, updateTerminalInteractiveState]);
 
   useEffect(() => {
     const controller = resizeControllerRef.current;
@@ -4744,6 +4772,7 @@ function WorkspaceTerminal({
     const windowsTerminalDiagnosticsEnabled = isWindowsTerminalDiagnosticLoggingEnabled();
     if (terminalActiveRef.current) {
       setActiveTerminalKeyboardTarget(paneId, terminalInstanceId);
+      setTerminalAudioInputTarget(true, terminalInstanceId, "terminal_instance_allocated");
     }
     const lifecycleStartedAt = performance.now();
     const setPaneStage = (state, title, detail = "", fields = {}) => {
@@ -11788,6 +11817,7 @@ function WorkspaceTerminal({
         workspaceId: workspace?.id || "",
       });
       clearActiveTerminalKeyboardTargetIfCurrent(paneId, terminalInstanceId);
+      setTerminalAudioInputTarget(false, terminalInstanceId, "terminal_cleanup");
       const preserveCoordinationSession = preserveCoordinationOnNextCleanupRef.current && !isGenericTerminal;
       preserveCoordinationOnNextCleanupRef.current = false;
       logTerminalStatus("frontend.terminal_lifecycle.cleanup_close", {
@@ -12846,6 +12876,7 @@ function WorkspaceTerminal({
     });
 
     try {
+      setTerminalAudioInputTarget(false, terminalInstanceIdRef.current || 0, "terminal_close");
       await invoke("terminal_close", {
         paneId,
         instanceId: terminalInstanceIdRef.current || undefined,
@@ -12899,7 +12930,7 @@ function WorkspaceTerminal({
       terminalIndex,
       workspaceId: workspace?.id || "",
     });
-  }, [onCloseTerminal, onThreadTerminalLifecycle, paneId, terminalClosed, terminalIndex, workspace?.id]);
+  }, [onCloseTerminal, onThreadTerminalLifecycle, paneId, setTerminalAudioInputTarget, terminalClosed, terminalIndex, workspace?.id]);
 
   const cancelParkedPrompt = useCallback(async () => {
     if (!parkedPrompt?.taskId || terminalClosingRef.current) {

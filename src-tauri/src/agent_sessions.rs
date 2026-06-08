@@ -56,6 +56,17 @@ struct CodexThreadSessionDiscoverRequest {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CodexThreadTranscriptArtifact {
+    kind: String,
+    mime_type: String,
+    path: String,
+    url: String,
+    title: String,
+    prompt: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CodexThreadTranscriptMessage {
     id: String,
     role: String,
@@ -65,6 +76,8 @@ struct CodexThreadTranscriptMessage {
     call_id: String,
     created_at: String,
     source: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    artifacts: Vec<CodexThreadTranscriptArtifact>,
 }
 
 #[derive(Clone, Default)]
@@ -541,6 +554,294 @@ fn codex_content_text(value: &Value) -> String {
     }
 }
 
+fn clean_codex_artifact_reference(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '"' | '\'' | '<' | '>' | '[' | ']' | '(' | ')' | ',' | ';'
+            )
+        })
+        .trim()
+        .to_string()
+}
+
+fn codex_artifact_extension(reference: &str) -> String {
+    let reference = reference
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(reference)
+        .trim_end_matches('/');
+    Path::new(reference)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+fn codex_image_mime(reference: &str, explicit_mime: &str) -> String {
+    let explicit_mime = explicit_mime.trim().to_lowercase();
+    if explicit_mime.starts_with("image/") {
+        return explicit_mime;
+    }
+
+    match codex_artifact_extension(reference).as_str() {
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn codex_artifact_path_url(reference: &str) -> (String, String) {
+    let reference = clean_codex_artifact_reference(reference);
+    if reference.starts_with("file://") {
+        return (
+            reference.trim_start_matches("file://").to_string(),
+            reference,
+        );
+    }
+    if reference.starts_with("http://")
+        || reference.starts_with("https://")
+        || reference.starts_with("data:")
+    {
+        return (String::new(), reference);
+    }
+    if reference.starts_with('/') || reference.starts_with("~/") {
+        return (reference.clone(), format!("file://{reference}"));
+    }
+
+    (reference.clone(), reference)
+}
+
+fn codex_image_artifact(
+    reference: &str,
+    title: &str,
+    prompt: &str,
+    explicit_mime: &str,
+) -> Option<CodexThreadTranscriptArtifact> {
+    let reference = clean_codex_artifact_reference(reference);
+    if reference.is_empty() {
+        return None;
+    }
+
+    let mime_type = codex_image_mime(&reference, explicit_mime);
+    if mime_type.is_empty() {
+        return None;
+    }
+
+    let (path, url) = codex_artifact_path_url(&reference);
+    Some(CodexThreadTranscriptArtifact {
+        kind: "image".to_string(),
+        mime_type,
+        path,
+        url,
+        title: clean_codex_title(title, "Generated image"),
+        prompt: prompt.trim().to_string(),
+    })
+}
+
+fn push_codex_image_artifact(
+    artifacts: &mut Vec<CodexThreadTranscriptArtifact>,
+    seen: &mut HashSet<String>,
+    reference: &str,
+    title: &str,
+    prompt: &str,
+    explicit_mime: &str,
+) {
+    let Some(artifact) = codex_image_artifact(reference, title, prompt, explicit_mime) else {
+        return;
+    };
+    let key = if artifact.url.is_empty() {
+        artifact.path.clone()
+    } else {
+        artifact.url.clone()
+    };
+    if seen.insert(key) {
+        artifacts.push(artifact);
+    }
+}
+
+fn codex_generated_image_prompt(text: &str) -> String {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        for marker in ["prompt used:", "prompt:"] {
+            if let Some(index) = lower.find(marker) {
+                return trimmed[index + marker.len()..].trim().to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn collect_codex_image_artifacts_from_text(
+    text: &str,
+    title: &str,
+    prompt: &str,
+    artifacts: &mut Vec<CodexThreadTranscriptArtifact>,
+    seen: &mut HashSet<String>,
+) {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        for marker in ["saved to:", "generated image:", "image:", "path:"] {
+            if lower.starts_with(marker) {
+                push_codex_image_artifact(
+                    artifacts,
+                    seen,
+                    trimmed[marker.len()..].trim(),
+                    title,
+                    prompt,
+                    "",
+                );
+            }
+        }
+
+        if let Some(index) = trimmed.find("file://") {
+            push_codex_image_artifact(artifacts, seen, &trimmed[index..], title, prompt, "");
+        }
+
+        for token in trimmed.split_whitespace() {
+            push_codex_image_artifact(artifacts, seen, token, title, prompt, "");
+        }
+    }
+}
+
+fn collect_codex_image_artifacts_from_value(
+    value: &Value,
+    title: &str,
+    prompt: &str,
+    artifacts: &mut Vec<CodexThreadTranscriptArtifact>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        Value::String(text) => {
+            collect_codex_image_artifacts_from_text(text, title, prompt, artifacts, seen);
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_codex_image_artifacts_from_value(item, title, prompt, artifacts, seen);
+            }
+        }
+        Value::Object(object) => {
+            let explicit_mime = object
+                .get("mime_type")
+                .or_else(|| object.get("mimeType"))
+                .or_else(|| object.get("content_type"))
+                .or_else(|| object.get("contentType"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let kind = object
+                .get("kind")
+                .or_else(|| object.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let object_title = object
+                .get("title")
+                .or_else(|| object.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(title);
+            let object_prompt = object
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or(prompt);
+
+            for key in [
+                "path",
+                "file_path",
+                "filePath",
+                "local_path",
+                "localPath",
+                "url",
+                "uri",
+                "file_url",
+                "fileUrl",
+                "image_url",
+                "imageUrl",
+                "src",
+            ] {
+                if let Some(reference) = object.get(key).and_then(Value::as_str) {
+                    let mime_hint = if explicit_mime.starts_with("image/")
+                        || kind.contains("image")
+                        || key.to_lowercase().contains("image")
+                    {
+                        explicit_mime
+                    } else {
+                        ""
+                    };
+                    push_codex_image_artifact(
+                        artifacts,
+                        seen,
+                        reference,
+                        object_title,
+                        object_prompt,
+                        mime_hint,
+                    );
+                }
+            }
+
+            for value in object.values() {
+                collect_codex_image_artifacts_from_value(
+                    value,
+                    object_title,
+                    object_prompt,
+                    artifacts,
+                    seen,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn codex_image_artifacts_from_content(
+    value: &Value,
+    text: &str,
+    fallback_title: &str,
+) -> Vec<CodexThreadTranscriptArtifact> {
+    let prompt = codex_generated_image_prompt(text);
+    let title = if text.to_lowercase().contains("generated image") {
+        "Generated image"
+    } else {
+        fallback_title
+    };
+    let mut artifacts = Vec::new();
+    let mut seen = HashSet::new();
+    collect_codex_image_artifacts_from_value(value, title, &prompt, &mut artifacts, &mut seen);
+    collect_codex_image_artifacts_from_text(text, title, &prompt, &mut artifacts, &mut seen);
+    artifacts
+}
+
+fn codex_artifact_activity_kind(text: &str, artifacts: &[CodexThreadTranscriptArtifact]) -> String {
+    let lower = text.to_lowercase();
+    if !artifacts.is_empty()
+        && (lower.contains("generated image")
+            || lower.contains("image generated")
+            || lower.contains("prompt used:"))
+    {
+        return "image_generation".to_string();
+    }
+
+    "tool_output".to_string()
+}
+
+fn codex_artifact_activity_title(text: &str, fallback: &str, artifacts: &[CodexThreadTranscriptArtifact]) -> String {
+    if !artifacts.is_empty() && codex_artifact_activity_kind(text, artifacts) == "image_generation" {
+        return "Generated image".to_string();
+    }
+
+    fallback.to_string()
+}
+
 fn codex_summary_text(payload: &Value) -> String {
     let Some(summary) = payload.get("summary") else {
         return String::new();
@@ -590,6 +891,7 @@ fn transcript_task_complete_message(
         call_id: String::new(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
+    artifacts: Vec::new(),
     }
 }
 
@@ -608,6 +910,7 @@ fn transcript_error_message(
         call_id: String::new(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
+    artifacts: Vec::new(),
     }
 }
 
@@ -678,6 +981,7 @@ fn codex_function_call_message(
         call_id,
         created_at: timestamp.to_string(),
         source: "codex".to_string(),
+    artifacts: Vec::new(),
     })
 }
 
@@ -687,24 +991,27 @@ fn codex_function_output_message(
     payload: &Value,
 ) -> Option<CodexThreadTranscriptMessage> {
     let call_id = value_string(payload.get("call_id"));
-    let output = clean_codex_transcript_text(
-        codex_content_text(payload.get("output").unwrap_or(&Value::Null)),
-        CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
-    );
+    let output_value = payload.get("output").unwrap_or(&Value::Null);
+    let raw_output = codex_content_text(output_value);
+    let output = clean_codex_transcript_text(&raw_output, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    let artifacts = codex_image_artifacts_from_content(output_value, &raw_output, "Tool output");
 
-    if output.is_empty() {
+    if output.is_empty() && artifacts.is_empty() {
         return None;
     }
+    let kind = codex_artifact_activity_kind(&output, &artifacts);
+    let title = codex_artifact_activity_title(&output, "Tool output", &artifacts);
 
     Some(CodexThreadTranscriptMessage {
         id: format!("codex-{line_index}-tool-output"),
         role: "activity".to_string(),
-        kind: "tool_output".to_string(),
+        kind,
         text: output,
-        title: "Tool output".to_string(),
+        title,
         call_id,
         created_at: timestamp.to_string(),
         source: "codex".to_string(),
+        artifacts,
     })
 }
 
@@ -854,6 +1161,7 @@ fn codex_messages_from_event(
                 }
                 text.push_str(&format!("[{image_count} image attachment(s)]"));
             }
+            let artifacts = codex_image_artifacts_from_content(payload, &text, "Attached image");
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-user"),
                 role: "user".to_string(),
@@ -863,21 +1171,29 @@ fn codex_messages_from_event(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                artifacts,
             }]
         }
-        "agent_message" => vec![CodexThreadTranscriptMessage {
-            id: format!("codex-{line_index}-assistant-event"),
-            role: "assistant".to_string(),
-            kind: "message".to_string(),
-            text: clean_codex_transcript_text(
-                value_string(payload.get("message")),
-                CODEX_TRANSCRIPT_MAX_TEXT,
-            ),
-            title: String::new(),
-            call_id: String::new(),
-            created_at: timestamp.to_string(),
-            source: "codex".to_string(),
-        }],
+        "agent_message" => {
+            let raw_message = value_string(payload.get("message"));
+            let text = clean_codex_transcript_text(&raw_message, CODEX_TRANSCRIPT_MAX_TEXT);
+            let artifacts = codex_image_artifacts_from_content(payload, &raw_message, "Generated image");
+            if text.is_empty() && artifacts.is_empty() {
+                Vec::new()
+            } else {
+                vec![CodexThreadTranscriptMessage {
+                    id: format!("codex-{line_index}-assistant-event"),
+                    role: "assistant".to_string(),
+                    kind: "message".to_string(),
+                    text,
+                    title: String::new(),
+                    call_id: String::new(),
+                    created_at: timestamp.to_string(),
+                    source: "codex".to_string(),
+                    artifacts,
+                }]
+            }
+        }
         "task_complete" => vec![CodexThreadTranscriptMessage {
             id: format!("codex-{line_index}-task-complete"),
             role: "assistant".to_string(),
@@ -897,6 +1213,7 @@ fn codex_messages_from_event(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
+        artifacts: Vec::new(),
         }],
         "patch_apply_end" => {
             let success = payload.get("success").and_then(Value::as_bool).unwrap_or(false);
@@ -916,6 +1233,7 @@ fn codex_messages_from_event(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+            artifacts: Vec::new(),
             }]
         }
         "context_compacted" => vec![CodexThreadTranscriptMessage {
@@ -927,6 +1245,7 @@ fn codex_messages_from_event(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
+        artifacts: Vec::new(),
         }],
         "mcp_tool_call_end" => {
             let invocation = payload.get("invocation").unwrap_or(&Value::Null);
@@ -949,15 +1268,23 @@ fn codex_messages_from_event(
                 .map(pretty_json)
                 .or_else(|| payload.get("error").map(pretty_json))
                 .unwrap_or_default();
+            let artifact_value = payload
+                .get("result")
+                .or_else(|| payload.get("error"))
+                .unwrap_or(&Value::Null);
+            let artifacts = codex_image_artifacts_from_content(artifact_value, &text, &title);
+            let kind = codex_artifact_activity_kind(&text, &artifacts);
+            let title = codex_artifact_activity_title(&text, &clean_codex_title(title, "MCP tool"), &artifacts);
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-mcp"),
                 role: "activity".to_string(),
-                kind: "tool_output".to_string(),
+                kind,
                 text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: clean_codex_title(title, "MCP tool"),
+                title,
                 call_id: value_string(invocation.get("call_id")),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                artifacts,
             }]
         }
         _ => Vec::new(),
@@ -976,19 +1303,24 @@ fn codex_messages_from_response_item(
             if role != "assistant" {
                 return Vec::new();
             }
+            let content = payload.get("content").unwrap_or(&Value::Null);
+            let raw_text = codex_content_text(content);
+            let text = clean_codex_transcript_text(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
+            let artifacts = codex_image_artifacts_from_content(content, &raw_text, "Generated image");
+            if text.is_empty() && artifacts.is_empty() {
+                return Vec::new();
+            }
 
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-assistant"),
                 role: "assistant".to_string(),
                 kind: "message".to_string(),
-                text: clean_codex_transcript_text(
-                    codex_content_text(payload.get("content").unwrap_or(&Value::Null)),
-                    CODEX_TRANSCRIPT_MAX_TEXT,
-                ),
+                text,
                 title: String::new(),
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                artifacts,
             }]
         }
         "function_call" | "custom_tool_call" => {
@@ -1010,6 +1342,7 @@ fn codex_messages_from_response_item(
             call_id: value_string(payload.get("id")),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
+        artifacts: Vec::new(),
         }],
         "reasoning" => {
             let summary = clean_codex_transcript_text(
@@ -1028,6 +1361,7 @@ fn codex_messages_from_response_item(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "codex".to_string(),
+                artifacts: Vec::new(),
                 }]
             }
         }
@@ -1355,6 +1689,7 @@ fn claude_activity_from_block(
                 call_id,
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
+            artifacts: Vec::new(),
             })
         }
         "tool_result" => {
@@ -1363,15 +1698,20 @@ fn claude_activity_from_block(
                 .get("content")
                 .map(claude_content_text)
                 .unwrap_or_default();
+            let text = clean_codex_transcript_text(&content, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let artifacts = codex_image_artifacts_from_content(block, &content, "Tool output");
+            let kind = codex_artifact_activity_kind(&text, &artifacts);
+            let title = codex_artifact_activity_title(&text, "Tool output", &artifacts);
             Some(CodexThreadTranscriptMessage {
                 id: format!("claude-{line_index}-{block_index}-tool-output"),
                 role: "activity".to_string(),
-                kind: "tool_output".to_string(),
-                text: clean_codex_transcript_text(content, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: "Tool output".to_string(),
+                kind,
+                text,
+                title,
                 call_id,
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
+                artifacts,
             })
         }
         "thinking" => {
@@ -1388,6 +1728,7 @@ fn claude_activity_from_block(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "claude".to_string(),
+                artifacts: Vec::new(),
                 })
             }
         }
@@ -1509,6 +1850,7 @@ fn parse_claude_session(
                         call_id: String::new(),
                         created_at: timestamp.clone(),
                         source: "claude".to_string(),
+                    artifacts: Vec::new(),
                     }),
                 );
             }
@@ -1658,6 +2000,7 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+            artifacts: Vec::new(),
             }]
         }
         "reasoning" => {
@@ -1674,6 +2017,7 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+            artifacts: Vec::new(),
             }]
         }
         "tool" => {
@@ -1704,6 +2048,7 @@ fn opencode_part_message(
                 call_id: call_id.clone(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+            artifacts: Vec::new(),
             });
             let has_error = !error.trim().is_empty();
             let output_text = if has_error {
@@ -1712,19 +2057,27 @@ fn opencode_part_message(
                 output
             };
             if !output_text.trim().is_empty() {
+                let artifacts = codex_image_artifacts_from_content(data, &output_text, "Tool output");
+                let kind = if has_error {
+                    "tool_output".to_string()
+                } else {
+                    codex_artifact_activity_kind(&output_text, &artifacts)
+                };
+                let title = if has_error {
+                    "Tool error".to_string()
+                } else {
+                    codex_artifact_activity_title(&output_text, "Tool output", &artifacts)
+                };
                 messages.push(CodexThreadTranscriptMessage {
                     id: format!("opencode-{message_id}-{part_id}-tool-output"),
                     role: "activity".to_string(),
-                    kind: "tool_output".to_string(),
+                    kind,
                     text: clean_codex_transcript_text(output_text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                    title: if has_error {
-                        "Tool error".to_string()
-                    } else {
-                        "Tool output".to_string()
-                    },
+                    title,
                     call_id,
                     created_at: opencode_part_created_at(timestamp, data, true),
                     source: "opencode".to_string(),
+                    artifacts,
                 });
             }
             messages
@@ -1738,17 +2091,23 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
+        artifacts: Vec::new(),
         }],
-        "file" => vec![CodexThreadTranscriptMessage {
-            id: format!("opencode-{message_id}-{part_id}-file"),
-            role: "activity".to_string(),
-            kind: "file".to_string(),
-            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-            title: "File".to_string(),
-            call_id: String::new(),
-            created_at: timestamp.to_string(),
-            source: "opencode".to_string(),
-        }],
+        "file" => {
+            let text = pretty_json(data);
+            let artifacts = codex_image_artifacts_from_content(data, &text, "File");
+            vec![CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-file"),
+                role: "activity".to_string(),
+                kind: "file".to_string(),
+                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                title: "File".to_string(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+                artifacts,
+            }]
+        }
         "step-start" => {
             let text = first_value_string(&[data.get("summary"), data.get("description")]);
             let text = if text.trim().is_empty() {
@@ -1765,6 +2124,7 @@ fn opencode_part_message(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "opencode".to_string(),
+            artifacts: Vec::new(),
             }]
         }
         "step-finish" => {
@@ -1800,6 +2160,7 @@ fn opencode_part_message(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
+        artifacts: Vec::new(),
         }],
         _ => Vec::new(),
     }
@@ -2160,6 +2521,7 @@ fn parse_opencode_session(
                     call_id: String::new(),
                     created_at: timestamp.clone(),
                     source: "opencode".to_string(),
+                artifacts: Vec::new(),
                 }),
             );
         }
