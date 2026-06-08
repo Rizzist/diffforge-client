@@ -32,6 +32,10 @@ const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-workspace-asse
 const VOICE_PLAN_SERVER_RESULT_EVENT: &str = "diffforge-voice-plan-server-result";
 const CLOUD_MCP_DEVICE_ID_FILE: &str = "device-id";
 const CLOUD_MCP_DEVICE_KEY_FILE: &str = "device-key";
+const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT: u16 = 48_731;
+const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PATH: &str = "/v1/device-proof";
+const DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES: usize = 16 * 1024;
+const DIFFFORGE_LOCAL_DEVICE_BRIDGE_PROOF_TTL_MS: u64 = 30_000;
 const CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS: usize = 2_000_000;
 const CLOUD_MCP_WORKSPACE_TODO_MAX_ITEMS: usize = 120;
 const CLOUD_MCP_TODO_BODY_CACHE_MAX_ITEMS: usize = 96;
@@ -68,6 +72,8 @@ const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
     "Mia", "Ned", "Ona", "Pam", "Ray", "Rex", "Sam", "Sue", "Taj", "Alex", "Matt",
     "Mike", "Noah", "Omar", "Ezra",
 ];
+
+static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct CloudMcpBackgroundSync {
@@ -4038,6 +4044,354 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             })
         })
         .clone()
+}
+
+fn cloud_mcp_start_local_device_bridge() {
+    if CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async {
+        if let Err(error) = cloud_mcp_local_device_bridge_loop().await {
+            eprintln!("Diff Forge local device bridge stopped: {error}");
+        }
+    });
+}
+
+async fn cloud_mcp_local_device_bridge_loop() -> Result<(), String> {
+    let listener = TcpListener::bind(("127.0.0.1", DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT))
+        .await
+        .map_err(|error| {
+            CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED.store(false, Ordering::SeqCst);
+            format!(
+                "unable to bind 127.0.0.1:{}: {error}",
+                DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT
+            )
+        })?;
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("unable to accept local bridge request: {error}"))?;
+        tauri::async_runtime::spawn(async move {
+            let _ = cloud_mcp_handle_local_device_bridge_request(stream).await;
+        });
+    }
+}
+
+async fn cloud_mcp_handle_local_device_bridge_request(mut stream: TcpStream) -> Result<(), String> {
+    let Some(request) = cloud_mcp_read_local_bridge_http_request(&mut stream).await else {
+        return cloud_mcp_write_local_bridge_response(&mut stream, 400, None, json!({
+            "ok": false,
+            "error": "invalid_request",
+        }))
+        .await;
+    };
+
+    let origin = request
+        .headers
+        .get("origin")
+        .map(String::as_str)
+        .unwrap_or("");
+    let allowed_origin = cloud_mcp_local_bridge_allowed_origin(origin);
+    if request.method == "OPTIONS" {
+        return cloud_mcp_write_local_bridge_preflight(&mut stream, allowed_origin).await;
+    }
+
+    if request.method != "POST" || request.path != DIFFFORGE_LOCAL_DEVICE_BRIDGE_PATH {
+        return cloud_mcp_write_local_bridge_response(&mut stream, 404, allowed_origin, json!({
+            "ok": false,
+            "error": "not_found",
+        }))
+        .await;
+    }
+
+    if allowed_origin.is_none() {
+        return cloud_mcp_write_local_bridge_response(&mut stream, 403, None, json!({
+            "ok": false,
+            "error": "origin_not_allowed",
+        }))
+        .await;
+    }
+
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let nonce = cloud_mcp_payload_text(&body, &["nonce"])
+        .filter(|value| value.len() <= 160)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let web_device_id = cloud_mcp_payload_text(
+        &body,
+        &["web_device_id", "webDeviceId", "device_id", "deviceId"],
+    )
+    .filter(|value| value.len() <= 180)
+    .unwrap_or_else(|| "dashboard-web".to_string());
+    let web_session_id = cloud_mcp_payload_text(
+        &body,
+        &["web_session_id", "webSessionId", "session_id", "sessionId"],
+    )
+    .filter(|value| value.len() <= 180)
+    .unwrap_or_default();
+
+    let proof = cloud_mcp_local_device_bridge_proof(&nonce, &web_device_id, &web_session_id);
+    cloud_mcp_write_local_bridge_response(&mut stream, 200, allowed_origin, json!({
+        "ok": true,
+        "contract": "diffforge.local_device_bridge.v1",
+        "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
+        "proof": proof,
+    }))
+    .await
+}
+
+fn cloud_mcp_local_device_bridge_proof(
+    nonce: &str,
+    web_device_id: &str,
+    web_session_id: &str,
+) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let native_device_id = cloud_mcp_payload_text(
+        &device_profile,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
+    let native_device_name = cloud_mcp_payload_text(
+        &device_profile,
+        &["device_name", "deviceName", "machine_name", "machineName"],
+    )
+    .unwrap_or_else(|| "Diff Forge desktop".to_string());
+    let device_key_id =
+        cloud_mcp_payload_text(&device_profile, &["device_key_id", "deviceKeyId"])
+            .unwrap_or_default();
+    let device_public_key =
+        cloud_mcp_payload_text(&device_profile, &["device_public_key", "devicePublicKey"])
+            .unwrap_or_default();
+    let issued_at_ms = cloud_mcp_now_ms();
+    let expires_at_ms = issued_at_ms.saturating_add(DIFFFORGE_LOCAL_DEVICE_BRIDGE_PROOF_TTL_MS);
+    let signature = cloud_mcp_local_device_bridge_signature(
+        &native_device_id,
+        &device_key_id,
+        &device_public_key,
+        web_device_id,
+        web_session_id,
+        nonce,
+        issued_at_ms,
+        expires_at_ms,
+        DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
+    );
+    let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
+
+    json!({
+        "v": 1,
+        "contract": "diffforge.local_device_bridge.v1",
+        "source": "rust-diffforge",
+        "bridge_port": DIFFFORGE_LOCAL_DEVICE_BRIDGE_PORT,
+        "nonce": nonce,
+        "issued_at_ms": issued_at_ms,
+        "expires_at_ms": expires_at_ms,
+        "native_device_id": native_device_id,
+        "native_device_name": native_device_name,
+        "device_key_id": device_key_id,
+        "device_public_key": device_public_key,
+        "device_key_algorithm": "sha256-local-anchor-v1",
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "client_type": device_profile["client_type"].clone(),
+        "connection_source": device_profile["connection_source"].clone(),
+        "billing_scope_type": billing_scope_type,
+        "team_id": team_id,
+        "web_device_id": web_device_id,
+        "web_session_id": web_session_id,
+        "signature_algorithm": "sha256-local-bridge-v1",
+        "signature": signature,
+    })
+}
+
+fn cloud_mcp_local_device_bridge_signature(
+    native_device_id: &str,
+    device_key_id: &str,
+    device_public_key: &str,
+    web_device_id: &str,
+    web_session_id: &str,
+    nonce: &str,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    bridge_port: u16,
+) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "diffforge-local-device-proof-v1\n{native_device_id}\n{device_key_id}\n{device_public_key}\n{web_device_id}\n{web_session_id}\n{nonce}\n{issued_at_ms}\n{expires_at_ms}\n{bridge_port}"
+        )
+        .as_bytes(),
+    );
+    format!("{digest:x}")
+}
+
+struct CloudMcpLocalBridgeRequest {
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+async fn cloud_mcp_read_local_bridge_http_request(
+    stream: &mut TcpStream,
+) -> Option<CloudMcpLocalBridgeRequest> {
+    let mut buffer = Vec::with_capacity(2048);
+    let mut chunk = [0_u8; 2048];
+    let mut header_end = None;
+
+    loop {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len() > DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES {
+            return None;
+        }
+        if header_end.is_none() {
+            header_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+        }
+        if let Some(end) = header_end {
+            let content_length = cloud_mcp_local_bridge_content_length(&buffer[..end])?;
+            let expected_len = end.saturating_add(4).saturating_add(content_length);
+            if buffer.len() >= expected_len {
+                break;
+            }
+        }
+    }
+
+    let header_end = header_end?;
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut lines = header_text.lines();
+    let request_line = lines.next()?.trim();
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next()?.to_ascii_uppercase();
+    let path = request_parts
+        .next()
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
+    let mut headers = HashMap::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES);
+    let body_start = header_end.saturating_add(4);
+    let body_end = body_start.saturating_add(content_length).min(buffer.len());
+    Some(CloudMcpLocalBridgeRequest {
+        method,
+        path,
+        headers,
+        body: buffer[body_start..body_end].to_vec(),
+    })
+}
+
+fn cloud_mcp_local_bridge_content_length(header_bytes: &[u8]) -> Option<usize> {
+    let header_text = String::from_utf8_lossy(header_bytes);
+    for line in header_text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value <= DIFFFORGE_LOCAL_DEVICE_BRIDGE_MAX_REQUEST_BYTES);
+        }
+    }
+    Some(0)
+}
+
+fn cloud_mcp_local_bridge_allowed_origin(origin: &str) -> Option<String> {
+    let trimmed = origin.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://localhost:")
+        || lower.starts_with("http://127.0.0.1:")
+        || lower.starts_with("http://[::1]:")
+    {
+        return Some(trimmed.to_string());
+    }
+
+    let Some(rest) = lower.strip_prefix("https://") else {
+        return None;
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if host == "diffforge.ai" || host.ends_with(".diffforge.ai") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+async fn cloud_mcp_write_local_bridge_preflight(
+    stream: &mut TcpStream,
+    allowed_origin: Option<String>,
+) -> Result<(), String> {
+    let status = if allowed_origin.is_some() { 204 } else { 403 };
+    let origin_header = allowed_origin
+        .as_ref()
+        .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\n"))
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status} {}\r\n{origin_header}Access-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-DiffForge-Bridge\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Max-Age: 300\r\nVary: Origin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        if status == 204 { "No Content" } else { "Forbidden" },
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|error| format!("unable to write bridge preflight: {error}"))
+}
+
+async fn cloud_mcp_write_local_bridge_response(
+    stream: &mut TcpStream,
+    status: u16,
+    allowed_origin: Option<String>,
+    body: Value,
+) -> Result<(), String> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    let body = serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
+    let origin_header = allowed_origin
+        .as_ref()
+        .map(|origin| format!("Access-Control-Allow-Origin: {origin}\r\n"))
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\n{origin_header}Access-Control-Allow-Private-Network: true\r\nVary: Origin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len(),
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|error| format!("unable to write bridge response headers: {error}"))?;
+    stream
+        .write_all(&body)
+        .await
+        .map_err(|error| format!("unable to write bridge response body: {error}"))
 }
 
 #[tauri::command]

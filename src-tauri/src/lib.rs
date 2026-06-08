@@ -31,7 +31,7 @@ use tauri::{
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot, Mutex, RwLock},
     time::{sleep, timeout},
@@ -3638,6 +3638,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             pty_pool.ensure_warm_async();
+            cloud_mcp_start_local_device_bridge();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
