@@ -37,6 +37,10 @@ pub const TOOL_NAMES: &[&str] = &[
     "wait_for_todos",
     "list_todo_history",
     "list_assets",
+    "create_asset",
+    "finalize_asset",
+    "materialize_asset",
+    "link_asset_to_workspace",
     "register_asset",
     "upload_assets",
     "download_assets",
@@ -3255,6 +3259,10 @@ fn dispatch_tool_result(
         "wait_for_todos" => kernel_wait_for_todos(&kernel, &input),
         "list_todo_history" => kernel_list_todo_history(&kernel, &input),
         "list_assets" => kernel_list_assets(&kernel, &input),
+        "create_asset" => kernel_create_asset(&kernel, &input),
+        "finalize_asset" => kernel_finalize_asset(&kernel, &input),
+        "materialize_asset" => kernel_materialize_asset(&kernel, &input),
+        "link_asset_to_workspace" => kernel_link_asset_to_workspace(&kernel, &input),
         "register_asset" => kernel_register_asset(&kernel, &input),
         "upload_assets" => kernel_upload_assets(&kernel, &input),
         "download_assets" => kernel_download_assets(&kernel, &input),
@@ -3518,6 +3526,62 @@ fn kernel_list_assets(kernel: &CoordinationKernel, input: &Value) -> Result<Valu
         input["workspace_id"].as_str(),
         input,
     )?))
+}
+
+fn kernel_create_asset(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    Ok(api_ok(crate::cloud_mcp_forward_agent_create_asset(
+        Some(repo_path),
+        input["workspace_id"].as_str(),
+        input,
+    )?))
+}
+
+fn kernel_finalize_asset(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    Ok(api_ok(crate::cloud_mcp_forward_agent_finalize_asset(
+        Some(repo_path),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input,
+    )?))
+}
+
+fn kernel_materialize_asset(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    Ok(api_ok(crate::cloud_mcp_forward_agent_materialize_asset(
+        Some(repo_path),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input,
+    )?))
+}
+
+fn kernel_link_asset_to_workspace(
+    kernel: &CoordinationKernel,
+    input: &Value,
+) -> Result<Value, String> {
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
+        .as_str()
+        .unwrap_or(repo_path_fallback.as_str());
+    Ok(api_ok(
+        crate::cloud_mcp_forward_agent_link_asset_to_workspace(
+            Some(repo_path),
+            input["workspace_id"].as_str(),
+            input["cloud_mcp_base_url"].as_str(),
+            input,
+        )?,
+    ))
 }
 
 fn kernel_register_asset(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -5330,7 +5394,11 @@ fn tool_description(name: &str) -> String {
         "wait_for_todos" => "Wait inside the local Rust proxy over local SQLite todo status until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
         "list_todo_history" => "List compact recent todo dispatch history from the local Rust SQLite mirror for this workspace/repo, including origin/target devices, statuses, dispatch ids, batch ids, and body refs/previews. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "list_assets" => "List compact asset library rows from the local Rust SQLite mirror for this workspace/repo, including local/cloud availability, hashes, sizes, and recent transfer status. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
-        "register_asset" => "Register a local file as a workspace asset without uploading by default. Computes sha256/size locally, records the asset in the Rust SQLite mirror, and optionally uploads it when upload=true.".to_string(),
+        "create_asset" => "Reserve a canonical cross-platform Diff Forge asset-library path for a new generated/imported asset. For generated images and reusable media, call this before writing bytes; then write to localPath and call finalize_asset. Prefer this over creating repo assets/ files unless the user explicitly asked for a project-local file or the build needs one.".to_string(),
+        "finalize_asset" => "Finalize a file written to a Diff Forge managed asset path: compute sha256/size locally, register it in Rust's local asset mirror, sync a local-only Cloud asset row, and optionally upload when upload=true. Use this after create_asset for generated media.".to_string(),
+        "materialize_asset" => "Download or materialize one or more Cloud assets into the device-level Diff Forge asset library by default. Use this when a workspace needs an account asset locally; export/copy into a repo only when the project requires a static file.".to_string(),
+        "link_asset_to_workspace" => "Record that the current workspace uses an account asset without making the workspace own the asset. Use project_path/link_kind metadata when the asset is exported or referenced by the project.".to_string(),
+        "register_asset" => "Import/register an existing local file path as an asset. Prefer create_asset plus finalize_asset for newly generated media; use register_asset for adoption of files that already exist outside the managed asset root.".to_string(),
         "upload_assets" => "Upload one or more registered local assets to Cloud storage. Rust uses local sha256/size metadata for dedupe, records transfer progress locally, and lets Cloud acknowledge completed blobs.".to_string(),
         "download_assets" => "Download one or more Cloud-available assets into the workspace or target directory, update the local SQLite mirror, and preserve hash/size metadata for later dedupe.".to_string(),
         "get_asset_status" => "Return compact current asset and transfer status from the local Rust SQLite asset mirror only. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
@@ -5536,6 +5604,66 @@ fn tool_input_schema(name: &str) -> Value {
                 "kind": {"type": "string", "description": "Optional asset kind filter, for example image, video, audio, pdf, archive, or document."},
                 "limit": {"type": "integer", "description": "Maximum compact rows to return.", "default": 100, "maximum": 1000}
             },
+            "additionalProperties": true
+        }),
+        "create_asset" => json!({
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string", "description": "Optional requesting workspace id. Defaults to the current coordination workspace."},
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "asset_id": {"type": "string", "description": "Optional caller-provided account asset id. Omit to let Rust generate one."},
+                "name": {"type": "string", "description": "Preferred display filename, for example chocolate.png."},
+                "filename": {"type": "string", "description": "Alias for name."},
+                "mime_type": {"type": "string", "description": "Optional MIME type used to infer an extension."},
+                "kind": {"type": "string", "description": "Optional asset kind, for example image, video, audio, pdf, archive, document, or file."},
+                "extension": {"type": "string", "description": "Optional extension without a leading dot."},
+                "group": {"type": "string", "description": "Optional managed library subfolder, defaults to generated."},
+                "source_kind": {"type": "string", "description": "Optional provenance/source label."},
+                "metadata": {"type": "object", "description": "Optional metadata to carry into finalize_asset.", "additionalProperties": true}
+            },
+            "additionalProperties": true
+        }),
+        "finalize_asset" => json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Required local path written by the generator, usually localPath returned by create_asset."},
+                "local_path": {"type": "string", "description": "Alias for path."},
+                "workspace_id": {"type": "string", "description": "Optional requesting workspace id. Defaults to the current coordination workspace."},
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "asset_id": {"type": "string", "description": "Asset id returned by create_asset. Strongly recommended for generated media."},
+                "name": {"type": "string", "description": "Optional display name."},
+                "filename": {"type": "string", "description": "Alias for name."},
+                "mime_type": {"type": "string", "description": "Optional MIME type override."},
+                "kind": {"type": "string", "description": "Optional asset kind override."},
+                "source_kind": {"type": "string", "description": "Optional provenance/source label."},
+                "metadata": {"type": "object", "description": "Optional metadata to store with the asset.", "additionalProperties": true},
+                "upload": {"type": "boolean", "description": "When true, upload to Cloud after local and Cloud registration.", "default": false}
+            },
+            "required": ["path"],
+            "additionalProperties": true
+        }),
+        "materialize_asset" => json!({
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "description": "Single Cloud asset id to materialize locally."},
+                "asset_ids": {"type": "array", "description": "Multiple Cloud asset ids to materialize locally.", "items": {"type": "string"}},
+                "workspace_id": {"type": "string", "description": "Optional requesting workspace id. Defaults to the current coordination workspace."},
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "target_directory": {"type": "string", "description": "Optional target directory. Defaults to the device-level Diff Forge asset library materialized folder."}
+            },
+            "additionalProperties": true
+        }),
+        "link_asset_to_workspace" => json!({
+            "type": "object",
+            "properties": {
+                "asset_id": {"type": "string", "description": "Required account asset id to link to the workspace."},
+                "workspace_id": {"type": "string", "description": "Optional workspace id. Defaults to the current coordination workspace."},
+                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
+                "project_path": {"type": "string", "description": "Optional project path if the asset was exported or referenced inside the repo."},
+                "link_kind": {"type": "string", "description": "Optional link kind, for example reference, export, import, or generated_for."},
+                "metadata": {"type": "object", "description": "Optional usage metadata.", "additionalProperties": true}
+            },
+            "required": ["asset_id"],
             "additionalProperties": true
         }),
         "register_asset" => json!({
