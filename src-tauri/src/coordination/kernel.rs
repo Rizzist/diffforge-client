@@ -25065,7 +25065,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Architecture graph-only work is the direct-live exception: if the only edits are `.agents/architectures/graphs/*.arch`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the graph file directly in the visible repo root, then report the graph path in the final summary.\n\
-3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Cloud MCP must return a task_id first, then Rust mirrors that exact id locally for all leases, checkpoints, and patch submission.\n\
+3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission, then syncs its lifecycle to Cloud history in the background.\n\
 4. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
 5. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; the visible root is read-only for writes except live architecture graph sources at `.agents/architectures/graphs/*.arch`. Target the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT` explicitly for every Git-managed code or doc edit. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
 6. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
@@ -28128,7 +28128,11 @@ Appwrite > Session Store: create session
         );
         assert_eq!(response["ok"].as_bool(), Some(true));
         let task_id = response["data"]["task_id"].as_str().unwrap();
-        assert_eq!(task_id, "cloud-mount-task");
+        assert_ne!(task_id, "cloud-mount-task");
+        assert_eq!(
+            response["data"]["task_id_source"].as_str(),
+            Some("local_created")
+        );
         assert_eq!(response["data"]["created_task"].as_bool(), Some(true));
 
         let summary = kernel.mcp_client_mount_summary().unwrap();
@@ -28244,10 +28248,8 @@ Appwrite > Session Store: create session
         );
 
         assert_eq!(started["ok"].as_bool(), Some(true));
-        assert_eq!(
-            started["data"]["task_id"].as_str(),
-            Some("cloud-reactivated-task")
-        );
+        let task_id = started["data"]["task_id"].as_str().unwrap().to_string();
+        assert_ne!(task_id, "cloud-reactivated-task");
         let session = kernel
             .query_one(
                 "SELECT status, task_id, terminal_launch_epoch FROM agent_sessions WHERE id=?1",
@@ -28256,7 +28258,7 @@ Appwrite > Session Store: create session
             )
             .unwrap();
         assert_eq!(session["status"].as_str(), Some("active"));
-        assert_eq!(session["task_id"].as_str(), Some("cloud-reactivated-task"));
+        assert_eq!(session["task_id"].as_str(), Some(task_id.as_str()));
         assert_eq!(
             session["terminal_launch_epoch"].as_str(),
             Some("epoch-resume")
@@ -28291,7 +28293,7 @@ Appwrite > Session Store: create session
         );
         assert_eq!(started["ok"].as_bool(), Some(true));
         let task_id = started["data"]["task_id"].as_str().unwrap();
-        assert_eq!(task_id, "cloud-bootstrap-task");
+        assert_ne!(task_id, "cloud-bootstrap-task");
         assert_eq!(started["data"]["created_task"].as_bool(), Some(true));
 
         let repeated = crate::coordination::mcp::dispatch_tool(
@@ -28482,8 +28484,8 @@ Appwrite > Session Store: create session
     }
 
     #[test]
-    fn agent_mcp_start_task_refuses_local_task_without_cloud_task_id() {
-        let repo = init_git_repo("mcp_start_task_requires_cloud_id");
+    fn agent_mcp_start_task_creates_local_task_without_waiting_for_cloud() {
+        let repo = init_git_repo("mcp_start_task_is_local_first");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap().to_string();
@@ -28503,14 +28505,26 @@ Appwrite > Session Store: create session
             "start_task",
             json!({
                 "cloud_mcp_base_url": cloud_url.as_str(),
-                "plan": "Try to start without a Cloud task id."
+                "plan": "Start locally while Cloud history sync is unavailable."
             }),
         );
 
-        assert_eq!(response["ok"].as_bool(), Some(false));
+        assert_eq!(response["ok"].as_bool(), Some(true));
         assert_eq!(
-            response["error"]["code"].as_str(),
-            Some("cloud_start_task_failed")
+            response["data"]["task_id_source"].as_str(),
+            Some("local_created")
+        );
+        assert_eq!(
+            response["data"]["coordination_authority"].as_str(),
+            Some("local")
+        );
+        assert_eq!(
+            response["data"]["cloud"]["sync"]["queued"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            response["data"]["cloud"]["sync"]["durable"].as_bool(),
+            Some(true)
         );
         let session = kernel
             .query_one(
@@ -28519,9 +28533,11 @@ Appwrite > Session Store: create session
                 "missing session",
             )
             .unwrap();
-        assert!(session["task_id"].as_str().unwrap_or_default().is_empty());
+        let task_id = session["task_id"].as_str().unwrap_or_default();
+        assert!(!task_id.is_empty());
         let tasks = kernel.query_json("SELECT id FROM tasks", &[]).unwrap();
-        assert!(tasks.is_empty());
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"].as_str(), Some(task_id));
     }
 
     #[test]
@@ -28592,7 +28608,7 @@ Appwrite > Session Store: create session
         );
         assert_eq!(started["ok"].as_bool(), Some(true));
         let task_id = started["data"]["task_id"].as_str().unwrap();
-        assert_eq!(task_id, "cloud-session-omitted-task");
+        assert_ne!(task_id, "cloud-session-omitted-task");
         assert_ne!(task_id, session_id);
         assert_eq!(
             started["data"]["ignored_session_id_task_id"].as_bool(),
@@ -28723,7 +28739,7 @@ Appwrite > Session Store: create session
             }),
         );
         assert_eq!(next["ok"].as_bool(), Some(true));
-        assert_eq!(next["data"]["task_id"].as_str(), Some("cloud-after-cancel"));
+        assert_ne!(next["data"]["task_id"].as_str(), Some("cloud-after-cancel"));
         assert_eq!(next["data"]["created_task"].as_bool(), Some(true));
         assert_ne!(
             next["data"]["task_id"].as_str(),
@@ -28830,7 +28846,7 @@ Appwrite > Session Store: create session
         );
         assert_eq!(
             resumed["data"]["task_id_source"].as_str(),
-            Some("cloud_confirmed_existing")
+            Some("local_existing")
         );
         assert_eq!(resumed["data"]["reused_task"].as_bool(), Some(true));
         assert_ne!(

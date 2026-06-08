@@ -76,6 +76,9 @@ const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
 ];
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
+static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
+    std::sync::mpsc::Sender<(String, CloudMcpOutboxRow)>,
+> = OnceLock::new();
 
 #[derive(Clone)]
 struct CloudMcpBackgroundSync {
@@ -1036,6 +1039,74 @@ fn cloud_mcp_outbox_queued_response(row: &CloudMcpOutboxRow, error: Option<&str>
         response["lastError"] = json!(clean_terminal_telemetry_text(error));
     }
     response
+}
+
+fn cloud_mcp_queue_event_background(
+    base_url: &str,
+    event_kind: &str,
+    payload: &Value,
+    reason: &str,
+) -> Result<Value, String> {
+    let mut payload = payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        let event_id = format!(
+            "local-event-{}-{}",
+            cloud_mcp_now_ms(),
+            uuid::Uuid::new_v4()
+        );
+        let event_id = object
+            .entry("event_id".to_string())
+            .or_insert_with(|| json!(event_id))
+            .clone();
+        object
+            .entry("local_event_id".to_string())
+            .or_insert(event_id);
+    }
+    let row = cloud_mcp_outbox_enqueue_event(
+        event_kind,
+        &payload,
+        cloud_mcp_outbox_priority_for_event(event_kind),
+        reason,
+    )?;
+    let queued = cloud_mcp_outbox_queued_response(&row, None);
+    let _ = cloud_mcp_background_event_sender().send((base_url.to_string(), row));
+    Ok(queued)
+}
+
+fn cloud_mcp_background_event_sender(
+) -> &'static std::sync::mpsc::Sender<(String, CloudMcpOutboxRow)> {
+    CLOUD_MCP_BACKGROUND_EVENT_SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<(String, CloudMcpOutboxRow)>();
+        std::thread::spawn(move || {
+            for (base_url, row) in receiver {
+                let result = serde_json::from_str::<Value>(&row.payload_json)
+                    .map_err(|error| {
+                        format!("Unable to decode Cloud sync outbox payload: {error}")
+                    })
+                    .and_then(|payload| {
+                        let envelope = cloud_mcp_event_envelope(&row.event_kind, &payload);
+                        cloud_mcp_proxy_post_json_endpoint(
+                            &base_url,
+                            "/v1/events",
+                            &envelope.to_string(),
+                        )
+                        .map(|response| {
+                            serde_json::from_str::<Value>(&response)
+                                .unwrap_or_else(|_| json!({"raw_response": response}))
+                        })
+                    });
+                match result {
+                    Ok(response) => {
+                        let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+                    }
+                    Err(error) => {
+                        let _ = cloud_mcp_outbox_mark_retry(&row, &error);
+                    }
+                }
+            }
+        });
+        sender
+    })
 }
 
 async fn cloud_mcp_enqueue_background_sync(
@@ -18377,6 +18448,26 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn lifecycle_history_event_ids_keep_repeated_task_events_distinct() {
+        let first = json!({
+            "task_id": "task-local-1",
+            "event_id": "local-event-1",
+            "summary": "First checkpoint",
+        });
+        let second = json!({
+            "task_id": "task-local-1",
+            "event_id": "local-event-2",
+            "summary": "Second checkpoint",
+        });
+        let (_, first_key, _, _) =
+            cloud_mcp_outbox_payload_with_idempotency("checkpoint_recorded", &first);
+        let (_, second_key, _, _) =
+            cloud_mcp_outbox_payload_with_idempotency("checkpoint_recorded", &second);
+
+        assert_ne!(first_key, second_key);
+    }
+
+    #[test]
     fn cloud_workspace_bundle_prepares_container_manifest_and_child_filetrees() {
         let root = test_cloud_root("diffforge-cloud-container-bundle");
         create_cloud_package_project(&root.join("frontend"));
@@ -19547,7 +19638,7 @@ impl Read for CloudMcpAssetProgressReader {
 
 fn cloud_mcp_upload_asset_streaming_blocking(
     url: String,
-    mut headers: reqwest::header::HeaderMap,
+    headers: reqwest::header::HeaderMap,
     local_path: &Path,
     repo_id: String,
     workspace_id: String,
@@ -19573,11 +19664,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             )
         })?
         .len();
-    headers.insert(
-        reqwest::header::CONTENT_LENGTH,
-        reqwest::header::HeaderValue::from_str(&length.to_string())
-            .map_err(|error| format!("Invalid asset content length header: {error}"))?,
-    );
     let mut progress = CloudMcpAssetTransferProgress::new(
         repo_id,
         workspace_id,
@@ -19595,7 +19681,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
         .map_err(|error| format!("Unable to create asset upload client: {error}"))?
         .put(url)
         .headers(headers)
-        .body(reqwest::blocking::Body::new(reader))
+        .body(reqwest::blocking::Body::sized(reader, length))
         .send();
     let response = match send_result {
         Ok(response) => response,
@@ -20390,47 +20476,17 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     }
     cloud_mcp_proxy_insert_local_file_scope(&mut arguments, &identity, event_kind);
 
-    let request = json!({
-        "event_kind": event_kind,
-        "payload": Value::Object(arguments),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let payload = Value::Object(arguments);
     identity.log(
-        "cloud_mcp.agent_checkpoint.start",
+        "cloud_mcp.agent_checkpoint.queued",
         event_kind,
         json!({
-            "activity": "agent checkpoint",
+            "activity": "agent checkpoint queued for background Cloud history sync",
             "baseUrl": base_url,
             "summary": clean_terminal_telemetry_text(summary),
         }),
     );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            identity.log(
-                "cloud_mcp.agent_checkpoint.done",
-                event_kind,
-                json!({
-                    "activity": "agent checkpoint synced",
-                    "baseUrl": base_url,
-                }),
-            );
-            let parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            Ok(parsed)
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_checkpoint.error",
-                event_kind,
-                json!({
-                    "activity": "agent checkpoint sync failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
-    }
+    cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_checkpoint")
 }
 
 pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
@@ -20544,48 +20600,23 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
     }
     cloud_mcp_proxy_insert_local_file_scope(&mut arguments, &identity, event_kind);
 
-    let request = json!({
-        "event_kind": event_kind,
-        "payload": Value::Object(arguments),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let payload = Value::Object(arguments);
     identity.log(
-        "cloud_mcp.terminal_task_plan.start",
+        "cloud_mcp.terminal_task_plan.queued",
         event_kind,
         json!({
-            "activity": "terminal task plan sync",
+            "activity": "terminal task plan queued for background Cloud history sync",
             "baseUrl": base_url,
             "taskId": active_task_id,
             "reason": clean_terminal_telemetry_text(update_reason),
         }),
     );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            identity.log(
-                "cloud_mcp.terminal_task_plan.done",
-                event_kind,
-                json!({
-                    "activity": "terminal task plan synced",
-                    "baseUrl": base_url,
-                }),
-            );
-            let parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            Ok(parsed)
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.terminal_task_plan.error",
-                event_kind,
-                json!({
-                    "activity": "terminal task plan sync failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
-    }
+    cloud_mcp_queue_event_background(
+        &base_url,
+        event_kind,
+        &payload,
+        "terminal_task_plan_update",
+    )
 }
 
 fn cloud_mcp_proxy_push_current_filetree_snapshot(
@@ -20766,70 +20797,20 @@ pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
     arguments.insert("task_id".to_string(), json!(active_task_id));
     arguments.insert("run_id".to_string(), json!(active_task_id));
 
-    let request = json!({
-        "event_kind": "agent_heartbeat",
-        "payload": Value::Object(arguments),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let event_kind = "agent_heartbeat";
+    let payload = Value::Object(arguments);
     identity.log(
-        "cloud_mcp.agent_acquire_lease.start",
+        "cloud_mcp.agent_acquire_lease.queued",
         "acquire_lease",
         json!({
-            "activity": "agent acquire_lease",
+            "activity": "agent acquire_lease queued for background Cloud history sync",
             "baseUrl": base_url,
             "resourceKey": resource_key,
             "path": path,
             "taskId": active_task_id,
         }),
     );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            let filetree_sync = if let (Some(repo_id), Some(repo_path)) =
-                (identity.repo_id.as_deref(), identity.repo_path.as_ref())
-            {
-                match cloud_mcp_proxy_push_current_filetree_snapshot(
-                    &base_url,
-                    repo_id,
-                    repo_path,
-                    identity.workspace_id.as_deref(),
-                    identity.workspace_name.as_deref(),
-                    "acquire_lease_filetree_resync",
-                ) {
-                    Ok(response) => json!({"ok": true, "response": response}),
-                    Err(error) => json!({"ok": false, "error": error}),
-                }
-            } else {
-                json!({"ok": false, "skipped": true, "reason": "missing_repo_for_filetree_resync"})
-            };
-            identity.log(
-                "cloud_mcp.agent_acquire_lease.done",
-                "acquire_lease",
-                json!({
-                    "activity": "agent acquire_lease synced",
-                    "baseUrl": base_url,
-                    "filetreeSync": filetree_sync,
-                }),
-            );
-            let mut parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            if let Some(object) = parsed.as_object_mut() {
-                object.insert("filetree_sync".to_string(), filetree_sync);
-            }
-            Ok(parsed)
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_acquire_lease.error",
-                "acquire_lease",
-                json!({
-                    "activity": "agent acquire_lease sync failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
-    }
+    cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_acquire_lease")
 }
 
 pub(crate) fn cloud_mcp_forward_agent_submit_patch(
@@ -20988,11 +20969,8 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         arguments.insert("session_id".to_string(), json!(session_id));
     }
 
-    let request = json!({
-        "event_kind": "submit_patch",
-        "payload": Value::Object(arguments),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let event_kind = "submit_patch";
+    let payload = Value::Object(arguments);
     let should_sync_filetree_for_submit = ok
         && (auto_merge_status == "applied"
             || matches!(task_status.as_str(), "merged" | "done" | "completed"));
@@ -21018,64 +20996,38 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
         json!({"ok": false, "skipped": true, "reason": "patch_not_applied_to_main"})
     };
     identity.log(
-        "cloud_mcp.agent_submit_patch.start",
+        "cloud_mcp.agent_submit_patch.queued",
         "submit_patch",
         json!({
-            "activity": "agent submit_patch",
+            "activity": "agent submit_patch queued for background Cloud history sync",
             "baseUrl": base_url,
             "filetreeSync": filetree_sync,
             "taskStatus": task_status,
             "taskId": active_task_id,
         }),
     );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            let isolated_prune = if ok {
-                json!({"ok": false, "skipped": true, "reason": "patch_accepted"})
-            } else {
-                cloud_mcp_forward_isolated_work_pruned(
-                    &base_url,
-                    &identity,
-                    active_task_id,
-                    worktree_id,
-                    worktree_path,
-                    &changed_file_paths,
-                    "submit_patch_rejected",
-                    submit_result,
-                )
-                .unwrap_or_else(|error| json!({"ok": false, "error": error}))
-            };
-            identity.log(
-                "cloud_mcp.agent_submit_patch.done",
-                "submit_patch",
-                json!({
-                    "activity": "agent submit_patch synced",
-                    "baseUrl": base_url,
-                    "filetreeSync": filetree_sync,
-                    "isolatedPrune": isolated_prune,
-                }),
-            );
-            let mut parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            if let Some(object) = parsed.as_object_mut() {
-                object.insert("filetree_sync".to_string(), filetree_sync);
-                object.insert("isolated_prune".to_string(), isolated_prune);
-            }
-            Ok(parsed)
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_submit_patch.error",
-                "submit_patch",
-                json!({
-                    "activity": "agent submit_patch sync failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
+    let mut queued =
+        cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_submit_patch")?;
+    let isolated_prune = if ok {
+        json!({"ok": false, "skipped": true, "reason": "patch_accepted"})
+    } else {
+        cloud_mcp_forward_isolated_work_pruned(
+            &base_url,
+            &identity,
+            active_task_id,
+            worktree_id,
+            worktree_path,
+            &changed_file_paths,
+            "submit_patch_rejected",
+            submit_result,
+        )
+        .unwrap_or_else(|error| json!({"ok": false, "error": error}))
+    };
+    if let Some(object) = queued.as_object_mut() {
+        object.insert("filetree_sync".to_string(), filetree_sync);
+        object.insert("isolated_prune".to_string(), isolated_prune);
     }
+    Ok(queued)
 }
 
 pub(crate) fn cloud_mcp_forward_agent_complete_task(
@@ -21223,11 +21175,8 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
         arguments.insert("session_id".to_string(), json!(session_id));
     }
 
-    let request = json!({
-        "event_kind": "task_completed",
-        "payload": Value::Object(arguments),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let event_kind = "task_completed";
+    let payload = Value::Object(arguments);
     let should_sync_filetree = file_authority_text == "bounded_direct_edit"
         && matches!(task_status, "done" | "completed" | "merged");
     let filetree_sync = if should_sync_filetree {
@@ -21252,47 +21201,22 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
         json!({"ok": false, "skipped": true, "reason": "non_file_authority_completion"})
     };
     identity.log(
-        "cloud_mcp.agent_complete_task.start",
+        "cloud_mcp.agent_complete_task.queued",
         "complete_task",
         json!({
-            "activity": "agent complete_task",
+            "activity": "agent complete_task queued for background Cloud history sync",
             "baseUrl": base_url,
             "filetreeSync": filetree_sync,
             "taskStatus": task_status,
             "taskId": active_task_id,
         }),
     );
-    match cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &request.to_string()) {
-        Ok(response) => {
-            identity.log(
-                "cloud_mcp.agent_complete_task.done",
-                "complete_task",
-                json!({
-                    "activity": "agent complete_task synced",
-                    "baseUrl": base_url,
-                    "filetreeSync": filetree_sync,
-                }),
-            );
-            let mut parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            if let Some(object) = parsed.as_object_mut() {
-                object.insert("filetree_sync".to_string(), filetree_sync);
-            }
-            Ok(parsed)
-        }
-        Err(error) => {
-            identity.log(
-                "cloud_mcp.agent_complete_task.error",
-                "complete_task",
-                json!({
-                    "activity": "agent complete_task sync failed",
-                    "baseUrl": base_url,
-                    "error": clean_terminal_telemetry_text(&error),
-                }),
-            );
-            Err(error)
-        }
+    let mut queued =
+        cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_complete_task")?;
+    if let Some(object) = queued.as_object_mut() {
+        object.insert("filetree_sync".to_string(), filetree_sync);
     }
+    Ok(queued)
 }
 
 fn cloud_mcp_submit_patch_changed_file_paths(submit_result: &Value) -> Vec<String> {
@@ -21404,32 +21328,22 @@ fn cloud_mcp_forward_isolated_work_pruned(
         payload.insert("session_id".to_string(), json!(session_id));
     }
 
-    let request = json!({
-        "event_kind": "isolated_work_pruned",
-        "payload": Value::Object(payload),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    let response = cloud_mcp_proxy_post_json_endpoint(base_url, "/v1/events", &request.to_string());
+    let payload = Value::Object(payload);
     let cache_prune = json!({
         "ok": true,
         "skipped": true,
         "reason": "local_cache_prune_unavailable",
     });
-    match response {
-        Ok(response) => {
-            let mut parsed = serde_json::from_str::<Value>(&response)
-                .unwrap_or_else(|_| json!({"raw_response": response}));
-            if let Some(object) = parsed.as_object_mut() {
-                object.insert("cache_prune".to_string(), cache_prune);
-            }
-            Ok(parsed)
-        }
-        Err(error) => Ok(json!({
-            "ok": false,
-            "error": error,
-            "cache_prune": cache_prune,
-        })),
+    let mut queued = cloud_mcp_queue_event_background(
+        base_url,
+        "isolated_work_pruned",
+        &payload,
+        "isolated_work_pruned",
+    )?;
+    if let Some(object) = queued.as_object_mut() {
+        object.insert("cache_prune".to_string(), cache_prune);
     }
+    Ok(queued)
 }
 
 pub(crate) fn cloud_mcp_forward_agent_start_task(
@@ -21510,6 +21424,9 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
     );
     metadata.insert("intent_phase".to_string(), json!("agent_start_task_plan"));
     metadata.insert("start_task_plan".to_string(), json!(plan.clone()));
+    metadata.insert("coordination_authority".to_string(), json!("local"));
+    metadata.insert("task_id_source".to_string(), json!("local_coordination"));
+    metadata.insert("cloud_sync_mode".to_string(), json!("history_reference"));
     if let Some(agent_kind) = agent_kind.map(str::trim).filter(|value| !value.is_empty()) {
         metadata.insert("agent_kind".to_string(), json!(agent_kind));
         metadata.insert("coding_agent".to_string(), json!(agent_kind));
@@ -21627,106 +21544,29 @@ pub(crate) fn cloud_mcp_forward_agent_start_task(
         arguments.insert("session_id".to_string(), json!(session_id));
     }
 
-    let event_request = json!({
-        "event_kind": event_kind,
-        "payload": Value::Object(arguments.clone()),
-        "ts_ms": cloud_mcp_now_ms(),
-    });
+    let task_id = requested_task_id.ok_or_else(|| {
+        "Cloud history sync requires the local task_id created by the coordination kernel."
+            .to_string()
+    })?;
+    let payload = Value::Object(arguments);
     identity.log(
-        "cloud_mcp.agent_start_task.start",
+        "cloud_mcp.agent_start_task.queued",
         event_kind,
         json!({
-            "activity": "agent start_task plan",
+            "activity": "agent start_task queued for background Cloud history sync",
             "baseUrl": base_url,
             "plan": clean_terminal_telemetry_text(&plan),
+            "taskId": task_id,
         }),
     );
-    let event_response =
-        cloud_mcp_proxy_post_json_endpoint(&base_url, "/v1/events", &event_request.to_string())?;
-    let event_parsed = serde_json::from_str::<Value>(&event_response)
-        .unwrap_or_else(|_| json!({"raw_response": event_response}));
-    let event_data = event_parsed
-        .get("data")
-        .cloned()
-        .unwrap_or_else(|| event_parsed.clone());
-    let server_task_id = event_data["task_id"]
-        .as_str()
-        .or_else(|| event_data["task"]["id"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            "Cloud start_task did not return a task_id; refusing to create a local task."
-                .to_string()
-        })?;
-    if requested_task_id
-        .as_deref()
-        .is_some_and(|requested| requested != server_task_id)
-    {
-        return Err(format!(
-            "Cloud start_task returned task_id {server_task_id}, but the local continuation expected {}.",
-            requested_task_id.as_deref().unwrap_or_default()
-        ));
-    }
-
-    let mut context_payload = arguments;
-    context_payload.insert("task_id".to_string(), json!(server_task_id.as_str()));
-    context_payload.insert("run_id".to_string(), json!(server_task_id.as_str()));
-    if let Some(metadata) = context_payload
-        .entry("metadata".to_string())
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-    {
-        metadata.insert("cloud_task_id".to_string(), json!(server_task_id.as_str()));
-        metadata.insert(
-            "coordination_task_id".to_string(),
-            json!(server_task_id.as_str()),
-        );
-        metadata.insert(
-            "local_coordination_task_id".to_string(),
-            json!(server_task_id.as_str()),
-        );
-    }
-    context_payload.insert("history_limit".to_string(), json!(30));
-    context_payload.insert("agent_limit".to_string(), json!(50));
-    let context_request = Value::Object(context_payload.clone());
-    let context_pack = cloud_mcp_proxy_post_json_endpoint(
-        &base_url,
-        "/v1/context/pack",
-        &context_request.to_string(),
-    )
-    .ok()
-    .and_then(|response| serde_json::from_str::<Value>(&response).ok())
-    .map(|value| value.get("data").cloned().unwrap_or(value))
-    .unwrap_or_else(|| json!({"ok": false, "error": "context_pack_refresh_failed"}));
-    let task_history = cloud_mcp_proxy_post_json_endpoint(
-        &base_url,
-        "/v1/task/history",
-        &context_request.to_string(),
-    )
-    .ok()
-    .and_then(|response| serde_json::from_str::<Value>(&response).ok())
-    .map(|value| value.get("data").cloned().unwrap_or(value))
-    .unwrap_or_else(|| json!({"kind": "task_history", "version": 1, "tasks": []}));
-
-    identity.log(
-        "cloud_mcp.agent_start_task.done",
-        event_kind,
-        json!({
-            "activity": "agent start_task synced",
-            "baseUrl": base_url,
-            "specRecorded": event_data["spec_activity"]["recorded"].as_bool(),
-            "specNodeCount": event_data["spec_activity"]["node_ids"].as_array().map(Vec::len),
-        }),
-    );
-
+    let queued =
+        cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_start_task")?;
     Ok(json!({
-        "task_id": server_task_id,
-        "task": event_data["task"].clone(),
-        "event": event_data.clone(),
-        "spec_activity": event_data["spec_activity"].clone(),
-        "context_pack": context_pack,
-        "task_history": task_history,
+        "ok": true,
+        "task_id": task_id,
+        "coordination_authority": "local",
+        "cloud_sync_mode": "history_reference",
+        "sync": queued,
     }))
 }
 

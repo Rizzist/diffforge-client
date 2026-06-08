@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import styled, { keyframes } from "styled-components";
 import { Cached } from "@styled-icons/material-rounded/Cached";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
@@ -9,7 +8,6 @@ import { Delete } from "@styled-icons/material-rounded/Delete";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
 
-const ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 
 function text(value, fallback = "") {
@@ -112,44 +110,16 @@ function latestAssetTransfer(transfers, asset) {
     .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))[0] || null;
 }
 
-function assetTransferDirection(transfer) {
-  return text(transfer?.direction, "transfer").toLowerCase();
-}
-
-function assetTransferProgress(transfer) {
-  const bytesTotal = Math.max(0, numberValue(transfer?.bytesTotal ?? transfer?.bytes_total));
-  const bytesDone = Math.max(0, numberValue(transfer?.bytesDone ?? transfer?.bytes_done));
-  const percent = bytesTotal > 0 ? Math.min(100, Math.max(0, (bytesDone / bytesTotal) * 100)) : null;
-  return { bytesDone, bytesTotal, percent };
-}
-
-function formatBytes(value) {
-  const bytes = Math.max(0, numberValue(value));
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let size = bytes / 1024;
-  let unit = units[0];
-  for (let index = 1; index < units.length && size >= 1024; index += 1) {
-    size /= 1024;
-    unit = units[index];
-  }
-  return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${unit}`;
-}
-
-function assetTransferLabel(transfer) {
-  const status = text(transfer?.status, "transferring").toLowerCase().replace(/[_-]+/gu, " ");
-  const direction = assetTransferDirection(transfer);
-  const progress = assetTransferProgress(transfer);
-  if (assetTransferStatusKind(transfer) === "failed") {
-    return `${direction === "download" ? "Download" : "Upload"} failed`;
-  }
-  const action = direction === "download" ? "Downloading" : direction === "upload" ? "Uploading" : status;
-  if (progress.percent === null) return action;
-  return `${action} ${Math.round(progress.percent)}% · ${formatBytes(progress.bytesTotal)}`;
-}
-
 function assetLocalPath(asset) {
-  return text(asset?.localPath || asset?.local_path || asset?.path);
+  return text(
+    asset?.localPath
+      || asset?.local_path
+      || asset?.path
+      || asset?.localPathHint
+      || asset?.local_path_hint
+      || asset?.lastLocalPath
+      || asset?.last_local_path,
+  );
 }
 
 function assetLocalAvailable(asset) {
@@ -175,10 +145,7 @@ function assetCloudAvailable(asset) {
   return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
 }
 
-function assetAvailability(asset, syncing = false) {
-  if (syncing) {
-    return { hasCloud: false, hasLocal: true, label: "Local only", statusKind: "parked" };
-  }
+function assetAvailability(asset) {
   const hasLocal = assetLocalAvailable(asset);
   const hasCloud = assetCloudAvailable(asset);
   if (hasLocal && hasCloud) return { hasCloud, hasLocal, label: "Local & Cloud", statusKind: "done" };
@@ -279,99 +246,28 @@ function assetSha(asset) {
 export default function AccountAssetsView({
   assetWorkspaces = [],
   defaultWorkingDirectory = "",
+  error = "",
+  library = null,
+  loading = false,
+  onLoadCached = null,
+  onRefresh = null,
   rootDirectory = "",
+  syncing = false,
 }) {
   const repoPath = rootDirectory || defaultWorkingDirectory || "";
-  const [assetLibrary, setAssetLibrary] = useState(null);
-  const [assetLibraryLoading, setAssetLibraryLoading] = useState(true);
-  const [assetLibrarySyncCount, setAssetLibrarySyncCount] = useState(0);
-  const [assetLibraryError, setAssetLibraryError] = useState("");
-  const assetLibrarySyncing = assetLibrarySyncCount > 0;
-
-  const loadCachedAssetLibrary = useCallback(() => (
-    invoke("cloud_mcp_list_workspace_assets", {
-      includeAllWorkspaces: true,
-      limit: 500,
-      localOnly: true,
-      repoPath,
-    }).catch(() => null)
-  ), [repoPath]);
-
-  const reloadCachedAssetLibrary = useCallback(() => (
-    loadCachedAssetLibrary().then((result) => {
-      if (result) setAssetLibrary(result);
-      return result;
-    })
-  ), [loadCachedAssetLibrary]);
-
-  const refreshAssetLibrary = useCallback(({ silent = false } = {}) => {
-    if (!silent) setAssetLibraryLoading(true);
-    setAssetLibrarySyncCount((current) => current + 1);
-    setAssetLibraryError("");
-    return invoke("cloud_mcp_list_workspace_assets", {
-      includeAllWorkspaces: true,
-      limit: 500,
-      repoPath,
-    })
-      .then((result) => {
-        setAssetLibrary(result);
-        return result;
-      })
-      .catch((error) => {
-        setAssetLibraryError(error?.message || String(error || "Unable to load assets."));
-        return null;
-      })
-      .finally(() => {
-        setAssetLibrarySyncCount((current) => Math.max(0, current - 1));
-        if (!silent) setAssetLibraryLoading(false);
-      });
-  }, [repoPath]);
-
-  useEffect(() => {
-    let cancelled = false;
-    void reloadCachedAssetLibrary()
-      .finally(() => {
-        if (cancelled) return;
-        setAssetLibraryLoading(false);
-        void refreshAssetLibrary({ silent: true });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshAssetLibrary, reloadCachedAssetLibrary]);
-
-  useEffect(() => {
-    let cancelled = false;
-    let unlistenAssets = null;
-    listen(ASSETS_UPDATED_EVENT, () => {
-      if (cancelled) return;
-      void reloadCachedAssetLibrary();
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenAssets = unlisten;
-    }).catch(() => {});
-
-    return () => {
-      cancelled = true;
-      if (unlistenAssets) unlistenAssets();
-    };
-  }, [reloadCachedAssetLibrary]);
 
   return (
-    <AssetsSurface aria-label="Account Assets" data-state={assetLibraryLoading ? "loading" : "ready"}>
+    <AssetsSurface aria-label="Account Assets" data-state={loading ? "loading" : "ready"}>
       <AssetsPanel
         assetWorkspaces={assetWorkspaces}
-        error={assetLibraryError}
-        library={assetLibrary}
-        loading={assetLibraryLoading}
-        onLoadCached={reloadCachedAssetLibrary}
-        onRefresh={refreshAssetLibrary}
+        error={error}
+        library={library}
+        loading={loading}
+        onLoadCached={onLoadCached}
+        onRefresh={onRefresh}
         repoLabel="Assets"
         repoPath={repoPath}
-        syncing={assetLibrarySyncing}
+        syncing={syncing}
       />
     </AssetsSurface>
   );
@@ -394,6 +290,7 @@ function AssetsPanel({
   const [selectedWorkspaceFilterKeys, setSelectedWorkspaceFilterKeys] = useState([]);
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
+  const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
 
   const workspaceFilterOptions = useMemo(() => {
     const options = [];
@@ -457,8 +354,8 @@ function AssetsPanel({
       ? transfers.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
       : transfers
   ), [selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
-  const cloudCount = filteredItems.filter((item) => assetAvailability(item, syncing).hasCloud).length;
-  const localCount = filteredItems.filter((item) => assetAvailability(item, syncing).hasLocal).length;
+  const cloudCount = filteredItems.filter((item) => assetAvailability(item).hasCloud).length;
+  const localCount = filteredItems.filter((item) => assetAvailability(item).hasLocal).length;
   const activeTransfers = selectedWorkspaceFilterOptions.length
     ? visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length
     : numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
@@ -588,15 +485,16 @@ function AssetsPanel({
           {filteredItems.map((asset, index) => {
             const id = assetId(asset, `asset-${index}`);
             const name = assetName(asset, `Asset ${index + 1}`);
-            const availability = assetAvailability(asset, syncing);
+            const availability = assetAvailability(asset);
             const transfer = latestAssetTransfer(visibleTransfers, asset);
             const transferStatus = transfer ? assetTransferStatusKind(transfer) : "";
             const transferActive = transferStatus === "active";
             const transferFailed = transferStatus === "failed";
-            const transferProgress = transfer ? assetTransferProgress(transfer) : null;
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = assetLocalPath(asset);
             const previewUrl = assetPreviewUrl(asset);
+            const previewKey = `${id}:${previewUrl}`;
+            const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
             const rowWorkspaceOption = workspaceOptionForAsset(asset);
             const canRunAssetAction = Boolean(
               (assetRepoPath(asset) || rowWorkspaceOption?.rootDirectory || repoPath)
@@ -614,13 +512,7 @@ function AssetsPanel({
             return (
               <AssetCard data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
                 <AssetCardPreview>
-                  <AssetDocumentPreview aria-hidden={previewUrl ? "true" : undefined}>
-                    <AssetDocumentGlyph>
-                      <InsertDriveFile aria-hidden="true" />
-                      <span>{assetFileTypeLabel(asset)}</span>
-                    </AssetDocumentGlyph>
-                  </AssetDocumentPreview>
-                  {previewUrl && (
+                  {shouldShowImagePreview ? (
                     <AssetPreviewImage
                       alt={name}
                       decoding="async"
@@ -628,9 +520,21 @@ function AssetsPanel({
                       loading={index < 20 ? "eager" : "lazy"}
                       onError={(event) => {
                         event.currentTarget.hidden = true;
+                        setFailedPreviewKeys((current) => {
+                          const next = new Set(current);
+                          next.add(previewKey);
+                          return next;
+                        });
                       }}
                       src={previewUrl}
                     />
+                  ) : (
+                    <AssetDocumentPreview aria-hidden="true">
+                      <AssetDocumentGlyph>
+                        <InsertDriveFile aria-hidden="true" />
+                        <span>{assetFileTypeLabel(asset)}</span>
+                      </AssetDocumentGlyph>
+                    </AssetDocumentPreview>
                   )}
                 </AssetCardPreview>
                 <AssetCardStatus data-status={availability.statusKind} title={`Availability: ${availability.label}`}>
@@ -687,26 +591,6 @@ function AssetsPanel({
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
                 </AssetCardCaption>
-                {(transferActive || transferFailed) && (
-                  <>
-                    <AssetTransferLabel data-status={transferStatus}>
-                      {assetTransferLabel(transfer)}
-                    </AssetTransferLabel>
-                    <AssetTransferTrack
-                      aria-label={assetTransferLabel(transfer)}
-                      aria-valuemax={transferProgress?.percent === null ? undefined : 100}
-                      aria-valuenow={transferProgress?.percent === null ? undefined : Math.round(transferProgress.percent)}
-                      data-indeterminate={transferProgress?.percent === null}
-                      data-status={transferStatus}
-                      role="progressbar"
-                    >
-                      <AssetTransferFill
-                        data-indeterminate={transferProgress?.percent === null}
-                        style={transferProgress?.percent === null ? undefined : { width: `${transferProgress.percent}%` }}
-                      />
-                    </AssetTransferTrack>
-                  </>
-                )}
               </AssetCard>
             );
           })}
@@ -777,16 +661,6 @@ const AssetsSummary = styled.span`
 const assetSyncSpin = keyframes`
   to {
     transform: rotate(360deg);
-  }
-`;
-
-const assetTransferSweep = keyframes`
-  from {
-    transform: translateX(-120%);
-  }
-
-  to {
-    transform: translateX(360%);
   }
 `;
 
@@ -960,6 +834,7 @@ const AssetDocumentPreview = styled.div`
   display: grid;
   place-items: center;
   width: 100%;
+  height: 100%;
   min-width: 0;
   padding: 16px 14px 42px;
   color: rgba(203, 213, 225, 0.78);
@@ -998,7 +873,7 @@ const AssetPreviewImage = styled.img`
   inset: 0;
   width: 100%;
   height: 100%;
-  padding: 7px 7px 34px;
+  padding: 7px 7px 31px;
   object-fit: contain;
   object-position: center;
   background: rgba(2, 6, 23, 0.7);
@@ -1079,63 +954,6 @@ const AssetCardCaption = styled.div`
   padding: 18px 8px 7px;
   background: linear-gradient(180deg, transparent, rgba(2, 6, 23, 0.94) 42%);
   pointer-events: none;
-`;
-
-const AssetTransferLabel = styled.span`
-  position: absolute;
-  right: 7px;
-  bottom: 29px;
-  left: 7px;
-  z-index: 5;
-  overflow: hidden;
-  color: rgba(219, 234, 254, 0.94);
-  font-size: 8px;
-  font-weight: 850;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  pointer-events: none;
-  text-shadow: 0 1px 3px rgba(2, 6, 23, 0.95);
-
-  &[data-status="failed"] {
-    color: rgba(254, 205, 211, 0.96);
-  }
-`;
-
-const AssetTransferTrack = styled.div`
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 6;
-  height: 5px;
-  overflow: hidden;
-  background: rgba(30, 41, 59, 0.92);
-  pointer-events: none;
-
-  &[data-status="failed"] {
-    background: rgba(127, 29, 29, 0.82);
-  }
-`;
-
-const AssetTransferFill = styled.i`
-  display: block;
-  width: 0;
-  height: 100%;
-  background: rgba(96, 165, 250, 0.96);
-  box-shadow: 0 0 8px rgba(96, 165, 250, 0.72);
-  transition: width 180ms ease;
-
-  &[data-indeterminate="true"] {
-    width: 34%;
-    animation: ${assetTransferSweep} 1s ease-in-out infinite;
-  }
-
-  ${AssetTransferTrack}[data-status="failed"] & {
-    width: 100%;
-    background: rgba(251, 113, 133, 0.92);
-    box-shadow: none;
-  }
 `;
 
 const AssetCardName = styled.strong`

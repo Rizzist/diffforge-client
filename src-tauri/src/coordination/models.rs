@@ -416,6 +416,16 @@ Merge integration branch: diff-forge/integration\nShell cwd opens in the visible
             )
         };
 
+        banner = banner
+            .replace(
+                "Cloud MCP lifecycle: automatic through Diff Forge Rust, not agent-called",
+                "Cloud MCP lifecycle: durable background history/reference sync through Diff Forge Rust, not agent-called",
+            )
+            .replace(
+                "Cloud MCP must return a task_id first; Rust then mirrors that exact id locally, refreshes cloud context, and returns the current task_id, branch root, and peer state.",
+                "Rust creates or resumes the local task immediately, queues Cloud history sync in the background, and returns the current task_id and branch root.",
+            );
+
         if self.enforcement_mode == "coordination_only" {
             banner.push_str(
                 "WARNING: Safe parallel write isolation is unavailable because git worktree setup failed or this repo has no .git. submit_patch and merge are blocked by default.\n",

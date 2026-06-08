@@ -3709,53 +3709,18 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         }
     }
 
-    let cloud = match crate::cloud_mcp_forward_agent_start_task(
-        input["repo_path"].as_str(),
-        input["db_path"].as_str().map(PathBuf::from).as_deref(),
-        input["workspace_id"].as_str(),
-        input["cloud_mcp_base_url"].as_str(),
-        agent_id,
-        session_id,
-        local_task_hint.as_deref().or_else(|| {
-            task_id.and_then(|task_id| {
-                (explicit_task_id_provided
-                    && !input_task_id_is_session_id
-                    && !requested_task_is_existing_non_reusable)
-                    .then_some(task_id)
-            })
-        }),
-        input["worktree_id"].as_str(),
-        input["worktree_path"].as_str(),
-        agent_kind,
-        lane.as_deref(),
-        task_title.as_deref(),
-        None,
-        input["session_mode"].as_str(),
-        input["file_authority"].as_str(),
-        input["enforcement_mode"].as_str(),
-        input["completion_mode"].as_str(),
-        &start_plan,
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            return Ok(api_error(
-                "cloud_start_task_failed",
-                "Cloud start_task must return a task_id before Rust creates local task state.",
-                json!({"error": error}),
-            ))
-        }
-    };
-    let Some(cloud_task_id) = cloud_start_task_id(&cloud) else {
-        return Ok(api_error(
-            "cloud_start_task_missing_task_id",
-            "Cloud start_task did not return a task_id; refusing to create a local task.",
-            json!({"cloud": cloud}),
-        ));
-    };
+    let requested_local_task_id = local_task_hint.as_deref().or_else(|| {
+        task_id.and_then(|task_id| {
+            (explicit_task_id_provided
+                && !input_task_id_is_session_id
+                && !requested_task_is_existing_non_reusable)
+                .then_some(task_id)
+        })
+    });
     let started = kernel.start_task(
         agent_id,
         session_id,
-        Some(cloud_task_id.as_str()),
+        requested_local_task_id,
         None,
         Some(&start_plan),
         requested_title,
@@ -3777,13 +3742,36 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
             json!({}),
         ));
     };
-    if started_task_id != cloud_task_id {
-        return Ok(api_error(
-            "cloud_local_task_id_mismatch",
-            "Rust refused to continue because the local task id did not match Cloud start_task.",
-            json!({"cloud_task_id": cloud_task_id, "local_task_id": started_task_id}),
-        ));
-    }
+
+    let cloud = match crate::cloud_mcp_forward_agent_start_task(
+        input["repo_path"].as_str(),
+        input["db_path"].as_str().map(PathBuf::from).as_deref(),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        agent_id,
+        session_id,
+        Some(&started_task_id),
+        input["worktree_id"].as_str(),
+        input["worktree_path"].as_str(),
+        agent_kind,
+        lane.as_deref(),
+        task_title.as_deref(),
+        None,
+        input["session_mode"].as_str(),
+        input["file_authority"].as_str(),
+        input["enforcement_mode"].as_str(),
+        input["completion_mode"].as_str(),
+        &start_plan,
+    ) {
+        Ok(response) => response,
+        Err(error) => json!({
+            "ok": false,
+            "queued": false,
+            "coordination_authority": "local",
+            "cloud_sync_mode": "history_reference",
+            "error": error,
+        }),
+    };
 
     let start_authority_resolution = if let (Some(agent_id), Some(session_id)) =
         (agent_id, session_id)
@@ -3807,7 +3795,7 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         Value::Null
     };
 
-    let source_todo_refs = cloud_start_task_source_refs(&cloud);
+    let source_todo_refs = cloud_start_task_source_refs(input);
     let attached_source_refs = if value_has_content(&source_todo_refs) {
         let attached = kernel.attach_task_source_refs(&started_task_id, &source_todo_refs)?;
         if attached["ok"].as_bool() == Some(false) {
@@ -3833,7 +3821,12 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         object.insert("brief".to_string(), brief);
         object.insert("start_plan".to_string(), json!(start_plan));
         object.insert("cloud".to_string(), cloud_start_task_for_agent(&cloud));
-        object.insert("cloud_task_id".to_string(), json!(cloud_task_id));
+        object.insert("cloud_task_id".to_string(), json!(started_task_id));
+        object.insert("coordination_authority".to_string(), json!("local"));
+        object.insert(
+            "cloud_sync_mode".to_string(),
+            json!("background_history_reference"),
+        );
         if !start_authority_resolution.is_null() {
             object.insert("authority".to_string(), start_authority_resolution);
         }
@@ -3844,11 +3837,11 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         object.insert(
             "task_id_source".to_string(),
             json!(if local_task_hint.is_some() {
-                "cloud_confirmed_existing"
-            } else if task_id.is_some() {
-                "cloud_confirmed_explicit"
+                "local_existing"
+            } else if requested_local_task_id.is_some() {
+                "local_explicit"
             } else {
-                "cloud"
+                "local_created"
             }),
         );
         if input_task_id_is_session_id {
@@ -3943,9 +3936,15 @@ fn start_task_brief_for_agent(brief: &Value) -> Value {
 fn cloud_start_task_for_agent(response: &Value) -> Value {
     let context_pack = &response["context_pack"];
     let mut view = Map::new();
-    view.insert("ok".to_string(), json!(true));
+    view.insert(
+        "ok".to_string(),
+        json!(response["ok"].as_bool().unwrap_or(true)),
+    );
     if let Some(task_id) = cloud_start_task_id(response) {
         view.insert("task_id".to_string(), json!(task_id));
+    }
+    for field in ["coordination_authority", "cloud_sync_mode", "sync", "error"] {
+        insert_if_present(&mut view, field, response[field].clone());
     }
     let source_refs = cloud_start_task_source_refs(response);
     insert_if_present(&mut view, "source_todo", source_refs["source_todo"].clone());
@@ -5323,7 +5322,7 @@ fn mcp_start_task_seen_for_task(
 
 fn tool_description(name: &str) -> String {
     match name {
-        "start_task" => "Start the coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Cloud must return the task_id before Rust mirrors it locally for leases, checkpoints, patches, or direct/activity completion.".to_string(),
+        "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion, then preserves its lifecycle to Cloud history in the background.".to_string(),
         "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; future or blocked step titles are user-editable in the Plans tab.".to_string(),
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),

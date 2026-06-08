@@ -511,6 +511,7 @@ import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
+import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
@@ -14361,6 +14362,9 @@ export default function App() {
     workspaceSettings,
     workspaces,
   ]);
+  const accountAssetsLibrary = useAccountAssetsLibrary({
+    repoPath: defaultWorkingDirectory,
+  });
   const processKnownRoots = useMemo(() => {
     const roots = [];
     const seen = new Set();
@@ -21849,6 +21853,12 @@ export default function App() {
                   <AccountAssetsView
                     assetWorkspaces={assetWorkspaceOptions}
                     defaultWorkingDirectory={defaultWorkingDirectory}
+                    error={accountAssetsLibrary.error}
+                    library={accountAssetsLibrary.library}
+                    loading={accountAssetsLibrary.loading}
+                    onLoadCached={accountAssetsLibrary.loadCached}
+                    onRefresh={accountAssetsLibrary.refresh}
+                    syncing={accountAssetsLibrary.syncing}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (
