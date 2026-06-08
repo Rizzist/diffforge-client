@@ -95,6 +95,7 @@ const MAX_WORKSPACE_PROJECT_MOUNTS: usize = 128;
 const MAX_SAFE_WORKSPACE_ROOT_IMMEDIATE_ENTRIES: usize = 256;
 const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 4;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
+const MAX_WORKSPACE_IMAGE_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_WORKSPACE_FILE_DIFF_BYTES: usize = 384 * 1024;
 const GIT_STATUS_TIMEOUT_SECS: u64 = 2;
 const GIT_DIFF_TIMEOUT_SECS: u64 = 3;
@@ -1546,6 +1547,22 @@ struct WorkspaceFileText {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceFileImage {
+    root: String,
+    relative_path: String,
+    name: String,
+    data_url: String,
+    mime_type: String,
+    size: u64,
+    modified_ms: Option<u64>,
+    git_status: Option<String>,
+    project_root: Option<String>,
+    project_relative_path: Option<String>,
+    mount_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceFileDiff {
     root: String,
     relative_path: String,
@@ -1554,6 +1571,15 @@ struct WorkspaceFileDiff {
     project_root: Option<String>,
     project_relative_path: Option<String>,
     mount_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFileOperationResult {
+    root: String,
+    relative_path: String,
+    target_relative_path: Option<String>,
+    parent_relative_path: String,
 }
 
 #[derive(Deserialize)]
@@ -3695,7 +3721,11 @@ pub fn run() {
             validate_workspace_root_directory,
             list_workspace_directory,
             read_workspace_file,
+            read_workspace_file_image,
             read_workspace_file_diff,
+            rename_workspace_entry,
+            delete_workspace_entry,
+            move_workspace_entry,
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,

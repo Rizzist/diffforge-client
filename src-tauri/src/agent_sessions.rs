@@ -6,6 +6,7 @@ const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
 const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 180;
 const AGENT_THREAD_TRANSCRIPT_MAX_WATCHES: usize = 128;
+const CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT: usize = 16;
 
 use notify::Watcher as NotifyWatcher;
 
@@ -16,6 +17,7 @@ struct CodexThreadTranscriptRequest {
     provider_session_id: Option<String>,
     cwd: Option<String>,
     max_messages: Option<usize>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -52,6 +54,7 @@ struct CodexThreadSessionDiscoverRequest {
     home_search_cwd: Option<String>,
     max_messages: Option<usize>,
     submitted_at: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -63,6 +66,12 @@ struct CodexThreadTranscriptArtifact {
     url: String,
     title: String,
     prompt: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    asset_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    asset_path: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    original_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -567,6 +576,43 @@ fn clean_codex_artifact_reference(value: &str) -> String {
         .to_string()
 }
 
+fn codex_percent_decode_path(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if !bytes.contains(&b'%') {
+        return value.to_string();
+    }
+
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' || index + 2 >= bytes.len() {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+
+        let hi = (bytes[index + 1] as char).to_digit(16);
+        let lo = (bytes[index + 2] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(hi), Some(lo)) => {
+                output.push(((hi << 4) | lo) as u8);
+                index += 3;
+            }
+            _ => {
+                output.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(output).unwrap_or_else(|_| value.to_string())
+}
+
+fn codex_file_url_for_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    format!("file://{}", path.replace('%', "%25").replace(' ', "%20"))
+}
+
 fn codex_artifact_extension(reference: &str) -> String {
     let reference = reference
         .split(['?', '#'])
@@ -602,8 +648,12 @@ fn codex_image_mime(reference: &str, explicit_mime: &str) -> String {
 fn codex_artifact_path_url(reference: &str) -> (String, String) {
     let reference = clean_codex_artifact_reference(reference);
     if reference.starts_with("file://") {
+        let mut path = reference.trim_start_matches("file://").to_string();
+        if let Some(stripped) = path.strip_prefix("localhost/") {
+            path = format!("/{stripped}");
+        }
         return (
-            reference.trim_start_matches("file://").to_string(),
+            codex_percent_decode_path(&path),
             reference,
         );
     }
@@ -614,7 +664,8 @@ fn codex_artifact_path_url(reference: &str) -> (String, String) {
         return (String::new(), reference);
     }
     if reference.starts_with('/') || reference.starts_with("~/") {
-        return (reference.clone(), format!("file://{reference}"));
+        let path = codex_percent_decode_path(&reference);
+        return (path.clone(), codex_file_url_for_path(Path::new(&path)));
     }
 
     (reference.clone(), reference)
@@ -628,6 +679,9 @@ fn codex_image_artifact(
 ) -> Option<CodexThreadTranscriptArtifact> {
     let reference = clean_codex_artifact_reference(reference);
     if reference.is_empty() {
+        return None;
+    }
+    if reference.contains("_image_id_") {
         return None;
     }
 
@@ -644,7 +698,219 @@ fn codex_image_artifact(
         url,
         title: clean_codex_title(title, "Generated image"),
         prompt: prompt.trim().to_string(),
+        asset_id: String::new(),
+        asset_path: String::new(),
+        original_path: String::new(),
     })
+}
+
+fn codex_artifact_path_from_reference(reference: &str) -> Option<PathBuf> {
+    let (path, _) = codex_artifact_path_url(reference);
+    let path = path.trim();
+    if path.is_empty() || !(path.starts_with('/') || path.starts_with("~/")) {
+        return None;
+    }
+
+    if let Some(stripped) = path.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(stripped))
+            .or_else(|| Some(PathBuf::from(path)));
+    }
+
+    Some(PathBuf::from(path))
+}
+
+fn codex_generated_image_source_path(artifact: &CodexThreadTranscriptArtifact) -> Option<PathBuf> {
+    if !artifact.mime_type.to_ascii_lowercase().starts_with("image/") {
+        return None;
+    }
+    let path = codex_artifact_path_from_reference(&artifact.path)?;
+    let path_key = path.to_string_lossy().replace('\\', "/");
+    if !path_key.contains("/generated_images/") {
+        return None;
+    }
+    if !path.is_file() {
+        return None;
+    }
+    Some(path)
+}
+
+fn promote_generated_image_artifacts(
+    messages: &mut [CodexThreadTranscriptMessage],
+    cwd: &str,
+    workspace_id: Option<&str>,
+) {
+    for message in messages {
+        for artifact in &mut message.artifacts {
+            let Some(source_path) = codex_generated_image_source_path(artifact) else {
+                continue;
+            };
+            let name_hint = Path::new(&artifact.path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty());
+            let promoted = cloud_mcp_promote_generated_asset_to_library(
+                Some(cwd),
+                workspace_id,
+                &source_path,
+                name_hint,
+                Some(&artifact.prompt),
+            );
+            let Ok(promoted) = promoted else {
+                continue;
+            };
+            let asset_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+                .unwrap_or_default();
+            if asset_path.is_empty() {
+                continue;
+            }
+            let asset_id = cloud_mcp_payload_text(&promoted, &["asset_id", "assetId", "id"])
+                .unwrap_or_default();
+            let original_path = artifact.path.clone();
+            artifact.asset_id = asset_id;
+            artifact.asset_path = asset_path.clone();
+            if artifact.original_path.is_empty() {
+                artifact.original_path = original_path;
+            }
+            artifact.path = asset_path.clone();
+            artifact.url = codex_file_url_for_path(Path::new(&asset_path));
+        }
+    }
+}
+
+fn promote_result_generated_image_artifacts(
+    result: &mut CodexThreadTranscriptResult,
+    workspace_id: Option<&str>,
+) {
+    let cwd = result.cwd.clone();
+    promote_generated_image_artifacts(&mut result.messages, &cwd, workspace_id);
+}
+
+fn promoted_generated_asset_event(
+    result: &CodexThreadTranscriptResult,
+    workspace_id: Option<&str>,
+    reason: &str,
+) -> Option<Value> {
+    let mut seen = HashSet::new();
+    let mut assets = Vec::new();
+    for artifact in result.messages.iter().flat_map(|message| &message.artifacts) {
+        if artifact.asset_path.trim().is_empty() {
+            continue;
+        }
+        let key = if artifact.asset_id.trim().is_empty() {
+            artifact.asset_path.clone()
+        } else {
+            artifact.asset_id.clone()
+        };
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        assets.push(json!({
+            "asset_id": artifact.asset_id,
+            "assetId": artifact.asset_id,
+            "local_path": artifact.asset_path,
+            "localPath": artifact.asset_path,
+            "original_path": artifact.original_path,
+            "originalPath": artifact.original_path,
+            "path": artifact.asset_path,
+        }));
+    }
+    if assets.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "event_kind": "workspace_assets_updated",
+        "eventKind": "workspace_assets_updated",
+        "kind": "workspace_assets_updated",
+        "reason": reason,
+        "repo_path": result.cwd,
+        "repoPath": result.cwd,
+        "source": "codex_imagegen_autocopy",
+        "workspace_id": workspace_id.unwrap_or_default(),
+        "workspaceId": workspace_id.unwrap_or_default(),
+        "assets": assets,
+    }))
+}
+
+fn emit_promoted_generated_asset_event(
+    app: &AppHandle,
+    result: &CodexThreadTranscriptResult,
+    workspace_id: Option<&str>,
+    reason: &str,
+) {
+    let Some(event) = promoted_generated_asset_event(result, workspace_id, reason) else {
+        return;
+    };
+    let _ = app.emit(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, event);
+}
+
+fn codex_path_has_generated_images(path: &Path) -> bool {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .contains("/generated_images/")
+}
+
+fn collect_codex_generated_image_dir_artifacts(
+    reference: &str,
+    title: &str,
+    prompt: &str,
+    artifacts: &mut Vec<CodexThreadTranscriptArtifact>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(path) = codex_artifact_path_from_reference(reference) else {
+        return;
+    };
+    if !codex_path_has_generated_images(&path) {
+        return;
+    }
+
+    if path.is_file() {
+        let path = path.to_string_lossy().to_string();
+        push_codex_image_artifact(artifacts, seen, &path, title, prompt, "");
+        return;
+    }
+
+    let scan_dir = if path.is_dir() {
+        path
+    } else if codex_image_mime(&path.to_string_lossy(), "").starts_with("image/") {
+        match path.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => return,
+        }
+    } else {
+        return;
+    };
+    if !scan_dir.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(scan_dir) else {
+        return;
+    };
+    let mut image_paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| codex_image_mime(&path.to_string_lossy(), "").starts_with("image/"))
+        .collect::<Vec<_>>();
+    image_paths.sort();
+
+    for path in image_paths.into_iter().take(CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT) {
+        let path = path.to_string_lossy().to_string();
+        push_codex_image_artifact(artifacts, seen, &path, title, prompt, "");
+    }
+}
+
+fn text_before_any_marker<'a>(text: &'a str, markers: &[&str]) -> &'a str {
+    let lower = text.to_ascii_lowercase();
+    let end = markers
+        .iter()
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 fn push_codex_image_artifact(
@@ -665,6 +931,37 @@ fn push_codex_image_artifact(
     };
     if seen.insert(key) {
         artifacts.push(artifact);
+    }
+}
+
+fn collect_codex_generated_image_notice_artifacts(
+    line: &str,
+    title: &str,
+    prompt: &str,
+    artifacts: &mut Vec<CodexThreadTranscriptArtifact>,
+    seen: &mut HashSet<String>,
+) {
+    let lower = line.to_ascii_lowercase();
+    for marker in [
+        "generated images are saved to ",
+        "generated image is saved to ",
+        "generated images saved to ",
+        "generated image saved to ",
+    ] {
+        let Some(index) = lower.find(marker) else {
+            continue;
+        };
+        let after_marker = &line[index + marker.len()..];
+        let directory = text_before_any_marker(after_marker, &[" as ", " by default", " unless "])
+            .trim();
+        collect_codex_generated_image_dir_artifacts(directory, title, prompt, artifacts, seen);
+
+        let after_marker_lower = after_marker.to_ascii_lowercase();
+        if let Some(as_index) = after_marker_lower.find(" as ") {
+            let after_as = &after_marker[as_index + " as ".len()..];
+            let pattern = text_before_any_marker(after_as, &[" by default", " unless "]).trim();
+            collect_codex_generated_image_dir_artifacts(pattern, title, prompt, artifacts, seen);
+        }
     }
 }
 
@@ -692,6 +989,14 @@ fn collect_codex_image_artifacts_from_text(
     for line in text.lines() {
         let trimmed = line.trim();
         let lower = trimmed.to_lowercase();
+        collect_codex_generated_image_notice_artifacts(
+            trimmed,
+            title,
+            prompt,
+            artifacts,
+            seen,
+        );
+
         for marker in ["saved to:", "generated image:", "image:", "path:"] {
             if lower.starts_with(marker) {
                 push_codex_image_artifact(
@@ -1300,13 +1605,30 @@ fn codex_messages_from_response_item(
     match item_type {
         "message" => {
             let role = payload.get("role").and_then(Value::as_str).unwrap_or_default();
-            if role != "assistant" {
-                return Vec::new();
-            }
             let content = payload.get("content").unwrap_or(&Value::Null);
             let raw_text = codex_content_text(content);
             let text = clean_codex_transcript_text(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
             let artifacts = codex_image_artifacts_from_content(content, &raw_text, "Generated image");
+            if role == "developer" {
+                if artifacts.is_empty() {
+                    return Vec::new();
+                }
+
+                return vec![CodexThreadTranscriptMessage {
+                    id: format!("codex-{line_index}-generated-image"),
+                    role: "activity".to_string(),
+                    kind: "image_generation".to_string(),
+                    text: String::new(),
+                    title: "Generated image".to_string(),
+                    call_id: String::new(),
+                    created_at: timestamp.to_string(),
+                    source: "codex".to_string(),
+                    artifacts,
+                }];
+            }
+            if role != "assistant" {
+                return Vec::new();
+            }
             if text.is_empty() && artifacts.is_empty() {
                 return Vec::new();
             }
@@ -1366,6 +1688,62 @@ fn codex_messages_from_response_item(
             }
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod agent_sessions_tests {
+    use super::*;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!("{name}-{suffix}"))
+    }
+
+    #[test]
+    fn developer_imagegen_response_item_yields_generated_dir_artifact() {
+        let root = unique_test_dir("codex-developer-imagegen-artifact");
+        let image_dir = root
+            .join("codex-home")
+            .join("generated_images")
+            .join("019ea89a-b677-7fd3-a293-cdc2d10c0351");
+        let image_path = image_dir.join("ig_0baf5da02d75dc2f016a2711455b2c81908b3860dc4fbe6d20.png");
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(&image_path, b"fake png").unwrap();
+
+        let notice = format!(
+            "Generated images are saved to {} as {}/_image_id_.png by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
+            image_dir.display(),
+            image_dir.display()
+        );
+        let payload = serde_json::json!({
+            "type": "message",
+            "role": "developer",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": notice
+                }
+            ]
+        });
+
+        let messages = codex_messages_from_response_item(11, "2026-06-08T15:00:51Z", &payload);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "activity");
+        assert_eq!(messages[0].kind, "image_generation");
+        assert_eq!(messages[0].title, "Generated image");
+        assert_eq!(messages[0].artifacts.len(), 1);
+        assert_eq!(
+            messages[0].artifacts[0].path,
+            image_path.to_string_lossy().to_string()
+        );
+        assert_eq!(messages[0].artifacts[0].mime_type, "image/png");
+
+        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -2553,6 +2931,7 @@ fn read_agent_thread_transcript(
     agent_id: &str,
     provider_session_id: &str,
     cwd: &str,
+    workspace_id: Option<&str>,
     max_messages: usize,
 ) -> Result<CodexThreadTranscriptResult, String> {
     if provider_session_id.trim().is_empty() {
@@ -2561,7 +2940,7 @@ fn read_agent_thread_transcript(
 
     if agent_id == "claude" {
         let (path, initial_meta, matched_by) = find_claude_session(provider_session_id, cwd)?;
-        let (parsed_meta, messages) = parse_claude_session(&path, max_messages)?;
+        let (parsed_meta, mut messages) = parse_claude_session(&path, max_messages)?;
         let session_id = if parsed_meta.session_id.is_empty() {
             initial_meta.session_id
         } else {
@@ -2578,6 +2957,7 @@ fn read_agent_thread_transcript(
             parsed_meta.latest_timestamp
         };
 
+        promote_generated_image_artifacts(&mut messages, &cwd, workspace_id);
         return Ok(CodexThreadTranscriptResult {
             session_id,
             session_title: if parsed_meta.title.is_empty() {
@@ -2596,8 +2976,9 @@ fn read_agent_thread_transcript(
     if agent_id == "opencode" {
         let (session_id, title, session_cwd, matched_by) =
             find_opencode_session(provider_session_id, cwd)?;
-        let (parsed_meta, messages) =
+        let (parsed_meta, mut messages) =
             parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
+        promote_generated_image_artifacts(&mut messages, &parsed_meta.cwd, workspace_id);
         return Ok(CodexThreadTranscriptResult {
             session_id: parsed_meta.session_id,
             session_title: parsed_meta.title,
@@ -2612,7 +2993,7 @@ fn read_agent_thread_transcript(
     }
 
     let (path, initial_meta, matched_by) = find_codex_rollout(provider_session_id, cwd)?;
-    let (parsed_meta, messages) = parse_codex_rollout(&path, max_messages)?;
+    let (parsed_meta, mut messages) = parse_codex_rollout(&path, max_messages)?;
     let session_id = if parsed_meta.session_id.is_empty() {
         initial_meta.session_id
     } else {
@@ -2633,6 +3014,7 @@ fn read_agent_thread_transcript(
         initial_meta.title,
         codex_session_index_title(&session_id),
     ]);
+    promote_generated_image_artifacts(&mut messages, &cwd, workspace_id);
 
     Ok(CodexThreadTranscriptResult {
         session_id,
@@ -2779,6 +3161,7 @@ async fn emit_agent_thread_transcript_watch_update(
             &read_context.agent_id,
             &read_context.provider_session_id,
             &read_context.cwd,
+            Some(read_context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
             read_context.max_messages,
         )
     })
@@ -2796,6 +3179,12 @@ async fn emit_agent_thread_transcript_watch_update(
         }
         return;
     };
+    emit_promoted_generated_asset_event(
+        &app,
+        &result,
+        Some(context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
+        "transcript-watch",
+    );
 
     let signature = agent_thread_transcript_signature(&result);
     let should_emit = {
@@ -2941,6 +3330,7 @@ fn register_agent_thread_transcript_watch(
 
 #[tauri::command]
 async fn agent_thread_session_discover(
+    app: AppHandle,
     request: CodexThreadSessionDiscoverRequest,
 ) -> Result<CodexThreadTranscriptResult, String> {
     let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
@@ -2961,28 +3351,32 @@ async fn agent_thread_session_discover(
         .max_messages
         .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
         .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
+    let workspace_id = request.workspace_id.unwrap_or_default();
+    let workspace_id = Some(workspace_id.as_str()).filter(|value| !value.trim().is_empty());
 
-    if agent_id == "claude" {
-        return discover_claude_session_by_prompt(&expected_user_message, &cwd, max_messages);
-    }
-
-    if agent_id == "opencode" {
-        return discover_opencode_session_by_prompt(&expected_user_message, &cwd, max_messages);
-    }
-
-    discover_codex_session_by_prompt(
-        &expected_user_message,
-        &cwd,
-        &home_search_cwd,
-        allow_timestamp_fallback,
-        &submitted_at,
-        fallback_window_ms,
-        max_messages,
-    )
+    let mut result = if agent_id == "claude" {
+        discover_claude_session_by_prompt(&expected_user_message, &cwd, max_messages)
+    } else if agent_id == "opencode" {
+        discover_opencode_session_by_prompt(&expected_user_message, &cwd, max_messages)
+    } else {
+        discover_codex_session_by_prompt(
+            &expected_user_message,
+            &cwd,
+            &home_search_cwd,
+            allow_timestamp_fallback,
+            &submitted_at,
+            fallback_window_ms,
+            max_messages,
+        )
+    }?;
+    promote_result_generated_image_artifacts(&mut result, workspace_id);
+    emit_promoted_generated_asset_event(&app, &result, workspace_id, "session-discover");
+    Ok(result)
 }
 
 #[tauri::command]
 async fn agent_thread_transcript(
+    app: AppHandle,
     request: CodexThreadTranscriptRequest,
 ) -> Result<CodexThreadTranscriptResult, String> {
     let agent_id = clean_codex_id(request.agent_id.unwrap_or_else(|| "codex".to_string()))
@@ -2994,7 +3388,20 @@ async fn agent_thread_transcript(
         .unwrap_or(CODEX_TRANSCRIPT_DEFAULT_LIMIT)
         .clamp(1, CODEX_TRANSCRIPT_MAX_LIMIT);
 
-    read_agent_thread_transcript(&agent_id, &provider_session_id, &cwd, max_messages)
+    let result = read_agent_thread_transcript(
+        &agent_id,
+        &provider_session_id,
+        &cwd,
+        request.workspace_id.as_deref(),
+        max_messages,
+    )?;
+    emit_promoted_generated_asset_event(
+        &app,
+        &result,
+        request.workspace_id.as_deref(),
+        "transcript-read",
+    );
+    Ok(result)
 }
 
 #[tauri::command]
@@ -3007,8 +3414,15 @@ async fn agent_thread_transcript_watch(
         &context.agent_id,
         &context.provider_session_id,
         &context.cwd,
+        Some(context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
         context.max_messages,
     )?;
+    emit_promoted_generated_asset_event(
+        &app,
+        &result,
+        Some(context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
+        "transcript-watch-start",
+    );
     let _ = register_agent_thread_transcript_watch(&app, &request, &result);
     Ok(result)
 }

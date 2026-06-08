@@ -633,6 +633,16 @@ async fn read_workspace_file(
 }
 
 #[tauri::command]
+async fn read_workspace_file_image(
+    root: String,
+    relative_path: String,
+) -> Result<WorkspaceFileImage, String> {
+    tauri::async_runtime::spawn_blocking(move || read_workspace_file_image_for(root, relative_path))
+        .await
+        .map_err(|error| format!("Unable to read workspace image: {error}"))?
+}
+
+#[tauri::command]
 async fn read_workspace_file_diff(
     root: String,
     relative_path: String,
@@ -640,6 +650,44 @@ async fn read_workspace_file_diff(
     tauri::async_runtime::spawn_blocking(move || read_workspace_file_diff_for(root, relative_path))
         .await
         .map_err(|error| format!("Unable to read workspace file diff: {error}"))?
+}
+
+#[tauri::command]
+async fn rename_workspace_entry(
+    root: String,
+    relative_path: String,
+    new_name: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        rename_workspace_entry_for(root, relative_path, new_name)
+    })
+    .await
+    .map_err(|error| format!("Unable to rename workspace item: {error}"))?
+}
+
+#[tauri::command]
+async fn delete_workspace_entry(
+    root: String,
+    relative_path: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_workspace_entry_for(root, relative_path)
+    })
+    .await
+    .map_err(|error| format!("Unable to delete workspace item: {error}"))?
+}
+
+#[tauri::command]
+async fn move_workspace_entry(
+    root: String,
+    relative_path: String,
+    target_directory: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        move_workspace_entry_for(root, relative_path, target_directory)
+    })
+    .await
+    .map_err(|error| format!("Unable to move workspace item: {error}"))?
 }
 
 #[tauri::command]

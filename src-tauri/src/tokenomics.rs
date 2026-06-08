@@ -8,6 +8,9 @@ const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v5-device-awar
 const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v3-device-aware";
 const TOKENOMICS_ROLLUP_ID_VERSION: &str = "scope-aware-rollups-v1";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
+const TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX: &str = "codex_usage_api_cache:";
+const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 60;
+const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
@@ -3602,12 +3605,12 @@ fn tokenomics_refresh_cloud_daily_rollups(conn: &rusqlite::Connection) -> Result
     Ok(())
 }
 
-fn tokenomics_provider_limits(_conn: &rusqlite::Connection) -> Result<Vec<Value>, String> {
+fn tokenomics_provider_limits(conn: &rusqlite::Connection) -> Result<Vec<Value>, String> {
     let mut limits = Vec::new();
 
     let codex_plan = tokenomics_codex_plan_state();
     let codex_account = tokenomics_provider_account("openai", "codex");
-    if let Some(codex_usage) = tokenomics_codex_live_usage(&codex_plan) {
+    if let Some(codex_usage) = tokenomics_codex_live_usage(conn, &codex_plan, &codex_account) {
         limits.extend(tokenomics_codex_live_limit_snapshots(
             &codex_plan,
             &codex_usage,
@@ -3660,12 +3663,136 @@ fn tokenomics_provider_limits(_conn: &rusqlite::Connection) -> Result<Vec<Value>
     Ok(limits)
 }
 
-fn tokenomics_codex_live_usage(plan: &Value) -> Option<Value> {
+fn tokenomics_codex_usage_cache_key(provider_account: &TokenomicsProviderAccount) -> String {
+    format!(
+        "{TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX}{}",
+        provider_account.key
+    )
+}
+
+fn tokenomics_cached_codex_usage(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    now_unix: u64,
+    max_age_secs: u64,
+) -> Result<Option<Value>, String> {
+    let text: String = match conn.query_row(
+        "SELECT value FROM tokenomics_meta WHERE key=?1",
+        rusqlite::params![cache_key],
+        |row| row.get(0),
+    ) {
+        Ok(text) => text,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("Unable to read Codex usage cache: {error}")),
+    };
+    let cached = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Unable to parse Codex usage cache: {error}"))?;
+    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix", "fetchedAtUnix"])
+        .unwrap_or(0)
+        .max(0) as u64;
+    if fetched_at == 0 || now_unix.saturating_sub(fetched_at) > max_age_secs {
+        return Ok(None);
+    }
+    let Some(usage) = cached.get("usage").filter(|value| value.is_object()) else {
+        return Ok(None);
+    };
+    Ok(Some(tokenomics_adjust_cached_codex_usage(
+        usage,
+        now_unix.saturating_sub(fetched_at),
+    )))
+}
+
+fn tokenomics_store_codex_usage_cache(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    usage: &Value,
+) -> Result<(), String> {
+    tokenomics_store_codex_usage_cache_at(conn, cache_key, usage, tokenomics_unix_now())
+}
+
+fn tokenomics_store_codex_usage_cache_at(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    usage: &Value,
+    fetched_at_unix: u64,
+) -> Result<(), String> {
+    let payload = json!({
+        "fetched_at_unix": fetched_at_unix,
+        "usage": usage,
+    });
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![cache_key, payload.to_string()],
+    )
+    .map_err(|error| format!("Unable to write Codex usage cache: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_adjust_cached_codex_usage(usage: &Value, elapsed_seconds: u64) -> Value {
+    let mut usage = usage.clone();
+    if elapsed_seconds == 0 {
+        return usage;
+    }
+    let elapsed_seconds = elapsed_seconds.min(i64::MAX as u64) as i64;
+    let Some(rate_limit) = usage
+        .get_mut("rate_limit")
+        .and_then(Value::as_object_mut)
+    else {
+        return usage;
+    };
+    for window_key in ["primary_window", "secondary_window"] {
+        let Some(window) = rate_limit.get_mut(window_key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for reset_key in ["reset_after_seconds", "resetAfterSeconds"] {
+            let Some(value) = window.get(reset_key).and_then(Value::as_i64) else {
+                continue;
+            };
+            window.insert(
+                reset_key.to_string(),
+                json!(value.saturating_sub(elapsed_seconds).max(0)),
+            );
+        }
+    }
+    usage
+}
+
+fn tokenomics_codex_live_usage(
+    conn: &rusqlite::Connection,
+    plan: &Value,
+    provider_account: &TokenomicsProviderAccount,
+) -> Option<Value> {
     let access_token = plan
         .get("access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
+    let cache_key = tokenomics_codex_usage_cache_key(provider_account);
+    let now_unix = tokenomics_unix_now();
+    if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
+        conn,
+        &cache_key,
+        now_unix,
+        TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
+    ) {
+        return Some(cached);
+    }
+    let fetched = tokenomics_fetch_codex_live_usage(access_token);
+    if let Some(usage) = fetched {
+        let _ = tokenomics_store_codex_usage_cache(conn, &cache_key, &usage);
+        return Some(usage);
+    }
+    tokenomics_cached_codex_usage(
+        conn,
+        &cache_key,
+        now_unix,
+        TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS,
+    )
+    .ok()
+    .flatten()
+}
+
+fn tokenomics_fetch_codex_live_usage(access_token: &str) -> Option<Value> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
@@ -4458,6 +4585,67 @@ mod tokenomics_tests {
         let state =
             tokenomics_get_scan_state(&conn, "openai", "codex", "/tmp/state_5.sqlite").unwrap();
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn tokenomics_codex_usage_cache_reuses_fresh_weekly_snapshot() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let usage = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "reset_after_seconds": 300
+                },
+                "secondary_window": {
+                    "used_percent": 60,
+                    "reset_after_seconds": 604_800
+                }
+            }
+        });
+        tokenomics_store_codex_usage_cache_at(&conn, "codex-usage-cache-test", &usage, 1_000)
+            .unwrap();
+
+        let cached = tokenomics_cached_codex_usage(
+            &conn,
+            "codex-usage-cache-test",
+            1_030,
+            TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
+        )
+        .unwrap()
+        .expect("fresh cache");
+
+        assert_eq!(
+            cached["rate_limit"]["primary_window"]["reset_after_seconds"],
+            json!(270)
+        );
+        assert_eq!(
+            cached["rate_limit"]["secondary_window"]["reset_after_seconds"],
+            json!(604_770)
+        );
+    }
+
+    #[test]
+    fn tokenomics_codex_usage_cache_expires_after_stale_window() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        tokenomics_store_codex_usage_cache_at(
+            &conn,
+            "codex-usage-cache-test",
+            &json!({"rate_limit": {"secondary_window": {"reset_after_seconds": 604_800}}}),
+            1_000,
+        )
+        .unwrap();
+
+        let expired = tokenomics_cached_codex_usage(
+            &conn,
+            "codex-usage-cache-test",
+            1_000 + TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS + 1,
+            TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS,
+        )
+        .unwrap();
+
+        assert!(expired.is_none());
     }
 
     #[test]

@@ -14345,6 +14345,21 @@ export default function App() {
   const selectedWorkspaceFileRoot = selectedWorkspace
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
     : "";
+  const assetWorkspaceOptions = useMemo(() => (
+    workspaces.map((workspace) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      const savedRoot = workspaceId ? getWorkspaceRootDirectory(workspaceSettings, workspaceId) : "";
+      return {
+        id: workspaceId,
+        name: workspace?.name || workspaceId || "Workspace",
+        rootDirectory: savedRoot || defaultWorkingDirectory,
+      };
+    }).filter((workspace) => workspace.id || workspace.name)
+  ), [
+    defaultWorkingDirectory,
+    workspaceSettings,
+    workspaces,
+  ]);
   const processKnownRoots = useMemo(() => {
     const roots = [];
     const seen = new Set();
@@ -17532,6 +17547,7 @@ export default function App() {
           homeSearchCwd,
           maxMessages: 320,
           submittedAt,
+          workspaceId,
         };
       const transcriptWatchRequested = Boolean(providerSessionId);
       const transcriptContinueDelayMs = transcriptWatchRequested
@@ -21830,9 +21846,8 @@ export default function App() {
               ) : visibleView === "assets" ? (
                 <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
                   <AccountAssetsView
+                    assetWorkspaces={assetWorkspaceOptions}
                     defaultWorkingDirectory={defaultWorkingDirectory}
-                    rootDirectory={selectedWorkspaceFileRoot}
-                    workspace={selectedWorkspace}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (

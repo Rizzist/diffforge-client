@@ -71,6 +71,7 @@ import {
   logFileDragDiagnosticEvent,
 } from "../threads/bigViewSyncDiagnostics";
 import {
+  getLiveTerminalForThread,
   getThreadTerminalGroundTruth,
 } from "../threads/threadTerminalGroundTruth.js";
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
@@ -14046,6 +14047,109 @@ function TerminalView({
     resolveTodoQueueLiveTerminal,
   ]);
   const selectedTerminalPlanTarget = useMemo(() => {
+    const normalizePlanTerminalIndex = (value) => {
+      if (value === null || value === undefined || String(value).trim() === "") {
+        return null;
+      }
+      const index = Number(value);
+      return Number.isInteger(index) && index >= 0 ? index : null;
+    };
+
+    const buildPlanTarget = ({
+      forcedLiveTerminal = null,
+      paneIdOverride = "",
+      providerBinding = null,
+      terminalIndex,
+      thread = null,
+    }) => {
+      const resolvedIndex = normalizePlanTerminalIndex(terminalIndex);
+      const hasTerminalIndex = resolvedIndex !== null;
+      const paneId = paneIdOverride || (hasTerminalIndex ? getTerminalPaneId(resolvedIndex) : "");
+      const { liveTerminal: resolvedLiveTerminal } = hasTerminalIndex
+        ? resolveTodoQueueLiveTerminal(resolvedIndex, paneId)
+        : { liveTerminal: null };
+      const candidateLiveTerminal = forcedLiveTerminal || resolvedLiveTerminal || null;
+      const liveTerminal = thread?.id
+        && candidateLiveTerminal?.threadId
+        && candidateLiveTerminal.threadId !== thread.id
+        ? forcedLiveTerminal || null
+        : candidateLiveTerminal;
+      const coordination = liveTerminal?.coordination
+        || thread?.coordination
+        || providerBinding?.coordination
+        || {};
+      const activeTask = liveTerminal?.activeTask
+        || liveTerminal?.active_task
+        || {};
+      const projectTarget = hasTerminalIndex
+        ? getTerminalProjectTarget(resolvedIndex)
+        : getTerminalProjectTarget(null);
+      const fallbackRole = hasTerminalIndex ? getTerminalRole(resolvedIndex) : "";
+
+      return {
+        agentId: liveTerminal?.agentId
+          || coordination.agentId
+          || coordination.agent_id
+          || thread?.currentAgent
+          || fallbackRole
+          || "",
+        dbPath: projectTarget?.dbPath || "",
+        mountId: projectTarget?.mountId || "",
+        paneId,
+        repoPath: projectTarget?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+        sessionId: liveTerminal?.sessionId
+          || liveTerminal?.session_id
+          || coordination.sessionId
+          || coordination.session_id
+          || activeTask.sessionId
+          || activeTask.session_id
+          || providerBinding?.nativeSessionId
+          || providerBinding?.native_session_id
+          || thread?.transcriptSessionId
+          || "",
+        taskId: liveTerminal?.taskId
+          || liveTerminal?.task_id
+          || activeTask.taskId
+          || activeTask.task_id
+          || activeTask.id
+          || "",
+        terminalIndex: hasTerminalIndex ? resolvedIndex : null,
+        threadId: thread?.id || liveTerminal?.threadId || "",
+        workspaceId: terminalWorkspace?.id || liveTerminal?.workspaceId || thread?.workspaceId || "",
+      };
+    };
+
+    if (fullscreenActive && selectedWorkspaceThreadId && workspaceThreadEntry?.threads) {
+      const selectedThread = workspaceThreadEntry.threads[selectedWorkspaceThreadId] || null;
+      const selectedThreadProviderBinding = getWorkspaceThreadProviderBinding(
+        selectedThread,
+        selectedThread?.currentAgent || "",
+      );
+      const selectedThreadBinding = selectedThreadProviderBinding?.terminalBinding
+        || selectedThread?.terminalBinding
+        || null;
+      const selectedThreadLiveTerminal = getLiveTerminalForThread(
+        selectedThread,
+        selectedThreadProviderBinding,
+        workspaceThreadEntry,
+      );
+      const selectedThreadTerminalIndex = normalizePlanTerminalIndex(
+        selectedThreadLiveTerminal?.terminalIndex
+          ?? selectedThreadBinding?.terminalIndex
+          ?? selectedThread?.terminalIndex,
+      );
+
+      if (selectedThread && selectedThreadTerminalIndex !== null) {
+        return buildPlanTarget({
+          forcedLiveTerminal: selectedThreadLiveTerminal,
+          paneIdOverride: selectedThreadLiveTerminal?.paneId || selectedThreadBinding?.paneId || "",
+          providerBinding: selectedThreadProviderBinding,
+          terminalIndex: selectedThreadTerminalIndex,
+          thread: selectedThread,
+        });
+      }
+    }
+
     const terminalIndex = logicalTerminalIndexes.find((candidateIndex) => (
       getTerminalPaneId(candidateIndex) === activePaneId
     ));
@@ -14066,45 +14170,28 @@ function TerminalView({
 	        workspaceId: terminalWorkspace?.id || "",
 	      };
 	    }
-	    const paneId = getTerminalPaneId(resolvedIndex);
-	    const { liveTerminal } = resolveTodoQueueLiveTerminal(resolvedIndex, paneId);
-	    const coordination = liveTerminal?.coordination || {};
-	    const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
-	    const projectTarget = getTerminalProjectTarget(resolvedIndex);
-	    return {
-	      agentId: liveTerminal?.agentId
-	        || coordination.agentId
-	        || coordination.agent_id
-	        || getTerminalRole(resolvedIndex)
-	        || "",
-	      dbPath: projectTarget?.dbPath || "",
-	      mountId: projectTarget?.mountId || "",
-	      paneId,
-	      repoPath: projectTarget?.repoPath || terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
-	      sessionId: liveTerminal?.sessionId
-	        || liveTerminal?.session_id
-        || coordination.sessionId
-        || coordination.session_id
-        || "",
-      taskId: liveTerminal?.taskId
-        || liveTerminal?.task_id
-        || activeTask.taskId
-        || activeTask.task_id
-        || "",
+    const thread = getTerminalThread(resolvedIndex);
+    const providerBinding = getWorkspaceThreadProviderBinding(thread, getTerminalRole(resolvedIndex));
+    return buildPlanTarget({
+      providerBinding,
       terminalIndex: resolvedIndex,
-      workspaceId: terminalWorkspace?.id || liveTerminal?.workspaceId || "",
-    };
+      thread,
+    });
   }, [
 	    activePaneId,
 	    defaultWorkingDirectory,
+	    fullscreenActive,
 	    getTerminalProjectTarget,
 	    getTerminalPaneId,
 	    getTerminalRole,
+	    getTerminalThread,
 	    logicalTerminalIndexes,
 	    resolveTodoQueueLiveTerminal,
+	    selectedWorkspaceThreadId,
 	    terminalWorkspaceWorkingDirectory,
 	    terminalWorkspace?.id,
 	    todoQueueDispatchRevision,
+	    workspaceThreadEntry,
 	  ]);
   const terminalBreakoutPlanTargets = useMemo(() => {
     if (!terminalBreakoutLayoutActive) {
@@ -22334,9 +22421,9 @@ function TerminalView({
     clearFullscreenTransitionTimer();
 
     if (fullscreenActive && fullscreenTerminalIndex === terminalIndex) {
-      const selectedLivePaneId = getLiveTerminalPaneIdForThread(selectedWorkspaceThreadId);
-      if (selectedLivePaneId) {
-        setActiveTerminalPaneId(selectedLivePaneId);
+      const closingPaneId = paneId || getTerminalPaneId(terminalIndex);
+      if (closingPaneId) {
+        setActiveTerminalPaneId(closingPaneId);
       }
       setFullscreenMotion({
         ...motion,
@@ -22375,10 +22462,9 @@ function TerminalView({
     fullscreenActive,
     fullscreenTerminalIndex,
     getFullscreenMotionFromRect,
-    getLiveTerminalPaneIdForThread,
     getTerminalThread,
+    getTerminalPaneId,
     onSelectWorkspaceThread,
-    selectedWorkspaceThreadId,
     terminalWorkspace?.id,
   ]);
 

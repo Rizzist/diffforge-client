@@ -958,6 +958,90 @@ const EmptyThreads = styled.div`
   font-weight: 460;
 `;
 
+function threadTimestampMs(value) {
+  if (value == null || value === "") {
+    return 0;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      return 0;
+    }
+    return Math.abs(value) > 0 && Math.abs(value) < 10_000_000_000 ? value * 1000 : value;
+  }
+  const text = String(value || "").trim();
+  if (!text) {
+    return 0;
+  }
+  const numeric = Number.parseFloat(text);
+  if (Number.isFinite(numeric) && /^-?\d+(?:\.\d+)?$/.test(text)) {
+    return Math.abs(numeric) > 0 && Math.abs(numeric) < 10_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function maxThreadTimestampMs(values) {
+  return values.reduce((latest, value) => Math.max(latest, threadTimestampMs(value)), 0);
+}
+
+function latestCollectionTimestampMs(values, keys) {
+  if (!Array.isArray(values)) {
+    return 0;
+  }
+  return values.reduce((latest, item) => (
+    Math.max(latest, maxThreadTimestampMs(keys.map((key) => item?.[key])))
+  ), 0);
+}
+
+function getThreadSortFreshnessMs(thread, threadState, entry) {
+  const providerBinding = getWorkspaceThreadProviderBinding(thread, thread?.currentAgent);
+  const terminalBinding = providerBinding?.terminalBinding || thread?.terminalBinding;
+  const terminalIndex = terminalBinding?.terminalIndex ?? thread?.terminalIndex;
+  const terminalKey = terminalIndex == null ? "" : String(terminalIndex);
+  const mappedTerminal = terminalKey ? entry?.terminals?.[terminalKey] : null;
+  return maxThreadTimestampMs([
+    thread?.lastMessageAt,
+    thread?.lastActiveAt,
+    thread?.updatedAt,
+    thread?.createdAt,
+    thread?.pendingPrompt?.updatedAt,
+    thread?.pendingPrompt?.submittedAt,
+    thread?.pendingPrompt?.createdAt,
+    thread?.latestTurn?.updatedAt,
+    thread?.latestTurn?.completedAt,
+    thread?.latestTurn?.startedAt,
+    thread?.latestTurn?.requestedAt,
+    thread?.latestTurn?.createdAt,
+    providerBinding?.lastMessageAt,
+    providerBinding?.lastActiveAt,
+    providerBinding?.nativeSessionUpdatedAt,
+    providerBinding?.updatedAt,
+    mappedTerminal?.lastMessageAt,
+    mappedTerminal?.lastActiveAt,
+    mappedTerminal?.updatedAt,
+    mappedTerminal?.createdAt,
+    mappedTerminal?.terminalLaunchEpoch,
+    latestCollectionTimestampMs(thread?.messages, ["createdAt", "created_at"]),
+    latestCollectionTimestampMs(thread?.projectionEvents, ["createdAt", "created_at"]),
+  ]);
+}
+
+function getThreadSortBucket(thread, threadState) {
+  if (getWorkspaceThreadIsPinned(thread)) {
+    return 0;
+  }
+  if (threadState?.threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION) {
+    return 1;
+  }
+  if (threadState?.threadViewState === THREAD_VIEW_STATE.LIVE_SESSION) {
+    return 2;
+  }
+  if (threadState?.threadViewState === THREAD_VIEW_STATE.DETACHED_SESSION) {
+    return 3;
+  }
+  return 4;
+}
+
 function getThreadRows(workspaceThreads, workspaceId) {
   const entry = workspaceThreads?.[workspaceId];
   if (!entry) {
@@ -975,14 +1059,20 @@ function getThreadRows(workspaceThreads, workspaceId) {
     .filter(({ threadState }) => (
       threadState.threadViewState !== THREAD_VIEW_STATE.INACTIVE_NO_SESSION
     ))
-    .map(({ thread, index }) => ({ index, thread }))
+    .map(({ thread, threadState, index }) => ({
+      bucket: getThreadSortBucket(thread, threadState),
+      freshness: getThreadSortFreshnessMs(thread, threadState, entry),
+      index,
+      thread,
+    }))
     .sort((left, right) => {
-      const leftPinned = getWorkspaceThreadIsPinned(left.thread);
-      const rightPinned = getWorkspaceThreadIsPinned(right.thread);
-      if (leftPinned !== rightPinned) {
-        return leftPinned ? -1 : 1;
+      if (left.bucket !== right.bucket) {
+        return left.bucket - right.bucket;
       }
-      return left.index - right.index;
+      if (left.freshness !== right.freshness) {
+        return right.freshness - left.freshness;
+      }
+      return right.index - left.index;
     })
     .map(({ thread }) => thread);
 }

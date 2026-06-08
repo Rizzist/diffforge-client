@@ -1936,6 +1936,48 @@ fn workspace_relative_display(path: &Path) -> String {
         .join("/")
 }
 
+fn clean_workspace_entry_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("Name is required.".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("Name is invalid.".to_string());
+    }
+    if name
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b'\x7f' || byte == b'/' || byte == b'\\')
+    {
+        return Err("Name cannot include path separators or control characters.".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn workspace_relative_parent_display(relative_path: &str) -> Result<String, String> {
+    let cleaned = clean_workspace_relative_path(relative_path)?;
+    Ok(cleaned
+        .parent()
+        .map(workspace_relative_display)
+        .unwrap_or_default())
+}
+
+fn workspace_file_operation_result(
+    root: &Path,
+    relative_path: String,
+    target_relative_path: Option<String>,
+) -> Result<WorkspaceFileOperationResult, String> {
+    Ok(WorkspaceFileOperationResult {
+        root: workspace_path_display(root),
+        parent_relative_path: workspace_relative_parent_display(
+            target_relative_path
+                .as_deref()
+                .unwrap_or(relative_path.as_str()),
+        )?,
+        relative_path,
+        target_relative_path,
+    })
+}
+
 fn modified_ms(metadata: &fs::Metadata) -> Option<u64> {
     metadata
         .modified()
@@ -2353,6 +2395,25 @@ fn list_workspace_directory_for(
     })
 }
 
+fn workspace_preview_image_mime(relative_path: &str) -> Option<&'static str> {
+    let extension = Path::new(relative_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "gif" => Some("image/gif"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "svg" => Some("image/svg+xml"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 fn read_workspace_file_for(
     root: String,
     relative_path: String,
@@ -2400,6 +2461,63 @@ fn read_workspace_file_for(
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string()),
         content,
+        size: metadata.len(),
+        modified_ms: modified_ms(&metadata),
+    })
+}
+
+fn read_workspace_file_image_for(
+    root: String,
+    relative_path: String,
+) -> Result<WorkspaceFileImage, String> {
+    let workspace_root = resolve_workspace_root_directory(Some(&root))?;
+    let (file_path, normalized_relative_path) =
+        resolve_workspace_child_path(&workspace_root, &relative_path)?;
+    let metadata = fs::metadata(&file_path)
+        .map_err(|error| format!("Unable to inspect workspace image: {error}"))?;
+
+    if !metadata.is_file() {
+        return Err("Workspace path is not a file.".to_string());
+    }
+
+    if metadata.len() > MAX_WORKSPACE_IMAGE_PREVIEW_BYTES {
+        return Err("Workspace image is too large to preview.".to_string());
+    }
+
+    let mime_type = workspace_preview_image_mime(&normalized_relative_path)
+        .ok_or_else(|| "Workspace file is not a supported image preview.".to_string())?;
+    let bytes =
+        fs::read(&file_path).map_err(|error| format!("Unable to read workspace image: {error}"))?;
+    let data_url = format!(
+        "data:{mime_type};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    );
+    let project_mounts = workspace_project_mounts(&workspace_root);
+    let project_context = workspace_project_context_for_path(&file_path, &project_mounts);
+    let git_status = project_context.as_ref().and_then(|context| {
+        let statuses = workspace_git_statuses(&context.mount.root_path);
+        git_status_for_project_context(&statuses, context, "file")
+    });
+
+    Ok(WorkspaceFileImage {
+        root: workspace_path_display(&workspace_root),
+        git_status,
+        project_root: project_context
+            .as_ref()
+            .map(|context| context.mount.project_root.clone()),
+        project_relative_path: project_context
+            .as_ref()
+            .map(|context| context.project_relative_path.clone()),
+        mount_id: project_context
+            .as_ref()
+            .map(|context| context.mount.mount_id.clone()),
+        relative_path: normalized_relative_path,
+        name: file_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "image".to_string()),
+        data_url,
+        mime_type: mime_type.to_string(),
         size: metadata.len(),
         modified_ms: modified_ms(&metadata),
     })
@@ -2538,6 +2656,122 @@ fn read_workspace_file_diff_for(
         project_relative_path: Some(context.project_relative_path.clone()),
         mount_id: Some(context.mount.mount_id.clone()),
     })
+}
+
+fn rename_workspace_entry_for(
+    root: String,
+    relative_path: String,
+    new_name: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    let workspace_root = resolve_workspace_root_directory(Some(&root))?;
+    let (source_path, normalized_relative_path) =
+        resolve_workspace_child_path(&workspace_root, &relative_path)?;
+    if normalized_relative_path.is_empty() {
+        return Err("Cannot rename the workspace root.".to_string());
+    }
+
+    let new_name = clean_workspace_entry_name(&new_name)?;
+    let parent = source_path
+        .parent()
+        .ok_or_else(|| "Unable to resolve workspace parent folder.".to_string())?;
+    let target_path = parent.join(new_name);
+    if target_path.exists() {
+        return Err("A file or folder with that name already exists.".to_string());
+    }
+    if !target_path.starts_with(&workspace_root) {
+        return Err("Workspace path must stay inside the workspace directory.".to_string());
+    }
+
+    fs::rename(&source_path, &target_path)
+        .map_err(|error| format!("Unable to rename workspace item: {error}"))?;
+    let target_relative_path = child_relative_path(&workspace_root, &target_path)
+        .ok_or_else(|| "Renamed path left the workspace directory.".to_string())?;
+
+    workspace_file_operation_result(
+        &workspace_root,
+        normalized_relative_path,
+        Some(target_relative_path),
+    )
+}
+
+fn delete_workspace_entry_for(
+    root: String,
+    relative_path: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    let workspace_root = resolve_workspace_root_directory(Some(&root))?;
+    let (entry_path, normalized_relative_path) =
+        resolve_workspace_child_path(&workspace_root, &relative_path)?;
+    if normalized_relative_path.is_empty() {
+        return Err("Cannot delete the workspace root.".to_string());
+    }
+
+    let metadata = fs::symlink_metadata(&entry_path)
+        .map_err(|error| format!("Unable to inspect workspace item: {error}"))?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(&entry_path)
+            .map_err(|error| format!("Unable to delete workspace folder: {error}"))?;
+    } else {
+        fs::remove_file(&entry_path)
+            .map_err(|error| format!("Unable to delete workspace file: {error}"))?;
+    }
+
+    workspace_file_operation_result(&workspace_root, normalized_relative_path, None)
+}
+
+fn move_workspace_entry_for(
+    root: String,
+    relative_path: String,
+    target_directory: String,
+) -> Result<WorkspaceFileOperationResult, String> {
+    let workspace_root = resolve_workspace_root_directory(Some(&root))?;
+    let (source_path, normalized_relative_path) =
+        resolve_workspace_child_path(&workspace_root, &relative_path)?;
+    if normalized_relative_path.is_empty() {
+        return Err("Cannot move the workspace root.".to_string());
+    }
+    let (target_directory_path, _) =
+        resolve_workspace_child_path(&workspace_root, &target_directory)?;
+    let target_metadata = fs::metadata(&target_directory_path)
+        .map_err(|error| format!("Unable to inspect target folder: {error}"))?;
+    if !target_metadata.is_dir() {
+        return Err("Move target is not a folder.".to_string());
+    }
+    if fs::metadata(&source_path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+        && target_directory_path.starts_with(&source_path)
+    {
+        return Err("Cannot move a folder into itself.".to_string());
+    }
+
+    let file_name = source_path
+        .file_name()
+        .ok_or_else(|| "Unable to resolve workspace item name.".to_string())?;
+    let target_path = target_directory_path.join(file_name);
+    if normalized_path_key(&target_path) == normalized_path_key(&source_path) {
+        return workspace_file_operation_result(
+            &workspace_root,
+            normalized_relative_path,
+            child_relative_path(&workspace_root, &target_path),
+        );
+    }
+    if target_path.exists() {
+        return Err("A file or folder with that name already exists in the target folder.".to_string());
+    }
+    if !target_path.starts_with(&workspace_root) {
+        return Err("Workspace path must stay inside the workspace directory.".to_string());
+    }
+
+    fs::rename(&source_path, &target_path)
+        .map_err(|error| format!("Unable to move workspace item: {error}"))?;
+    let target_relative_path = child_relative_path(&workspace_root, &target_path)
+        .ok_or_else(|| "Moved path left the workspace directory.".to_string())?;
+
+    workspace_file_operation_result(
+        &workspace_root,
+        normalized_relative_path,
+        Some(target_relative_path),
+    )
 }
 
 #[cfg(test)]
@@ -3279,6 +3513,31 @@ mod workspace_files_tests {
         assert!(diff.diff.contains("-one"));
         assert!(diff.diff.contains("+two"));
         assert!(!root.join(".git").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_file_image_preview_returns_data_url() {
+        let root = test_workspace_root("diffforge-image-preview");
+        create_package_project(&root, "{}\n");
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(
+            root.join("assets").join("chocolate.svg"),
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4"/></svg>"#,
+        )
+        .unwrap();
+
+        let image = read_workspace_file_image_for(
+            workspace_path_display(&root),
+            "assets/chocolate.svg".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(image.mime_type, "image/svg+xml");
+        assert_eq!(image.relative_path, "assets/chocolate.svg");
+        assert!(image.data_url.starts_with("data:image/svg+xml;base64,"));
+        assert!(image.data_url.contains("PHN2Zy"));
 
         let _ = fs::remove_dir_all(root);
     }

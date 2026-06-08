@@ -13137,6 +13137,149 @@ fn cloud_mcp_available_asset_download_path(target_dir: &Path, filename: &str) ->
     ))
 }
 
+fn cloud_mcp_promote_generated_asset_to_library(
+    repo_path: Option<&str>,
+    workspace_id: Option<&str>,
+    source_path: &Path,
+    name_hint: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Value, String> {
+    let source_path = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    if !source_path.is_file() {
+        return Err(format!(
+            "Generated image asset does not exist: {}",
+            source_path.display()
+        ));
+    }
+
+    let mime_type = cloud_mcp_asset_mime_for_path(&source_path);
+    if !mime_type.starts_with("image/") {
+        return Err(format!(
+            "Generated asset is not an image: {}",
+            source_path.display()
+        ));
+    }
+
+    let (source_sha256, source_size_bytes) = cloud_mcp_file_sha256_and_size(&source_path)?;
+    let req = cloud_mcp_repo_request(
+        repo_path.unwrap_or_default().to_string(),
+        workspace_id.map(str::to_string),
+        None,
+    );
+    let workspace_id_text = workspace_id.unwrap_or_default();
+    let asset_id = format!(
+        "asset-imagegen-{}",
+        cloud_mcp_short_hash(&format!(
+            "{}:{}:{}:{}",
+            req.repo_id, workspace_id_text, source_sha256, source_size_bytes
+        ))
+    );
+
+    let fallback_name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("generated-image");
+    let mut filename = cloud_mcp_sanitize_asset_filename(
+        name_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_name),
+        "generated-image",
+    );
+    if Path::new(&filename).extension().is_none() {
+        if let Some(extension) = cloud_mcp_asset_extension_for_mime(&mime_type) {
+            filename = format!("{filename}.{extension}");
+        }
+    }
+
+    let asset_root = cloud_mcp_managed_asset_root()?;
+    let target_dir = asset_root.join("imagegen").join(&asset_id);
+    fs::create_dir_all(&target_dir).map_err(|error| {
+        format!(
+            "Unable to create generated image asset directory {}: {error}",
+            target_dir.display()
+        )
+    })?;
+    let target_path = target_dir.join(&filename);
+    let should_copy = match cloud_mcp_file_sha256_and_size(&target_path) {
+        Ok((target_sha256, target_size_bytes)) => {
+            target_sha256 != source_sha256 || target_size_bytes != source_size_bytes
+        }
+        Err(_) => true,
+    };
+    if should_copy {
+        fs::copy(&source_path, &target_path).map_err(|error| {
+            format!(
+                "Unable to copy generated image asset {} to {}: {error}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+    }
+    let target_path = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
+    let target_path_text = target_path.display().to_string();
+
+    if let Ok(existing) = cloud_mcp_asset_row_from_file(&asset_id) {
+        let existing_path = cloud_mcp_asset_row_text(&existing, &["local_path", "localPath", "path"]);
+        if existing_path == target_path_text && Path::new(&existing_path).is_file() {
+            return Ok(json!({
+                "kind": "generated_asset_promoted",
+                "source": "managed_asset_library",
+                "asset_id": asset_id,
+                "assetId": asset_id,
+                "local_path": target_path_text,
+                "localPath": target_path_text,
+                "path": target_path_text,
+                "asset": existing,
+            }));
+        }
+    }
+
+    let metadata = json!({
+        "source": "codex_imagegen_autocopy",
+        "sourceKind": "imagegen",
+        "original_path": source_path.display().to_string(),
+        "originalPath": source_path.display().to_string(),
+        "prompt": prompt.unwrap_or_default(),
+    });
+    let input = json!({
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "name": filename,
+        "filename": filename,
+        "mime_type": mime_type,
+        "mimeType": mime_type,
+        "kind": "image",
+        "source_kind": "imagegen",
+        "sourceKind": "imagegen",
+        "metadata": metadata,
+    });
+    let row = cloud_mcp_asset_local_row_with_input(
+        &req,
+        workspace_id_text,
+        req.workspace_name.as_deref(),
+        &target_path,
+        &input,
+    )?;
+    cloud_mcp_asset_store_local_row(&row)?;
+
+    Ok(json!({
+        "kind": "generated_asset_promoted",
+        "source": "managed_asset_library",
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "local_path": target_path_text,
+        "localPath": target_path_text,
+        "path": target_path_text,
+        "asset": row,
+    }))
+}
+
 fn cloud_mcp_asset_local_row(
     req: &CloudMcpRepoRequest,
     workspace_id: &str,
@@ -17359,6 +17502,31 @@ pub fn run_cloud_mcp_stdio_proxy(args: Vec<String>) -> Result<(), String> {
 mod cloud_mcp_tests {
     use super::*;
 
+    static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    struct ScopedCloudMcpEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedCloudMcpEnv {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedCloudMcpEnv {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
     fn test_cloud_root(prefix: &str) -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -17382,6 +17550,77 @@ mod cloud_mcp_tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn generated_asset_promotion_copies_and_registers_local_asset() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("generated-asset-promotion");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let repo_root = root.join("repo");
+        let source_path = root
+            .join("codex-home")
+            .join("generated_images")
+            .join("turn")
+            .join("chocolate.png");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::write(&source_path, b"fake png payload").unwrap();
+
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+
+        let promoted = cloud_mcp_promote_generated_asset_to_library(
+            Some(repo_root.to_str().unwrap()),
+            Some("workspace-a"),
+            &source_path,
+            Some("chocolate preview.png"),
+            Some("make chocolate"),
+        )
+        .unwrap();
+        let local_path = cloud_mcp_payload_text(&promoted, &["local_path", "localPath", "path"])
+            .expect("promoted local path");
+        let local_path_buf = PathBuf::from(&local_path);
+        let expected_asset_root = data_root
+            .join("assets")
+            .join("imagegen")
+            .canonicalize()
+            .unwrap();
+
+        assert!(local_path_buf.starts_with(expected_asset_root));
+        assert_eq!(fs::read(&local_path_buf).unwrap(), b"fake png payload");
+        assert_eq!(
+            promoted["asset"]["workspaceId"].as_str(),
+            Some("workspace-a")
+        );
+        assert_eq!(promoted["asset"]["sourceKind"].as_str(), Some("imagegen"));
+        assert_eq!(
+            promoted["asset"]["metadata"]["originalPath"].as_str(),
+            Some(source_path.canonicalize().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            promoted["asset"]["metadata"]["prompt"].as_str(),
+            Some("make chocolate")
+        );
+
+        let promoted_again = cloud_mcp_promote_generated_asset_to_library(
+            Some(repo_root.to_str().unwrap()),
+            Some("workspace-a"),
+            &source_path,
+            Some("chocolate preview.png"),
+            Some("make chocolate"),
+        )
+        .unwrap();
+        assert_eq!(
+            cloud_mcp_payload_text(&promoted_again, &["local_path", "localPath", "path"]),
+            Some(local_path)
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

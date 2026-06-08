@@ -60,15 +60,6 @@ function planSnapshotCacheKey({
   return `${scope}|${target}`;
 }
 
-function planSnapshotRepoCacheKey({ dbPath = "", repoPath = "", workspaceId = "" }) {
-  return [
-    cleanText(workspaceId),
-    pathIdentity(repoPath),
-    pathIdentity(dbPath),
-    "repo",
-  ].join("|");
-}
-
 function trimPlanSnapshotCache() {
   while (planSnapshotCache.size > PLAN_SNAPSHOT_CACHE_LIMIT) {
     const oldestKey = planSnapshotCache.keys().next().value;
@@ -542,32 +533,37 @@ export default function PlansWorkspaceView({
   const snapshotAgentId = targetMatchesActiveRepo ? target.agentId || "" : "";
   const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
   const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
+  const hasSnapshotTarget = Boolean(snapshotTaskId || snapshotSessionId);
   const workspaceId = target.workspaceId || workspace?.id || "";
-  const snapshotCacheKeys = useMemo(() => ({
-    exact: planSnapshotCacheKey({
-      agentId: snapshotAgentId,
-      dbPath: activeDbPath,
-      repoPath: activeRepoPath,
-      sessionId: snapshotSessionId,
-      taskId: snapshotTaskId,
-      workspaceId,
-    }),
-    repo: planSnapshotRepoCacheKey({
-      dbPath: activeDbPath,
-      repoPath: activeRepoPath,
-      workspaceId,
-    }),
-  }), [
+  const snapshotCacheKeys = useMemo(() => {
+    if (!hasSnapshotTarget) {
+      return { exact: "", repo: "" };
+    }
+
+    return {
+      exact: planSnapshotCacheKey({
+        agentId: snapshotAgentId,
+        dbPath: activeDbPath,
+        repoPath: activeRepoPath,
+        sessionId: snapshotSessionId,
+        taskId: snapshotTaskId,
+        workspaceId,
+      }),
+      repo: "",
+    };
+  }, [
     activeDbPath,
     activeRepoPath,
+    hasSnapshotTarget,
     snapshotAgentId,
     snapshotSessionId,
     snapshotTaskId,
     workspaceId,
   ]);
-  const activeSnapshotRequestKey = snapshotCacheKeys.exact || snapshotCacheKeys.repo || "";
-  const selectedPlan = snapshot?.selected_plan || null;
-  const planCandidates = Array.isArray(snapshot?.history) ? snapshot.history : [];
+  const activeSnapshotRequestKey = snapshotCacheKeys.exact || "";
+  const scopedSnapshot = hasSnapshotTarget ? snapshot : null;
+  const selectedPlan = scopedSnapshot?.selected_plan || null;
+  const planCandidates = Array.isArray(scopedSnapshot?.history) ? scopedSnapshot.history : [];
   const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
   const latestPlanCandidate = planCandidates[0] || null;
   const displayedPlan = selectedPlan && !planIsTerminal(selectedPlan)
@@ -575,7 +571,7 @@ export default function PlansWorkspaceView({
     : activePlanCandidate || selectedPlan || latestPlanCandidate || null;
   const displayedPlanId = planIdentity(displayedPlan);
   const displayedPlanCanContinue = planCanContinue(displayedPlan);
-  const titleMaxChars = Number(snapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
+  const titleMaxChars = Number(scopedSnapshot?.title_max_chars || displayedPlan?.title_max_chars || 96);
 
   const setPendingStepSaveRecord = useCallback((key, record) => {
     if (!key || !record) {
@@ -622,12 +618,18 @@ export default function PlansWorkspaceView({
 
   useEffect(() => {
     snapshotRequestKeyRef.current = activeSnapshotRequestKey;
+    if (!hasSnapshotTarget) {
+      setSnapshot(null);
+      setError("");
+      return;
+    }
+
     setSnapshot(applyPendingPlanStepSaves(
       cachedPlanSnapshot(snapshotCacheKeys),
       pendingStepSavesRef.current,
     ));
     setError("");
-  }, [activeSnapshotRequestKey, snapshotCacheKeys]);
+  }, [activeSnapshotRequestKey, hasSnapshotTarget, snapshotCacheKeys]);
 
   useEffect(() => {
     if (activeRepoPath !== selectedRepoPath) {
@@ -644,7 +646,7 @@ export default function PlansWorkspaceView({
 
   const loadSnapshot = useCallback(async (options = {}) => {
     const silent = options?.silent === true;
-    if (!activeRepoPath) {
+    if (!activeRepoPath || !hasSnapshotTarget) {
       setSnapshot(null);
       return;
     }
@@ -693,6 +695,7 @@ export default function PlansWorkspaceView({
     activeDbPath,
     activeRepoPath,
     activeSnapshotRequestKey,
+    hasSnapshotTarget,
     snapshotAgentId,
     snapshotCacheKeys,
     snapshotSessionId,
@@ -700,6 +703,10 @@ export default function PlansWorkspaceView({
   ]);
 
   useEffect(() => {
+    if (!hasSnapshotTarget) {
+      return undefined;
+    }
+
     const cachedSnapshot = cachedPlanSnapshot(snapshotCacheKeys);
     if (cachedSnapshot && cachedPlanSnapshotIsFresh(snapshotCacheKeys)) {
       return undefined;
@@ -710,7 +717,7 @@ export default function PlansWorkspaceView({
     return () => {
       window.clearTimeout(loadTimer);
     };
-  }, [activeSnapshotRequestKey, loadSnapshot, snapshotCacheKeys]);
+  }, [activeSnapshotRequestKey, hasSnapshotTarget, loadSnapshot, snapshotCacheKeys]);
 
   useEffect(() => {
     planEventStateRef.current = {
@@ -731,7 +738,7 @@ export default function PlansWorkspaceView({
   ]);
 
   useEffect(() => {
-    if (!activeRepoPath) {
+    if (!activeRepoPath || !hasSnapshotTarget) {
       return undefined;
     }
 
@@ -797,7 +804,7 @@ export default function PlansWorkspaceView({
         unlisten();
       }
     };
-  }, [activeRepoPath]);
+  }, [activeRepoPath, hasSnapshotTarget]);
 
   useEffect(() => {
     setEditingStepIndex(null);
@@ -980,118 +987,120 @@ export default function PlansWorkspaceView({
 
       {error && <FormMessage data-tone="danger">{error}</FormMessage>}
 
-      {displayedPlan ? (
-        <PlanPanel>
-          <PlanPanelHeader>
-            <div>
-              <PlanName>{displayedPlan.title || displayedPlan.task_title || "Terminal task"}</PlanName>
-              <PlanSubline>
-                <span>{planStatusLabel(displayedPlan.status)}</span>
-                {timestampLabel(displayedPlan.updated_at) && <span>{timestampLabel(displayedPlan.updated_at)}</span>}
-              </PlanSubline>
-            </div>
-            <PlanPanelActions>
-              <PlanBadge data-status={normalizedPlanStatus(displayedPlan.status)}>
-                {planStatusLabel(displayedPlan.status)}
-              </PlanBadge>
-              {displayedPlanCanContinue && (
-                <ResumeButton
-                  onClick={() => onResumePlan?.(displayedPlan)}
-                  type="button"
-                >
-                  Continue
-                </ResumeButton>
-              )}
-            </PlanPanelActions>
-          </PlanPanelHeader>
-          <StepList>
-            {(displayedPlan.steps || []).map((step) => {
-              const index = Number(step.index);
-              const editing = editingStepIndex === index;
-              const pendingSave = planStepSaveForStep(pendingStepSaves, displayedPlan.task_id, index);
-              const syncing = pendingSave?.status === "syncing";
-              const syncFailed = pendingSave?.status === "error";
-              const editable = planStepUserEditable(step, displayedPlan) && !syncing;
-              const statusKind = stepStatusKind(step.status);
-              return (
-                <StepRow data-status={cleanText(step.status).toLowerCase()} key={step.id || index}>
-                  <StepMarker aria-hidden="true" data-status={statusKind}>
-                    <StepStatusGlyph status={step.status} />
-                  </StepMarker>
-                  <StepContent>
-                    {editing ? (
-                      <StepEditRow onBlur={handleStepEditBlur}>
-                        <StepInput
-                          aria-label={`Step ${index + 1} title`}
-                          autoFocus
-                          maxLength={titleMaxChars}
-                          onChange={(event) => setEditingTitle(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") {
-                              event.preventDefault();
-                              saveEditing();
-                            }
-                            if (event.key === "Escape") {
+      <PlansBody>
+        {displayedPlan ? (
+          <PlanPanel>
+            <PlanPanelHeader>
+              <div>
+                <PlanName>{displayedPlan.title || displayedPlan.task_title || "Terminal task"}</PlanName>
+                <PlanSubline>
+                  <span>{planStatusLabel(displayedPlan.status)}</span>
+                  {timestampLabel(displayedPlan.updated_at) && <span>{timestampLabel(displayedPlan.updated_at)}</span>}
+                </PlanSubline>
+              </div>
+              <PlanPanelActions>
+                <PlanBadge data-status={normalizedPlanStatus(displayedPlan.status)}>
+                  {planStatusLabel(displayedPlan.status)}
+                </PlanBadge>
+                {displayedPlanCanContinue && (
+                  <ResumeButton
+                    onClick={() => onResumePlan?.(displayedPlan)}
+                    type="button"
+                  >
+                    Continue
+                  </ResumeButton>
+                )}
+              </PlanPanelActions>
+            </PlanPanelHeader>
+            <StepList>
+              {(displayedPlan.steps || []).map((step) => {
+                const index = Number(step.index);
+                const editing = editingStepIndex === index;
+                const pendingSave = planStepSaveForStep(pendingStepSaves, displayedPlan.task_id, index);
+                const syncing = pendingSave?.status === "syncing";
+                const syncFailed = pendingSave?.status === "error";
+                const editable = planStepUserEditable(step, displayedPlan) && !syncing;
+                const statusKind = stepStatusKind(step.status);
+                return (
+                  <StepRow data-status={cleanText(step.status).toLowerCase()} key={step.id || index}>
+                    <StepMarker aria-hidden="true" data-status={statusKind}>
+                      <StepStatusGlyph status={step.status} />
+                    </StepMarker>
+                    <StepContent>
+                      {editing ? (
+                        <StepEditRow onBlur={handleStepEditBlur}>
+                          <StepInput
+                            aria-label={`Step ${index + 1} title`}
+                            autoFocus
+                            maxLength={titleMaxChars}
+                            onChange={(event) => setEditingTitle(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                saveEditing();
+                              }
+                              if (event.key === "Escape") {
+                                skipStepEditBlurCommitRef.current = true;
+                                cancelEditing();
+                              }
+                            }}
+                            value={editingTitle}
+                          />
+                          <IconButton
+                            aria-label="Save step title"
+                            disabled={!cleanText(editingTitle)}
+                            onClick={() => {
                               skipStepEditBlurCommitRef.current = true;
-                              cancelEditing();
-                            }
-                          }}
-                          value={editingTitle}
-                        />
-                        <IconButton
-                          aria-label="Save step title"
-                          disabled={!cleanText(editingTitle)}
-                          onClick={() => {
-                            skipStepEditBlurCommitRef.current = true;
-                            saveEditing();
-                          }}
-                          title="Save"
-                          type="button"
-                        >
-                          <Check aria-hidden="true" />
-                        </IconButton>
-                        <IconButton
-                          aria-label="Cancel step edit"
-                          onClick={() => {
-                            skipStepEditBlurCommitRef.current = true;
-                            cancelEditing();
-                          }}
-                          title="Cancel"
-                          type="button"
-                        >
-                          <Close aria-hidden="true" />
-                        </IconButton>
-                      </StepEditRow>
-                    ) : (
-                      <StepTitleRow>
-                        <StepTitle>{step.title}</StepTitle>
-                        {editable && (
-                          <StepTextButton
-                            onClick={() => startEditing(step)}
+                              saveEditing();
+                            }}
+                            title="Save"
                             type="button"
                           >
-                            Edit
-                          </StepTextButton>
-                        )}
-                      </StepTitleRow>
-                    )}
-                    <StepMeta>
-                      <span>{stepStatusLabel(step.status)}</span>
-                      {syncing && <span>Syncing</span>}
-                      {syncFailed && <span>Sync failed</span>}
-                      {step.detail && <span>{step.detail}</span>}
-                    </StepMeta>
-                  </StepContent>
-                </StepRow>
-              );
-            })}
-          </StepList>
-        </PlanPanel>
-      ) : (
-        <EmptyPanel>
-          <PlanName>No plan</PlanName>
-        </EmptyPanel>
-      )}
+                            <Check aria-hidden="true" />
+                          </IconButton>
+                          <IconButton
+                            aria-label="Cancel step edit"
+                            onClick={() => {
+                              skipStepEditBlurCommitRef.current = true;
+                              cancelEditing();
+                            }}
+                            title="Cancel"
+                            type="button"
+                          >
+                            <Close aria-hidden="true" />
+                          </IconButton>
+                        </StepEditRow>
+                      ) : (
+                        <StepTitleRow>
+                          <StepTitle>{step.title}</StepTitle>
+                          {editable && (
+                            <StepTextButton
+                              onClick={() => startEditing(step)}
+                              type="button"
+                            >
+                              Edit
+                            </StepTextButton>
+                          )}
+                        </StepTitleRow>
+                      )}
+                      <StepMeta>
+                        <span>{stepStatusLabel(step.status)}</span>
+                        {syncing && <span>Syncing</span>}
+                        {syncFailed && <span>Sync failed</span>}
+                        {step.detail && <span>{step.detail}</span>}
+                      </StepMeta>
+                    </StepContent>
+                  </StepRow>
+                );
+              })}
+            </StepList>
+          </PlanPanel>
+        ) : (
+          <EmptyPanel>
+            <PlanName>No plan</PlanName>
+          </EmptyPanel>
+        )}
+      </PlansBody>
     </PlansSurface>
   );
 }
@@ -1106,6 +1115,7 @@ const PlansSurface = styled.section`
   height: 100%;
   padding: 12px;
   color: #e6edf7;
+  background: #05070a;
 `;
 
 const PlansHeader = styled.header`
@@ -1175,10 +1185,20 @@ const IconButton = styled.button`
   }
 `;
 
+const PlansBody = styled.div`
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: stretch;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+`;
+
 const PlanPanel = styled.article`
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  flex: 1 1 0;
+  grid-template-rows: auto auto;
+  flex: 0 0 auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -1256,9 +1276,10 @@ const PlanBadge = styled.span`
 
 const StepList = styled.div`
   display: grid;
+  align-content: start;
   gap: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: visible;
 `;
 
 const StepRow = styled.div`

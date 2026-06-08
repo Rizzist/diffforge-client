@@ -4921,6 +4921,7 @@ export const TerminalAgentRow = styled.div`
 export const FilesWorkspaceSurface = styled.section`
   ${FILES_VSCODE_THEME_VARS}
 
+  position: relative;
   display: grid;
   width: 100%;
   height: 100%;
@@ -5097,9 +5098,78 @@ export const FileTreeButton = styled.button`
     background: var(--files-vscode-selection);
   }
 
+  &[data-drop-target="true"] {
+    color: #ffffff;
+    background: rgba(47, 128, 255, 0.36);
+    box-shadow:
+      inset 0 0 0 1px rgba(117, 190, 255, 0.78),
+      inset 3px 0 0 rgba(117, 190, 255, 0.96);
+  }
+
   &:focus-visible {
     outline: 1px solid var(--files-vscode-focus);
     outline-offset: -1px;
+  }
+`;
+
+export const FileRenameInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  height: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--files-vscode-focus);
+  border-radius: 2px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-editor);
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  outline: none;
+`;
+
+export const FileContextMenu = styled.div`
+  position: absolute;
+  z-index: 2000;
+  display: grid;
+  min-width: 168px;
+  padding: 4px 0;
+  border: 1px solid var(--files-vscode-border);
+  border-radius: 6px;
+  color: var(--files-vscode-text);
+  background: var(--files-vscode-sidebar);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.42);
+  overflow: hidden;
+`;
+
+export const FileContextMenuItem = styled.button`
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    background: var(--files-vscode-hover);
+    outline: none;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.46;
+  }
+
+  &[data-danger="true"] {
+    color: #fca5a5;
   }
 `;
 
@@ -5583,6 +5653,24 @@ export const FilePreviewScroll = styled.div`
   &::-webkit-scrollbar-track {
     background: transparent;
   }
+`;
+
+export const FileImagePreviewSurface = styled.div`
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  place-items: center;
+  padding: 24px;
+  background: var(--files-vscode-editor);
+`;
+
+export const FileImagePreviewImage = styled.img`
+  display: block;
+  max-width: min(100%, 1200px);
+  max-height: calc(100vh - 170px);
+  object-fit: contain;
+  image-rendering: auto;
 `;
 
 export const HighlightedCodeBlock = styled.pre`

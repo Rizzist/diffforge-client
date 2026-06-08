@@ -570,6 +570,43 @@ function assetRepoPath(asset) {
   return text(asset?.repoPath || asset?.repo_path || asset?.workspaceRoot || asset?.workspace_root || asset?.rootPath || asset?.root_path);
 }
 
+function assetWorkspaceOptionKey(option) {
+  const id = text(option?.id || option?.workspaceId || option?.workspace_id);
+  if (id) return `id:${id}`;
+  const name = text(option?.name || option?.workspaceName || option?.workspace_name);
+  if (name) return `name:${name.toLowerCase()}`;
+  const rootDirectory = text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
+  if (rootDirectory) return `root:${architectureRepoPathKey(rootDirectory)}`;
+  return "";
+}
+
+function assetWorkspaceOptionLabel(option) {
+  return text(
+    option?.name
+      || option?.workspaceName
+      || option?.workspace_name
+      || option?.id
+      || option?.workspaceId
+      || option?.workspace_id,
+    "Workspace",
+  );
+}
+
+function assetMatchesWorkspaceOption(asset, option) {
+  const optionId = text(option?.id || option?.workspaceId || option?.workspace_id);
+  const optionName = text(option?.name || option?.workspaceName || option?.workspace_name);
+  const optionRoot = text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
+  const workspaceId = assetWorkspaceId(asset);
+  const workspaceName = assetWorkspaceName(asset);
+  const repoPath = assetRepoPath(asset);
+
+  return Boolean(
+    (optionId && workspaceId && optionId === workspaceId)
+      || (optionName && workspaceName && optionName === workspaceName)
+      || (optionRoot && repoPath && architectureRepoPathKey(optionRoot) === architectureRepoPathKey(repoPath)),
+  );
+}
+
 function assetSha(asset) {
   return text(asset?.sha256 || asset?.hash || asset?.contentHash || asset?.content_hash);
 }
@@ -8603,12 +8640,10 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
 }
 
 export function AccountAssetsView({
+  assetWorkspaces = [],
   defaultWorkingDirectory = "",
   rootDirectory = "",
-  workspace = null,
 }) {
-  const activeWorkspaceId = workspace?.id || "";
-  const activeWorkspaceName = workspace?.name || "";
   const repoPath = rootDirectory || defaultWorkingDirectory || "";
   const [assetLibrary, setAssetLibrary] = useState(null);
   const [assetLibraryLoading, setAssetLibraryLoading] = useState(false);
@@ -8621,8 +8656,6 @@ export function AccountAssetsView({
       includeAllWorkspaces: true,
       limit: 500,
       repoPath,
-      workspaceId: activeWorkspaceId || undefined,
-      workspaceName: activeWorkspaceName || undefined,
     })
       .then((result) => {
         setAssetLibrary(result);
@@ -8636,7 +8669,7 @@ export function AccountAssetsView({
       .finally(() => {
         if (!silent) setAssetLibraryLoading(false);
       });
-  }, [activeWorkspaceId, activeWorkspaceName, repoPath]);
+  }, [repoPath]);
 
   useEffect(() => {
     void refreshAssetLibrary({ silent: true });
@@ -8665,81 +8698,135 @@ export function AccountAssetsView({
   }, [refreshAssetLibrary]);
 
   return (
-    <ArchitectureSurface aria-label="Account Assets" data-state={assetLibraryLoading ? "loading" : "ready"}>
+    <ArchitectureSurface
+      aria-label="Account Assets"
+      data-layout="single"
+      data-state={assetLibraryLoading ? "loading" : "ready"}
+    >
       <AssetsPanel
-        accountScope
+        assetWorkspaces={assetWorkspaces}
         error={assetLibraryError}
         library={assetLibrary}
         loading={assetLibraryLoading}
         onRefresh={refreshAssetLibrary}
-        repoLabel="Account assets"
+        repoLabel="Assets"
         repoPath={repoPath}
-        workspaceId={activeWorkspaceId}
-        workspaceName={activeWorkspaceName}
       />
     </ArchitectureSurface>
   );
 }
 
 function AssetsPanel({
-  accountScope = false,
+  assetWorkspaces = [],
   error = "",
   library = null,
   loading = false,
   onRefresh,
   repoLabel,
   repoPath,
-  workspaceId,
-  workspaceName,
 }) {
   const items = useMemo(() => assetLibraryItems(library), [library]);
   const transfers = useMemo(() => assetLibraryTransfers(library), [library]);
   const aggregate = useMemo(() => assetLibraryAggregate(library), [library]);
-  const [draftPath, setDraftPath] = useState("");
-  const [registerUpload, setRegisterUpload] = useState(false);
+  const [selectedWorkspaceFilterKeys, setSelectedWorkspaceFilterKeys] = useState([]);
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
-  const cloudCount = items.filter((item) => ["done", "active"].includes(assetStatusKind(assetStatus(item)))).length;
-  const localCount = items.filter((item) => assetLocalPath(item)).length;
-  const canRegister = Boolean(repoPath && workspaceId);
-  const activeTransfers = numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
-    || transfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
+
+  const workspaceFilterOptions = useMemo(() => {
+    const options = [];
+    const seen = new Set();
+    const seenNames = new Set();
+    const seenRoots = new Set();
+    const addOption = (option, fallbackOnly = false) => {
+      const key = assetWorkspaceOptionKey(option);
+      const nameKey = text(option?.name || option?.workspaceName || option?.workspace_name).toLowerCase();
+      const rootKey = architectureRepoPathKey(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path);
+      if (!key || seen.has(key)) return;
+      if (fallbackOnly && ((nameKey && seenNames.has(nameKey)) || (rootKey && seenRoots.has(rootKey)))) return;
+      seen.add(key);
+      if (nameKey) seenNames.add(nameKey);
+      if (rootKey) seenRoots.add(rootKey);
+      options.push({
+        id: text(option?.id || option?.workspaceId || option?.workspace_id),
+        key,
+        name: assetWorkspaceOptionLabel(option),
+        rootDirectory: text(option?.rootDirectory || option?.root_directory || option?.repoPath || option?.repo_path),
+      });
+    };
+
+    assetWorkspaces.forEach((option) => addOption(option));
+    items.forEach((asset) => {
+      addOption({
+        id: assetWorkspaceId(asset),
+        name: assetWorkspaceName(asset),
+        rootDirectory: assetRepoPath(asset),
+      }, true);
+    });
+
+    return options;
+  }, [assetWorkspaces, items]);
+  const workspaceFilterOptionKeys = useMemo(
+    () => new Set(workspaceFilterOptions.map((option) => option.key)),
+    [workspaceFilterOptions],
+  );
+  useEffect(() => {
+    setSelectedWorkspaceFilterKeys((current) => (
+      current.filter((key) => workspaceFilterOptionKeys.has(key))
+    ));
+  }, [workspaceFilterOptionKeys]);
+
+  const selectedWorkspaceFilterOptions = useMemo(() => (
+    selectedWorkspaceFilterKeys
+      .map((key) => workspaceFilterOptions.find((option) => option.key === key))
+      .filter(Boolean)
+  ), [selectedWorkspaceFilterKeys, workspaceFilterOptions]);
+  const filteredItems = useMemo(() => {
+    if (!selectedWorkspaceFilterOptions.length) return items;
+    return items.filter((asset) => (
+      selectedWorkspaceFilterOptions.some((option) => assetMatchesWorkspaceOption(asset, option))
+    ));
+  }, [items, selectedWorkspaceFilterOptions]);
+  const visibleAssetIds = useMemo(() => new Set(filteredItems.map((asset) => assetId(asset)).filter(Boolean)), [filteredItems]);
+  const visibleTransfers = useMemo(() => (
+    selectedWorkspaceFilterOptions.length
+      ? transfers.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
+      : transfers
+  ), [selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
+  const cloudCount = filteredItems.filter((item) => ["done", "active"].includes(assetStatusKind(assetStatus(item)))).length;
+  const localCount = filteredItems.filter((item) => assetLocalPath(item)).length;
+  const activeTransfers = selectedWorkspaceFilterOptions.length
+    ? visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length
+    : numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
+      || visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length;
+  const hasWorkspaceFilters = selectedWorkspaceFilterKeys.length > 0;
+  const assetCountPluralBase = hasWorkspaceFilters ? items.length : filteredItems.length;
 
   const refresh = useCallback((options = { silent: true }) => (
     typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
   ), [onRefresh]);
 
-  const registerAsset = useCallback((event) => {
-    event.preventDefault();
-    const path = draftPath.trim();
-    if (!path || !canRegister) return;
-    setBusyKey("register");
-    setActionError("");
-    invoke("cloud_mcp_register_workspace_asset", {
-      metadata: { source: accountScope ? "account_assets_view" : "workspace_assets_view" },
-      path,
-      repoPath,
-      upload: registerUpload,
-      workspaceId,
-      workspaceName,
-    })
-      .then(() => {
-        setDraftPath("");
-        return refresh({ silent: true });
-      })
-      .catch((nextError) => {
-        setActionError(nextError?.message || String(nextError || "Unable to register asset."));
-      })
-      .finally(() => {
-        setBusyKey((current) => (current === "register" ? "" : current));
-      });
-  }, [accountScope, canRegister, draftPath, refresh, registerUpload, repoPath, workspaceId, workspaceName]);
+  const clearWorkspaceFilters = useCallback(() => {
+    setSelectedWorkspaceFilterKeys([]);
+  }, []);
+
+  const toggleWorkspaceFilter = useCallback((key) => {
+    setSelectedWorkspaceFilterKeys((current) => (
+      current.includes(key)
+        ? current.filter((item) => item !== key)
+        : [...current, key]
+    ));
+  }, []);
+
+  const workspaceOptionForAsset = useCallback((asset) => (
+    workspaceFilterOptions.find((option) => assetMatchesWorkspaceOption(asset, option)) || null
+  ), [workspaceFilterOptions]);
 
   const runAssetAction = useCallback((action, asset) => {
     const id = assetId(asset);
-    const actionRepoPath = assetRepoPath(asset) || repoPath;
-    const actionWorkspaceId = assetWorkspaceId(asset) || workspaceId;
-    const actionWorkspaceName = assetWorkspaceName(asset) || workspaceName;
+    const actionWorkspace = workspaceOptionForAsset(asset);
+    const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
+    const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
+    const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
     if (!id || !actionRepoPath || !actionWorkspaceId) return;
     const key = `${action}:${id}`;
     setBusyKey(key);
@@ -8765,26 +8852,18 @@ function AssetsPanel({
       .finally(() => {
         setBusyKey((current) => (current === key ? "" : current));
       });
-  }, [refresh, repoPath, workspaceId, workspaceName]);
-
-  if (!accountScope && (!repoPath || !workspaceId)) {
-    return (
-      <HistoryPane>
-        <EmptyState>No workspace selected.</EmptyState>
-      </HistoryPane>
-    );
-  }
+  }, [refresh, repoPath, workspaceOptionForAsset]);
 
   return (
-    <HistoryPane>
+    <AssetsPane>
       <TimelineHeader>
         <div>
-          <TimelineKicker>{accountScope ? "Account assets" : "Workspace assets"}</TimelineKicker>
+          <TimelineKicker>Library</TimelineKicker>
           <TimelineTitle>{repoLabel}</TimelineTitle>
         </div>
         <AssetHeaderActions>
           <TimelineSummary>
-            {items.length} asset{items.length === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud
+            {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud
             {activeTransfers ? ` · ${activeTransfers} active` : ""}
           </TimelineSummary>
           <AssetIconButton
@@ -8798,39 +8877,40 @@ function AssetsPanel({
           </AssetIconButton>
         </AssetHeaderActions>
       </TimelineHeader>
-      <AssetRegisterForm onSubmit={registerAsset}>
-        <ArchitectureInput
-          aria-label="Local asset path"
-          disabled={!canRegister || busyKey === "register"}
-          onChange={(event) => setDraftPath(event.target.value)}
-          placeholder={canRegister ? "Local file path" : "Select a workspace to register an asset"}
-          value={draftPath}
-        />
-        <AssetToggle>
-          <input
-            checked={registerUpload}
-            disabled={!canRegister || busyKey === "register"}
-            onChange={(event) => setRegisterUpload(event.target.checked)}
-            type="checkbox"
-          />
-          <span>Upload</span>
-        </AssetToggle>
-        <AssetIconButton
-          aria-label="Register asset"
-          data-primary="true"
-          disabled={!draftPath.trim() || !canRegister || busyKey === "register"}
-          title="Register asset"
-          type="submit"
-        >
-          <Add aria-hidden="true" />
-        </AssetIconButton>
-      </AssetRegisterForm>
+      {workspaceFilterOptions.length > 0 && (
+        <AssetWorkspaceFilters aria-label="Asset workspace filters">
+          <AssetFilterButton
+            aria-pressed={!hasWorkspaceFilters}
+            data-active={!hasWorkspaceFilters}
+            onClick={clearWorkspaceFilters}
+            title="Show all assets"
+            type="button"
+          >
+            All
+          </AssetFilterButton>
+          {workspaceFilterOptions.map((option) => {
+            const selected = selectedWorkspaceFilterKeys.includes(option.key);
+            return (
+              <AssetFilterButton
+                aria-pressed={selected}
+                data-active={selected}
+                key={option.key}
+                onClick={() => toggleWorkspaceFilter(option.key)}
+                title={option.name}
+                type="button"
+              >
+                {option.name}
+              </AssetFilterButton>
+            );
+          })}
+        </AssetWorkspaceFilters>
+      )}
       {(error || actionError) && <TaskActionError>{actionError || error}</TaskActionError>}
-      {!items.length ? (
-        <EmptyState>{loading ? "Loading assets..." : "No assets registered yet."}</EmptyState>
+      {!filteredItems.length ? (
+        <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
       ) : (
         <AssetList aria-label="Asset library list">
-          {items.map((asset, index) => {
+          {filteredItems.map((asset, index) => {
             const id = assetId(asset, `asset-${index}`);
             const name = assetName(asset, `Asset ${index + 1}`);
             const status = assetStatus(asset);
@@ -8840,11 +8920,15 @@ function AssetsPanel({
             const size = formatBytes(assetSizeBytes(asset));
             const kind = assetKind(asset);
             const rowWorkspaceLabel = assetWorkspaceName(asset) || assetWorkspaceId(asset);
-            const canRunAssetAction = Boolean((assetRepoPath(asset) || repoPath) && (assetWorkspaceId(asset) || workspaceId));
+            const rowWorkspaceOption = workspaceOptionForAsset(asset);
+            const canRunAssetAction = Boolean(
+              (assetRepoPath(asset) || rowWorkspaceOption?.rootDirectory || repoPath)
+                && (assetWorkspaceId(asset) || rowWorkspaceOption?.id),
+            );
             const updatedMs = assetUpdatedMs(asset);
             const updated = formatRelativeTimeMs(updatedMs) || "unknown";
             const created = formatTime(updatedMs) || "";
-            const transfer = assetTransferSummary(transfers, asset);
+            const transfer = assetTransferSummary(visibleTransfers, asset);
             const uploadBusy = busyKey === `upload:${id}`;
             const downloadBusy = busyKey === `download:${id}`;
             const deleteLocalBusy = busyKey === `deleteLocal:${id}`;
@@ -8862,7 +8946,7 @@ function AssetsPanel({
                     </StatusPill>
                   </AssetTitleLine>
                   <AssetMeta>
-                    {accountScope && rowWorkspaceLabel && <TodoHistoryMetaChip>{rowWorkspaceLabel}</TodoHistoryMetaChip>}
+                    {rowWorkspaceLabel && <TodoHistoryMetaChip>{rowWorkspaceLabel}</TodoHistoryMetaChip>}
                     <TodoHistoryMetaChip>{kind}</TodoHistoryMetaChip>
                     {size && <TodoHistoryMetaChip>{size}</TodoHistoryMetaChip>}
                     {sha && <TodoHistoryMetaChip>{shortLabel(sha, 18)}</TodoHistoryMetaChip>}
@@ -8919,7 +9003,7 @@ function AssetsPanel({
           })}
         </AssetList>
       )}
-    </HistoryPane>
+    </AssetsPane>
   );
 }
 
@@ -9167,6 +9251,10 @@ const ArchitectureSurface = styled.section`
   overflow: hidden;
   color: var(--forge-text);
   background: var(--forge-bg);
+
+  &[data-layout="single"] {
+    grid-template-rows: minmax(0, 1fr);
+  }
 `;
 
 const ArchitectureToolbar = styled.div`
@@ -11581,6 +11669,17 @@ const HistoryPane = styled.div`
   padding: 16px;
 `;
 
+const AssetsPane = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  padding: 16px;
+`;
+
 const TimelineHeader = styled.header`
   display: flex;
   align-items: flex-end;
@@ -11867,49 +11966,58 @@ const AssetHeaderActions = styled.div`
   }
 `;
 
-const AssetRegisterForm = styled.form`
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) auto 32px;
-  gap: 8px;
-  align-items: center;
+const AssetWorkspaceFilters = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
   min-width: 0;
+  max-height: 112px;
+  overflow: auto;
   padding-bottom: 10px;
+  padding-right: 2px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-
-  @media (max-width: 700px) {
-    grid-template-columns: minmax(0, 1fr) auto;
-
-    ${ArchitectureInput} {
-      grid-column: 1 / -1;
-    }
-  }
+  scrollbar-width: thin;
 `;
 
-const AssetToggle = styled.label`
+const AssetFilterButton = styled.button`
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
+  min-width: 44px;
+  max-width: 180px;
   min-height: 30px;
-  padding: 0 9px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
+  padding: 0 10px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.15);
   border-radius: 7px;
-  color: rgba(203, 213, 225, 0.82);
+  color: rgba(203, 213, 225, 0.78);
   background: rgba(15, 23, 42, 0.38);
+  font: inherit;
   font-size: 10px;
   font-weight: 850;
+  line-height: 1;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
 
-  input {
-    width: 13px;
-    height: 13px;
-    margin: 0;
-    accent-color: #2dd4bf;
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.14);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(45, 212, 191, 0.34);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.2);
   }
 `;
 
 const AssetList = styled.div`
   display: grid;
+  flex: 1 1 auto;
   align-content: start;
   min-width: 0;
   min-height: 0;
@@ -12946,4 +13054,9 @@ const EmptyState = styled.div`
   color: var(--forge-text-muted);
   font-size: 13px;
   font-weight: 760;
+`;
+
+const AssetEmptyState = styled(EmptyState)`
+  flex: 1 1 auto;
+  min-height: 0;
 `;
