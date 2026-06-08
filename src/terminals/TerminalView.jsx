@@ -100,6 +100,7 @@ import {
 import { selectTodoQueueDispatchCandidate } from "./todoQueueScheduler.js";
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+  TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
   TODO_QUEUE_SOURCE_TODO_AUTO,
   TODO_QUEUE_SOURCE_VOICE_AGENT,
   TODO_QUEUE_SOURCE_VOICE_PLAN,
@@ -7961,6 +7962,111 @@ function getTodoQueueLifecycleSource(source) {
   });
 }
 
+function todoQueueTerminalDirectLifecycleEventType(value) {
+  return String(value || "").trim().toLowerCase().replace(/_/g, "-");
+}
+
+function todoQueueTerminalDirectSourceIsEligible(value) {
+  const source = String(value || "").trim().toLowerCase();
+  return source === "tui-manual-input"
+    || source.startsWith("tui-manual-input:")
+    || source === "observed-terminal-prompt"
+    || source === "observed_terminal_prompt"
+    || source === "terminal-prompt-submitted"
+    || source === "terminal_prompt_submitted";
+}
+
+function todoQueueLifecycleEventHasTodoQueueOwner(event = {}) {
+  const source = normalizeTodoQueueSource(
+    event.source
+      || event.messageSource
+      || event.message_source
+      || event.promptEventSource
+      || event.prompt_event_source
+      || "",
+  );
+  const normalizedSource = String(source || "").trim().toLowerCase();
+  if (
+    normalizedSource === TODO_QUEUE_SOURCE_TERMINAL_DIRECT
+    || normalizedSource === TODO_QUEUE_SOURCE_TODO_AUTO
+    || normalizedSource === TODO_QUEUE_SOURCE_VOICE_AGENT
+    || normalizedSource === TODO_QUEUE_SOURCE_VOICE_PLAN
+    || normalizedSource === TODO_QUEUE_SOURCE_REMOTE_CONTROL
+    || normalizedSource === "tui-todo-drop"
+    || normalizedSource === "terminal-view-drop"
+    || normalizedSource === "todo-auto-queue"
+    || normalizedSource === "terminal-direct-input"
+    || normalizedSource === "voice-agent-queue"
+    || normalizedSource === "voice-plan-queue"
+    || normalizedSource === "remote-control"
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    event.todoId
+      || event.todo_id
+      || event.todoDispatchId
+      || event.todo_dispatch_id
+      || event.todoCommandId
+      || event.todo_command_id
+      || event.remoteCommand
+      || event.remote_command,
+  );
+}
+
+function getTodoQueueTerminalDirectLifecycleText(event = {}) {
+  return normalizeTodoQueueText(
+    event.userMessage
+      || event.user_message
+      || event.pendingPromptText
+      || event.pending_prompt_text
+      || event.expectedUserMessage
+      || event.expected_user_message
+      || event.terminalPrompt
+      || event.terminal_prompt
+      || event.promptText
+      || event.prompt_text
+      || "",
+  );
+}
+
+function getTodoQueueTerminalDirectPromptId(event = {}, terminalIndex = null, text = "", submittedAt = "") {
+  const promptId = String(
+    event.promptEventId
+      || event.prompt_event_id
+      || event.pendingPromptId
+      || event.pending_prompt_id
+      || event.messageId
+      || event.message_id
+      || event.turnId
+      || event.turn_id
+      || "",
+  ).trim();
+  if (promptId) {
+    return promptId;
+  }
+
+  const fallbackSource = [
+    terminalIndex ?? "terminal",
+    submittedAt || event.messageCreatedAt || event.message_created_at || "",
+    text,
+  ].join(":");
+  let hash = 0;
+  for (let index = 0; index < fallbackSource.length; index += 1) {
+    hash = ((hash << 5) - hash + fallbackSource.charCodeAt(index)) | 0;
+  }
+  return `terminal-direct-${Math.abs(hash).toString(16)}-${Date.now().toString(36)}`;
+}
+
+function getTodoQueueTerminalDirectItemId(promptId) {
+  const safePromptId = String(promptId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_.:-]+/g, "_")
+    .slice(0, 160);
+  return `terminal-direct-${safePromptId || Date.now().toString(36)}`;
+}
+
 function normalizeTodoTerminalAgentId(value) {
   return String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
 }
@@ -13232,6 +13338,7 @@ function TerminalView({
   const todoQueueRehydratedStorageKeyRef = useRef("");
   const todoQueueCloudSyncTimerRef = useRef(0);
   const todoQueueCloudSyncSignatureRef = useRef("");
+  const terminalDirectTodoPromptIdsRef = useRef(new Set());
   const voiceAgentToolCallIdsRef = useRef(new Set());
   const voicePlanClientCancelledTasksRef = useRef(new Set());
   const voicePlanDeferredTasksRef = useRef(new Map());
@@ -14962,10 +15069,6 @@ function TerminalView({
     logicalTerminalIndexes,
     terminalWorkspace?.id,
   ]);
-  const handleWorkspaceTerminalLifecycle = useCallback((event) => {
-    recordTodoQueueTerminalLifecycle(event);
-    onThreadTerminalLifecycle?.(event);
-  }, [onThreadTerminalLifecycle, recordTodoQueueTerminalLifecycle]);
   const getLiveTerminalPaneIdForThread = useCallback((threadId) => {
     const safeThreadId = String(threadId || "").trim();
     if (!safeThreadId || !workspaceThreadEntry?.terminals) {

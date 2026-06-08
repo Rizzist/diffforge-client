@@ -1,4 +1,5 @@
 export const TODO_QUEUE_SOURCE_TODO_AUTO = "tui-todo-auto-queue";
+export const TODO_QUEUE_SOURCE_TERMINAL_DIRECT = "tui-terminal-direct-input";
 export const TODO_QUEUE_SOURCE_VOICE_AGENT = "tui-voice-agent-queue";
 export const TODO_QUEUE_SOURCE_VOICE_PLAN = "tui-voice-plan-queue";
 export const TODO_QUEUE_SOURCE_REMOTE_CONTROL = "next-remote-control";
@@ -10,7 +11,8 @@ export function normalizeTodoQueueSourceValue(value) {
 export function getTodoQueueAutoQueueSourceForSource({ source } = {}) {
   const normalizedSource = normalizeTodoQueueSourceValue(source);
   if (
-    normalizedSource === TODO_QUEUE_SOURCE_VOICE_AGENT
+    normalizedSource === TODO_QUEUE_SOURCE_TERMINAL_DIRECT
+    || normalizedSource === TODO_QUEUE_SOURCE_VOICE_AGENT
     || normalizedSource === TODO_QUEUE_SOURCE_VOICE_PLAN
     || normalizedSource === TODO_QUEUE_SOURCE_REMOTE_CONTROL
   ) {
@@ -24,6 +26,9 @@ export function getTodoQueuePromptEventSourceForSource({ source } = {}) {
   const normalizedSource = normalizeTodoQueueSourceValue(source);
   if (normalizedSource === TODO_QUEUE_SOURCE_TODO_AUTO) {
     return "todo-auto-queue";
+  }
+  if (normalizedSource === TODO_QUEUE_SOURCE_TERMINAL_DIRECT) {
+    return "terminal-direct-input";
   }
   if (normalizedSource === TODO_QUEUE_SOURCE_VOICE_AGENT) {
     return "voice-agent-queue";
@@ -42,6 +47,7 @@ export function getTodoQueueLifecycleSourceForSource({ source } = {}) {
   const normalizedSource = normalizeTodoQueueSourceValue(source);
   if (
     normalizedSource === TODO_QUEUE_SOURCE_TODO_AUTO
+    || normalizedSource === TODO_QUEUE_SOURCE_TERMINAL_DIRECT
     || normalizedSource === TODO_QUEUE_SOURCE_VOICE_AGENT
     || normalizedSource === TODO_QUEUE_SOURCE_VOICE_PLAN
     || normalizedSource === TODO_QUEUE_SOURCE_REMOTE_CONTROL

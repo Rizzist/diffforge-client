@@ -5436,12 +5436,11 @@ impl CoordinationKernel {
         session_id: Option<&str>,
         agent_id: Option<&str>,
     ) -> Result<Value, String> {
-        let selected_plan_from_target = if let Some(task_id) =
-            task_id.map(str::trim).filter(|value| !value.is_empty())
-        {
+        let task_target = task_id.map(str::trim).filter(|value| !value.is_empty());
+        let session_target = session_id.map(str::trim).filter(|value| !value.is_empty());
+        let selected_plan_from_target = if let Some(task_id) = task_target {
             self.terminal_task_plan_view_by_task_id(task_id).ok()
-        } else if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty())
-        {
+        } else if let Some(session_id) = session_target {
             self.query_json(
                 "SELECT task_id FROM terminal_task_plans
                  WHERE session_id=?1
@@ -5455,33 +5454,58 @@ impl CoordinationKernel {
         } else {
             None
         };
-        let history_rows =
-            if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
-                self.query_json(
-                    "SELECT p.*, t.title AS task_title, t.status AS task_status
+        let lineage_history_rows = if task_target.is_none() {
+            session_target
+                .map(|session_id| {
+                    self.terminal_task_plan_history_rows_for_session_lineage(session_id)
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let history_scope = if !lineage_history_rows.is_empty() {
+            "session_lineage"
+        } else if task_target.is_some() || session_target.is_some() {
+            "target"
+        } else if agent_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            "agent"
+        } else {
+            "repo"
+        };
+        let history_rows = if !lineage_history_rows.is_empty() {
+            lineage_history_rows
+        } else if task_target.is_some() || session_target.is_some() {
+            Vec::new()
+        } else if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
                  FROM terminal_task_plans p
                  LEFT JOIN tasks t ON t.id=p.task_id
                  WHERE p.agent_id=?1 OR t.claimed_by_agent_id=?1
                  ORDER BY p.updated_at DESC LIMIT 25",
-                    &[&agent_id],
-                )?
-            } else {
-                self.query_json(
-                    "SELECT p.*, t.title AS task_title, t.status AS task_status
+                &[&agent_id],
+            )?
+        } else {
+            self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
                  FROM terminal_task_plans p
                  LEFT JOIN tasks t ON t.id=p.task_id
                  ORDER BY p.updated_at DESC LIMIT 25",
-                    &[],
-                )?
-            };
-        let selected_plan_is_active = selected_plan_from_target
-            .as_ref()
-            .map(|plan| {
-                !terminal_task_plan_is_terminal_status(plan["status"].as_str().unwrap_or_default())
-            })
-            .unwrap_or(false);
-        let selected_plan = if selected_plan_is_active {
+                &[],
+            )?
+        };
+        let selected_plan = if selected_plan_from_target.is_some() {
             selected_plan_from_target
+        } else if history_scope == "session_lineage" {
+            history_rows
+                .first()
+                .and_then(|row| row["task_id"].as_str())
+                .and_then(|task_id| self.terminal_task_plan_view_by_task_id(task_id).ok())
         } else {
             let fallback_task_id = history_rows
                 .iter()
@@ -5520,8 +5544,76 @@ impl CoordinationKernel {
         Ok(api_ok(json!({
             "selected_plan": selected_plan,
             "history": history,
+            "history_scope": history_scope,
             "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
         })))
+    }
+
+    fn terminal_task_plan_history_rows_for_session_lineage(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(session) = self
+            .query_json(
+                "SELECT id, agent_id, agent_slot_id, pty_id
+                 FROM agent_sessions
+                 WHERE id=?1
+                 LIMIT 1",
+                &[&session_id],
+            )?
+            .into_iter()
+            .next()
+        else {
+            return Ok(Vec::new());
+        };
+
+        let session_agent_id = session["agent_id"].as_str().unwrap_or_default();
+        if let Some(pty_id) = session["pty_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let rows = self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
+                 FROM terminal_task_plans p
+                 LEFT JOIN tasks t ON t.id=p.task_id
+                 LEFT JOIN agent_sessions s ON s.id=p.session_id
+                 WHERE s.pty_id=?1
+                   AND (?2='' OR COALESCE(p.agent_id, t.claimed_by_agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                 ORDER BY p.updated_at DESC LIMIT 25",
+                &[&pty_id, &session_agent_id],
+            )?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        if let Some(agent_slot_id) = session["agent_slot_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let rows = self.query_json(
+                "SELECT p.*, t.title AS task_title, t.status AS task_status
+                 FROM terminal_task_plans p
+                 LEFT JOIN tasks t ON t.id=p.task_id
+                 LEFT JOIN agent_sessions s ON s.id=p.session_id
+                 WHERE s.agent_slot_id=?1
+                   AND (?2='' OR COALESCE(p.agent_id, t.claimed_by_agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                 ORDER BY p.updated_at DESC LIMIT 25",
+                &[&agent_slot_id, &session_agent_id],
+            )?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     pub fn terminal_task_plan_compact(&self, task_id: &str) -> Result<Option<Value>, String> {
@@ -26247,6 +26339,111 @@ mod tests {
         assert_eq!(
             checkpoint["compact_plan"]["steps"][2]["title"].as_str(),
             Some("Verify plan sync")
+        );
+    }
+
+    #[test]
+    fn terminal_task_plan_snapshot_uses_terminal_lineage_after_restart() {
+        let repo = init_git_repo("terminal_plan_restart_lineage");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let pty_id = "workspace-terminal-test-0-codex";
+
+        let first_session = kernel
+            .create_session_for_slot_key(
+                "1",
+                "Codex 1",
+                "codex",
+                None,
+                None,
+                Some(pty_id),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let first_session_id = first_session["id"].as_str().unwrap().to_string();
+
+        let stale_task = kernel
+            .create_task("Older unfinished plan", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let stale_task_id = stale_task["id"].as_str().unwrap();
+        kernel
+            .create_terminal_task_plan(
+                stale_task_id,
+                Some(agent_id),
+                Some(&first_session_id),
+                Some("Older unfinished plan"),
+                &json!(["Draft", "Patch"]),
+                Some(0),
+                None,
+            )
+            .unwrap();
+        kernel
+            .conn
+            .execute(
+                "UPDATE terminal_task_plans SET updated_at='0000-01-01T00:00:00.000Z' WHERE task_id=?1",
+                params![stale_task_id],
+            )
+            .unwrap();
+
+        let completed_task = kernel
+            .create_task("Completed plan", None, 0, 1, None, None, None, None)
+            .unwrap();
+        let completed_task_id = completed_task["id"].as_str().unwrap();
+        kernel
+            .create_terminal_task_plan(
+                completed_task_id,
+                Some(agent_id),
+                Some(&first_session_id),
+                Some("Completed plan"),
+                &json!(["Inspect", "Patch", "Verify"]),
+                Some(2),
+                None,
+            )
+            .unwrap();
+        kernel
+            .finish_terminal_task_plan(
+                completed_task_id,
+                "completed",
+                Some(agent_id),
+                Some(&first_session_id),
+            )
+            .unwrap();
+
+        kernel
+            .interrupt_session(&first_session_id, "terminal_restarted")
+            .unwrap();
+        let restarted_session = kernel
+            .create_session_for_slot_key(
+                "1",
+                "Codex 1",
+                "codex",
+                None,
+                None,
+                Some(pty_id),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let restarted_session_id = restarted_session["id"].as_str().unwrap();
+
+        let snapshot = kernel
+            .terminal_task_plan_snapshot(None, Some(restarted_session_id), Some("codex"))
+            .unwrap();
+        assert_eq!(
+            snapshot["data"]["history_scope"].as_str(),
+            Some("session_lineage")
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["task_id"].as_str(),
+            Some(completed_task_id)
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["status"].as_str(),
+            Some("completed")
         );
     }
 

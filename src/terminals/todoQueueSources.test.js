@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+  TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
   TODO_QUEUE_SOURCE_TODO_AUTO,
   TODO_QUEUE_SOURCE_VOICE_AGENT,
   TODO_QUEUE_SOURCE_VOICE_PLAN,
@@ -36,6 +37,18 @@ test("known todo queue sources keep their existing mappings", () => {
   assert.equal(
     getTodoQueueAutoQueueSourceForSource({ source: TODO_QUEUE_SOURCE_VOICE_AGENT }),
     TODO_QUEUE_SOURCE_VOICE_AGENT,
+  );
+  assert.equal(
+    getTodoQueueAutoQueueSourceForSource({ source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT }),
+    TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+  );
+  assert.equal(
+    getTodoQueuePromptEventSourceForSource({ source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT }),
+    "terminal-direct-input",
+  );
+  assert.equal(
+    getTodoQueueLifecycleSourceForSource({ source: TODO_QUEUE_SOURCE_TERMINAL_DIRECT }),
+    TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
   );
   assert.equal(
     getTodoQueueAutoQueueSourceForSource({ source: TODO_QUEUE_SOURCE_VOICE_PLAN }),

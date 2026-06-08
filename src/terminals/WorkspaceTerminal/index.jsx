@@ -9,6 +9,9 @@ import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
+import {
+  TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
+} from "../todoQueueSources.js";
 import { createTerminalOutputWorkerSession } from "./terminalOutputWorkerClient.js";
 import {
   GlobalStyle,
@@ -623,6 +626,26 @@ function cleanTerminalInputTransportPayload(payload) {
   return cleanPayload;
 }
 
+function getTerminalDirectTodoSafePromptId(promptEventId) {
+  return String(promptEventId || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_.:-]+/g, "_")
+    .slice(0, 160);
+}
+
+function getTerminalDirectTodoRefs(promptEventId) {
+  const safePromptId = getTerminalDirectTodoSafePromptId(promptEventId);
+  if (!safePromptId) {
+    return null;
+  }
+  return {
+    todoAction: "dispatch",
+    todoCommandId: `terminal-direct-command-${safePromptId}`,
+    todoDispatchId: `terminal-direct-dispatch-${safePromptId}`,
+    todoId: `terminal-direct-${safePromptId}`,
+  };
+}
+
 function getTerminalInputTransportLogFields(payload = {}, extra = {}) {
   const data = String(payload?.data || "");
   return {
@@ -636,6 +659,7 @@ function getTerminalInputTransportLogFields(payload = {}, extra = {}) {
     promptEventSource: String(payload?.promptEventSource || "").trim(),
     promptTextLength: String(payload?.promptEventText || "").trim().length,
     threadId: payload?.threadId || "",
+    todoId: String(payload?.todoId || "").trim(),
     ...extra,
   };
 }
@@ -661,6 +685,10 @@ function invokeTerminalInputPayload(payload) {
     promptEventSource: payload?.promptEventSource,
     promptEventSubmittedAt: payload?.promptEventSubmittedAt,
     promptEventText: payload?.promptEventText,
+    todoAction: payload?.todoAction,
+    todoCommandId: payload?.todoCommandId,
+    todoDispatchId: payload?.todoDispatchId,
+    todoId: payload?.todoId,
     threadId: payload?.threadId,
   });
 }
