@@ -522,7 +522,13 @@ import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.j
 import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
-import SnippingToastStack, { SNIPPING_TOAST_HASH } from "../snipping/SnippingToastStack.jsx";
+import SnippingQuickAccess, {
+  SnippingAnnotationEditorWindow,
+  SnippingPinnedWindow,
+  SNIPPING_EDITOR_HASH,
+  SNIPPING_PIN_HASH,
+  SNIPPING_TOAST_HASH,
+} from "../snipping/SnippingQuickAccess.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
 
@@ -1070,6 +1076,7 @@ const TERMINAL_INPUT_HOT_FALLBACK_MS = 2500;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
@@ -5595,8 +5602,16 @@ export default function App() {
     return <SnippingOverlayWindow />;
   }
 
+  if (window.location.hash.startsWith(SNIPPING_PIN_HASH)) {
+    return <SnippingPinnedWindow />;
+  }
+
+  if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {
+    return <SnippingAnnotationEditorWindow />;
+  }
+
   if (window.location.hash === SNIPPING_TOAST_HASH) {
-    return <SnippingToastStack />;
+    return <SnippingQuickAccess />;
   }
 
   if (window.location.hash === ACTIVITY_OVERLAY_HASH) {
@@ -14465,6 +14480,115 @@ export default function App() {
     defaultWorkingDirectory,
     workspaceSettings,
     workspaces,
+  ]);
+  const snippingAssetTarget = useMemo(() => ({
+    repoPath: selectedWorkspaceRootDirectory || defaultWorkingDirectory || "",
+    workspaceId: selectedWorkspace?.id || "",
+    workspaceName: selectedWorkspace?.name || "",
+  }), [
+    defaultWorkingDirectory,
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceRootDirectory,
+  ]);
+  useEffect(() => {
+    invoke("snipping_set_asset_target", {
+      request: snippingAssetTarget,
+    }).catch(() => {});
+  }, [
+    snippingAssetTarget.repoPath,
+    snippingAssetTarget.workspaceId,
+    snippingAssetTarget.workspaceName,
+  ]);
+  useEffect(() => {
+    let disposed = false;
+    let unlistenAnnotationTodo = null;
+
+    listen(SNIPPING_ANNOTATION_TODO_EVENT, (annotationEvent) => {
+      if (disposed) return;
+      const payload = annotationEvent?.payload && typeof annotationEvent.payload === "object"
+        ? annotationEvent.payload
+        : {};
+      const workspaceId = String(
+        payload.workspaceId
+          || payload.workspace_id
+          || snippingAssetTarget.workspaceId
+          || "",
+      ).trim();
+      if (!workspaceId) {
+        logBigViewSyncDiagnosticEvent("snipping.annotation_todo.skip", {
+          reason: "missing_workspace",
+          surface: "app_shell",
+        });
+        return;
+      }
+      const text = String(payload.text || payload.todo || payload.prompt || "").trim();
+      const payloadImage = payload.image && typeof payload.image === "object" ? payload.image : {};
+      const imageSrc = String(
+        payloadImage.src
+          || payload.imageDataUrl
+          || payload.image_data_url
+          || payload.imageSrc
+          || "",
+      ).trim();
+      if (!text && !imageSrc) {
+        return;
+      }
+      const commandId = String(payload.commandId || payload.command_id || "").trim()
+        || `snip-todo-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const createdAt = String(payload.createdAt || payload.created_at || "").trim()
+        || new Date().toISOString();
+      const image = imageSrc
+        ? {
+          name: String(payloadImage.name || payload.name || "annotated-snip.png").slice(0, 160),
+          size: Number(payloadImage.size || 0),
+          src: imageSrc,
+          type: String(payloadImage.type || "image/png").slice(0, 80),
+        }
+        : null;
+
+      window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
+        detail: {
+          commandId,
+          item: {
+            createdAt,
+            id: commandId,
+            kind: "todo",
+            ...(image ? { image } : {}),
+            remoteCommand: {
+              commandId,
+              source: "snipping-annotation",
+              sourceName: String(payload.name || payload.sourceName || "").trim(),
+              sourcePath: String(payload.sourcePath || payload.source_path || "").trim(),
+            },
+            source: "snipping-annotation",
+            text,
+            workspaceId,
+          },
+          source: "snipping-annotation",
+          workspaceId,
+          workspaceName: String(payload.workspaceName || payload.workspace_name || snippingAssetTarget.workspaceName || "").trim(),
+        },
+      }));
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlistenAnnotationTodo = unlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (typeof unlistenAnnotationTodo === "function") {
+        unlistenAnnotationTodo();
+      }
+    };
+  }, [
+    snippingAssetTarget.workspaceId,
+    snippingAssetTarget.workspaceName,
   ]);
   const accountAssetsLibrary = useAccountAssetsLibrary({
     repoPath: defaultWorkingDirectory,

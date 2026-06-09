@@ -2,15 +2,18 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import styled, { keyframes } from "styled-components";
+import { AddToPhotos } from "@styled-icons/material-rounded/AddToPhotos";
 import { Cached } from "@styled-icons/material-rounded/Cached";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
+import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
-import { LibraryAddCheck } from "@styled-icons/material-rounded/LibraryAddCheck";
+import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
+import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 
@@ -498,8 +501,51 @@ function AssetsPanel({
     workspaceFilterOptions.find((option) => assetMatchesWorkspaceOption(asset, option)) || null
   ), [workspaceFilterOptions]);
 
-  const runAssetAction = useCallback((action, asset) => {
+  const runAssetAction = useCallback(async (action, asset) => {
     const id = assetId(asset);
+    const name = assetName(asset, "asset");
+    const localPath = assetLocalPath(asset);
+    const availability = assetAvailability(asset);
+    if (["copy", "open", "view"].includes(action) && !localPath) return;
+    if (action === "open") {
+      const key = `${action}:${id || localPath}`;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        await openPath(localPath);
+      } catch (nextError) {
+        setActionError(nextError?.message || String(nextError || "Unable to open asset."));
+      } finally {
+        setBusyKey((current) => (current === key ? "" : current));
+      }
+      return;
+    }
+    if (action === "copy") {
+      const key = `${action}:${id || localPath}`;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        await invoke("diffforge_copy_asset_to_clipboard", { path: localPath });
+      } catch (nextError) {
+        setActionError(nextError?.message || String(nextError || "Unable to copy asset."));
+      } finally {
+        setBusyKey((current) => (current === key ? "" : current));
+      }
+      return;
+    }
+    if (action === "view") {
+      const key = `${action}:${id || localPath}`;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        await invoke("snipping_open_annotation_editor", { path: localPath });
+      } catch (nextError) {
+        setActionError(nextError?.message || String(nextError || "Unable to open asset viewer."));
+      } finally {
+        setBusyKey((current) => (current === key ? "" : current));
+      }
+      return;
+    }
     const actionWorkspace = workspaceOptionForAsset(asset);
     const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
     const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
@@ -508,27 +554,52 @@ function AssetsPanel({
     const key = `${action}:${id}`;
     setBusyKey(key);
     setActionError("");
-    const command = action === "upload"
-      ? "cloud_mcp_upload_workspace_asset"
-      : action === "download"
-        ? "cloud_mcp_download_workspace_asset"
-        : action === "deleteLocal"
-          ? "cloud_mcp_delete_local_workspace_asset"
-          : "cloud_mcp_delete_cloud_workspace_asset";
-    invoke(command, {
-      assetId: id,
-      deleteFile: action === "deleteLocal" ? true : undefined,
-      repoPath: actionRepoPath,
-      workspaceId: actionWorkspaceId,
-      workspaceName: actionWorkspaceName,
-    })
-      .then(() => refresh({ silent: true }))
-      .catch((nextError) => {
-        setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
-      })
-      .finally(() => {
-        setBusyKey((current) => (current === key ? "" : current));
-      });
+    try {
+      if (action === "untrack") {
+        if (!localPath) return;
+        await invoke("diffforge_untrack_workspace_asset", {
+          assetId: id,
+          name,
+          path: localPath,
+        });
+        if (availability.hasCloud) {
+          try {
+            await invoke("cloud_mcp_delete_cloud_workspace_asset", {
+              assetId: id,
+              repoPath: actionRepoPath,
+              workspaceId: actionWorkspaceId,
+              workspaceName: actionWorkspaceName,
+            });
+          } catch (cloudError) {
+            setActionError(
+              `Moved to scratch, but the Cloud copy is still tracked: ${
+                cloudError?.message || String(cloudError || "Cloud delete failed.")
+              }`,
+            );
+          }
+        }
+      } else {
+        const command = action === "upload"
+          ? "cloud_mcp_upload_workspace_asset"
+          : action === "download"
+            ? "cloud_mcp_download_workspace_asset"
+            : action === "deleteLocal"
+              ? "cloud_mcp_delete_local_workspace_asset"
+              : "cloud_mcp_delete_cloud_workspace_asset";
+        await invoke(command, {
+          assetId: id,
+          deleteFile: action === "deleteLocal" ? true : undefined,
+          repoPath: actionRepoPath,
+          workspaceId: actionWorkspaceId,
+          workspaceName: actionWorkspaceName,
+        });
+      }
+      await refresh({ silent: true, force: true });
+    } catch (nextError) {
+      setActionError(nextError?.message || String(nextError || `Unable to ${action} asset.`));
+    } finally {
+      setBusyKey((current) => (current === key ? "" : current));
+    }
   }, [refresh, repoPath, workspaceOptionForAsset]);
 
   return (
@@ -628,10 +699,16 @@ function AssetsPanel({
             const downloadBusy = busyKey === `download:${id}`;
             const deleteLocalBusy = busyKey === `deleteLocal:${id}`;
             const deleteCloudBusy = busyKey === `deleteCloud:${id}`;
+            const viewBusy = busyKey === `view:${id}`;
+            const copyBusy = busyKey === `copy:${id}`;
+            const untrackBusy = busyKey === `untrack:${id}`;
             const canUpload = canRunAssetAction && !transferActive && availability.hasLocal && !availability.hasCloud && Boolean(localPath);
             const canDownload = canRunAssetAction && !transferActive && availability.hasCloud && !availability.hasLocal;
             const canDeleteCloud = canRunAssetAction && !transferActive && availability.hasCloud;
             const canDeleteLocal = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
+            const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
+            const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
+            const canUntrack = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
             const showUpload = availability.hasLocal;
             const showDownload = availability.hasCloud;
             const showDeleteCloud = availability.hasCloud;
@@ -639,7 +716,13 @@ function AssetsPanel({
 
             return (
               <AssetCard data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
-                <AssetCardPreview>
+                <AssetCardPreview
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
+                  disabled={!localPath || Boolean(busyKey)}
+                  onClick={() => runAssetAction(shouldShowImagePreview ? "view" : "open", asset)}
+                  title={shouldShowImagePreview ? "Open big view and annotate" : "Open file"}
+                  type="button"
+                >
                   {shouldShowImagePreview ? (
                     <AssetPreviewImage
                       alt={name}
@@ -669,6 +752,40 @@ function AssetsPanel({
                   {availability.label}
                 </AssetCardStatus>
                 <AssetCardActions>
+                  {canView && (
+                    <AssetIconButton
+                      aria-label={`Open big view for ${name}`}
+                      disabled={!canView || viewBusy || Boolean(busyKey && !viewBusy)}
+                      onClick={() => runAssetAction("view", asset)}
+                      title="Open big view and annotate"
+                      type="button"
+                    >
+                      <OpenInFull aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {canCopy && (
+                    <AssetIconButton
+                      aria-label={`Copy ${name} to clipboard`}
+                      disabled={!canCopy || copyBusy || Boolean(busyKey && !copyBusy)}
+                      onClick={() => runAssetAction("copy", asset)}
+                      title="Copy image to clipboard"
+                      type="button"
+                    >
+                      <ContentCopy aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {canUntrack && (
+                    <AssetIconButton
+                      aria-label={`Untrack ${name}`}
+                      data-warning="true"
+                      disabled={!canUntrack || untrackBusy || Boolean(busyKey && !untrackBusy)}
+                      onClick={() => runAssetAction("untrack", asset)}
+                      title="Move to untracked scratch"
+                      type="button"
+                    >
+                      <MoveToInbox aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
                   {showUpload && (
                     <AssetIconButton
                       aria-label={`Upload ${name}`}
@@ -772,6 +889,10 @@ function UntrackedAssetsPanel({
     try {
       if (action === "open") {
         await openPath(localPath);
+      } else if (action === "view") {
+        await invoke("snipping_open_annotation_editor", { path: localPath });
+      } else if (action === "copy") {
+        await invoke("diffforge_copy_asset_to_clipboard", { path: localPath });
       } else if (action === "delete") {
         if (typeof onDelete !== "function") return;
         await onDelete(localPath);
@@ -850,13 +971,23 @@ function UntrackedAssetsPanel({
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
             const openBusy = busyKey === `open:${id}`;
+            const viewBusy = busyKey === `view:${id}`;
+            const copyBusy = busyKey === `copy:${id}`;
             const trackBusy = busyKey === `track:${id}`;
             const renameBusy = busyKey === `rename:${id}`;
             const deleteBusy = busyKey === `delete:${id}`;
+            const canView = assetIsImage(asset) && Boolean(localPath);
+            const canCopy = assetIsImage(asset) && Boolean(localPath);
 
             return (
               <AssetCard data-status="parked" key={id} title={localPath || name}>
-                <AssetCardPreview>
+                <AssetCardPreview
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
+                  disabled={!localPath || Boolean(busyKey)}
+                  onClick={() => runUntrackedAction(shouldShowImagePreview ? "view" : "open", asset)}
+                  title={shouldShowImagePreview ? "Open big view and annotate" : "Open file"}
+                  type="button"
+                >
                   {shouldShowImagePreview ? (
                     <AssetPreviewImage
                       alt={name}
@@ -886,6 +1017,28 @@ function UntrackedAssetsPanel({
                   Untracked
                 </AssetCardStatus>
                 <AssetCardActions>
+                  {canView && (
+                    <AssetIconButton
+                      aria-label={`Open big view for ${name}`}
+                      disabled={!localPath || viewBusy || Boolean(busyKey && !viewBusy)}
+                      onClick={() => runUntrackedAction("view", asset)}
+                      title="Open big view and annotate"
+                      type="button"
+                    >
+                      <OpenInFull aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {canCopy && (
+                    <AssetIconButton
+                      aria-label={`Copy ${name} to clipboard`}
+                      disabled={!localPath || copyBusy || Boolean(busyKey && !copyBusy)}
+                      onClick={() => runUntrackedAction("copy", asset)}
+                      title="Copy image to clipboard"
+                      type="button"
+                    >
+                      <ContentCopy aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
                   <AssetIconButton
                     aria-label={`Open ${name}`}
                     disabled={!localPath || openBusy || Boolean(busyKey && !openBusy)}
@@ -897,12 +1050,13 @@ function UntrackedAssetsPanel({
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Track ${name}`}
+                    data-primary="true"
                     disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
                     onClick={() => runUntrackedAction("track", asset)}
-                    title="Track asset"
+                    title="Track this scratch asset"
                     type="button"
                   >
-                    <LibraryAddCheck aria-hidden="true" />
+                    <AddToPhotos aria-hidden="true" />
                   </AssetIconButton>
                   <AssetIconButton
                     aria-label={`Rename ${name}`}
@@ -1201,7 +1355,7 @@ const AssetCard = styled.article`
     [data-asset-actions="true"] {
       opacity: 1;
       pointer-events: auto;
-      transform: translateY(0);
+      transform: translate(-50%, 0);
     }
   }
 
@@ -1217,18 +1371,33 @@ const AssetCard = styled.article`
     [data-asset-actions="true"] {
       opacity: 1;
       pointer-events: auto;
-      transform: translateY(0);
+      transform: translate(-50%, 0);
     }
   }
 `;
 
-const AssetCardPreview = styled.div`
+const AssetCardPreview = styled.button`
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
   overflow: hidden;
+  padding: 0;
+  border: 0;
+  color: inherit;
   background: rgba(15, 23, 42, 0.44);
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 211, 252, 0.46);
+    outline-offset: -3px;
+  }
+
+  &:disabled {
+    cursor: default;
+  }
 `;
 
 const AssetDocumentPreview = styled.div`
@@ -1274,7 +1443,7 @@ const AssetPreviewImage = styled.img`
   inset: 0;
   width: 100%;
   height: 100%;
-  padding: 7px 7px 31px;
+  padding: 7px 7px 45px;
   object-fit: contain;
   object-position: center;
   background: rgba(2, 6, 23, 0.7);
@@ -1287,7 +1456,7 @@ const AssetCardStatus = styled.span`
   z-index: 3;
   display: inline-flex;
   align-items: center;
-  max-width: calc(100% - 78px);
+  max-width: calc(100% - 14px);
   overflow: hidden;
   padding: 3px 6px;
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -1326,20 +1495,28 @@ const AssetCardStatus = styled.span`
 
 const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   position: absolute;
-  top: 7px;
-  right: 7px;
+  right: auto;
+  bottom: 34px;
+  left: 50%;
   z-index: 4;
-  display: grid;
-  grid-template-columns: repeat(2, 28px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 4px;
+  max-width: calc(100% - 14px);
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 999px;
+  background: rgba(2, 6, 23, 0.58);
   opacity: 0;
   pointer-events: none;
-  transform: translateY(-3px);
+  transform: translate(-50%, 5px);
   transition: opacity 130ms ease, transform 130ms ease;
+  backdrop-filter: blur(10px);
 
   button {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     background: rgba(2, 6, 23, 0.88);
     backdrop-filter: blur(8px);
   }
@@ -1408,6 +1585,30 @@ const AssetIconButton = styled.button`
     &:focus-visible {
       border-color: rgba(251, 113, 133, 0.32);
       background: rgba(190, 18, 60, 0.18);
+    }
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.28);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.18);
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      border-color: rgba(45, 212, 191, 0.46);
+      background: rgba(13, 148, 136, 0.28);
+    }
+  }
+
+  &[data-warning="true"] {
+    border-color: rgba(251, 191, 36, 0.22);
+    color: rgba(254, 240, 138, 0.9);
+    background: rgba(113, 63, 18, 0.18);
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      border-color: rgba(251, 191, 36, 0.4);
+      background: rgba(146, 64, 14, 0.26);
     }
   }
 `;

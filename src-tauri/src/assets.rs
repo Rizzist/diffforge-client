@@ -55,6 +55,15 @@ fn diffforge_path_is_inside_untracked_assets(path: &Path) -> Result<bool, String
     Ok(candidate == root || candidate.starts_with(&root))
 }
 
+fn diffforge_path_is_inside_managed_assets(path: &Path) -> Result<bool, String> {
+    let root = cloud_mcp_managed_asset_root()?;
+    let root = root
+        .canonicalize()
+        .unwrap_or_else(|_| diffforge_clean_path(root));
+    let candidate = diffforge_absolute_asset_path(path);
+    Ok(candidate == root || candidate.starts_with(&root))
+}
+
 fn diffforge_reject_untracked_asset_path_for_tracking(path: &Path, action: &str) -> Result<(), String> {
     if diffforge_path_is_inside_untracked_assets(path).unwrap_or(false) {
         return Err(format!(
@@ -296,6 +305,88 @@ fn diffforge_untracked_asset_file(path: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn diffforge_local_asset_file(path: &str) -> Result<PathBuf, String> {
+    let raw_path = PathBuf::from(path);
+    let canonical = raw_path
+        .canonicalize()
+        .map_err(|error| format!("Asset does not exist: {path}: {error}"))?;
+    if !canonical.is_file() {
+        return Err(format!("Asset is not a file: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
+fn diffforge_copy_image_file_to_clipboard(file: &Path) -> Result<Value, String> {
+    let image = xcap::image::open(file)
+        .map_err(|error| format!("Unable to read image {}: {error}", file.display()))?
+        .into_rgba8();
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let bytes = image.into_raw();
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Owned(bytes),
+        })
+        .map_err(|error| format!("Unable to copy image to clipboard: {error}"))?;
+
+    Ok(json!({
+        "kind": "asset_clipboard_image_copied",
+        "path": file.display().to_string(),
+        "width": width,
+        "height": height,
+    }))
+}
+
+fn diffforge_copy_image_data_url_to_clipboard_for(image_data_url: &str) -> Result<Value, String> {
+    let encoded = image_data_url
+        .split_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(image_data_url);
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("Unable to decode clipboard image: {error}"))?;
+    let image = xcap::image::load_from_memory(&bytes)
+        .map_err(|error| format!("Clipboard image is not a valid image: {error}"))?
+        .into_rgba8();
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let bytes = image.into_raw();
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width,
+            height,
+            bytes: std::borrow::Cow::Owned(bytes),
+        })
+        .map_err(|error| format!("Unable to copy image to clipboard: {error}"))?;
+
+    Ok(json!({
+        "kind": "asset_clipboard_image_copied",
+        "width": width,
+        "height": height,
+    }))
+}
+
+fn diffforge_delete_tracked_asset_cache_row(asset_id: &str) -> Result<(), String> {
+    let conn = cloud_mcp_open_asset_library_conn()?;
+    conn.execute(
+        "DELETE FROM workspace_asset_transfers WHERE asset_id=?1",
+        rusqlite::params![asset_id],
+    )
+    .map_err(|error| format!("Unable to remove tracked asset transfers from cache: {error}"))?;
+    conn.execute(
+        "DELETE FROM workspace_asset_items WHERE asset_id=?1",
+        rusqlite::params![asset_id],
+    )
+    .map_err(|error| format!("Unable to remove tracked asset from cache: {error}"))?;
+    Ok(())
+}
+
 fn diffforge_remove_empty_untracked_parents(path: &Path) {
     let Ok(root) = diffforge_untracked_asset_root() else {
         return;
@@ -450,6 +541,122 @@ fn diffforge_rename_untracked_asset(
         "old_path": file.display().to_string(),
         "oldPath": file.display().to_string(),
         "item": item,
+        "library": diffforge_untracked_asset_library(None)?,
+    }))
+}
+
+#[tauri::command]
+fn diffforge_copy_asset_to_clipboard(path: String) -> Result<Value, String> {
+    let file = diffforge_local_asset_file(&path)?;
+    diffforge_copy_image_file_to_clipboard(&file)
+}
+
+#[tauri::command]
+fn diffforge_copy_image_data_url_to_clipboard(image_data_url: String) -> Result<Value, String> {
+    diffforge_copy_image_data_url_to_clipboard_for(&image_data_url)
+}
+
+#[tauri::command]
+fn diffforge_untrack_workspace_asset(
+    app: AppHandle,
+    asset_id: String,
+    path: Option<String>,
+    name: Option<String>,
+    delete_source: Option<bool>,
+) -> Result<Value, String> {
+    let asset_id = asset_id.trim().to_string();
+    if asset_id.is_empty() {
+        return Err("Asset id is required to untrack an asset.".to_string());
+    }
+
+    let row = cloud_mcp_asset_row_from_file(&asset_id)?;
+    let local_path = path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"]))
+        .ok_or_else(|| "Download the asset locally before untracking it.".to_string())?;
+    let source = diffforge_local_asset_file(&local_path)?;
+    if diffforge_path_is_inside_untracked_assets(&source).unwrap_or(false) {
+        return Err("Asset is already in the untracked scratch folder.".to_string());
+    }
+
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let imports_dir = root.join("imports");
+    fs::create_dir_all(&imports_dir).map_err(|error| {
+        format!(
+            "Unable to create untracked imports directory {}: {error}",
+            imports_dir.display()
+        )
+    })?;
+    let source_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset");
+    let filename = cloud_mcp_sanitize_asset_filename(
+        name.as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(source_name),
+        "asset",
+    );
+    let target = cloud_mcp_available_asset_download_path(&imports_dir, &filename);
+    fs::copy(&source, &target).map_err(|error| {
+        format!(
+            "Unable to copy tracked asset {} to untracked scratch {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let item = diffforge_untracked_asset_item(&root, &target).ok();
+
+    let should_delete_source = delete_source.unwrap_or(true)
+        && diffforge_path_is_inside_managed_assets(&source).unwrap_or(false)
+        && !diffforge_path_is_inside_untracked_assets(&source).unwrap_or(false);
+    let removed_source = if should_delete_source {
+        fs::remove_file(&source).map_err(|error| {
+            format!(
+                "Copied asset to untracked scratch, but removing tracked copy {} failed: {error}",
+                source.display()
+            )
+        })?;
+        true
+    } else {
+        false
+    };
+    diffforge_delete_tracked_asset_cache_row(&asset_id)?;
+    diffforge_emit_untracked_assets_updated(&app, "untracked", item.clone());
+    let _ = app.emit(
+        CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT,
+        json!({
+            "kind": "workspace_asset_untracked",
+            "event_kind": "workspace_asset_untracked",
+            "eventKind": "workspace_asset_untracked",
+            "asset_id": asset_id.clone(),
+            "assetId": asset_id.clone(),
+            "local_path": local_path,
+            "localPath": source.display().to_string(),
+            "untracked_path": target.display().to_string(),
+            "untrackedPath": target.display().to_string(),
+            "source_removed": removed_source,
+            "sourceRemoved": removed_source,
+        }),
+    );
+
+    Ok(json!({
+        "kind": "workspace_asset_untracked",
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "path": target.display().to_string(),
+        "local_path": target.display().to_string(),
+        "localPath": target.display().to_string(),
+        "item": item,
+        "source_removed": removed_source,
+        "sourceRemoved": removed_source,
         "library": diffforge_untracked_asset_library(None)?,
     }))
 }

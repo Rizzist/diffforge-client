@@ -58,6 +58,7 @@ function createTokenomicsStoreState() {
     status: "loading",
     error: "",
     selectedProvider: "all",
+    selectedScopeKey: "all",
     selectedAccountKey: "all",
     selectedDeviceId: "all",
     scanProgress: null,
@@ -162,19 +163,117 @@ function rowDeviceId(row) {
   return String(row?.device_id || row?.deviceId || row?.machine_id || row?.machineId || "").trim();
 }
 
-function deviceLabel(deviceId, currentDeviceId = "") {
-  if (!deviceId) return "Unknown device";
-  if (currentDeviceId && deviceId === currentDeviceId) return "This device";
-  const compact = deviceId.length > 18 ? `${deviceId.slice(0, 8)}...${deviceId.slice(-6)}` : deviceId;
-  return compact.replace(/^desktop-/, "Desktop ");
+function rowScopeKey(row) {
+  const explicit = String(row?.billing_scope_key || row?.billingScopeKey || "").trim();
+  if (explicit) return explicit;
+  const type = String(row?.billing_scope_type || row?.billingScopeType || row?.scope_type || row?.scopeType || "").trim().toLowerCase();
+  const teamId = String(row?.billing_team_id || row?.billingTeamId || row?.team_id || row?.teamId || "").trim();
+  if (type === "team" || teamId) return teamId ? `team:${teamId}` : "team";
+  if (type === "personal") return "personal";
+  return "unknown";
 }
 
-function filterRows(rows, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all") {
+function rowScopeLabel(row, key = rowScopeKey(row)) {
+  const explicit = String(row?.billing_scope_label || row?.billingScopeLabel || "").trim();
+  if (explicit && explicit !== "Unknown scope") return explicit;
+  if (key === "personal") return "Personal";
+  if (key.startsWith("team:")) {
+    const teamId = key.slice("team:".length);
+    return teamId ? `Team ${teamId.length > 16 ? `${teamId.slice(0, 6)}...${teamId.slice(-4)}` : teamId}` : "Team";
+  }
+  if (key === "team") return "Team";
+  return "Unknown scope";
+}
+
+function tokenomicsDeviceIdentityRows(summary = {}) {
+  return [
+    ...(Array.isArray(summary.device_identities) ? summary.device_identities : []),
+    ...(Array.isArray(summary.deviceIdentities) ? summary.deviceIdentities : []),
+    ...(Array.isArray(summary.devices) ? summary.devices : []),
+  ];
+}
+
+function tokenomicsDeviceIdentityLabel(identity = {}) {
+  return String(
+    identity?.display_name
+      || identity?.displayName
+      || identity?.label
+      || identity?.device_name
+      || identity?.deviceName
+      || identity?.machine_name
+      || identity?.machineName
+      || identity?.hostname
+      || identity?.name
+      || "",
+  ).trim();
+}
+
+function tokenomicsDeviceIdentityIds(identity = {}) {
+  return [
+    rowDeviceId(identity),
+    identity?.id,
+    identity?.device_id,
+    identity?.deviceId,
+    identity?.machine_id,
+    identity?.machineId,
+    identity?.native_device_id,
+    identity?.nativeDeviceId,
+    identity?.target_device_id,
+    identity?.targetDeviceId,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function tokenomicsDeviceIdentityMap(summary = {}) {
+  const byId = new Map();
+  tokenomicsDeviceIdentityRows(summary).forEach((identity) => {
+    const label = tokenomicsDeviceIdentityLabel(identity);
+    [...new Set(tokenomicsDeviceIdentityIds(identity))].forEach((id) => {
+      const current = byId.get(id) || {};
+      byId.set(id, {
+        ...current,
+        ...identity,
+        display_name: label || current.display_name || current.displayName || "",
+        displayName: label || current.displayName || current.display_name || "",
+      });
+    });
+  });
+  return byId;
+}
+
+function genericDeviceLabel(deviceId) {
+  const lower = String(deviceId || "").toLowerCase();
+  if (lower.includes("windows") || lower.startsWith("win")) return "Windows PC";
+  if (lower.includes("macos") || lower.includes("macbook") || lower.startsWith("mac")) return "Mac device";
+  if (lower.includes("linux")) return "Linux device";
+  return "Other device";
+}
+
+function dedupeDeviceLabels(devices) {
+  const counts = new Map();
+  devices.forEach((device) => counts.set(device.label, (counts.get(device.label) || 0) + 1));
+  const seen = new Map();
+  return devices.map((device) => {
+    if (device.current || counts.get(device.label) <= 1) return device;
+    const next = (seen.get(device.label) || 0) + 1;
+    seen.set(device.label, next);
+    return { ...device, label: `${device.label} ${next}` };
+  });
+}
+
+function deviceLabel(deviceId, currentDeviceId = "", identityMap = new Map()) {
+  if (!deviceId) return "Unknown device";
+  if (currentDeviceId && deviceId === currentDeviceId) return "This Device";
+  const identityLabel = tokenomicsDeviceIdentityLabel(identityMap.get(deviceId));
+  return identityLabel || genericDeviceLabel(deviceId);
+}
+
+function filterRows(rows, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all", selectedScopeKey = "all") {
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   return rows.filter((row) => (
     provider.match(row)
       && (selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey)
       && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId)
+      && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
 }
 
@@ -239,8 +338,8 @@ function fullDayLabel(key, todayKey) {
   });
 }
 
-function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
-  const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId);
+function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+  const filtered = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   const byDay = new Map();
   for (const row of filtered) {
     const key = bucketDayKey(row);
@@ -272,11 +371,11 @@ function buildDailyRows(dailyRows, selectedProvider, selectedAccountKey, selecte
   }));
 }
 
-function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
+function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all", windowDays = TOKENOMICS_DAILY_WINDOW_DAYS) {
   const today = dateFromDayKey(dayKeyUtc(new Date()));
   const startKey = dayKeyUtc(addUtcDays(today, -(Math.max(1, windowDays) - 1)));
   const endKey = dayKeyUtc(today);
-  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId)
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey)
     .filter((row) => {
       const key = bucketDayKey(row);
       return key >= startKey && key <= endKey;
@@ -284,18 +383,19 @@ function rollingWindowAggregate(dailyRows, selectedProvider, selectedAccountKey,
   return aggregateRows(rows);
 }
 
-function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
+function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all") {
   const today = dayKeyUtc(new Date());
-  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId)
+  const rows = filterRows(dailyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey)
     .filter((row) => bucketDayKey(row) === today);
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider, selectedAccountKey = "all") {
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedScopeKey = "all") {
   if (!Array.isArray(limits)) return [];
   return limits.filter((limit) => (
     (selectedProvider === "all" || providerKey(limit) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
+      && (selectedScopeKey === "all" || rowScopeKey(limit) === selectedScopeKey)
   ));
 }
 
@@ -463,10 +563,10 @@ function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable =
   return "Safe at current pace";
 }
 
-function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
+function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all") {
   const windowSeconds = sessionWindowSeconds(limit);
   const bucketCount = Math.max(1, Math.ceil(windowSeconds / 3600));
-  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKey, selectedDeviceId);
+  const rows = filterRows(Array.isArray(hourlyRows) ? hourlyRows : [], selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   if (rows.some((row) => row?.window_index != null || row?.windowIndex != null)) {
     const byIndex = new Map();
     for (const row of rows) {
@@ -618,8 +718,8 @@ function dailyBarHeight(value, maxValue) {
   return Math.max(11, Math.round((total / max) * 94));
 }
 
-function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId) {
-  const rows = filterRows(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId);
+function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey = "all") {
+  const rows = filterRows(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey);
   const byModel = new Map();
   for (const row of rows) {
     const rawModel = String(row?.model || "").trim();
@@ -645,12 +745,16 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selecte
     }));
 }
 
-function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all") {
+function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all", selectedScopeKey = "all") {
   if (selectedProvider === "all") return [];
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
   const rows = [
     ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
-  ].filter((row) => provider.match(row) && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId));
+  ].filter((row) => (
+    provider.match(row)
+      && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId)
+      && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
+  ));
   const byKey = new Map();
   for (const row of rows) {
     const key = rowProviderAccountKey(row);
@@ -676,8 +780,9 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   return [{ key: "all", label: providerLabelText }, ...accounts];
 }
 
-function deviceOptions(summary) {
+function deviceOptions(summary, selectedScopeKey = "all") {
   const currentDeviceId = String(summary?.current_device_id || summary?.currentDeviceId || "").trim();
+  const identityMap = tokenomicsDeviceIdentityMap(summary);
   const rows = [
     ...(Array.isArray(summary?.by_device) ? summary.by_device : []),
     ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
@@ -688,13 +793,17 @@ function deviceOptions(summary) {
   ];
   const byDevice = new Map();
   for (const row of rows) {
+    if (selectedScopeKey !== "all" && rowScopeKey(row) !== selectedScopeKey) continue;
     const id = rowDeviceId(row);
     if (!id) continue;
     const current = byDevice.get(id) || {
       key: id,
-      label: deviceLabel(id, currentDeviceId),
+      current: currentDeviceId === id,
+      label: deviceLabel(id, currentDeviceId, identityMap),
       total: 0,
     };
+    current.current = current.current || currentDeviceId === id;
+    current.label = deviceLabel(id, currentDeviceId, identityMap);
     current.total += rowTotal(row);
     byDevice.set(id, current);
   }
@@ -703,7 +812,37 @@ function deviceOptions(summary) {
     if (b.key === currentDeviceId) return 1;
     return b.total - a.total || a.label.localeCompare(b.label);
   });
-  return [{ key: "all", label: "All devices" }, ...devices];
+  return [{ key: "all", label: "All devices" }, ...dedupeDeviceLabels(devices)];
+}
+
+function scopeOptions(summary) {
+  const rows = [
+    ...(Array.isArray(summary?.by_device_provider) ? summary.by_device_provider : []),
+    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
+    ...(Array.isArray(summary?.by_device_model) ? summary.by_device_model : []),
+    ...(Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : []),
+    ...(Array.isArray(summary?.hourly) ? summary.hourly : []),
+    ...(Array.isArray(summary?.limits) ? summary.limits : []),
+  ];
+  const byScope = new Map();
+  for (const row of rows) {
+    const key = rowScopeKey(row);
+    if (!key || key === "unknown") continue;
+    const current = byScope.get(key) || {
+      key,
+      label: rowScopeLabel(row, key),
+      total: 0,
+    };
+    current.total += rowTotal(row);
+    byScope.set(key, current);
+  }
+  const scopes = [...byScope.values()].sort((left, right) => {
+    if (left.key === "personal") return -1;
+    if (right.key === "personal") return 1;
+    return right.total - left.total || left.label.localeCompare(right.label);
+  });
+  if (!scopes.length) return [];
+  return [{ key: "all", label: "All scopes" }, ...scopes];
 }
 
 function lastUpdatedText(value) {
@@ -719,6 +858,7 @@ function lastUpdatedText(value) {
 
 function providerLimitKey(row = {}) {
   return [
+    rowScopeKey(row),
     providerKey(row),
     rowProviderAccountKey(row),
     String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
@@ -773,6 +913,8 @@ function mergeTokenomicsSummary(previous, next) {
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
+    device_identities: next.device_identities || previous.device_identities,
+    deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
     credits: next.credits || previous.credits,
   };
   return stripLegacyTokenomicsSummaryFields(merged);
@@ -1005,9 +1147,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     summary,
     status,
     error,
-    selectedProvider,
-    selectedAccountKey,
-    selectedDeviceId,
+	    selectedProvider,
+	    selectedScopeKey = "all",
+	    selectedAccountKey,
+	    selectedDeviceId,
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
@@ -1018,6 +1161,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
   const setSelectedProvider = useCallback((provider) => {
     updateTokenomicsStore({ selectedProvider: provider, selectedAccountKey: "all" });
+  }, []);
+
+  const setSelectedScopeKey = useCallback((nextScopeKey) => {
+    updateTokenomicsStore({ selectedScopeKey: nextScopeKey || "all", selectedAccountKey: "all", selectedDeviceId: "all" });
   }, []);
 
   const setSelectedAccountKey = useCallback((nextAccountKey) => {
@@ -1046,11 +1193,20 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const deviceFiltered = selectedDeviceId !== "all";
   const modelRows = Array.isArray(summary?.by_device_model) ? summary.by_device_model : [];
   const providerRows = providers;
-  const devices = useMemo(() => deviceOptions(summary), [summary]);
+  const scopes = useMemo(() => scopeOptions(summary), [summary]);
+  const devices = useMemo(() => deviceOptions(summary, selectedScopeKey), [summary, selectedScopeKey]);
   const accountOptions = useMemo(
-    () => providerAccountOptions(summary, selectedProvider, selectedDeviceId),
-    [summary, selectedDeviceId, selectedProvider],
+    () => providerAccountOptions(summary, selectedProvider, selectedDeviceId, selectedScopeKey),
+    [summary, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
+  useEffect(() => {
+    if (
+      selectedScopeKey !== "all"
+      && !scopes.some((option) => option.key === selectedScopeKey)
+    ) {
+      updateTokenomicsStore({ selectedScopeKey: "all", selectedAccountKey: "all", selectedDeviceId: "all" });
+    }
+  }, [scopes, selectedScopeKey]);
   useEffect(() => {
     if (
       selectedDeviceId !== "all"
@@ -1076,34 +1232,34 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const dailyRaw = Array.isArray(summary?.daily_by_device_provider) ? summary.daily_by_device_provider : [];
   const hourlyRaw = Array.isArray(summary?.hourly) ? summary.hourly : [];
   const dailyRows = useMemo(
-    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, dailyWindowDays),
-    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedDeviceId, selectedProvider],
+    () => buildDailyRows(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey, dailyWindowDays),
+    [dailyRaw, dailyWindowDays, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const today = useMemo(
-    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
-    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
+    () => todayAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const last30Days = useMemo(
-    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
-    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
+    () => rollingWindowAggregate(dailyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    [dailyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const deviceAccountRows = Array.isArray(summary?.by_device_account) ? summary.by_device_account : [];
   const totalRows = deviceFiltered
     ? (selectedAccountKey === "all" ? providerRows : deviceAccountRows)
     : selectedAccountKey === "all" ? providerRows : deviceAccountRows;
   const total = useMemo(
-    () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey, selectedDeviceId)),
-    [selectedAccountKey, selectedDeviceId, selectedProvider, totalRows],
+    () => aggregateRows(filterRows(totalRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey)),
+    [selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, totalRows],
   );
   const limits = useMemo(
-    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedDeviceId),
-    [selectedAccountKey, selectedDeviceId, selectedProvider, summary?.limits],
+    () => filterLimits(summary?.limits, selectedProvider, selectedAccountKey, selectedScopeKey),
+    [selectedAccountKey, selectedProvider, selectedScopeKey, summary?.limits],
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
   const sessionUsageRows = useMemo(
-    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey, selectedDeviceId),
-    [fiveHour, hourlyRaw, selectedAccountKey, selectedDeviceId, selectedProvider],
+    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    [fiveHour, hourlyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
@@ -1112,8 +1268,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const dailyAverage = dailyRows.reduce((sum, row) => sum + dailyUsageValue(row), 0) / Math.max(1, dailyRows.filter((row) => dailyUsageValue(row) > 0).length);
   const maxDaily = Math.max(1, ...dailyRows.map((row) => dailyUsageValue(row)));
   const breakdown = useMemo(
-    () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId),
-    [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider],
+    () => modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const credits = billingStatus?.credits || summary?.credits || {};
   const creditUsageHistory = useMemo(
@@ -1138,6 +1294,23 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             </ProviderTab>
           ))}
         </ProviderTabs>
+        {scopes.length > 2 ? (
+          <AccountTabs role="tablist" aria-label="Billing scope filter">
+            {scopes.map((scope) => (
+              <AccountTab
+                key={scope.key}
+                $active={selectedScopeKey === scope.key}
+                $provider={selectedProvider}
+                onClick={() => setSelectedScopeKey(scope.key)}
+                role="tab"
+                title={scope.label}
+                type="button"
+              >
+                {scope.label}
+              </AccountTab>
+            ))}
+          </AccountTabs>
+        ) : null}
         {accountOptions.length > 1 ? (
           <AccountTabs role="tablist" aria-label="Provider account filter">
             {accountOptions.map((account) => (
@@ -1164,7 +1337,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 $provider={selectedProvider}
                 onClick={() => setSelectedDeviceId(device.key)}
                 role="tab"
-                title={device.key === "all" ? device.label : `${device.label} · ${device.key}`}
+                title={device.label}
                 type="button"
               >
                 {device.label}

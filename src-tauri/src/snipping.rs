@@ -13,13 +13,15 @@ const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
 const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
 const SNIPPING_TOAST_WINDOW_LABEL: &str = "snipping-toasts";
+const SNIPPING_PIN_WINDOW_PREFIX: &str = "snipping-pin";
+const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
-const SNIPPING_TOAST_WINDOW_WIDTH: f64 = 284.0;
-const SNIPPING_TOAST_WINDOW_HEIGHT: f64 = 220.0;
-const SNIPPING_TOAST_WINDOW_MARGIN: i32 = 16;
+const SNIPPING_TOAST_WINDOW_WIDTH: f64 = 316.0;
+const SNIPPING_TOAST_WINDOW_HEIGHT: f64 = 560.0;
+const SNIPPING_TOAST_WINDOW_MARGIN: i32 = 18;
 #[cfg(target_os = "macos")]
 const MACOS_SCREEN_CAPTURE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
@@ -97,6 +99,7 @@ struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
     active_area_monitor: Arc<StdMutex<Option<SnippingAreaMonitor>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
+    asset_target: Arc<StdMutex<SnippingAssetTarget>>,
 }
 
 impl SnippingState {
@@ -105,8 +108,16 @@ impl SnippingState {
             shortcut_manager: SnippingShortcutManager::new(),
             active_area_monitor: Arc::new(StdMutex::new(None)),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
+            asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct SnippingAssetTarget {
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -340,6 +351,29 @@ struct SnippingAreaSelectionRequest {
     width: f64,
     height: f64,
     scale_factor: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingAssetTargetRequest {
+    repo_path: Option<String>,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingUploadAssetRequest {
+    path: String,
+    name: Option<String>,
+    group: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingEditedAssetRequest {
+    source_path: String,
+    image_data_url: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1231,9 +1265,8 @@ fn position_snipping_toast_window(app: &AppHandle, window: &tauri::WebviewWindow
 
     let work_area = monitor.work_area();
     let scale_factor = monitor.scale_factor().max(0.1);
-    let width = (SNIPPING_TOAST_WINDOW_WIDTH * scale_factor).round() as i32;
     let height = (SNIPPING_TOAST_WINDOW_HEIGHT * scale_factor).round() as i32;
-    let x = work_area.position.x + work_area.size.width as i32 - width - SNIPPING_TOAST_WINDOW_MARGIN;
+    let x = work_area.position.x + SNIPPING_TOAST_WINDOW_MARGIN;
     let y = work_area.position.y + work_area.size.height as i32 - height - SNIPPING_TOAST_WINDOW_MARGIN;
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
@@ -1250,7 +1283,7 @@ fn ensure_snipping_toast_window(app: &AppHandle) -> Result<tauri::WebviewWindow,
         SNIPPING_TOAST_WINDOW_LABEL,
         WebviewUrl::App("index.html#/snipping-toasts".into()),
     )
-    .title("Snips")
+    .title("Snip Quick Access")
     .inner_size(SNIPPING_TOAST_WINDOW_WIDTH, SNIPPING_TOAST_WINDOW_HEIGHT)
     .resizable(false)
     .decorations(false)
@@ -1353,6 +1386,44 @@ fn snipping_prepare_capture_path(mode: &str) -> Result<(PathBuf, PathBuf), Strin
     Ok((target, tmp))
 }
 
+fn snipping_emit_untracked_image_saved(
+    app: &AppHandle,
+    target: &Path,
+    width: u32,
+    height: u32,
+    mode: &str,
+    reason: &str,
+    shortcut: String,
+    original_path: Option<String>,
+) -> Result<Value, String> {
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let item = diffforge_untracked_asset_item(&root, target).ok();
+    let saved_at_ms = cloud_mcp_now_ms();
+    let payload = json!({
+        "kind": "snipping_capture_saved",
+        "mode": mode,
+        "reason": reason,
+        "shortcut": shortcut,
+        "path": target.display().to_string(),
+        "local_path": target.display().to_string(),
+        "localPath": target.display().to_string(),
+        "filename": target.file_name().and_then(|value| value.to_str()).unwrap_or("snip.png"),
+        "width": width,
+        "height": height,
+        "saved_at_ms": saved_at_ms,
+        "savedAtMs": saved_at_ms,
+        "original_path": original_path.clone(),
+        "originalPath": original_path,
+        "item": item,
+        "library": diffforge_untracked_asset_library(None)?,
+    });
+    diffforge_emit_untracked_assets_updated(app, "snip-saved", payload.get("item").cloned());
+    snipping_push_recent_capture_toast(app, payload.clone());
+    show_snipping_toast_window(app);
+    let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
+    Ok(payload)
+}
+
 fn snipping_save_image(
     app: &AppHandle,
     image: xcap::image::RgbaImage,
@@ -1360,7 +1431,6 @@ fn snipping_save_image(
     reason: &str,
     shortcut: String,
 ) -> Result<Value, String> {
-    let root = diffforge_prepare_untracked_asset_root()?;
     let (target, tmp) = snipping_prepare_capture_path(mode)?;
     let width = image.width();
     let height = image.height();
@@ -1376,54 +1446,217 @@ fn snipping_save_image(
         )
     })?;
 
-    let item = diffforge_untracked_asset_item(&root, &target).ok();
-    let payload = json!({
-        "kind": "snipping_capture_saved",
-        "mode": mode,
-        "reason": reason,
-        "shortcut": shortcut,
-        "path": target.display().to_string(),
-        "local_path": target.display().to_string(),
-        "localPath": target.display().to_string(),
-        "filename": target.file_name().and_then(|value| value.to_str()).unwrap_or("snip.png"),
-        "width": width,
-        "height": height,
-        "saved_at_ms": cloud_mcp_now_ms(),
-        "savedAtMs": cloud_mcp_now_ms(),
-        "item": item,
-        "library": diffforge_untracked_asset_library(None)?,
-    });
-    diffforge_emit_untracked_assets_updated(app, "snip-saved", payload.get("item").cloned());
-    snipping_push_recent_capture_toast(app, payload.clone());
-    show_snipping_toast_window(app);
-    let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
-    Ok(payload)
+    snipping_emit_untracked_image_saved(app, &target, width, height, mode, reason, shortcut, None)
 }
 
 fn snipping_copy_untracked_asset_to_clipboard_for(path: String) -> Result<Value, String> {
     let file = diffforge_untracked_asset_file(&path)?;
-    let image = xcap::image::open(&file)
-        .map_err(|error| format!("Unable to read snip image {}: {error}", file.display()))?
-        .into_rgba8();
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let bytes = image.into_raw();
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|error| format!("Unable to open system clipboard: {error}"))?;
-    clipboard
-        .set_image(arboard::ImageData {
-            width,
-            height,
-            bytes: std::borrow::Cow::Owned(bytes),
-        })
-        .map_err(|error| format!("Unable to copy snip image to clipboard: {error}"))?;
+    diffforge_copy_image_file_to_clipboard(&file)
+}
 
+fn snipping_url_token(value: &str) -> String {
+    general_purpose::URL_SAFE_NO_PAD.encode(value.as_bytes())
+}
+
+fn snipping_window_token(path: &Path) -> String {
+    let seed = format!("{}:{}", path.display(), uuid::Uuid::new_v4());
+    cloud_mcp_short_hash(&seed)
+}
+
+fn snipping_center_floating_window(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|main_window| main_window.current_monitor().ok().flatten())
+        .or_else(|| window.current_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
+        let _ = window.center();
+        return;
+    };
+
+    let work_area = monitor.work_area();
+    let Ok(size) = window.outer_size() else {
+        let _ = window.center();
+        return;
+    };
+    let x = work_area.position.x
+        + ((work_area.size.width as i32 - size.width as i32) / 2).max(0);
+    let y = work_area.position.y
+        + ((work_area.size.height as i32 - size.height as i32) / 2).max(0);
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+fn snipping_open_floating_asset_window(
+    app: &AppHandle,
+    path: String,
+    prefix: &str,
+    route: &str,
+    title: &str,
+    width: f64,
+    height: f64,
+) -> Result<Value, String> {
+    let file = diffforge_local_asset_file(&path)?;
+    let label = format!("{prefix}-{}", snipping_window_token(&file));
+    let encoded_path = snipping_url_token(&file.display().to_string());
+    let window = WebviewWindowBuilder::new(
+        app,
+        label.clone(),
+        WebviewUrl::App(format!("index.html#{route}/{encoded_path}").into()),
+    )
+    .title(title)
+    .inner_size(width, height)
+    .min_inner_size(260.0, 180.0)
+    .resizable(true)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(true)
+    .accept_first_mouse(true)
+    .transparent(false)
+    .visible(false)
+    .shadow(true)
+    .build()
+    .map_err(|error| format!("Unable to create {title} window: {error}"))?;
+    snipping_center_floating_window(app, &window);
+    window
+        .show()
+        .map_err(|error| format!("Unable to show {title} window: {error}"))?;
+    let _ = window.set_focus();
     Ok(json!({
-        "kind": "snipping_clipboard_image_copied",
+        "kind": "snipping_floating_asset_window_opened",
+        "label": label,
         "path": file.display().to_string(),
-        "width": width,
-        "height": height,
     }))
+}
+
+fn snipping_set_asset_target_for(
+    app: &AppHandle,
+    request: SnippingAssetTargetRequest,
+) -> Result<Value, String> {
+    let repo_path = request
+        .repo_path
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let workspace_id = request
+        .workspace_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let workspace_name = request
+        .workspace_name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let state = app.state::<SnippingState>();
+    let mut guard = state
+        .asset_target
+        .lock()
+        .map_err(|_| "Unable to lock snipping asset target.".to_string())?;
+    *guard = SnippingAssetTarget {
+        repo_path,
+        workspace_id,
+        workspace_name,
+    };
+    Ok(json!({
+        "kind": "snipping_asset_target_set",
+        "repoPath": guard.repo_path.clone(),
+        "workspaceId": guard.workspace_id.clone(),
+        "workspaceName": guard.workspace_name.clone(),
+    }))
+}
+
+fn snipping_asset_target_for(app: &AppHandle) -> Result<SnippingAssetTarget, String> {
+    app.state::<SnippingState>()
+        .asset_target
+        .lock()
+        .map(|guard| guard.clone())
+        .map_err(|_| "Unable to lock snipping asset target.".to_string())
+}
+
+fn snipping_upload_untracked_asset_for(
+    app: &AppHandle,
+    request: SnippingUploadAssetRequest,
+) -> Result<Value, String> {
+    let target = snipping_asset_target_for(app)?;
+    if target.repo_path.trim().is_empty() {
+        return Err("Select a workspace before uploading this snip.".to_string());
+    }
+    diffforge_promote_untracked_asset(
+        app.clone(),
+        target.repo_path,
+        target.workspace_id,
+        target.workspace_name,
+        request.path,
+        request.name,
+        request.group.or_else(|| Some("snips".to_string())),
+        Some(false),
+    )
+}
+
+fn snipping_save_edited_untracked_asset_for(
+    app: &AppHandle,
+    request: SnippingEditedAssetRequest,
+) -> Result<Value, String> {
+    let source = diffforge_local_asset_file(&request.source_path)?;
+    let source_name = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("snip");
+    let encoded = request
+        .image_data_url
+        .split_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(request.image_data_url.as_str());
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("Unable to decode edited snip image: {error}"))?;
+    let image = xcap::image::load_from_memory(&bytes)
+        .map_err(|error| format!("Edited snip is not a valid image: {error}"))?;
+    let width = image.width();
+    let height = image.height();
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let edits_dir = root.join("edits");
+    let tmp_dir = root.join(".tmp");
+    fs::create_dir_all(&edits_dir).map_err(|error| {
+        format!(
+            "Unable to create snipping edits directory {}: {error}",
+            edits_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&tmp_dir).map_err(|error| {
+        format!(
+            "Unable to create snipping temp directory {}: {error}",
+            tmp_dir.display()
+        )
+    })?;
+    let filename = cloud_mcp_sanitize_asset_filename(
+        &format!("{source_name}-edited-{}.png", cloud_mcp_now_ms()),
+        "snip-edited.png",
+    );
+    let target = cloud_mcp_available_asset_download_path(&edits_dir, &filename);
+    let tmp = tmp_dir.join(format!(
+        ".{}-{}.tmp",
+        filename.trim_end_matches(".png"),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&tmp, &bytes)
+        .map_err(|error| format!("Unable to write edited snip {}: {error}", tmp.display()))?;
+    fs::rename(&tmp, &target).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "Unable to move edited snip {} to {}: {error}",
+            tmp.display(),
+            target.display()
+        )
+    })?;
+    snipping_emit_untracked_image_saved(
+        app,
+        &target,
+        width,
+        height,
+        "edited",
+        "annotation-editor",
+        String::new(),
+        Some(source.display().to_string()),
+    )
 }
 
 fn ensure_snipping_enabled(app: &AppHandle) -> Result<(), String> {
@@ -1691,6 +1924,56 @@ fn snipping_finish_area_snip(
 #[tauri::command]
 fn snipping_recent_capture_toasts(app: AppHandle) -> Result<Value, String> {
     Ok(snipping_recent_capture_toasts_for(&app))
+}
+
+#[tauri::command]
+fn snipping_set_asset_target(
+    app: AppHandle,
+    request: SnippingAssetTargetRequest,
+) -> Result<Value, String> {
+    snipping_set_asset_target_for(&app, request)
+}
+
+#[tauri::command]
+fn snipping_upload_untracked_asset(
+    app: AppHandle,
+    request: SnippingUploadAssetRequest,
+) -> Result<Value, String> {
+    snipping_upload_untracked_asset_for(&app, request)
+}
+
+#[tauri::command]
+fn snipping_save_edited_untracked_asset(
+    app: AppHandle,
+    request: SnippingEditedAssetRequest,
+) -> Result<Value, String> {
+    snipping_save_edited_untracked_asset_for(&app, request)
+}
+
+#[tauri::command]
+fn snipping_open_pinned_window(app: AppHandle, path: String) -> Result<Value, String> {
+    snipping_open_floating_asset_window(
+        &app,
+        path,
+        SNIPPING_PIN_WINDOW_PREFIX,
+        "/snipping-pin",
+        "Pinned Snip",
+        460.0,
+        340.0,
+    )
+}
+
+#[tauri::command]
+fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value, String> {
+    snipping_open_floating_asset_window(
+        &app,
+        path,
+        SNIPPING_EDITOR_WINDOW_PREFIX,
+        "/snipping-editor",
+        "Annotate Snip",
+        980.0,
+        720.0,
+    )
 }
 
 #[tauri::command]

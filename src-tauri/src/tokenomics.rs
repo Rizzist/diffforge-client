@@ -14,6 +14,7 @@ const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
+const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
 use std::io::BufRead as _;
@@ -1159,6 +1160,23 @@ fn tokenomics_local_device_id() -> String {
         .to_string()
 }
 
+fn tokenomics_local_device_name() -> String {
+    let profile = cloud_mcp_desktop_device_profile();
+    tokenomics_text_field(
+        &profile,
+        &[
+            "display_name",
+            "displayName",
+            "device_name",
+            "deviceName",
+            "machine_name",
+            "machineName",
+            "hostname",
+        ],
+    )
+    .unwrap_or_else(|| "This Device".to_string())
+}
+
 fn tokenomics_device_id_from_value(value: &Value, inherited: Option<String>) -> String {
     tokenomics_text_field(value, &["device_id", "deviceId", "machine_id", "machineId"])
         .or(inherited)
@@ -1227,6 +1245,190 @@ fn tokenomics_store_local_device_aliases(
     )
     .map_err(|error| format!("Unable to store Tokenomics device aliases: {error}"))?;
     Ok(())
+}
+
+fn tokenomics_device_identity_ids(identity: &Value) -> Vec<String> {
+    [
+        tokenomics_text_field(identity, &["device_id", "deviceId"]),
+        tokenomics_text_field(identity, &["machine_id", "machineId"]),
+        tokenomics_text_field(identity, &["native_device_id", "nativeDeviceId"]),
+        tokenomics_text_field(identity, &["target_device_id", "targetDeviceId"]),
+        tokenomics_text_field(identity, &["id"]),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| tokenomics_clean_device_id(&value))
+    .collect::<std::collections::BTreeSet<_>>()
+    .into_iter()
+    .collect()
+}
+
+fn tokenomics_device_identity_label(identity: &Value) -> Option<String> {
+    tokenomics_text_field(
+        identity,
+        &[
+            "display_name",
+            "displayName",
+            "label",
+            "device_name",
+            "deviceName",
+            "machine_name",
+            "machineName",
+            "hostname",
+            "name",
+        ],
+    )
+}
+
+fn tokenomics_generic_device_label(device_id: &str) -> String {
+    let lower = device_id.to_ascii_lowercase();
+    if lower.contains("windows") || lower.starts_with("win") {
+        "Windows PC".to_string()
+    } else if lower.contains("macos") || lower.contains("macbook") || lower.starts_with("mac") {
+        "Mac device".to_string()
+    } else if lower.contains("linux") {
+        "Linux device".to_string()
+    } else {
+        "Other device".to_string()
+    }
+}
+
+fn tokenomics_cached_device_identities(conn: &rusqlite::Connection) -> Result<Vec<Value>, String> {
+    let stored: String = match conn.query_row(
+        "SELECT value FROM tokenomics_meta WHERE key=?1",
+        rusqlite::params![TOKENOMICS_DEVICE_IDENTITIES_KEY],
+        |row| row.get(0),
+    ) {
+        Ok(text) => text,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Unable to read Tokenomics device identities: {error}")),
+    };
+    let parsed = serde_json::from_str::<Value>(&stored).unwrap_or_else(|_| json!([]));
+    Ok(parsed.as_array().cloned().unwrap_or_default())
+}
+
+fn tokenomics_store_cloud_device_identities(
+    conn: &rusqlite::Connection,
+    summary: &Value,
+) -> Result<usize, String> {
+    let incoming = summary
+        .get("device_identities")
+        .or_else(|| summary.get("deviceIdentities"))
+        .or_else(|| summary.get("devices"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+
+    let mut by_id = std::collections::BTreeMap::<String, Value>::new();
+    for identity in tokenomics_cached_device_identities(conn)?
+        .into_iter()
+        .chain(incoming.into_iter())
+    {
+        let ids = tokenomics_device_identity_ids(&identity);
+        if ids.is_empty() {
+            continue;
+        }
+        let primary_id = ids[0].clone();
+        let label = tokenomics_device_identity_label(&identity);
+        let updated_at = tokenomics_text_field(
+            &identity,
+            &["updated_at", "updatedAt", "last_seen_at", "lastSeenAt"],
+        )
+        .unwrap_or_else(tokenomics_now_iso_like);
+        let mut object = identity.as_object().cloned().unwrap_or_default();
+        object.insert("device_id".to_string(), json!(primary_id.as_str()));
+        object.insert("machine_id".to_string(), json!(primary_id.as_str()));
+        object.insert("updated_at".to_string(), json!(updated_at.as_str()));
+        object.insert("last_seen_at".to_string(), json!(updated_at.as_str()));
+        if let Some(label) = label {
+            object.insert("display_name".to_string(), json!(label.as_str()));
+            object.insert("device_name".to_string(), json!(label.as_str()));
+        }
+        let value = Value::Object(object);
+        for id in ids {
+            let replace = by_id
+                .get(&id)
+                .and_then(|existing| tokenomics_text_field(existing, &["updated_at", "updatedAt"]))
+                .map(|existing_updated_at| updated_at.as_str() >= existing_updated_at.as_str())
+                .unwrap_or(true);
+            if replace {
+                by_id.insert(id, value.clone());
+            }
+        }
+    }
+    let rows = by_id.into_values().collect::<Vec<_>>();
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![TOKENOMICS_DEVICE_IDENTITIES_KEY, json!(rows).to_string()],
+    )
+    .map_err(|error| format!("Unable to store Tokenomics device identities: {error}"))?;
+    Ok(rows.len())
+}
+
+fn tokenomics_summary_device_identities(
+    conn: &rusqlite::Connection,
+    include_cloud: bool,
+) -> Result<Vec<Value>, String> {
+    let mut by_id = std::collections::BTreeMap::<String, Value>::new();
+    let current_device_id = tokenomics_local_device_id();
+    let current_device_name = tokenomics_local_device_name();
+    by_id.insert(
+        current_device_id.clone(),
+        json!({
+            "device_id": current_device_id.as_str(),
+            "machine_id": current_device_id.as_str(),
+            "display_name": current_device_name.as_str(),
+            "device_name": current_device_name.as_str(),
+            "source": "local_device_profile",
+            "current": true,
+            "updated_at": tokenomics_now_iso_like(),
+        }),
+    );
+    for identity in tokenomics_cached_device_identities(conn)? {
+        for id in tokenomics_device_identity_ids(&identity) {
+            by_id.entry(id).or_insert_with(|| identity.clone());
+        }
+    }
+
+    let table = if include_cloud {
+        "tokenomics_display_rollups"
+    } else {
+        "tokenomics_rollups"
+    };
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT device_id, MAX(updated_at) AS updated_at
+             FROM {table}
+             WHERE device_id IS NOT NULL AND device_id!=''
+             GROUP BY device_id"
+        ))
+        .map_err(|error| format!("Unable to prepare Tokenomics device identity query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| format!("Unable to query Tokenomics device identities: {error}"))?;
+    for row in rows {
+        let (device_id, updated_at) =
+            row.map_err(|error| format!("Unable to read Tokenomics device identity: {error}"))?;
+        let Some(device_id) = tokenomics_clean_device_id(&device_id) else {
+            continue;
+        };
+        by_id.entry(device_id.clone()).or_insert_with(|| {
+            let label = tokenomics_generic_device_label(&device_id);
+            json!({
+                "device_id": device_id.as_str(),
+                "machine_id": device_id.as_str(),
+                "display_name": label.as_str(),
+                "device_name": label.as_str(),
+                "source": "usage_rollups",
+                "updated_at": updated_at.as_str(),
+                "last_seen_at": updated_at.as_str(),
+            })
+        });
+    }
+    Ok(by_id.into_values().collect())
 }
 
 fn tokenomics_reconcile_local_device_id(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -3515,9 +3717,9 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
 	        ),
 	    )?;
     let hourly = tokenomics_query_rows(
-	        conn,
-	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count, MAX(updated_at) AS updated_at FROM {hourly_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind), bucket_start ORDER BY bucket_start DESC LIMIT 5000"
+		        conn,
+		        &format!(
+		            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count, MAX(updated_at) AS updated_at FROM {hourly_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind), bucket_start ORDER BY bucket_start DESC LIMIT 5000"
 	        ),
 	    )?;
     let limits = tokenomics_provider_limits(conn, include_cloud, include_cloud)?;
@@ -3526,14 +3728,16 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     } else {
         hourly
     };
+    let device_identities = tokenomics_summary_device_identities(conn, include_cloud)?;
     Ok(json!({
-    "known": total.get("total_tokens").and_then(Value::as_i64).unwrap_or(0) > 0,
-    "source": "rust_local_tokenomics_sqlite",
-    "updated_at": tokenomics_now_iso_like(),
-    "current_device_id": tokenomics_local_device_id(),
-    "inserted_events": inserted_events.unwrap_or(0),
-    "total": total,
-    "by_device": by_device,
+	    "known": total.get("total_tokens").and_then(Value::as_i64).unwrap_or(0) > 0,
+	    "source": "rust_local_tokenomics_sqlite",
+	    "updated_at": tokenomics_now_iso_like(),
+	    "current_device_id": tokenomics_local_device_id(),
+	    "current_device_name": tokenomics_local_device_name(),
+	    "inserted_events": inserted_events.unwrap_or(0),
+	    "total": total,
+	    "by_device": by_device,
     "by_device_provider": by_device_provider,
     "by_device_account": by_device_account,
     "by_device_model": by_device_model,
@@ -3546,9 +3750,11 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         {"provider": "anthropic", "agent_kind": "claude", "label": "Claude Code"},
         {"provider": "openai", "agent_kind": "codex", "label": "Codex"},
         {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
-    ],
-    "limits": limits,
-    }))
+	    ],
+	    "limits": limits,
+	    "device_identities": device_identities.clone(),
+	    "deviceIdentities": device_identities,
+	    }))
 }
 
 fn tokenomics_sql_string_literal(value: &str) -> String {
@@ -3723,6 +3929,7 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
     let summary = tokenomics_cloud_summary_payload(event);
     let stored_limit_count =
         tokenomics_store_cloud_provider_limits(&conn, summary, &inherited_billing_scope)?;
+    let stored_device_identity_count = tokenomics_store_cloud_device_identities(&conn, summary)?;
     let hourly = summary
         .get("hourly")
         .and_then(Value::as_array)
@@ -3733,6 +3940,7 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
             "ok": true,
             "stored_count": 0,
             "stored_limit_count": stored_limit_count,
+            "stored_device_identity_count": stored_device_identity_count,
             "event_kind": event_kind,
         }));
     }
@@ -3844,6 +4052,7 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
         "ok": true,
         "stored_count": stored_count,
         "stored_limit_count": stored_limit_count,
+        "stored_device_identity_count": stored_device_identity_count,
         "event_kind": event_kind,
         "device_count": incoming_devices.len(),
     }))
