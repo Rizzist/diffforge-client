@@ -174,9 +174,10 @@ CREATE TABLE IF NOT EXISTS task_dependencies(
   PRIMARY KEY(task_id, depends_on_task_id)
 );
 
-CREATE TABLE IF NOT EXISTS terminal_task_plans(
+CREATE TABLE IF NOT EXISTS terminal_todo_plans(
   id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL UNIQUE,
+  todo_id TEXT NOT NULL UNIQUE,
+  workspace_id TEXT,
   agent_id TEXT,
   session_id TEXT,
   title TEXT,
@@ -189,10 +190,10 @@ CREATE TABLE IF NOT EXISTS terminal_task_plans(
   interrupted_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
+CREATE TABLE IF NOT EXISTS terminal_todo_plan_steps(
   id TEXT PRIMARY KEY,
   plan_id TEXT NOT NULL,
-  task_id TEXT NOT NULL,
+  todo_id TEXT NOT NULL,
   step_index INTEGER NOT NULL,
   title TEXT NOT NULL,
   detail TEXT,
@@ -203,7 +204,8 @@ CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
   completed_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE(plan_id, step_index)
+  UNIQUE(plan_id, step_index),
+  UNIQUE(plan_id, todo_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_resource_intents(
@@ -808,9 +810,6 @@ ON agent_sessions(pty_id)
 WHERE status='active' AND pty_id IS NOT NULL AND pty_id <> '';
 CREATE INDEX IF NOT EXISTS idx_task_resource_intents_task ON task_resource_intents(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_resource_intents_resource ON task_resource_intents(resource_key, status);
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_task ON terminal_task_plans(task_id);
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_session ON terminal_task_plans(session_id, status);
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plan_steps_plan ON terminal_task_plan_steps(plan_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_task ON task_slice_dependencies(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_task_slice_dependencies_resource ON task_slice_dependencies(resource_key, status);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
@@ -881,12 +880,18 @@ CREATE TABLE IF NOT EXISTS dependency_edges(
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_dependent ON dependency_edges(dependent_task_id, status, required);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_prerequisite ON dependency_edges(prerequisite_kind, prerequisite_key, status);
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_predicate ON dependency_edges(predicate_kind, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_todo ON terminal_todo_plans(todo_id);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_session ON terminal_todo_plans(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_workspace ON terminal_todo_plans(workspace_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plan_steps_plan ON terminal_todo_plan_steps(plan_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plan_steps_todo ON terminal_todo_plan_steps(todo_id);
 "#;
 
 pub const TERMINAL_TODO_PLAN_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS terminal_task_plans(
+CREATE TABLE IF NOT EXISTS terminal_todo_plans(
   id TEXT PRIMARY KEY,
-  task_id TEXT NOT NULL UNIQUE,
+  todo_id TEXT NOT NULL UNIQUE,
+  workspace_id TEXT,
   agent_id TEXT,
   session_id TEXT,
   title TEXT,
@@ -899,10 +904,10 @@ CREATE TABLE IF NOT EXISTS terminal_task_plans(
   interrupted_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
+CREATE TABLE IF NOT EXISTS terminal_todo_plan_steps(
   id TEXT PRIMARY KEY,
   plan_id TEXT NOT NULL,
-  task_id TEXT NOT NULL,
+  todo_id TEXT NOT NULL,
   step_index INTEGER NOT NULL,
   title TEXT NOT NULL,
   detail TEXT,
@@ -913,12 +918,15 @@ CREATE TABLE IF NOT EXISTS terminal_task_plan_steps(
   completed_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  UNIQUE(plan_id, step_index)
+  UNIQUE(plan_id, step_index),
+  UNIQUE(plan_id, todo_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_task ON terminal_task_plans(task_id);
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plans_session ON terminal_task_plans(session_id, status);
-CREATE INDEX IF NOT EXISTS idx_terminal_task_plan_steps_plan ON terminal_task_plan_steps(plan_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_todo ON terminal_todo_plans(todo_id);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_session ON terminal_todo_plans(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plans_workspace ON terminal_todo_plans(workspace_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plan_steps_plan ON terminal_todo_plan_steps(plan_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_terminal_todo_plan_steps_todo ON terminal_todo_plan_steps(todo_id);
 "#;
 
 pub const SLOT_SCHEMA_SQL: &str = r#"

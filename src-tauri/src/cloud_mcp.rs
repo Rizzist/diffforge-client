@@ -4186,6 +4186,29 @@ async fn cloud_mcp_send_lifecycle_event(
     }))
 }
 
+async fn cloud_mcp_send_app_ws_close_request(
+    state: &CloudMcpState,
+    reason: &str,
+) -> Result<(), String> {
+    let auth = cloud_mcp_ws_auth_object(state).await?;
+    let reason = reason.trim();
+    let now = cloud_mcp_now_ms();
+    let envelope = json!({
+        "kind": "cloud_app_ws_close",
+        "id": format!("desktop-close-{}-{}", now, uuid::Uuid::new_v4()),
+        "contract": "diffforge.app_ws.v1",
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "reason": if reason.is_empty() { "app_shutdown" } else { reason },
+        "source": "rust-diffforge",
+    });
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return Err("Cloud MCP app websocket is not connected.".to_string());
+    };
+    tx.send(envelope)
+        .map_err(|_| "Cloud MCP app websocket sender is closed.".to_string())
+}
+
 fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
     let Some(target_device_id) = cloud_mcp_payload_text(event, &["target_device_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["targetDeviceId"]))
@@ -11212,7 +11235,7 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
     }
 
     let reason = reason.trim();
-    let result = timeout(
+    let lifecycle_result = timeout(
         Duration::from_millis(900),
         cloud_mcp_send_lifecycle_event(
             &state,
@@ -11225,9 +11248,15 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
             }),
         ),
     )
-    .await
-    .map_err(|_| "Timed out sending desktop close signal to Cloud MCP.".to_string())??;
-    sleep(Duration::from_millis(150)).await;
+    .await;
+    let _ = timeout(
+        Duration::from_millis(900),
+        cloud_mcp_send_app_ws_close_request(&state, reason),
+    )
+    .await;
+    sleep(Duration::from_millis(250)).await;
+    let result = lifecycle_result
+        .map_err(|_| "Timed out sending desktop close signal to Cloud MCP.".to_string())??;
     Ok(result)
 }
 
@@ -14438,6 +14467,7 @@ async fn cloud_mcp_register_workspace_asset(
     metadata: Option<Value>,
     upload: Option<bool>,
 ) -> Result<Value, String> {
+    diffforge_reject_untracked_asset_path_for_tracking(Path::new(&path), "register a tracked asset")?;
     let req = cloud_mcp_repo_request(
         repo_path.clone(),
         Some(workspace_id.clone()),
@@ -14506,6 +14536,7 @@ async fn cloud_mcp_upload_workspace_asset(
     let row = cloud_mcp_asset_row_from_file(&asset_id)?;
     let local_path = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"])
         .ok_or_else(|| "Asset has no local path to upload.".to_string())?;
+    diffforge_reject_untracked_asset_path_for_tracking(Path::new(&local_path), "upload a tracked asset")?;
     let mut payload = cloud_mcp_asset_payload_base(
         &req,
         &workspace_id,
@@ -14663,6 +14694,7 @@ async fn cloud_mcp_download_workspace_asset(
             .join(".diffforge")
             .join("assets")
     });
+    diffforge_reject_untracked_asset_path_for_tracking(&target_dir, "download a tracked asset")?;
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("Unable to create asset download directory: {error}"))?;
     let target_path = cloud_mcp_available_asset_download_path(&target_dir, &name);
@@ -20977,9 +21009,12 @@ pub(crate) fn cloud_mcp_forward_agent_get_asset_root(
         .map(|value| cloud_mcp_sanitize_asset_id(&value))
         .unwrap_or_else(|| format!("asset-{}", uuid::Uuid::new_v4()));
     let filename = cloud_mcp_asset_filename_for_input(input, "asset");
-    let group = cloud_mcp_payload_text(input, &["group", "category", "source_kind", "sourceKind"])
+    let raw_group = cloud_mcp_payload_text(input, &["group", "category", "source_kind", "sourceKind"])
         .unwrap_or_else(|| "generated".to_string());
-    let group = cloud_mcp_sanitize_asset_filename(&group, "generated");
+    if diffforge_asset_group_is_untracked(&raw_group) {
+        return Err("get_asset_root cannot create paths inside the untracked scratch folder.".to_string());
+    }
+    let group = cloud_mcp_sanitize_asset_filename(&raw_group, "generated");
     let asset_root = cloud_mcp_managed_asset_root()?;
     let asset_dir = asset_root.join(&group).join(&asset_id);
     fs::create_dir_all(&asset_dir)
@@ -21215,6 +21250,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
 ) -> Result<Value, String> {
     let path = cloud_mcp_payload_text(input, &["path", "local_path", "localPath"])
         .ok_or_else(|| "upload_asset requires path or local_path.".to_string())?;
+    diffforge_reject_untracked_asset_path_for_tracking(Path::new(&path), "upload a tracked asset")?;
     let repo_path = repo_path.unwrap_or_default().trim().to_string();
     let req = cloud_mcp_repo_request(
         repo_path,
@@ -21400,6 +21436,7 @@ pub(crate) fn cloud_mcp_forward_agent_download_asset(
                 .join("cloud")
                 .join(&asset_id)
         });
+    diffforge_reject_untracked_asset_path_for_tracking(&target_dir, "download a tracked asset")?;
     fs::create_dir_all(&target_dir)
         .map_err(|error| format!("Unable to create asset target directory: {error}"))?;
     let mut payload = cloud_mcp_asset_payload_base(

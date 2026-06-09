@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { createGlobalStyle, keyframes } from "styled-components";
 
@@ -17,6 +18,14 @@ const REFRESH_INTERVAL_MS = 4500;
 const REFRESH_DEBOUNCE_MS = 180;
 const LIVE_EVENT_LIMIT = 36;
 const CARD_LIMIT = 8;
+
+function runOverlayWindowAction(action) {
+  try {
+    Promise.resolve(action(getCurrentWindow())).catch(() => {});
+  } catch {
+    // Native overlay chrome is best-effort.
+  }
+}
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -891,7 +900,7 @@ function selectHudCards(todoCards, remoteCards, syncCards, transferCards) {
     ...remoteCards.map((card) => ({ ...card, group: "remote" })),
     ...syncCards.map((card) => ({ ...card, group: "sync" })),
     ...transferCards.map((card) => ({ ...card, group: "move" })),
-  ], 4);
+  ], 14);
 }
 
 function hudCardKind(card) {
@@ -924,6 +933,11 @@ function hudCardMeta(card) {
   const meta = firstText(card?.meta, card?.detail);
   const age = timeAgo(card?.updatedAt);
   return meta ? `${shortText(meta, 44)} / ${age}` : `updated ${age}`;
+}
+
+function hudCardShowsProgress(card) {
+  const kind = hudCardKind(card);
+  return kind === "upload" || kind === "download" || kind === "transfer";
 }
 
 function hudIdleCard(data) {
@@ -1107,76 +1121,95 @@ export default function ActivityOverlayWindow() {
     [remoteCards, syncCards, todoCards, transferCards],
   );
   const primaryCard = hudCards[0] || hudIdleCard(data);
-  const secondaryCards = hudCards.slice(1, 4);
+  const secondaryCards = hudCards.slice(1);
   const statusToneName = primaryCard.tone || (data.errors.length ? "warn" : stats.failed ? "danger" : stats.active ? "hot" : "muted");
   const primaryKind = hudCardKind(primaryCard);
   const primaryActive = statusKey(primaryCard.status) === "active";
   const primaryProgress = clampPercent(primaryCard.progress ?? statusProgress(primaryCard.status));
+  const primaryShowsProgress = hudCardShowsProgress(primaryCard);
+  const dragOverlayWindow = useCallback((event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (event.button !== 0 || target?.closest("[data-overlay-scroll]")) {
+      return;
+    }
+
+    runOverlayWindowAction((windowHandle) => windowHandle.startDragging());
+  }, []);
 
   return (
     <>
       <OverlayGlobalStyle />
-      <MinimalRoot data-tone={statusToneName}>
-        <PrimarySignal data-tone={statusToneName}>
-          <PrimaryTop>
-            <SignalIcon
-              aria-hidden="true"
-              data-active={primaryActive ? "true" : "false"}
-              data-kind={primaryKind}
-              data-tone={statusToneName}
-            />
-            <PrimaryCopy>
-              <PrimaryTitle>{primaryCard.title}</PrimaryTitle>
-              <PrimaryDetail>{hudCardSubtitle(primaryCard)}</PrimaryDetail>
-            </PrimaryCopy>
-            <SignalChip data-tone={statusToneName}>{hudCardChip(primaryCard)}</SignalChip>
-          </PrimaryTop>
-          <PrimaryMeta>{hudCardMeta(primaryCard)}</PrimaryMeta>
-          <SignalTrack aria-hidden="true">
-            <SignalFill
-              data-kind={primaryKind}
-              data-tone={statusToneName}
-              style={{ width: `${primaryProgress}%` }}
-            />
-          </SignalTrack>
-        </PrimarySignal>
+      <OverlayShell>
+        <MinimalRoot data-tone={statusToneName} onMouseDown={dragOverlayWindow}>
+          <PrimarySignal
+            data-tauri-drag-region
+            data-tone={statusToneName}
+          >
+            <PrimaryTop>
+              <SignalIcon
+                aria-hidden="true"
+                data-active={primaryActive ? "true" : "false"}
+                data-kind={primaryKind}
+                data-tone={statusToneName}
+              />
+              <PrimaryCopy>
+                <PrimaryTitle>{primaryCard.title}</PrimaryTitle>
+                <PrimaryDetail>{hudCardSubtitle(primaryCard)}</PrimaryDetail>
+              </PrimaryCopy>
+              <SignalChip data-tone={statusToneName}>{hudCardChip(primaryCard)}</SignalChip>
+            </PrimaryTop>
+            <PrimaryMeta>{hudCardMeta(primaryCard)}</PrimaryMeta>
+            {primaryShowsProgress ? (
+              <SignalTrack aria-hidden="true">
+                <SignalFill
+                  data-kind={primaryKind}
+                  data-tone={statusToneName}
+                  style={{ width: `${primaryProgress}%` }}
+                />
+              </SignalTrack>
+            ) : null}
+          </PrimarySignal>
 
-        <MiniFeed aria-live="polite">
-          {secondaryCards.length ? secondaryCards.map((card) => {
-            const kind = hudCardKind(card);
-            const tone = card.tone || statusTone(card.status);
-            const progress = clampPercent(card.progress ?? statusProgress(card.status));
-            return (
-              <MiniRow data-tone={tone} key={card.id}>
-                <MiniIcon aria-hidden="true" data-kind={kind} data-tone={tone} />
-                <MiniCopy>
-                  <MiniTitle>{card.title}</MiniTitle>
-                  <MiniMeta>{hudCardMeta(card)}</MiniMeta>
-                  <MiniTrack aria-hidden="true">
-                    <MiniFill data-kind={kind} data-tone={tone} style={{ width: `${progress}%` }} />
-                  </MiniTrack>
-                </MiniCopy>
-                <MiniChip>{hudCardChip(card)}</MiniChip>
-              </MiniRow>
-            );
-          }) : (
-            <QuietRow>
-              <QuietLoader aria-hidden="true" />
-              <QuietCopy>
-                <QuietTitle>Listening for work</QuietTitle>
-                <QuietMeta>{data.errors.length ? data.errors.join(", ") : `updated ${timeAgo(data.updatedAt)}`}</QuietMeta>
-              </QuietCopy>
-            </QuietRow>
-          )}
-        </MiniFeed>
+          <MiniFeed aria-live="polite" data-overlay-scroll>
+            {secondaryCards.length ? secondaryCards.map((card) => {
+              const kind = hudCardKind(card);
+              const tone = card.tone || statusTone(card.status);
+              const progress = clampPercent(card.progress ?? statusProgress(card.status));
+              const showsProgress = hudCardShowsProgress(card);
+              return (
+                <MiniRow data-progress={showsProgress ? "true" : "false"} data-tone={tone} key={card.id}>
+                  <MiniIcon aria-hidden="true" data-kind={kind} data-tone={tone} />
+                  <MiniCopy>
+                    <MiniTitle>{card.title}</MiniTitle>
+                    <MiniMeta>{hudCardMeta(card)}</MiniMeta>
+                    {showsProgress ? (
+                      <MiniTrack aria-hidden="true">
+                        <MiniFill data-kind={kind} data-tone={tone} style={{ width: `${progress}%` }} />
+                      </MiniTrack>
+                    ) : null}
+                  </MiniCopy>
+                  <MiniChip>{hudCardChip(card)}</MiniChip>
+                </MiniRow>
+              );
+            }) : (
+              <QuietRow>
+                <QuietLoader aria-hidden="true" />
+                <QuietCopy>
+                  <QuietTitle>Listening for work</QuietTitle>
+                  <QuietMeta>{data.errors.length ? data.errors.join(", ") : `updated ${timeAgo(data.updatedAt)}`}</QuietMeta>
+                </QuietCopy>
+              </QuietRow>
+            )}
+          </MiniFeed>
 
-        <MinimalFooter>
-          <LiveDot data-active={stats.active > 0 ? "true" : "false"} />
-          <span>{data.errors.length ? "snapshot pending" : stats.active > 0 ? "live work" : "quiet"}</span>
-          <FooterSpacer />
-          <span>{timeAgo(data.updatedAt)}</span>
-        </MinimalFooter>
-      </MinimalRoot>
+          <MinimalFooter data-tauri-drag-region>
+            <LiveDot data-active={stats.active > 0 ? "true" : "false"} />
+            <span>{data.errors.length ? "snapshot pending" : stats.active > 0 ? "live work" : "quiet"}</span>
+            <FooterSpacer />
+            <span>{timeAgo(data.updatedAt)}</span>
+          </MinimalFooter>
+        </MinimalRoot>
+      </OverlayShell>
     </>
   );
 }
@@ -1190,47 +1223,70 @@ const softPulse = keyframes`
   50% { opacity: 1; }
 `;
 
+const OverlayShell = styled.div`
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 8px;
+  background: transparent;
+`;
+
 const MinimalRoot = styled.main`
-  width: 390px;
-  height: 228px;
+  width: 100%;
+  height: 100%;
   max-width: 100vw;
   max-height: 100vh;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
-  padding: 16px;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  color: rgba(248, 246, 240, 0.9);
+  gap: 9px;
+  color: var(--forge-text, #f4f7fa);
   font-family: "SF Mono", "JetBrains Mono", "Roboto Mono", ui-monospace, Menlo, Consolas, monospace;
   letter-spacing: 0;
+  background: rgba(7, 9, 13, 0.94);
   background:
-    linear-gradient(180deg, rgba(24, 24, 27, 0.9), rgba(13, 13, 15, 0.88)),
-    rgba(10, 10, 12, 0.86);
-  border: 1px solid rgba(232, 229, 220, 0.18);
-  border-radius: 18px;
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--forge-surface-raised, #11161d) 92%, transparent),
+      color-mix(in srgb, var(--forge-bg, #07090d) 94%, transparent)
+    ),
+    var(--forge-bg, #07090d);
+  border: 1px solid var(--forge-border-strong, rgba(230, 236, 245, 0.16));
+  border-radius: 20px;
   box-shadow:
-    0 22px 68px rgba(0, 0, 0, 0.52),
-    inset 0 1px 0 rgba(255, 255, 255, 0.045);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
+    0 18px 54px rgba(0, 0, 0, 0.42),
+    inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
 
   &[data-tone="danger"] {
-    border-color: rgba(255, 91, 106, 0.32);
+    border-color: color-mix(in srgb, var(--forge-red, #ef6b6b) 42%, var(--forge-border-strong, rgba(230, 236, 245, 0.16)));
   }
 
   &[data-tone="warn"] {
-    border-color: rgba(255, 169, 38, 0.28);
+    border-color: color-mix(in srgb, var(--forge-amber, #dfa55a) 38%, var(--forge-border-strong, rgba(230, 236, 245, 0.16)));
   }
 
   &[data-tone="hot"] {
-    border-color: rgba(255, 169, 38, 0.24);
+    border-color: color-mix(in srgb, var(--forge-blue, #3b82f6) 36%, var(--forge-border-strong, rgba(230, 236, 245, 0.16)));
   }
 `;
 
 const PrimarySignal = styled.section`
+  flex: 0 0 auto;
   min-width: 0;
   display: grid;
-  gap: 9px;
+  gap: 8px;
+  cursor: grab;
+
+  &:active {
+    cursor: grabbing;
+  }
 `;
 
 const PrimaryTop = styled.div`
@@ -1250,7 +1306,7 @@ const PrimaryCopy = styled.div`
 const PrimaryTitle = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: rgba(255, 255, 252, 0.94);
+  color: var(--forge-text, #f4f7fa);
   font-size: 15px;
   font-weight: 760;
   line-height: 1.2;
@@ -1261,7 +1317,7 @@ const PrimaryTitle = styled.div`
 const PrimaryDetail = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: rgba(248, 246, 240, 0.58);
+  color: var(--forge-text-soft, #b6c0cc);
   font-size: 12px;
   font-weight: 500;
   line-height: 1.35;
@@ -1273,7 +1329,7 @@ const PrimaryMeta = styled.div`
   min-width: 0;
   overflow: hidden;
   padding-left: 40px;
-  color: rgba(248, 246, 240, 0.42);
+  color: var(--forge-text-muted, #7a8493);
   font-size: 10px;
   font-weight: 520;
   line-height: 1;
@@ -1285,43 +1341,48 @@ const SignalChip = styled.div`
   max-width: 86px;
   overflow: hidden;
   padding: 5px 9px;
-  border: 1px solid rgba(255, 169, 38, 0.44);
+  border: 1px solid color-mix(in srgb, var(--forge-blue, #3b82f6) 54%, transparent);
   border-radius: 5px;
-  color: rgba(255, 188, 72, 0.92);
+  color: var(--forge-blue-soft, #7db0ff);
   font-size: 11px;
   font-weight: 700;
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
 
+  &[data-tone="warn"] {
+    color: var(--forge-amber, #dfa55a);
+    border-color: color-mix(in srgb, var(--forge-amber, #dfa55a) 52%, transparent);
+  }
+
   &[data-tone="danger"] {
-    color: rgba(255, 118, 130, 0.94);
-    border-color: rgba(255, 91, 106, 0.5);
+    color: var(--forge-red, #ef6b6b);
+    border-color: color-mix(in srgb, var(--forge-red, #ef6b6b) 54%, transparent);
   }
 
   &[data-tone="good"] {
-    color: rgba(77, 213, 129, 0.9);
-    border-color: rgba(77, 213, 129, 0.38);
+    color: var(--forge-green, #3ccb7f);
+    border-color: color-mix(in srgb, var(--forge-green, #3ccb7f) 48%, transparent);
   }
 `;
 
 const iconColor = `
-  color: rgba(255, 169, 38, 0.95);
+  color: var(--forge-blue-soft, #7db0ff);
 
   &[data-tone="danger"] {
-    color: rgba(255, 102, 118, 0.96);
+    color: var(--forge-red, #ef6b6b);
   }
 
   &[data-tone="good"] {
-    color: rgba(77, 213, 129, 0.92);
+    color: var(--forge-green, #3ccb7f);
+  }
+
+  &[data-tone="warn"] {
+    color: var(--forge-amber, #dfa55a);
   }
 
   &[data-kind="download"] {
-    color: rgba(122, 169, 255, 0.95);
-  }
-
-  &[data-kind="remote"] {
-    color: rgba(188, 160, 255, 0.92);
+    color: #8ec5ff;
   }
 `;
 
@@ -1331,7 +1392,7 @@ const SignalIcon = styled.span`
   height: 30px;
   display: block;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.035);
+  background: var(--forge-surface-control, #151b23);
   ${iconColor}
 
   &::before,
@@ -1409,38 +1470,53 @@ const SignalTrack = styled.div`
   height: 5px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
+  background: color-mix(in srgb, var(--forge-border-strong, rgba(230, 236, 245, 0.16)) 70%, transparent);
 `;
 
 const SignalFill = styled.div`
   height: 100%;
   min-width: 7%;
   border-radius: inherit;
-  background: linear-gradient(90deg, rgba(255, 169, 38, 0.98), rgba(255, 205, 93, 0.9));
+  background: linear-gradient(90deg, var(--forge-blue, #3b82f6), var(--forge-blue-soft, #7db0ff));
   transition: width 180ms ease;
 
   &[data-kind="download"] {
-    background: linear-gradient(90deg, rgba(92, 145, 255, 0.98), rgba(137, 188, 255, 0.9));
-  }
-
-  &[data-kind="remote"] {
-    background: linear-gradient(90deg, rgba(163, 126, 255, 0.96), rgba(217, 186, 255, 0.82));
+    background: linear-gradient(90deg, #4fa3ff, #8ec5ff);
   }
 
   &[data-kind="sync"],
   &[data-tone="good"] {
-    background: linear-gradient(90deg, rgba(65, 210, 124, 0.96), rgba(149, 226, 167, 0.84));
+    background: linear-gradient(90deg, var(--forge-green, #3ccb7f), #84e7b0);
   }
 
   &[data-tone="danger"] {
-    background: linear-gradient(90deg, rgba(255, 88, 105, 0.98), rgba(255, 151, 161, 0.84));
+    background: linear-gradient(90deg, var(--forge-red, #ef6b6b), #ff9a9a);
   }
 `;
 
 const MiniFeed = styled.div`
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
+  align-content: start;
   gap: 7px;
+  overflow-y: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+  scrollbar-color: color-mix(in srgb, var(--forge-blue, #3b82f6) 52%, transparent) transparent;
+
+  &::-webkit-scrollbar {
+    width: 5px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--forge-blue, #3b82f6) 42%, transparent);
+  }
 `;
 
 const MiniRow = styled.div`
@@ -1450,9 +1526,13 @@ const MiniRow = styled.div`
   align-items: center;
   gap: 9px;
   padding: 8px 9px;
-  border: 1px solid rgba(248, 246, 240, 0.08);
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.026);
+  background: color-mix(in srgb, var(--forge-surface-raised, #11161d) 72%, transparent);
+
+  &[data-progress="false"] {
+    padding-block: 9px;
+  }
 `;
 
 const MiniIcon = styled.span`
@@ -1516,7 +1596,7 @@ const MiniCopy = styled.div`
 const MiniTitle = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: rgba(248, 246, 240, 0.82);
+  color: var(--forge-text, #f4f7fa);
   font-size: 11px;
   font-weight: 640;
   line-height: 1;
@@ -1527,7 +1607,7 @@ const MiniTitle = styled.div`
 const MiniMeta = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: rgba(248, 246, 240, 0.36);
+  color: var(--forge-text-muted, #7a8493);
   font-size: 9px;
   font-weight: 520;
   line-height: 1;
@@ -1539,7 +1619,7 @@ const MiniTrack = styled.div`
   height: 2px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
+  background: color-mix(in srgb, var(--forge-border, rgba(230, 236, 245, 0.1)) 82%, transparent);
 `;
 
 const MiniFill = styled(SignalFill)`
@@ -1549,7 +1629,7 @@ const MiniFill = styled(SignalFill)`
 const MiniChip = styled.div`
   max-width: 62px;
   overflow: hidden;
-  color: rgba(248, 246, 240, 0.38);
+  color: var(--forge-text-muted, #7a8493);
   font-size: 9px;
   font-weight: 650;
   line-height: 1;
@@ -1565,16 +1645,16 @@ const QuietRow = styled.div`
   align-items: center;
   gap: 10px;
   padding: 10px;
-  border: 1px dashed rgba(248, 246, 240, 0.1);
+  border: 1px dashed var(--forge-border, rgba(230, 236, 245, 0.1));
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.018);
+  background: color-mix(in srgb, var(--forge-surface, #0d1117) 54%, transparent);
 `;
 
 const QuietLoader = styled.span`
   width: 18px;
   height: 18px;
-  border: 2px solid rgba(248, 246, 240, 0.18);
-  border-top-color: rgba(255, 169, 38, 0.92);
+  border: 2px solid color-mix(in srgb, var(--forge-border-strong, rgba(230, 236, 245, 0.16)) 88%, transparent);
+  border-top-color: var(--forge-blue-soft, #7db0ff);
   border-radius: 50%;
   animation: ${spin} 1s linear infinite;
 `;
@@ -1586,7 +1666,7 @@ const QuietCopy = styled.div`
 `;
 
 const QuietTitle = styled.div`
-  color: rgba(248, 246, 240, 0.8);
+  color: var(--forge-text, #f4f7fa);
   font-size: 12px;
   font-weight: 680;
   line-height: 1;
@@ -1595,7 +1675,7 @@ const QuietTitle = styled.div`
 const QuietMeta = styled.div`
   min-width: 0;
   overflow: hidden;
-  color: rgba(248, 246, 240, 0.4);
+  color: var(--forge-text-muted, #7a8493);
   font-size: 10px;
   font-weight: 520;
   line-height: 1;
@@ -1604,15 +1684,21 @@ const QuietMeta = styled.div`
 `;
 
 const MinimalFooter = styled.footer`
+  flex: 0 0 auto;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
-  color: rgba(248, 246, 240, 0.32);
+  color: var(--forge-text-muted, #7a8493);
+  cursor: grab;
   font-size: 9px;
   font-weight: 650;
   line-height: 1;
   text-transform: uppercase;
+
+  &:active {
+    cursor: grabbing;
+  }
 `;
 
 const LiveDot = styled.span`
@@ -1620,10 +1706,10 @@ const LiveDot = styled.span`
   height: 6px;
   flex: 0 0 auto;
   border-radius: 50%;
-  background: rgba(248, 246, 240, 0.34);
+  background: var(--forge-text-disabled, #505966);
 
   &[data-active="true"] {
-    background: rgba(54, 215, 119, 0.96);
+    background: var(--forge-blue-soft, #7db0ff);
     animation: ${softPulse} 1.2s ease-in-out infinite;
   }
 `;
@@ -1633,10 +1719,31 @@ const FooterSpacer = styled.span`
 `;
 
 const OverlayGlobalStyle = createGlobalStyle`
+  :root {
+    --forge-bg: #07090d;
+    --forge-bg-deep: #020304;
+    --forge-surface: #0d1117;
+    --forge-surface-raised: #11161d;
+    --forge-surface-control: #151b23;
+    --forge-border: rgba(230, 236, 245, 0.1);
+    --forge-border-strong: rgba(230, 236, 245, 0.16);
+    --forge-text: #f4f7fa;
+    --forge-text-soft: #b6c0cc;
+    --forge-text-muted: #7a8493;
+    --forge-text-disabled: #505966;
+    --forge-blue: #3b82f6;
+    --forge-blue-soft: #7db0ff;
+    --forge-amber: #dfa55a;
+    --forge-green: #3ccb7f;
+    --forge-red: #ef6b6b;
+    color-scheme: dark;
+  }
+
   html,
   body,
   #root {
     width: 100%;
+    height: 100%;
     min-width: 0;
     min-height: 100%;
     margin: 0;
@@ -1645,7 +1752,7 @@ const OverlayGlobalStyle = createGlobalStyle`
   }
 
   body {
-    color: #f9f7ef;
+    color: var(--forge-text, #f4f7fa);
     font-family: "SF Mono", "JetBrains Mono", "Roboto Mono", ui-monospace, Menlo, Consolas, monospace;
     letter-spacing: 0;
     user-select: none;

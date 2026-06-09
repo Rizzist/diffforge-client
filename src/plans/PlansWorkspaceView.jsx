@@ -191,6 +191,9 @@ function planStatusLabel(status) {
   if (normalized === "blocked") {
     return "Blocked";
   }
+  if (normalized === "listed") {
+    return "Listed";
+  }
   return "Active";
 }
 
@@ -204,6 +207,9 @@ function normalizedPlanStatus(status) {
   }
   if (normalized === "blocked") {
     return "blocked";
+  }
+  if (["listed", "list", "queued", "pending", "ready"].includes(normalized)) {
+    return "listed";
   }
   return "active";
 }
@@ -250,30 +256,31 @@ function planStepUserEditable(step, plan) {
 }
 
 function planIdentity(plan) {
-  return cleanText(plan?.plan_id) || cleanText(plan?.task_id);
+  return cleanText(plan?.plan_id || plan?.planId || plan?.id)
+    || cleanText(plan?.todo_id || plan?.todoId);
 }
 
-function planStepSaveKey(taskId, stepIndex) {
-  const safeTaskId = cleanText(taskId);
+function planStepSaveKey(planRef, stepIndex) {
+  const safePlanRef = cleanText(planRef);
   const safeStepIndex = Number(stepIndex);
-  return safeTaskId && Number.isInteger(safeStepIndex) ? `${safeTaskId}:${safeStepIndex}` : "";
+  return safePlanRef && Number.isInteger(safeStepIndex) ? `${safePlanRef}:${safeStepIndex}` : "";
 }
 
-function planStepSaveForStep(pendingSaves, taskId, stepIndex) {
-  const key = planStepSaveKey(taskId, stepIndex);
+function planStepSaveForStep(pendingSaves, planRef, stepIndex) {
+  const key = planStepSaveKey(planRef, stepIndex);
   return key ? pendingSaves?.[key] || null : null;
 }
 
-function withPlanStepTitle(plan, taskId, stepIndex, title, fields = {}) {
-  const safeTaskId = cleanText(taskId);
+function withPlanStepTitle(plan, planRef, stepIndex, title, fields = {}) {
+  const safePlanRef = cleanText(planRef);
   const safeStepIndex = Number(stepIndex);
   const safeTitle = cleanText(title);
   if (
     !plan
-    || !safeTaskId
+    || !safePlanRef
     || !Number.isInteger(safeStepIndex)
     || !safeTitle
-    || cleanText(plan.task_id || plan.taskId) !== safeTaskId
+    || planIdentity(plan) !== safePlanRef
     || !Array.isArray(plan.steps)
   ) {
     return plan;
@@ -306,11 +313,11 @@ function withPlanStepTitle(plan, taskId, stepIndex, title, fields = {}) {
   };
 }
 
-function withSnapshotPlanStepTitle(snapshot, taskId, stepIndex, title, fields = {}) {
+function withSnapshotPlanStepTitle(snapshot, planRef, stepIndex, title, fields = {}) {
   if (!snapshot || typeof snapshot !== "object") {
     return snapshot || null;
   }
-  const updatePlan = (plan) => withPlanStepTitle(plan, taskId, stepIndex, title, fields);
+  const updatePlan = (plan) => withPlanStepTitle(plan, planRef, stepIndex, title, fields);
   return {
     ...snapshot,
     selected_plan: updatePlan(snapshot.selected_plan || snapshot.selectedPlan || null),
@@ -324,10 +331,10 @@ function applyPendingPlanStepSaves(snapshot, pendingSaves = {}) {
     if (!pendingSave?.title) {
       return;
     }
-    nextSnapshot = withSnapshotPlanStepTitle(
-      nextSnapshot,
-      pendingSave.taskId,
-      pendingSave.stepIndex,
+	      nextSnapshot = withSnapshotPlanStepTitle(
+	        nextSnapshot,
+	        pendingSave.planRef,
+	        pendingSave.stepIndex,
       pendingSave.title,
       {
         pendingSync: pendingSave.status !== "error",
@@ -533,35 +540,43 @@ export default function PlansWorkspaceView({
   const snapshotAgentId = targetMatchesActiveRepo ? target.agentId || "" : "";
   const snapshotSessionId = targetMatchesActiveRepo ? target.sessionId || "" : "";
   const snapshotTaskId = targetMatchesActiveRepo ? target.taskId || "" : "";
-  const hasSnapshotTarget = Boolean(snapshotTaskId || snapshotSessionId);
   const workspaceId = target.workspaceId || workspace?.id || "";
+  const hasSnapshotScope = Boolean(activeRepoPath);
   const snapshotCacheKeys = useMemo(() => {
-    if (!hasSnapshotTarget) {
+    if (!hasSnapshotScope) {
       return { exact: "", repo: "" };
     }
 
+    const baseKey = {
+      agentId: snapshotAgentId,
+      dbPath: activeDbPath,
+      repoPath: activeRepoPath,
+      sessionId: snapshotSessionId,
+      taskId: snapshotTaskId,
+      workspaceId,
+    };
+    if (snapshotTaskId || snapshotSessionId) {
+      return {
+        exact: planSnapshotCacheKey(baseKey),
+        repo: "",
+      };
+    }
+
     return {
-      exact: planSnapshotCacheKey({
-        agentId: snapshotAgentId,
-        dbPath: activeDbPath,
-        repoPath: activeRepoPath,
-        sessionId: snapshotSessionId,
-        taskId: snapshotTaskId,
-        workspaceId,
-      }),
-      repo: "",
+      exact: "",
+      repo: planSnapshotCacheKey(baseKey),
     };
   }, [
     activeDbPath,
     activeRepoPath,
-    hasSnapshotTarget,
+    hasSnapshotScope,
     snapshotAgentId,
     snapshotSessionId,
     snapshotTaskId,
     workspaceId,
   ]);
-  const activeSnapshotRequestKey = snapshotCacheKeys.exact || "";
-  const scopedSnapshot = hasSnapshotTarget ? snapshot : null;
+  const activeSnapshotRequestKey = snapshotCacheKeys.exact || snapshotCacheKeys.repo || "";
+  const scopedSnapshot = hasSnapshotScope ? snapshot : null;
   const selectedPlan = scopedSnapshot?.selected_plan || null;
   const planCandidates = Array.isArray(scopedSnapshot?.history) ? scopedSnapshot.history : [];
   const activePlanCandidate = planCandidates.find((plan) => !planIsTerminal(plan)) || null;
@@ -618,7 +633,7 @@ export default function PlansWorkspaceView({
 
   useEffect(() => {
     snapshotRequestKeyRef.current = activeSnapshotRequestKey;
-    if (!hasSnapshotTarget) {
+    if (!hasSnapshotScope) {
       setSnapshot(null);
       setError("");
       return;
@@ -629,7 +644,7 @@ export default function PlansWorkspaceView({
       pendingStepSavesRef.current,
     ));
     setError("");
-  }, [activeSnapshotRequestKey, hasSnapshotTarget, snapshotCacheKeys]);
+  }, [activeSnapshotRequestKey, hasSnapshotScope, snapshotCacheKeys]);
 
   useEffect(() => {
     if (activeRepoPath !== selectedRepoPath) {
@@ -646,7 +661,7 @@ export default function PlansWorkspaceView({
 
   const loadSnapshot = useCallback(async (options = {}) => {
     const silent = options?.silent === true;
-    if (!activeRepoPath || !hasSnapshotTarget) {
+    if (!activeRepoPath) {
       setSnapshot(null);
       return;
     }
@@ -661,6 +676,7 @@ export default function PlansWorkspaceView({
           directRepoTarget: Boolean(activeRepoPath),
           sessionId: snapshotSessionId,
           taskId: snapshotTaskId,
+          workspaceId,
         },
       };
       if (activeDbPath) {
@@ -695,15 +711,15 @@ export default function PlansWorkspaceView({
     activeDbPath,
     activeRepoPath,
     activeSnapshotRequestKey,
-    hasSnapshotTarget,
     snapshotAgentId,
     snapshotCacheKeys,
     snapshotSessionId,
     snapshotTaskId,
+    workspaceId,
   ]);
 
   useEffect(() => {
-    if (!hasSnapshotTarget) {
+    if (!hasSnapshotScope) {
       return undefined;
     }
 
@@ -717,7 +733,7 @@ export default function PlansWorkspaceView({
     return () => {
       window.clearTimeout(loadTimer);
     };
-  }, [activeSnapshotRequestKey, hasSnapshotTarget, loadSnapshot, snapshotCacheKeys]);
+  }, [activeSnapshotRequestKey, hasSnapshotScope, loadSnapshot, snapshotCacheKeys]);
 
   useEffect(() => {
     planEventStateRef.current = {
@@ -738,7 +754,7 @@ export default function PlansWorkspaceView({
   ]);
 
   useEffect(() => {
-    if (!activeRepoPath || !hasSnapshotTarget) {
+    if (!activeRepoPath || !hasSnapshotScope) {
       return undefined;
     }
 
@@ -804,7 +820,7 @@ export default function PlansWorkspaceView({
         unlisten();
       }
     };
-  }, [activeRepoPath, hasSnapshotTarget]);
+  }, [activeRepoPath, hasSnapshotScope]);
 
   useEffect(() => {
     setEditingStepIndex(null);
@@ -836,12 +852,12 @@ export default function PlansWorkspaceView({
   }, []);
 
   const saveEditing = useCallback(() => {
-    const taskId = cleanText(displayedPlan?.task_id);
-    const stepIndex = Number(editingStepIndex);
-    const title = cleanText(editingTitle);
-    if (!taskId || !Number.isInteger(stepIndex) || !title) {
-      return;
-    }
+	    const planRef = planIdentity(displayedPlan);
+	    const stepIndex = Number(editingStepIndex);
+	    const title = cleanText(editingTitle);
+	    if (!planRef || !Number.isInteger(stepIndex) || !title) {
+	      return;
+	    }
     const existingStep = Array.isArray(displayedPlan?.steps)
       ? displayedPlan.steps.find((step) => Number(step?.index) === stepIndex)
       : null;
@@ -855,13 +871,13 @@ export default function PlansWorkspaceView({
       return;
     }
 
-    const saveKey = planStepSaveKey(taskId, stepIndex);
-    const sequence = stepSaveSequenceRef.current + 1;
-    stepSaveSequenceRef.current = sequence;
-    const pendingRecord = {
-      taskId,
-      stepIndex,
-      title,
+	    const saveKey = planStepSaveKey(planRef, stepIndex);
+	    const sequence = stepSaveSequenceRef.current + 1;
+	    stepSaveSequenceRef.current = sequence;
+	    const pendingRecord = {
+	      planRef,
+	      stepIndex,
+	      title,
       sequence,
       status: "syncing",
       updatedAt: new Date().toISOString(),
@@ -869,10 +885,10 @@ export default function PlansWorkspaceView({
     setPendingStepSaveRecord(saveKey, pendingRecord);
     setError("");
 
-    setSnapshot((current) => {
-      const nextSnapshot = withSnapshotPlanStepTitle(current, taskId, stepIndex, title, {
-        pendingSync: true,
-        source: "user",
+	    setSnapshot((current) => {
+	      const nextSnapshot = withSnapshotPlanStepTitle(current, planRef, stepIndex, title, {
+	        pendingSync: true,
+	        source: "user",
         updatedAt: pendingRecord.updatedAt,
       });
       cachePlanSnapshot(snapshotCacheKeys, nextSnapshot);
@@ -884,10 +900,11 @@ export default function PlansWorkspaceView({
       repoPath: activeRepoPath,
       ...(activeDbPath ? { dbPath: activeDbPath } : {}),
       input: {
-        agentId: snapshotAgentId || displayedPlan?.agent_id || "",
-        sessionId: snapshotSessionId || displayedPlan?.session_id || "",
-        taskId,
-        stepIndex,
+	        agentId: snapshotAgentId || displayedPlan?.agent_id || "",
+	        sessionId: snapshotSessionId || displayedPlan?.session_id || "",
+	        planId: cleanText(displayedPlan?.plan_id || displayedPlan?.planId || displayedPlan?.id) || planRef,
+	        todoId: cleanText(displayedPlan?.todo_id || displayedPlan?.todoId),
+	        stepIndex,
         title,
         workspaceId,
       },
@@ -1016,7 +1033,7 @@ export default function PlansWorkspaceView({
               {(displayedPlan.steps || []).map((step) => {
                 const index = Number(step.index);
                 const editing = editingStepIndex === index;
-                const pendingSave = planStepSaveForStep(pendingStepSaves, displayedPlan.task_id, index);
+	                const pendingSave = planStepSaveForStep(pendingStepSaves, displayedPlanId, index);
                 const syncing = pendingSave?.status === "syncing";
                 const syncFailed = pendingSave?.status === "error";
                 const editable = planStepUserEditable(step, displayedPlan) && !syncing;
@@ -1264,6 +1281,12 @@ const PlanBadge = styled.span`
     color: #baf0ca;
     border-color: rgba(92, 214, 132, 0.24);
     background: rgba(52, 180, 96, 0.12);
+  }
+
+  &[data-status="listed"] {
+    color: #c7d2e5;
+    border-color: rgba(148, 163, 184, 0.2);
+    background: rgba(148, 163, 184, 0.09);
   }
 
   &[data-status="interrupted"],

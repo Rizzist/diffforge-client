@@ -6633,7 +6633,8 @@ pub(crate) fn observe_terminal_coordination_event(
 ) {
     if matches!(
         event_type.as_str(),
-        "terminal_todo_plan_checkpoint"
+        "terminal_todo_plan_created"
+            | "terminal_todo_plan_checkpoint"
             | "terminal_todo_plan_step_title_edited"
             | "terminal_todo_plan_finished"
     ) {
@@ -6652,6 +6653,7 @@ pub(crate) fn observe_terminal_coordination_event(
         let task_id = refs.task_id.clone();
         let agent_id = refs.agent_id.clone();
         let session_id = refs.session_id.clone();
+        let plan_ref = refs.resource_id.clone();
 
         tauri::async_runtime::spawn(async move {
             sleep(Duration::from_millis(35)).await;
@@ -6660,12 +6662,14 @@ pub(crate) fn observe_terminal_coordination_event(
             let plan_task_id = task_id.clone();
             let plan_agent_id = agent_id.clone();
             let plan_session_id = session_id.clone();
+            let plan_resource_id = plan_ref.clone();
             let plan_snapshot = tauri::async_runtime::spawn_blocking(move || {
                 crate::coordination::CoordinationKernel::open(plan_repo_path, Some(plan_db_path))?
                     .terminal_todo_plan_event_snapshot(
                         plan_task_id.as_deref(),
                         plan_session_id.as_deref(),
                         plan_agent_id.as_deref(),
+                        plan_resource_id.as_deref(),
                     )
             })
             .await
@@ -6695,6 +6699,7 @@ pub(crate) fn observe_terminal_coordination_event(
                     "dbPath": db_path.display().to_string(),
                     "eventType": event_type,
                     "taskId": task_id,
+                    "planId": plan_ref,
                     "agentId": agent_id,
                     "sessionId": session_id,
                     "refs": refs_payload,

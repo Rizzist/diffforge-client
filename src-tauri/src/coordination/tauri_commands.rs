@@ -645,6 +645,9 @@ pub fn coordination_terminal_todo_plan_snapshot(
     let agent_id = input["agent_id"]
         .as_str()
         .or_else(|| input["agentId"].as_str());
+    let workspace_id = input["workspace_id"]
+        .as_str()
+        .or_else(|| input["workspaceId"].as_str());
     let direct_repo_target = input["direct_repo_target"]
         .as_bool()
         .or_else(|| input["directRepoTarget"].as_bool())
@@ -659,10 +662,20 @@ pub fn coordination_terminal_todo_plan_snapshot(
         let repo_path = coordination_input_root(repo_path)?;
         let db_path = clean_optional_path(db_path);
         let (kernel, _) = CoordinationKernel::open_for_terminal_launch(repo_path, db_path)?;
-        return result(kernel.terminal_todo_plan_snapshot(task_id, session_id, agent_id));
+        return result(kernel.terminal_todo_plan_snapshot(
+            task_id,
+            session_id,
+            agent_id,
+            workspace_id,
+        ));
     }
 
-    result(kernel(repo_path, db_path)?.terminal_todo_plan_snapshot(task_id, session_id, agent_id))
+    result(kernel(repo_path, db_path)?.terminal_todo_plan_snapshot(
+        task_id,
+        session_id,
+        agent_id,
+        workspace_id,
+    ))
 }
 
 #[tauri::command]
@@ -672,11 +685,14 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
     input: Value,
 ) -> Result<Value, String> {
     let kernel = kernel(repo_path, db_path)?;
-    let task_id = input["task_id"]
+    let plan_ref = input["plan_id"]
         .as_str()
-        .or_else(|| input["taskId"].as_str())
+        .or_else(|| input["planId"].as_str())
+        .or_else(|| input["todo_id"].as_str())
+        .or_else(|| input["todoId"].as_str())
+        .or_else(|| input["id"].as_str())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "task_id is required.".to_string())?;
+        .ok_or_else(|| "plan_id or todo_id is required.".to_string())?;
     let step_index = input["step_index"]
         .as_i64()
         .or_else(|| input["stepIndex"].as_i64())
@@ -692,7 +708,7 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
         .as_str()
         .or_else(|| input["sessionId"].as_str());
     let mut response =
-        kernel.edit_terminal_todo_plan_step_title(task_id, step_index, title, agent_id)?;
+        kernel.edit_terminal_todo_plan_step_title(plan_ref, step_index, title, agent_id)?;
     let compact_plan = response["data"]["compact_plan"].clone();
     let cloud = if response["ok"].as_bool() != Some(false) && !compact_plan.is_null() {
         match crate::cloud_mcp_forward_terminal_todo_plan_update(
@@ -703,7 +719,7 @@ pub fn coordination_terminal_todo_plan_edit_step_title(
                 .or_else(|| input["workspaceId"].as_str()),
             agent_id,
             session_id,
-            Some(task_id),
+            None,
             input["worktree_id"]
                 .as_str()
                 .or_else(|| input["worktreeId"].as_str()),
@@ -747,11 +763,14 @@ pub fn coordination_terminal_todo_plan_finish(
     } else {
         kernel(repo_path, db_path)?
     };
-    let task_id = input["task_id"]
+    let plan_ref = input["plan_id"]
         .as_str()
-        .or_else(|| input["taskId"].as_str())
+        .or_else(|| input["planId"].as_str())
+        .or_else(|| input["todo_id"].as_str())
+        .or_else(|| input["todoId"].as_str())
+        .or_else(|| input["id"].as_str())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "task_id is required.".to_string())?
+        .ok_or_else(|| "plan_id or todo_id is required.".to_string())?
         .to_string();
     let agent_id = input["agent_id"]
         .as_str()
@@ -774,7 +793,7 @@ pub fn coordination_terminal_todo_plan_finish(
         .or_else(|| input["worktreePath"].as_str())
         .map(str::to_string);
     let finished = kernel.finish_terminal_todo_plan(
-        &task_id,
+        &plan_ref,
         "completed",
         agent_id.as_deref(),
         session_id.as_deref(),
@@ -787,7 +806,6 @@ pub fn coordination_terminal_todo_plan_finish(
     let cloud = if !compact_plan.is_null() {
         let repo_path = kernel.paths.repo_path.display().to_string();
         let db_path = kernel.paths.db_path.clone();
-        let cloud_task_id = task_id.clone();
         let cloud_agent_id = agent_id.clone();
         let cloud_session_id = session_id.clone();
         let cloud_workspace_id = workspace_id.clone();
@@ -800,7 +818,7 @@ pub fn coordination_terminal_todo_plan_finish(
                 cloud_workspace_id.as_deref(),
                 cloud_agent_id.as_deref(),
                 cloud_session_id.as_deref(),
-                Some(&cloud_task_id),
+                None,
                 cloud_worktree_id.as_deref(),
                 cloud_worktree_path.as_deref(),
                 "user_finished_terminal_todo_plan",

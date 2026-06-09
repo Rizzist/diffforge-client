@@ -2300,27 +2300,27 @@ export const RailTop = styled.div`
 
 export const RailHeader = styled.div`
   display: grid;
-  height: 28px;
+  height: 24px;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  grid-template-columns: minmax(0, 1fr) 24px 24px;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
   transition:
     gap 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
     grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    grid-template-columns: 0 0 28px;
+    grid-template-columns: 0 0 24px;
     gap: 0;
     justify-content: center;
     justify-items: center;
   }
 
   @media (max-width: 760px) {
-    height: 28px;
-    grid-template-columns: minmax(0, 1fr) 28px 28px;
-    gap: 8px;
+    height: 24px;
+    grid-template-columns: minmax(0, 1fr) 24px 24px;
+    gap: 6px;
     justify-content: stretch;
     justify-items: stretch;
   }
@@ -2356,19 +2356,19 @@ export const RailSectionTitle = styled.p`
 
 export const RailCollapseButton = styled.button`
   display: inline-flex;
-  width: 28px;
-  height: 28px;
+  width: 24px;
+  height: 24px;
   align-items: center;
   justify-content: center;
   justify-self: end;
   padding: 0;
-  border: 1px solid rgba(230, 236, 245, 0.1);
-  border-radius: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 7px;
   color: var(--forge-text-muted);
   background:
-    linear-gradient(180deg, rgba(230, 236, 245, 0.05), rgba(230, 236, 245, 0.018)),
-    rgba(7, 9, 13, 0.74);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.025);
+    linear-gradient(180deg, rgba(230, 236, 245, 0.035), rgba(230, 236, 245, 0.012)),
+    rgba(7, 9, 13, 0.48);
+  box-shadow: none;
   line-height: 0;
   transition:
     background 160ms ease,
@@ -2380,21 +2380,19 @@ export const RailCollapseButton = styled.button`
   svg {
     display: block;
     flex: 0 0 auto;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     margin: 0;
     transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
 
   &:hover {
-    border-color: rgba(98, 160, 255, 0.3);
+    border-color: rgba(98, 160, 255, 0.22);
     color: var(--forge-text);
     background:
-      linear-gradient(90deg, rgba(47, 128, 255, 0.14), rgba(255, 122, 24, 0.04)),
-      rgba(13, 17, 23, 0.78);
-    box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.045),
-      0 0 18px rgba(47, 128, 255, 0.08);
+      linear-gradient(90deg, rgba(47, 128, 255, 0.09), rgba(255, 122, 24, 0.025)),
+      rgba(13, 17, 23, 0.58);
+    box-shadow: none;
   }
 
   html[data-forge-theme="light"] & {
@@ -2412,7 +2410,7 @@ export const RailCollapseButton = styled.button`
   }
 
   &:active {
-    transform: scale(0.96);
+    transform: scale(0.97);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
@@ -2433,15 +2431,125 @@ export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
   color: var(--forge-text-soft);
 
   &:hover {
-    border-color: rgba(255, 122, 24, 0.34);
+    border-color: rgba(255, 122, 24, 0.24);
     color: #ffd0a5;
     background:
-      linear-gradient(90deg, rgba(255, 122, 24, 0.13), rgba(47, 128, 255, 0.06)),
-      rgba(13, 17, 23, 0.78);
+      linear-gradient(90deg, rgba(255, 122, 24, 0.09), rgba(47, 128, 255, 0.035)),
+      rgba(13, 17, 23, 0.58);
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     display: none;
+  }
+`;
+
+export const RailAccountScopeShell = styled.div`
+  position: relative;
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  opacity: 0;
+  animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 115ms both;
+`;
+
+export const RailAccountScopeSelect = styled.select`
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 28px 0 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 7px;
+  box-sizing: border-box;
+  color: #d6deea;
+  background: rgba(230, 236, 245, 0.035);
+  box-shadow: none;
+  color-scheme: dark;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0;
+  line-height: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  appearance: none;
+  -webkit-appearance: none;
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease;
+
+  &::-ms-expand {
+    display: none;
+  }
+
+  &:hover {
+    border-color: rgba(125, 160, 205, 0.18);
+    color: #eef3fb;
+    background: rgba(230, 236, 245, 0.055);
+  }
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.32);
+    outline: none;
+    background: rgba(230, 236, 245, 0.065);
+  }
+
+  option,
+  optgroup {
+    color: #f4f7fa;
+    background: #0d1117;
+    background-image: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.08);
+    color: #3f4650;
+    background: rgba(0, 0, 0, 0.025);
+    color-scheme: light;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    border-color: rgba(0, 102, 204, 0.18);
+    color: #1d1d1f;
+    background: rgba(0, 102, 204, 0.045);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: rgba(0, 102, 204, 0.28);
+    background: rgba(0, 102, 204, 0.055);
+  }
+
+  html[data-forge-theme="light"] option,
+  html[data-forge-theme="light"] optgroup {
+    color: #1d1d1f;
+    background: #ffffff;
+    background-image: none;
+  }
+`;
+
+export const RailAccountScopeIcon = styled(ExpandMore)`
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  width: 16px;
+  height: 16px;
+  color: #8e99a8;
+  pointer-events: none;
+  transform: translateY(-50%);
+  transition: color 150ms ease;
+
+  ${RailAccountScopeShell}:hover & {
+    color: #c4ccd8;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #6e7681;
+  }
+
+  html[data-forge-theme="light"] ${RailAccountScopeShell}:hover & {
+    color: #0066cc;
   }
 `;
 

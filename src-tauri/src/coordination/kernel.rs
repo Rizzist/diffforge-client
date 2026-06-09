@@ -155,6 +155,7 @@ fn normalize_terminal_todo_plan_status(status: &str) -> String {
             "interrupted".to_string()
         }
         "blocked" => "blocked".to_string(),
+        "listed" | "list" | "queued" | "pending" | "ready" => "listed".to_string(),
         "active" | "running" | "in_progress" | "in-progress" | "working" | "" => {
             "active".to_string()
         }
@@ -4828,6 +4829,191 @@ impl CoordinationKernel {
         Ok(json!({"posted": true}))
     }
 
+    pub fn record_terminal_todo_plan_from_create_plan(
+        &self,
+        created: &Value,
+        input: &Value,
+    ) -> Result<Option<Value>, String> {
+        let compact_plan = created
+            .get("compact_plan")
+            .or_else(|| created.get("compactPlan"))
+            .filter(|value| value.is_object())
+            .unwrap_or(created);
+        let plan_id = string_from_value_keys(compact_plan, &["plan_id", "planId", "id"])
+            .or_else(|| string_from_value_keys(created, &["plan_id", "planId", "id"]))
+            .ok_or_else(|| "create_plan did not return a plan_id.".to_string())?;
+        let todo_id = string_from_value_keys(
+            compact_plan,
+            &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+        )
+        .or_else(|| {
+            string_from_value_keys(
+                created,
+                &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+            )
+        })
+        .unwrap_or_else(|| plan_id.clone());
+        let workspace_id = string_from_value_keys(input, &["workspace_id", "workspaceId"])
+            .or_else(|| string_from_value_keys(created, &["workspace_id", "workspaceId"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["workspace_id", "workspaceId"]));
+        let agent_id = string_from_value_keys(input, &["agent_id", "agentId"])
+            .or_else(|| string_from_value_keys(created, &["agent_id", "agentId"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["agent_id", "agentId"]));
+        let session_id = string_from_value_keys(input, &["session_id", "sessionId"])
+            .or_else(|| string_from_value_keys(created, &["session_id", "sessionId"]))
+            .or_else(|| string_from_value_keys(compact_plan, &["session_id", "sessionId"]));
+        let title = string_from_value_keys(compact_plan, &["title", "name", "summary"])
+            .or_else(|| string_from_value_keys(created, &["title", "name", "summary"]))
+            .unwrap_or_else(|| "Local agent plan".to_string());
+        let status = normalize_terminal_todo_plan_status(
+            string_from_value_keys(compact_plan, &["status"])
+                .or_else(|| string_from_value_keys(created, &["status"]))
+                .as_deref()
+                .unwrap_or("listed"),
+        );
+        let steps = compact_plan
+            .get("steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if steps.is_empty() {
+            return Ok(None);
+        }
+        let current_step_index = optional_i64_field(
+            compact_plan,
+            &[
+                "current_step_index",
+                "currentStepIndex",
+                "plan_step_index",
+                "planStepIndex",
+            ],
+        )
+        .or_else(|| {
+            optional_i64_field(
+                created,
+                &[
+                    "current_step_index",
+                    "currentStepIndex",
+                    "plan_step_index",
+                    "planStepIndex",
+                ],
+            )
+        })
+        .unwrap_or(0)
+        .max(0)
+        .min(steps.len().saturating_sub(1) as i64);
+        let now = now_rfc3339();
+        let actor_id = agent_id.as_deref().unwrap_or(REPO_ID);
+        let result = (|| {
+            self.begin_immediate_transaction("record terminal todo plan from create_plan")?;
+            self.conn
+                    .execute(
+                        "INSERT INTO terminal_todo_plans(
+                            id, todo_id, workspace_id, agent_id, session_id, title, status,
+                            current_step_index, revision, created_at, updated_at, completed_at,
+                            interrupted_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9, NULL, NULL)
+                         ON CONFLICT(id) DO UPDATE SET
+                            todo_id=excluded.todo_id,
+                        workspace_id=COALESCE(excluded.workspace_id, terminal_todo_plans.workspace_id),
+                        agent_id=COALESCE(excluded.agent_id, terminal_todo_plans.agent_id),
+                        session_id=COALESCE(excluded.session_id, terminal_todo_plans.session_id),
+                        title=excluded.title,
+                        status=excluded.status,
+                        current_step_index=excluded.current_step_index,
+                        updated_at=excluded.updated_at,
+                        revision=terminal_todo_plans.revision + 1",
+                    params![
+                        &plan_id,
+                        &todo_id,
+                        workspace_id.as_deref(),
+                        agent_id.as_deref(),
+                        session_id.as_deref(),
+                        &title,
+                        &status,
+                        current_step_index,
+                        &now,
+                    ],
+                )
+                .map_err(|error| format!("Unable to record terminal todo plan: {error}"))?;
+            for (index, step) in steps.iter().enumerate() {
+                let step_index = optional_i64_field(
+                    step,
+                    &[
+                        "index",
+                        "step_index",
+                        "stepIndex",
+                        "plan_step_index",
+                        "planStepIndex",
+                    ],
+                )
+                .unwrap_or(index as i64)
+                .max(0);
+                let step_todo_id = string_from_value_keys(step, &["todo_id", "todoId", "id"])
+                    .unwrap_or_else(|| format!("{plan_id}-todo-{}", step_index + 1));
+                let step_id = string_from_value_keys(step, &["id"])
+                    .unwrap_or_else(|| format!("{plan_id}-step-{step_index}"));
+                let step_title = terminal_todo_plan_step_title_from_value(step)
+                    .unwrap_or_else(|| format!("Step {}", step_index + 1));
+                let step_detail = terminal_todo_plan_step_detail_from_value(step);
+                let step_status = string_from_value_keys(step, &["status", "state", "phase"])
+                    .unwrap_or_else(|| "listed".to_string());
+                self.conn
+                        .execute(
+                            "INSERT INTO terminal_todo_plan_steps(
+                                id, plan_id, todo_id, step_index, title, detail, status,
+                                source, revision, started_at, completed_at, created_at, updated_at
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'coordination-kernel.create_plan', 1, NULL, NULL, ?8, ?8)
+                             ON CONFLICT(plan_id, step_index) DO UPDATE SET
+                                todo_id=excluded.todo_id,
+                            title=excluded.title,
+                            detail=excluded.detail,
+                            status=excluded.status,
+                            source=excluded.source,
+                            updated_at=excluded.updated_at,
+                            revision=terminal_todo_plan_steps.revision + 1",
+                        params![
+                            &step_id,
+                            &plan_id,
+                            &step_todo_id,
+                            step_index,
+                            &step_title,
+                            step_detail.as_deref(),
+                            &step_status,
+                            &now,
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to record terminal todo plan step: {error}")
+                    })?;
+            }
+            let event_id = self.emit_event(
+                "terminal_todo_plan_created",
+                "agent",
+                actor_id,
+                EventRefs {
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    resource_id: Some(plan_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "plan_id": plan_id.clone(),
+                    "todo_id": todo_id.clone(),
+                    "workspace_id": workspace_id.clone(),
+                    "source": "coordination-kernel.create_plan",
+                }),
+            )?;
+            Ok(json!({
+                "event_id": event_id,
+                "plan": self.terminal_todo_plan_view_by_plan_ref(&plan_id)?,
+                "compact_plan": self.terminal_todo_plan_compact_for_plan_ref(&plan_id)?.unwrap_or(Value::Null),
+            }))
+        })();
+        self.finish_transaction(result, "record terminal todo plan from create_plan")
+            .map(Some)
+    }
+
     pub fn checkpoint_terminal_todo_plan(
         &self,
         task_id: &str,
@@ -4836,7 +5022,7 @@ impl CoordinationKernel {
         input: &Value,
     ) -> Result<Option<Value>, String> {
         let task_id = task_id.trim();
-        if task_id.is_empty() || self.terminal_todo_plan_id_for_task(task_id)?.is_none() {
+        if task_id.is_empty() {
             return Ok(None);
         }
         let requested_current = optional_i64_field(
@@ -4922,7 +5108,11 @@ impl CoordinationKernel {
             return Ok(None);
         }
 
-        let plan = self.terminal_todo_plan_view_by_task_id(task_id)?;
+        let Some(plan_id) = self.terminal_todo_plan_plan_id_from_input_or_task(input, task_id)?
+        else {
+            return Ok(None);
+        };
+        let plan = self.terminal_todo_plan_view_by_plan_ref(&plan_id)?;
         let steps_len = plan["steps"].as_array().map(Vec::len).unwrap_or(0);
         if steps_len == 0 {
             return Ok(None);
@@ -4945,13 +5135,13 @@ impl CoordinationKernel {
             if let Some(completed_index) = completed_index {
                 let completed_index = completed_index.max(0).min(max_index);
                 self.conn
-                    .execute(
-                        "UPDATE terminal_task_plan_steps
-                         SET status='completed', completed_at=COALESCE(completed_at, ?1), updated_at=?1,
-                             revision=revision + 1
-                         WHERE task_id=?2 AND step_index=?3",
-                        params![&now, &task_id, completed_index],
-                    )
+                        .execute(
+                            "UPDATE terminal_todo_plan_steps
+                             SET status='completed', completed_at=COALESCE(completed_at, ?1), updated_at=?1,
+                                 revision=revision + 1
+                             WHERE plan_id=?2 AND step_index=?3",
+                            params![&now, &plan_id, completed_index],
+                        )
                     .map_err(|error| {
                         format!("Unable to mark terminal todo plan step complete: {error}")
                     })?;
@@ -4962,33 +5152,33 @@ impl CoordinationKernel {
                 .filter(|status| *status != "completed")
                 .unwrap_or("in_progress");
             self.conn
-                .execute(
-                    "UPDATE terminal_task_plan_steps
-                     SET status='completed', completed_at=COALESCE(completed_at, ?1),
-                         updated_at=?1, revision=revision + 1
-                     WHERE task_id=?2 AND step_index < ?3 AND status NOT IN ('completed', 'skipped')",
-                    params![&now, &task_id, next_index],
-                )
+                    .execute(
+                        "UPDATE terminal_todo_plan_steps
+                         SET status='completed', completed_at=COALESCE(completed_at, ?1),
+                             updated_at=?1, revision=revision + 1
+                         WHERE plan_id=?2 AND step_index < ?3 AND status NOT IN ('completed', 'skipped')",
+                        params![&now, &plan_id, next_index],
+                    )
                 .map_err(|error| {
                     format!("Unable to advance terminal todo plan completed steps: {error}")
                 })?;
             self.conn
                 .execute(
-                    "UPDATE terminal_task_plan_steps
+                    "UPDATE terminal_todo_plan_steps
                      SET status=?1,
                          title=COALESCE(?2, title),
-                         detail=COALESCE(?3, detail),
-                         source='agent',
-                         started_at=COALESCE(started_at, ?4),
-                         updated_at=?4,
-                         revision=revision + 1
-                     WHERE task_id=?5 AND step_index=?6",
+                             detail=COALESCE(?3, detail),
+                             source='agent',
+                             started_at=COALESCE(started_at, ?4),
+                             updated_at=?4,
+                             revision=revision + 1
+                         WHERE plan_id=?5 AND step_index=?6",
                     params![
                         in_progress_status,
                         next_title.as_deref(),
                         next_detail.as_deref(),
                         &now,
-                        &task_id,
+                        &plan_id,
                         next_index,
                     ],
                 )
@@ -4996,11 +5186,11 @@ impl CoordinationKernel {
                     format!("Unable to update terminal todo plan current step: {error}")
                 })?;
             self.conn
-                .execute(
-                    "UPDATE terminal_task_plan_steps
-                     SET status='queued', completed_at=NULL, updated_at=?1, revision=revision + 1
-                     WHERE task_id=?2 AND step_index > ?3 AND status NOT IN ('queued', 'skipped')",
-                    params![&now, &task_id, next_index],
+                    .execute(
+                        "UPDATE terminal_todo_plan_steps
+                         SET status='queued', completed_at=NULL, updated_at=?1, revision=revision + 1
+                         WHERE plan_id=?2 AND step_index > ?3 AND status NOT IN ('queued', 'skipped')",
+                    params![&now, &plan_id, next_index],
                 )
                 .map_err(|error| {
                     format!("Unable to update terminal todo plan queued steps: {error}")
@@ -5008,7 +5198,7 @@ impl CoordinationKernel {
             for update in &step_updates {
                 self.conn
                     .execute(
-                        "UPDATE terminal_task_plan_steps
+                        "UPDATE terminal_todo_plan_steps
                          SET title=COALESCE(?1, title),
                              detail=COALESCE(?2, detail),
                              status=COALESCE(?3, status),
@@ -5018,21 +5208,21 @@ impl CoordinationKernel {
                                 ELSE started_at
                              END,
                              completed_at=CASE
-                                WHEN ?3='completed' THEN COALESCE(completed_at, ?4)
-                                WHEN ?3='queued' THEN NULL
-                                ELSE completed_at
-                             END,
-                             updated_at=?4,
-                             revision=revision + 1
-                         WHERE task_id=?5 AND step_index=?6",
-                        params![
-                            update.title.as_deref(),
-                            update.detail.as_deref(),
-                            update.status.as_deref(),
-                            &now,
-                            &task_id,
-                            update.step_index,
-                        ],
+                                    WHEN ?3='completed' THEN COALESCE(completed_at, ?4)
+                                    WHEN ?3='queued' THEN NULL
+                                    ELSE completed_at
+                                 END,
+                                 updated_at=?4,
+                                 revision=revision + 1
+                             WHERE plan_id=?5 AND step_index=?6",
+                            params![
+                                update.title.as_deref(),
+                                update.detail.as_deref(),
+                                update.status.as_deref(),
+                                &now,
+                                &plan_id,
+                                update.step_index,
+                            ],
                     )
                     .map_err(|error| {
                         format!("Unable to apply terminal todo plan checkpoint step update: {error}")
@@ -5058,18 +5248,18 @@ impl CoordinationKernel {
             };
             self.conn
                 .execute(
-                    "UPDATE terminal_task_plans
-                     SET status=?1, current_step_index=?2, updated_at=?3, revision=revision + 1,
-                         completed_at=COALESCE(?4, completed_at),
-                         interrupted_at=COALESCE(?5, interrupted_at)
-                     WHERE task_id=?6",
+                    "UPDATE terminal_todo_plans
+                         SET status=?1, current_step_index=?2, updated_at=?3, revision=revision + 1,
+                             completed_at=COALESCE(?4, completed_at),
+                             interrupted_at=COALESCE(?5, interrupted_at)
+                         WHERE id=?6",
                     params![
                         &resolved_plan_status,
                         next_index,
                         &now,
                         completed_at,
                         interrupted_at,
-                        &task_id,
+                        &plan_id,
                     ],
                 )
                 .map_err(|error| format!("Unable to update terminal todo plan: {error}"))?;
@@ -5082,11 +5272,14 @@ impl CoordinationKernel {
                     task_id: Some(task_id.to_string()),
                     agent_id: agent_id.map(str::to_string),
                     session_id: session_id.map(str::to_string),
+                    resource_id: Some(plan_id.clone()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "current_step_index": next_index,
-                    "completed_step_index": completed_index,
+                        "plan_id": plan_id,
+                        "todo_id": plan["todo_id"].clone(),
+                        "current_step_index": next_index,
+                        "completed_step_index": completed_index,
                     "step_title": next_title,
                     "step_updates": step_updates_payload,
                     "plan_status": resolved_plan_status,
@@ -5095,8 +5288,8 @@ impl CoordinationKernel {
             )?;
             Ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_plan_ref(&plan_id)?,
+                "compact_plan": self.terminal_todo_plan_compact_for_plan_ref(&plan_id)?.unwrap_or(Value::Null),
             }))
         })();
         self.finish_transaction(result, "checkpoint terminal todo plan")
@@ -5105,22 +5298,25 @@ impl CoordinationKernel {
 
     pub fn edit_terminal_todo_plan_step_title(
         &self,
-        task_id: &str,
+        plan_ref: &str,
         step_index: i64,
         title: &str,
         actor_id: Option<&str>,
     ) -> Result<Value, String> {
-        let task_id = task_id.trim();
-        if task_id.is_empty() {
-            return Err("Plan step edit requires task_id.".to_string());
+        let plan_ref = plan_ref.trim();
+        if plan_ref.is_empty() {
+            return Err("Plan step edit requires plan_id or todo_id.".to_string());
         }
         let title = compact_terminal_todo_plan_text(title, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS);
         if title.is_empty() {
             return Err("Plan step title cannot be empty.".to_string());
         }
+        let plan_id = self
+            .terminal_todo_plan_plan_id_for_plan_ref(plan_ref)?
+            .ok_or_else(|| "Terminal todo plan does not exist.".to_string())?;
         let step = self.query_one(
-            "SELECT id, status FROM terminal_task_plan_steps WHERE task_id=?1 AND step_index=?2",
-            &[&task_id, &step_index],
+            "SELECT id, status FROM terminal_todo_plan_steps WHERE plan_id=?1 AND step_index=?2",
+            &[&plan_id, &step_index],
             "Plan step does not exist.",
         )?;
         let status = step["status"].as_str().unwrap_or_default();
@@ -5128,7 +5324,7 @@ impl CoordinationKernel {
             return Ok(api_error(
                 "terminal_todo_plan_step_not_editable",
                 "Only queued, pending, or blocked terminal todo plan step titles can be edited.",
-                json!({"task_id": task_id, "step_index": step_index, "status": status}),
+                json!({"plan_id": plan_id, "step_index": step_index, "status": status}),
             ));
         }
         let now = now_rfc3339();
@@ -5139,18 +5335,18 @@ impl CoordinationKernel {
             self.begin_immediate_transaction("edit terminal todo plan step")?;
             self.conn
                 .execute(
-                    "UPDATE terminal_task_plan_steps
-                     SET title=?1, source='user', updated_at=?2, revision=revision + 1
-                     WHERE task_id=?3 AND step_index=?4",
-                    params![&title, &now, &task_id, step_index],
+                    "UPDATE terminal_todo_plan_steps
+                         SET title=?1, source='user', updated_at=?2, revision=revision + 1
+                         WHERE plan_id=?3 AND step_index=?4",
+                    params![&title, &now, &plan_id, step_index],
                 )
                 .map_err(|error| format!("Unable to edit terminal todo plan step: {error}"))?;
             self.conn
                 .execute(
-                    "UPDATE terminal_task_plans
-                     SET updated_at=?1, revision=revision + 1
-                     WHERE task_id=?2",
-                    params![&now, &task_id],
+                    "UPDATE terminal_todo_plans
+                         SET updated_at=?1, revision=revision + 1
+                         WHERE id=?2",
+                    params![&now, &plan_id],
                 )
                 .map_err(|error| {
                     format!("Unable to update terminal todo plan revision: {error}")
@@ -5160,26 +5356,56 @@ impl CoordinationKernel {
                 "user",
                 actor_id,
                 EventRefs {
-                    task_id: Some(task_id.to_string()),
+                    resource_id: Some(plan_id.clone()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "step_index": step_index,
-                    "title": title,
-                    "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
+                        "plan_id": plan_id.clone(),
+                        "step_index": step_index,
+                        "title": title,
+                        "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
                     "source": "terminal-plans-ui",
                 }),
             )?;
             Ok(api_ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_plan_ref(&plan_id)?,
+                "compact_plan": self.terminal_todo_plan_compact_for_plan_ref(&plan_id)?.unwrap_or(Value::Null),
             })))
         })();
         self.finish_transaction(result, "edit terminal todo plan step")
     }
 
     pub fn finish_terminal_todo_plan(
+        &self,
+        plan_ref: &str,
+        status: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        let plan_ref = plan_ref.trim();
+        let plan_status = normalize_terminal_todo_plan_status(status);
+        if plan_ref.is_empty()
+            || !matches!(
+                plan_status.as_str(),
+                "completed" | "interrupted" | "blocked"
+            )
+        {
+            return Ok(None);
+        }
+        let Some(plan_id) = self.terminal_todo_plan_plan_id_for_plan_ref(plan_ref)? else {
+            return Ok(None);
+        };
+        self.finish_terminal_todo_plan_by_plan_id(
+            &plan_id,
+            &plan_status,
+            agent_id,
+            session_id,
+            None,
+        )
+    }
+
+    pub fn finish_terminal_todo_plan_for_task(
         &self,
         task_id: &str,
         status: &str,
@@ -5193,10 +5419,29 @@ impl CoordinationKernel {
                 plan_status.as_str(),
                 "completed" | "interrupted" | "blocked"
             )
-            || self.terminal_todo_plan_id_for_task(task_id)?.is_none()
         {
             return Ok(None);
         }
+        let Some(plan_id) = self.terminal_todo_plan_plan_id_for_task_source(task_id)? else {
+            return Ok(None);
+        };
+        self.finish_terminal_todo_plan_by_plan_id(
+            &plan_id,
+            &plan_status,
+            agent_id,
+            session_id,
+            Some(task_id),
+        )
+    }
+
+    fn finish_terminal_todo_plan_by_plan_id(
+        &self,
+        plan_id: &str,
+        plan_status: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        task_event_id: Option<&str>,
+    ) -> Result<Option<Value>, String> {
         let now = now_rfc3339();
         let actor_id = agent_id
             .filter(|value| !value.trim().is_empty())
@@ -5206,11 +5451,11 @@ impl CoordinationKernel {
             if plan_status == "completed" {
                 self.conn
                     .execute(
-                        "UPDATE terminal_task_plan_steps
-                         SET status='completed', completed_at=COALESCE(completed_at, ?1),
-                             updated_at=?1, revision=revision + 1
-                         WHERE task_id=?2 AND status NOT IN ('completed', 'skipped')",
-                        params![&now, &task_id],
+                        "UPDATE terminal_todo_plan_steps
+                             SET status='completed', completed_at=COALESCE(completed_at, ?1),
+                                 updated_at=?1, revision=revision + 1
+                             WHERE plan_id=?2 AND status NOT IN ('completed', 'skipped')",
+                        params![&now, &plan_id],
                     )
                     .map_err(|error| {
                         format!("Unable to complete terminal todo plan steps: {error}")
@@ -5218,38 +5463,39 @@ impl CoordinationKernel {
             }
             self.conn
                 .execute(
-                    "UPDATE terminal_task_plans
-                     SET status=?1,
-                         current_step_index=COALESCE((
-                            SELECT MAX(step_index) FROM terminal_task_plan_steps WHERE task_id=?2
-                         ), current_step_index),
+                    "UPDATE terminal_todo_plans
+                         SET status=?1,
+                             current_step_index=COALESCE((
+                                SELECT MAX(step_index) FROM terminal_todo_plan_steps WHERE plan_id=?2
+                             ), current_step_index),
                          updated_at=?3,
                          revision=revision + 1,
-                         completed_at=CASE WHEN ?1='completed' THEN COALESCE(completed_at, ?3) ELSE completed_at END,
-                         interrupted_at=CASE WHEN ?1='interrupted' THEN COALESCE(interrupted_at, ?3) ELSE interrupted_at END
-                     WHERE task_id=?2",
-                    params![&plan_status, &task_id, &now],
-                )
+                             completed_at=CASE WHEN ?1='completed' THEN COALESCE(completed_at, ?3) ELSE completed_at END,
+                             interrupted_at=CASE WHEN ?1='interrupted' THEN COALESCE(interrupted_at, ?3) ELSE interrupted_at END
+                         WHERE id=?2",
+                        params![&plan_status, &plan_id, &now],
+                    )
                 .map_err(|error| format!("Unable to finish terminal todo plan: {error}"))?;
             let event_id = self.emit_event(
                 "terminal_todo_plan_finished",
                 "agent",
                 actor_id,
                 EventRefs {
-                    task_id: Some(task_id.to_string()),
+                    task_id: task_event_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                     session_id: session_id.map(str::to_string),
+                    resource_id: Some(plan_id.to_string()),
                     ..EventRefs::default()
                 },
                 json!({
-                    "plan_status": plan_status,
-                    "source": "coordination-kernel.task_lifecycle",
+                        "plan_status": plan_status,
+                        "source": "coordination-kernel.task_lifecycle",
                 }),
             )?;
             Ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_plan_ref(plan_id)?,
+                "compact_plan": self.terminal_todo_plan_compact_for_plan_ref(plan_id)?.unwrap_or(Value::Null),
             }))
         })();
         self.finish_transaction(result, "finish terminal todo plan")
@@ -5261,29 +5507,48 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         session_id: Option<&str>,
         agent_id: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<Value, String> {
         let task_target = task_id.map(str::trim).filter(|value| !value.is_empty());
         let session_target = session_id.map(str::trim).filter(|value| !value.is_empty());
+        let workspace_target = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let selected_plan_from_target = if let Some(task_id) = task_target {
-            self.terminal_todo_plan_view_by_task_id(task_id).ok()
+            self.terminal_todo_plan_plan_id_for_task_source(task_id)?
+                .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(&plan_id).ok())
         } else if let Some(session_id) = session_target {
-            self.query_json(
-                "SELECT task_id FROM terminal_task_plans
-                 WHERE session_id=?1
-                 ORDER BY updated_at DESC LIMIT 1",
-                &[&session_id],
-            )?
-            .into_iter()
-            .next()
-            .and_then(|row| row["task_id"].as_str().map(str::to_string))
-            .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(&task_id).ok())
+            let rows = if let Some(workspace_id) = workspace_target.as_deref() {
+                self.query_json(
+                    "SELECT id FROM terminal_todo_plans
+                     WHERE session_id=?1
+                       AND (workspace_id=?2 OR workspace_id IS NULL OR workspace_id='')
+                     ORDER BY updated_at DESC LIMIT 1",
+                    &[&session_id, &workspace_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT id FROM terminal_todo_plans
+                     WHERE session_id=?1
+                     ORDER BY updated_at DESC LIMIT 1",
+                    &[&session_id],
+                )?
+            };
+            rows.into_iter()
+                .next()
+                .and_then(|row| row["id"].as_str().map(str::to_string))
+                .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(&plan_id).ok())
         } else {
             None
         };
         let lineage_history_rows = if task_target.is_none() {
             session_target
                 .map(|session_id| {
-                    self.terminal_todo_plan_history_rows_for_session_lineage(session_id)
+                    self.terminal_todo_plan_history_rows_for_session_lineage(
+                        session_id,
+                        workspace_target.as_deref(),
+                    )
                 })
                 .transpose()?
                 .unwrap_or_default()
@@ -5308,32 +5573,51 @@ impl CoordinationKernel {
         } else if task_target.is_some() || session_target.is_some() {
             Vec::new()
         } else if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
-            self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
-                 FROM terminal_task_plans p
-                 LEFT JOIN tasks t ON t.id=p.task_id
-                 WHERE p.agent_id=?1 OR t.claimed_by_agent_id=?1
-                 ORDER BY p.updated_at DESC LIMIT 25",
-                &[&agent_id],
-            )?
+            if let Some(workspace_id) = workspace_target.as_deref() {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         WHERE p.agent_id=?1
+                           AND (p.workspace_id=?2 OR p.workspace_id IS NULL OR p.workspace_id='')
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&agent_id, &workspace_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         WHERE p.agent_id=?1
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&agent_id],
+                )?
+            }
         } else {
-            self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
-                 FROM terminal_task_plans p
-                 LEFT JOIN tasks t ON t.id=p.task_id
-                 ORDER BY p.updated_at DESC LIMIT 25",
-                &[],
-            )?
+            if let Some(workspace_id) = workspace_target.as_deref() {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         WHERE p.workspace_id=?1 OR p.workspace_id IS NULL OR p.workspace_id=''
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&workspace_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[],
+                )?
+            }
         };
-        let selected_plan = if selected_plan_from_target.is_some() {
-            selected_plan_from_target
+        let selected_plan = if let Some(plan) = selected_plan_from_target {
+            Some(plan)
         } else if history_scope == "session_lineage" {
             history_rows
                 .first()
-                .and_then(|row| row["task_id"].as_str())
-                .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(task_id).ok())
+                .and_then(|row| row["id"].as_str())
+                .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(plan_id).ok())
         } else {
-            let fallback_task_id = history_rows
+            let fallback_plan_id = history_rows
                 .iter()
                 .find(|row| {
                     !terminal_todo_plan_is_terminal_status(
@@ -5341,24 +5625,22 @@ impl CoordinationKernel {
                     )
                 })
                 .or_else(|| history_rows.first())
-                .and_then(|row| row["task_id"].as_str())
+                .and_then(|row| row["id"].as_str())
                 .map(str::to_string);
-            fallback_task_id
+            fallback_plan_id
                 .as_deref()
-                .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(task_id).ok())
-                .or(selected_plan_from_target)
+                .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(plan_id).ok())
         };
         let history = history_rows
             .into_iter()
             .map(|row| {
-                json!({
-                    "plan_id": row["id"].clone(),
-                    "task_id": row["task_id"].clone(),
-                    "title": row["title"].clone(),
-                    "task_title": row["task_title"].clone(),
-                    "status": row["status"].clone(),
-                    "task_status": row["task_status"].clone(),
-                    "current_step_index": row["current_step_index"].clone(),
+                    json!({
+                        "plan_id": row["id"].clone(),
+                        "todo_id": row["todo_id"].clone(),
+                        "workspace_id": row["workspace_id"].clone(),
+                        "title": row["title"].clone(),
+                        "status": row["status"].clone(),
+                        "current_step_index": row["current_step_index"].clone(),
                     "revision": row["revision"].clone(),
                     "session_id": row["session_id"].clone(),
                     "agent_id": row["agent_id"].clone(),
@@ -5378,6 +5660,7 @@ impl CoordinationKernel {
     fn terminal_todo_plan_history_rows_for_session_lineage(
         &self,
         session_id: &str,
+        workspace_id: Option<&str>,
     ) -> Result<Vec<Value>, String> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -5404,16 +5687,28 @@ impl CoordinationKernel {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let rows = self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
-                 FROM terminal_task_plans p
-                 LEFT JOIN tasks t ON t.id=p.task_id
-                 LEFT JOIN agent_sessions s ON s.id=p.session_id
-                 WHERE s.pty_id=?1
-                   AND (?2='' OR COALESCE(p.agent_id, t.claimed_by_agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
-                 ORDER BY p.updated_at DESC LIMIT 25",
-                &[&pty_id, &session_agent_id],
-            )?;
+            let rows = if let Some(workspace_id) = workspace_id {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         LEFT JOIN agent_sessions s ON s.id=p.session_id
+                         WHERE s.pty_id=?1
+                           AND (?2='' OR COALESCE(p.agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                           AND (p.workspace_id=?3 OR p.workspace_id IS NULL OR p.workspace_id='')
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&pty_id, &session_agent_id, &workspace_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         LEFT JOIN agent_sessions s ON s.id=p.session_id
+                         WHERE s.pty_id=?1
+                           AND (?2='' OR COALESCE(p.agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&pty_id, &session_agent_id],
+                )?
+            };
             if !rows.is_empty() {
                 return Ok(rows);
             }
@@ -5424,16 +5719,28 @@ impl CoordinationKernel {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let rows = self.query_json(
-                "SELECT p.*, t.title AS task_title, t.status AS task_status
-                 FROM terminal_task_plans p
-                 LEFT JOIN tasks t ON t.id=p.task_id
-                 LEFT JOIN agent_sessions s ON s.id=p.session_id
-                 WHERE s.agent_slot_id=?1
-                   AND (?2='' OR COALESCE(p.agent_id, t.claimed_by_agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
-                 ORDER BY p.updated_at DESC LIMIT 25",
-                &[&agent_slot_id, &session_agent_id],
-            )?;
+            let rows = if let Some(workspace_id) = workspace_id {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         LEFT JOIN agent_sessions s ON s.id=p.session_id
+                         WHERE s.agent_slot_id=?1
+                           AND (?2='' OR COALESCE(p.agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                           AND (p.workspace_id=?3 OR p.workspace_id IS NULL OR p.workspace_id='')
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&agent_slot_id, &session_agent_id, &workspace_id],
+                )?
+            } else {
+                self.query_json(
+                    "SELECT p.*
+                         FROM terminal_todo_plans p
+                         LEFT JOIN agent_sessions s ON s.id=p.session_id
+                         WHERE s.agent_slot_id=?1
+                           AND (?2='' OR COALESCE(p.agent_id, s.agent_id, '')=?2 OR s.agent_id=?2)
+                         ORDER BY p.updated_at DESC LIMIT 25",
+                    &[&agent_slot_id, &session_agent_id],
+                )?
+            };
             if !rows.is_empty() {
                 return Ok(rows);
             }
@@ -5442,8 +5749,11 @@ impl CoordinationKernel {
         Ok(Vec::new())
     }
 
-    pub fn terminal_todo_plan_compact(&self, task_id: &str) -> Result<Option<Value>, String> {
-        let plan = match self.terminal_todo_plan_view_by_task_id(task_id) {
+    fn terminal_todo_plan_compact_for_plan_ref(
+        &self,
+        plan_ref: &str,
+    ) -> Result<Option<Value>, String> {
+        let plan = match self.terminal_todo_plan_view_by_plan_ref(plan_ref) {
             Ok(plan) => plan,
             Err(_) => return Ok(None),
         };
@@ -5454,18 +5764,28 @@ impl CoordinationKernel {
             .into_iter()
             .map(|step| {
                 json!({
+                    "id": step["id"].clone(),
                     "index": step["index"].clone(),
+                    "todo_id": step["todo_id"].clone(),
                     "title": step["title"].clone(),
                     "status": step["status"].clone(),
                     "revision": step["revision"].clone(),
                 })
             })
             .collect::<Vec<_>>();
+        let todo_ids = Value::Array(
+            steps
+                .iter()
+                .filter_map(|step| step["todo_id"].as_str().map(|value| json!(value)))
+                .collect::<Vec<_>>(),
+        );
         Ok(Some(json!({
             "kind": "terminal_todo_plan",
             "version": 1,
-            "plan_id": plan["plan_id"].clone(),
-            "task_id": plan["task_id"].clone(),
+                "plan_id": plan["plan_id"].clone(),
+                "todo_id": plan["todo_id"].clone(),
+                "todo_ids": todo_ids,
+                "workspace_id": plan["workspace_id"].clone(),
             "agent_id": plan["agent_id"].clone(),
             "session_id": plan["session_id"].clone(),
             "title": plan["title"].clone(),
@@ -5482,23 +5802,27 @@ impl CoordinationKernel {
         task_id: Option<&str>,
         session_id: Option<&str>,
         _agent_id: Option<&str>,
+        plan_ref: Option<&str>,
     ) -> Result<Value, String> {
-        let selected_plan = if let Some(task_id) =
-            task_id.map(str::trim).filter(|value| !value.is_empty())
+        let selected_plan = if let Some(plan_ref) =
+            plan_ref.map(str::trim).filter(|value| !value.is_empty())
         {
-            self.terminal_todo_plan_view_by_task_id(task_id).ok()
+            self.terminal_todo_plan_view_by_plan_ref(plan_ref).ok()
+        } else if let Some(task_id) = task_id.map(str::trim).filter(|value| !value.is_empty()) {
+            self.terminal_todo_plan_plan_id_for_task_source(task_id)?
+                .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(&plan_id).ok())
         } else if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty())
         {
             self.query_json(
-                "SELECT task_id FROM terminal_task_plans
+                "SELECT id FROM terminal_todo_plans
                  WHERE session_id=?1
                  ORDER BY updated_at DESC LIMIT 1",
                 &[&session_id],
             )?
             .into_iter()
             .next()
-            .and_then(|row| row["task_id"].as_str().map(str::to_string))
-            .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(&task_id).ok())
+            .and_then(|row| row["id"].as_str().map(str::to_string))
+            .and_then(|plan_id| self.terminal_todo_plan_view_by_plan_ref(&plan_id).ok())
         } else {
             None
         };
@@ -5506,13 +5830,12 @@ impl CoordinationKernel {
         let history = selected_plan
             .as_ref()
             .map(|plan| {
-                vec![json!({
-                    "plan_id": plan["plan_id"].clone(),
-                    "task_id": plan["task_id"].clone(),
-                    "title": plan["title"].clone(),
-                    "task_title": plan["task_title"].clone(),
-                    "status": plan["status"].clone(),
-                    "task_status": plan["task_status"].clone(),
+                    vec![json!({
+                        "plan_id": plan["plan_id"].clone(),
+                        "todo_id": plan["todo_id"].clone(),
+                        "workspace_id": plan["workspace_id"].clone(),
+                        "title": plan["title"].clone(),
+                        "status": plan["status"].clone(),
                     "current_step_index": plan["current_step_index"].clone(),
                     "revision": plan["revision"].clone(),
                     "session_id": plan["session_id"].clone(),
@@ -5530,10 +5853,46 @@ impl CoordinationKernel {
         })))
     }
 
-    fn terminal_todo_plan_id_for_task(&self, task_id: &str) -> Result<Option<String>, String> {
+    fn terminal_todo_plan_plan_id_from_input_or_task(
+        &self,
+        input: &Value,
+        task_id: &str,
+    ) -> Result<Option<String>, String> {
+        if let Some(plan_ref) = string_from_value_keys(
+            input,
+            &[
+                "plan_id",
+                "planId",
+                "todo_id",
+                "todoId",
+                "source_todo_id",
+                "sourceTodoId",
+            ],
+        ) {
+            if let Some(plan_id) = self.terminal_todo_plan_plan_id_for_plan_ref(&plan_ref)? {
+                return Ok(Some(plan_id));
+            }
+        }
+        self.terminal_todo_plan_plan_id_for_task_source(task_id)
+    }
+
+    fn terminal_todo_plan_plan_id_for_task_source(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<String>, String> {
+        let task_id = task_id.trim();
+        if task_id.is_empty() {
+            return Ok(None);
+        }
         Ok(self
             .query_json(
-                "SELECT id FROM terminal_task_plans WHERE task_id=?1 LIMIT 1",
+                "SELECT p.id
+                     FROM terminal_todo_plans p
+                     JOIN tasks t ON t.source_todo_id=p.todo_id
+                     WHERE t.id=?1
+                       AND t.source_todo_id IS NOT NULL
+                       AND TRIM(t.source_todo_id) <> ''
+                     ORDER BY p.updated_at DESC LIMIT 1",
                 &[&task_id],
             )?
             .into_iter()
@@ -5541,48 +5900,71 @@ impl CoordinationKernel {
             .and_then(|row| row["id"].as_str().map(str::to_string)))
     }
 
-    fn terminal_todo_plan_view_by_task_id(&self, task_id: &str) -> Result<Value, String> {
+    fn terminal_todo_plan_plan_id_for_plan_ref(
+        &self,
+        plan_ref: &str,
+    ) -> Result<Option<String>, String> {
+        let plan_ref = plan_ref.trim();
+        if plan_ref.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .query_json(
+                "SELECT id FROM terminal_todo_plans
+                     WHERE id=?1 OR todo_id=?1
+                     ORDER BY CASE WHEN id=?1 THEN 0 ELSE 1 END, updated_at DESC
+                     LIMIT 1",
+                &[&plan_ref],
+            )?
+            .into_iter()
+            .next()
+            .and_then(|row| row["id"].as_str().map(str::to_string)))
+    }
+
+    fn terminal_todo_plan_view_by_plan_ref(&self, plan_ref: &str) -> Result<Value, String> {
         let plan = self.query_one(
-            "SELECT p.*, t.title AS task_title, t.status AS task_status
-             FROM terminal_task_plans p
-             LEFT JOIN tasks t ON t.id=p.task_id
-             WHERE p.task_id=?1",
-            &[&task_id],
+            "SELECT p.*
+                 FROM terminal_todo_plans p
+                 WHERE p.id=?1 OR p.todo_id=?1
+                 ORDER BY CASE WHEN p.id=?1 THEN 0 ELSE 1 END, p.updated_at DESC
+                 LIMIT 1",
+            &[&plan_ref],
             "Terminal todo plan does not exist.",
         )?;
         let plan_id = plan["id"].as_str().unwrap_or_default().to_string();
         let steps = self.query_json(
-            "SELECT id, step_index, title, detail, status, source, revision, started_at,
-                    completed_at, created_at, updated_at
-             FROM terminal_task_plan_steps
-             WHERE plan_id=?1
+                "SELECT id, todo_id, step_index, title, detail, status, source, revision,
+                        started_at, completed_at, created_at, updated_at
+                 FROM terminal_todo_plan_steps
+                 WHERE plan_id=?1
              ORDER BY step_index ASC",
             &[&plan_id],
         )?
         .into_iter()
-        .map(|step| {
-            json!({
-                "id": step["id"].clone(),
-                "index": step["step_index"].clone(),
-                "title": step["title"].clone(),
-                "detail": step["detail"].clone(),
-                "status": step["status"].clone(),
-                "source": step["source"].clone(),
-                "revision": step["revision"].clone(),
-                "started_at": step["started_at"].clone(),
-                "completed_at": step["completed_at"].clone(),
-                "created_at": step["created_at"].clone(),
-                "updated_at": step["updated_at"].clone(),
-                "editable": terminal_todo_plan_step_user_editable(step["status"].as_str().unwrap_or_default()),
-            })
-        })
-        .collect::<Vec<_>>();
+            .map(|step| {
+                json!({
+                        "id": step["id"].clone(),
+                        "todo_id": step["todo_id"].clone(),
+                        "index": step["step_index"].clone(),
+                        "title": step["title"].clone(),
+                        "detail": step["detail"].clone(),
+                        "status": step["status"].clone(),
+                        "source": step["source"].clone(),
+                        "revision": step["revision"].clone(),
+                        "started_at": step["started_at"].clone(),
+                        "completed_at": step["completed_at"].clone(),
+                        "created_at": step["created_at"].clone(),
+                        "updated_at": step["updated_at"].clone(),
+                        "editable": terminal_todo_plan_step_user_editable(step["status"].as_str().unwrap_or_default()),
+                    })
+                })
+                .collect::<Vec<_>>();
         Ok(json!({
-            "plan_id": plan["id"].clone(),
-            "task_id": plan["task_id"].clone(),
-            "task_title": plan["task_title"].clone(),
-            "task_status": plan["task_status"].clone(),
-            "agent_id": plan["agent_id"].clone(),
+                "plan_id": plan["id"].clone(),
+                "id": plan["id"].clone(),
+                "todo_id": plan["todo_id"].clone(),
+                "workspace_id": plan["workspace_id"].clone(),
+                "agent_id": plan["agent_id"].clone(),
             "session_id": plan["session_id"].clone(),
             "title": plan["title"].clone(),
             "status": plan["status"].clone(),
@@ -26373,8 +26755,9 @@ mod tests {
         title: &str,
         steps: &[&str],
         current_step_index: i64,
-    ) {
+    ) -> String {
         let plan_id = uuid();
+        let todo_id = format!("{plan_id}-todo");
         let now = now_rfc3339();
         let current_step_index = current_step_index
             .max(0)
@@ -26382,13 +26765,20 @@ mod tests {
         kernel
             .conn
             .execute(
-                "INSERT INTO terminal_task_plans(
-                    id, task_id, agent_id, session_id, title, status, current_step_index,
-                    revision, created_at, updated_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, ?7, ?7)",
+                "UPDATE tasks SET source_todo_id=?1, updated_at=?2 WHERE id=?3",
+                params![&todo_id, &now, task_id],
+            )
+            .unwrap();
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO terminal_todo_plans(
+                        id, todo_id, agent_id, session_id, title, status, current_step_index,
+                        revision, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, ?7, ?7)",
                 params![
                     &plan_id,
-                    task_id,
+                    &todo_id,
                     agent_id,
                     session_id,
                     title,
@@ -26399,6 +26789,7 @@ mod tests {
             .unwrap();
         for (index, title) in steps.iter().enumerate() {
             let step_index = index as i64;
+            let step_id = uuid();
             let status = if step_index < current_step_index {
                 "completed"
             } else if step_index == current_step_index {
@@ -26409,14 +26800,14 @@ mod tests {
             kernel
                 .conn
                 .execute(
-                    "INSERT INTO terminal_task_plan_steps(
-                        id, plan_id, task_id, step_index, title, detail, status, source,
-                        revision, started_at, completed_at, created_at, updated_at
-                     ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, 'test', 1, ?7, ?8, ?9, ?9)",
+                    "INSERT INTO terminal_todo_plan_steps(
+                            id, plan_id, todo_id, step_index, title, detail, status, source,
+                            revision, started_at, completed_at, created_at, updated_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, 'test', 1, ?7, ?8, ?9, ?9)",
                     params![
-                        uuid(),
+                        &step_id,
                         &plan_id,
-                        task_id,
+                        &step_id,
                         step_index,
                         title,
                         status,
@@ -26435,6 +26826,80 @@ mod tests {
                 )
                 .unwrap();
         }
+        plan_id
+    }
+
+    #[test]
+    fn create_plan_records_taskless_terminal_todo_plan() {
+        let repo = init_git_repo("taskless_terminal_todo_plan");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let created = json!({
+            "plan_id": "local-plan-test",
+            "todo_id": "local-plan-test-todo-1",
+            "compact_plan": {
+                "plan_id": "local-plan-test",
+                "todo_id": "local-plan-test-todo-1",
+                "title": "Ice Cream Wishlist Page",
+                "status": "listed",
+                "current_step_index": 0,
+                "steps": [
+                    {
+                        "id": "local-plan-test-todo-1",
+                        "todo_id": "local-plan-test-todo-1",
+                        "index": 0,
+                        "title": "Define chocolate target",
+                        "status": "listed"
+                    },
+                    {
+                        "id": "local-plan-test-todo-2",
+                        "todo_id": "local-plan-test-todo-2",
+                        "index": 1,
+                        "title": "Click chocolate",
+                        "status": "listed"
+                    }
+                ]
+            }
+        });
+        let input = json!({
+            "workspace_id": "workspace-test",
+            "agent_id": "codex",
+            "session_id": "session-test"
+        });
+
+        let recorded = kernel
+            .record_terminal_todo_plan_from_create_plan(&created, &input)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded["plan"]["plan_id"].as_str(),
+            Some("local-plan-test")
+        );
+        assert_eq!(
+            recorded["plan"]["todo_id"].as_str(),
+            Some("local-plan-test-todo-1")
+        );
+        assert!(!recorded["plan"]
+            .as_object()
+            .unwrap()
+            .contains_key("task_id"));
+
+        let snapshot = kernel
+            .terminal_todo_plan_snapshot(None, None, Some("codex"), Some("workspace-test"))
+            .unwrap();
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["plan_id"].as_str(),
+            Some("local-plan-test")
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["status"].as_str(),
+            Some("listed")
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["steps"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
     }
 
     #[test]
@@ -26448,7 +26913,7 @@ mod tests {
             .unwrap();
         let task_id = task["id"].as_str().unwrap();
 
-        seed_terminal_todo_plan_for_test(
+        let plan_id = seed_terminal_todo_plan_for_test(
             &kernel,
             task_id,
             Some(agent_id),
@@ -26459,7 +26924,7 @@ mod tests {
         );
 
         let active_edit = kernel
-            .edit_terminal_todo_plan_step_title(task_id, 0, "User active edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(&plan_id, 0, "User active edit", Some("user"))
             .unwrap();
         assert_eq!(active_edit["ok"].as_bool(), Some(false));
         assert_eq!(
@@ -26468,7 +26933,7 @@ mod tests {
         );
 
         let queued_edit = kernel
-            .edit_terminal_todo_plan_step_title(task_id, 1, "User queued edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(&plan_id, 1, "User queued edit", Some("user"))
             .unwrap();
         assert_eq!(queued_edit["ok"].as_bool(), Some(true));
         assert_eq!(
@@ -26489,7 +26954,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let blocked_edit = kernel
-            .edit_terminal_todo_plan_step_title(task_id, 1, "User blocked edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(&plan_id, 1, "User blocked edit", Some("user"))
             .unwrap();
         assert_eq!(blocked_edit["ok"].as_bool(), Some(true));
         assert_eq!(
@@ -26498,7 +26963,7 @@ mod tests {
         );
 
         let completed_edit = kernel
-            .edit_terminal_todo_plan_step_title(task_id, 0, "User completed edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(&plan_id, 0, "User completed edit", Some("user"))
             .unwrap();
         assert_eq!(completed_edit["ok"].as_bool(), Some(false));
     }
@@ -26593,7 +27058,7 @@ mod tests {
             .create_task("Older unfinished plan", None, 0, 1, None, None, None, None)
             .unwrap();
         let stale_task_id = stale_task["id"].as_str().unwrap();
-        seed_terminal_todo_plan_for_test(
+        let stale_plan_id = seed_terminal_todo_plan_for_test(
             &kernel,
             stale_task_id,
             Some(agent_id),
@@ -26605,8 +27070,8 @@ mod tests {
         kernel
             .conn
             .execute(
-                "UPDATE terminal_task_plans SET updated_at='0000-01-01T00:00:00.000Z' WHERE task_id=?1",
-                params![stale_task_id],
+                "UPDATE terminal_todo_plans SET updated_at='0000-01-01T00:00:00.000Z' WHERE id=?1",
+                params![&stale_plan_id],
             )
             .unwrap();
 
@@ -26614,7 +27079,7 @@ mod tests {
             .create_task("Completed plan", None, 0, 1, None, None, None, None)
             .unwrap();
         let completed_task_id = completed_task["id"].as_str().unwrap();
-        seed_terminal_todo_plan_for_test(
+        let completed_plan_id = seed_terminal_todo_plan_for_test(
             &kernel,
             completed_task_id,
             Some(agent_id),
@@ -26625,7 +27090,7 @@ mod tests {
         );
         kernel
             .finish_terminal_todo_plan(
-                completed_task_id,
+                &completed_plan_id,
                 "completed",
                 Some(agent_id),
                 Some(&first_session_id),
@@ -26651,15 +27116,15 @@ mod tests {
         let restarted_session_id = restarted_session["id"].as_str().unwrap();
 
         let snapshot = kernel
-            .terminal_todo_plan_snapshot(None, Some(restarted_session_id), Some("codex"))
+            .terminal_todo_plan_snapshot(None, Some(restarted_session_id), Some("codex"), None)
             .unwrap();
         assert_eq!(
             snapshot["data"]["history_scope"].as_str(),
             Some("session_lineage")
         );
         assert_eq!(
-            snapshot["data"]["selected_plan"]["task_id"].as_str(),
-            Some(completed_task_id)
+            snapshot["data"]["selected_plan"]["plan_id"].as_str(),
+            Some(completed_plan_id.as_str())
         );
         assert_eq!(
             snapshot["data"]["selected_plan"]["status"].as_str(),

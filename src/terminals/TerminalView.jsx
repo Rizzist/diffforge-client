@@ -3729,7 +3729,9 @@ const TodoQueueList = styled.div`
 
 const TodoQueueItemCard = styled.article`
   --todo-dot-center-x: 19px;
-  --todo-dot-center-y: 19px;
+  --todo-row-padding-top: 8px;
+  --todo-text-line-height: 17.4px;
+  --todo-dot-center-y: calc(var(--todo-row-padding-top) + (var(--todo-text-line-height) / 2));
   --todo-dot-radius: 3px;
   --todo-dot-size: 6px;
   --todo-spinner-radius: 8px;
@@ -3743,7 +3745,7 @@ const TodoQueueItemCard = styled.article`
   min-height: 35px;
   grid-template-columns: 20px minmax(0, 1fr);
   align-items: start;
-  padding: 8px 36px 8px 12px;
+  padding: var(--todo-row-padding-top) 36px 8px 12px;
   border: 0;
   border-radius: 0;
   color: #eef4fb;
@@ -3760,7 +3762,7 @@ const TodoQueueItemCard = styled.article`
     content: "";
     width: var(--todo-dot-size);
     height: var(--todo-dot-size);
-    margin-top: calc(var(--todo-dot-center-y) - 8px - var(--todo-dot-radius));
+    margin-top: calc(var(--todo-dot-center-y) - var(--todo-row-padding-top) - var(--todo-dot-radius));
     margin-left: calc(var(--todo-dot-center-x) - 12px - var(--todo-dot-radius));
     border-radius: 999px;
     background: var(--todo-agent-color, ${TODO_QUEUE_DEFAULT_DOT_COLOR});
@@ -4351,7 +4353,7 @@ const TodoQueueItemEditor = styled.textarea`
 
 const TodoQueueDraftBullet = styled.span`
   position: absolute;
-  top: 16px;
+  top: calc(8px + (17.4px / 2) - 3px);
   left: 16px;
   z-index: 1;
   width: 6px;

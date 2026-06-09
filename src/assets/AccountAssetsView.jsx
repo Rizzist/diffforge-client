@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 import styled, { keyframes } from "styled-components";
 import { Cached } from "@styled-icons/material-rounded/Cached";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { Delete } from "@styled-icons/material-rounded/Delete";
+import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
+import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
+import { LibraryAddCheck } from "@styled-icons/material-rounded/LibraryAddCheck";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 
@@ -292,36 +296,106 @@ export default function AccountAssetsView({
   onRefresh = null,
   rootDirectory = "",
   syncing = false,
+  untrackedError = "",
+  untrackedLibrary = null,
+  untrackedLoading = false,
+  untrackedSyncing = false,
+  onUntrackedDelete = null,
+  onUntrackedPromote = null,
+  onUntrackedRefresh = null,
+  onUntrackedRename = null,
 }) {
   const repoPath = rootDirectory || defaultWorkingDirectory || "";
+  const [assetMode, setAssetMode] = useState("tracked");
+  const trackedCount = useMemo(() => assetLibraryItems(library).length, [library]);
+  const untrackedCount = useMemo(() => assetLibraryItems(untrackedLibrary).length, [untrackedLibrary]);
 
   return (
     <AssetsSurface aria-label="Account Assets" data-state={loading ? "loading" : "ready"}>
-      <AssetsPanel
-        assetWorkspaces={assetWorkspaces}
-        error={error}
-        library={library}
-        loading={loading}
-        onLoadCached={onLoadCached}
-        onRefresh={onRefresh}
-        repoLabel="Assets"
-        repoPath={repoPath}
-        syncing={syncing}
-      />
+      {assetMode === "untracked" ? (
+        <UntrackedAssetsPanel
+          assetMode={assetMode}
+          assetWorkspaces={assetWorkspaces}
+          error={untrackedError}
+          library={untrackedLibrary}
+          loading={untrackedLoading}
+          onAssetModeChange={setAssetMode}
+          onDelete={onUntrackedDelete}
+          onPromote={onUntrackedPromote}
+          onRefresh={onUntrackedRefresh}
+          onRename={onUntrackedRename}
+          onTrackedRefresh={onRefresh}
+          repoPath={repoPath}
+          syncing={untrackedSyncing}
+          trackedCount={trackedCount}
+          untrackedCount={untrackedCount}
+        />
+      ) : (
+        <AssetsPanel
+          assetMode={assetMode}
+          assetWorkspaces={assetWorkspaces}
+          error={error}
+          library={library}
+          loading={loading}
+          onAssetModeChange={setAssetMode}
+          onLoadCached={onLoadCached}
+          onRefresh={onRefresh}
+          repoLabel="Assets"
+          repoPath={repoPath}
+          syncing={syncing}
+          trackedCount={trackedCount}
+          untrackedCount={untrackedCount}
+        />
+      )}
     </AssetsSurface>
   );
 }
 
+function AssetModeTabs({
+  assetMode = "tracked",
+  onAssetModeChange,
+  trackedCount = 0,
+  untrackedCount = 0,
+}) {
+  const setMode = typeof onAssetModeChange === "function" ? onAssetModeChange : () => {};
+  return (
+    <AssetModeTabList aria-label="Asset library sections">
+      <AssetModeTab
+        aria-pressed={assetMode === "tracked"}
+        data-active={assetMode === "tracked"}
+        onClick={() => setMode("tracked")}
+        type="button"
+      >
+        Tracked
+        <span>{trackedCount}</span>
+      </AssetModeTab>
+      <AssetModeTab
+        aria-pressed={assetMode === "untracked"}
+        data-active={assetMode === "untracked"}
+        onClick={() => setMode("untracked")}
+        type="button"
+      >
+        Untracked
+        <span>{untrackedCount}</span>
+      </AssetModeTab>
+    </AssetModeTabList>
+  );
+}
+
 function AssetsPanel({
+  assetMode = "tracked",
   assetWorkspaces = [],
   error = "",
   library = null,
   loading = false,
+  onAssetModeChange,
   onLoadCached,
   onRefresh,
   repoLabel,
   repoPath,
   syncing = false,
+  trackedCount = 0,
+  untrackedCount = 0,
 }) {
   const items = useMemo(() => assetLibraryItems(library), [library]);
   const transfers = useMemo(() => assetLibraryTransfers(library), [library]);
@@ -462,6 +536,12 @@ function AssetsPanel({
       <AssetsHeader>
         <div>
           <AssetsKicker>Library</AssetsKicker>
+          <AssetModeTabs
+            assetMode={assetMode}
+            onAssetModeChange={onAssetModeChange}
+            trackedCount={trackedCount}
+            untrackedCount={untrackedCount}
+          />
           <AssetHeadingLine>
             <AssetsTitle>{repoLabel}</AssetsTitle>
             {(syncing || (!loading && !error)) && (
@@ -552,6 +632,10 @@ function AssetsPanel({
             const canDownload = canRunAssetAction && !transferActive && availability.hasCloud && !availability.hasLocal;
             const canDeleteCloud = canRunAssetAction && !transferActive && availability.hasCloud;
             const canDeleteLocal = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
+            const showUpload = availability.hasLocal;
+            const showDownload = availability.hasCloud;
+            const showDeleteCloud = availability.hasCloud;
+            const showDeleteLocal = availability.hasLocal;
 
             return (
               <AssetCard data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
@@ -585,33 +669,33 @@ function AssetsPanel({
                   {availability.label}
                 </AssetCardStatus>
                 <AssetCardActions>
-                  {canUpload && (
+                  {showUpload && (
                     <AssetIconButton
                       aria-label={`Upload ${name}`}
-                      disabled={uploadBusy || Boolean(busyKey && !uploadBusy)}
+                      disabled={!canUpload || uploadBusy || Boolean(busyKey && !uploadBusy)}
                       onClick={() => runAssetAction("upload", asset)}
-                      title="Upload to Cloud"
+                      title={availability.hasCloud ? "Already in Cloud" : "Upload to Cloud"}
                       type="button"
                     >
                       <CloudUpload aria-hidden="true" />
                     </AssetIconButton>
                   )}
-                  {canDownload && (
+                  {showDownload && (
                     <AssetIconButton
                       aria-label={`Download ${name}`}
-                      disabled={downloadBusy || Boolean(busyKey && !downloadBusy)}
+                      disabled={!canDownload || downloadBusy || Boolean(busyKey && !downloadBusy)}
                       onClick={() => runAssetAction("download", asset)}
-                      title="Download asset"
+                      title={availability.hasLocal ? "Already local" : "Download asset"}
                       type="button"
                     >
                       <FileDownload aria-hidden="true" />
                     </AssetIconButton>
                   )}
-                  {canDeleteCloud && (
+                  {showDeleteCloud && (
                     <AssetIconButton
                       aria-label={`Delete Cloud copy of ${name}`}
                       data-danger="true"
-                      disabled={deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
+                      disabled={!canDeleteCloud || deleteCloudBusy || Boolean(busyKey && !deleteCloudBusy)}
                       onClick={() => runAssetAction("deleteCloud", asset)}
                       title="Delete Cloud copy"
                       type="button"
@@ -619,11 +703,11 @@ function AssetsPanel({
                       <Cloud aria-hidden="true" />
                     </AssetIconButton>
                   )}
-                  {canDeleteLocal && (
+                  {showDeleteLocal && (
                     <AssetIconButton
                       aria-label={`Delete local copy of ${name}`}
                       data-danger="true"
-                      disabled={deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
+                      disabled={!canDeleteLocal || deleteLocalBusy || Boolean(busyKey && !deleteLocalBusy)}
                       onClick={() => runAssetAction("deleteLocal", asset)}
                       title="Delete local copy"
                       type="button"
@@ -631,6 +715,214 @@ function AssetsPanel({
                       <Delete aria-hidden="true" />
                     </AssetIconButton>
                   )}
+                </AssetCardActions>
+                <AssetCardCaption>
+                  <AssetCardName>{name}</AssetCardName>
+                </AssetCardCaption>
+              </AssetCard>
+            );
+          })}
+        </AssetGrid>
+      )}
+    </AssetsPane>
+  );
+}
+
+function UntrackedAssetsPanel({
+  assetMode = "untracked",
+  assetWorkspaces = [],
+  error = "",
+  library = null,
+  loading = false,
+  onAssetModeChange,
+  onDelete,
+  onPromote,
+  onRefresh,
+  onRename,
+  onTrackedRefresh,
+  repoPath = "",
+  syncing = false,
+  trackedCount = 0,
+  untrackedCount = 0,
+}) {
+  const items = useMemo(() => assetLibraryItems(library), [library]);
+  const [busyKey, setBusyKey] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
+  const defaultWorkspace = useMemo(() => (
+    assetWorkspaces.find((workspace) => text(workspace?.id))
+      || assetWorkspaces.find((workspace) => text(workspace?.rootDirectory))
+      || assetWorkspaces[0]
+      || null
+  ), [assetWorkspaces]);
+  const refresh = useCallback((options = { silent: true }) => (
+    typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
+  ), [onRefresh]);
+  const trackedRefresh = useCallback((options = { silent: true, force: true }) => (
+    typeof onTrackedRefresh === "function" ? onTrackedRefresh(options) : Promise.resolve(null)
+  ), [onTrackedRefresh]);
+  const runUntrackedAction = useCallback(async (action, asset) => {
+    const id = assetId(asset);
+    const name = assetName(asset, "asset");
+    const localPath = assetLocalPath(asset);
+    if (!id || !localPath) return;
+    const key = `${action}:${id}`;
+    setBusyKey(key);
+    setActionError("");
+    try {
+      if (action === "open") {
+        await openPath(localPath);
+      } else if (action === "delete") {
+        if (typeof onDelete !== "function") return;
+        await onDelete(localPath);
+      } else if (action === "rename") {
+        if (typeof onRename !== "function") return;
+        const nextName = window.prompt("Rename untracked asset", name);
+        if (nextName === null) return;
+        const trimmed = nextName.trim();
+        if (!trimmed || trimmed === name) return;
+        await onRename(localPath, trimmed);
+      } else if (action === "track") {
+        if (typeof onPromote !== "function") return;
+        await onPromote({
+          deleteSource: true,
+          name,
+          path: localPath,
+          repoPath,
+          workspaceId: text(defaultWorkspace?.id),
+          workspaceName: text(defaultWorkspace?.name),
+        });
+        await trackedRefresh({ silent: true, force: true });
+      }
+    } catch (nextError) {
+      setActionError(nextError?.message || String(nextError || `Unable to ${action} untracked asset.`));
+    } finally {
+      setBusyKey((current) => (current === key ? "" : current));
+    }
+  }, [defaultWorkspace, onDelete, onPromote, onRename, repoPath, trackedRefresh]);
+
+  return (
+    <AssetsPane>
+      <AssetsHeader>
+        <div>
+          <AssetsKicker>Scratch</AssetsKicker>
+          <AssetModeTabs
+            assetMode={assetMode}
+            onAssetModeChange={onAssetModeChange}
+            trackedCount={trackedCount}
+            untrackedCount={untrackedCount}
+          />
+          <AssetHeadingLine>
+            <AssetsTitle>Untracked Assets</AssetsTitle>
+            <AssetSyncPill aria-live="polite" data-state={syncing ? "syncing" : "local"}>
+              {syncing && <AssetSyncSpinner aria-hidden="true" />}
+              {syncing ? "Scanning" : "Local Scratch"}
+            </AssetSyncPill>
+          </AssetHeadingLine>
+        </div>
+        <AssetHeaderActions>
+          <AssetsSummary>
+            {items.length} scratch file{items.length === 1 ? "" : "s"} · local only · not synced
+          </AssetsSummary>
+          <AssetIconButton
+            aria-label="Refresh untracked assets"
+            disabled={loading || syncing}
+            onClick={() => refresh({ silent: false, force: true })}
+            title="Refresh untracked assets"
+            type="button"
+          >
+            <Cached aria-hidden="true" />
+          </AssetIconButton>
+        </AssetHeaderActions>
+      </AssetsHeader>
+      {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
+      {!items.length ? (
+        <AssetEmptyState>
+          {loading ? "Loading untracked assets..." : "No untracked scratch files yet. Snips and edits will appear here before you track them."}
+        </AssetEmptyState>
+      ) : (
+        <AssetGrid aria-label="Untracked asset scratch grid">
+          {items.map((asset, index) => {
+            const id = assetId(asset, `untracked-${index}`);
+            const name = assetName(asset, `Scratch ${index + 1}`);
+            const localPath = assetLocalPath(asset);
+            const previewUrl = assetPreviewUrl(asset);
+            const previewKey = `${id}:${previewUrl}`;
+            const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
+            const openBusy = busyKey === `open:${id}`;
+            const trackBusy = busyKey === `track:${id}`;
+            const renameBusy = busyKey === `rename:${id}`;
+            const deleteBusy = busyKey === `delete:${id}`;
+
+            return (
+              <AssetCard data-status="parked" key={id} title={localPath || name}>
+                <AssetCardPreview>
+                  {shouldShowImagePreview ? (
+                    <AssetPreviewImage
+                      alt={name}
+                      decoding="async"
+                      draggable={false}
+                      loading={index < 20 ? "eager" : "lazy"}
+                      onError={(event) => {
+                        event.currentTarget.hidden = true;
+                        setFailedPreviewKeys((current) => {
+                          const next = new Set(current);
+                          next.add(previewKey);
+                          return next;
+                        });
+                      }}
+                      src={previewUrl}
+                    />
+                  ) : (
+                    <AssetDocumentPreview aria-hidden="true">
+                      <AssetDocumentGlyph>
+                        <InsertDriveFile aria-hidden="true" />
+                        <span>{assetFileTypeLabel(asset)}</span>
+                      </AssetDocumentGlyph>
+                    </AssetDocumentPreview>
+                  )}
+                </AssetCardPreview>
+                <AssetCardStatus data-status="parked" title="This file is local scratch and is not synced">
+                  Untracked
+                </AssetCardStatus>
+                <AssetCardActions>
+                  <AssetIconButton
+                    aria-label={`Open ${name}`}
+                    disabled={!localPath || openBusy || Boolean(busyKey && !openBusy)}
+                    onClick={() => runUntrackedAction("open", asset)}
+                    title="Open file"
+                    type="button"
+                  >
+                    <FileOpen aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Track ${name}`}
+                    disabled={!localPath || !onPromote || trackBusy || Boolean(busyKey && !trackBusy)}
+                    onClick={() => runUntrackedAction("track", asset)}
+                    title="Track asset"
+                    type="button"
+                  >
+                    <LibraryAddCheck aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Rename ${name}`}
+                    disabled={!localPath || !onRename || renameBusy || Boolean(busyKey && !renameBusy)}
+                    onClick={() => runUntrackedAction("rename", asset)}
+                    title="Rename scratch file"
+                    type="button"
+                  >
+                    <DriveFileRenameOutline aria-hidden="true" />
+                  </AssetIconButton>
+                  <AssetIconButton
+                    aria-label={`Delete ${name}`}
+                    data-danger="true"
+                    disabled={!localPath || !onDelete || deleteBusy || Boolean(busyKey && !deleteBusy)}
+                    onClick={() => runUntrackedAction("delete", asset)}
+                    title="Delete scratch file"
+                    type="button"
+                  >
+                    <Delete aria-hidden="true" />
+                  </AssetIconButton>
                 </AssetCardActions>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
@@ -686,6 +978,59 @@ const AssetsKicker = styled.div`
   text-transform: uppercase;
 `;
 
+const AssetModeTabList = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 3px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.28);
+`;
+
+const AssetModeTab = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.74);
+  background: transparent;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+  cursor: pointer;
+
+  span {
+    color: rgba(148, 163, 184, 0.8);
+    font-size: 8px;
+    font-weight: 900;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.24);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.1);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(45, 212, 191, 0.26);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.16);
+
+    span {
+      color: rgba(204, 251, 241, 0.78);
+    }
+  }
+`;
+
 const AssetsTitle = styled.strong`
   display: block;
   min-width: 0;
@@ -736,6 +1081,12 @@ const AssetSyncPill = styled.span`
     border-color: rgba(45, 212, 191, 0.2);
     color: rgba(204, 251, 241, 0.82);
     background: rgba(13, 148, 136, 0.12);
+  }
+
+  &[data-state="local"] {
+    border-color: rgba(245, 158, 11, 0.22);
+    color: rgba(253, 230, 138, 0.86);
+    background: rgba(146, 64, 14, 0.12);
   }
 `;
 

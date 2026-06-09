@@ -3856,7 +3856,7 @@ fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Valu
     let repo_path = input["repo_path"]
         .as_str()
         .unwrap_or(repo_path_fallback.as_str());
-    let created = crate::cloud_mcp_record_agent_create_plan_todos(
+    let mut created = crate::cloud_mcp_record_agent_create_plan_todos(
         Some(repo_path),
         input["workspace_id"].as_str(),
         input["cloud_mcp_base_url"].as_str(),
@@ -3864,6 +3864,32 @@ fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Valu
         input["session_id"].as_str(),
         input,
     )?;
+    let terminal_plan = kernel.record_terminal_todo_plan_from_create_plan(&created, input)?;
+    if let Some(object) = created.as_object_mut() {
+        if let Some(terminal_plan) = terminal_plan {
+            object.insert("terminal_plan".to_string(), terminal_plan.clone());
+            object.insert("terminalPlan".to_string(), terminal_plan.clone());
+            object.insert("terminal_todo_plan".to_string(), terminal_plan);
+        }
+        object.insert(
+            "stored_in".to_string(),
+            json!([
+                "terminal_todo_plans",
+                "terminal_todo_plan_steps",
+                "workspace_todo_mirror_rows",
+                "workspace_todo_history_rows"
+            ]),
+        );
+        object.insert(
+            "storedIn".to_string(),
+            json!([
+                "terminal_todo_plans",
+                "terminal_todo_plan_steps",
+                "workspace_todo_mirror_rows",
+                "workspace_todo_history_rows"
+            ]),
+        );
+    }
     Ok(api_ok(created))
 }
 
@@ -4739,7 +4765,7 @@ fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         .as_str()
         .or(status)
         .or(Some("done"));
-    let terminal_plan_update = kernel.finish_terminal_todo_plan(
+    let terminal_plan_update = kernel.finish_terminal_todo_plan_for_task(
         task_id,
         completed_status.unwrap_or("done"),
         Some(agent_id),
@@ -4931,7 +4957,12 @@ fn run_submit_patch_job_worker(
         .and_then(|rows| rows.into_iter().next())
         .unwrap_or_else(|| json!({}));
     let terminal_plan_update = kernel
-        .finish_terminal_todo_plan(&task_id, "completed", Some(&agent_id), Some(&session_id))
+        .finish_terminal_todo_plan_for_task(
+            &task_id,
+            "completed",
+            Some(&agent_id),
+            Some(&session_id),
+        )
         .unwrap_or_else(|error| {
             Some(json!({
                 "ok": false,
@@ -5271,7 +5302,7 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion, then preserves its lifecycle to Cloud history in the background.".to_string(),
-        "create_plan" => "Create a todo-backed plan without start_task or task_id. Rust assigns a stable plan_id and todo_id-backed steps, writes local todo history immediately, and queues background Cloud sync.".to_string(),
+        "create_plan" => "Create a todo-backed plan without start_task or task_id. Rust assigns a stable plan_id and todo_id-backed steps, writes terminal_todo_plans plus local todo history immediately, and queues background Cloud sync.".to_string(),
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),

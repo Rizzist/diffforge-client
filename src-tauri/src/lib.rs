@@ -2123,6 +2123,7 @@ include!("developer_processes.rs");
 include!("terminal_cli.rs");
 include!("tokenomics.rs");
 include!("cloud_mcp.rs");
+include!("assets.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
 include!("api.rs");
@@ -3833,6 +3834,11 @@ pub fn run() {
             cloud_mcp_delete_cloud_workspace_asset,
             cloud_mcp_delete_local_workspace_asset,
             cloud_mcp_get_workspace_asset_status,
+            diffforge_start_untracked_assets_watcher,
+            diffforge_list_untracked_assets,
+            diffforge_delete_untracked_asset,
+            diffforge_rename_untracked_asset,
+            diffforge_promote_untracked_asset,
             cloud_mcp_sync_workspace_todos,
             cloud_mcp_request_workspace_todo_dispatch,
             cloud_mcp_record_todo_dispatch_status,

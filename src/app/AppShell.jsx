@@ -230,6 +230,9 @@ import {
   RailSectionTitle,
   RailCollapseButton,
   RailCreateWorkspaceButton,
+  RailAccountScopeShell,
+  RailAccountScopeSelect,
+  RailAccountScopeIcon,
   WorkspaceList,
   WorkspaceRow,
   WorkspaceButton,
@@ -512,6 +515,7 @@ import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceVie
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
+import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
 import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
@@ -11944,9 +11948,6 @@ export default function App() {
   const planLabel = billingPlanLabelFromStatus(billingStatus, user);
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
-  const billingTotalCredits = Number(billingCredits?.termTotalCredits || 0);
-  const billingUsedCredits = Number(billingCredits?.termUsedCredits || 0);
-  const billingReservedCredits = Number(billingCredits?.termReservedCredits || 0);
   const billingCreditPercent = creditUsagePercent(billingCredits);
   const billingResetLabel = creditResetLabel(billingCredits?.resetAt);
   const billingLowCreditState = String(billingCredits?.lowCreditState || "pending");
@@ -14336,6 +14337,7 @@ export default function App() {
   const accountAssetsLibrary = useAccountAssetsLibrary({
     repoPath: defaultWorkingDirectory,
   });
+  const untrackedAssetsLibrary = useUntrackedAssetsLibrary();
   const processKnownRoots = useMemo(() => {
     const roots = [];
     const seen = new Set();
@@ -20856,8 +20858,8 @@ export default function App() {
                     </RailCollapseButton>
                   </RailHeader>
                   {shouldShowAccountScopePicker && !workspaceRailCollapsed && (
-                    <WorkspaceSettingsSelectShell data-rail-selection-preserve="true">
-                      <WorkspaceSettingsSelect
+                    <RailAccountScopeShell data-rail-selection-preserve="true">
+                      <RailAccountScopeSelect
                         aria-label="Account scope"
                         onChange={handleAccountScopeChange}
                         value={activeAccountScopeKey}
@@ -20867,9 +20869,9 @@ export default function App() {
                             {scope.label}
                           </option>
                         ))}
-                      </WorkspaceSettingsSelect>
-                      <WorkspaceSettingsSelectIcon aria-hidden="true" />
-                    </WorkspaceSettingsSelectShell>
+                      </RailAccountScopeSelect>
+                      <RailAccountScopeIcon aria-hidden="true" />
+                    </RailAccountScopeShell>
                   )}
                   <WorkspaceList>
                     {workspaces.map((workspace) => {
@@ -21722,21 +21724,6 @@ export default function App() {
                         <CreditUsageFill style={{ width: `${billingCreditPercent}%` }} />
                       </CreditUsageTrack>
 
-                      <SettingsIdentityGrid>
-                        <SettingsIdentityItem>
-                          <span>Total</span>
-                          <strong>{formatCreditCount(billingTotalCredits)}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Used</span>
-                          <strong>{formatCreditCount(billingUsedCredits)}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Reserved</span>
-                          <strong>{formatCreditCount(billingReservedCredits)}</strong>
-                        </SettingsIdentityItem>
-                      </SettingsIdentityGrid>
-
                       {billingStatusError && <FormMessage $state="error">{billingStatusError}</FormMessage>}
 
                       <AccountCardFooter>
@@ -21816,6 +21803,14 @@ export default function App() {
                     onLoadCached={accountAssetsLibrary.loadCached}
                     onRefresh={accountAssetsLibrary.refresh}
                     syncing={accountAssetsLibrary.syncing}
+                    untrackedError={untrackedAssetsLibrary.error}
+                    untrackedLibrary={untrackedAssetsLibrary.library}
+                    untrackedLoading={untrackedAssetsLibrary.loading}
+                    untrackedSyncing={untrackedAssetsLibrary.syncing}
+                    onUntrackedDelete={untrackedAssetsLibrary.deleteAsset}
+                    onUntrackedPromote={untrackedAssetsLibrary.promoteAsset}
+                    onUntrackedRefresh={untrackedAssetsLibrary.refresh}
+                    onUntrackedRename={untrackedAssetsLibrary.renameAsset}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "tokenomics" ? (

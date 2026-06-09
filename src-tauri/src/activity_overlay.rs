@@ -1,6 +1,13 @@
-const ACTIVITY_OVERLAY_DEFAULT_WIDTH: f64 = 390.0;
-const ACTIVITY_OVERLAY_DEFAULT_HEIGHT: f64 = 228.0;
+const ACTIVITY_OVERLAY_DEFAULT_WIDTH: f64 = 406.0;
+const ACTIVITY_OVERLAY_DEFAULT_HEIGHT: f64 = 244.0;
 const ACTIVITY_OVERLAY_CORNER_MARGIN: i32 = 22;
+
+fn size_activity_overlay_window(window: &tauri::WebviewWindow) {
+    let _ = window.set_size(tauri::LogicalSize::new(
+        ACTIVITY_OVERLAY_DEFAULT_WIDTH,
+        ACTIVITY_OVERLAY_DEFAULT_HEIGHT,
+    ));
+}
 
 fn position_activity_overlay_window(window: &tauri::WebviewWindow) {
     let Ok(Some(monitor)) = window.current_monitor() else {
@@ -17,6 +24,7 @@ fn position_activity_overlay_window(window: &tauri::WebviewWindow) {
 
 fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(ACTIVITY_OVERLAY_WINDOW_LABEL) {
+        size_activity_overlay_window(&window);
         position_activity_overlay_window(&window);
         return Ok(window);
     }
@@ -28,7 +36,7 @@ fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindo
     )
     .title("Activity")
     .inner_size(ACTIVITY_OVERLAY_DEFAULT_WIDTH, ACTIVITY_OVERLAY_DEFAULT_HEIGHT)
-    .min_inner_size(300.0, 138.0)
+    .min_inner_size(320.0, 174.0)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)

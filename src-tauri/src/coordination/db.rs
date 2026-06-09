@@ -1216,6 +1216,19 @@ fn apply_terminal_todo_plan_migration(
     with_sqlite_lock_retry("Unable to initialize terminal todo plan schema", || {
         connection.execute_batch(TERMINAL_TODO_PLAN_SCHEMA_SQL)
     })?;
+    with_sqlite_lock_retry(
+        "Unable to remove deprecated terminal task plan schema",
+        || {
+            connection.execute_batch(
+                "DROP INDEX IF EXISTS idx_terminal_task_plans_task;
+             DROP INDEX IF EXISTS idx_terminal_task_plans_session;
+             DROP INDEX IF EXISTS idx_terminal_task_plan_steps_plan;
+             DROP INDEX IF EXISTS idx_terminal_todo_plans_task;
+             DROP TABLE IF EXISTS terminal_task_plan_steps;
+             DROP TABLE IF EXISTS terminal_task_plans;",
+            )
+        },
+    )?;
     let mut migration = if migration_applied(connection, TERMINAL_TODO_PLAN_MIGRATION_VERSION)? {
         SchemaMigrationDiagnostics::new(
             TERMINAL_TODO_PLAN_MIGRATION_VERSION,
@@ -1232,7 +1245,10 @@ fn apply_terminal_todo_plan_migration(
     };
     migration.details.splice(
         0..0,
-        ["TERMINAL_TODO_PLAN_SCHEMA_SQL executed idempotently".to_string()],
+        [
+            "TERMINAL_TODO_PLAN_SCHEMA_SQL executed idempotently".to_string(),
+            "deprecated terminal_task_plans schema removed idempotently".to_string(),
+        ],
     );
     Ok(migration)
 }
