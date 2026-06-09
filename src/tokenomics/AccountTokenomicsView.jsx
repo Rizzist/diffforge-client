@@ -92,6 +92,83 @@ function formatCreditBytes(value) {
   return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
 }
 
+function storageByteValue(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return number;
+    }
+  }
+  return 0;
+}
+
+function formatStorageBytes(value) {
+  const bytes = storageByteValue(value);
+  const mib = 1024 ** 2;
+  const gib = 1024 ** 3;
+  if (bytes <= 0) return "0 GB";
+  if (bytes >= gib) {
+    const amount = bytes / gib;
+    return `${Number.isInteger(amount) ? amount.toFixed(0) : amount.toFixed(1)} GB`;
+  }
+  if (bytes >= mib) return `${Math.round(bytes / mib)} MB`;
+  return formatCreditBytes(bytes) || "0 GB";
+}
+
+function storageLimitsForPlan(planName) {
+  const normalized = String(planName || "").trim().toLowerCase();
+  if (normalized === "ultra") {
+    return { totalBytes: 15 * 1024 ** 3, sqliteBytes: 6 * 1024 ** 3, assetsBytes: 9 * 1024 ** 3 };
+  }
+  if (normalized === "pro") {
+    return { totalBytes: 5 * 1024 ** 3, sqliteBytes: 3 * 1024 ** 3, assetsBytes: 2 * 1024 ** 3 };
+  }
+  if (normalized === "plus") {
+    return { totalBytes: 2 * 1024 ** 3, sqliteBytes: 1.5 * 1024 ** 3, assetsBytes: 0.5 * 1024 ** 3 };
+  }
+  return { totalBytes: 0, sqliteBytes: 0, assetsBytes: 0 };
+}
+
+function storageUsageModel(billingStatus = {}, summary = {}, liveStorageUsage = null) {
+  const planName = String(
+    billingStatus?.planName
+      || billingStatus?.credits?.planName
+      || liveStorageUsage?.planName
+      || liveStorageUsage?.plan_name
+      || "free",
+  ).trim().toLowerCase();
+  const raw = liveStorageUsage
+    || summary?.storageUsage
+    || summary?.storage_usage
+    || billingStatus?.storage?.usage
+    || {};
+  const usage = raw?.usage || raw || {};
+  const fallback = storageLimitsForPlan(planName);
+  const explicitLimits = raw?.limits
+    || billingStatus?.storage?.limits
+    || billingStatus?.entitlements?.storage
+    || billingStatus?.limits?.storage
+    || billingStatus?.user?.entitlements?.storage
+    || {};
+  const limits = {
+    totalBytes: storageByteValue(explicitLimits.totalBytes, explicitLimits.total_bytes, fallback.totalBytes),
+    sqliteBytes: storageByteValue(explicitLimits.sqliteBytes, explicitLimits.sqlite_bytes, fallback.sqliteBytes),
+    assetsBytes: storageByteValue(explicitLimits.assetsBytes, explicitLimits.assets_bytes, fallback.assetsBytes),
+  };
+  const rows = [
+    { key: "total", label: "Total", used: storageByteValue(usage.totalBytes, usage.total_bytes), limit: limits.totalBytes },
+    { key: "sqlite", label: "SQLite", used: storageByteValue(usage.sqliteBytes, usage.sqlite_bytes), limit: limits.sqliteBytes },
+    { key: "assets", label: "Assets", used: storageByteValue(usage.assetsBytes, usage.assets_bytes), limit: limits.assetsBytes },
+  ].map((row) => ({
+    ...row,
+    percent: row.limit > 0 ? Math.min(100, Math.max(0, Math.round((row.used / row.limit) * 100))) : 0,
+  }));
+  return {
+    known: Boolean(raw?.known || raw?.usage || billingStatus?.storage?.usage),
+    rows,
+  };
+}
+
 function compactCreditId(value) {
   const text = String(value || "").trim();
   if (!text) return "";
@@ -916,6 +993,8 @@ function mergeTokenomicsSummary(previous, next) {
     device_identities: next.device_identities || previous.device_identities,
     deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
     credits: next.credits || previous.credits,
+    storage_usage: next.storage_usage || previous.storage_usage,
+    storageUsage: next.storageUsage || previous.storageUsage,
   };
   return stripLegacyTokenomicsSummaryFields(merged);
 }
@@ -1142,7 +1221,7 @@ function CostCell({ value }) {
   return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
 }
 
-export default function AccountTokenomicsView({ accountKey = "", billingStatus = null } = {}) {
+export default function AccountTokenomicsView({ accountKey = "", billingStatus = null, storageUsage = null } = {}) {
   const [{
     summary,
     status,
@@ -1272,6 +1351,10 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const credits = billingStatus?.credits || summary?.credits || {};
+  const storage = useMemo(
+    () => storageUsageModel(billingStatus, summary, storageUsage),
+    [billingStatus, storageUsage, summary],
+  );
   const creditUsageHistory = useMemo(
     () => creditHistoryRows(billingStatus, summary),
     [billingStatus, summary],
@@ -1562,6 +1645,26 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             )}
           </CreditHistoryList>
         </CreditsCard>
+
+        <StorageCard>
+          <StorageTitle>
+            <span>Storage</span>
+            <strong>{storage.known ? "Live" : "Waiting"}</strong>
+          </StorageTitle>
+          <StorageRows>
+            {storage.rows.map((row) => (
+              <StorageRow key={row.key}>
+                <StorageRowTop>
+                  <span>{row.label}</span>
+                  <strong>{formatStorageBytes(row.used)} / {formatStorageBytes(row.limit)}</strong>
+                </StorageRowTop>
+                <StorageTrack aria-label={`${row.label} storage used`}>
+                  <StorageFill style={{ width: `${row.percent}%` }} />
+                </StorageTrack>
+              </StorageRow>
+            ))}
+          </StorageRows>
+        </StorageCard>
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
@@ -2466,6 +2569,96 @@ const CreditHistoryEmpty = styled.div`
   html[data-forge-theme="light"] & {
     color: #64748b;
   }
+`;
+
+const StorageCard = styled.div`
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(96, 165, 250, 0.17);
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.08), transparent 34%),
+    rgba(15, 23, 42, 0.72);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.14);
+    background:
+      radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.08), transparent 34%),
+      #f8fafc;
+  }
+`;
+
+const StorageTitle = styled.div`
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #e5eefb;
+  font-size: clamp(11px, 2.8vw, 13px);
+  font-weight: 900;
+
+  strong {
+    color: #60a5fa;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+`;
+
+const StorageRows = styled.div`
+  display: grid;
+  gap: 8px;
+`;
+
+const StorageRow = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const StorageRowTop = styled.div`
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: #8794a8;
+  font-size: 10px;
+  font-weight: 900;
+
+  strong {
+    color: #e5eefb;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+
+    strong {
+      color: #0f172a;
+    }
+  }
+`;
+
+const StorageTrack = styled.div`
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.2);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(15, 23, 42, 0.1);
+  }
+`;
+
+const StorageFill = styled.div`
+  height: 100%;
+  min-width: 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #60a5fa, #34d399);
+  box-shadow: 0 0 16px rgba(96, 165, 250, 0.28);
 `;
 
 const TokenomicsFooter = styled.footer`

@@ -4,6 +4,8 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import styled, { keyframes } from "styled-components";
 import { AddToPhotos } from "@styled-icons/material-rounded/AddToPhotos";
 import { Cached } from "@styled-icons/material-rounded/Cached";
+import { CheckBox } from "@styled-icons/material-rounded/CheckBox";
+import { CheckBoxOutlineBlank } from "@styled-icons/material-rounded/CheckBoxOutlineBlank";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
@@ -12,6 +14,7 @@ import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFile
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { FileOpen } from "@styled-icons/material-rounded/FileOpen";
 import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile";
+import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
 
@@ -407,6 +410,7 @@ function AssetsPanel({
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
+  const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
 
   const workspaceFilterOptions = useMemo(() => {
     const options = [];
@@ -482,6 +486,20 @@ function AssetsPanel({
   );
   const hasWorkspaceFilters = selectedWorkspaceFilterKeys.length > 0;
   const assetCountPluralBase = hasWorkspaceFilters ? items.length : filteredItems.length;
+  const selectedAssets = useMemo(() => (
+    filteredItems.filter((asset) => selectedAssetIds.has(assetId(asset)))
+  ), [filteredItems, selectedAssetIds]);
+  const selectedImageAssets = useMemo(() => (
+    selectedAssets.filter((asset) => assetLocalAvailable(asset) && assetIsImage(asset) && assetLocalPath(asset))
+  ), [selectedAssets]);
+
+  useEffect(() => {
+    const visibleIds = new Set(filteredItems.map((asset) => assetId(asset)).filter(Boolean));
+    setSelectedAssetIds((current) => {
+      const next = new Set([...current].filter((id) => visibleIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [filteredItems]);
 
   const refresh = useCallback((options = { silent: true }) => (
     typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
@@ -500,6 +518,24 @@ function AssetsPanel({
   const workspaceOptionForAsset = useCallback((asset) => (
     workspaceFilterOptions.find((option) => assetMatchesWorkspaceOption(asset, option)) || null
   ), [workspaceFilterOptions]);
+
+  const toggleAssetSelected = useCallback((asset) => {
+    const id = assetId(asset);
+    if (!id) return;
+    setSelectedAssetIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const clearSelectedAssets = useCallback(() => {
+    setSelectedAssetIds(new Set());
+  }, []);
 
   const runAssetAction = useCallback(async (action, asset) => {
     const id = assetId(asset);
@@ -602,6 +638,77 @@ function AssetsPanel({
     }
   }, [refresh, repoPath, workspaceOptionForAsset]);
 
+  const runSelectedAssetAction = useCallback(async (action) => {
+    if (!selectedAssets.length) return;
+    const key = `batch:${action}`;
+    setBusyKey(key);
+    setActionError("");
+    try {
+      if (action === "annotate") {
+        const paths = selectedImageAssets.map(assetLocalPath).filter(Boolean);
+        if (!paths.length) {
+          setActionError("Select at least one local image to annotate.");
+          return;
+        }
+        await invoke("snipping_open_annotation_editor_batch", {
+          request: { paths },
+        });
+        return;
+      }
+
+      if (action === "delete") {
+        let deletedCount = 0;
+        for (const asset of selectedAssets) {
+          const id = assetId(asset);
+          const actionWorkspace = workspaceOptionForAsset(asset);
+          const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
+          const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
+          const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
+          const availability = assetAvailability(asset);
+          if (!id || !actionRepoPath || !actionWorkspaceId) {
+            continue;
+          }
+          if (availability.hasLocal) {
+            await invoke("cloud_mcp_delete_local_workspace_asset", {
+              assetId: id,
+              deleteFile: true,
+              repoPath: actionRepoPath,
+              workspaceId: actionWorkspaceId,
+              workspaceName: actionWorkspaceName,
+            });
+            deletedCount += 1;
+          }
+          if (availability.hasCloud) {
+            await invoke("cloud_mcp_delete_cloud_workspace_asset", {
+              assetId: id,
+              repoPath: actionRepoPath,
+              workspaceId: actionWorkspaceId,
+              workspaceName: actionWorkspaceName,
+            });
+            deletedCount += 1;
+          }
+        }
+        if (!deletedCount) {
+          setActionError("Selected assets could not be deleted from this workspace.");
+          return;
+        }
+        clearSelectedAssets();
+        await refresh({ silent: true, force: true });
+      }
+    } catch (nextError) {
+      setActionError(nextError?.message || String(nextError || `Unable to ${action} selected assets.`));
+    } finally {
+      setBusyKey((current) => (current === key ? "" : current));
+    }
+  }, [
+    clearSelectedAssets,
+    refresh,
+    repoPath,
+    selectedAssets,
+    selectedImageAssets,
+    workspaceOptionForAsset,
+  ]);
+
   return (
     <AssetsPane>
       <AssetsHeader>
@@ -672,6 +779,33 @@ function AssetsPanel({
           })}
         </AssetWorkspaceFilters>
       )}
+      {selectedAssets.length > 0 && (
+        <AssetSelectionToolbar>
+          <strong>{selectedAssets.length} selected</strong>
+          <span>{selectedImageAssets.length} annotatable image{selectedImageAssets.length === 1 ? "" : "s"}</span>
+          <AssetBatchButton
+            data-primary="true"
+            disabled={!selectedImageAssets.length || Boolean(busyKey)}
+            onClick={() => runSelectedAssetAction("annotate")}
+            type="button"
+          >
+            <ModeEdit aria-hidden="true" />
+            <span>Annotation</span>
+          </AssetBatchButton>
+          <AssetBatchButton
+            data-danger="true"
+            disabled={Boolean(busyKey)}
+            onClick={() => runSelectedAssetAction("delete")}
+            type="button"
+          >
+            <Delete aria-hidden="true" />
+            <span>Delete</span>
+          </AssetBatchButton>
+          <AssetBatchButton disabled={Boolean(busyKey)} onClick={clearSelectedAssets} type="button">
+            Clear
+          </AssetBatchButton>
+        </AssetSelectionToolbar>
+      )}
       {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
@@ -713,9 +847,10 @@ function AssetsPanel({
             const showDownload = availability.hasCloud;
             const showDeleteCloud = availability.hasCloud;
             const showDeleteLocal = availability.hasLocal;
+            const selected = selectedAssetIds.has(id);
 
             return (
-              <AssetCard data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
+              <AssetCard data-selected={selected ? "true" : "false"} data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
@@ -751,6 +886,17 @@ function AssetsPanel({
                 <AssetCardStatus data-status={availability.statusKind} title={`Availability: ${availability.label}`}>
                   {availability.label}
                 </AssetCardStatus>
+                <AssetSelectButton
+                  aria-label={`${selected ? "Deselect" : "Select"} ${name}`}
+                  aria-pressed={selected}
+                  data-selected={selected ? "true" : "false"}
+                  disabled={Boolean(busyKey)}
+                  onClick={() => toggleAssetSelected(asset)}
+                  title={selected ? "Deselect asset" : "Select asset"}
+                  type="button"
+                >
+                  {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
+                </AssetSelectButton>
                 <AssetCardActions>
                   {canView && (
                     <AssetIconButton
@@ -866,18 +1012,53 @@ function UntrackedAssetsPanel({
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
+  const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
   const defaultWorkspace = useMemo(() => (
     assetWorkspaces.find((workspace) => text(workspace?.id))
       || assetWorkspaces.find((workspace) => text(workspace?.rootDirectory))
       || assetWorkspaces[0]
       || null
   ), [assetWorkspaces]);
+  const selectedAssets = useMemo(() => (
+    items.filter((asset) => selectedAssetIds.has(assetId(asset)))
+  ), [items, selectedAssetIds]);
+  const selectedImageAssets = useMemo(() => (
+    selectedAssets.filter((asset) => assetLocalAvailable(asset) && assetIsImage(asset) && assetLocalPath(asset))
+  ), [selectedAssets]);
+
+  useEffect(() => {
+    const visibleIds = new Set(items.map((asset) => assetId(asset)).filter(Boolean));
+    setSelectedAssetIds((current) => {
+      const next = new Set([...current].filter((id) => visibleIds.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [items]);
+
   const refresh = useCallback((options = { silent: true }) => (
     typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
   ), [onRefresh]);
   const trackedRefresh = useCallback((options = { silent: true, force: true }) => (
     typeof onTrackedRefresh === "function" ? onTrackedRefresh(options) : Promise.resolve(null)
   ), [onTrackedRefresh]);
+
+  const toggleAssetSelected = useCallback((asset) => {
+    const id = assetId(asset);
+    if (!id) return;
+    setSelectedAssetIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const clearSelectedAssets = useCallback(() => {
+    setSelectedAssetIds(new Set());
+  }, []);
+
   const runUntrackedAction = useCallback(async (action, asset) => {
     const id = assetId(asset);
     const name = assetName(asset, "asset");
@@ -922,6 +1103,48 @@ function UntrackedAssetsPanel({
     }
   }, [defaultWorkspace, onDelete, onPromote, onRename, repoPath, trackedRefresh]);
 
+  const runSelectedUntrackedAction = useCallback(async (action) => {
+    if (!selectedAssets.length) return;
+    const key = `batch:${action}`;
+    setBusyKey(key);
+    setActionError("");
+    try {
+      if (action === "annotate") {
+        const paths = selectedImageAssets.map(assetLocalPath).filter(Boolean);
+        if (!paths.length) {
+          setActionError("Select at least one local image to annotate.");
+          return;
+        }
+        await invoke("snipping_open_annotation_editor_batch", {
+          request: { paths },
+        });
+        return;
+      }
+
+      if (action === "delete") {
+        if (typeof onDelete !== "function") return;
+        for (const asset of selectedAssets) {
+          const localPath = assetLocalPath(asset);
+          if (localPath) {
+            await onDelete(localPath);
+          }
+        }
+        clearSelectedAssets();
+        await refresh({ silent: true, force: true });
+      }
+    } catch (nextError) {
+      setActionError(nextError?.message || String(nextError || `Unable to ${action} selected scratch assets.`));
+    } finally {
+      setBusyKey((current) => (current === key ? "" : current));
+    }
+  }, [
+    clearSelectedAssets,
+    onDelete,
+    refresh,
+    selectedAssets,
+    selectedImageAssets,
+  ]);
+
   return (
     <AssetsPane>
       <AssetsHeader>
@@ -956,6 +1179,33 @@ function UntrackedAssetsPanel({
           </AssetIconButton>
         </AssetHeaderActions>
       </AssetsHeader>
+      {selectedAssets.length > 0 && (
+        <AssetSelectionToolbar>
+          <strong>{selectedAssets.length} selected</strong>
+          <span>{selectedImageAssets.length} annotatable image{selectedImageAssets.length === 1 ? "" : "s"}</span>
+          <AssetBatchButton
+            data-primary="true"
+            disabled={!selectedImageAssets.length || Boolean(busyKey)}
+            onClick={() => runSelectedUntrackedAction("annotate")}
+            type="button"
+          >
+            <ModeEdit aria-hidden="true" />
+            <span>Annotation</span>
+          </AssetBatchButton>
+          <AssetBatchButton
+            data-danger="true"
+            disabled={Boolean(busyKey)}
+            onClick={() => runSelectedUntrackedAction("delete")}
+            type="button"
+          >
+            <Delete aria-hidden="true" />
+            <span>Delete</span>
+          </AssetBatchButton>
+          <AssetBatchButton disabled={Boolean(busyKey)} onClick={clearSelectedAssets} type="button">
+            Clear
+          </AssetBatchButton>
+        </AssetSelectionToolbar>
+      )}
       {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       {!items.length ? (
         <AssetEmptyState>
@@ -978,9 +1228,10 @@ function UntrackedAssetsPanel({
             const deleteBusy = busyKey === `delete:${id}`;
             const canView = assetIsImage(asset) && Boolean(localPath);
             const canCopy = assetIsImage(asset) && Boolean(localPath);
+            const selected = selectedAssetIds.has(id);
 
             return (
-              <AssetCard data-status="parked" key={id} title={localPath || name}>
+              <AssetCard data-selected={selected ? "true" : "false"} data-status="parked" key={id} title={localPath || name}>
                 <AssetCardPreview
                   aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
@@ -1016,6 +1267,17 @@ function UntrackedAssetsPanel({
                 <AssetCardStatus data-status="parked" title="This file is local scratch and is not synced">
                   Untracked
                 </AssetCardStatus>
+                <AssetSelectButton
+                  aria-label={`${selected ? "Deselect" : "Select"} ${name}`}
+                  aria-pressed={selected}
+                  data-selected={selected ? "true" : "false"}
+                  disabled={Boolean(busyKey)}
+                  onClick={() => toggleAssetSelected(asset)}
+                  title={selected ? "Deselect asset" : "Select asset"}
+                  type="button"
+                >
+                  {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
+                </AssetSelectButton>
                 <AssetCardActions>
                   {canView && (
                     <AssetIconButton
@@ -1316,6 +1578,77 @@ const AssetFilterButton = styled.button`
   }
 `;
 
+const AssetSelectionToolbar = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid rgba(45, 212, 191, 0.18);
+  border-radius: 9px;
+  background: rgba(13, 148, 136, 0.1);
+
+  strong {
+    color: rgba(204, 251, 241, 0.96);
+    font-size: 10px;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.72);
+    font-size: 10px;
+    font-weight: 780;
+  }
+`;
+
+const AssetBatchButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.86);
+  background: rgba(15, 23, 42, 0.42);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 850;
+  cursor: pointer;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.95);
+    background: rgba(14, 165, 233, 0.14);
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.26);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.16);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.2);
+    color: rgba(254, 205, 211, 0.9);
+    background: rgba(127, 29, 29, 0.16);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+`;
+
 const AssetGrid = styled.div`
   display: grid;
   flex: 1 1 auto;
@@ -1357,6 +1690,12 @@ const AssetCard = styled.article`
       pointer-events: auto;
       transform: translate(-50%, 0);
     }
+
+    [data-asset-select="true"] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
+    }
   }
 
   &[data-status="active"] {
@@ -1367,11 +1706,24 @@ const AssetCard = styled.article`
     border-color: rgba(251, 113, 133, 0.28);
   }
 
+  &[data-selected="true"] {
+    border-color: rgba(45, 212, 191, 0.5);
+    box-shadow:
+      0 12px 28px rgba(2, 6, 23, 0.34),
+      0 0 0 1px rgba(45, 212, 191, 0.22);
+  }
+
   @media (hover: none) {
     [data-asset-actions="true"] {
       opacity: 1;
       pointer-events: auto;
       transform: translate(-50%, 0);
+    }
+
+    [data-asset-select="true"] {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateY(0);
     }
   }
 `;
@@ -1456,7 +1808,7 @@ const AssetCardStatus = styled.span`
   z-index: 3;
   display: inline-flex;
   align-items: center;
-  max-width: calc(100% - 14px);
+  max-width: calc(100% - 50px);
   overflow: hidden;
   padding: 3px 6px;
   border: 1px solid rgba(148, 163, 184, 0.16);
@@ -1490,6 +1842,49 @@ const AssetCardStatus = styled.span`
   &[data-status="cancelled"] {
     border-color: rgba(251, 113, 133, 0.24);
     color: rgba(254, 205, 211, 0.86);
+  }
+`;
+
+const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 5;
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(2, 6, 23, 0.82);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-3px);
+  cursor: pointer;
+  transition: opacity 130ms ease, transform 130ms ease;
+  backdrop-filter: blur(8px);
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible,
+  &[data-selected="true"] {
+    border-color: rgba(45, 212, 191, 0.36);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.2);
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
   }
 `;
 

@@ -2423,6 +2423,18 @@ function cloudWorkspaceTodosFromRuntimeStatus(status) {
   return workspaceTodos && typeof workspaceTodos === "object" ? workspaceTodos : null;
 }
 
+function cloudStorageUsageFromRuntimeStatus(status) {
+  const liveRuntime = status?.liveRuntimeStatus || status?.live_runtime_status || {};
+  const storageUsage = status?.storageUsage
+    || status?.storage_usage
+    || liveRuntime?.storageUsage
+    || liveRuntime?.storage_usage
+    || liveRuntime?.tokenomics?.storageUsage
+    || liveRuntime?.tokenomics?.storage_usage
+    || null;
+  return storageUsage && typeof storageUsage === "object" ? storageUsage : null;
+}
+
 function sanitizeWorkspaceMcpServerForCloud(server) {
   if (!server || typeof server !== "object") {
     return null;
@@ -2583,6 +2595,7 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   knownDevices: [],
   stage: "idle",
   status: "idle",
+  storageUsage: null,
   title: "Cloud workspace",
   updatedAt: 0,
   workspaceTodos: null,
@@ -3321,6 +3334,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   const connectedDevices = cloudConnectedDevicesFromRuntimeStatus(status);
   const knownDevices = cloudKnownDevicesFromRuntimeStatus(status);
   const workspaceTodos = cloudWorkspaceTodosFromRuntimeStatus(status);
+  const storageUsage = cloudStorageUsageFromRuntimeStatus(status);
 
   if (connected || statusKey === "connected") {
     return {
@@ -3329,6 +3343,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "workspace_socket",
       status: "connected",
+      storageUsage,
       title: "Cloud workspace ready",
       workspaceTodos,
     };
@@ -3341,6 +3356,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "cloud_auth",
       status: "active",
+      storageUsage,
       title: "Preparing cloud auth",
       workspaceTodos,
     };
@@ -3353,6 +3369,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "cloud_route",
       status: "active",
+      storageUsage,
       title: "Finding your cloud route",
       workspaceTodos,
     };
@@ -3365,6 +3382,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "cloud_instance",
       status: "active",
+      storageUsage,
       title: "Setting up your instance",
       workspaceTodos,
     };
@@ -3377,6 +3395,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "workspace_socket",
       status: "active",
+      storageUsage,
       title: "Linking the live workspace",
       workspaceTodos,
     };
@@ -3395,6 +3414,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "workspace_socket",
       status: "error",
+      storageUsage,
       title: "Device limit reached",
       workspaceTodos,
     };
@@ -3407,6 +3427,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
       knownDevices,
       stage: "workspace_socket",
       status: "active",
+      storageUsage,
       title: "Linking the live workspace",
       workspaceTodos,
     };
@@ -3418,6 +3439,7 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
     knownDevices,
     stage: "cloud_route",
     status: "active",
+    storageUsage,
     title: "Preparing your cloud workspace",
     workspaceTodos,
   };
@@ -3444,12 +3466,18 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
       ? previous.workspaceTodos
       : null;
+  const storageUsage = progress?.storageUsage && typeof progress.storageUsage === "object"
+    ? progress.storageUsage
+    : previous?.storageUsage && typeof previous.storageUsage === "object"
+      ? previous.storageUsage
+      : null;
 
   if (previousStatus === "connected" && nextStatus !== "error") {
     return {
       ...previous,
       connectedDevices,
       knownDevices,
+      storageUsage,
       updatedAt: Date.now(),
       workspaceTodos,
     };
@@ -3464,6 +3492,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
       ),
       connectedDevices,
       knownDevices,
+      storageUsage,
       updatedAt: Date.now(),
       workspaceTodos,
     };
@@ -3476,6 +3505,7 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     knownDevices,
     stage: nextStage,
     status: nextStatus,
+    storageUsage,
     title: String(progress?.title || previous.title || "Cloud workspace"),
     updatedAt: Date.now(),
     workspaceTodos,
@@ -14524,42 +14554,54 @@ export default function App() {
       }
       const text = String(payload.text || payload.todo || payload.prompt || "").trim();
       const payloadImage = payload.image && typeof payload.image === "object" ? payload.image : {};
-      const imageSrc = String(
-        payloadImage.src
-          || payload.imageDataUrl
-          || payload.image_data_url
-          || payload.imageSrc
-          || "",
-      ).trim();
-      if (!text && !imageSrc) {
+      const payloadImages = (Array.isArray(payload.images) ? payload.images : [])
+        .concat(payloadImage && Object.keys(payloadImage).length ? [payloadImage] : [])
+        .map((image, index) => {
+          const src = String(
+            image?.src
+              || image?.imageDataUrl
+              || image?.image_data_url
+              || image?.imageSrc
+              || "",
+          ).trim();
+          if (!src) return null;
+          return {
+            name: String(image?.name || payload.name || `annotated-snip-${index + 1}.png`).slice(0, 160),
+            size: Number(image?.size || 0),
+            src,
+            type: String(image?.type || "image/png").slice(0, 80),
+          };
+        })
+        .filter(Boolean);
+      if (!text && !payloadImages.length) {
         return;
       }
-      const commandId = String(payload.commandId || payload.command_id || "").trim()
+      const baseCommandId = String(payload.commandId || payload.command_id || "").trim()
         || `snip-todo-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const createdAt = String(payload.createdAt || payload.created_at || "").trim()
         || new Date().toISOString();
-      const image = imageSrc
-        ? {
-          name: String(payloadImage.name || payload.name || "annotated-snip.png").slice(0, 160),
-          size: Number(payloadImage.size || 0),
-          src: imageSrc,
-          type: String(payloadImage.type || "image/png").slice(0, 80),
-        }
-        : null;
+      const sourcePaths = Array.isArray(payload.sourcePaths)
+        ? payload.sourcePaths
+        : Array.isArray(payload.source_paths)
+          ? payload.source_paths
+          : undefined;
 
       window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
         detail: {
-          commandId,
+          commandId: baseCommandId,
           item: {
             createdAt,
-            id: commandId,
+            id: baseCommandId,
             kind: "todo",
-            ...(image ? { image } : {}),
+            ...(payloadImages[0] ? { image: payloadImages[0] } : {}),
+            ...(payloadImages.length > 1 ? { images: payloadImages } : {}),
             remoteCommand: {
-              commandId,
+              commandId: baseCommandId,
+              imageTotal: payloadImages.length || undefined,
               source: "snipping-annotation",
               sourceName: String(payload.name || payload.sourceName || "").trim(),
               sourcePath: String(payload.sourcePath || payload.source_path || "").trim(),
+              sourcePaths,
             },
             source: "snipping-annotation",
             text,
@@ -21566,6 +21608,7 @@ export default function App() {
                             connectedDevices={cloudWorkspaceProgress.connectedDevices}
                             defaultWorkingDirectory={defaultWorkingDirectory}
                             knownDevices={cloudWorkspaceProgress.knownDevices}
+                            storageUsage={cloudWorkspaceProgress.storageUsage}
                             workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                             terminalWorkspace={runtimeWorkspace}
                             terminalAgentsByIndex={runtimeDescriptor.terminalAgentsByIndex}
@@ -22304,6 +22347,7 @@ export default function App() {
                   <AccountTokenomicsView
                     accountKey={user?.id || user?.email || ""}
                     billingStatus={billingStatus}
+                    storageUsage={cloudWorkspaceProgress.storageUsage}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "processes" ? (

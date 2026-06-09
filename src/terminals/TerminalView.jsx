@@ -4061,6 +4061,51 @@ const TodoQueueItemImage = styled.img.attrs({ draggable: false })`
   user-select: none;
 `;
 
+const TodoQueueItemImageGrid = styled.div`
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  gap: 2px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+
+  ${TodoQueueItemImage} {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    object-fit: cover;
+  }
+`;
+
+const TodoQueueItemImageTile = styled.div`
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.055);
+`;
+
+const TodoQueueImageCountBadge = styled.span`
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  display: inline-flex;
+  min-width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.94);
+  background: rgba(2, 6, 23, 0.82);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24);
+  font-size: 11px;
+  font-weight: 900;
+`;
+
 const TodoQueueItemNoteFrame = styled.div`
   display: grid;
   width: 128px;
@@ -7902,10 +7947,6 @@ function normalizeTodoQueueImage(value) {
   };
 }
 
-function getTodoQueueItemImage(item) {
-  return normalizeTodoQueueImage(item?.image || item?.imageDataUrl || item?.imageSrc);
-}
-
 function dedupeTodoQueueImages(images) {
   const seenSources = new Set();
 
@@ -7919,6 +7960,27 @@ function dedupeTodoQueueImages(images) {
       seenSources.add(image.src);
       return true;
     });
+}
+
+function getTodoQueueItemImages(item) {
+  if (!item || typeof item !== "object") {
+    return [];
+  }
+
+  return dedupeTodoQueueImages([
+    ...(Array.isArray(item.images) ? item.images : []),
+    ...(Array.isArray(item.imageAttachments) ? item.imageAttachments : []),
+    ...(Array.isArray(item.image_attachments) ? item.image_attachments : []),
+    item.image,
+    item.imageDataUrl,
+    item.image_data_url,
+    item.imageSrc,
+    item.image_src,
+  ].filter(Boolean));
+}
+
+function getTodoQueueItemImage(item) {
+  return getTodoQueueItemImages(item)[0] || null;
 }
 
 function getTodoQueueItemTerminalText(item) {
@@ -9081,13 +9143,16 @@ function getTodoImageLogSummary(images) {
 function getTodoQueueItemLogSummary(items) {
   return (Array.isArray(items) ? items : [items])
     .map((item) => {
-      const image = getTodoQueueItemImage(item);
+      const images = getTodoQueueItemImages(item);
+      const image = images[0] || null;
       const note = getTodoQueueItemNote(item);
       return {
-        hasImage: Boolean(image),
+        hasImage: images.length > 0,
         hasNote: Boolean(note),
         id: String(item?.id || ""),
         image: image ? getTodoImageLogSummary([image])[0] || null : null,
+        imageCount: images.length,
+        images: getTodoImageLogSummary(images),
         kind: normalizeTodoQueueKind(item?.kind || item?.type),
         noteLength: note ? normalizeTodoQueueMultilineText(note.text).length : 0,
         source: normalizeTodoQueueSource(item?.source),
@@ -9298,7 +9363,10 @@ function createTodoQueueItem(text, options = {}) {
     : typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const image = normalizeTodoQueueImage(options.image);
+  const images = dedupeTodoQueueImages(Array.isArray(options.images)
+    ? options.images
+    : [options.image]);
+  const image = images[0] || null;
   const note = normalizeTodoQueueNote(options.note);
   const kind = normalizeTodoQueueKind(options.kind);
   const source = normalizeTodoQueueSource(options.source);
@@ -9340,6 +9408,7 @@ function createTodoQueueItem(text, options = {}) {
     createdAt,
     id,
     ...(image ? { image } : {}),
+    ...(images.length > 1 ? { images } : {}),
     kind,
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
@@ -9375,7 +9444,8 @@ function normalizeTodoQueueItem(item) {
   }
 
   const text = normalizeTodoQueueText(item.text);
-  const image = getTodoQueueItemImage(item);
+  const images = getTodoQueueItemImages(item);
+  const image = images[0] || null;
   const note = getTodoQueueItemNote(item);
   const kind = normalizeTodoQueueKind(item.kind || item.type);
   const source = normalizeTodoQueueSource(item.source);
@@ -9414,7 +9484,7 @@ function normalizeTodoQueueItem(item) {
   const todoFailedAt = String(item.todoFailedAt || item.todo_failed_at || item.failedAt || item.failed_at || "").trim();
   const todoDeletedAt = String(item.todoDeletedAt || item.todo_deleted_at || item.deletedAt || item.deleted_at || "").trim();
   const todoStatusReason = String(item.todoStatusReason || item.todo_status_reason || item.statusReason || item.status_reason || item.reason || "").trim();
-  if (!text && !image && !note) {
+  if (!text && !images.length && !note) {
     return null;
   }
 
@@ -9424,6 +9494,7 @@ function normalizeTodoQueueItem(item) {
       ? item.id
       : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
     ...(image ? { image } : {}),
+    ...(images.length > 1 ? { images } : {}),
     kind,
     ...(note ? { note } : {}),
     ...(planTask ? { planTask } : {}),
@@ -9495,7 +9566,8 @@ function buildTodoQueueCloudSyncItem(item, {
   if (!normalizedItem) {
     return null;
   }
-  const image = getTodoQueueItemImage(normalizedItem);
+  const images = getTodoQueueItemImages(normalizedItem);
+  const image = images[0] || null;
   const note = getTodoQueueItemNote(normalizedItem);
   const queueState = normalizeTodoQueuePersistedQueueState(normalizedItem);
   const cloudStatus = normalizeTodoQueueLifecycleStatus(status)
@@ -9531,6 +9603,13 @@ function buildTodoQueueCloudSyncItem(item, {
         name: image.name || "",
         type: image.type || "",
       },
+    } : {}),
+    ...(images.length > 1 ? {
+      images: images.map((nextImage) => ({
+        present: true,
+        name: nextImage.name || "",
+        type: nextImage.type || "",
+      })),
     } : {}),
     ...(normalizedItem.planTask ? { planTask: normalizedItem.planTask } : {}),
     ...(normalizedItem.remoteCommand ? { remoteCommand: normalizedItem.remoteCommand } : {}),
@@ -11785,10 +11864,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
     const text = normalizeTodoQueueText(item?.text);
     const terminalText = getTodoQueueItemTerminalText(item);
-    const image = getTodoQueueItemImage(item);
+    const images = getTodoQueueItemImages(item);
+    const image = images[0] || null;
     const note = getTodoQueueItemNote(item);
     const planTask = getTodoQueueItemPlanTask(item);
-    if (!terminalText && !image && !note) {
+    if (!terminalText && !images.length && !note) {
       event.preventDefault();
       return;
     }
@@ -11808,6 +11888,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       item: {
         id: item.id,
         ...(image ? { image } : {}),
+        ...(images.length > 1 ? { images } : {}),
         ...(note ? { note } : {}),
         ...(planTask ? { planTask } : {}),
         ...(item.source ? { source: item.source } : {}),
@@ -12366,6 +12447,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           <AccountTokenomicsView
             accountKey={accountKey}
             billingStatus={billingStatus}
+            storageUsage={storageUsage}
           />
         </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "orchestrator" ? (
@@ -12490,9 +12572,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                     const isSending = isPending && !isQueued;
                     const actionLabel = isQueued ? "Cancel queued todo" : "Queue todo";
                     const actionTitle = isQueued ? "Cancel queued send" : "Send when an agent is available";
-                    const image = getTodoQueueItemImage(item);
+                    const images = getTodoQueueItemImages(item);
+                    const image = images[0] || null;
                     const note = getTodoQueueItemNote(item);
-                    const hasPreview = Boolean(image || note);
+                    const hasPreview = Boolean(images.length || note);
                     const recoverableStatus = getTodoQueueRecoverableStatus(item);
                     const recoverableStatusLabel = todoQueueRecoverableStatusLabel(recoverableStatus);
                     const targetAgentId = getTodoQueueTargetAgentId(item);
@@ -12594,12 +12677,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                           </TodoQueueItemPendingSpinner>
                         )}
                         <TodoQueueItemContent data-has-preview={hasPreview ? "true" : "false"}>
-                          {image && (
+                          {images.length > 0 && (
                             <TodoQueueItemImageFrame>
-                              <TodoQueueItemImage alt="" src={image.src} />
+                              {images.length > 1 ? (
+                                <TodoQueueItemImageGrid>
+                                  {images.slice(0, 4).map((nextImage, imageIndex) => (
+                                    <TodoQueueItemImageTile key={`${nextImage.src}:${imageIndex}`}>
+                                      <TodoQueueItemImage alt="" src={nextImage.src} />
+                                    </TodoQueueItemImageTile>
+                                  ))}
+                                  <TodoQueueImageCountBadge>{images.length}</TodoQueueImageCountBadge>
+                                </TodoQueueItemImageGrid>
+                              ) : (
+                                <TodoQueueItemImage alt="" src={image.src} />
+                              )}
                             </TodoQueueItemImageFrame>
                           )}
-                          {!image && note && (
+                          {!images.length && note && (
                             <TodoQueueItemNoteFrame>
                               <TodoQueueItemNoteTitle>{note.title}</TodoQueueItemNoteTitle>
                               <TodoQueueItemNoteIcon aria-hidden="true" />
@@ -13151,6 +13245,7 @@ function TerminalView({
   connectedDevices = [],
   defaultWorkingDirectory = "",
   knownDevices = [],
+  storageUsage = null,
   terminalWorkspace,
   terminalAgentsByIndex = {},
   terminalRolesByIndex = {},
@@ -19237,7 +19332,13 @@ function TerminalView({
       requireAvailable,
       reservationItemId,
     });
-    const image = target.image || getTodoQueueItemImage(currentItem);
+    const itemImages = getTodoQueueItemImages(currentItem);
+    const images = itemImages.length
+      ? itemImages
+      : target.image
+        ? [target.image]
+        : [];
+    const image = images[0] || null;
     const paneId = target.paneId || "";
     const targetRole = String(target.targetRole || "").toLowerCase();
     const shouldAutoSubmit = Boolean(target.shouldAutoSubmit);
@@ -19488,14 +19589,17 @@ function TerminalView({
       return true;
     };
     const attachmentSource = getTodoQueueAttachmentSource(source);
-    const queuedAttachment = image
-      ? todoImageToComposerAttachment(image, 0, attachmentSource)
-      : null;
+    const queuedAttachments = images
+      .map((nextImage, imageIndex) => todoImageToComposerAttachment(nextImage, imageIndex, attachmentSource))
+      .filter(Boolean);
+    const queuedAttachment = queuedAttachments[0] || null;
 
-    if (queuedAttachment && syncKey) {
-      appendWorkspaceThreadComposerAttachments(syncKey, [queuedAttachment], {
+    if (queuedAttachments.length && syncKey) {
+      appendWorkspaceThreadComposerAttachments(syncKey, queuedAttachments, {
         fields: {
           image: getTodoImageLogSummary([image])[0] || null,
+          imageCount: queuedAttachments.length,
+          images: getTodoImageLogSummary(images),
           paneId,
           source,
           surface: "tui_terminal_grid",
@@ -19506,9 +19610,11 @@ function TerminalView({
         source: attachmentSource,
       });
     }
-    if (queuedAttachment && !syncKey) {
+    if (queuedAttachments.length && !syncKey) {
       logBigViewSyncDiagnosticEvent("tui.image.drop_attachment_skip", {
         image: getTodoImageLogSummary([image])[0] || null,
+        imageCount: queuedAttachments.length,
+        images: getTodoImageLogSummary(images),
         paneId,
         reason: "missing_sync_key",
         source,
@@ -19522,13 +19628,15 @@ function TerminalView({
     let dropResult = null;
     let draftTransaction = null;
     let draftTransactionId = "";
-    if (!terminalText && queuedAttachment) {
+    if (!terminalText && queuedAttachments.length) {
       if (!syncKey) {
-        throw new Error("Unable to queue image because this terminal has no thread composer.");
+        throw new Error("Unable to queue images because this terminal has no thread composer.");
       }
       logBigViewSyncDiagnosticEvent("tui.image.drop_queued_only", {
         attachmentQueued: Boolean(syncKey),
         image: getTodoImageLogSummary([image])[0] || null,
+        imageCount: queuedAttachments.length,
+        images: getTodoImageLogSummary(images),
         paneId,
         shouldAutoSubmit,
         source,
@@ -19600,10 +19708,11 @@ function TerminalView({
         });
       }
       logBigViewSyncDiagnosticEvent("tui.image.drop_prepared", {
-        attachmentQueued: Boolean(queuedAttachment && syncKey),
+        attachmentQueued: Boolean(queuedAttachments.length && syncKey),
         draftRevision: draftTransaction?.revision || 0,
         hasImageAttachmentBlock: false,
-        hasQueuedImage: Boolean(queuedAttachment),
+        hasQueuedImage: Boolean(queuedAttachments.length),
+        imageCount: queuedAttachments.length,
         paneId,
         shouldAutoSubmit,
         sharedDraftSynced: Boolean(syncKey && draftTransaction),
@@ -20513,12 +20622,10 @@ function TerminalView({
     }
 
     const nextItems = images.length
-      ? images.map((image, imageIndex) => (
-        createTodoQueueItem(imageIndex === 0 ? text : "", {
-          image,
-          ...(imageIndex === 0 && note ? { note } : {}),
-        })
-      ))
+      ? [createTodoQueueItem(text, {
+        images,
+        ...(note ? { note } : {}),
+      })]
       : [createTodoQueueItem(text, note ? { note } : {})];
 
     if (images.length) {
@@ -21727,12 +21834,13 @@ function TerminalView({
   const handleBeginTodoDrag = useCallback((event) => {
     const text = normalizeTodoQueueText(event?.item?.text);
     const terminalText = getTodoQueueItemTerminalText(event?.item);
-    const image = getTodoQueueItemImage(event?.item);
+    const images = getTodoQueueItemImages(event?.item);
+    const image = images[0] || null;
     const note = getTodoQueueItemNote(event?.item);
     const sourceRect = event?.sourceRect;
 
     if (
-      (!terminalText && !image && !note)
+      (!terminalText && !images.length && !note)
       || !terminalWorkspace?.id
       || !sourceRect
       || !terminalPanelsRef.current
@@ -21761,6 +21869,7 @@ function TerminalView({
       kind: normalizeTodoQueueKind(event.item?.kind),
       source: normalizeTodoQueueSource(event.item?.source),
       ...(image ? { image } : {}),
+      ...(images.length > 1 ? { images } : {}),
       ...(note ? { note } : {}),
       ...(event.item?.planTask ? { planTask: event.item.planTask } : {}),
       width: dragWidth,
@@ -22935,9 +23044,10 @@ function TerminalView({
   const todoDragOverDropTarget = Boolean(
     todoDragActive && Number.isInteger(todoDragState?.targetTerminalIndex),
   );
-  const todoDragImage = getTodoQueueItemImage(todoDragState);
+  const todoDragImages = getTodoQueueItemImages(todoDragState);
+  const todoDragImage = todoDragImages[0] || null;
   const todoDragNote = getTodoQueueItemNote(todoDragState);
-  const todoDragHasPreview = Boolean(todoDragImage || todoDragNote);
+  const todoDragHasPreview = Boolean(todoDragImages.length || todoDragNote);
   const terminalBreakoutCanvasInteracting = Boolean(
     terminalBreakoutPanning
       || terminalDragState?.mode === "canvas"
@@ -23708,12 +23818,23 @@ function TerminalView({
                 }}
               >
                 <TodoQueueItemContent data-has-preview={todoDragHasPreview ? "true" : "false"}>
-                  {todoDragImage && (
+                  {todoDragImages.length > 0 && (
                     <TodoQueueItemImageFrame>
-                      <TodoQueueItemImage alt="" src={todoDragImage.src} />
+                      {todoDragImages.length > 1 ? (
+                        <TodoQueueItemImageGrid>
+                          {todoDragImages.slice(0, 4).map((nextImage, imageIndex) => (
+                            <TodoQueueItemImageTile key={`${nextImage.src}:${imageIndex}`}>
+                              <TodoQueueItemImage alt="" src={nextImage.src} />
+                            </TodoQueueItemImageTile>
+                          ))}
+                          <TodoQueueImageCountBadge>{todoDragImages.length}</TodoQueueImageCountBadge>
+                        </TodoQueueItemImageGrid>
+                      ) : (
+                        <TodoQueueItemImage alt="" src={todoDragImage.src} />
+                      )}
                     </TodoQueueItemImageFrame>
                   )}
-                  {!todoDragImage && todoDragNote && (
+                  {!todoDragImages.length && todoDragNote && (
                     <TodoQueueItemNoteFrame>
                       <TodoQueueItemNoteTitle>{todoDragNote.title}</TodoQueueItemNoteTitle>
                       <TodoQueueItemNoteIcon aria-hidden="true" />

@@ -376,6 +376,12 @@ struct SnippingEditedAssetRequest {
     image_data_url: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingAnnotationEditorRequest {
+    paths: Vec<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SnippingAreaMonitor {
@@ -1527,6 +1533,64 @@ fn snipping_open_floating_asset_window(
     }))
 }
 
+fn snipping_open_annotation_editor_for_paths(
+    app: &AppHandle,
+    paths: Vec<String>,
+) -> Result<Value, String> {
+    let mut files = Vec::new();
+    for path in paths {
+        let value = path.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let file = diffforge_local_asset_file(value)?;
+        if !files.iter().any(|existing: &PathBuf| existing == &file) {
+            files.push(file);
+        }
+    }
+    if files.is_empty() {
+        return Err("Select at least one local image to annotate.".to_string());
+    }
+    let path_values = files
+        .iter()
+        .map(|file| file.display().to_string())
+        .collect::<Vec<_>>();
+    let seed = format!("{}:{}", path_values.join("|"), uuid::Uuid::new_v4());
+    let label = format!("{}-{}", SNIPPING_EDITOR_WINDOW_PREFIX, cloud_mcp_short_hash(&seed));
+    let encoded_paths = snipping_url_token(
+        &serde_json::to_string(&path_values)
+            .map_err(|error| format!("Unable to encode annotation paths: {error}"))?,
+    );
+    let window = WebviewWindowBuilder::new(
+        app,
+        label.clone(),
+        WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
+    )
+    .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
+    .inner_size(1080.0, 760.0)
+    .min_inner_size(360.0, 260.0)
+    .resizable(true)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(true)
+    .accept_first_mouse(true)
+    .transparent(false)
+    .visible(false)
+    .shadow(true)
+    .build()
+    .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
+    snipping_center_floating_window(app, &window);
+    window
+        .show()
+        .map_err(|error| format!("Unable to show annotation editor window: {error}"))?;
+    let _ = window.set_focus();
+    Ok(json!({
+        "kind": "snipping_floating_asset_window_opened",
+        "label": label,
+        "paths": path_values,
+    }))
+}
+
 fn snipping_set_asset_target_for(
     app: &AppHandle,
     request: SnippingAssetTargetRequest,
@@ -1974,6 +2038,14 @@ fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value
         980.0,
         720.0,
     )
+}
+
+#[tauri::command]
+fn snipping_open_annotation_editor_batch(
+    app: AppHandle,
+    request: SnippingAnnotationEditorRequest,
+) -> Result<Value, String> {
+    snipping_open_annotation_editor_for_paths(&app, request.paths)
 }
 
 #[tauri::command]

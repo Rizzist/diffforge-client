@@ -11337,7 +11337,30 @@ async fn cloud_mcp_set_desktop_session_token(
 
 #[tauri::command]
 async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
+    let _ = cloud_mcp_refresh_live_runtime_status_if_connected(state.inner()).await;
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
+}
+
+async fn cloud_mcp_refresh_live_runtime_status_if_connected(
+    state: &CloudMcpState,
+) -> Result<(), String> {
+    let snapshot = cloud_mcp_status_snapshot(state).await;
+    if !snapshot.global_ws_connected {
+        return Ok(());
+    }
+    let response = cloud_mcp_ws_request_with_timeout(
+        state,
+        "live_runtime_status",
+        &json!({}),
+        Duration::from_millis(900),
+    )
+    .await?;
+    let data = cloud_mcp_response_data(&response);
+    if data.is_object() {
+        let mut runtime = state.inner.lock().await;
+        runtime.live_runtime_status = Some(data);
+    }
+    Ok(())
 }
 
 #[tauri::command]

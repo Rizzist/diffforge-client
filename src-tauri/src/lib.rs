@@ -3801,6 +3801,7 @@ pub fn run() {
             snipping_save_edited_untracked_asset,
             snipping_open_pinned_window,
             snipping_open_annotation_editor,
+            snipping_open_annotation_editor_batch,
             snipping_copy_untracked_asset_to_clipboard,
             snipping_cancel_area_snip,
             audio_widget_status,

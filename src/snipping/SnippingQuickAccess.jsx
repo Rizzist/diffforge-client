@@ -82,6 +82,60 @@ function pathFromHash(prefix) {
   return decodePathToken(raw.split(/[?#]/u)[0]);
 }
 
+function pathsFromHash(prefix) {
+  const decoded = pathFromHash(prefix);
+  if (!decoded) return [];
+  try {
+    const parsed = JSON.parse(decoded);
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => text(item)).filter(Boolean);
+    }
+  } catch {
+    // Single-image routes encode a plain path.
+  }
+  return [decoded].filter(Boolean);
+}
+
+function loadImageElementFromPath(localPath) {
+  const previewUrl = assetPreviewUrl({ localPath });
+  if (!previewUrl) {
+    return Promise.reject(new Error("Image path is unavailable."));
+  }
+
+  return fetch(previewUrl)
+    .then((response) => {
+      if (!response.ok) throw new Error(`Unable to read image: ${response.status}`);
+      return response.blob();
+    })
+    .then((blob) => new Promise((resolve, reject) => {
+      const objectUrl = URL.createObjectURL(blob);
+      const image = new window.Image();
+      image.onload = () => resolve({ image, objectUrl });
+      image.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Unable to load image."));
+      };
+      image.src = objectUrl;
+    }));
+}
+
+async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
+  const { image, objectUrl } = await loadImageElementFromPath(localPath);
+  try {
+    const width = image.naturalWidth || image.width;
+    const height = image.naturalHeight || image.height;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.drawImage(image, 0, 0, width, height);
+    annotations.forEach((annotation) => drawAnnotation(context, annotation));
+    return canvas.toDataURL("image/png");
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 function snipToastFromPayload(payload) {
   const source = payload && typeof payload === "object" ? payload : {};
   const item = source.item && typeof source.item === "object" ? source.item : source;
@@ -381,9 +435,12 @@ export function SnippingPinnedWindow() {
 }
 
 export function SnippingAnnotationEditorWindow() {
-  const localPath = useMemo(() => pathFromHash(SNIPPING_EDITOR_HASH), []);
-  const previewUrl = useMemo(() => assetPreviewUrl({ localPath }), [localPath]);
-  const name = useMemo(() => assetName({ localPath }), [localPath]);
+  const localPaths = useMemo(() => pathsFromHash(SNIPPING_EDITOR_HASH), []);
+  const [activePath, setActivePath] = useState(() => localPaths[0] || "");
+  const previewUrl = useMemo(() => assetPreviewUrl({ localPath: activePath }), [activePath]);
+  const name = useMemo(() => assetName({ localPath: activePath }), [activePath]);
+  const activeIndex = Math.max(0, localPaths.indexOf(activePath));
+  const multiImage = localPaths.length > 1;
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
   const draftRef = useRef(null);
@@ -391,13 +448,26 @@ export function SnippingAnnotationEditorWindow() {
   const [tool, setTool] = useState("pen");
   const [color, setColor] = useState("#ef4444");
   const [strokeWidth, setStrokeWidth] = useState(5);
-  const [annotations, setAnnotations] = useState([]);
+  const [annotationsByPath, setAnnotationsByPath] = useState({});
   const [draft, setDraft] = useState(null);
   const [status, setStatus] = useState("Loading image...");
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [todoDraft, setTodoDraft] = useState("");
+  const annotations = annotationsByPath[activePath] || [];
 
   useFloatingWindowBody("editor");
+
+  const updateActiveAnnotations = useCallback((updater) => {
+    if (!activePath) return;
+    setAnnotationsByPath((current) => {
+      const currentAnnotations = current[activePath] || [];
+      const nextAnnotations = typeof updater === "function" ? updater(currentAnnotations) : updater;
+      return {
+        ...current,
+        [activePath]: Array.isArray(nextAnnotations) ? nextAnnotations : [],
+      };
+    });
+  }, [activePath]);
 
   useEffect(() => {
     if (!previewUrl) {
@@ -406,12 +476,18 @@ export function SnippingAnnotationEditorWindow() {
     }
     let disposed = false;
     let objectUrl = "";
-    const image = new Image();
+    const image = new window.Image();
+    imageRef.current = null;
+    draftRef.current = null;
+    drawingRef.current = false;
+    setDraft(null);
+    setCanvasSize({ width: 0, height: 0 });
+    setStatus("Loading image...");
     image.onload = () => {
       if (disposed) return;
       imageRef.current = image;
       setCanvasSize({ width: image.naturalWidth || image.width, height: image.naturalHeight || image.height });
-      setStatus("Ready");
+      setStatus(multiImage ? `Ready ${activeIndex + 1}/${localPaths.length}` : "Ready");
     };
     image.onerror = () => {
       if (!disposed) setStatus("Unable to load snip.");
@@ -435,7 +511,7 @@ export function SnippingAnnotationEditorWindow() {
       disposed = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [previewUrl]);
+  }, [activeIndex, localPaths.length, multiImage, previewUrl]);
 
   const drawCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -471,7 +547,7 @@ export function SnippingAnnotationEditorWindow() {
     if (tool === "text") {
       const value = window.prompt("Text annotation");
       if (!value?.trim()) return;
-      setAnnotations((current) => [
+      updateActiveAnnotations((current) => [
         ...current,
         {
           type: "text",
@@ -498,7 +574,7 @@ export function SnippingAnnotationEditorWindow() {
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [canvasSize.height, canvasSize.width, color, pointFromEvent, strokeWidth, tool]);
+  }, [canvasSize.height, canvasSize.width, color, pointFromEvent, strokeWidth, tool, updateActiveAnnotations]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -516,14 +592,14 @@ export function SnippingAnnotationEditorWindow() {
     drawingRef.current = false;
     draftRef.current = null;
     setDraft(null);
-    setAnnotations((current) => [...current, annotation]);
+    updateActiveAnnotations((current) => [...current, annotation]);
     setStatus("Annotation added");
-  }, []);
+  }, [updateActiveAnnotations]);
 
   const undo = useCallback(() => {
-    setAnnotations((current) => current.slice(0, -1));
+    updateActiveAnnotations((current) => current.slice(0, -1));
     setStatus("Undone");
-  }, []);
+  }, [updateActiveAnnotations]);
 
   const copyCanvas = useCallback(async () => {
     const canvas = canvasRef.current;
@@ -542,55 +618,61 @@ export function SnippingAnnotationEditorWindow() {
 
   const saveCopy = useCallback(async () => {
     const canvas = canvasRef.current;
-    if (!canvas || !localPath) return;
+    if (!canvas || !activePath) return;
     setStatus("Saving edited copy...");
     try {
       const imageDataUrl = canvas.toDataURL("image/png");
       await invoke("snipping_save_edited_untracked_asset", {
         request: {
           imageDataUrl,
-          sourcePath: localPath,
+          sourcePath: activePath,
         },
       });
       setStatus("Saved edited copy");
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to save edited copy."));
     }
-  }, [localPath]);
+  }, [activePath]);
 
   const queueTodo = useCallback(async (event) => {
     event.preventDefault();
     const text = todoDraft.trim();
-    const canvas = canvasRef.current;
     if (!text) {
       setStatus("Describe the todo first");
       return;
     }
-    if (!canvas) {
-      setStatus("Image is not ready yet");
+    if (!localPaths.length) {
+      setStatus("No images are ready yet");
       return;
     }
-    setStatus("Queueing todo...");
+    setStatus(`Queueing todo with ${localPaths.length} image${localPaths.length === 1 ? "" : "s"}...`);
     try {
-      const imageDataUrl = canvas.toDataURL("image/png");
-      await emit(SNIPPING_ANNOTATION_TODO_EVENT, {
-        createdAt: new Date().toISOString(),
-        image: {
-          name: `${name.replace(/\.[^.]+$/u, "") || "snip"}-annotated.png`,
+      const images = await Promise.all(localPaths.map(async (path, index) => {
+        const imageDataUrl = activePath === path && canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0
+          ? canvasRef.current.toDataURL("image/png")
+          : await renderAnnotatedImageDataUrl(path, annotationsByPath[path] || []);
+        const imageName = assetName({ localPath: path });
+        return {
+          name: `${imageName.replace(/\.[^.]+$/u, "") || `image-${index + 1}`}-annotated.png`,
           src: imageDataUrl,
           type: "image/png",
-        },
+        };
+      }));
+      await emit(SNIPPING_ANNOTATION_TODO_EVENT, {
+        createdAt: new Date().toISOString(),
+        images,
         name,
         sourceName: name,
-        sourcePath: localPath,
+        sourcePath: activePath,
+        sourcePaths: localPaths,
         text,
       });
       setTodoDraft("");
-      setStatus("Queued todo");
+      setStatus(`Queued todo with ${images.length} image${images.length === 1 ? "" : "s"}`);
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [localPath, name, todoDraft]);
+  }, [activePath, annotationsByPath, localPaths, name, todoDraft]);
 
   const closeEditor = useCallback(() => {
     getCurrentWindow().close().catch(() => {});
@@ -602,8 +684,8 @@ export function SnippingAnnotationEditorWindow() {
       <EditorWindowRoot>
         <EditorTitleBar data-tauri-drag-region>
           <div>
-            <strong>Annotate</strong>
-            <span>{name}</span>
+            <strong>{multiImage ? "Annotate Selection" : "Annotate"}</strong>
+            <span>{multiImage ? `${name} · ${activeIndex + 1}/${localPaths.length}` : name}</span>
           </div>
           <EditorStatus>{status}</EditorStatus>
           <FloatingButton aria-label="Close editor" onClick={closeEditor} title="Close" type="button">
@@ -611,37 +693,63 @@ export function SnippingAnnotationEditorWindow() {
           </FloatingButton>
         </EditorTitleBar>
 
-        <EditorToolbar>
-          <EditorToolGroup>
-            {TOOL_OPTIONS.map(({ id, label, Icon }) => (
-              <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
-                <Icon aria-hidden="true" />
-              </EditorToolButton>
-            ))}
-          </EditorToolGroup>
-          <EditorToolGroup>
-            {COLOR_OPTIONS.map((option) => (
-              <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
-            ))}
-          </EditorToolGroup>
-          <StrokeControl>
-            <span>Stroke</span>
-            <input max="14" min="2" onChange={(event) => setStrokeWidth(Number(event.target.value) || 5)} type="range" value={strokeWidth} />
-          </StrokeControl>
-          <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
-            <Undo aria-hidden="true" />
-          </EditorToolButton>
-          <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { setAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
-            <Delete aria-hidden="true" />
-          </EditorToolButton>
-          <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
-            <ContentCopy aria-hidden="true" />
-          </EditorToolButton>
-          <EditorSaveButton onClick={saveCopy} type="button">
-            <Save aria-hidden="true" />
-            <span>Save copy</span>
-          </EditorSaveButton>
-        </EditorToolbar>
+        <EditorControlsStack>
+          {multiImage && (
+            <EditorBatchStrip aria-label="Selected images">
+              {localPaths.map((path, index) => {
+                const itemName = assetName({ localPath: path });
+                const itemPreviewUrl = assetPreviewUrl({ localPath: path });
+                const annotationCount = (annotationsByPath[path] || []).length;
+                const active = path === activePath;
+                return (
+                  <EditorThumbButton
+                    aria-label={`Edit ${itemName}`}
+                    data-active={active ? "true" : "false"}
+                    key={path}
+                    onClick={() => setActivePath(path)}
+                    title={itemName}
+                    type="button"
+                  >
+                    {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
+                    <strong>{index + 1}</strong>
+                    {annotationCount > 0 && <small>{annotationCount}</small>}
+                  </EditorThumbButton>
+                );
+              })}
+            </EditorBatchStrip>
+          )}
+          <EditorToolbar>
+            <EditorToolGroup>
+              {TOOL_OPTIONS.map(({ id, label, Icon }) => (
+                <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
+                  <Icon aria-hidden="true" />
+                </EditorToolButton>
+              ))}
+            </EditorToolGroup>
+            <EditorToolGroup>
+              {COLOR_OPTIONS.map((option) => (
+                <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
+              ))}
+            </EditorToolGroup>
+            <StrokeControl>
+              <span>Stroke</span>
+              <input max="14" min="2" onChange={(event) => setStrokeWidth(Number(event.target.value) || 5)} type="range" value={strokeWidth} />
+            </StrokeControl>
+            <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
+              <Undo aria-hidden="true" />
+            </EditorToolButton>
+            <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
+              <Delete aria-hidden="true" />
+            </EditorToolButton>
+            <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
+              <ContentCopy aria-hidden="true" />
+            </EditorToolButton>
+            <EditorSaveButton onClick={saveCopy} type="button">
+              <Save aria-hidden="true" />
+              <span>Save copy</span>
+            </EditorSaveButton>
+          </EditorToolbar>
+        </EditorControlsStack>
 
         <EditorCanvasStage>
           <canvas
@@ -1101,14 +1209,96 @@ const EditorStatus = styled.span`
   font-weight: 750;
 `;
 
+const EditorControlsStack = styled.div`
+  display: grid;
+  min-width: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 12, 18, 0.92);
+`;
+
+const EditorBatchStrip = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 9px 12px 0;
+  scrollbar-width: thin;
+`;
+
+const EditorThumbButton = styled.button`
+  position: relative;
+  flex: 0 0 auto;
+  width: 72px;
+  height: 52px;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  color: #f8fafc;
+  background: rgba(255, 255, 255, 0.055);
+  cursor: pointer;
+
+  img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  > span {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    place-items: center;
+    color: rgba(248, 250, 252, 0.62);
+    font-size: 12px;
+    font-weight: 850;
+  }
+
+  strong,
+  small {
+    position: absolute;
+    display: inline-grid;
+    min-width: 18px;
+    height: 18px;
+    place-items: center;
+    border-radius: 999px;
+    font-size: 9px;
+    font-weight: 900;
+    line-height: 1;
+  }
+
+  strong {
+    left: 5px;
+    bottom: 5px;
+    color: rgba(248, 250, 252, 0.92);
+    background: rgba(7, 10, 16, 0.78);
+  }
+
+  small {
+    top: 5px;
+    right: 5px;
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.76);
+  }
+
+  &[data-active="true"],
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(147, 197, 253, 0.56);
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.18);
+  }
+`;
+
 const EditorToolbar = styled.nav`
   display: flex;
   align-items: center;
   gap: 10px;
   min-height: 48px;
   padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.92);
+  overflow-x: auto;
+  scrollbar-width: thin;
 `;
 
 const EditorToolGroup = styled.div`
