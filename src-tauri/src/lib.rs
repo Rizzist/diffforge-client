@@ -2130,6 +2130,7 @@ include!("api.rs");
 include!("activity_overlay.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
+include!("snipping.rs");
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -3671,6 +3672,7 @@ pub fn run() {
             whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
         })
+        .manage(SnippingState::new())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -3686,6 +3688,7 @@ pub fn run() {
             register_terminal_coordination_event_bridge(app);
 
             register_audio_shortcuts(app.handle());
+            register_snipping_shortcuts(app.handle());
             register_activity_overlay_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
@@ -3782,6 +3785,16 @@ pub fn run() {
             open_audio_shortcut_permissions,
             set_audio_shortcut,
             reset_audio_shortcuts,
+            snipping_status,
+            snipping_shortcuts_status,
+            set_snipping_shortcut,
+            reset_snipping_shortcuts,
+            open_snipping_permissions,
+            snipping_capture_screenshot,
+            snipping_begin_area_snip,
+            snipping_area_overlay_status,
+            snipping_finish_area_snip,
+            snipping_cancel_area_snip,
             audio_widget_status,
             show_audio_widget,
             hide_audio_widget,
@@ -3808,6 +3821,7 @@ pub fn run() {
             cloud_mcp_delete_workspace,
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,
+            cloud_mcp_reset_device_tokenomics,
             tokenomics_scan_usage,
             tokenomics_scan_usage_silent,
             tokenomics_resync_last_30_days,
@@ -3817,6 +3831,7 @@ pub fn run() {
             tokenomics_get_sync_delta,
             tokenomics_record_usage,
             cloud_mcp_hard_reset_cloud_sqlite,
+            cloud_mcp_reset_server_state,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
             cloud_mcp_sync_device_workspace_catalog,

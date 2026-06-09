@@ -500,6 +500,7 @@ import {
   ButtonKeyIcon,
   ButtonMicIcon,
   ButtonProcessIcon,
+  ButtonSnippingIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
@@ -518,6 +519,7 @@ import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
 import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
+import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
 
@@ -5484,6 +5486,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 }
 
 export default function App() {
+  if (window.location.hash === SNIPPING_OVERLAY_HASH) {
+    return <SnippingOverlayWindow />;
+  }
+
   if (window.location.hash === ACTIVITY_OVERLAY_HASH) {
     return <ActivityOverlayWindow />;
   }
@@ -5580,6 +5586,10 @@ export default function App() {
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
   const [cloudSqliteResetSelectedRepoPath, setCloudSqliteResetSelectedRepoPath] = useState("");
+  const [cloudSqliteResetScope, setCloudSqliteResetScope] = useState("repo");
+  const [tokenomicsCloudResetState, setTokenomicsCloudResetState] = useState("idle");
+  const [tokenomicsCloudResetMessage, setTokenomicsCloudResetMessage] = useState("");
+  const [tokenomicsCloudResetError, setTokenomicsCloudResetError] = useState("");
   const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
     readDismissedLowCreditWarningKey,
@@ -14464,37 +14474,82 @@ export default function App() {
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
-  const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
-  const cloudSqliteResetWorkspace = activatedWorkspace || selectedWorkspace || defaultWorkspace || null;
-  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetWorkspace?.id || "").trim();
-  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetWorkspace?.name || "").trim();
-  const cloudSqliteResetWorkspaceRoot = cloudSqliteResetWorkspaceId
-    ? getWorkspaceRootDirectory(workspaceSettings, cloudSqliteResetWorkspaceId) || defaultWorkingDirectory
-    : "";
-  const cloudSqliteResetRepoTargets = useMemo(() => {
-    const targets = dedupeWorkspaceCoordinationTargets(
-      getWorkspaceCoordinationTargetsForRoot(
-        workspaceCoordinationTargetsByRoot,
-        cloudSqliteResetWorkspaceRoot,
-      ),
+  const cloudSqliteResetTargets = useMemo(() => {
+    const targets = [];
+    const seen = new Set();
+    workspaces.forEach((workspace) => {
+      const workspaceId = String(workspace?.id || "").trim();
+      if (!workspaceId) {
+        return;
+      }
+      const workspaceName = String(workspace?.name || workspaceId).trim();
+      const workspaceRoot = (
+        getWorkspaceRootDirectory(workspaceSettings, workspaceId)
+        || defaultWorkingDirectory
+        || ""
+      );
+      if (!workspaceRoot) {
+        return;
+      }
+      const discoveredTargets = dedupeWorkspaceCoordinationTargets(
+        getWorkspaceCoordinationTargetsForRoot(
+          workspaceCoordinationTargetsByRoot,
+          workspaceRoot,
+        ),
+      );
+      const gitTargets = discoveredTargets.filter(workspaceCoordinationTargetIsGitRepo);
+      const repoTargets = gitTargets.length ? gitTargets : discoveredTargets;
+      const usableTargets = repoTargets.length
+        ? repoTargets
+        : [{
+          repoPath: workspaceRoot,
+          workspaceRelativePath: "",
+          projectKind: "workspace",
+          hasGit: false,
+        }];
+      usableTargets.forEach((target) => {
+        const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || workspaceRoot);
+        const repoIdentity = getWorkspaceRootIdentity(repoPath);
+        if (!repoPath || !repoIdentity) {
+          return;
+        }
+        const key = `${workspaceId}:${repoIdentity}`;
+        if (seen.has(key)) {
+          return;
+        }
+        seen.add(key);
+        const repoLabel = workspaceCoordinationTargetRepoLabel(target);
+        targets.push({
+          key,
+          workspaceId,
+          workspaceName,
+          workspaceRoot,
+          repoPath,
+          repoLabel,
+          label: `${workspaceName} / ${repoLabel}`,
+          target,
+        });
+      });
+    });
+    return targets;
+  }, [
+    defaultWorkingDirectory,
+    workspaceCoordinationTargetsByRoot,
+    workspaceSettings,
+    workspaces,
+  ]);
+  const cloudSqliteResetTarget = useMemo(() => {
+    const selectedKey = String(cloudSqliteResetSelectedRepoPath || "").trim();
+    return (
+      cloudSqliteResetTargets.find((target) => target.key === selectedKey)
+      || cloudSqliteResetTargets[0]
+      || null
     );
-    const gitTargets = targets.filter(workspaceCoordinationTargetIsGitRepo);
-    return gitTargets.length ? gitTargets : targets;
-  }, [cloudSqliteResetWorkspaceRoot, workspaceCoordinationTargetsByRoot]);
-  const cloudSqliteResetRepoPath = useMemo(() => {
-    const selectedKey = getWorkspaceRootIdentity(cloudSqliteResetSelectedRepoPath);
-    const selectedTarget = selectedKey
-      ? cloudSqliteResetRepoTargets.find((target) => getWorkspaceRootIdentity(target.repoPath) === selectedKey)
-      : null;
-    return selectedTarget?.repoPath || cloudSqliteResetRepoTargets[0]?.repoPath || "";
-  }, [cloudSqliteResetRepoTargets, cloudSqliteResetSelectedRepoPath]);
-  const cloudSqliteResetRepoTarget = useMemo(() => {
-    const repoKey = getWorkspaceRootIdentity(cloudSqliteResetRepoPath);
-    return repoKey
-      ? cloudSqliteResetRepoTargets.find((target) => getWorkspaceRootIdentity(target.repoPath) === repoKey) || null
-      : null;
-  }, [cloudSqliteResetRepoPath, cloudSqliteResetRepoTargets]);
-  const cloudSqliteResetRepoLabel = workspaceCoordinationTargetRepoLabel(cloudSqliteResetRepoTarget);
+  }, [cloudSqliteResetSelectedRepoPath, cloudSqliteResetTargets]);
+  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetTarget?.workspaceId || "").trim();
+  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetTarget?.workspaceName || "").trim();
+  const cloudSqliteResetRepoPath = String(cloudSqliteResetTarget?.repoPath || "").trim();
+  const cloudSqliteResetRepoLabel = String(cloudSqliteResetTarget?.repoLabel || "Repository").trim();
   const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
     || cloudSqliteResetState === "resetting";
   const isCloudSqliteRepoResetting = cloudSqliteResetState === "repo_resetting"
@@ -14502,11 +14557,16 @@ export default function App() {
   const cloudSqliteResetDisabled = isCloudSqliteResetting
     || !cloudSqliteResetWorkspaceId
     || !cloudSqliteResetRepoPath;
+  const isTokenomicsCloudResetting = tokenomicsCloudResetState === "resetting";
+  const tokenomicsCloudResetDisabled = isTokenomicsCloudResetting
+    || authState !== "authenticated"
+    || !isPaidUser(user);
   useEffect(() => {
-    if (cloudSqliteResetRepoPath !== cloudSqliteResetSelectedRepoPath) {
-      setCloudSqliteResetSelectedRepoPath(cloudSqliteResetRepoPath);
+    const nextKey = cloudSqliteResetTarget?.key || "";
+    if (nextKey !== cloudSqliteResetSelectedRepoPath) {
+      setCloudSqliteResetSelectedRepoPath(nextKey);
     }
-  }, [cloudSqliteResetRepoPath, cloudSqliteResetSelectedRepoPath]);
+  }, [cloudSqliteResetSelectedRepoPath, cloudSqliteResetTarget?.key]);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const workspaceGitPullSelectedPaths = useMemo(
@@ -14998,12 +15058,16 @@ export default function App() {
     setCloudSqliteResetError("");
 
     if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetRepoPath) {
-      setCloudSqliteResetError("Choose a repository before resetting cloud SQLite.");
+      setCloudSqliteResetError("Choose a workspace repository before resetting server state.");
       return;
     }
 
+    const resetScopeLabel = cloudSqliteResetScope === "workspace" ? "workspace" : "repository";
+    const resetTargetLabel = cloudSqliteResetScope === "workspace"
+      ? cloudSqliteResetWorkspaceName
+      : `${cloudSqliteResetWorkspaceName} / ${cloudSqliteResetRepoLabel}`;
     const confirmed = window.confirm(
-      `Hard reset cloud SQLite for ${cloudSqliteResetRepoLabel}? This clears cloud runtime state, task history, logs, MCP state, terminal presence, and Architecture task state for the selected repository. The cloud checkpoint is refreshed.`,
+      `Reset server state for this ${resetScopeLabel}: ${resetTargetLabel}? Devices, billing history, and tokenomics are preserved.`,
     );
     if (!confirmed) {
       return;
@@ -15011,11 +15075,11 @@ export default function App() {
 
     setCloudSqliteResetState("repo_resetting");
     try {
-      const response = await invoke("cloud_mcp_hard_reset_cloud_sqlite", {
+      const response = await invoke("cloud_mcp_reset_server_state", {
         repoPath: cloudSqliteResetRepoPath,
         workspaceId: cloudSqliteResetWorkspaceId,
         workspaceName: cloudSqliteResetWorkspaceName || null,
-        resetScope: "repo",
+        resetScope: cloudSqliteResetScope,
       });
       const data = unwrapCloudCommandData(response, {});
       const backups = Array.isArray(data?.backups) ? data.backups : [];
@@ -15029,25 +15093,56 @@ export default function App() {
       } else if (updatedBackupCount > 0) {
         checkpointMessage = "refreshed cloud checkpoint";
       }
-      tokenomicsSyncCursorRef.current = "";
-      const forceTokenomicsResync = tokenomicsForceResyncRef.current;
-      if (typeof forceTokenomicsResync === "function") {
-        await forceTokenomicsResync();
-      }
       setCloudSqliteResetMessage(
-        `Cloud SQLite repo reset complete for ${cloudSqliteResetRepoLabel}; ${checkpointMessage}.`,
+        `Server state reset complete for ${resetTargetLabel}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
       );
     } catch (error) {
-      setCloudSqliteResetError(getErrorMessage(error, "Unable to hard reset cloud SQLite."));
+      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset server state."));
     } finally {
       setCloudSqliteResetState("idle");
     }
   }, [
     cloudSqliteResetRepoLabel,
     cloudSqliteResetRepoPath,
+    cloudSqliteResetScope,
     cloudSqliteResetWorkspaceId,
     cloudSqliteResetWorkspaceName,
   ]);
+
+  const resetCurrentDeviceTokenomicsCloud = useCallback(async () => {
+    setTokenomicsCloudResetMessage("");
+    setTokenomicsCloudResetError("");
+
+    if (authState !== "authenticated" || !isPaidUser(user)) {
+      setTokenomicsCloudResetError("Sign in with an active paid account before resetting cloud Tokenomics.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Reset cloud Tokenomics saved for this native device only? Other devices and billing history are preserved, and this device will immediately resync its local Tokenomics.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setTokenomicsCloudResetState("resetting");
+    try {
+      const response = await invoke("cloud_mcp_reset_device_tokenomics");
+      const data = unwrapCloudCommandData(response, {});
+      tokenomicsSyncCursorRef.current = "";
+      const deletedRollups = Number(data?.deleted_rollups ?? data?.deletedRollups ?? 0) || 0;
+      const deletedDeviceIdentities = Number(
+        data?.deleted_device_identities ?? data?.deletedDeviceIdentities ?? 0,
+      ) || 0;
+      setTokenomicsCloudResetMessage(
+        `Reset this device's cloud Tokenomics (${deletedRollups} rollup rows, ${deletedDeviceIdentities} device identity rows) and queued a full device resync.`,
+      );
+    } catch (error) {
+      setTokenomicsCloudResetError(getErrorMessage(error, "Unable to reset this device's cloud Tokenomics."));
+    } finally {
+      setTokenomicsCloudResetState("idle");
+    }
+  }, [authState, user]);
 
   useEffect(() => {
     if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
@@ -21020,6 +21115,17 @@ export default function App() {
                       <span>Processes</span>
                     </RailActionButton>
                     <RailActionButton
+                      aria-label="Snipping"
+                      data-active={activeView === "snipping"}
+                      data-scope="global"
+                      onClick={() => showView("snipping")}
+                      title="Snipping"
+                      type="button"
+                    >
+                      <ButtonSnippingIcon aria-hidden="true" />
+                      <span>Snipping</span>
+                    </RailActionButton>
+                    <RailActionButton
                       aria-label="Audio"
                       data-active={activeView === "audio"}
                       data-scope="global"
@@ -21558,72 +21664,154 @@ export default function App() {
                             <span>Activate selected</span>
                           </PrimaryButton>
                         )}
-                      </AccountCardFooter>
-                    </AccountCard>
-                  </AccountSettingsPanel>
+                        </AccountCardFooter>
+                      </AccountCard>
 
-                  <AccountSettingsPanel>
+                      <AccountCard data-tone="blue">
+                        <AccountCardHeader>
+                          <div>
+                            <SettingsLabel>Tokenomics</SettingsLabel>
+                            <SettingsValue>Reset this device</SettingsValue>
+                            <SettingsHint>
+                              Clear only this native device's cloud Tokenomics rows, then resend this device's local Tokenomics through sync.
+                            </SettingsHint>
+                          </div>
+                          <AgentReadyPill data-tone="blue">
+                            {isTokenomicsCloudResetting ? (
+                              <PendingIcon aria-hidden="true" />
+                            ) : (
+                              <ButtonRefreshIcon aria-hidden="true" />
+                            )}
+                            <span>{isTokenomicsCloudResetting ? "Resetting" : "Device only"}</span>
+                          </AgentReadyPill>
+                        </AccountCardHeader>
+
+                        <SettingsIdentityGrid>
+                          <SettingsIdentityItem>
+                            <span>Scope</span>
+                            <strong>Native device</strong>
+                          </SettingsIdentityItem>
+                          <SettingsIdentityItem>
+                            <span>Preserved</span>
+                            <strong>Other devices</strong>
+                          </SettingsIdentityItem>
+                          <SettingsIdentityItem>
+                            <span>Billing</span>
+                            <strong>Preserved</strong>
+                          </SettingsIdentityItem>
+                          <SettingsIdentityItem>
+                            <span>After reset</span>
+                            <strong>Full device resync</strong>
+                          </SettingsIdentityItem>
+                        </SettingsIdentityGrid>
+
+                        {tokenomicsCloudResetError && <FormMessage $state="error">{tokenomicsCloudResetError}</FormMessage>}
+                        {tokenomicsCloudResetMessage && (
+                          <AgentInstallMessage data-tone="success">
+                            {tokenomicsCloudResetMessage}
+                          </AgentInstallMessage>
+                        )}
+
+                        <AccountCardFooter>
+                          <SettingsHint>
+                            Provider account identities, billing records, and every other device's Tokenomics stay intact.
+                          </SettingsHint>
+                          <PrimaryDangerButton
+                            disabled={tokenomicsCloudResetDisabled}
+                            onClick={resetCurrentDeviceTokenomicsCloud}
+                            type="button"
+                          >
+                            {isTokenomicsCloudResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                            <span>{isTokenomicsCloudResetting ? "Resetting..." : "Reset device Tokenomics"}</span>
+                          </PrimaryDangerButton>
+                        </AccountCardFooter>
+                      </AccountCard>
+                    </AccountSettingsPanel>
+
+                    <AccountSettingsPanel>
                     <PanelHeaderRow>
                       <div>
                         <PanelKicker>Cloud maintenance</PanelKicker>
-                        <PanelHeading>Cloud SQLite reset</PanelHeading>
+                        <PanelHeading>Server state reset</PanelHeading>
                       </div>
                     </PanelHeaderRow>
 
-	                    <AccountCard data-tone="orange">
-	                      <AccountCardHeader>
-	                        <div>
-	                          <SettingsLabel>Hard reset</SettingsLabel>
-	                          <SettingsValue>Reset cloud SQLite</SettingsValue>
-	                          <SettingsHint>
-	                            Reset the selected repository's cloud runtime state and keep the workspace/account intact.
-	                          </SettingsHint>
-	                        </div>
-	                        <AgentReadyPill data-tone="orange">
+                    <AccountCard data-tone="orange">
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Reset</SettingsLabel>
+                          <SettingsValue>Reset server state</SettingsValue>
+                          <SettingsHint>
+                            Clear cloud runtime state for a repository or workspace while preserving devices, billing, and tokenomics.
+                          </SettingsHint>
+                        </div>
+                        <AgentReadyPill data-tone="orange">
                           {isCloudSqliteResetting ? (
                             <PendingIcon aria-hidden="true" />
                           ) : (
                             <ButtonRefreshIcon aria-hidden="true" />
                           )}
-	                          <span>{isCloudSqliteResetting ? "Resetting" : "Checkpoint"}</span>
-	                        </AgentReadyPill>
-	                      </AccountCardHeader>
+                          <span>{isCloudSqliteResetting ? "Resetting" : "Preserved"}</span>
+                        </AgentReadyPill>
+                      </AccountCardHeader>
 
-	                      <SetupField>
-	                        <SettingsLabel>Repository</SettingsLabel>
-	                        <WorkspaceSettingsSelectShell>
-	                          <WorkspaceSettingsSelect
-	                            disabled={isCloudSqliteResetting || cloudSqliteResetRepoTargets.length === 0}
-	                            onChange={(event) => setCloudSqliteResetSelectedRepoPath(event.target.value)}
-	                            value={cloudSqliteResetRepoPath}
-	                          >
-	                            {cloudSqliteResetRepoTargets.length === 0 ? (
-	                              <option value="">No git repositories found</option>
-	                            ) : cloudSqliteResetRepoTargets.map((target) => (
-	                              <option key={target.repoPath} value={target.repoPath}>
-	                                {workspaceCoordinationTargetRepoLabel(target)}
-	                              </option>
-	                            ))}
-	                          </WorkspaceSettingsSelect>
-	                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
-	                        </WorkspaceSettingsSelectShell>
-	                        <SettingsHint>{cloudSqliteResetRepoPath || "Select a workspace with a git repository."}</SettingsHint>
-	                      </SetupField>
+                      <SetupField>
+                        <SettingsLabel>Scope</SettingsLabel>
+                        <WorkspaceSettingsSelectShell>
+                          <WorkspaceSettingsSelect
+                            disabled={isCloudSqliteResetting}
+                            onChange={(event) => setCloudSqliteResetScope(event.target.value)}
+                            value={cloudSqliteResetScope}
+                          >
+                            <option value="repo">Repository server state</option>
+                            <option value="workspace">Workspace server state</option>
+                          </WorkspaceSettingsSelect>
+                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
+                        </WorkspaceSettingsSelectShell>
+                        <SettingsHint>
+                          Repository reset keeps workspace todos and plans. Workspace reset clears workspace todos and plans too.
+                        </SettingsHint>
+                      </SetupField>
 
-	                      <SettingsIdentityGrid>
-	                        <SettingsIdentityItem>
-	                          <span>Workspace</span>
-	                          <strong>{cloudSqliteResetWorkspaceName || "No workspace"}</strong>
-	                        </SettingsIdentityItem>
-	                        <SettingsIdentityItem>
-	                          <span>Repo</span>
-	                          <strong>{cloudSqliteResetRepoPath ? cloudSqliteResetRepoLabel : "None"}</strong>
-	                        </SettingsIdentityItem>
-	                        <SettingsIdentityItem>
-	                          <span>Local</span>
-	                          <strong>.agents</strong>
-	                        </SettingsIdentityItem>
-	                      </SettingsIdentityGrid>
+                      <SetupField>
+                        <SettingsLabel>Workspace / repository</SettingsLabel>
+                        <WorkspaceSettingsSelectShell>
+                          <WorkspaceSettingsSelect
+                            disabled={isCloudSqliteResetting || cloudSqliteResetTargets.length === 0}
+                            onChange={(event) => setCloudSqliteResetSelectedRepoPath(event.target.value)}
+                            value={cloudSqliteResetTarget?.key || ""}
+                          >
+                            {cloudSqliteResetTargets.length === 0 ? (
+                              <option value="">No workspaces found</option>
+                            ) : cloudSqliteResetTargets.map((target) => (
+                              <option key={target.key} value={target.key}>
+                                {target.label}
+                              </option>
+                            ))}
+                          </WorkspaceSettingsSelect>
+                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
+                        </WorkspaceSettingsSelectShell>
+                        <SettingsHint>{cloudSqliteResetRepoPath || "Add or sync a workspace to reset its server state."}</SettingsHint>
+                      </SetupField>
+
+                      <SettingsIdentityGrid>
+                        <SettingsIdentityItem>
+                          <span>Scope</span>
+                          <strong>{cloudSqliteResetScope === "workspace" ? "Workspace" : "Repository"}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Workspace</span>
+                          <strong>{cloudSqliteResetWorkspaceName || "No workspace"}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Repo</span>
+                          <strong>{cloudSqliteResetRepoPath ? cloudSqliteResetRepoLabel : "None"}</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Preserved</span>
+                          <strong>Devices, billing, tokenomics</strong>
+                        </SettingsIdentityItem>
+                      </SettingsIdentityGrid>
 
                       {cloudSqliteResetError && <FormMessage $state="error">{cloudSqliteResetError}</FormMessage>}
                       {cloudSqliteResetMessage && (
@@ -21632,20 +21820,20 @@ export default function App() {
                         </AgentInstallMessage>
                       )}
 
-	                      <AccountCardFooter>
-	                        <SettingsHint>
-	                          Reset only the selected repo's cloud SQLite scope.
-	                        </SettingsHint>
-	                        <PrimaryDangerButton
-	                          disabled={cloudSqliteResetDisabled}
-	                          onClick={hardResetCloudSqlite}
-	                          type="button"
-	                        >
-	                          {isCloudSqliteRepoResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-	                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset selected repo"}</span>
-	                        </PrimaryDangerButton>
-	                      </AccountCardFooter>
-	                    </AccountCard>
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          This does not delete the workspace, local files, devices, billing history, or device-level tokenomics.
+                        </SettingsHint>
+                        <PrimaryDangerButton
+                          disabled={cloudSqliteResetDisabled}
+                          onClick={hardResetCloudSqlite}
+                          type="button"
+                        >
+                          {isCloudSqliteRepoResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset server state"}</span>
+                        </PrimaryDangerButton>
+                      </AccountCardFooter>
+                    </AccountCard>
                   </AccountSettingsPanel>
 
                   <AccountSettingsPanel>
@@ -21825,6 +22013,14 @@ export default function App() {
                   <ProcessesView
                     onCloseTrackedTerminal={closeTrackedProcessTerminal}
                     workspaceRoots={processKnownRoots}
+                  />
+                </ForgeWorkspace>
+              ) : visibleView === "snipping" ? (
+                <ForgeWorkspace aria-label="Snipping" data-motion={viewMotion}>
+                  <SnippingWorkspaceView
+                    untrackedLibrary={untrackedAssetsLibrary.library}
+                    untrackedLoading={untrackedAssetsLibrary.loading || untrackedAssetsLibrary.syncing}
+                    onUntrackedRefresh={untrackedAssetsLibrary.refresh}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (

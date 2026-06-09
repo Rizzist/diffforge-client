@@ -299,7 +299,11 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         .map_err(|error| format!("Unable to backfill Tokenomics billing scope source: {error}"))?;
     }
     conn.execute_batch(
-        "DROP VIEW IF EXISTS tokenomics_display_rollups;
+        "DROP VIEW IF EXISTS tokenomics_display_daily_rollups;
+         DROP VIEW IF EXISTS tokenomics_display_hourly_rollups;
+         DROP VIEW IF EXISTS tokenomics_daily_rollups;
+         DROP VIEW IF EXISTS tokenomics_hourly_rollups;
+         DROP VIEW IF EXISTS tokenomics_display_rollups;
          CREATE VIEW tokenomics_display_rollups AS
            SELECT id, device_id, provider, agent_kind, model, subscription_key,
                   provider_account_key, provider_account_label,
@@ -318,7 +322,118 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
                   cache_read_tokens, cache_write_tokens, total_tokens,
                   estimated_cost_microusd, event_count, updated_at
            FROM tokenomics_cloud_rollups;
+         CREATE VIEW tokenomics_hourly_rollups AS
+           SELECT id, device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, provider_account_label,
+                  billing_scope_type, billing_team_id, billing_scope_source,
+                  workspace_id, repo_path,
+                  bucket_width, bucket_start, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, total_tokens,
+                  estimated_cost_microusd, event_count, updated_at
+           FROM tokenomics_rollups
+           WHERE bucket_width='hour';
+         CREATE VIEW tokenomics_display_hourly_rollups AS
+           SELECT id, device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, provider_account_label,
+                  billing_scope_type, billing_team_id, billing_scope_source,
+                  workspace_id, repo_path,
+                  bucket_width, bucket_start, input_tokens, output_tokens,
+                  cache_read_tokens, cache_write_tokens, total_tokens,
+                  estimated_cost_microusd, event_count, updated_at
+           FROM tokenomics_display_rollups
+           WHERE bucket_width='hour';
+         CREATE VIEW tokenomics_daily_rollups AS
+           SELECT
+                  'daily-from-hour:' || MIN(id) AS id,
+                  device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, MAX(provider_account_label) AS provider_account_label,
+                  billing_scope_type, billing_team_id, MAX(billing_scope_source) AS billing_scope_source,
+                  workspace_id, MAX(repo_path) AS repo_path,
+                  'day' AS bucket_width, substr(bucket_start, 1, 10) AS bucket_start,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                  COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
+                  COALESCE(SUM(event_count), 0) AS event_count,
+                  MAX(updated_at) AS updated_at
+           FROM tokenomics_hourly_rollups
+           WHERE LENGTH(substr(bucket_start, 1, 10)) = 10
+           GROUP BY device_id, provider, agent_kind, model, subscription_key,
+                    provider_account_key, billing_scope_type, billing_team_id,
+                    workspace_id, substr(bucket_start, 1, 10)
+           UNION ALL
+           SELECT day.id, day.device_id, day.provider, day.agent_kind, day.model, day.subscription_key,
+                  day.provider_account_key, day.provider_account_label,
+                  day.billing_scope_type, day.billing_team_id, day.billing_scope_source,
+                  day.workspace_id, day.repo_path,
+                  day.bucket_width, day.bucket_start, day.input_tokens, day.output_tokens,
+                  day.cache_read_tokens, day.cache_write_tokens, day.total_tokens,
+                  day.estimated_cost_microusd, day.event_count, day.updated_at
+           FROM tokenomics_rollups day
+           WHERE day.bucket_width='day'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tokenomics_hourly_rollups hour
+               WHERE hour.device_id=day.device_id
+                 AND hour.provider=day.provider
+                 AND hour.agent_kind=day.agent_kind
+                 AND COALESCE(hour.model, '')=COALESCE(day.model, '')
+                 AND COALESCE(hour.subscription_key, '')=COALESCE(day.subscription_key, '')
+                 AND COALESCE(hour.provider_account_key, '')=COALESCE(day.provider_account_key, '')
+                 AND COALESCE(hour.billing_scope_type, '')=COALESCE(day.billing_scope_type, '')
+                 AND COALESCE(hour.billing_team_id, '')=COALESCE(day.billing_team_id, '')
+                 AND COALESCE(hour.workspace_id, '')=COALESCE(day.workspace_id, '')
+                 AND substr(hour.bucket_start, 1, 10)=day.bucket_start
+             );
+         CREATE VIEW tokenomics_display_daily_rollups AS
+           SELECT
+                  'daily-from-hour:' || MIN(id) AS id,
+                  device_id, provider, agent_kind, model, subscription_key,
+                  provider_account_key, MAX(provider_account_label) AS provider_account_label,
+                  billing_scope_type, billing_team_id, MAX(billing_scope_source) AS billing_scope_source,
+                  workspace_id, MAX(repo_path) AS repo_path,
+                  'day' AS bucket_width, substr(bucket_start, 1, 10) AS bucket_start,
+                  COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                  COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                  COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                  COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                  COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
+                  COALESCE(SUM(event_count), 0) AS event_count,
+                  MAX(updated_at) AS updated_at
+           FROM tokenomics_display_hourly_rollups
+           WHERE LENGTH(substr(bucket_start, 1, 10)) = 10
+           GROUP BY device_id, provider, agent_kind, model, subscription_key,
+                    provider_account_key, billing_scope_type, billing_team_id,
+                    workspace_id, substr(bucket_start, 1, 10)
+           UNION ALL
+           SELECT day.id, day.device_id, day.provider, day.agent_kind, day.model, day.subscription_key,
+                  day.provider_account_key, day.provider_account_label,
+                  day.billing_scope_type, day.billing_team_id, day.billing_scope_source,
+                  day.workspace_id, day.repo_path,
+                  day.bucket_width, day.bucket_start, day.input_tokens, day.output_tokens,
+                  day.cache_read_tokens, day.cache_write_tokens, day.total_tokens,
+                  day.estimated_cost_microusd, day.event_count, day.updated_at
+           FROM tokenomics_display_rollups day
+           WHERE day.bucket_width='day'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM tokenomics_display_hourly_rollups hour
+               WHERE hour.device_id=day.device_id
+                 AND hour.provider=day.provider
+                 AND hour.agent_kind=day.agent_kind
+                 AND COALESCE(hour.model, '')=COALESCE(day.model, '')
+                 AND COALESCE(hour.subscription_key, '')=COALESCE(day.subscription_key, '')
+                 AND COALESCE(hour.provider_account_key, '')=COALESCE(day.provider_account_key, '')
+                 AND COALESCE(hour.billing_scope_type, '')=COALESCE(day.billing_scope_type, '')
+                 AND COALESCE(hour.billing_team_id, '')=COALESCE(day.billing_team_id, '')
+                 AND COALESCE(hour.workspace_id, '')=COALESCE(day.workspace_id, '')
+                 AND substr(hour.bucket_start, 1, 10)=day.bucket_start
+             );
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_provider ON tokenomics_rollups(provider, agent_kind, bucket_width, bucket_start);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_width_start ON tokenomics_rollups(bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_workspace ON tokenomics_rollups(workspace_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_account ON tokenomics_rollups(provider, agent_kind, provider_account_key, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_rollups_device ON tokenomics_rollups(device_id, bucket_width, bucket_start);
@@ -1047,6 +1162,72 @@ fn tokenomics_device_id_from_value(value: &Value, inherited: Option<String>) -> 
         .unwrap_or_else(tokenomics_local_device_id)
 }
 
+#[derive(Clone)]
+struct TokenomicsSourceIdentity {
+    provider_account: TokenomicsProviderAccount,
+    device_id: String,
+    billing_scope: TokenomicsBillingScope,
+}
+
+fn tokenomics_existing_source_identity(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    path: &Path,
+) -> Result<Option<TokenomicsSourceIdentity>, String> {
+    let source_path = path.display().to_string();
+    let source_path_with_suffix = format!("{source_path}:%");
+    match conn.query_row(
+        "SELECT
+           COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS account_key,
+           COALESCE(MAX(NULLIF(provider_account_label, '')), '') AS account_label,
+           COALESCE(NULLIF(device_id, ''), 'desktop-primary') AS device_id,
+           COALESCE(NULLIF(billing_scope_type, ''), 'unknown') AS billing_scope_type,
+           NULLIF(billing_team_id, '') AS billing_team_id,
+           COALESCE(MAX(NULLIF(billing_scope_source, '')), 'unknown') AS billing_scope_source
+         FROM tokenomics_usage_events
+         WHERE provider=?1 AND agent_kind=?2
+           AND COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) IS NOT NULL
+           AND (source_path=?3 OR source_path LIKE ?4)
+         GROUP BY account_key, device_id, billing_scope_type, billing_team_id
+         ORDER BY COUNT(*) DESC, MAX(COALESCE(observed_at, '')) DESC
+         LIMIT 1",
+        rusqlite::params![provider, agent_kind, source_path, source_path_with_suffix],
+        |row| {
+            let key: String = row.get(0)?;
+            let label = row
+                .get::<_, Option<String>>(1)?
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| key.clone());
+            let device_id = row
+                .get::<_, Option<String>>(2)?
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(tokenomics_local_device_id);
+            let scope_type = row.get::<_, Option<String>>(3)?;
+            let team_id = row.get::<_, Option<String>>(4)?;
+            let scope_source = row
+                .get::<_, Option<String>>(5)?
+                .unwrap_or_else(|| "existing_source_identity".to_string());
+            Ok(TokenomicsSourceIdentity {
+                provider_account: TokenomicsProviderAccount { key, label },
+                device_id,
+                billing_scope: tokenomics_billing_scope_from_parts(
+                    scope_type.as_deref(),
+                    team_id.as_deref(),
+                    &scope_source,
+                ),
+            })
+        },
+    ) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(format!(
+            "Unable to read Tokenomics source identity for {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn tokenomics_collect_jwt_account_identifiers(value: &Value, output: &mut Vec<String>) {
     tokenomics_collect_jwt_values_for_keys(
         value,
@@ -1750,8 +1931,11 @@ fn tokenomics_scan_codex_state_db(
             |row| row.get(0),
         )
         .unwrap_or(0);
-    if needs_scanner_reset || accountless_events > 0 {
+    if accountless_events > 0 {
         tokenomics_delete_provider_rows(conn, "openai", "codex")?;
+        tokenomics_delete_provider_scan_cache(conn, "openai", "codex")?;
+        scan_state = None;
+    } else if needs_scanner_reset {
         tokenomics_delete_provider_scan_cache(conn, "openai", "codex")?;
         scan_state = None;
     }
@@ -2010,8 +2194,19 @@ fn tokenomics_scan_codex_session_file(
         model_provider
     };
     let model = model.filter(|value| !value.trim().is_empty());
-    let device_id = tokenomics_local_device_id();
-    let billing_scope = tokenomics_current_billing_scope();
+    let source_identity = tokenomics_existing_source_identity(conn, provider, "codex", path)?;
+    let source_provider_account = source_identity
+        .as_ref()
+        .map(|identity| identity.provider_account.clone())
+        .unwrap_or_else(|| provider_account.clone());
+    let device_id = source_identity
+        .as_ref()
+        .map(|identity| identity.device_id.clone())
+        .unwrap_or_else(tokenomics_local_device_id);
+    let billing_scope = source_identity
+        .as_ref()
+        .map(|identity| identity.billing_scope.clone())
+        .unwrap_or_else(tokenomics_current_billing_scope);
     let mut inserted = 0usize;
     let mut last_line_index = start_after_line.max(-1);
     let mut newest_event_timestamp = updated_at_unix;
@@ -2088,7 +2283,7 @@ fn tokenomics_scan_codex_session_file(
             tokenomics_event_identity_account_key(
                 provider,
                 "codex",
-                Some(provider_account.key.as_str())
+                Some(source_provider_account.key.as_str())
             ),
             path.display()
         );
@@ -2098,9 +2293,9 @@ fn tokenomics_scan_codex_session_file(
             provider: provider.to_string(),
             agent_kind: "codex".to_string(),
             model: model.map(str::to_string),
-            subscription_key: Some(provider_account.key.clone()),
-            provider_account_key: Some(provider_account.key.clone()),
-            provider_account_label: Some(provider_account.label.clone()),
+            subscription_key: Some(source_provider_account.key.clone()),
+            provider_account_key: Some(source_provider_account.key.clone()),
+            provider_account_label: Some(source_provider_account.label.clone()),
             billing_scope_type: billing_scope.scope_type.clone(),
             billing_team_id: billing_scope.team_id.clone(),
             billing_scope_source: billing_scope.source.clone(),
@@ -3142,61 +3337,66 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     let scope_label_sql = "CASE WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='team' THEN 'Team' WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='personal' THEN 'Personal' ELSE 'Unknown scope' END";
     let scope_source_sql = "COALESCE(NULLIF(billing_scope_source, ''), 'unknown')";
     let scope_select_sql = format!("{scope_type_sql} AS billing_scope_type, {scope_team_sql} AS billing_team_id, {scope_key_sql} AS billing_scope_key, {scope_label_sql} AS billing_scope_label, MAX({scope_source_sql}) AS billing_scope_source");
-    let rollup_table = if include_cloud {
-        "tokenomics_display_rollups"
+    let hourly_rollup_table = if include_cloud {
+        "tokenomics_display_hourly_rollups"
     } else {
-        "tokenomics_rollups"
+        "tokenomics_hourly_rollups"
+    };
+    let daily_rollup_table = if include_cloud {
+        "tokenomics_display_daily_rollups"
+    } else {
+        "tokenomics_daily_rollups"
     };
     let total = tokenomics_query_one(
         conn,
-        &format!("SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day'")
+        &format!("SELECT COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table}")
     )?;
     let by_device = tokenomics_query_rows(
         conn,
-        &format!("SELECT device_id, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id ORDER BY total_tokens DESC LIMIT 40"),
+        &format!("SELECT device_id, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id ORDER BY total_tokens DESC LIMIT 40"),
     )?;
     let by_device_provider = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key ORDER BY total_tokens DESC LIMIT 80"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key ORDER BY total_tokens DESC LIMIT 80"
 	        ),
 	    )?;
     let by_device_account = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key ORDER BY total_tokens DESC LIMIT 120"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key ORDER BY total_tokens DESC LIMIT 120"
 	        ),
 	    )?;
     let daily = tokenomics_query_rows(
         conn,
-        &format!("SELECT bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY bucket_start ORDER BY bucket_start DESC LIMIT 30"),
+        &format!("SELECT bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY bucket_start ORDER BY bucket_start DESC LIMIT 30"),
     )?;
     let daily_by_device_provider = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, bucket_start ORDER BY bucket_start DESC LIMIT 720"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, bucket_start ORDER BY bucket_start DESC LIMIT 720"
 	        ),
 	    )?;
     let monthly = tokenomics_query_rows(
         conn,
-        &format!("SELECT substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 24"),
+        &format!("SELECT substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 24"),
     )?;
     let monthly_by_device_provider = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 720"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, substr(bucket_start, 1, 7) || '-01' AS bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, substr(bucket_start, 1, 7) ORDER BY bucket_start DESC LIMIT 720"
 	        ),
 	    )?;
     let by_device_model = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {rollup_table} WHERE bucket_width='day' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind) ORDER BY total_tokens DESC LIMIT 120"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count FROM {daily_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind) ORDER BY total_tokens DESC LIMIT 120"
 	        ),
 	    )?;
     let hourly = tokenomics_query_rows(
 	        conn,
 	        &format!(
-	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count, MAX(updated_at) AS updated_at FROM {rollup_table} WHERE bucket_width='hour' GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind), bucket_start ORDER BY bucket_start DESC LIMIT 5000"
+	            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count, MAX(updated_at) AS updated_at FROM {hourly_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind), bucket_start ORDER BY bucket_start DESC LIMIT 5000"
 	        ),
 	    )?;
     let limits = tokenomics_provider_limits(conn)?;
@@ -4775,6 +4975,106 @@ mod tokenomics_tests {
         ] {
             assert!(summary.get(legacy_key).is_none());
         }
+    }
+
+    #[test]
+    fn tokenomics_existing_source_identity_reuses_historical_codex_provider() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        tokenomics_insert_event(
+            &conn,
+            &TokenomicsUsageEvent {
+                id: "historical-codex-event".to_string(),
+                device_id: "macos-history".to_string(),
+                provider: "openai".to_string(),
+                agent_kind: "codex".to_string(),
+                model: Some("gpt-5.5".to_string()),
+                subscription_key: Some("openai:codex:d9b6c65b".to_string()),
+                provider_account_key: Some("openai:codex:d9b6c65b".to_string()),
+                provider_account_label: Some("Digital Agency".to_string()),
+                billing_scope_type: "personal".to_string(),
+                billing_team_id: None,
+                billing_scope_source: "legacy_provider_restore".to_string(),
+                workspace_id: None,
+                repo_path: None,
+                source_kind: "codex_token_count_jsonl".to_string(),
+                source_path: Some("/tmp/history.jsonl:codex".to_string()),
+                bucket_day: "2026-05-31".to_string(),
+                bucket_hour: "2026-05-31T00".to_string(),
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 12,
+                estimated_cost_microusd: 0,
+                created_at: Some("2026-05-31T00:00:00Z".to_string()),
+                observed_at: "2026-05-31T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let identity = tokenomics_existing_source_identity(
+            &conn,
+            "openai",
+            "codex",
+            Path::new("/tmp/history.jsonl"),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(identity.provider_account.key, "openai:codex:d9b6c65b");
+        assert_eq!(identity.provider_account.label, "Digital Agency");
+        assert_eq!(identity.device_id, "macos-history");
+        assert_eq!(identity.billing_scope.scope_type, "personal");
+        assert_eq!(identity.billing_scope.source, "legacy_provider_restore");
+    }
+
+    #[test]
+    fn tokenomics_summary_derives_days_from_hourly_without_double_counting() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        for (id, bucket_width, bucket_start, total_tokens) in [
+            ("hour-rollup", "hour", "2026-05-31T00", 12_i64),
+            ("day-rollup", "day", "2026-05-31", 999_i64),
+        ] {
+            conn.execute(
+                "INSERT INTO tokenomics_rollups(
+                   id, device_id, provider, agent_kind, model, subscription_key,
+                   provider_account_key, provider_account_label,
+                   billing_scope_type, billing_team_id, billing_scope_source,
+                   workspace_id, repo_path,
+                   bucket_width, bucket_start, input_tokens, output_tokens,
+                   cache_read_tokens, cache_write_tokens, total_tokens,
+                   estimated_cost_microusd, event_count, updated_at
+                 ) VALUES(
+                   ?1, 'device-a', 'openai', 'codex', 'gpt-5.5', 'openai:codex:work',
+                   'openai:codex:work', 'Work',
+                   'personal', NULL, 'test',
+                   NULL, NULL,
+                   ?2, ?3, ?4, 0,
+                   0, 0, ?4,
+                   0, 1, '2026-05-31T00:00:00Z'
+                 )",
+                rusqlite::params![id, bucket_width, bucket_start, total_tokens],
+            )
+            .unwrap();
+        }
+
+        let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
+
+        assert_eq!(summary["total"]["total_tokens"], json!(12));
+        assert_eq!(summary["daily"][0]["bucket_start"], json!("2026-05-31"));
+        assert_eq!(summary["daily"][0]["total_tokens"], json!(12));
+        assert_eq!(
+            summary["daily_by_device_provider"][0]["provider_account_key"],
+            json!("openai:codex:work")
+        );
+        assert_eq!(
+            summary["daily_by_device_provider"][0]["total_tokens"],
+            json!(12)
+        );
     }
 
     #[test]

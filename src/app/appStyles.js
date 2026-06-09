@@ -32,6 +32,7 @@ import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
 import { Pending } from "@styled-icons/material-rounded/Pending";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Settings } from "@styled-icons/material-rounded/Settings";
+import { ScreenshotMonitor } from "@styled-icons/material-rounded/ScreenshotMonitor";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
@@ -12013,6 +12014,10 @@ export const ButtonMicIcon = styled(Mic)`
 `;
 
 export const ButtonProcessIcon = styled(Memory)`
+  ${buttonIconSize}
+`;
+
+export const ButtonSnippingIcon = styled(ScreenshotMonitor)`
   ${buttonIconSize}
 `;
 

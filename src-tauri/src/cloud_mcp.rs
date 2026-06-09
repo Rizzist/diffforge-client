@@ -7643,6 +7643,8 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/workspace/assets/report-transfer-progress" => {
             Some("workspace_asset_report_transfer_progress")
         }
+        "/v1/tokenomics/reset-device" => Some("tokenomics_reset_device_cloud"),
+        "/v1/cloud/server-reset" => Some("server_reset_cloud_state"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -13036,6 +13038,78 @@ async fn cloud_mcp_schedule_tokenomics_sync(
     ))
 }
 
+#[tauri::command]
+async fn cloud_mcp_reset_device_tokenomics(
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(
+        &device_profile,
+        &["device_id", "deviceId", "machine_id", "machineId"],
+    )
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+    .ok_or_else(|| "Unable to determine the native desktop device id.".to_string())?;
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(state.inner()).await;
+    let billing_scope_key =
+        tokenomics_billing_scope_key(billing_scope_type.as_str(), team_id.as_deref());
+    let payload = json!({
+        "source": "rust-diffforge-tokenomics-device-reset",
+        "scope": "device",
+        "billing_scope_type": billing_scope_type,
+        "billing_scope_key": billing_scope_key,
+        "team_id": team_id,
+        "account_scoped": true,
+        "confirm": "reset_device_tokenomics",
+        "device": device_profile.clone(),
+        "device_id": device_id,
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": "tokenomics_device_cloud_reset",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/tokenomics/reset-device", &payload)
+            .await?;
+    {
+        let mut tokenomics_cursor = state.background_sync.tokenomics_cursor.lock().await;
+        tokenomics_cursor.remove(payload["billing_scope_key"].as_str().unwrap_or("personal"));
+    }
+    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state.inner(),
+        "tokenomics_device_cloud_reset".to_string(),
+        true,
+        true,
+    )
+    .await;
+    let mut data = cloud_mcp_response_data(&response);
+    if let Some(object) = data.as_object_mut() {
+        object.insert("sync_queued".to_string(), json!(true));
+        object.insert(
+            "sync".to_string(),
+            cloud_mcp_background_sync_ack(
+                "tokenomics_sync",
+                "tokenomics:scan",
+                "tokenomics_device_cloud_reset",
+                json!({
+                    "full": queued_job.force_full,
+                    "resync_last_30_days": queued_job.force_resync,
+                    "queued_reason": queued_job.reason,
+                }),
+            ),
+        );
+    }
+    Ok(data)
+}
+
 fn cloud_mcp_tokenomics_cursor_from_summary(summary: &Value) -> Option<String> {
     let direct = summary
         .get("sync_cursor")
@@ -13159,6 +13233,69 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/sqlite/hard-reset", &payload)
             .await?;
+    {
+        let mut snapshots = state.runtime_snapshots.lock().await;
+        *snapshots = CloudMcpRuntimeSnapshots::default();
+    }
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_reset_server_state(
+    state: State<'_, CloudMcpState>,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    reset_scope: Option<String>,
+) -> Result<Value, String> {
+    let req = cloud_mcp_repo_request(
+        repo_path.clone(),
+        Some(workspace_id.clone()),
+        workspace_name.clone(),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let requested_reset_scope = reset_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("repo")
+        .to_ascii_lowercase();
+    let reset_scope = match requested_reset_scope.as_str() {
+        "repo" | "repository" | "git_repo" | "git-repo" => "repo",
+        "workspace" | "workspace_runtime" | "workspace-runtime" => "workspace",
+        "account" | "account_runtime" | "account-runtime" => "account_runtime",
+        _ => "repo",
+    };
+    let payload = json!({
+        "source": "rust-diffforge-server-state-reset",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": req.repo_id,
+        "repo_path": req.root_display,
+        "workspace_root": req.root_display,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "scope": reset_scope,
+        "confirm": "reset_server_state",
+        "preserve": {
+            "devices": true,
+            "billing": true,
+            "tokenomics": true,
+        },
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "self_agent_id": "rust-diffforge",
+        "current_agent_id": "rust-diffforge",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/server-reset", &payload).await?;
     {
         let mut snapshots = state.runtime_snapshots.lock().await;
         *snapshots = CloudMcpRuntimeSnapshots::default();
