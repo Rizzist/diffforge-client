@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use super::schema::{
     APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME, APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION,
-    CREATE_SCHEMA_SQL, DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
+    CRASH_TODO_RESUME_MIGRATION_NAME, CRASH_TODO_RESUME_MIGRATION_VERSION, CREATE_SCHEMA_SQL,
+    DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
     DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION,
     INTEGRATOR_POLICY_MIGRATION_NAME, INTEGRATOR_POLICY_MIGRATION_VERSION, MIGRATION_NAME,
     MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
@@ -19,8 +20,8 @@ use super::schema::{
     TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
     TASK_SOURCE_TODO_REFS_MIGRATION_NAME, TASK_SOURCE_TODO_REFS_MIGRATION_VERSION,
     TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
-    TERMINAL_TASK_PLAN_MIGRATION_NAME, TERMINAL_TASK_PLAN_MIGRATION_VERSION,
-    TERMINAL_TASK_PLAN_SCHEMA_SQL, WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
+    TERMINAL_TODO_PLAN_MIGRATION_NAME, TERMINAL_TODO_PLAN_MIGRATION_VERSION,
+    TERMINAL_TODO_PLAN_SCHEMA_SQL, WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
     WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
     WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME, WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
     WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME, WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION,
@@ -626,12 +627,81 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
         connection,
     )?);
     diagnostics.push(apply_worktree_task_binding_migration(connection)?);
-    diagnostics.push(apply_terminal_task_plan_migration(connection)?);
+    diagnostics.push(apply_terminal_todo_plan_migration(connection)?);
     diagnostics.push(apply_task_source_todo_refs_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_secrets_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_exposure_mode_migration(connection)?);
+    diagnostics.push(apply_crash_todo_resume_migration(connection)?);
 
     Ok(diagnostics)
+}
+
+fn apply_crash_todo_resume_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    let mut details = Vec::new();
+    let added = ensure_column(connection, "agent_sessions", "provider_session_id", "TEXT")?;
+    details.push(format!(
+        "agent_sessions.provider_session_id {}",
+        if added { "added" } else { "already_present" }
+    ));
+    with_sqlite_lock_retry("Unable to initialize crash todo resume schema", || {
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS terminal_crash_todo_resumes(
+              id TEXT PRIMARY KEY,
+              old_task_id TEXT NOT NULL UNIQUE,
+              todo_id TEXT NOT NULL,
+              todo_dispatch_id TEXT,
+              source_prompt_event_id TEXT,
+              source_command_id TEXT,
+              provider_session_id TEXT NOT NULL,
+              old_session_id TEXT NOT NULL,
+              old_agent_id TEXT,
+              old_agent_kind TEXT,
+              old_agent_slot_id TEXT,
+              old_slot_key TEXT,
+              old_pty_id TEXT,
+              task_title TEXT,
+              task_body TEXT,
+              status TEXT NOT NULL,
+              resume_session_id TEXT,
+              resume_prompt_event_id TEXT,
+              resume_dispatch_id TEXT,
+              resume_command_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              claimed_at TEXT,
+              dispatched_at TEXT,
+              skipped_at TEXT,
+              error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_sessions_provider_session
+              ON agent_sessions(provider_session_id);
+            CREATE INDEX IF NOT EXISTS idx_crash_todo_resumes_provider
+              ON terminal_crash_todo_resumes(provider_session_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_crash_todo_resumes_todo
+              ON terminal_crash_todo_resumes(todo_id, status, updated_at);
+            ",
+        )
+    })?;
+    details.push("terminal_crash_todo_resumes schema ensured".to_string());
+    let mut migration = if migration_applied(connection, CRASH_TODO_RESUME_MIGRATION_VERSION)? {
+        SchemaMigrationDiagnostics::new(
+            CRASH_TODO_RESUME_MIGRATION_VERSION,
+            CRASH_TODO_RESUME_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        )
+    } else {
+        record_migration_if_missing(
+            connection,
+            CRASH_TODO_RESUME_MIGRATION_VERSION,
+            CRASH_TODO_RESUME_MIGRATION_NAME,
+        )?
+    };
+    migration.details.splice(0..0, details);
+    Ok(migration)
 }
 
 fn apply_slot_migration(connection: &Connection) -> Result<SchemaMigrationDiagnostics, String> {
@@ -1125,29 +1195,29 @@ fn apply_worktree_task_binding_migration(
     Ok(migration)
 }
 
-fn apply_terminal_task_plan_migration(
+fn apply_terminal_todo_plan_migration(
     connection: &Connection,
 ) -> Result<SchemaMigrationDiagnostics, String> {
-    with_sqlite_lock_retry("Unable to initialize terminal task plan schema", || {
-        connection.execute_batch(TERMINAL_TASK_PLAN_SCHEMA_SQL)
+    with_sqlite_lock_retry("Unable to initialize terminal todo plan schema", || {
+        connection.execute_batch(TERMINAL_TODO_PLAN_SCHEMA_SQL)
     })?;
-    let mut migration = if migration_applied(connection, TERMINAL_TASK_PLAN_MIGRATION_VERSION)? {
+    let mut migration = if migration_applied(connection, TERMINAL_TODO_PLAN_MIGRATION_VERSION)? {
         SchemaMigrationDiagnostics::new(
-            TERMINAL_TASK_PLAN_MIGRATION_VERSION,
-            TERMINAL_TASK_PLAN_MIGRATION_NAME,
+            TERMINAL_TODO_PLAN_MIGRATION_VERSION,
+            TERMINAL_TODO_PLAN_MIGRATION_NAME,
             "already_applied",
             vec!["schema_migrations row already exists".to_string()],
         )
     } else {
         record_migration_if_missing(
             connection,
-            TERMINAL_TASK_PLAN_MIGRATION_VERSION,
-            TERMINAL_TASK_PLAN_MIGRATION_NAME,
+            TERMINAL_TODO_PLAN_MIGRATION_VERSION,
+            TERMINAL_TODO_PLAN_MIGRATION_NAME,
         )?
     };
     migration.details.splice(
         0..0,
-        ["TERMINAL_TASK_PLAN_SCHEMA_SQL executed idempotently".to_string()],
+        ["TERMINAL_TODO_PLAN_SCHEMA_SQL executed idempotently".to_string()],
     );
     Ok(migration)
 }

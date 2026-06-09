@@ -512,6 +512,7 @@ import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceVie
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
+import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
@@ -5479,6 +5480,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 }
 
 export default function App() {
+  if (window.location.hash === ACTIVITY_OVERLAY_HASH) {
+    return <ActivityOverlayWindow />;
+  }
+
   if (window.location.hash === AUDIO_WIDGET_HASH) {
     return <AudioWidgetWindow />;
   }

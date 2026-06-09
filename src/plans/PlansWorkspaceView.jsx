@@ -7,7 +7,7 @@ import styled, { keyframes } from "styled-components";
 
 import { FormMessage } from "../app/appStyles";
 
-const TERMINAL_TASK_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
+const TERMINAL_TODO_PLAN_UPDATED_EVENT = "forge-terminal-todo-plan-updated";
 const PLAN_SNAPSHOT_CACHE_LIMIT = 80;
 const PLAN_SNAPSHOT_CACHE_FRESH_MS = 5000;
 const PLAN_SNAPSHOT_FOCUS_SETTLE_MS = 700;
@@ -669,7 +669,7 @@ export default function PlansWorkspaceView({
       const requestKey = planSnapshotRequestKey(snapshotCacheKeys);
       let request = requestKey ? planSnapshotRequests.get(requestKey) : null;
       if (!request) {
-        request = invoke("coordination_terminal_task_plan_snapshot", command)
+        request = invoke("coordination_terminal_todo_plan_snapshot", command)
           .then(dataOf)
           .finally(() => {
             if (requestKey) {
@@ -688,7 +688,7 @@ export default function PlansWorkspaceView({
       setSnapshot(nextSnapshot);
     } catch (nextError) {
       if (!silent) {
-        setError(cleanText(nextError?.message || nextError) || "Unable to load terminal plans.");
+        setError(cleanText(nextError?.message || nextError) || "Unable to load terminal todo plans.");
       }
     }
   }, [
@@ -746,7 +746,7 @@ export default function PlansWorkspaceView({
     let unlisten = null;
     const rootPath = pathIdentity(activeRepoPath);
 
-    listen(TERMINAL_TASK_PLAN_UPDATED_EVENT, (event) => {
+    listen(TERMINAL_TODO_PLAN_UPDATED_EVENT, (event) => {
       const state = planEventStateRef.current || {};
       if (cancelled) {
         return;
@@ -880,7 +880,7 @@ export default function PlansWorkspaceView({
     });
     cancelEditing();
 
-    void invoke("coordination_terminal_task_plan_edit_step_title", {
+    void invoke("coordination_terminal_todo_plan_edit_step_title", {
       repoPath: activeRepoPath,
       ...(activeDbPath ? { dbPath: activeDbPath } : {}),
       input: {
@@ -964,10 +964,10 @@ export default function PlansWorkspaceView({
   }, [activeRepoTarget, target.agentId, target.paneId, target.sessionId, target.taskId, target.terminalIndex]);
 
   return (
-    <PlansSurface aria-label="Terminal plans">
+    <PlansSurface aria-label="Terminal todo plans">
       <PlansHeader>
         <div>
-          <PlansEyebrow>{headerMeta || "Terminal plan"}</PlansEyebrow>
+          <PlansEyebrow>{headerMeta || "Terminal todo plan"}</PlansEyebrow>
           <PlansTitle>Plans</PlansTitle>
         </div>
         {normalizedRepoTargets.length > 1 && (

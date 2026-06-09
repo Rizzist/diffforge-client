@@ -44,6 +44,15 @@ test("parked resume backend submit remains authoritative", () => {
   }), true);
 });
 
+test("crash todo resume backend submit remains authoritative", () => {
+  assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
+    expectedPrompt: "continue after crash",
+    observedPrompt: "continue after crash",
+    promptMatch: true,
+    promptSource: "crash_todo_resume_backend_submit",
+  }), true);
+});
+
 test("activity hook user prompt submit is authoritative", () => {
   assert.equal(terminalPromptSubmittedPayloadIsAuthoritative({
     prompt: "ship it",

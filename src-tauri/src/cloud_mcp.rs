@@ -8,6 +8,7 @@ const CLOUD_MCP_LOCAL_DOCKER_PROBE_TIMEOUT_MS: u64 = 180;
 const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
+const CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
 const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
@@ -45,6 +46,8 @@ const CLOUD_MCP_TODO_MIRROR_ROWS_TABLE: &str = "workspace_todo_mirror_rows";
 const CLOUD_MCP_TODO_HISTORY_ROWS_TABLE: &str = "workspace_todo_history_rows";
 const CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS: usize = 2048;
 const CLOUD_MCP_TODO_MIRROR_WORKSPACE_TODOS_MAX_ITEMS: usize = 500;
+const CLOUD_MCP_CREDIT_LEDGER_DB_FILE: &str = "diffforge-credit-ledger.sqlite";
+const CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT: i64 = 1_000_000;
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
 const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
 const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
@@ -532,6 +535,599 @@ fn cloud_mcp_local_data_file_path(filename: &str) -> Option<PathBuf> {
 
 fn cloud_mcp_outbox_db_path() -> Option<PathBuf> {
     cloud_mcp_local_cache_file_path(CLOUD_MCP_OUTBOX_DB_FILE)
+}
+
+fn cloud_mcp_credit_ledger_db_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path(CLOUD_MCP_CREDIT_LEDGER_DB_FILE)
+}
+
+fn cloud_mcp_credit_scope_parts() -> (String, Option<String>, String) {
+    let (scope_type, team_id) = cloud_mcp_process_account_scope();
+    let scope_type = scope_type.trim().to_ascii_lowercase();
+    let scope_type = if scope_type.is_empty() {
+        "unknown".to_string()
+    } else {
+        scope_type
+    };
+    let team_id = team_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let scope_key = if scope_type == "team" {
+        format!("team:{}", team_id.as_deref().unwrap_or("unknown"))
+    } else if scope_type == "personal" {
+        "personal".to_string()
+    } else {
+        "unknown".to_string()
+    };
+    (scope_type, team_id, scope_key)
+}
+
+fn cloud_mcp_credit_ledger_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        CREATE TABLE IF NOT EXISTS diffforge_credit_ledger(
+            id TEXT PRIMARY KEY,
+            scope_type TEXT NOT NULL,
+            team_id TEXT NOT NULL DEFAULT '',
+            scope_key TEXT NOT NULL,
+            meter TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            credits INTEGER NOT NULL DEFAULT 0,
+            bytes INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            source_event_id TEXT NOT NULL DEFAULT '',
+            dedupe_key TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_diffforge_credit_ledger_created
+            ON diffforge_credit_ledger(created_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_diffforge_credit_ledger_meter
+            ON diffforge_credit_ledger(scope_key, meter, created_at_ms DESC);
+        CREATE TABLE IF NOT EXISTS diffforge_credit_transfer_events(
+            dedupe_key TEXT PRIMARY KEY,
+            scope_key TEXT NOT NULL,
+            transfer_id TEXT NOT NULL,
+            direction TEXT NOT NULL DEFAULT '',
+            bytes INTEGER NOT NULL DEFAULT 0,
+            asset_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL DEFAULT '',
+            repo_id TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS diffforge_credit_transfer_counters(
+            scope_key TEXT PRIMARY KEY,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            billed_credits INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );
+        "
+    )
+}
+
+fn cloud_mcp_open_credit_ledger_conn() -> Result<rusqlite::Connection, String> {
+    let path = cloud_mcp_credit_ledger_db_path()
+        .ok_or_else(|| "Diff Forge credit ledger path is unavailable.".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create credit ledger directory: {error}"))?;
+    }
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("Unable to open Diff Forge credit ledger: {error}"))?;
+    conn.busy_timeout(Duration::from_millis(2_500))
+        .map_err(|error| format!("Unable to configure Diff Forge credit ledger: {error}"))?;
+    cloud_mcp_credit_ledger_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize Diff Forge credit ledger: {error}"))?;
+    Ok(conn)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_record_diffforge_credit_ledger_row(
+    conn: &rusqlite::Connection,
+    meter: &str,
+    entity_type: &str,
+    entity_id: &str,
+    credits: i64,
+    bytes: i64,
+    reason: &str,
+    description: &str,
+    workspace_id: Option<&str>,
+    repo_id: Option<&str>,
+    source_event_id: Option<&str>,
+    source: &str,
+    metadata: &Value,
+    dedupe_override: Option<&str>,
+) -> Result<bool, String> {
+    let entity_id = entity_id.trim();
+    if entity_id.is_empty() || credits <= 0 {
+        return Ok(false);
+    }
+    let (scope_type, team_id, scope_key) = cloud_mcp_credit_scope_parts();
+    let meter = meter.trim();
+    let entity_type = entity_type.trim();
+    let dedupe_key = dedupe_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{scope_key}:{meter}:{entity_type}:{entity_id}"));
+    let id = format!("credit-{}", cloud_mcp_short_hash(&dedupe_key));
+    let now = cloud_mcp_rfc3339_now();
+    let now_ms = cloud_mcp_now_ms() as i64;
+    let metadata_json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_string());
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO diffforge_credit_ledger(
+                id, scope_type, team_id, scope_key, meter, entity_type, entity_id,
+                credits, bytes, reason, description, workspace_id, repo_id, source_event_id,
+                dedupe_key, source, metadata_json, created_at, created_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            rusqlite::params![
+                id,
+                scope_type,
+                team_id.unwrap_or_default(),
+                scope_key,
+                meter,
+                entity_type,
+                entity_id,
+                credits,
+                bytes.max(0),
+                reason,
+                description,
+                workspace_id.unwrap_or_default(),
+                repo_id.unwrap_or_default(),
+                source_event_id.unwrap_or_default(),
+                dedupe_key,
+                source,
+                metadata_json,
+                now,
+                now_ms,
+            ],
+        )
+        .map_err(|error| format!("Unable to record Diff Forge credit ledger row: {error}"))?;
+    Ok(inserted > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_record_diffforge_credit_entity(
+    meter: &str,
+    entity_type: &str,
+    entity_id: &str,
+    reason: &str,
+    description: &str,
+    workspace_id: Option<&str>,
+    repo_id: Option<&str>,
+    source_event_id: Option<&str>,
+    source: &str,
+    metadata: Value,
+) -> Result<bool, String> {
+    let conn = cloud_mcp_open_credit_ledger_conn()?;
+    cloud_mcp_record_diffforge_credit_ledger_row(
+        &conn,
+        meter,
+        entity_type,
+        entity_id,
+        1,
+        0,
+        reason,
+        description,
+        workspace_id,
+        repo_id,
+        source_event_id,
+        source,
+        &metadata,
+        None,
+    )
+}
+
+pub(crate) fn cloud_mcp_record_diffforge_task_credit(
+    repo_path: Option<&str>,
+    workspace_id: Option<&str>,
+    task_id: &str,
+    source: &str,
+    metadata: Value,
+) -> Result<bool, String> {
+    let repo_id = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    cloud_mcp_record_diffforge_credit_entity(
+        "task_created",
+        "task",
+        task_id,
+        "Task created",
+        &format!("Task created · task_id {task_id}"),
+        workspace_id,
+        repo_id.as_deref(),
+        Some(task_id),
+        source,
+        metadata,
+    )
+}
+
+fn cloud_mcp_diffforge_credit_text(row: &Value, keys: &[&str]) -> Option<String> {
+    cloud_mcp_payload_text(row, keys)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cloud_mcp_record_diffforge_todo_plan_credits_from_rows(
+    source: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    rows: &[Value],
+) {
+    let mut todo_ids = HashSet::<String>::new();
+    let mut plan_ids = HashSet::<String>::new();
+    for row in rows {
+        let todo_id = if cloud_mcp_todo_mirror_row_kind(row) == "dispatch" {
+            cloud_mcp_diffforge_credit_text(row, &["todo_id", "todoId"])
+        } else {
+            cloud_mcp_diffforge_credit_text(row, &["todo_id", "todoId", "id"])
+        };
+        if let Some(todo_id) = todo_id {
+            todo_ids.insert(todo_id);
+        }
+        if let Some(plan_id) = cloud_mcp_diffforge_credit_text(
+            row,
+            &["plan_id", "planId", "todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+        ) {
+            if cloud_mcp_payload_text(row, &["plan_id", "planId"]).is_some()
+                || cloud_mcp_payload_text(row, &["plan", "plan_id"]).is_some()
+                || cloud_mcp_payload_text(row, &["plan", "planId"]).is_some()
+            {
+                plan_ids.insert(plan_id);
+            }
+        }
+    }
+    for todo_id in todo_ids {
+        let _ = cloud_mcp_record_diffforge_credit_entity(
+            "todo_created",
+            "todo",
+            &todo_id,
+            "Todo created",
+            &format!("Todo created · todo_id {todo_id}"),
+            workspace_id,
+            repo_id,
+            Some(&todo_id),
+            source,
+            json!({
+                "meter": "todo_created",
+                "source": source,
+                "todo_id": todo_id,
+                "todoId": todo_id,
+            }),
+        );
+    }
+    for plan_id in plan_ids {
+        let _ = cloud_mcp_record_diffforge_credit_entity(
+            "plan_created",
+            "plan",
+            &plan_id,
+            "Plan created",
+            &format!("Plan created · plan_id {plan_id}"),
+            workspace_id,
+            repo_id,
+            Some(&plan_id),
+            source,
+            json!({
+                "meter": "plan_created",
+                "source": source,
+                "plan_id": plan_id,
+                "planId": plan_id,
+            }),
+        );
+    }
+}
+
+fn cloud_mcp_diffforge_todo_credit_source_is_billable(source: &str) -> bool {
+    let source = source.trim().to_ascii_lowercase();
+    source.contains("create_plan")
+        || source.contains("send_todos")
+        || source.contains("todo_dispatch")
+        || source.contains("local_workspace_todo")
+        || source.contains("workspace_todo_event")
+}
+
+fn cloud_mcp_asset_transfer_status_is_billable(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "completed" | "complete" | "uploaded" | "downloaded" | "ready"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_record_diffforge_asset_transfer_credit(
+    source: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    asset_id: &str,
+    transfer_id: &str,
+    direction: &str,
+    bytes: i64,
+) -> Result<i64, String> {
+    let transfer_id = transfer_id.trim();
+    let bytes = bytes.max(0);
+    if transfer_id.is_empty() || bytes <= 0 {
+        return Ok(0);
+    }
+    let conn = cloud_mcp_open_credit_ledger_conn()?;
+    let (_scope_type, _team_id, scope_key) = cloud_mcp_credit_scope_parts();
+    let event_dedupe_key = format!("{scope_key}:asset_transfer_bytes:{transfer_id}");
+    let now = cloud_mcp_rfc3339_now();
+    let now_ms = cloud_mcp_now_ms() as i64;
+    let metadata = json!({
+        "meter": "asset_transfer_mb",
+        "source": source,
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "transfer_id": transfer_id,
+        "transferId": transfer_id,
+        "direction": direction,
+        "bytes": bytes,
+        "bytes_per_credit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
+        "bytesPerCredit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
+    });
+    let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("Unable to start Diff Forge transfer billing transaction: {error}"))?;
+    let result = (|| -> Result<i64, String> {
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO diffforge_credit_transfer_events(
+                    dedupe_key, scope_key, transfer_id, direction, bytes, asset_id,
+                    workspace_id, repo_id, source, metadata_json, created_at, created_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    event_dedupe_key,
+                    scope_key,
+                    transfer_id,
+                    direction,
+                    bytes,
+                    asset_id,
+                    workspace_id.unwrap_or_default(),
+                    repo_id.unwrap_or_default(),
+                    source,
+                    metadata_json,
+                    now,
+                    now_ms,
+                ],
+            )
+            .map_err(|error| format!("Unable to record transfer byte event: {error}"))?;
+        if inserted == 0 {
+            return Ok(0);
+        }
+        let (previous_total, previous_billed): (i64, i64) = conn
+            .query_row(
+                "SELECT total_bytes, billed_credits
+                 FROM diffforge_credit_transfer_counters
+                 WHERE scope_key=?1",
+                [&scope_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+        let next_total = previous_total.saturating_add(bytes);
+        let next_billed = next_total / CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT;
+        let credits_to_bill = next_billed.saturating_sub(previous_billed);
+        conn.execute(
+            "INSERT INTO diffforge_credit_transfer_counters(
+                scope_key, total_bytes, billed_credits, updated_at, updated_at_ms
+             ) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(scope_key) DO UPDATE SET
+                total_bytes=excluded.total_bytes,
+                billed_credits=excluded.billed_credits,
+                updated_at=excluded.updated_at,
+                updated_at_ms=excluded.updated_at_ms",
+            rusqlite::params![scope_key, next_total, next_billed, now, now_ms],
+        )
+        .map_err(|error| format!("Unable to update transfer byte counter: {error}"))?;
+        if credits_to_bill > 0 {
+            let mb_start = previous_billed + 1;
+            let mb_end = next_billed;
+            let dedupe = format!("{scope_key}:asset_transfer_mb:{transfer_id}:{mb_start}-{mb_end}");
+            let description = format!(
+                "Asset transfer · {} MB · {} {} bytes",
+                credits_to_bill, direction, bytes
+            );
+            cloud_mcp_record_diffforge_credit_ledger_row(
+                &conn,
+                "asset_transfer_mb",
+                "asset_transfer",
+                transfer_id,
+                credits_to_bill,
+                bytes,
+                "Asset transfer",
+                &description,
+                workspace_id,
+                repo_id,
+                Some(transfer_id),
+                source,
+                &metadata,
+                Some(&dedupe),
+            )?;
+        }
+        Ok(credits_to_bill)
+    })();
+    match result {
+        Ok(credits) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|error| format!("Unable to commit transfer billing: {error}"))?;
+            Ok(credits)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_credit_ledger_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let metadata_json: String = row.get(15)?;
+    let metadata = serde_json::from_str::<Value>(&metadata_json).unwrap_or_else(|_| json!({}));
+    Ok(json!({
+        "id": row.get::<_, String>(0)?,
+        "meter": row.get::<_, String>(1)?,
+        "entity_type": row.get::<_, String>(2)?,
+        "entityType": row.get::<_, String>(2)?,
+        "entity_id": row.get::<_, String>(3)?,
+        "entityId": row.get::<_, String>(3)?,
+        "credits": row.get::<_, i64>(4)?,
+        "bytes": row.get::<_, i64>(5)?,
+        "reason": row.get::<_, String>(6)?,
+        "description": row.get::<_, String>(7)?,
+        "workspace_id": row.get::<_, String>(8)?,
+        "workspaceId": row.get::<_, String>(8)?,
+        "repo_id": row.get::<_, String>(9)?,
+        "repoId": row.get::<_, String>(9)?,
+        "source_event_id": row.get::<_, String>(10)?,
+        "sourceEventId": row.get::<_, String>(10)?,
+        "dedupe_key": row.get::<_, String>(11)?,
+        "dedupeKey": row.get::<_, String>(11)?,
+        "source": row.get::<_, String>(12)?,
+        "created_at": row.get::<_, String>(13)?,
+        "createdAt": row.get::<_, String>(13)?,
+        "created_at_ms": row.get::<_, i64>(14)?,
+        "createdAtMs": row.get::<_, i64>(14)?,
+        "metadata": metadata,
+    }))
+}
+
+fn cloud_mcp_diffforge_credit_ledger_summary(limit: usize) -> Value {
+    let Ok(conn) = cloud_mcp_open_credit_ledger_conn() else {
+        return json!({
+            "known": false,
+            "source": "local_diff_forge_credit_ledger",
+            "items": [],
+            "history": [],
+            "total_credits": 0,
+            "totalCredits": 0,
+        });
+    };
+    let limit = limit.clamp(1, 200) as i64;
+    let total_credits: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(credits), 0) FROM diffforge_credit_ledger",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let mut by_meter = Vec::<Value>::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT meter, COALESCE(SUM(credits), 0) AS credits, COUNT(*) AS events
+         FROM diffforge_credit_ledger
+         GROUP BY meter
+         ORDER BY credits DESC, meter ASC",
+    ) {
+        if let Ok(mapped) = stmt.query_map([], |row| {
+            Ok(json!({
+                "meter": row.get::<_, String>(0)?,
+                "credits": row.get::<_, i64>(1)?,
+                "events": row.get::<_, i64>(2)?,
+            }))
+        }) {
+            by_meter.extend(mapped.filter_map(Result::ok));
+        }
+    }
+    let mut items = Vec::<Value>::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, meter, entity_type, entity_id, credits, bytes, reason, description,
+                workspace_id, repo_id, source_event_id, dedupe_key, source, created_at,
+                created_at_ms, metadata_json
+         FROM diffforge_credit_ledger
+         ORDER BY created_at_ms DESC
+         LIMIT ?1",
+    ) {
+        if let Ok(mapped) = stmt.query_map([limit], cloud_mcp_credit_ledger_row_from_sql) {
+            items.extend(mapped.filter_map(Result::ok));
+        }
+    }
+    let (transfer_total_bytes, transfer_billed_credits): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(total_bytes), 0), COALESCE(SUM(billed_credits), 0)
+             FROM diffforge_credit_transfer_counters",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let transfer_remainder_bytes = transfer_total_bytes
+        .saturating_sub(transfer_billed_credits.saturating_mul(CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT));
+    json!({
+        "known": total_credits > 0 || transfer_total_bytes > 0,
+        "source": "local_diff_forge_credit_ledger",
+        "updated_at": cloud_mcp_rfc3339_now(),
+        "updatedAt": cloud_mcp_rfc3339_now(),
+        "total_credits": total_credits,
+        "totalCredits": total_credits,
+        "items": items,
+        "history": items,
+        "by_meter": by_meter,
+        "byMeter": by_meter,
+        "transfer": {
+            "bytes_per_credit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
+            "bytesPerCredit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
+            "total_bytes": transfer_total_bytes,
+            "totalBytes": transfer_total_bytes,
+            "billed_credits": transfer_billed_credits,
+            "billedCredits": transfer_billed_credits,
+            "remainder_bytes": transfer_remainder_bytes,
+            "remainderBytes": transfer_remainder_bytes,
+        },
+    })
+}
+
+fn cloud_mcp_merge_diffforge_credit_ledger(mut billing: Value, ledger: Value) -> Value {
+    let history = ledger
+        .get("items")
+        .cloned()
+        .or_else(|| ledger.get("history").cloned())
+        .unwrap_or_else(|| json!([]));
+    let by_meter = ledger
+        .get("by_meter")
+        .cloned()
+        .or_else(|| ledger.get("byMeter").cloned())
+        .unwrap_or_else(|| json!([]));
+    if let Some(object) = billing.as_object_mut() {
+        object.insert("credit_ledger".to_string(), ledger.clone());
+        object.insert("creditLedger".to_string(), ledger.clone());
+        object.insert("billing_history".to_string(), history.clone());
+        object.insert("billingHistory".to_string(), history.clone());
+        let credits = object
+            .entry("credits".to_string())
+            .or_insert_with(|| json!({}));
+        if let Some(credits_object) = credits.as_object_mut() {
+            credits_object.insert("usage_history".to_string(), history.clone());
+            credits_object.insert("usageHistory".to_string(), history);
+            credits_object.insert("usage_by_meter".to_string(), by_meter.clone());
+            credits_object.insert("usageByMeter".to_string(), by_meter);
+            credits_object.insert(
+                "local_metered_used_credits".to_string(),
+                ledger
+                    .get("total_credits")
+                    .cloned()
+                    .unwrap_or_else(|| json!(0)),
+            );
+            credits_object.insert(
+                "localMeteredUsedCredits".to_string(),
+                ledger
+                    .get("totalCredits")
+                    .cloned()
+                    .unwrap_or_else(|| json!(0)),
+            );
+            credits_object.insert("transfer".to_string(), ledger["transfer"].clone());
+        }
+    }
+    billing
 }
 
 fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
@@ -10725,7 +11321,9 @@ async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result
         .await
         .map_err(|error| format!("Unable to load billing status: {error}"))?;
 
-    read_api_response(response, "Unable to load billing status.").await
+    let billing = read_api_response(response, "Unable to load billing status.").await?;
+    let ledger = cloud_mcp_diffforge_credit_ledger_summary(100);
+    Ok(cloud_mcp_merge_diffforge_credit_ledger(billing, ledger))
 }
 
 #[tauri::command]
@@ -15096,6 +15694,30 @@ fn cloud_mcp_update_asset_library_conn_inner(
             ],
         )
         .map_err(|error| format!("Unable to update asset transfer cache from {source}: {error}"))?;
+        let transfer_status = cloud_mcp_asset_row_text(&transfer, &["status"]);
+        if cloud_mcp_asset_transfer_status_is_billable(&transfer_status) {
+            let row_repo_id = cloud_mcp_asset_row_text(&transfer, &["repo_id", "repoId"]);
+            let row_workspace_id = cloud_mcp_asset_row_text(&transfer, &["workspace_id", "workspaceId"]);
+            let transfer_bytes = cloud_mcp_asset_row_i64(&transfer, &["bytes_done", "bytesDone"])
+                .max(cloud_mcp_asset_row_i64(&transfer, &["bytes_total", "bytesTotal"]));
+            let _ = cloud_mcp_record_diffforge_asset_transfer_credit(
+                source,
+                Some(if row_repo_id.is_empty() {
+                    repo_id.unwrap_or_default()
+                } else {
+                    row_repo_id.as_str()
+                }),
+                Some(if row_workspace_id.is_empty() {
+                    workspace_id.unwrap_or_default()
+                } else {
+                    row_workspace_id.as_str()
+                }),
+                &cloud_mcp_asset_row_text(&transfer, &["asset_id", "assetId"]),
+                &transfer_id,
+                &cloud_mcp_asset_row_text(&transfer, &["direction"]),
+                transfer_bytes,
+            );
+        }
     }
     if authoritative_full_snapshot {
         let mut sql = "SELECT asset_id, local_path, row_json FROM workspace_asset_items WHERE 1=1"
@@ -16343,6 +16965,16 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
         )
         .map_err(|error| format!("Unable to upsert todo mirror row: {error}"))?;
     }
+    if table_name == CLOUD_MCP_TODO_MIRROR_ROWS_TABLE
+        && cloud_mcp_diffforge_todo_credit_source_is_billable(source)
+    {
+        cloud_mcp_record_diffforge_todo_plan_credits_from_rows(
+            source,
+            (!repo_id.is_empty()).then_some(repo_id),
+            (!observer_workspace_id.is_empty()).then_some(observer_workspace_id),
+            rows,
+        );
+    }
     Ok(())
 }
 
@@ -16982,6 +17614,850 @@ fn cloud_mcp_todo_history_from_file(
         Ok(conn) => cloud_mcp_todo_history_from_conn(&conn, repo_id, workspace_id, input),
         Err(error) => cloud_mcp_todo_history_empty_response(input, Some(error)),
     }
+}
+
+#[derive(Clone)]
+struct CloudMcpAgentCreatePlanTodoRows {
+    plan_id: String,
+    plan_title: String,
+    compact_plan: Value,
+    todo_rows: Vec<Value>,
+    dispatch_rows: Vec<Value>,
+}
+
+struct CloudMcpAgentCreatePlanSyncPayloads {
+    snapshot: Value,
+    dispatches: Vec<Value>,
+}
+
+fn cloud_mcp_agent_plan_text(value: &str, max_chars: usize) -> String {
+    value
+        .replace(|character: char| character.is_control(), " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn cloud_mcp_agent_create_plan_required_text(
+    value: &Value,
+    keys: &[&str],
+    label: &str,
+) -> Result<String, String> {
+    cloud_mcp_payload_text(value, keys)
+        .map(|value| cloud_mcp_agent_plan_text(&value, 256))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("create_plan generated invalid todo plan row without {label}."))
+}
+
+fn cloud_mcp_agent_create_plan_cloud_row(row: &Value) -> Value {
+    let mut row = row.clone();
+    if let Some(object) = row.as_object_mut() {
+        object.remove("local_only");
+        object.remove("localOnly");
+        object.insert("server_sync_queued".to_string(), json!(true));
+        object.insert("serverSyncQueued".to_string(), json!(true));
+        object.insert("cloud_sync_status".to_string(), json!("queued"));
+        object.insert("cloudSyncStatus".to_string(), json!("queued"));
+    }
+    row
+}
+
+fn cloud_mcp_validate_agent_create_plan_rows(
+    rows: &CloudMcpAgentCreatePlanTodoRows,
+) -> Result<(), String> {
+    let plan_id = rows.plan_id.trim();
+    if plan_id.is_empty() {
+        return Err("create_plan generated invalid todo plan without plan_id.".to_string());
+    }
+    if rows.todo_rows.is_empty() {
+        return Err("create_plan generated invalid todo plan without todos.".to_string());
+    }
+    if rows.todo_rows.len() != rows.dispatch_rows.len() {
+        return Err(
+            "create_plan generated invalid todo plan with mismatched todo/dispatch rows."
+                .to_string(),
+        );
+    }
+
+    let compact_plan_id = cloud_mcp_agent_create_plan_required_text(
+        &rows.compact_plan,
+        &["plan_id", "planId", "id"],
+        "plan_id",
+    )?;
+    if compact_plan_id != plan_id {
+        return Err("create_plan generated invalid todo plan with inconsistent plan_id.".to_string());
+    }
+    let primary_todo_id = cloud_mcp_agent_create_plan_required_text(
+        &rows.compact_plan,
+        &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+        "todo_id",
+    )?;
+
+    let mut todo_ids = HashSet::<String>::new();
+    for (index, row) in rows.todo_rows.iter().enumerate() {
+        let row_plan_id = cloud_mcp_agent_create_plan_required_text(
+            row,
+            &["plan_id", "planId", "todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+            "plan_id",
+        )?;
+        if row_plan_id != plan_id {
+            return Err(format!(
+                "create_plan generated invalid todo row {} with inconsistent plan_id.",
+                index + 1
+            ));
+        }
+        let todo_id =
+            cloud_mcp_agent_create_plan_required_text(row, &["todo_id", "todoId", "id"], "todo_id")?;
+        if !todo_ids.insert(todo_id) {
+            return Err(format!(
+                "create_plan generated invalid duplicate todo_id for step {}.",
+                index + 1
+            ));
+        }
+    }
+    if !todo_ids.contains(&primary_todo_id) {
+        return Err("create_plan generated invalid todo plan whose primary todo_id is not a step todo.".to_string());
+    }
+
+    for (index, row) in rows.dispatch_rows.iter().enumerate() {
+        let row_plan_id = cloud_mcp_agent_create_plan_required_text(
+            row,
+            &["plan_id", "planId", "todo_batch_id", "todoBatchId", "batch_id", "batchId"],
+            "plan_id",
+        )?;
+        if row_plan_id != plan_id {
+            return Err(format!(
+                "create_plan generated invalid dispatch row {} with inconsistent plan_id.",
+                index + 1
+            ));
+        }
+        let todo_id =
+            cloud_mcp_agent_create_plan_required_text(row, &["todo_id", "todoId", "id"], "todo_id")?;
+        if !todo_ids.contains(&todo_id) {
+            return Err(format!(
+                "create_plan generated invalid dispatch row {} with unknown todo_id.",
+                index + 1
+            ));
+        }
+        let _ = cloud_mcp_agent_create_plan_required_text(
+            row,
+            &[
+                "todo_dispatch_id",
+                "todoDispatchId",
+                "dispatch_id",
+                "dispatchId",
+            ],
+            "dispatch_id",
+        )?;
+    }
+
+    let steps = rows
+        .compact_plan
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "create_plan generated invalid todo plan without compact steps.".to_string())?;
+    if steps.len() != rows.todo_rows.len() {
+        return Err("create_plan generated invalid todo plan with mismatched compact steps.".to_string());
+    }
+    for (index, step) in steps.iter().enumerate() {
+        let step_plan_id = cloud_mcp_agent_create_plan_required_text(
+            step,
+            &["plan_id", "planId"],
+            "plan_id",
+        )?;
+        if step_plan_id != plan_id {
+            return Err(format!(
+                "create_plan generated invalid compact step {} with inconsistent plan_id.",
+                index + 1
+            ));
+        }
+        let step_todo_id = cloud_mcp_agent_create_plan_required_text(
+            step,
+            &["todo_id", "todoId", "id"],
+            "todo_id",
+        )?;
+        if !todo_ids.contains(&step_todo_id) {
+            return Err(format!(
+                "create_plan generated invalid compact step {} with unknown todo_id.",
+                index + 1
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn cloud_mcp_agent_create_plan_sync_payloads(
+    rows: &CloudMcpAgentCreatePlanTodoRows,
+) -> Result<CloudMcpAgentCreatePlanSyncPayloads, String> {
+    cloud_mcp_validate_agent_create_plan_rows(rows)?;
+
+    let first_row = rows
+        .todo_rows
+        .first()
+        .ok_or_else(|| "create_plan generated invalid todo plan without todos.".to_string())?;
+    let repo_id = cloud_mcp_payload_text(first_row, &["repo_id", "repoId"]).unwrap_or_default();
+    let repo_path = cloud_mcp_payload_text(
+        first_row,
+        &["repo_path", "repoPath", "workspace_root", "workspaceRoot"],
+    )
+    .unwrap_or_default();
+    let workspace_id =
+        cloud_mcp_payload_text(first_row, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let workspace_name =
+        cloud_mcp_payload_text(first_row, &["workspace_name", "workspaceName"]).unwrap_or_default();
+    let device_id = cloud_mcp_payload_text(first_row, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
+    let device_name = cloud_mcp_payload_text(first_row, &["device_name", "deviceName"])
+        .unwrap_or_else(|| "Desktop".to_string());
+    let primary_todo_id = cloud_mcp_agent_create_plan_required_text(
+        &rows.compact_plan,
+        &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+        "todo_id",
+    )?;
+    let todo_ids = rows
+        .todo_rows
+        .iter()
+        .map(|row| cloud_mcp_agent_create_plan_required_text(row, &["todo_id", "todoId", "id"], "todo_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let todos = rows
+        .todo_rows
+        .iter()
+        .map(cloud_mcp_agent_create_plan_cloud_row)
+        .collect::<Vec<_>>();
+    let dispatches = rows
+        .dispatch_rows
+        .iter()
+        .map(|row| {
+            let mut row = cloud_mcp_agent_create_plan_cloud_row(row);
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "event_kind".to_string(),
+                    json!("workspace_todo_dispatch_requested"),
+                );
+                object.insert(
+                    "eventKind".to_string(),
+                    json!("workspace_todo_dispatch_requested"),
+                );
+                object.insert("source".to_string(), json!("rust-diffforge-agent-create-plan"));
+                object.insert("reason".to_string(), json!("agent_create_plan_step_listed"));
+                object.insert("mode".to_string(), json!("listed"));
+                object.insert("send_mode".to_string(), json!("listed"));
+                object.insert("sendMode".to_string(), json!("listed"));
+                object.insert("client_id".to_string(), json!(CLOUD_MCP_RUST_CLIENT_ID));
+                object.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let mut snapshot = json!({
+        "event_kind": "workspace_todo_snapshot",
+        "eventKind": "workspace_todo_snapshot",
+        "source": "rust-diffforge-agent-create-plan",
+        "reason": "agent_create_plan",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "repo_id": repo_id,
+        "repoId": repo_id,
+        "repo_path": repo_path,
+        "repoPath": repo_path,
+        "workspace_root": repo_path,
+        "workspaceRoot": repo_path,
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name,
+        "workspaceName": workspace_name,
+        "device": device_profile,
+        "device_id": device_id,
+        "deviceId": device_id,
+        "machine_id": device_id,
+        "machineId": device_id,
+        "device_name": device_name,
+        "machine_name": device_name,
+        "snapshot_full": false,
+        "snapshotFull": false,
+        "prune_missing": false,
+        "pruneMissing": false,
+        "plan_id": rows.plan_id,
+        "planId": rows.plan_id,
+        "todo_batch_id": rows.plan_id,
+        "todoBatchId": rows.plan_id,
+        "batch_id": rows.plan_id,
+        "batchId": rows.plan_id,
+        "todo_id": primary_todo_id,
+        "todoId": primary_todo_id,
+        "primary_todo_id": primary_todo_id,
+        "primaryTodoId": primary_todo_id,
+        "todo_ids": todo_ids,
+        "todoIds": todo_ids,
+        "plan": rows.compact_plan,
+        "compact_plan": rows.compact_plan,
+        "compactPlan": rows.compact_plan,
+        "todos": todos,
+        "dispatches": dispatches,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_limit_workspace_todo_sync_payload(&mut snapshot);
+
+    Ok(CloudMcpAgentCreatePlanSyncPayloads {
+        snapshot,
+        dispatches,
+    })
+}
+
+fn cloud_mcp_queue_agent_create_plan_todo_sync(
+    base_url: &str,
+    rows: &CloudMcpAgentCreatePlanTodoRows,
+) -> Result<Value, String> {
+    let payloads = cloud_mcp_agent_create_plan_sync_payloads(rows)?;
+    let snapshot_sync = cloud_mcp_queue_event_background(
+        base_url,
+        "workspace_todo_snapshot",
+        &payloads.snapshot,
+        "agent_create_plan_todo_snapshot",
+    )?;
+    let mut dispatch_syncs = Vec::with_capacity(payloads.dispatches.len());
+    for dispatch in &payloads.dispatches {
+        dispatch_syncs.push(cloud_mcp_queue_event_background(
+            base_url,
+            "workspace_todo_dispatch_requested",
+            dispatch,
+            "agent_create_plan_todo_dispatch",
+        )?);
+    }
+    Ok(json!({
+        "ok": true,
+        "kind": "todo_plan_cloud_sync",
+        "background": true,
+        "durable": true,
+        "server_sync_queued": true,
+        "serverSyncQueued": true,
+        "plan_id": rows.plan_id,
+        "planId": rows.plan_id,
+        "todo_id": rows.compact_plan["todo_id"].clone(),
+        "todoId": rows.compact_plan["todoId"].clone(),
+        "todo_ids": rows.compact_plan["todo_ids"].clone(),
+        "todoIds": rows.compact_plan["todoIds"].clone(),
+        "todo_batch_id": rows.plan_id,
+        "todoBatchId": rows.plan_id,
+        "event_count": dispatch_syncs.len() + 1,
+        "eventCount": dispatch_syncs.len() + 1,
+        "snapshot": snapshot_sync,
+        "dispatches": dispatch_syncs,
+    }))
+}
+
+fn cloud_mcp_agent_create_plan_step_body(step: &Value) -> Option<(String, String, Value)> {
+    if let Some(text) = step
+        .as_str()
+        .map(|value| cloud_mcp_agent_plan_text(value, CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS))
+        .filter(|value| !value.trim().is_empty())
+    {
+        let title = cloud_mcp_prompt_summary(&text);
+        return Some((title, text, Value::Null));
+    }
+
+    let title = cloud_mcp_payload_text(
+        step,
+        &["title", "name", "summary", "objective", "label"],
+    )
+    .map(|value| cloud_mcp_agent_plan_text(&value, 512));
+    let body = cloud_mcp_payload_text(
+        step,
+        &[
+            "body",
+            "text",
+            "prompt",
+            "message",
+            "description",
+            "detail",
+            "details",
+        ],
+    )
+    .map(|value| cloud_mcp_agent_plan_text(&value, CLOUD_MCP_WORKSPACE_TODO_TEXT_MAX_CHARS));
+    let step_body = match (title.as_deref(), body.as_deref()) {
+        (Some(title), Some(body)) if !body.eq_ignore_ascii_case(title) => {
+            format!("{title}\n\n{body}")
+        }
+        (Some(title), _) => title.to_string(),
+        (_, Some(body)) => body.to_string(),
+        _ => return None,
+    };
+    let step_title = title
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| cloud_mcp_prompt_summary(&step_body));
+    let detail = cloud_mcp_payload_text(step, &["detail", "details", "description"])
+        .map(|value| json!(cloud_mcp_agent_plan_text(&value, 2_000)))
+        .unwrap_or(Value::Null);
+    Some((step_title, step_body, detail))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_agent_create_plan_todo_rows(
+    repo_id: Option<&str>,
+    repo_path: Option<&str>,
+    workspace_id: Option<&str>,
+    workspace_name: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+    device_profile: &Value,
+    now: &str,
+) -> Result<CloudMcpAgentCreatePlanTodoRows, String> {
+    let steps = input
+        .get("steps")
+        .or_else(|| input.get("todos"))
+        .or_else(|| input.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "create_plan requires steps[].".to_string())?;
+    if steps.is_empty() {
+        return Err("create_plan requires at least one step.".to_string());
+    }
+    if steps.len() > 24 {
+        return Err("create_plan supports at most 24 steps.".to_string());
+    }
+
+    let plan_id = cloud_mcp_payload_text(
+        input,
+        &[
+            "plan_id",
+            "planId",
+            "todo_batch_id",
+            "todoBatchId",
+            "batch_id",
+            "batchId",
+        ],
+    )
+    .map(|value| cloud_mcp_agent_plan_text(&value, 160))
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| format!("local-plan-{}", uuid::Uuid::new_v4()));
+    let plan_title = cloud_mcp_payload_text(
+        input,
+        &["title", "plan_title", "planTitle", "name", "objective", "summary"],
+    )
+    .map(|value| cloud_mcp_agent_plan_text(&value, 220))
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| "Local agent plan".to_string());
+    let current_step_index = cloud_mcp_payload_i64(input, &["current_step_index", "currentStepIndex"])
+        .unwrap_or(0)
+        .clamp(0, steps.len().saturating_sub(1) as i64);
+    let current_step_detail = cloud_mcp_payload_text(
+        input,
+        &["current_step_detail", "currentStepDetail", "detail"],
+    )
+    .map(|value| cloud_mcp_agent_plan_text(&value, 2_000));
+    let workspace_id = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let workspace_name = workspace_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let repo_id = repo_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let repo_path = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let agent_id = agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    let device_id = cloud_mcp_payload_text(device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
+    let device_name = cloud_mcp_payload_text(device_profile, &["device_name", "deviceName"])
+        .unwrap_or_else(|| "Desktop".to_string());
+    let step_count = steps.len();
+    let mut compact_steps = Vec::new();
+    let mut todo_rows = Vec::new();
+    let mut dispatch_rows = Vec::new();
+    let mut todo_ids = Vec::new();
+
+    for (index, step) in steps.iter().enumerate() {
+        let Some((step_title, step_body, step_detail)) =
+            cloud_mcp_agent_create_plan_step_body(step)
+        else {
+            return Err(format!("create_plan step {} is empty.", index + 1));
+        };
+        let explicit_todo_id = cloud_mcp_payload_text(step, &["todo_id", "todoId", "id"]);
+        let todo_id = explicit_todo_id
+            .map(|value| cloud_mcp_agent_plan_text(&value, 160))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("{plan_id}-todo-{}", index + 1));
+        todo_ids.push(todo_id.clone());
+        let dispatch_id = cloud_mcp_payload_text(
+            step,
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+            ],
+        )
+        .map(|value| cloud_mcp_agent_plan_text(&value, 160))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{plan_id}-dispatch-{}", index + 1));
+        let command_id = cloud_mcp_payload_text(step, &["command_id", "commandId"])
+            .map(|value| cloud_mcp_agent_plan_text(&value, 160))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("{dispatch_id}-command"));
+        let body_preview = cloud_mcp_prompt_summary(&step_body);
+        let compact_step = json!({
+            "id": todo_id,
+            "plan_id": plan_id,
+            "planId": plan_id,
+            "todo_batch_id": plan_id,
+            "todoBatchId": plan_id,
+            "todo_id": todo_id,
+            "todoId": todo_id,
+            "dispatch_id": dispatch_id,
+            "dispatchId": dispatch_id,
+            "command_id": command_id,
+            "commandId": command_id,
+            "step_index": index as i64,
+            "stepIndex": index as i64,
+            "title": step_title,
+            "body_preview": body_preview,
+            "bodyPreview": body_preview,
+            "status": "listed",
+            "detail": step_detail,
+        });
+        compact_steps.push(compact_step.clone());
+
+        let plan_metadata = json!({
+            "id": plan_id,
+            "plan_id": plan_id,
+            "planId": plan_id,
+            "title": plan_title,
+            "source": "coordination-kernel.create_plan",
+            "todo_batch_id": plan_id,
+            "todoBatchId": plan_id,
+            "step_count": step_count,
+            "stepCount": step_count,
+            "todo_id": compact_steps
+                .first()
+                .and_then(|step| step.get("todo_id"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "todoId": compact_steps
+                .first()
+                .and_then(|step| step.get("todoId"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "todo_ids": todo_ids,
+            "todoIds": todo_ids,
+            "current_step_index": current_step_index,
+            "currentStepIndex": current_step_index,
+            "current_step_detail": current_step_detail,
+            "currentStepDetail": current_step_detail,
+            "steps": compact_steps.clone(),
+        });
+        let common = json!({
+            "repo_id": repo_id,
+            "repoId": repo_id,
+            "repo_path": repo_path,
+            "repoPath": repo_path,
+            "workspace_root": repo_path,
+            "workspaceRoot": repo_path,
+            "workspace_id": workspace_id,
+            "workspaceId": workspace_id,
+            "workspace_name": workspace_name,
+            "workspaceName": workspace_name,
+            "todo_batch_id": plan_id,
+            "todoBatchId": plan_id,
+            "batch_id": plan_id,
+            "batchId": plan_id,
+            "todo_id": todo_id,
+            "todoId": todo_id,
+            "id": todo_id,
+            "title": step_title,
+            "text": step_body,
+            "body": step_body,
+            "todo_text": step_body,
+            "todoText": step_body,
+            "todo_body_preview": body_preview,
+            "todoBodyPreview": body_preview,
+            "body_preview": body_preview,
+            "bodyPreview": body_preview,
+            "source": "coordination-kernel.create_plan",
+            "source_kind": "local-agent-create-plan",
+            "sourceKind": "local-agent-create-plan",
+            "created_at": now,
+            "createdAt": now,
+            "updated_at": now,
+            "updatedAt": now,
+            "todo_device_id": device_id,
+            "todoDeviceId": device_id,
+            "todo_workspace_id": workspace_id,
+            "todoWorkspaceId": workspace_id,
+            "device_id": device_id,
+            "deviceId": device_id,
+            "device_name": device_name,
+            "deviceName": device_name,
+            "requested_by_device_id": device_id,
+            "requestedByDeviceId": device_id,
+            "requested_by_workspace_id": workspace_id,
+            "requestedByWorkspaceId": workspace_id,
+            "agent_id": agent_id,
+            "agentId": agent_id,
+            "session_id": session_id,
+            "sessionId": session_id,
+            "plan_id": plan_id,
+            "planId": plan_id,
+            "plan_title": plan_title,
+            "planTitle": plan_title,
+            "plan_step_index": index as i64,
+            "planStepIndex": index as i64,
+            "plan_step_count": step_count,
+            "planStepCount": step_count,
+            "plan": plan_metadata,
+            "plan_task": plan_metadata,
+            "planTask": plan_metadata,
+            "local_only": false,
+            "localOnly": false,
+            "server_sync_queued": true,
+            "serverSyncQueued": true,
+        });
+
+        let mut todo_row = common.clone();
+        if let Some(object) = todo_row.as_object_mut() {
+            object.insert("mirror_row_kind".to_string(), json!("todo"));
+            object.insert("mirrorRowKind".to_string(), json!("todo"));
+            object.insert("kind".to_string(), json!("todo"));
+            object.insert("status".to_string(), json!("listed"));
+            object.insert("todo_status".to_string(), json!("listed"));
+            object.insert("todoStatus".to_string(), json!("listed"));
+        }
+        todo_rows.push(todo_row);
+
+        let mut dispatch_row = common;
+        if let Some(object) = dispatch_row.as_object_mut() {
+            object.insert("mirror_row_kind".to_string(), json!("dispatch"));
+            object.insert("mirrorRowKind".to_string(), json!("dispatch"));
+            object.insert("kind".to_string(), json!("todo_history"));
+            object.insert(
+                "event_kind".to_string(),
+                json!("workspace_todo_dispatch_requested"),
+            );
+            object.insert(
+                "eventKind".to_string(),
+                json!("workspace_todo_dispatch_requested"),
+            );
+            object.insert("dispatch_id".to_string(), json!(dispatch_id.as_str()));
+            object.insert("dispatchId".to_string(), json!(dispatch_id.as_str()));
+            object.insert(
+                "todo_dispatch_id".to_string(),
+                json!(dispatch_id.as_str()),
+            );
+            object.insert("todoDispatchId".to_string(), json!(dispatch_id.as_str()));
+            object.insert("command_id".to_string(), json!(command_id.as_str()));
+            object.insert("commandId".to_string(), json!(command_id.as_str()));
+            object.insert("dispatch_kind".to_string(), json!("local-listed"));
+            object.insert("dispatchKind".to_string(), json!("local-listed"));
+            object.insert("status".to_string(), json!("listed"));
+            object.insert("dispatch_status".to_string(), json!("listed"));
+            object.insert("dispatchStatus".to_string(), json!("listed"));
+            object.insert("target_device_id".to_string(), json!(device_id.as_str()));
+            object.insert("targetDeviceId".to_string(), json!(device_id.as_str()));
+            object.insert("target_device_name".to_string(), json!(device_name.as_str()));
+            object.insert("targetDeviceName".to_string(), json!(device_name.as_str()));
+            object.insert("target_workspace_id".to_string(), json!(workspace_id));
+            object.insert("targetWorkspaceId".to_string(), json!(workspace_id));
+            object.insert("target_workspace_name".to_string(), json!(workspace_name));
+            object.insert("targetWorkspaceName".to_string(), json!(workspace_name));
+            object.insert("target_agent_id".to_string(), json!(agent_id));
+            object.insert("targetAgentId".to_string(), json!(agent_id));
+        }
+        dispatch_rows.push(dispatch_row);
+    }
+
+    let primary_todo_id = todo_ids
+        .first()
+        .cloned()
+        .ok_or_else(|| "create_plan generated invalid todo plan without todo_id.".to_string())?;
+    let compact_plan = json!({
+        "id": plan_id,
+        "plan_id": plan_id,
+        "planId": plan_id,
+        "title": plan_title,
+        "source": "coordination-kernel.create_plan",
+        "todo_batch_id": plan_id,
+        "todoBatchId": plan_id,
+        "todo_id": primary_todo_id,
+        "todoId": primary_todo_id,
+        "primary_todo_id": primary_todo_id,
+        "primaryTodoId": primary_todo_id,
+        "todo_ids": todo_ids,
+        "todoIds": todo_ids,
+        "status": "listed",
+        "steps": compact_steps,
+        "step_count": step_count,
+        "stepCount": step_count,
+        "current_step_index": current_step_index,
+        "currentStepIndex": current_step_index,
+        "current_step_detail": current_step_detail,
+        "currentStepDetail": current_step_detail,
+    });
+
+    for row in todo_rows.iter_mut().chain(dispatch_rows.iter_mut()) {
+        if let Some(object) = row.as_object_mut() {
+            object.insert("plan".to_string(), compact_plan.clone());
+            object.insert("plan_task".to_string(), compact_plan.clone());
+            object.insert("planTask".to_string(), compact_plan.clone());
+        }
+    }
+
+    let rows = CloudMcpAgentCreatePlanTodoRows {
+        plan_id,
+        plan_title,
+        compact_plan,
+        todo_rows,
+        dispatch_rows,
+    };
+    cloud_mcp_validate_agent_create_plan_rows(&rows)?;
+    Ok(rows)
+}
+
+pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
+    repo_path: Option<&str>,
+    workspace_id: Option<&str>,
+    base_url_override: Option<&str>,
+    agent_id: Option<&str>,
+    session_id: Option<&str>,
+    input: &Value,
+) -> Result<Value, String> {
+    let repo_path_text = repo_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path_text
+        .as_deref()
+        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
+    let workspace_id = workspace_id
+        .or_else(|| input.get("workspace_id").and_then(Value::as_str))
+        .or_else(|| input.get("workspaceId").and_then(Value::as_str));
+    let workspace_name = input["workspace_name"]
+        .as_str()
+        .or_else(|| input["workspaceName"].as_str());
+    let base_url = base_url_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or_else(cloud_mcp_base_url);
+    let now_ms = cloud_mcp_now_ms();
+    let now = cloud_mcp_rfc3339_now();
+    let rows = cloud_mcp_agent_create_plan_todo_rows(
+        repo_id.as_deref(),
+        repo_path_text.as_deref(),
+        workspace_id,
+        workspace_name,
+        agent_id,
+        session_id,
+        input,
+        &cloud_mcp_desktop_device_profile(),
+        &now,
+    )?;
+    let sync = cloud_mcp_queue_agent_create_plan_todo_sync(&base_url, &rows)?;
+    let conn = cloud_mcp_open_todo_mirror_conn()?;
+    cloud_mcp_todo_mirror_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
+    cloud_mcp_todo_mirror_upsert_rows_into(
+        &conn,
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+        "coordination-kernel.create_plan",
+        Some(base_url.as_str()),
+        repo_id.as_deref(),
+        workspace_id,
+        &rows.todo_rows,
+        now_ms,
+    )?;
+    cloud_mcp_todo_mirror_upsert_rows_into(
+        &conn,
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+        "coordination-kernel.create_plan",
+        Some(base_url.as_str()),
+        repo_id.as_deref(),
+        workspace_id,
+        &rows.dispatch_rows,
+        now_ms,
+    )?;
+    cloud_mcp_todo_mirror_upsert_rows_into(
+        &conn,
+        CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+        "coordination-kernel.create_plan",
+        Some(base_url.as_str()),
+        repo_id.as_deref(),
+        workspace_id,
+        &rows.dispatch_rows,
+        now_ms,
+    )?;
+    let history_filter = json!({
+        "batch_id": rows.plan_id,
+        "limit": rows.dispatch_rows.len().max(1),
+    });
+    let history = cloud_mcp_todo_history_from_conn(
+        &conn,
+        repo_id.as_deref(),
+        workspace_id,
+        &history_filter,
+    );
+    let plan_id = rows.plan_id.clone();
+    let plan_title = rows.plan_title.clone();
+    let todo_count = rows.todo_rows.len();
+    let dispatch_count = rows.dispatch_rows.len();
+    let compact_plan = rows.compact_plan.clone();
+    let primary_todo_id = cloud_mcp_agent_create_plan_required_text(
+        &compact_plan,
+        &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
+        "todo_id",
+    )?;
+    let task_id_ignored = cloud_mcp_payload_text(input, &["task_id", "taskId"]).is_some();
+    Ok(json!({
+        "kind": "todo_plan",
+        "source": "local_todo_history",
+        "local_only": false,
+        "localOnly": false,
+        "server_sync_queued": true,
+        "serverSyncQueued": true,
+        "task_id_required": false,
+        "taskIdRequired": false,
+        "start_task_required": false,
+        "startTaskRequired": false,
+        "task_id_ignored": task_id_ignored,
+        "taskIdIgnored": task_id_ignored,
+        "plan_id": plan_id.clone(),
+        "planId": plan_id.clone(),
+        "todo_id": primary_todo_id,
+        "todoId": primary_todo_id,
+        "todo_ids": compact_plan["todo_ids"].clone(),
+        "todoIds": compact_plan["todoIds"].clone(),
+        "title": plan_title,
+        "todo_batch_id": plan_id.clone(),
+        "todoBatchId": plan_id,
+        "count": dispatch_count,
+        "todo_count": todo_count,
+        "todoCount": todo_count,
+        "dispatch_count": dispatch_count,
+        "dispatchCount": dispatch_count,
+        "todos": rows.todo_rows,
+        "dispatches": rows.dispatch_rows,
+        "compact_plan": compact_plan.clone(),
+        "compactPlan": compact_plan,
+        "history": history,
+        "sync": sync,
+        "stored_in": ["workspace_todo_mirror_rows", "workspace_todo_history_rows"],
+        "storedIn": ["workspace_todo_mirror_rows", "workspace_todo_history_rows"],
+    }))
 }
 
 fn cloud_mcp_todo_targets_empty_response(
@@ -18050,6 +19526,150 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn diffforge_credit_ledger_dedupes_entities_and_meters_transfer_bytes() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("diffforge-credit-ledger");
+        fs::create_dir_all(&root).unwrap();
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &root);
+        cloud_mcp_update_process_auth_cache(
+            None,
+            None,
+            None,
+            Some("personal".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        let rows = vec![
+            json!({
+                "kind": "workspace_todo",
+                "todo_id": "todo-1",
+                "plan_id": "plan-1",
+                "workspace_id": "workspace-a"
+            }),
+            json!({
+                "kind": "workspace_todo",
+                "todo_id": "todo-2",
+                "plan_id": "plan-1",
+                "workspace_id": "workspace-a"
+            }),
+            json!({
+                "kind": "workspace_todo_dispatch",
+                "dispatch_id": "dispatch-1",
+                "todo_id": "todo-1",
+                "plan_id": "plan-1",
+                "workspace_id": "workspace-a"
+            }),
+        ];
+        cloud_mcp_record_diffforge_todo_plan_credits_from_rows(
+            "coordination-kernel.create_plan",
+            Some("repo-1"),
+            Some("workspace-a"),
+            &rows,
+        );
+        cloud_mcp_record_diffforge_todo_plan_credits_from_rows(
+            "coordination-kernel.create_plan",
+            Some("repo-1"),
+            Some("workspace-a"),
+            &rows,
+        );
+
+        assert!(cloud_mcp_record_diffforge_task_credit(
+            Some("/repo"),
+            Some("workspace-a"),
+            "task-1",
+            "coordination-kernel.start_task",
+            json!({"task_id": "task-1"})
+        )
+        .unwrap());
+        assert!(!cloud_mcp_record_diffforge_task_credit(
+            Some("/repo"),
+            Some("workspace-a"),
+            "task-1",
+            "coordination-kernel.start_task",
+            json!({"task_id": "task-1"})
+        )
+        .unwrap());
+
+        assert_eq!(
+            cloud_mcp_record_diffforge_asset_transfer_credit(
+                "local_asset_transfer_progress",
+                Some("repo-1"),
+                Some("workspace-a"),
+                "asset-1",
+                "upload-1",
+                "upload",
+                600_000,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            cloud_mcp_record_diffforge_asset_transfer_credit(
+                "local_asset_transfer_progress",
+                Some("repo-1"),
+                Some("workspace-a"),
+                "asset-1",
+                "download-1",
+                "download",
+                500_000,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            cloud_mcp_record_diffforge_asset_transfer_credit(
+                "local_asset_transfer_progress",
+                Some("repo-1"),
+                Some("workspace-a"),
+                "asset-1",
+                "download-1",
+                "download",
+                500_000,
+            )
+            .unwrap(),
+            0
+        );
+
+        let summary = cloud_mcp_diffforge_credit_ledger_summary(20);
+        assert_eq!(summary["totalCredits"].as_i64(), Some(5));
+        assert_eq!(summary["transfer"]["totalBytes"].as_i64(), Some(1_100_000));
+        assert_eq!(summary["transfer"]["billedCredits"].as_i64(), Some(1));
+        assert_eq!(summary["transfer"]["remainderBytes"].as_i64(), Some(100_000));
+
+        let by_meter = summary["byMeter"].as_array().unwrap();
+        let meter_credits = |meter: &str| {
+            by_meter
+                .iter()
+                .find(|row| row["meter"].as_str() == Some(meter))
+                .and_then(|row| row["credits"].as_i64())
+                .unwrap_or(0)
+        };
+        assert_eq!(meter_credits("todo_created"), 2);
+        assert_eq!(meter_credits("plan_created"), 1);
+        assert_eq!(meter_credits("task_created"), 1);
+        assert_eq!(meter_credits("asset_transfer_mb"), 1);
+
+        let merged = cloud_mcp_merge_diffforge_credit_ledger(
+            json!({"credits": {"used_credits": 99}}),
+            summary.clone(),
+        );
+        assert_eq!(
+            merged["credits"]["localMeteredUsedCredits"].as_i64(),
+            Some(5)
+        );
+        assert_eq!(
+            merged["credits"]["usageHistory"].as_array().map(Vec::len),
+            summary["items"].as_array().map(Vec::len)
+        );
+        assert!(merged["billingHistory"].is_array());
+    }
+
+    #[test]
     fn generated_asset_promotion_copies_and_registers_local_asset() {
         let _guard = CLOUD_MCP_TEST_ENV_LOCK
             .get_or_init(|| StdMutex::new(()))
@@ -18118,6 +19738,19 @@ mod cloud_mcp_tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_upload_size_guard_allows_only_one_mib_slack() {
+        let expected = 4 * 1024 * 1024_i64;
+        let allowed = expected as u64 + CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES;
+
+        assert_eq!(cloud_mcp_asset_upload_exceeds_size_limit(allowed, expected), None);
+        assert_eq!(
+            cloud_mcp_asset_upload_exceeds_size_limit(allowed + 1, expected),
+            Some(allowed)
+        );
+        assert_eq!(cloud_mcp_asset_upload_exceeds_size_limit(allowed + 1, -1), None);
     }
 
     #[test]
@@ -18365,6 +19998,153 @@ mod cloud_mcp_tests {
             history["aggregate"]["status"].as_str(),
             Some("completed")
         );
+    }
+
+    #[test]
+    fn create_plan_rows_are_todo_backed_history_without_task() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let input = json!({
+            "task_id": "ignored-task-id",
+            "plan_id": "plan-1",
+            "title": "Ship local todo plans",
+            "steps": [
+                "Inspect current create_plan",
+                {
+                    "title": "Patch create_plan",
+                    "detail": "Write todo mirror and history rows instead of terminal todo plan rows."
+                }
+            ]
+        });
+        let rows = cloud_mcp_agent_create_plan_todo_rows(
+            Some("repo-1"),
+            Some("/repo"),
+            Some("workspace-a"),
+            Some("Workspace A"),
+            Some("agent-a"),
+            Some("session-a"),
+            &input,
+            &json!({"device_id": "device-a", "device_name": "Desktop A"}),
+            "2026-06-08T00:00:00Z",
+        )
+        .unwrap();
+
+        assert_eq!(rows.plan_id, "plan-1");
+        assert_eq!(rows.compact_plan["plan_id"].as_str(), Some("plan-1"));
+        assert_eq!(rows.compact_plan["todo_id"].as_str(), Some("plan-1-todo-1"));
+        assert_eq!(
+            rows.compact_plan["todo_ids"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(rows.todo_rows.len(), 2);
+        assert_eq!(rows.dispatch_rows.len(), 2);
+        assert!(cloud_mcp_validate_agent_create_plan_rows(&rows).is_ok());
+        assert!(rows.todo_rows.iter().all(|row| {
+            row["plan_id"].as_str() == Some("plan-1")
+                && row["todo_id"].as_str().is_some_and(|value| !value.is_empty())
+                && row["localOnly"].as_bool() == Some(false)
+                && row["serverSyncQueued"].as_bool() == Some(true)
+        }));
+        assert!(rows
+            .dispatch_rows
+            .iter()
+            .all(|row| row.get("task_id").is_none() && row.get("taskId").is_none()));
+        assert!(rows
+            .dispatch_rows
+            .iter()
+            .all(|row| row["dispatchStatus"].as_str() == Some("listed")));
+
+        let sync_payloads = cloud_mcp_agent_create_plan_sync_payloads(&rows).unwrap();
+        assert_eq!(
+            sync_payloads.snapshot["event_kind"].as_str(),
+            Some("workspace_todo_snapshot")
+        );
+        assert_eq!(sync_payloads.snapshot["plan_id"].as_str(), Some("plan-1"));
+        assert_eq!(
+            sync_payloads.snapshot["todo_id"].as_str(),
+            Some("plan-1-todo-1")
+        );
+        assert_eq!(
+            sync_payloads.snapshot["todos"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(sync_payloads.dispatches.len(), 2);
+        assert!(sync_payloads.dispatches.iter().all(|row| {
+            row["event_kind"].as_str() == Some("workspace_todo_dispatch_requested")
+                && row["source"].as_str() == Some("rust-diffforge-agent-create-plan")
+                && row["plan_id"].as_str() == Some("plan-1")
+                && row["todo_id"].as_str().is_some_and(|value| !value.is_empty())
+                && row["localOnly"].is_null()
+        }));
+
+        let mut invalid_rows = rows.clone();
+        invalid_rows.todo_rows[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("todo_id");
+        invalid_rows.todo_rows[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("todoId");
+        invalid_rows.todo_rows[0].as_object_mut().unwrap().remove("id");
+        assert!(cloud_mcp_validate_agent_create_plan_rows(&invalid_rows)
+            .unwrap_err()
+            .contains("todo_id"));
+
+        cloud_mcp_todo_mirror_upsert_rows_into(
+            &conn,
+            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+            "test-create-plan",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &rows.todo_rows,
+            1,
+        )
+        .unwrap();
+        cloud_mcp_todo_mirror_upsert_rows_into(
+            &conn,
+            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+            "test-create-plan",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &rows.dispatch_rows,
+            1,
+        )
+        .unwrap();
+        cloud_mcp_todo_mirror_upsert_rows_into(
+            &conn,
+            CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+            "test-create-plan",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &rows.dispatch_rows,
+            1,
+        )
+        .unwrap();
+
+        let history = cloud_mcp_todo_history_from_conn(
+            &conn,
+            Some("repo-1"),
+            Some("workspace-a"),
+            &json!({"batch_id": "plan-1"}),
+        );
+        assert_eq!(history["kind"].as_str(), Some("todo_history"));
+        assert_eq!(history["history_source"].as_str(), Some("sqlite_history"));
+        assert_eq!(history["count"].as_u64(), Some(2));
+        assert_eq!(history["aggregate"]["status"].as_str(), Some("listed"));
+        assert_eq!(
+            history["items"][0]["plan"]["steps"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let workspace_todos =
+            cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, Some("repo-1"), Some("workspace-a"))
+                .unwrap();
+        assert_eq!(workspace_todos["count"].as_u64(), Some(2));
+        assert_eq!(workspace_todos["dispatch_count"].as_u64(), Some(2));
     }
 
     #[tokio::test]
@@ -19916,12 +21696,6 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     let fail_workspace_id = workspace_id.clone();
     let fail_asset_id = asset_id.clone();
     let fail_transfer_id = transfer_id.clone();
-    let file = fs::File::open(local_path).map_err(|error| {
-        format!(
-            "Unable to open asset file {}: {error}",
-            local_path.display()
-        )
-    })?;
     let length = fs::metadata(local_path)
         .map_err(|error| {
             format!(
@@ -19930,6 +21704,35 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             )
         })?
         .len();
+    if let Some(max_allowed_bytes) = cloud_mcp_asset_upload_exceeds_size_limit(length, bytes_total)
+    {
+        let error = format!(
+            "Asset upload cancelled before transfer: file {} is {} bytes, exceeding declared size {} bytes plus {} bytes ({} bytes allowed).",
+            local_path.display(),
+            length,
+            bytes_total,
+            CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES,
+            max_allowed_bytes
+        );
+        let _ = cloud_mcp_asset_store_local_transfer_progress(
+            &fail_repo_id,
+            &fail_workspace_id,
+            &fail_asset_id,
+            &fail_transfer_id,
+            "upload",
+            "failed",
+            bytes_total,
+            0,
+            Some(&error),
+        );
+        return Err(error);
+    }
+    let file = fs::File::open(local_path).map_err(|error| {
+        format!(
+            "Unable to open asset file {}: {error}",
+            local_path.display()
+        )
+    })?;
     let mut progress = CloudMcpAssetTransferProgress::new(
         repo_id,
         workspace_id,
@@ -19994,7 +21797,29 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 .unwrap_or("upload failed")
         ));
     }
+    let completed_bytes = bytes_total.max(i64::try_from(length).unwrap_or(i64::MAX));
+    let _ = cloud_mcp_asset_store_local_transfer_progress(
+        &fail_repo_id,
+        &fail_workspace_id,
+        &fail_asset_id,
+        &fail_transfer_id,
+        "upload",
+        "completed",
+        completed_bytes,
+        completed_bytes,
+        None,
+    );
     Ok(upload_result)
+}
+
+fn cloud_mcp_asset_upload_size_limit(bytes_total: i64) -> Option<u64> {
+    let expected_bytes = u64::try_from(bytes_total).ok()?;
+    Some(expected_bytes.saturating_add(CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES))
+}
+
+fn cloud_mcp_asset_upload_exceeds_size_limit(actual_bytes: u64, bytes_total: i64) -> Option<u64> {
+    let max_allowed_bytes = cloud_mcp_asset_upload_size_limit(bytes_total)?;
+    (actual_bytes > max_allowed_bytes).then_some(max_allowed_bytes)
 }
 
 fn cloud_mcp_download_asset_streaming_blocking(
@@ -20743,7 +22568,7 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     worktree_path: Option<&str>,
     lane: Option<&str>,
     summary: &str,
-    terminal_task_plan: Option<&Value>,
+    terminal_todo_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = local_task_id
         .map(str::trim)
@@ -20809,8 +22634,8 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_todo_plan".to_string(), plan.clone());
     }
 
     let mut arguments = serde_json::Map::new();
@@ -20824,8 +22649,8 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     arguments.insert("summary".to_string(), json!(summary));
     arguments.insert("agent_status".to_string(), json!("active"));
     arguments.insert("metadata".to_string(), Value::Object(metadata));
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_todo_plan".to_string(), plan.clone());
     }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
@@ -20865,7 +22690,7 @@ pub(crate) fn cloud_mcp_forward_agent_checkpoint(
     cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_checkpoint")
 }
 
-pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
+pub(crate) fn cloud_mcp_forward_terminal_todo_plan_update(
     repo_path: Option<&str>,
     db_path: Option<&Path>,
     workspace_id: Option<&str>,
@@ -20875,14 +22700,14 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
     worktree_id: Option<&str>,
     worktree_path: Option<&str>,
     update_reason: &str,
-    terminal_task_plan: &Value,
+    terminal_todo_plan: &Value,
 ) -> Result<Value, String> {
     let active_task_id = local_task_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "terminal plan sync requires an active task_id.".to_string())?;
-    if terminal_task_plan.is_null() {
-        return Err("terminal plan sync requires a compact terminal_task_plan.".to_string());
+        .ok_or_else(|| "terminal todo plan sync requires an active task_id.".to_string())?;
+    if terminal_todo_plan.is_null() {
+        return Err("terminal todo plan sync requires a compact terminal_todo_plan.".to_string());
     }
     let repo_path_text = repo_path
         .map(str::trim)
@@ -20925,18 +22750,18 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
         agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
         client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
     };
-    let event_kind = "terminal_task_plan_updated";
+    let event_kind = "terminal_todo_plan_updated";
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "reported_by".to_string(),
-        json!("coordination-kernel.terminal_task_plan"),
+        json!("coordination-kernel.terminal_todo_plan"),
     );
     metadata.insert(
         "local_coordination_task_id".to_string(),
         json!(active_task_id),
     );
     metadata.insert("coordination_task_id".to_string(), json!(active_task_id));
-    metadata.insert("terminal_task_plan".to_string(), terminal_task_plan.clone());
+    metadata.insert("terminal_todo_plan".to_string(), terminal_todo_plan.clone());
     if let Some(worktree_id) = worktree_id {
         metadata.insert("worktree_id".to_string(), json!(worktree_id));
     }
@@ -20947,15 +22772,15 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
     let mut arguments = serde_json::Map::new();
     arguments.insert(
         "source".to_string(),
-        json!("rust-diffforge-terminal-task-plan"),
+        json!("rust-diffforge-terminal-todo-plan"),
     );
     arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
     arguments.insert("task_id".to_string(), json!(active_task_id));
     arguments.insert("run_id".to_string(), json!(active_task_id));
-    arguments.insert("summary".to_string(), json!("Terminal task plan updated."));
+    arguments.insert("summary".to_string(), json!("Terminal todo plan updated."));
     arguments.insert("update_reason".to_string(), json!(update_reason));
     arguments.insert("metadata".to_string(), Value::Object(metadata));
-    arguments.insert("terminal_task_plan".to_string(), terminal_task_plan.clone());
+    arguments.insert("terminal_todo_plan".to_string(), terminal_todo_plan.clone());
     if let Some(repo_id) = identity.repo_id.as_deref() {
         arguments.insert("repo_id".to_string(), json!(repo_id));
     }
@@ -20978,10 +22803,10 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
 
     let payload = Value::Object(arguments);
     identity.log(
-        "cloud_mcp.terminal_task_plan.queued",
+        "cloud_mcp.terminal_todo_plan.queued",
         event_kind,
         json!({
-            "activity": "terminal task plan queued for background Cloud history sync",
+            "activity": "terminal todo plan queued for background Cloud history sync",
             "baseUrl": base_url,
             "taskId": active_task_id,
             "reason": clean_terminal_telemetry_text(update_reason),
@@ -20991,7 +22816,7 @@ pub(crate) fn cloud_mcp_forward_terminal_task_plan_update(
         &base_url,
         event_kind,
         &payload,
-        "terminal_task_plan_update",
+        "terminal_todo_plan_update",
     )
 }
 
@@ -21202,7 +23027,7 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     summary: Option<&str>,
     local_task_status: Option<&str>,
     submit_result: &Value,
-    terminal_task_plan: Option<&Value>,
+    terminal_todo_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = task_id
         .map(str::trim)
@@ -21300,8 +23125,8 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     if let Some(worktree_path) = worktree_path {
         metadata.insert("worktree_path".to_string(), json!(worktree_path));
     }
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_todo_plan".to_string(), plan.clone());
     }
 
     let mut arguments = serde_json::Map::new();
@@ -21319,8 +23144,8 @@ pub(crate) fn cloud_mcp_forward_agent_submit_patch(
     arguments.insert("metadata".to_string(), Value::Object(metadata));
     arguments.insert("task_id".to_string(), json!(active_task_id));
     arguments.insert("run_id".to_string(), json!(active_task_id));
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_todo_plan".to_string(), plan.clone());
     }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));
@@ -21421,7 +23246,7 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     enforcement_mode: Option<&str>,
     completion_mode: Option<&str>,
     complete_result: &Value,
-    terminal_task_plan: Option<&Value>,
+    terminal_todo_plan: Option<&Value>,
 ) -> Result<Value, String> {
     let active_task_id = task_id
         .map(str::trim)
@@ -21503,8 +23328,8 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     metadata.insert("enforcementMode".to_string(), json!(enforcement_mode_text));
     metadata.insert("completion_mode".to_string(), json!(completion_mode_text));
     metadata.insert("completionMode".to_string(), json!(completion_mode_text));
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        metadata.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        metadata.insert("terminal_todo_plan".to_string(), plan.clone());
     }
 
     let mut arguments = serde_json::Map::new();
@@ -21525,8 +23350,8 @@ pub(crate) fn cloud_mcp_forward_agent_complete_task(
     arguments.insert("enforcement_mode".to_string(), json!(enforcement_mode_text));
     arguments.insert("completion_mode".to_string(), json!(completion_mode_text));
     arguments.insert("record_spec_activity".to_string(), json!(false));
-    if let Some(plan) = terminal_task_plan.filter(|value| !value.is_null()) {
-        arguments.insert("terminal_task_plan".to_string(), plan.clone());
+    if let Some(plan) = terminal_todo_plan.filter(|value| !value.is_null()) {
+        arguments.insert("terminal_todo_plan".to_string(), plan.clone());
     }
     if let Some(lane) = lane.map(str::trim).filter(|value| !value.is_empty()) {
         arguments.insert("lane".to_string(), json!(lane));

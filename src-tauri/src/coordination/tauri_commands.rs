@@ -630,7 +630,7 @@ pub fn coordination_get_snapshot(
 }
 
 #[tauri::command]
-pub fn coordination_terminal_task_plan_snapshot(
+pub fn coordination_terminal_todo_plan_snapshot(
     repo_path: Option<String>,
     db_path: Option<String>,
     input: Option<Value>,
@@ -659,14 +659,14 @@ pub fn coordination_terminal_task_plan_snapshot(
         let repo_path = coordination_input_root(repo_path)?;
         let db_path = clean_optional_path(db_path);
         let (kernel, _) = CoordinationKernel::open_for_terminal_launch(repo_path, db_path)?;
-        return result(kernel.terminal_task_plan_snapshot(task_id, session_id, agent_id));
+        return result(kernel.terminal_todo_plan_snapshot(task_id, session_id, agent_id));
     }
 
-    result(kernel(repo_path, db_path)?.terminal_task_plan_snapshot(task_id, session_id, agent_id))
+    result(kernel(repo_path, db_path)?.terminal_todo_plan_snapshot(task_id, session_id, agent_id))
 }
 
 #[tauri::command]
-pub fn coordination_terminal_task_plan_edit_step_title(
+pub fn coordination_terminal_todo_plan_edit_step_title(
     repo_path: Option<String>,
     db_path: Option<String>,
     input: Value,
@@ -692,10 +692,10 @@ pub fn coordination_terminal_task_plan_edit_step_title(
         .as_str()
         .or_else(|| input["sessionId"].as_str());
     let mut response =
-        kernel.edit_terminal_task_plan_step_title(task_id, step_index, title, agent_id)?;
+        kernel.edit_terminal_todo_plan_step_title(task_id, step_index, title, agent_id)?;
     let compact_plan = response["data"]["compact_plan"].clone();
     let cloud = if response["ok"].as_bool() != Some(false) && !compact_plan.is_null() {
-        match crate::cloud_mcp_forward_terminal_task_plan_update(
+        match crate::cloud_mcp_forward_terminal_todo_plan_update(
             Some(&kernel.paths.repo_path.display().to_string()),
             Some(&kernel.paths.db_path),
             input["workspace_id"]
@@ -726,7 +726,7 @@ pub fn coordination_terminal_task_plan_edit_step_title(
 }
 
 #[tauri::command]
-pub fn coordination_terminal_task_plan_finish(
+pub fn coordination_terminal_todo_plan_finish(
     repo_path: Option<String>,
     db_path: Option<String>,
     input: Value,
@@ -773,7 +773,7 @@ pub fn coordination_terminal_task_plan_finish(
         .as_str()
         .or_else(|| input["worktreePath"].as_str())
         .map(str::to_string);
-    let finished = kernel.finish_terminal_task_plan(
+    let finished = kernel.finish_terminal_todo_plan(
         &task_id,
         "completed",
         agent_id.as_deref(),
@@ -794,7 +794,7 @@ pub fn coordination_terminal_task_plan_finish(
         let cloud_worktree_id = worktree_id.clone();
         let cloud_worktree_path = worktree_path.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let _ = crate::cloud_mcp_forward_terminal_task_plan_update(
+            let _ = crate::cloud_mcp_forward_terminal_todo_plan_update(
                 Some(&repo_path),
                 Some(&db_path),
                 cloud_workspace_id.as_deref(),
@@ -803,7 +803,7 @@ pub fn coordination_terminal_task_plan_finish(
                 Some(&cloud_task_id),
                 cloud_worktree_id.as_deref(),
                 cloud_worktree_path.as_deref(),
-                "user_finished_terminal_task_plan",
+                "user_finished_terminal_todo_plan",
                 &compact_plan,
             );
         });

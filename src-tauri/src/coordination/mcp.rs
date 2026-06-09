@@ -3189,7 +3189,7 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
     apply_context_defaults(context, &mut input);
     if matches!(
         tool,
-        "create_plan" | "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
+        "acquire_lease" | "checkpoint" | "complete_task" | "submit_patch"
     ) && !explicit_task_id
     {
         if let Some(object) = input.as_object_mut() {
@@ -3852,71 +3852,19 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
 }
 
 fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
-    if input["__explicit_task_id_missing"].as_bool() == Some(true) {
-        return Ok(api_error(
-            "task_id_required_after_start_task",
-            "create_plan requires the task_id returned by start_task.",
-            json!({}),
-        ));
-    }
-    let task_id = req(input, "task_id")?;
-    let agent_id = req(input, "agent_id")?;
-    let session_id = req(input, "session_id")?;
-    if !mcp_start_task_seen_for_task(kernel, task_id, session_id)? {
-        return Ok(api_error(
-            "start_task_required_before_create_plan",
-            "Call start_task for this session and pass its returned task_id before creating a terminal plan.",
-            json!({"task_id": task_id, "session_id": session_id}),
-        ));
-    }
-    let steps = input.get("steps").unwrap_or(&Value::Null);
-    let current_step_index = input["current_step_index"]
-        .as_i64()
-        .or_else(|| input["currentStepIndex"].as_i64());
-    let current_step_detail = input["current_step_detail"]
+    let repo_path_fallback = kernel.paths.repo_path.to_string_lossy().to_string();
+    let repo_path = input["repo_path"]
         .as_str()
-        .or_else(|| input["currentStepDetail"].as_str())
-        .or_else(|| input["detail"].as_str());
-    let title = input["title"]
-        .as_str()
-        .or_else(|| input["plan_title"].as_str());
-    let created = kernel.create_terminal_task_plan(
-        task_id,
-        Some(agent_id),
-        Some(session_id),
-        title,
-        steps,
-        current_step_index,
-        current_step_detail,
+        .unwrap_or(repo_path_fallback.as_str());
+    let created = crate::cloud_mcp_record_agent_create_plan_todos(
+        Some(repo_path),
+        input["workspace_id"].as_str(),
+        input["cloud_mcp_base_url"].as_str(),
+        input["agent_id"].as_str(),
+        input["session_id"].as_str(),
+        input,
     )?;
-    if created["ok"].as_bool() == Some(false) {
-        return Ok(created);
-    }
-    let compact_plan = created["data"]["compact_plan"].clone();
-    let cloud = if value_has_content(&compact_plan) {
-        match crate::cloud_mcp_forward_terminal_task_plan_update(
-            input["repo_path"].as_str(),
-            input["db_path"].as_str().map(PathBuf::from).as_deref(),
-            input["workspace_id"].as_str(),
-            Some(agent_id),
-            Some(session_id),
-            Some(task_id),
-            input["worktree_id"].as_str(),
-            input["worktree_path"].as_str(),
-            "created",
-            &compact_plan,
-        ) {
-            Ok(response) => json!({"ok": true, "response": response}),
-            Err(error) => json!({"ok": false, "error": error}),
-        }
-    } else {
-        json!({"ok": false, "reason": "empty_compact_plan"})
-    };
-    let mut response = created;
-    if let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) {
-        data.insert("cloud".to_string(), cloud);
-    }
-    Ok(response)
+    Ok(api_ok(created))
 }
 
 fn start_task_brief_for_agent(brief: &Value) -> Value {
@@ -4002,7 +3950,7 @@ fn cloud_current_work_for_agent(current_work: &Value) -> Value {
             "suggested_lane",
             "summary",
             "claimed_paths",
-            "terminal_task_plan",
+            "terminal_todo_plan",
             "local_task_id",
             "prompt_summary",
         ],
@@ -4019,7 +3967,7 @@ fn cloud_peer_work_for_agent(peer: &Value) -> Value {
             "lane",
             "progress",
             "claimed_paths",
-            "terminal_task_plan",
+            "terminal_todo_plan",
             "local_task_id",
             "last_seen_at",
         ],
@@ -4712,7 +4660,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         }),
     )?;
     let terminal_plan_update =
-        kernel.checkpoint_terminal_task_plan(task_id, agent_id, session_id, input)?;
+        kernel.checkpoint_terminal_todo_plan(task_id, agent_id, session_id, input)?;
     let terminal_plan_compact = terminal_plan_update.as_ref().and_then(|value| {
         value
             .get("compact_plan")
@@ -4791,7 +4739,7 @@ fn kernel_complete_task(kernel: &CoordinationKernel, input: &Value) -> Result<Va
         .as_str()
         .or(status)
         .or(Some("done"));
-    let terminal_plan_update = kernel.finish_terminal_task_plan(
+    let terminal_plan_update = kernel.finish_terminal_todo_plan(
         task_id,
         completed_status.unwrap_or("done"),
         Some(agent_id),
@@ -4983,7 +4931,7 @@ fn run_submit_patch_job_worker(
         .and_then(|rows| rows.into_iter().next())
         .unwrap_or_else(|| json!({}));
     let terminal_plan_update = kernel
-        .finish_terminal_task_plan(&task_id, "completed", Some(&agent_id), Some(&session_id))
+        .finish_terminal_todo_plan(&task_id, "completed", Some(&agent_id), Some(&session_id))
         .unwrap_or_else(|error| {
             Some(json!({
                 "ok": false,
@@ -5323,7 +5271,7 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion, then preserves its lifecycle to Cloud history in the background.".to_string(),
-        "create_plan" => "Create or replace the structured terminal task plan after start_task. Pass the task_id returned by start_task and concise step titles; future or blocked step titles are user-editable in the Plans tab.".to_string(),
+        "create_plan" => "Create a todo-backed plan without start_task or task_id. Rust assigns a stable plan_id and todo_id-backed steps, writes local todo history immediately, and queues background Cloud sync.".to_string(),
         "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
@@ -5344,7 +5292,7 @@ fn tool_description(name: &str) -> String {
         "delete_local_asset" => "Delete this device's local asset file/copy and clear the active local path in the Rust SQLite mirror while preserving the Cloud copy for download later.".to_string(),
         "delete_cloud_asset" => "Delete the Cloud durable copy/reference for an asset, including backing blob storage when no active cloud references remain, while keeping any local file path recorded in the Rust SQLite mirror so it can be uploaded again.".to_string(),
         "acquire_lease" => "Acquire a lease for a task that was explicitly started in this session. You must pass the task_id returned by start_task; implicit session defaults are rejected.".to_string(),
-        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
+        "checkpoint" => "Send one short summary only while an active started task exists. You may also advance or revise the terminal todo plan with current/next/completed step fields, step title/detail fields, or step_updates. You must pass the task_id returned by start_task; read-only file inspection should not create checkpoints.".to_string(),
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
@@ -5378,21 +5326,23 @@ fn tool_input_schema(name: &str) -> Value {
         "create_plan" => json!({
             "type": "object",
             "properties": {
-                "task_id": {"type": "string", "description": "Required task_id returned by start_task."},
+                "plan_id": {"type": "string", "description": "Optional stable plan/todo batch id. Rust generates one when omitted."},
                 "title": {"type": "string", "description": "Optional short plan title."},
                 "steps": {
                     "type": "array",
-                    "description": "Ordered plan steps. Step titles are capped to 96 characters.",
+                    "description": "Ordered plan steps. Each step is recorded as a listed todo in the same todo batch and queued for background Cloud sync. Rust generates todo_id values when omitted.",
                     "items": {
                         "oneOf": [
                             {"type": "string"},
                             {
                                 "type": "object",
                                 "properties": {
+                                    "todo_id": {"type": "string", "description": "Optional stable todo id for this plan step. Rust generates one when omitted."},
                                     "title": {"type": "string"},
-                                    "detail": {"type": "string", "description": "Optional detail for the current or completed step only."}
+                                    "text": {"type": "string"},
+                                    "body": {"type": "string"},
+                                    "detail": {"type": "string", "description": "Optional todo detail stored with the step metadata."}
                                 },
-                                "required": ["title"],
                                 "additionalProperties": true
                             }
                         ]
@@ -5400,10 +5350,10 @@ fn tool_input_schema(name: &str) -> Value {
                     "minItems": 1,
                     "maxItems": 24
                 },
-                "current_step_index": {"type": "integer", "description": "Optional zero-based current step index.", "default": 0},
-                "current_step_detail": {"type": "string", "description": "Optional detail for the current step."}
+                "current_step_index": {"type": "integer", "description": "Optional zero-based current step index stored as plan metadata.", "default": 0},
+                "current_step_detail": {"type": "string", "description": "Optional detail stored as plan metadata."}
             },
-            "required": ["task_id", "steps"],
+            "required": ["steps"],
             "additionalProperties": true
         }),
         "architecture_context" => json!({
@@ -5661,7 +5611,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "next_step_title": {"type": "string", "description": "Optional title revision for the current/next step touched by this checkpoint."},
                 "next_step_detail": {"type": "string", "description": "Optional detail to attach to the next/current step when it begins."},
                 "step_updates": {"type": "array", "description": "Optional step title/detail/status revisions. Each item may include step_index, title, detail, and status."},
-                "plan_status": {"type": "string", "description": "Optional terminal plan status: active, completed, interrupted, or blocked."}
+                "plan_status": {"type": "string", "description": "Optional terminal todo plan status: active, completed, interrupted, or blocked."}
             },
             "required": ["task_id", "summary"],
             "additionalProperties": true
@@ -5732,6 +5682,27 @@ mod tests {
         assert!(!start_task_plan_is_direct_architecture_graph_work(
             "Run architecture target Deploy and update src/deploy.ts."
         ));
+    }
+
+    #[test]
+    fn create_plan_schema_is_todo_backed_without_task_id() {
+        let description = tool_description("create_plan");
+        assert!(description.contains("without start_task or task_id"));
+        assert!(description.contains("todo history"));
+        assert!(description.contains("background Cloud sync"));
+
+        let schema = tool_input_schema("create_plan");
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|value| value.as_str() == Some("steps")));
+        assert!(!required
+            .iter()
+            .any(|value| value.as_str() == Some("task_id")));
+        assert!(schema["properties"]["task_id"].is_null());
+        assert!(schema["properties"]["plan_id"].is_object());
+        assert!(schema["properties"]["steps"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("todo_id"));
     }
 
     #[test]

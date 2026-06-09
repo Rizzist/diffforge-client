@@ -18,5 +18,8 @@ export function terminalPromptSubmittedPayloadIsAuthoritative(payload = {}) {
     ).trim().length > 0;
   }
 
-  return promptSource === "parked_resume_backend_submit";
+  return (
+    promptSource === "parked_resume_backend_submit"
+    || promptSource === "crash_todo_resume_backend_submit"
+  );
 }

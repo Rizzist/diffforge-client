@@ -180,7 +180,7 @@ const TERMINAL_BREAKOUT_RESIZE_HANDLES = Object.freeze([
   { edgeX: -1, edgeY: 1, id: "sw", label: "Resize terminal from bottom left" },
   { edgeX: -1, edgeY: 0, id: "w", label: "Resize terminal from left" },
 ]);
-const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-task-plan-updated";
+const TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT = "forge-terminal-todo-plan-updated";
 const TERMINAL_BREAKOUT_PLAN_CACHE_LIMIT = 80;
 const TERMINAL_BREAKOUT_PLAN_CACHE_FRESH_MS = 5000;
 const TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS = 1100;
@@ -5974,7 +5974,7 @@ function requestTerminalBreakoutPlanSnapshot(target) {
     command.dbPath = dbPath;
   }
 
-  const request = invoke("coordination_terminal_task_plan_snapshot", command)
+  const request = invoke("coordination_terminal_todo_plan_snapshot", command)
     .then(terminalBreakoutPlanData)
     .then((snapshot) => {
       cacheTerminalBreakoutPlanSnapshot(cacheKey, snapshot);
@@ -23138,7 +23138,7 @@ function TerminalView({
             >
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalBreakoutPlan && (
                 <TerminalBreakoutPlanPanel
-                  aria-label={`Live terminal plan: ${breakoutPlanTitle}`}
+                  aria-label={`Live terminal todo plan: ${breakoutPlanTitle}`}
                   data-terminal-control="true"
                 >
                   <TerminalBreakoutPlanHeader>

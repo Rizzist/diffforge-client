@@ -726,8 +726,8 @@ function architectureTodoPlanEntries(item, relatedTasks = []) {
   };
 
   [
-    item?.terminal_task_plan,
-    item?.terminalTaskPlan,
+    item?.terminal_todo_plan,
+    item?.terminalTodoPlan,
     item?.terminalPlan,
     item?.terminal_plan,
     item?.plan,
@@ -810,10 +810,10 @@ function taskStatus(task) {
 
 function taskTerminalPlan(task) {
   const metadata = jsonObject(task?.metadata_json || task?.metadata);
-  return jsonObject(task?.terminal_task_plan)
-    || jsonObject(task?.terminalTaskPlan)
-    || jsonObject(metadata?.terminal_task_plan)
-    || jsonObject(metadata?.terminalTaskPlan);
+  return jsonObject(task?.terminal_todo_plan)
+    || jsonObject(task?.terminalTodoPlan)
+    || jsonObject(metadata?.terminal_todo_plan)
+    || jsonObject(metadata?.terminalTodoPlan);
 }
 
 function taskPlanTaskId(task, fallback = "") {
@@ -828,7 +828,7 @@ function taskPlanTaskId(task, fallback = "") {
   );
 }
 
-function completedTerminalTaskPlan(plan) {
+function completedTerminalTodoPlan(plan) {
   if (!plan) return null;
   const steps = jsonArray(plan.steps).map((step, index) => {
     if (typeof step === "string") {
@@ -854,11 +854,11 @@ function completedTerminalTaskPlan(plan) {
 
 function taskWithCompletedTerminalPlan(task) {
   const terminalPlan = taskTerminalPlan(task);
-  const completedPlan = completedTerminalTaskPlan(terminalPlan);
+  const completedPlan = completedTerminalTodoPlan(terminalPlan);
   if (!completedPlan) return task;
   return {
     ...task,
-    terminal_task_plan: completedPlan,
+    terminal_todo_plan: completedPlan,
   };
 }
 
@@ -5229,7 +5229,7 @@ export default function ArchitectureWorkspaceView({
     });
   }, [repoPath, activeWorkspaceId, activeWorkspaceName]);
 
-  const finishTerminalTaskPlan = useCallback((item) => {
+  const finishTerminalTodoPlan = useCallback((item) => {
     const task = item?.task || null;
     const terminalPlan = taskTerminalPlan(task);
     const taskId = text(
@@ -5242,7 +5242,7 @@ export default function ArchitectureWorkspaceView({
     if (!taskId || !repoPath) return;
 
     setFinishPlanState({ error: "", taskId });
-    invoke("coordination_terminal_task_plan_finish", {
+    invoke("coordination_terminal_todo_plan_finish", {
       repoPath,
       input: {
         agent_id: terminalPlan?.agent_id || terminalPlan?.agentId || task?.agent_id || task?.agentId || taskAgentLabel(task),
@@ -5254,7 +5254,7 @@ export default function ArchitectureWorkspaceView({
     })
       .then((response) => {
         if (response?.data?.plan_finished === false) {
-          throw new Error("No terminal plan was found to finish.");
+          throw new Error("No terminal todo plan was found to finish.");
         }
         setFinishedPlanTaskIds((current) => {
           const next = new Set(current);
@@ -5273,7 +5273,7 @@ export default function ArchitectureWorkspaceView({
       })
       .catch((error) => {
         setFinishPlanState({
-          error: error?.message || String(error || "Unable to finish terminal plan."),
+          error: error?.message || String(error || "Unable to finish terminal todo plan."),
           taskId: "",
         });
       });
@@ -5346,7 +5346,7 @@ export default function ArchitectureWorkspaceView({
         <HistoryTimeline
           finishPlanError={finishPlanState.error}
           finishingPlanTaskId={finishPlanState.taskId}
-          onFinishPlan={finishTerminalTaskPlan}
+          onFinishPlan={finishTerminalTodoPlan}
           tasks={visibleTasks}
           repoLabel={repoLabel}
         />
@@ -9081,7 +9081,7 @@ function TaskDetailPanel({
       {terminalPlan && (
         <TaskPlanCard>
           <TaskPlanHeader>
-            <span>Terminal plan</span>
+            <span>Terminal todo plan</span>
             <strong>{text(terminalPlan.title, title)}</strong>
           </TaskPlanHeader>
           {planDetail && <TaskPlanDescription>{planDetail}</TaskPlanDescription>}

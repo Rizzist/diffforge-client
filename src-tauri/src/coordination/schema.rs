@@ -33,8 +33,8 @@ pub const WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_agent_config_access";
 pub const WORKTREE_TASK_BINDING_MIGRATION_VERSION: i64 = 15;
 pub const WORKTREE_TASK_BINDING_MIGRATION_NAME: &str = "coordination_kernel_worktree_task_binding";
-pub const TERMINAL_TASK_PLAN_MIGRATION_VERSION: i64 = 16;
-pub const TERMINAL_TASK_PLAN_MIGRATION_NAME: &str = "coordination_kernel_terminal_task_plans";
+pub const TERMINAL_TODO_PLAN_MIGRATION_VERSION: i64 = 16;
+pub const TERMINAL_TODO_PLAN_MIGRATION_NAME: &str = "coordination_kernel_terminal_todo_plans";
 pub const TASK_SOURCE_TODO_REFS_MIGRATION_VERSION: i64 = 17;
 pub const TASK_SOURCE_TODO_REFS_MIGRATION_NAME: &str = "coordination_kernel_task_source_todo_refs";
 pub const WORKSPACE_MCP_SECRETS_MIGRATION_VERSION: i64 = 18;
@@ -42,6 +42,8 @@ pub const WORKSPACE_MCP_SECRETS_MIGRATION_NAME: &str = "coordination_kernel_work
 pub const WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION: i64 = 19;
 pub const WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_exposure_mode";
+pub const CRASH_TODO_RESUME_MIGRATION_VERSION: i64 = 20;
+pub const CRASH_TODO_RESUME_MIGRATION_NAME: &str = "coordination_kernel_crash_todo_resume";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -96,6 +98,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions(
   context_role TEXT,
   pty_id TEXT,
   terminal_launch_epoch TEXT,
+  provider_session_id TEXT,
   worktree_id TEXT,
   sandbox_db_id TEXT,
   base_git_sha TEXT,
@@ -132,6 +135,35 @@ CREATE TABLE IF NOT EXISTS tasks(
   finished_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS terminal_crash_todo_resumes(
+  id TEXT PRIMARY KEY,
+  old_task_id TEXT NOT NULL UNIQUE,
+  todo_id TEXT NOT NULL,
+  todo_dispatch_id TEXT,
+  source_prompt_event_id TEXT,
+  source_command_id TEXT,
+  provider_session_id TEXT NOT NULL,
+  old_session_id TEXT NOT NULL,
+  old_agent_id TEXT,
+  old_agent_kind TEXT,
+  old_agent_slot_id TEXT,
+  old_slot_key TEXT,
+  old_pty_id TEXT,
+  task_title TEXT,
+  task_body TEXT,
+  status TEXT NOT NULL,
+  resume_session_id TEXT,
+  resume_prompt_event_id TEXT,
+  resume_dispatch_id TEXT,
+  resume_command_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  claimed_at TEXT,
+  dispatched_at TEXT,
+  skipped_at TEXT,
+  error_message TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies(
@@ -767,6 +799,7 @@ CREATE TABLE IF NOT EXISTS cloud_sync_jobs(
 
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_status ON agent_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_slot_status ON agent_sessions(agent_slot_id, status);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_provider_session ON agent_sessions(provider_session_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_one_active_slot
 ON agent_sessions(agent_slot_id)
 WHERE status='active' AND agent_slot_id IS NOT NULL;
@@ -788,6 +821,10 @@ CREATE INDEX IF NOT EXISTS idx_leases_active_resource ON leases(resource_id, sta
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_workspace_changes_task ON workspace_changes(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_crash_todo_resumes_provider
+ON terminal_crash_todo_resumes(provider_session_id, status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_crash_todo_resumes_todo
+ON terminal_crash_todo_resumes(todo_id, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workspace_changes_session ON workspace_changes(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_workspace_changes_resource ON workspace_changes(resource_key, created_at);
 CREATE INDEX IF NOT EXISTS idx_file_watchers_status ON file_watchers(status, updated_at);
@@ -846,7 +883,7 @@ CREATE INDEX IF NOT EXISTS idx_dependency_edges_prerequisite ON dependency_edges
 CREATE INDEX IF NOT EXISTS idx_dependency_edges_predicate ON dependency_edges(predicate_kind, status);
 "#;
 
-pub const TERMINAL_TASK_PLAN_SCHEMA_SQL: &str = r#"
+pub const TERMINAL_TODO_PLAN_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS terminal_task_plans(
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL UNIQUE,

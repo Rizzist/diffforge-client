@@ -77,8 +77,7 @@ const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
 const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
 const WORKSPACE_MCP_EXPOSURE_HIDDEN: &str = "hidden";
 const WORKTREE_DIFF_UNTRACKED_MAX_BYTES: u64 = 1_000_000;
-pub const TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS: usize = 96;
-const TERMINAL_TASK_PLAN_MAX_STEPS: usize = 24;
+pub const TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS: usize = 96;
 
 #[derive(Clone)]
 struct SessionSlotOptions {
@@ -139,7 +138,7 @@ fn now_epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn compact_terminal_task_plan_text(value: &str, max_chars: usize) -> String {
+fn compact_terminal_todo_plan_text(value: &str, max_chars: usize) -> String {
     let text = value
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -149,7 +148,7 @@ fn compact_terminal_task_plan_text(value: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-fn normalize_terminal_task_plan_status(status: &str) -> String {
+fn normalize_terminal_todo_plan_status(status: &str) -> String {
     match status.trim().to_ascii_lowercase().as_str() {
         "done" | "complete" | "completed" | "finished" | "success" => "completed".to_string(),
         "interrupt" | "interrupted" | "cancelled" | "canceled" | "stopped" => {
@@ -163,7 +162,7 @@ fn normalize_terminal_task_plan_status(status: &str) -> String {
     }
 }
 
-fn normalize_terminal_task_plan_step_status(status: &str) -> String {
+fn normalize_terminal_todo_plan_step_status(status: &str) -> String {
     match status.trim().to_ascii_lowercase().as_str() {
         "done" | "complete" | "completed" | "finished" | "success" => "completed".to_string(),
         "active" | "running" | "current" | "in_progress" | "in-progress" | "working" => {
@@ -176,25 +175,25 @@ fn normalize_terminal_task_plan_step_status(status: &str) -> String {
     }
 }
 
-fn terminal_task_plan_step_user_editable(status: &str) -> bool {
+fn terminal_todo_plan_step_user_editable(status: &str) -> bool {
     matches!(
-        normalize_terminal_task_plan_step_status(status).as_str(),
+        normalize_terminal_todo_plan_step_status(status).as_str(),
         "queued" | "blocked"
     )
 }
 
-fn terminal_task_plan_is_terminal_status(status: &str) -> bool {
+fn terminal_todo_plan_is_terminal_status(status: &str) -> bool {
     matches!(
-        normalize_terminal_task_plan_status(status).as_str(),
+        normalize_terminal_todo_plan_status(status).as_str(),
         "completed" | "interrupted"
     )
 }
 
-fn terminal_task_plan_can_resume(status: &str) -> bool {
-    normalize_terminal_task_plan_status(status) != "completed"
+fn terminal_todo_plan_can_resume(status: &str) -> bool {
+    normalize_terminal_todo_plan_status(status) != "completed"
 }
 
-fn terminal_task_plan_step_title_from_value(value: &Value) -> Option<String> {
+fn terminal_todo_plan_step_title_from_value(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::to_string)
@@ -209,12 +208,12 @@ fn terminal_task_plan_step_title_from_value(value: &Value) -> Option<String> {
                 .map(str::to_string)
         })
         .map(|value| {
-            compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS)
+            compact_terminal_todo_plan_text(&value, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS)
         })
         .filter(|value| !value.is_empty())
 }
 
-fn terminal_task_plan_step_detail_from_value(value: &Value) -> Option<String> {
+fn terminal_todo_plan_step_detail_from_value(value: &Value) -> Option<String> {
     value
         .as_object()
         .and_then(|object| {
@@ -228,19 +227,19 @@ fn terminal_task_plan_step_detail_from_value(value: &Value) -> Option<String> {
             .iter()
             .find_map(|key| object.get(*key).and_then(Value::as_str))
         })
-        .map(|value| compact_terminal_task_plan_text(value, 2000))
+        .map(|value| compact_terminal_todo_plan_text(value, 2000))
         .filter(|value| !value.is_empty())
 }
 
 #[derive(Clone, Debug)]
-struct TerminalTaskPlanStepUpdate {
+struct TerminalTodoPlanStepUpdate {
     step_index: i64,
     title: Option<String>,
     detail: Option<String>,
     status: Option<String>,
 }
 
-fn terminal_task_plan_step_update_values(input: &Value) -> Vec<&Value> {
+fn terminal_todo_plan_step_update_values(input: &Value) -> Vec<&Value> {
     [
         "step_updates",
         "stepUpdates",
@@ -256,7 +255,7 @@ fn terminal_task_plan_step_update_values(input: &Value) -> Vec<&Value> {
     .unwrap_or_default()
 }
 
-fn terminal_task_plan_step_index_from_value(value: &Value, fallback: i64) -> i64 {
+fn terminal_todo_plan_step_index_from_value(value: &Value, fallback: i64) -> i64 {
     optional_i64_field(
         value,
         &[
@@ -274,19 +273,19 @@ fn terminal_task_plan_step_index_from_value(value: &Value, fallback: i64) -> i64
     .unwrap_or(fallback)
 }
 
-fn terminal_task_plan_step_updates_from_input(
+fn terminal_todo_plan_step_updates_from_input(
     input: &Value,
     max_index: i64,
-) -> Vec<TerminalTaskPlanStepUpdate> {
-    terminal_task_plan_step_update_values(input)
+) -> Vec<TerminalTodoPlanStepUpdate> {
+    terminal_todo_plan_step_update_values(input)
         .into_iter()
         .enumerate()
         .filter_map(|(position, value)| {
-            let step_index = terminal_task_plan_step_index_from_value(value, position as i64)
+            let step_index = terminal_todo_plan_step_index_from_value(value, position as i64)
                 .max(0)
                 .min(max_index);
-            let title = terminal_task_plan_step_title_from_value(value);
-            let detail = terminal_task_plan_step_detail_from_value(value);
+            let title = terminal_todo_plan_step_title_from_value(value);
+            let detail = terminal_todo_plan_step_detail_from_value(value);
             let status = string_from_value_keys(
                 value,
                 &[
@@ -297,9 +296,9 @@ fn terminal_task_plan_step_updates_from_input(
                     "planStepStatus",
                 ],
             )
-            .map(|value| normalize_terminal_task_plan_step_status(&value));
+            .map(|value| normalize_terminal_todo_plan_step_status(&value));
             (title.is_some() || detail.is_some() || status.is_some()).then_some(
-                TerminalTaskPlanStepUpdate {
+                TerminalTodoPlanStepUpdate {
                     step_index,
                     title,
                     detail,
@@ -310,7 +309,7 @@ fn terminal_task_plan_step_updates_from_input(
         .collect()
 }
 
-fn terminal_task_plan_step_updates_payload(updates: &[TerminalTaskPlanStepUpdate]) -> Value {
+fn terminal_todo_plan_step_updates_payload(updates: &[TerminalTodoPlanStepUpdate]) -> Value {
     Value::Array(
         updates
             .iter()
@@ -4829,181 +4828,7 @@ impl CoordinationKernel {
         Ok(json!({"posted": true}))
     }
 
-    pub fn create_terminal_task_plan(
-        &self,
-        task_id: &str,
-        agent_id: Option<&str>,
-        session_id: Option<&str>,
-        title: Option<&str>,
-        steps: &Value,
-        current_step_index: Option<i64>,
-        current_step_detail: Option<&str>,
-    ) -> Result<Value, String> {
-        let task_id = task_id.trim();
-        if task_id.is_empty() {
-            return Err("Terminal task plan requires a task_id.".to_string());
-        }
-        let task = self.query_one(
-            "SELECT id, title, status, claimed_by_agent_id, claimed_session_id FROM tasks WHERE id=?1",
-            &[&task_id],
-            "Task does not exist for terminal task plan.",
-        )?;
-        let step_values = steps
-            .as_array()
-            .ok_or_else(|| "create_plan requires steps as an array.".to_string())?;
-        if step_values.is_empty() {
-            return Err("create_plan requires at least one step.".to_string());
-        }
-        if step_values.len() > TERMINAL_TASK_PLAN_MAX_STEPS {
-            return Err(format!(
-                "create_plan supports at most {TERMINAL_TASK_PLAN_MAX_STEPS} steps."
-            ));
-        }
-        let current_index = current_step_index
-            .unwrap_or(0)
-            .max(0)
-            .min((step_values.len().saturating_sub(1)) as i64);
-        let plan_id = self
-            .query_json(
-                "SELECT id FROM terminal_task_plans WHERE task_id=?1 LIMIT 1",
-                &[&task_id],
-            )?
-            .into_iter()
-            .next()
-            .and_then(|row| row["id"].as_str().map(str::to_string))
-            .unwrap_or_else(uuid);
-        let now = now_rfc3339();
-        let plan_title = title
-            .map(|value| compact_terminal_task_plan_text(value, 140))
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                task["title"]
-                    .as_str()
-                    .map(|value| compact_terminal_task_plan_text(value, 140))
-                    .filter(|value| !value.is_empty())
-            });
-        let actor_id = agent_id
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(REPO_ID);
-        let result = (|| {
-            self.begin_immediate_transaction("create terminal task plan")?;
-            self.conn
-                .execute(
-                    "INSERT INTO terminal_task_plans(
-                        id, task_id, agent_id, session_id, title, status, current_step_index,
-                        revision, created_at, updated_at
-                     ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, ?7, ?7)
-                     ON CONFLICT(task_id) DO UPDATE SET
-                        agent_id=COALESCE(excluded.agent_id, terminal_task_plans.agent_id),
-                        session_id=COALESCE(excluded.session_id, terminal_task_plans.session_id),
-                        title=COALESCE(excluded.title, terminal_task_plans.title),
-                        status='active',
-                        current_step_index=excluded.current_step_index,
-                        revision=terminal_task_plans.revision + 1,
-                        updated_at=excluded.updated_at,
-                        completed_at=NULL,
-                        interrupted_at=NULL",
-                    params![
-                        &plan_id,
-                        &task_id,
-                        agent_id,
-                        session_id,
-                        plan_title.as_deref(),
-                        current_index,
-                        &now,
-                    ],
-                )
-                .map_err(|error| format!("Unable to upsert terminal task plan: {error}"))?;
-            self.conn
-                .execute(
-                    "DELETE FROM terminal_task_plan_steps WHERE plan_id=?1",
-                    params![&plan_id],
-                )
-                .map_err(|error| format!("Unable to replace terminal task plan steps: {error}"))?;
-
-            let current_step_detail = current_step_detail
-                .map(|value| compact_terminal_task_plan_text(value, 2000))
-                .filter(|value| !value.is_empty());
-            for (index, step) in step_values.iter().enumerate() {
-                let title = terminal_task_plan_step_title_from_value(step)
-                    .ok_or_else(|| format!("Plan step {} requires a title.", index + 1))?;
-                let step_index = index as i64;
-                let status = if step_index < current_index {
-                    "completed"
-                } else if step_index == current_index {
-                    "in_progress"
-                } else {
-                    "queued"
-                };
-                let detail = if step_index == current_index {
-                    current_step_detail
-                        .clone()
-                        .or_else(|| terminal_task_plan_step_detail_from_value(step))
-                } else if step_index < current_index {
-                    terminal_task_plan_step_detail_from_value(step)
-                } else {
-                    None
-                };
-                self.conn
-                    .execute(
-                        "INSERT INTO terminal_task_plan_steps(
-                            id, plan_id, task_id, step_index, title, detail, status, source,
-                            revision, started_at, completed_at, created_at, updated_at
-                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'agent', 1, ?8, ?9, ?10, ?10)",
-                        params![
-                            uuid(),
-                            &plan_id,
-                            &task_id,
-                            step_index,
-                            &title,
-                            detail.as_deref(),
-                            status,
-                            if status == "in_progress" || status == "completed" {
-                                Some(now.as_str())
-                            } else {
-                                None
-                            },
-                            if status == "completed" {
-                                Some(now.as_str())
-                            } else {
-                                None
-                            },
-                            &now,
-                        ],
-                    )
-                    .map_err(|error| {
-                        format!("Unable to insert terminal task plan step: {error}")
-                    })?;
-            }
-
-            let event_id = self.emit_event(
-                "terminal_task_plan_created",
-                "agent",
-                actor_id,
-                EventRefs {
-                    task_id: Some(task_id.to_string()),
-                    agent_id: agent_id.map(str::to_string),
-                    session_id: session_id.map(str::to_string),
-                    ..EventRefs::default()
-                },
-                json!({
-                    "plan_id": plan_id,
-                    "step_count": step_values.len(),
-                    "current_step_index": current_index,
-                    "source": "coordination-kernel.create_plan",
-                }),
-            )?;
-            let plan = self.terminal_task_plan_view_by_task_id(task_id)?;
-            Ok(json!({
-                "event_id": event_id,
-                "plan": plan,
-                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
-            }))
-        })();
-        self.finish_transaction(result, "create terminal task plan")
-    }
-
-    pub fn checkpoint_terminal_task_plan(
+    pub fn checkpoint_terminal_todo_plan(
         &self,
         task_id: &str,
         agent_id: Option<&str>,
@@ -5011,7 +4836,7 @@ impl CoordinationKernel {
         input: &Value,
     ) -> Result<Option<Value>, String> {
         let task_id = task_id.trim();
-        if task_id.is_empty() || self.terminal_task_plan_id_for_task(task_id)?.is_none() {
+        if task_id.is_empty() || self.terminal_todo_plan_id_for_task(task_id)?.is_none() {
             return Ok(None);
         }
         let requested_current = optional_i64_field(
@@ -5045,7 +4870,7 @@ impl CoordinationKernel {
                 "planStepDetail",
             ],
         )
-        .map(|value| compact_terminal_task_plan_text(&value, 2000))
+        .map(|value| compact_terminal_todo_plan_text(&value, 2000))
         .filter(|value| !value.is_empty());
         let next_title = string_from_value_keys(
             input,
@@ -5061,7 +4886,7 @@ impl CoordinationKernel {
             ],
         )
         .map(|value| {
-            compact_terminal_task_plan_text(&value, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS)
+            compact_terminal_todo_plan_text(&value, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS)
         })
         .filter(|value| !value.is_empty());
         let step_status = string_from_value_keys(
@@ -5073,7 +4898,7 @@ impl CoordinationKernel {
                 "stepStatus",
             ],
         )
-        .map(|value| normalize_terminal_task_plan_step_status(&value));
+        .map(|value| normalize_terminal_todo_plan_step_status(&value));
         let plan_status = string_from_value_keys(
             input,
             &[
@@ -5083,8 +4908,8 @@ impl CoordinationKernel {
                 "terminalPlanStatus",
             ],
         )
-        .map(|value| normalize_terminal_task_plan_status(&value));
-        let has_step_updates = !terminal_task_plan_step_update_values(input).is_empty();
+        .map(|value| normalize_terminal_todo_plan_status(&value));
+        let has_step_updates = !terminal_todo_plan_step_update_values(input).is_empty();
 
         if requested_current.is_none()
             && completed_index.is_none()
@@ -5097,7 +4922,7 @@ impl CoordinationKernel {
             return Ok(None);
         }
 
-        let plan = self.terminal_task_plan_view_by_task_id(task_id)?;
+        let plan = self.terminal_todo_plan_view_by_task_id(task_id)?;
         let steps_len = plan["steps"].as_array().map(Vec::len).unwrap_or(0);
         if steps_len == 0 {
             return Ok(None);
@@ -5109,14 +4934,14 @@ impl CoordinationKernel {
             .unwrap_or(current_before)
             .max(0)
             .min(max_index);
-        let step_updates = terminal_task_plan_step_updates_from_input(input, max_index);
-        let step_updates_payload = terminal_task_plan_step_updates_payload(&step_updates);
+        let step_updates = terminal_todo_plan_step_updates_from_input(input, max_index);
+        let step_updates_payload = terminal_todo_plan_step_updates_payload(&step_updates);
         let now = now_rfc3339();
         let actor_id = agent_id
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(REPO_ID);
         let result = (|| {
-            self.begin_immediate_transaction("checkpoint terminal task plan")?;
+            self.begin_immediate_transaction("checkpoint terminal todo plan")?;
             if let Some(completed_index) = completed_index {
                 let completed_index = completed_index.max(0).min(max_index);
                 self.conn
@@ -5128,7 +4953,7 @@ impl CoordinationKernel {
                         params![&now, &task_id, completed_index],
                     )
                     .map_err(|error| {
-                        format!("Unable to mark terminal task plan step complete: {error}")
+                        format!("Unable to mark terminal todo plan step complete: {error}")
                     })?;
             }
 
@@ -5145,7 +4970,7 @@ impl CoordinationKernel {
                     params![&now, &task_id, next_index],
                 )
                 .map_err(|error| {
-                    format!("Unable to advance terminal task plan completed steps: {error}")
+                    format!("Unable to advance terminal todo plan completed steps: {error}")
                 })?;
             self.conn
                 .execute(
@@ -5168,7 +4993,7 @@ impl CoordinationKernel {
                     ],
                 )
                 .map_err(|error| {
-                    format!("Unable to update terminal task plan current step: {error}")
+                    format!("Unable to update terminal todo plan current step: {error}")
                 })?;
             self.conn
                 .execute(
@@ -5178,7 +5003,7 @@ impl CoordinationKernel {
                     params![&now, &task_id, next_index],
                 )
                 .map_err(|error| {
-                    format!("Unable to update terminal task plan queued steps: {error}")
+                    format!("Unable to update terminal todo plan queued steps: {error}")
                 })?;
             for update in &step_updates {
                 self.conn
@@ -5210,7 +5035,7 @@ impl CoordinationKernel {
                         ],
                     )
                     .map_err(|error| {
-                        format!("Unable to apply terminal task plan checkpoint step update: {error}")
+                        format!("Unable to apply terminal todo plan checkpoint step update: {error}")
                     })?;
             }
 
@@ -5247,10 +5072,10 @@ impl CoordinationKernel {
                         &task_id,
                     ],
                 )
-                .map_err(|error| format!("Unable to update terminal task plan: {error}"))?;
+                .map_err(|error| format!("Unable to update terminal todo plan: {error}"))?;
 
             let event_id = self.emit_event(
-                "terminal_task_plan_checkpoint",
+                "terminal_todo_plan_checkpoint",
                 "agent",
                 actor_id,
                 EventRefs {
@@ -5270,15 +5095,15 @@ impl CoordinationKernel {
             )?;
             Ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
             }))
         })();
-        self.finish_transaction(result, "checkpoint terminal task plan")
+        self.finish_transaction(result, "checkpoint terminal todo plan")
             .map(Some)
     }
 
-    pub fn edit_terminal_task_plan_step_title(
+    pub fn edit_terminal_todo_plan_step_title(
         &self,
         task_id: &str,
         step_index: i64,
@@ -5289,7 +5114,7 @@ impl CoordinationKernel {
         if task_id.is_empty() {
             return Err("Plan step edit requires task_id.".to_string());
         }
-        let title = compact_terminal_task_plan_text(title, TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS);
+        let title = compact_terminal_todo_plan_text(title, TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS);
         if title.is_empty() {
             return Err("Plan step title cannot be empty.".to_string());
         }
@@ -5299,10 +5124,10 @@ impl CoordinationKernel {
             "Plan step does not exist.",
         )?;
         let status = step["status"].as_str().unwrap_or_default();
-        if !terminal_task_plan_step_user_editable(status) {
+        if !terminal_todo_plan_step_user_editable(status) {
             return Ok(api_error(
-                "terminal_plan_step_not_editable",
-                "Only queued, pending, or blocked terminal plan step titles can be edited.",
+                "terminal_todo_plan_step_not_editable",
+                "Only queued, pending, or blocked terminal todo plan step titles can be edited.",
                 json!({"task_id": task_id, "step_index": step_index, "status": status}),
             ));
         }
@@ -5311,7 +5136,7 @@ impl CoordinationKernel {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("user");
         let result = (|| {
-            self.begin_immediate_transaction("edit terminal task plan step")?;
+            self.begin_immediate_transaction("edit terminal todo plan step")?;
             self.conn
                 .execute(
                     "UPDATE terminal_task_plan_steps
@@ -5319,7 +5144,7 @@ impl CoordinationKernel {
                      WHERE task_id=?3 AND step_index=?4",
                     params![&title, &now, &task_id, step_index],
                 )
-                .map_err(|error| format!("Unable to edit terminal task plan step: {error}"))?;
+                .map_err(|error| format!("Unable to edit terminal todo plan step: {error}"))?;
             self.conn
                 .execute(
                     "UPDATE terminal_task_plans
@@ -5328,10 +5153,10 @@ impl CoordinationKernel {
                     params![&now, &task_id],
                 )
                 .map_err(|error| {
-                    format!("Unable to update terminal task plan revision: {error}")
+                    format!("Unable to update terminal todo plan revision: {error}")
                 })?;
             let event_id = self.emit_event(
-                "terminal_task_plan_step_title_edited",
+                "terminal_todo_plan_step_title_edited",
                 "user",
                 actor_id,
                 EventRefs {
@@ -5341,20 +5166,20 @@ impl CoordinationKernel {
                 json!({
                     "step_index": step_index,
                     "title": title,
-                    "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+                    "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
                     "source": "terminal-plans-ui",
                 }),
             )?;
             Ok(api_ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
             })))
         })();
-        self.finish_transaction(result, "edit terminal task plan step")
+        self.finish_transaction(result, "edit terminal todo plan step")
     }
 
-    pub fn finish_terminal_task_plan(
+    pub fn finish_terminal_todo_plan(
         &self,
         task_id: &str,
         status: &str,
@@ -5362,13 +5187,13 @@ impl CoordinationKernel {
         session_id: Option<&str>,
     ) -> Result<Option<Value>, String> {
         let task_id = task_id.trim();
-        let plan_status = normalize_terminal_task_plan_status(status);
+        let plan_status = normalize_terminal_todo_plan_status(status);
         if task_id.is_empty()
             || !matches!(
                 plan_status.as_str(),
                 "completed" | "interrupted" | "blocked"
             )
-            || self.terminal_task_plan_id_for_task(task_id)?.is_none()
+            || self.terminal_todo_plan_id_for_task(task_id)?.is_none()
         {
             return Ok(None);
         }
@@ -5377,7 +5202,7 @@ impl CoordinationKernel {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(REPO_ID);
         let result = (|| {
-            self.begin_immediate_transaction("finish terminal task plan")?;
+            self.begin_immediate_transaction("finish terminal todo plan")?;
             if plan_status == "completed" {
                 self.conn
                     .execute(
@@ -5388,7 +5213,7 @@ impl CoordinationKernel {
                         params![&now, &task_id],
                     )
                     .map_err(|error| {
-                        format!("Unable to complete terminal task plan steps: {error}")
+                        format!("Unable to complete terminal todo plan steps: {error}")
                     })?;
             }
             self.conn
@@ -5405,9 +5230,9 @@ impl CoordinationKernel {
                      WHERE task_id=?2",
                     params![&plan_status, &task_id, &now],
                 )
-                .map_err(|error| format!("Unable to finish terminal task plan: {error}"))?;
+                .map_err(|error| format!("Unable to finish terminal todo plan: {error}"))?;
             let event_id = self.emit_event(
-                "terminal_task_plan_finished",
+                "terminal_todo_plan_finished",
                 "agent",
                 actor_id,
                 EventRefs {
@@ -5423,15 +5248,15 @@ impl CoordinationKernel {
             )?;
             Ok(json!({
                 "event_id": event_id,
-                "plan": self.terminal_task_plan_view_by_task_id(task_id)?,
-                "compact_plan": self.terminal_task_plan_compact(task_id)?.unwrap_or(Value::Null),
+                "plan": self.terminal_todo_plan_view_by_task_id(task_id)?,
+                "compact_plan": self.terminal_todo_plan_compact(task_id)?.unwrap_or(Value::Null),
             }))
         })();
-        self.finish_transaction(result, "finish terminal task plan")
+        self.finish_transaction(result, "finish terminal todo plan")
             .map(Some)
     }
 
-    pub fn terminal_task_plan_snapshot(
+    pub fn terminal_todo_plan_snapshot(
         &self,
         task_id: Option<&str>,
         session_id: Option<&str>,
@@ -5440,7 +5265,7 @@ impl CoordinationKernel {
         let task_target = task_id.map(str::trim).filter(|value| !value.is_empty());
         let session_target = session_id.map(str::trim).filter(|value| !value.is_empty());
         let selected_plan_from_target = if let Some(task_id) = task_target {
-            self.terminal_task_plan_view_by_task_id(task_id).ok()
+            self.terminal_todo_plan_view_by_task_id(task_id).ok()
         } else if let Some(session_id) = session_target {
             self.query_json(
                 "SELECT task_id FROM terminal_task_plans
@@ -5451,14 +5276,14 @@ impl CoordinationKernel {
             .into_iter()
             .next()
             .and_then(|row| row["task_id"].as_str().map(str::to_string))
-            .and_then(|task_id| self.terminal_task_plan_view_by_task_id(&task_id).ok())
+            .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(&task_id).ok())
         } else {
             None
         };
         let lineage_history_rows = if task_target.is_none() {
             session_target
                 .map(|session_id| {
-                    self.terminal_task_plan_history_rows_for_session_lineage(session_id)
+                    self.terminal_todo_plan_history_rows_for_session_lineage(session_id)
                 })
                 .transpose()?
                 .unwrap_or_default()
@@ -5506,12 +5331,12 @@ impl CoordinationKernel {
             history_rows
                 .first()
                 .and_then(|row| row["task_id"].as_str())
-                .and_then(|task_id| self.terminal_task_plan_view_by_task_id(task_id).ok())
+                .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(task_id).ok())
         } else {
             let fallback_task_id = history_rows
                 .iter()
                 .find(|row| {
-                    !terminal_task_plan_is_terminal_status(
+                    !terminal_todo_plan_is_terminal_status(
                         row["status"].as_str().unwrap_or_default(),
                     )
                 })
@@ -5520,7 +5345,7 @@ impl CoordinationKernel {
                 .map(str::to_string);
             fallback_task_id
                 .as_deref()
-                .and_then(|task_id| self.terminal_task_plan_view_by_task_id(task_id).ok())
+                .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(task_id).ok())
                 .or(selected_plan_from_target)
         };
         let history = history_rows
@@ -5538,7 +5363,7 @@ impl CoordinationKernel {
                     "session_id": row["session_id"].clone(),
                     "agent_id": row["agent_id"].clone(),
                     "updated_at": row["updated_at"].clone(),
-                    "can_resume": terminal_task_plan_can_resume(row["status"].as_str().unwrap_or_default()),
+                    "can_resume": terminal_todo_plan_can_resume(row["status"].as_str().unwrap_or_default()),
                 })
             })
             .collect::<Vec<_>>();
@@ -5546,11 +5371,11 @@ impl CoordinationKernel {
             "selected_plan": selected_plan,
             "history": history,
             "history_scope": history_scope,
-            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+            "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
         })))
     }
 
-    fn terminal_task_plan_history_rows_for_session_lineage(
+    fn terminal_todo_plan_history_rows_for_session_lineage(
         &self,
         session_id: &str,
     ) -> Result<Vec<Value>, String> {
@@ -5617,8 +5442,8 @@ impl CoordinationKernel {
         Ok(Vec::new())
     }
 
-    pub fn terminal_task_plan_compact(&self, task_id: &str) -> Result<Option<Value>, String> {
-        let plan = match self.terminal_task_plan_view_by_task_id(task_id) {
+    pub fn terminal_todo_plan_compact(&self, task_id: &str) -> Result<Option<Value>, String> {
+        let plan = match self.terminal_todo_plan_view_by_task_id(task_id) {
             Ok(plan) => plan,
             Err(_) => return Ok(None),
         };
@@ -5637,7 +5462,7 @@ impl CoordinationKernel {
             })
             .collect::<Vec<_>>();
         Ok(Some(json!({
-            "kind": "terminal_task_plan",
+            "kind": "terminal_todo_plan",
             "version": 1,
             "plan_id": plan["plan_id"].clone(),
             "task_id": plan["task_id"].clone(),
@@ -5652,7 +5477,7 @@ impl CoordinationKernel {
         })))
     }
 
-    pub fn terminal_task_plan_event_snapshot(
+    pub fn terminal_todo_plan_event_snapshot(
         &self,
         task_id: Option<&str>,
         session_id: Option<&str>,
@@ -5661,7 +5486,7 @@ impl CoordinationKernel {
         let selected_plan = if let Some(task_id) =
             task_id.map(str::trim).filter(|value| !value.is_empty())
         {
-            self.terminal_task_plan_view_by_task_id(task_id).ok()
+            self.terminal_todo_plan_view_by_task_id(task_id).ok()
         } else if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty())
         {
             self.query_json(
@@ -5673,7 +5498,7 @@ impl CoordinationKernel {
             .into_iter()
             .next()
             .and_then(|row| row["task_id"].as_str().map(str::to_string))
-            .and_then(|task_id| self.terminal_task_plan_view_by_task_id(&task_id).ok())
+            .and_then(|task_id| self.terminal_todo_plan_view_by_task_id(&task_id).ok())
         } else {
             None
         };
@@ -5693,7 +5518,7 @@ impl CoordinationKernel {
                     "session_id": plan["session_id"].clone(),
                     "agent_id": plan["agent_id"].clone(),
                     "updated_at": plan["updated_at"].clone(),
-                    "can_resume": terminal_task_plan_can_resume(plan["status"].as_str().unwrap_or_default()),
+                    "can_resume": terminal_todo_plan_can_resume(plan["status"].as_str().unwrap_or_default()),
                 })]
             })
             .unwrap_or_default();
@@ -5701,11 +5526,11 @@ impl CoordinationKernel {
         Ok(api_ok(json!({
             "selected_plan": selected_plan,
             "history": history,
-            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+            "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
         })))
     }
 
-    fn terminal_task_plan_id_for_task(&self, task_id: &str) -> Result<Option<String>, String> {
+    fn terminal_todo_plan_id_for_task(&self, task_id: &str) -> Result<Option<String>, String> {
         Ok(self
             .query_json(
                 "SELECT id FROM terminal_task_plans WHERE task_id=?1 LIMIT 1",
@@ -5716,14 +5541,14 @@ impl CoordinationKernel {
             .and_then(|row| row["id"].as_str().map(str::to_string)))
     }
 
-    fn terminal_task_plan_view_by_task_id(&self, task_id: &str) -> Result<Value, String> {
+    fn terminal_todo_plan_view_by_task_id(&self, task_id: &str) -> Result<Value, String> {
         let plan = self.query_one(
             "SELECT p.*, t.title AS task_title, t.status AS task_status
              FROM terminal_task_plans p
              LEFT JOIN tasks t ON t.id=p.task_id
              WHERE p.task_id=?1",
             &[&task_id],
-            "Terminal task plan does not exist.",
+            "Terminal todo plan does not exist.",
         )?;
         let plan_id = plan["id"].as_str().unwrap_or_default().to_string();
         let steps = self.query_json(
@@ -5748,7 +5573,7 @@ impl CoordinationKernel {
                 "completed_at": step["completed_at"].clone(),
                 "created_at": step["created_at"].clone(),
                 "updated_at": step["updated_at"].clone(),
-                "editable": terminal_task_plan_step_user_editable(step["status"].as_str().unwrap_or_default()),
+                "editable": terminal_todo_plan_step_user_editable(step["status"].as_str().unwrap_or_default()),
             })
         })
         .collect::<Vec<_>>();
@@ -5768,7 +5593,7 @@ impl CoordinationKernel {
             "completed_at": plan["completed_at"].clone(),
             "interrupted_at": plan["interrupted_at"].clone(),
             "steps": steps,
-            "title_max_chars": TERMINAL_TASK_PLAN_STEP_TITLE_MAX_CHARS,
+            "title_max_chars": TERMINAL_TODO_PLAN_STEP_TITLE_MAX_CHARS,
         }))
     }
 
@@ -7120,13 +6945,248 @@ impl CoordinationKernel {
         }))
     }
 
+    pub fn record_session_provider_session_id(
+        &self,
+        session_id: &str,
+        provider_session_id: &str,
+    ) -> Result<bool, String> {
+        let session_id = session_id.trim();
+        let provider_session_id = provider_session_id.trim();
+        if session_id.is_empty() || provider_session_id.is_empty() {
+            return Ok(false);
+        }
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE agent_sessions
+                 SET provider_session_id=?1, updated_at=?2
+                 WHERE id=?3
+                   AND COALESCE(provider_session_id, '') != ?1",
+                params![provider_session_id, now_rfc3339(), session_id],
+            )
+            .map_err(|error| format!("Unable to record terminal provider session id: {error}"))?;
+        Ok(updated > 0)
+    }
+
+    fn remember_crashed_todo_resume_candidate(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        session: &Value,
+    ) -> Result<Value, String> {
+        let Some(todo_id) = session["source_todo_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(json!({
+                "ok": false,
+                "reason": "missing_source_todo_id",
+            }));
+        };
+        let Some(provider_session_id) = session["provider_session_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(json!({
+                "ok": false,
+                "reason": "missing_provider_session_id",
+            }));
+        };
+
+        let now = now_rfc3339();
+        let candidate_id = format!("crash-resume-{}", sha256_hex(task_id.as_bytes()));
+        let resume_seed = format!("{task_id}:{todo_id}:{provider_session_id}:crash-resume");
+        let resume_hash = sha256_hex(resume_seed.as_bytes())
+            .chars()
+            .take(16)
+            .collect::<String>();
+        let resume_dispatch_id = format!("crash-resume-dispatch-{resume_hash}");
+        let resume_command_id = format!("crash-resume-command-{resume_hash}");
+        self.conn
+            .execute(
+                "INSERT INTO terminal_crash_todo_resumes(
+                    id, old_task_id, todo_id, todo_dispatch_id, source_prompt_event_id,
+                    source_command_id, provider_session_id, old_session_id, old_agent_id,
+                    old_agent_kind, old_agent_slot_id, old_slot_key, old_pty_id, task_title,
+                    task_body, status, resume_dispatch_id, resume_command_id, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'pending', ?16, ?17, ?18, ?18)
+                 ON CONFLICT(old_task_id) DO UPDATE SET
+                    todo_id=excluded.todo_id,
+                    todo_dispatch_id=COALESCE(excluded.todo_dispatch_id, terminal_crash_todo_resumes.todo_dispatch_id),
+                    source_prompt_event_id=COALESCE(excluded.source_prompt_event_id, terminal_crash_todo_resumes.source_prompt_event_id),
+                    source_command_id=COALESCE(excluded.source_command_id, terminal_crash_todo_resumes.source_command_id),
+                    provider_session_id=excluded.provider_session_id,
+                    old_session_id=excluded.old_session_id,
+                    old_agent_id=COALESCE(excluded.old_agent_id, terminal_crash_todo_resumes.old_agent_id),
+                    old_agent_kind=COALESCE(excluded.old_agent_kind, terminal_crash_todo_resumes.old_agent_kind),
+                    old_agent_slot_id=COALESCE(excluded.old_agent_slot_id, terminal_crash_todo_resumes.old_agent_slot_id),
+                    old_slot_key=COALESCE(excluded.old_slot_key, terminal_crash_todo_resumes.old_slot_key),
+                    old_pty_id=COALESCE(excluded.old_pty_id, terminal_crash_todo_resumes.old_pty_id),
+                    task_title=COALESCE(excluded.task_title, terminal_crash_todo_resumes.task_title),
+                    task_body=COALESCE(excluded.task_body, terminal_crash_todo_resumes.task_body),
+                    resume_dispatch_id=COALESCE(terminal_crash_todo_resumes.resume_dispatch_id, excluded.resume_dispatch_id),
+                    resume_command_id=COALESCE(terminal_crash_todo_resumes.resume_command_id, excluded.resume_command_id),
+                    updated_at=excluded.updated_at
+                 WHERE terminal_crash_todo_resumes.status='pending'",
+                params![
+                    candidate_id,
+                    task_id,
+                    todo_id,
+                    session["source_todo_dispatch_id"].as_str(),
+                    session["source_prompt_event_id"].as_str(),
+                    session["source_command_id"].as_str(),
+                    provider_session_id,
+                    session_id,
+                    session["agent_id"].as_str(),
+                    session["agent_kind"].as_str(),
+                    session["agent_slot_id"].as_str(),
+                    session["slot_key"].as_str(),
+                    session["pty_id"].as_str(),
+                    session["task_title"].as_str(),
+                    session["task_body"].as_str(),
+                    resume_dispatch_id,
+                    resume_command_id,
+                    now
+                ],
+            )
+            .map_err(|error| format!("Unable to remember crashed todo resume candidate: {error}"))?;
+
+        Ok(json!({
+            "ok": true,
+            "id": candidate_id,
+            "todoId": todo_id,
+            "oldTaskId": task_id,
+            "oldSessionId": session_id,
+            "providerSessionId": provider_session_id,
+            "resumeDispatchId": resume_dispatch_id,
+            "resumeCommandId": resume_command_id,
+            "status": "pending",
+        }))
+    }
+
+    pub fn claim_crashed_todo_resume_for_provider_session(
+        &self,
+        resume_session_id: &str,
+        provider_session_id: &str,
+        pty_id: Option<&str>,
+        agent_kind: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        let resume_session_id = resume_session_id.trim();
+        let provider_session_id = provider_session_id.trim();
+        if resume_session_id.is_empty() || provider_session_id.is_empty() {
+            return Ok(None);
+        }
+        let pty_id = pty_id.map(str::trim).filter(|value| !value.is_empty());
+        let agent_kind = agent_kind.map(str::trim).filter(|value| !value.is_empty());
+        let candidates = self.query_json(
+            "SELECT *
+             FROM terminal_crash_todo_resumes
+             WHERE status='pending'
+               AND provider_session_id=?1
+               AND (?2 IS NULL OR old_pty_id IS NULL OR old_pty_id='' OR old_pty_id=?2)
+               AND (?3 IS NULL OR old_agent_kind IS NULL OR old_agent_kind='' OR old_agent_kind=?3)
+             ORDER BY updated_at ASC
+             LIMIT 1",
+            &[&provider_session_id, &pty_id, &agent_kind],
+        )?;
+        let Some(candidate) = candidates.first().cloned() else {
+            return Ok(None);
+        };
+        let Some(candidate_id) = candidate["id"].as_str() else {
+            return Ok(None);
+        };
+        let now = now_rfc3339();
+        let resume_prompt_event_id = format!("crash-resume-prompt-{}", Uuid::new_v4());
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE terminal_crash_todo_resumes
+                 SET status='claimed',
+                     resume_session_id=?1,
+                     resume_prompt_event_id=?2,
+                     claimed_at=?3,
+                     updated_at=?3
+                 WHERE id=?4
+                   AND status='pending'",
+                params![resume_session_id, resume_prompt_event_id, now, candidate_id],
+            )
+            .map_err(|error| format!("Unable to claim crashed todo resume: {error}"))?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        let mut candidate = candidate;
+        if let Some(object) = candidate.as_object_mut() {
+            object.insert("status".to_string(), json!("claimed"));
+            object.insert("resume_session_id".to_string(), json!(resume_session_id));
+            object.insert(
+                "resume_prompt_event_id".to_string(),
+                json!(resume_prompt_event_id),
+            );
+            object.insert("claimed_at".to_string(), json!(now));
+        }
+        Ok(Some(candidate))
+    }
+
+    pub fn finish_crashed_todo_resume(
+        &self,
+        candidate_id: &str,
+        status: &str,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        let candidate_id = candidate_id.trim();
+        if candidate_id.is_empty() {
+            return Ok(false);
+        }
+        let status = match status.trim() {
+            "dispatched" => "dispatched",
+            "skipped" => "skipped",
+            "failed" => "failed",
+            _ => "failed",
+        };
+        let now = now_rfc3339();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE terminal_crash_todo_resumes
+                 SET status=?1,
+                     updated_at=?2,
+                     dispatched_at=CASE WHEN ?1='dispatched' THEN ?2 ELSE dispatched_at END,
+                     skipped_at=CASE WHEN ?1 IN ('skipped', 'failed') THEN ?2 ELSE skipped_at END,
+                     error_message=?3
+                 WHERE id=?4
+                   AND status='claimed'",
+                params![status, now, error_message, candidate_id],
+            )
+            .map_err(|error| format!("Unable to finish crashed todo resume: {error}"))?;
+        Ok(updated > 0)
+    }
+
     pub fn recover_crashed_terminal_sessions(&self) -> Result<Value, String> {
+        let rearmed_crash_resume_candidates = self
+            .conn
+            .execute(
+                "UPDATE terminal_crash_todo_resumes
+                 SET status='pending',
+                     resume_session_id=NULL,
+                     resume_prompt_event_id=NULL,
+                     claimed_at=NULL,
+                     updated_at=?1
+                 WHERE status='claimed'
+                   AND dispatched_at IS NULL",
+                params![now_rfc3339()],
+            )
+            .map_err(|error| {
+                format!("Unable to rearm undispatched crash todo resume candidates: {error}")
+            })?;
         let sessions = self.query_json(
             "SELECT s.id AS session_id,
                     s.agent_id,
                     s.agent_slot_id,
                     s.task_id,
                     s.pty_id,
+                    s.provider_session_id,
                     s.write_root,
                     s.last_heartbeat_at,
                     s.updated_at AS session_updated_at,
@@ -7136,6 +7196,10 @@ impl CoordinationKernel {
                     t.title AS task_title,
                     t.body AS task_body,
                     t.status AS task_status,
+                    t.source_todo_id,
+                    t.source_todo_dispatch_id,
+                    t.source_prompt_event_id,
+                    t.source_command_id,
                     t.claimed_session_id,
                     COALESCE(active_leases.active_lease_count, 0) AS active_lease_count,
                     COALESCE(startup_cleared_leases.startup_cleared_lease_count, 0) AS startup_cleared_lease_count
@@ -7202,6 +7266,7 @@ impl CoordinationKernel {
                 "taskStatus": task_status,
                 "claimedSessionId": claimed_session_id,
                 "ptyId": session["pty_id"].as_str(),
+                "providerSessionId": session["provider_session_id"].as_str(),
                 "writeRoot": session["write_root"].as_str(),
                 "lastHeartbeatAt": session["last_heartbeat_at"].as_str(),
                 "sessionUpdatedAt": session["session_updated_at"].as_str(),
@@ -7248,6 +7313,14 @@ impl CoordinationKernel {
                     .map_err(|error| {
                         format!("Unable to mark crashed terminal task intents interrupted: {error}")
                     })?;
+                let crash_resume_candidate = self
+                    .remember_crashed_todo_resume_candidate(task_id, session_id, &session)
+                    .unwrap_or_else(|error| {
+                        json!({
+                            "ok": false,
+                            "error": error,
+                        })
+                    });
                 if let Some(object) = crashed_terminal.as_object_mut() {
                     object.insert("cleanupReason".to_string(), json!("app_crash_recovery"));
                     object.insert(
@@ -7257,6 +7330,10 @@ impl CoordinationKernel {
                     object.insert("taskUpdated".to_string(), json!(task_updates > 0));
                     object.insert("updatedResourceIntents".to_string(), json!(intent_updates));
                     object.insert("interruptResult".to_string(), interrupt_result.clone());
+                    object.insert(
+                        "crashResumeCandidate".to_string(),
+                        crash_resume_candidate.clone(),
+                    );
                 }
 
                 self.emit_event(
@@ -7281,6 +7358,7 @@ impl CoordinationKernel {
                         "ui_policy": "no_crash_recovery_modal",
                         "recovery_policy": "quietly_record_crashed_terminals_and_mark_stale_work_interrupted",
                         "crashed_terminal": crashed_terminal.clone(),
+                        "crash_resume_candidate": crash_resume_candidate.clone(),
                     }),
                 )?;
 
@@ -7305,6 +7383,7 @@ impl CoordinationKernel {
                     "taskUpdated": task_updates > 0,
                     "updatedResourceIntents": intent_updates,
                     "interruptResult": interrupt_result,
+                    "crashResumeCandidate": crash_resume_candidate,
                 }));
                 crashed_terminals.push(crashed_terminal);
             } else {
@@ -7345,6 +7424,7 @@ impl CoordinationKernel {
                     "crashed_terminals": crashed_terminals.clone(),
                     "idle_sessions_interrupted": idle_sessions_interrupted,
                     "finished_sessions_interrupted": finished_sessions_interrupted,
+                    "rearmed_crash_resume_candidates": rearmed_crash_resume_candidates,
                     "ui_policy": "no_crash_recovery_modal",
                     "recovery_policy": "quietly_record_crashed_terminals_and_mark_stale_work_interrupted",
                 }),
@@ -7356,6 +7436,7 @@ impl CoordinationKernel {
             "crashedTerminals": crashed_terminals,
             "idleSessionsInterrupted": idle_sessions_interrupted,
             "finishedSessionsInterrupted": finished_sessions_interrupted,
+            "rearmedCrashResumeCandidates": rearmed_crash_resume_candidates,
             "scannedSessions": scanned_sessions,
         }))
     }
@@ -19241,6 +19322,31 @@ impl CoordinationKernel {
                 "Task does not exist.",
             )?
         };
+        if let Some(task_id) = task_id_for_brief {
+            let repo_path = process_path_text(&self.paths.repo_path);
+            let _ = crate::cloud_mcp_record_diffforge_task_credit(
+                Some(&repo_path),
+                None,
+                task_id,
+                "coordination-kernel.start_task",
+                json!({
+                    "meter": "task_created",
+                    "source": "coordination-kernel.start_task",
+                    "task_id": task_id,
+                    "taskId": task_id,
+                    "created_task": created_task,
+                    "createdTask": created_task,
+                    "reused_task": reused_task,
+                    "reusedTask": reused_task,
+                    "agent_id": agent_id,
+                    "agentId": agent_id,
+                    "session_id": session_id,
+                    "sessionId": session_id,
+                    "repo_path": repo_path.clone(),
+                    "repoPath": repo_path,
+                }),
+            );
+        }
         let brief = self.get_brief(agent_id, session_id, task_id_for_brief, context_run_id)?;
         Ok(api_ok(json!({
             "started": true,
@@ -19257,7 +19363,7 @@ impl CoordinationKernel {
                 "agent_visible_mcp_tools": crate::coordination::mcp::TOOL_NAMES,
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
-                    "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal plan.",
+                    "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal todo plan.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
                     "Use normal shell and edit tools from the visible project root; Git-managed writes must target the assigned agent branch root explicitly.",
@@ -26259,8 +26365,80 @@ mod tests {
         );
     }
 
+    fn seed_terminal_todo_plan_for_test(
+        kernel: &CoordinationKernel,
+        task_id: &str,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        title: &str,
+        steps: &[&str],
+        current_step_index: i64,
+    ) {
+        let plan_id = uuid();
+        let now = now_rfc3339();
+        let current_step_index = current_step_index
+            .max(0)
+            .min(steps.len().saturating_sub(1) as i64);
+        kernel
+            .conn
+            .execute(
+                "INSERT INTO terminal_task_plans(
+                    id, task_id, agent_id, session_id, title, status, current_step_index,
+                    revision, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'active', ?6, 1, ?7, ?7)",
+                params![
+                    &plan_id,
+                    task_id,
+                    agent_id,
+                    session_id,
+                    title,
+                    current_step_index,
+                    &now,
+                ],
+            )
+            .unwrap();
+        for (index, title) in steps.iter().enumerate() {
+            let step_index = index as i64;
+            let status = if step_index < current_step_index {
+                "completed"
+            } else if step_index == current_step_index {
+                "in_progress"
+            } else {
+                "queued"
+            };
+            kernel
+                .conn
+                .execute(
+                    "INSERT INTO terminal_task_plan_steps(
+                        id, plan_id, task_id, step_index, title, detail, status, source,
+                        revision, started_at, completed_at, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, NULL, ?6, 'test', 1, ?7, ?8, ?9, ?9)",
+                    params![
+                        uuid(),
+                        &plan_id,
+                        task_id,
+                        step_index,
+                        title,
+                        status,
+                        if matches!(status, "in_progress" | "completed") {
+                            Some(now.as_str())
+                        } else {
+                            None
+                        },
+                        if status == "completed" {
+                            Some(now.as_str())
+                        } else {
+                            None
+                        },
+                        &now,
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
-    fn terminal_task_plan_user_edits_only_unlocked_steps() {
+    fn terminal_todo_plan_user_edits_only_unlocked_steps() {
         let repo = init_git_repo("terminal_plan_user_edit_locks");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
@@ -26270,29 +26448,27 @@ mod tests {
             .unwrap();
         let task_id = task["id"].as_str().unwrap();
 
-        kernel
-            .create_terminal_task_plan(
-                task_id,
-                Some(agent_id),
-                None,
-                Some("Plan task"),
-                &json!(["Inspect", "Patch", "Verify"]),
-                Some(0),
-                None,
-            )
-            .unwrap();
+        seed_terminal_todo_plan_for_test(
+            &kernel,
+            task_id,
+            Some(agent_id),
+            None,
+            "Plan task",
+            &["Inspect", "Patch", "Verify"],
+            0,
+        );
 
         let active_edit = kernel
-            .edit_terminal_task_plan_step_title(task_id, 0, "User active edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(task_id, 0, "User active edit", Some("user"))
             .unwrap();
         assert_eq!(active_edit["ok"].as_bool(), Some(false));
         assert_eq!(
             active_edit["error"]["code"].as_str(),
-            Some("terminal_plan_step_not_editable")
+            Some("terminal_todo_plan_step_not_editable")
         );
 
         let queued_edit = kernel
-            .edit_terminal_task_plan_step_title(task_id, 1, "User queued edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(task_id, 1, "User queued edit", Some("user"))
             .unwrap();
         assert_eq!(queued_edit["ok"].as_bool(), Some(true));
         assert_eq!(
@@ -26301,7 +26477,7 @@ mod tests {
         );
 
         kernel
-            .checkpoint_terminal_task_plan(
+            .checkpoint_terminal_todo_plan(
                 task_id,
                 Some(agent_id),
                 None,
@@ -26313,7 +26489,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let blocked_edit = kernel
-            .edit_terminal_task_plan_step_title(task_id, 1, "User blocked edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(task_id, 1, "User blocked edit", Some("user"))
             .unwrap();
         assert_eq!(blocked_edit["ok"].as_bool(), Some(true));
         assert_eq!(
@@ -26322,13 +26498,13 @@ mod tests {
         );
 
         let completed_edit = kernel
-            .edit_terminal_task_plan_step_title(task_id, 0, "User completed edit", Some("user"))
+            .edit_terminal_todo_plan_step_title(task_id, 0, "User completed edit", Some("user"))
             .unwrap();
         assert_eq!(completed_edit["ok"].as_bool(), Some(false));
     }
 
     #[test]
-    fn terminal_task_plan_checkpoint_can_revise_step_titles() {
+    fn terminal_todo_plan_checkpoint_can_revise_step_titles() {
         let repo = init_git_repo("terminal_plan_checkpoint_edits");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
@@ -26338,20 +26514,18 @@ mod tests {
             .unwrap();
         let task_id = task["id"].as_str().unwrap();
 
-        kernel
-            .create_terminal_task_plan(
-                task_id,
-                Some(agent_id),
-                None,
-                Some("Plan task"),
-                &json!(["Inspect", "Patch", "Verify"]),
-                Some(0),
-                None,
-            )
-            .unwrap();
+        seed_terminal_todo_plan_for_test(
+            &kernel,
+            task_id,
+            Some(agent_id),
+            None,
+            "Plan task",
+            &["Inspect", "Patch", "Verify"],
+            0,
+        );
 
         let checkpoint = kernel
-            .checkpoint_terminal_task_plan(
+            .checkpoint_terminal_todo_plan(
                 task_id,
                 Some(agent_id),
                 None,
@@ -26393,7 +26567,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_task_plan_snapshot_uses_terminal_lineage_after_restart() {
+    fn terminal_todo_plan_snapshot_uses_terminal_lineage_after_restart() {
         let repo = init_git_repo("terminal_plan_restart_lineage");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
@@ -26419,17 +26593,15 @@ mod tests {
             .create_task("Older unfinished plan", None, 0, 1, None, None, None, None)
             .unwrap();
         let stale_task_id = stale_task["id"].as_str().unwrap();
-        kernel
-            .create_terminal_task_plan(
-                stale_task_id,
-                Some(agent_id),
-                Some(&first_session_id),
-                Some("Older unfinished plan"),
-                &json!(["Draft", "Patch"]),
-                Some(0),
-                None,
-            )
-            .unwrap();
+        seed_terminal_todo_plan_for_test(
+            &kernel,
+            stale_task_id,
+            Some(agent_id),
+            Some(&first_session_id),
+            "Older unfinished plan",
+            &["Draft", "Patch"],
+            0,
+        );
         kernel
             .conn
             .execute(
@@ -26442,19 +26614,17 @@ mod tests {
             .create_task("Completed plan", None, 0, 1, None, None, None, None)
             .unwrap();
         let completed_task_id = completed_task["id"].as_str().unwrap();
+        seed_terminal_todo_plan_for_test(
+            &kernel,
+            completed_task_id,
+            Some(agent_id),
+            Some(&first_session_id),
+            "Completed plan",
+            &["Inspect", "Patch", "Verify"],
+            2,
+        );
         kernel
-            .create_terminal_task_plan(
-                completed_task_id,
-                Some(agent_id),
-                Some(&first_session_id),
-                Some("Completed plan"),
-                &json!(["Inspect", "Patch", "Verify"]),
-                Some(2),
-                None,
-            )
-            .unwrap();
-        kernel
-            .finish_terminal_task_plan(
+            .finish_terminal_todo_plan(
                 completed_task_id,
                 "completed",
                 Some(agent_id),
@@ -26481,7 +26651,7 @@ mod tests {
         let restarted_session_id = restarted_session["id"].as_str().unwrap();
 
         let snapshot = kernel
-            .terminal_task_plan_snapshot(None, Some(restarted_session_id), Some("codex"))
+            .terminal_todo_plan_snapshot(None, Some(restarted_session_id), Some("codex"))
             .unwrap();
         assert_eq!(
             snapshot["data"]["history_scope"].as_str(),
@@ -30571,6 +30741,139 @@ Appwrite > Session Store: create session
             .unwrap();
         assert_eq!(task["status"].as_str(), Some("interrupted"));
         assert_eq!(lease["status"].as_str(), Some("expired"));
+    }
+
+    #[test]
+    fn crash_recovery_creates_todo_resume_candidate_for_preserved_provider_session() {
+        let repo = init_git_repo("crash_recovery_todo_resume_candidate");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
+        let agent_id = agent["id"].as_str().unwrap();
+        let session = kernel
+            .create_session(
+                agent_id,
+                None,
+                Some("workspace-terminal-test-0-codex"),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let session_id = session["id"].as_str().unwrap();
+        assert!(kernel
+            .record_session_provider_session_id(session_id, "provider-session-123")
+            .unwrap());
+        let task = kernel
+            .create_task(
+                "Resume crashed todo",
+                Some("Continue this todo after restart."),
+                0,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        kernel
+            .attach_task_source_refs(
+                task_id,
+                &json!({
+                    "todoId": "todo-123",
+                    "todoDispatchId": "dispatch-123",
+                    "promptEventId": "prompt-123",
+                    "commandId": "command-123",
+                }),
+            )
+            .unwrap();
+        kernel.claim_task(task_id, agent_id, session_id).unwrap();
+        kernel
+            .acquire_lease(
+                task_id,
+                agent_id,
+                session_id,
+                "file:src/resume.js",
+                "write",
+                Some(600),
+                None,
+            )
+            .unwrap();
+
+        let report = kernel.recover_crashed_terminal_sessions().unwrap();
+        let candidate = &report["interruptedTasks"][0]["crashResumeCandidate"];
+        assert_eq!(candidate["ok"].as_bool(), Some(true));
+        assert_eq!(candidate["todoId"].as_str(), Some("todo-123"));
+        assert_eq!(
+            candidate["providerSessionId"].as_str(),
+            Some("provider-session-123")
+        );
+        assert!(kernel
+            .claim_crashed_todo_resume_for_provider_session(
+                "resume-session-wrong",
+                "different-provider-session",
+                Some("workspace-terminal-test-0-codex"),
+                Some("codex"),
+            )
+            .unwrap()
+            .is_none());
+
+        let claimed = kernel
+            .claim_crashed_todo_resume_for_provider_session(
+                "resume-session-1",
+                "provider-session-123",
+                Some("workspace-terminal-test-0-codex"),
+                Some("codex"),
+            )
+            .unwrap()
+            .expect("matching provider session should claim crash resume candidate");
+        let first_candidate_id = claimed["id"].as_str().unwrap();
+        assert_eq!(claimed["status"].as_str(), Some("claimed"));
+        assert_eq!(claimed["todo_id"].as_str(), Some("todo-123"));
+        assert_eq!(claimed["old_task_id"].as_str(), Some(task_id));
+        assert!(claimed["resume_prompt_event_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("crash-resume-prompt-")));
+        assert!(kernel
+            .claim_crashed_todo_resume_for_provider_session(
+                "resume-session-2",
+                "provider-session-123",
+                Some("workspace-terminal-test-0-codex"),
+                Some("codex"),
+            )
+            .unwrap()
+            .is_none());
+        let rearm_report = kernel.recover_crashed_terminal_sessions().unwrap();
+        assert_eq!(
+            rearm_report["rearmedCrashResumeCandidates"].as_u64(),
+            Some(1)
+        );
+        let claimed = kernel
+            .claim_crashed_todo_resume_for_provider_session(
+                "resume-session-2",
+                "provider-session-123",
+                Some("workspace-terminal-test-0-codex"),
+                Some("codex"),
+            )
+            .unwrap()
+            .expect("undispatched claimed candidate should rearm after app restart");
+        let candidate_id = claimed["id"].as_str().unwrap();
+        assert_eq!(candidate_id, first_candidate_id);
+        assert!(kernel
+            .finish_crashed_todo_resume(candidate_id, "dispatched", None)
+            .unwrap());
+        let stored = kernel
+            .query_one(
+                "SELECT status, resume_session_id FROM terminal_crash_todo_resumes WHERE id=?1",
+                &[&candidate_id],
+                "missing crash resume candidate",
+            )
+            .unwrap();
+        assert_eq!(stored["status"].as_str(), Some("dispatched"));
+        assert_eq!(
+            stored["resume_session_id"].as_str(),
+            Some("resume-session-2")
+        );
     }
 
     #[test]

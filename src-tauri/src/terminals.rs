@@ -6633,10 +6633,9 @@ pub(crate) fn observe_terminal_coordination_event(
 ) {
     if matches!(
         event_type.as_str(),
-        "terminal_task_plan_created"
-            | "terminal_task_plan_checkpoint"
-            | "terminal_task_plan_step_title_edited"
-            | "terminal_task_plan_finished"
+        "terminal_todo_plan_checkpoint"
+            | "terminal_todo_plan_step_title_edited"
+            | "terminal_todo_plan_finished"
     ) {
         let Some(app) = TERMINAL_COORDINATION_EVENT_APP.get().cloned() else {
             return;
@@ -6663,7 +6662,7 @@ pub(crate) fn observe_terminal_coordination_event(
             let plan_session_id = session_id.clone();
             let plan_snapshot = tauri::async_runtime::spawn_blocking(move || {
                 crate::coordination::CoordinationKernel::open(plan_repo_path, Some(plan_db_path))?
-                    .terminal_task_plan_event_snapshot(
+                    .terminal_todo_plan_event_snapshot(
                         plan_task_id.as_deref(),
                         plan_session_id.as_deref(),
                         plan_agent_id.as_deref(),
@@ -6689,7 +6688,7 @@ pub(crate) fn observe_terminal_coordination_event(
                 .cloned()
                 .unwrap_or_else(|| json!([]));
             let _ = app.emit(
-                TERMINAL_TASK_PLAN_UPDATED_EVENT,
+                TERMINAL_TODO_PLAN_UPDATED_EVENT,
                 json!({
                     "source": "coordination",
                     "repoPath": repo_path.display().to_string(),
@@ -7774,6 +7773,298 @@ async fn terminal_resume_parked_prompt_once(
     true
 }
 
+fn terminal_crash_todo_resume_prompt(candidate: &Value, provider_session_id: &str) -> String {
+    let todo_id = terminal_resume_value_text(candidate["todo_id"].as_str(), "unknown todo", 180);
+    let old_task_id =
+        terminal_resume_value_text(candidate["old_task_id"].as_str(), "interrupted task", 180);
+    let title = terminal_resume_value_text(
+        candidate["task_title"].as_str(),
+        "Interrupted todo work",
+        300,
+    );
+    let body = terminal_resume_value_text(
+        candidate["task_body"].as_str(),
+        "Continue the todo from the point before the desktop app crashed.",
+        1800,
+    );
+    let provider_session_id = terminal_resume_clean_text(provider_session_id, 160);
+
+    format!(
+        "Diff Forge crash recovery is resuming a todo in this restored agent session.\n\n\
+Todo id:\n{todo_id}\n\n\
+Previous task attempt:\n- task_id: {old_task_id}\n- status: interrupted_by_crash\n- provider session confirmed: {provider_session_id}\n\n\
+Todo request:\n{title}\n\n{body}\n\n\
+Continue now:\n\
+1. Treat this as the same todo, but a fresh local execution attempt after the app crash.\n\
+2. Inspect the current repo state before editing so you do not work from stale filesystem assumptions.\n\
+3. When you are ready to edit, call coordination-kernel.start_task with this todo as the source context if the tool schema exposes todo/source refs.\n\
+4. Do not reuse the old interrupted task_id above for new leases or patch submission."
+    )
+}
+
+async fn terminal_try_crash_todo_resume_prompt_once(
+    app: AppHandle,
+    cloud_mcp_state: CloudMcpState,
+    terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    payload: TerminalActivityHookPayload,
+) -> bool {
+    if !payload.input_ready {
+        return false;
+    }
+    let Some(provider_session_id) = payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let Some(instance) = ({
+        let guard = terminals.read().await;
+        guard
+            .get(&payload.pane_id)
+            .filter(|instance| instance.id == payload.instance_id)
+            .cloned()
+    }) else {
+        return false;
+    };
+    let Some(coordination) = instance.coordination.clone() else {
+        return false;
+    };
+    let coordination_repo_path = coordination.repo_path.clone();
+    let coordination_db_path = coordination.db_path.clone();
+    let coordination_session_id = coordination.session_id.clone();
+    let coordination_agent_kind = coordination.agent_kind.clone();
+
+    let candidate = match crate::coordination::CoordinationKernel::open(
+        &coordination_repo_path,
+        Some(PathBuf::from(&coordination_db_path)),
+    )
+    .and_then(|kernel| {
+        let _ =
+            kernel.record_session_provider_session_id(&coordination_session_id, &provider_session_id);
+        kernel.claim_crashed_todo_resume_for_provider_session(
+            &coordination_session_id,
+            &provider_session_id,
+            Some(&payload.pane_id),
+            Some(&coordination_agent_kind),
+        )
+    }) {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return false,
+        Err(error) => {
+            log_terminal_crash_forensics_event(
+                "backend.crash_todo_resume.claim_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "instance_id": payload.instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
+                    "provider_session_present": true,
+                }),
+            );
+            return false;
+        }
+    };
+
+    let candidate_id = candidate["id"].as_str().unwrap_or_default().to_string();
+    let prompt = terminal_crash_todo_resume_prompt(&candidate, &provider_session_id);
+    let input_bytes = prompt.len() + TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.len();
+    if input_bytes > MAX_TERMINAL_WRITE_BYTES {
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+            &coordination_repo_path,
+            Some(PathBuf::from(&coordination_db_path)),
+        ) {
+            let _ = kernel.finish_crashed_todo_resume(
+                &candidate_id,
+                "failed",
+                Some("resume_input_too_large"),
+            );
+        }
+        return false;
+    }
+
+    let _input_guard = instance.input_queue.lock().await;
+    let still_current = {
+        let guard = terminals.read().await;
+        guard
+            .get(&payload.pane_id)
+            .map(|current| current.id == payload.instance_id)
+            .unwrap_or(false)
+    };
+    if !still_current {
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+            &coordination_repo_path,
+            Some(PathBuf::from(&coordination_db_path)),
+        ) {
+            let _ = kernel.finish_crashed_todo_resume(
+                &candidate_id,
+                "skipped",
+                Some("terminal_replaced_before_resume_write"),
+            );
+        }
+        return false;
+    }
+
+    {
+        let mut writer = instance.writer.lock().await;
+        log_terminal_crash_forensics_event(
+            "backend.crash_todo_resume.write_prompt.begin",
+            json!({
+                "bytes": prompt.len(),
+                "candidate_id": candidate_id,
+                "instance_id": instance.id,
+                "old_task_id": candidate["old_task_id"].as_str().unwrap_or_default(),
+                "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
+                "todo_id": candidate["todo_id"].as_str().unwrap_or_default(),
+            }),
+        );
+        if writer.write_all(prompt.as_bytes()).is_err() || writer.flush().is_err() {
+            if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+                &coordination_repo_path,
+                Some(PathBuf::from(&coordination_db_path)),
+            ) {
+                let _ = kernel.finish_crashed_todo_resume(
+                    &candidate_id,
+                    "failed",
+                    Some("resume_write_failed"),
+                );
+            }
+            return false;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_millis(
+        TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+    ))
+    .await;
+    let still_current = {
+        let guard = terminals.read().await;
+        guard
+            .get(&payload.pane_id)
+            .map(|current| current.id == payload.instance_id)
+            .unwrap_or(false)
+    };
+    if !still_current {
+        if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+            &coordination_repo_path,
+            Some(PathBuf::from(&coordination_db_path)),
+        ) {
+            let _ = kernel.finish_crashed_todo_resume(
+                &candidate_id,
+                "skipped",
+                Some("terminal_replaced_before_resume_submit"),
+            );
+        }
+        return false;
+    }
+
+    {
+        let mut writer = instance.writer.lock().await;
+        if writer
+            .write_all(TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE.as_bytes())
+            .is_err()
+            || writer.flush().is_err()
+        {
+            if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+                &coordination_repo_path,
+                Some(PathBuf::from(&coordination_db_path)),
+            ) {
+                let _ = kernel.finish_crashed_todo_resume(
+                    &candidate_id,
+                    "failed",
+                    Some("resume_submit_failed"),
+                );
+            }
+            return false;
+        }
+    }
+
+    let submitted_at = crate::coordination::kernel::now_rfc3339();
+    let prompt_event_id = candidate["resume_prompt_event_id"].as_str();
+    let todo_id = candidate["todo_id"].as_str();
+    let todo_dispatch_id = candidate["resume_dispatch_id"].as_str();
+    let todo_command_id = candidate["resume_command_id"].as_str();
+    emit_terminal_prompt_submitted(
+        &app,
+        &instance,
+        &prompt,
+        prompt_event_id,
+        None,
+        Some("terminal-crash-todo-resume"),
+        Some(&submitted_at),
+        todo_id,
+        todo_dispatch_id,
+        todo_command_id,
+        Some("crash_resume"),
+        true,
+        Some(&prompt),
+        Some(&prompt),
+        true,
+        "crash_todo_resume_backend_submit",
+        Some(&payload.thread_id),
+    );
+
+    if *instance.agent_started.lock().await {
+        let metadata = instance.metadata.clone();
+        let prompt_metadata = CloudMcpTerminalPromptMetadata {
+            prompt_event_id: prompt_event_id.map(str::to_string),
+            prompt_event_source: Some("terminal-crash-todo-resume".to_string()),
+            prompt_event_submitted_at: Some(submitted_at.clone()),
+            terminal_index: metadata.terminal_index,
+            thread_id: Some(payload.thread_id.clone()).filter(|value| !value.trim().is_empty()),
+            workspace_id: metadata.workspace_id.clone(),
+            workspace_name: metadata.workspace_name.clone(),
+            todo_id: todo_id.map(str::to_string),
+            todo_dispatch_id: todo_dispatch_id.map(str::to_string),
+            todo_command_id: todo_command_id.map(str::to_string),
+            todo_action: Some("crash_resume".to_string()),
+            todo_resume_requested: true,
+        };
+        let prompt_for_cloud = prompt.clone();
+        let working_directory = instance.working_directory.as_ref().clone();
+        let coordination_for_cloud = coordination.clone();
+        let session_mode = instance.session_mode;
+        let pane_id_for_cloud = payload.pane_id.clone();
+        let instance_id_for_cloud = payload.instance_id;
+        tauri::async_runtime::spawn(async move {
+            cloud_mcp_terminal_context_pack_for_prompt(
+                cloud_mcp_state,
+                pane_id_for_cloud,
+                instance_id_for_cloud,
+                working_directory,
+                Some(coordination_for_cloud),
+                session_mode,
+                None,
+                None,
+                prompt_for_cloud,
+                Some(prompt_metadata),
+            )
+            .await;
+        });
+    }
+
+    if let Ok(kernel) = crate::coordination::CoordinationKernel::open(
+        &coordination_repo_path,
+        Some(PathBuf::from(&coordination_db_path)),
+    ) {
+        let _ = kernel.finish_crashed_todo_resume(&candidate_id, "dispatched", None);
+    }
+
+    log_terminal_crash_forensics_event(
+        "backend.crash_todo_resume.dispatched",
+        json!({
+            "candidate_id": candidate_id,
+            "instance_id": payload.instance_id,
+            "old_task_id": candidate["old_task_id"].as_str().unwrap_or_default(),
+            "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
+            "todo_id": todo_id.unwrap_or_default(),
+        }),
+    );
+    true
+}
+
 fn emit_terminal_input_error(
     app: &AppHandle,
     pane_id: String,
@@ -8838,6 +9129,49 @@ fn spawn_terminal_activity_hook_watcher(
                                 )
                                 .await;
                             });
+                            if let Some(provider_session_id) = payload
+                                .provider_session_id
+                                .as_deref()
+                                .or(payload.native_session_id.as_deref())
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string)
+                            {
+                                if let Some(coordination) = instance.coordination.clone() {
+                                    tauri::async_runtime::spawn_blocking(move || {
+                                        match crate::coordination::CoordinationKernel::open(
+                                            &coordination.repo_path,
+                                            Some(PathBuf::from(&coordination.db_path)),
+                                        ) {
+                                            Ok(kernel) => {
+                                                let _ = kernel.record_session_provider_session_id(
+                                                    &coordination.session_id,
+                                                    &provider_session_id,
+                                                );
+                                            }
+                                            Err(error) => log_terminal_status_event(
+                                                "backend.terminal_activity_hook.provider_session_record_error",
+                                                json!({
+                                                    "error": clean_terminal_diagnostic_log_text(&error),
+                                                }),
+                                            ),
+                                        }
+                                    });
+                                }
+                            }
+                            let resume_app = app.clone();
+                            let resume_cloud_state = cloud_mcp_state.clone();
+                            let resume_terminals = Arc::clone(&terminals);
+                            let resume_payload = payload.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = terminal_try_crash_todo_resume_prompt_once(
+                                    resume_app,
+                                    resume_cloud_state,
+                                    resume_terminals,
+                                    resume_payload,
+                                )
+                                .await;
+                            });
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
                             if let Some(payload) = architecture_payload {
                                 let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
@@ -8944,7 +9278,7 @@ fn terminal_prompt_submitted_source_is_authoritative(
         "observed_input_gate" => observed_prompt
             .map(str::trim)
             .is_some_and(|value| !value.is_empty()),
-        "parked_resume_backend_submit" => true,
+        "parked_resume_backend_submit" | "crash_todo_resume_backend_submit" => true,
         _ => false,
     }
 }
@@ -12085,6 +12419,11 @@ mod terminal_tests {
         ));
         assert!(terminal_prompt_submitted_source_is_authoritative(
             "parked_resume_backend_submit",
+            true,
+            None,
+        ));
+        assert!(terminal_prompt_submitted_source_is_authoritative(
+            "crash_todo_resume_backend_submit",
             true,
             None,
         ));

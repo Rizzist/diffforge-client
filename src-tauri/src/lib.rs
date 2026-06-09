@@ -155,10 +155,13 @@ const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
-const TERMINAL_TASK_PLAN_UPDATED_EVENT: &str = "forge-terminal-task-plan-updated";
+const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
+const ACTIVITY_OVERLAY_WINDOW_LABEL: &str = "activity-overlay";
+const ACTIVITY_OVERLAY_VISIBILITY_CHANGED_EVENT: &str = "forge-activity-overlay-visibility-changed";
+const ACTIVITY_OVERLAY_SHORTCUT: &str = "Ctrl+Shift+Space";
 #[cfg(target_os = "macos")]
 const MAIN_WINDOW_RESTORE_FOCUS_DELAY_MS: u64 = 260;
 #[cfg(target_os = "macos")]
@@ -2097,6 +2100,13 @@ struct AudioWidgetVisibility {
     shortcut: String,
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ActivityOverlayVisibility {
+    visible: bool,
+    shortcut: String,
+}
+
 struct PreparedPromptImages {
     directory: PathBuf,
     paths: Vec<String>,
@@ -2116,6 +2126,7 @@ include!("cloud_mcp.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
 include!("api.rs");
+include!("activity_overlay.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
 
@@ -3674,6 +3685,7 @@ pub fn run() {
             register_terminal_coordination_event_bridge(app);
 
             register_audio_shortcuts(app.handle());
+            register_activity_overlay_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
@@ -3773,6 +3785,10 @@ pub fn run() {
             show_audio_widget,
             hide_audio_widget,
             toggle_audio_widget,
+            activity_overlay_status,
+            show_activity_overlay,
+            hide_activity_overlay,
+            toggle_activity_overlay,
             insert_transcribed_text,
             insert_handsfree_transcribed_text,
             note_main_window_minimize_requested,
@@ -3866,9 +3882,9 @@ pub fn run() {
             coordination::tauri_commands::coordination_init,
             coordination::tauri_commands::coordination_workspace_targets,
             coordination::tauri_commands::coordination_get_snapshot,
-            coordination::tauri_commands::coordination_terminal_task_plan_snapshot,
-            coordination::tauri_commands::coordination_terminal_task_plan_edit_step_title,
-            coordination::tauri_commands::coordination_terminal_task_plan_finish,
+            coordination::tauri_commands::coordination_terminal_todo_plan_snapshot,
+            coordination::tauri_commands::coordination_terminal_todo_plan_edit_step_title,
+            coordination::tauri_commands::coordination_terminal_todo_plan_finish,
             coordination::tauri_commands::coordination_log_ui_surface_event,
             coordination::tauri_commands::coordination_cleanup_bloat_dry_run,
             coordination::tauri_commands::coordination_start_file_watcher,
