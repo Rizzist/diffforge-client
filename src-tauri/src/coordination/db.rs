@@ -584,14 +584,17 @@ pub fn open_connection(
 
 fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnostics>, String> {
     let mut diagnostics = Vec::new();
+    let bootstrap_compatibility = ensure_bootstrap_compatibility_columns(connection)?;
     with_sqlite_lock_retry("Unable to initialize coordination schema", || {
         connection.execute_batch(CREATE_SCHEMA_SQL)
     })?;
+    let mut bootstrap_details = vec!["CREATE_SCHEMA_SQL executed idempotently".to_string()];
+    bootstrap_details.extend(bootstrap_compatibility);
     diagnostics.push(SchemaMigrationDiagnostics::new(
         0,
         "coordination_schema_bootstrap",
         "ensured",
-        vec!["CREATE_SCHEMA_SQL executed idempotently".to_string()],
+        bootstrap_details,
     ));
 
     diagnostics.push(record_migration_if_missing(
@@ -634,6 +637,18 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_crash_todo_resume_migration(connection)?);
 
     Ok(diagnostics)
+}
+
+fn ensure_bootstrap_compatibility_columns(connection: &Connection) -> Result<Vec<String>, String> {
+    let mut details = Vec::new();
+    if table_exists(connection, "agent_sessions")? {
+        let added = ensure_column(connection, "agent_sessions", "provider_session_id", "TEXT")?;
+        details.push(format!(
+            "agent_sessions.provider_session_id pre_bootstrap_{}",
+            if added { "added" } else { "already_present" }
+        ));
+    }
+    Ok(details)
 }
 
 fn apply_crash_todo_resume_migration(
@@ -1356,6 +1371,22 @@ fn ensure_column(
     Ok(true)
 }
 
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+            [table],
+            |_| Ok(()),
+        )
+        .map(|_| true)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            error => Err(format!(
+                "Unable to inspect {table} table existence: {error}"
+            )),
+        })
+}
+
 fn clean_stale_mcp_temp_files(mcp_root: &Path) -> Result<Vec<String>, String> {
     const MCP_TEMP_FILE_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
@@ -1541,6 +1572,98 @@ mod tests {
             .query_row(
                 "SELECT COUNT(1) FROM schema_migrations WHERE version=?1",
                 [WORKTREE_TASK_BINDING_MIGRATION_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
+
+        drop(connection);
+        let _ = fs::remove_dir_all(paths.agents_root);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn old_agent_sessions_schema_without_provider_session_id_bootstraps() {
+        let repo = temp_repo("agent_sessions_provider_session_id_migration");
+        let paths = StoragePaths::new(repo.clone(), None);
+        fs::create_dir_all(paths.db_path.parent().unwrap()).unwrap();
+        let legacy = Connection::open(&paths.db_path).unwrap();
+        legacy
+            .execute_batch(
+                r#"
+                CREATE TABLE schema_migrations(
+                  version INTEGER PRIMARY KEY,
+                  name TEXT NOT NULL,
+                  applied_at TEXT NOT NULL
+                );
+                CREATE TABLE agent_sessions(
+                  id TEXT PRIMARY KEY,
+                  agent_id TEXT NOT NULL,
+                  agent_slot_id TEXT,
+                  task_id TEXT,
+                  context_run_id TEXT,
+                  context_role TEXT,
+                  pty_id TEXT,
+                  terminal_launch_epoch TEXT,
+                  worktree_id TEXT,
+                  sandbox_db_id TEXT,
+                  base_git_sha TEXT,
+                  current_git_sha TEXT,
+                  base_schema_fingerprint TEXT,
+                  current_schema_fingerprint TEXT,
+                  status TEXT NOT NULL,
+                  write_root TEXT,
+                  enforcement_mode TEXT NOT NULL DEFAULT 'worktree_required',
+                  last_heartbeat_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        for version in 1..CRASH_TODO_RESUME_MIGRATION_VERSION {
+            legacy
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES(?1, ?2, 'legacy')",
+                    rusqlite::params![version, format!("legacy_{version}")],
+                )
+                .unwrap();
+        }
+        drop(legacy);
+
+        let (connection, existed, diagnostics) = open_connection(&paths).unwrap();
+
+        assert!(existed);
+        assert!(diagnostics
+            .migrations
+            .iter()
+            .any(|migration| migration.details.iter().any(|detail| {
+                detail == "agent_sessions.provider_session_id pre_bootstrap_added"
+            })));
+        let columns = connection
+            .prepare("PRAGMA table_info(agent_sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "provider_session_id"));
+
+        let indexes = connection
+            .prepare("PRAGMA index_list(agent_sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(indexes
+            .iter()
+            .any(|index| index == "idx_agent_sessions_provider_session"));
+
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(1) FROM schema_migrations WHERE version=?1",
+                [CRASH_TODO_RESUME_MIGRATION_VERSION],
                 |row| row.get(0),
             )
             .unwrap();
