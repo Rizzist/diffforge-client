@@ -3689,6 +3689,7 @@ pub fn run() {
 
             register_audio_shortcuts(app.handle());
             register_snipping_shortcuts(app.handle());
+            prewarm_snipping_overlay_window(app.handle());
             register_activity_overlay_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
@@ -3796,6 +3797,7 @@ pub fn run() {
             snipping_area_overlay_status,
             snipping_finish_area_snip,
             snipping_recent_capture_toasts,
+            snipping_dismiss_capture_toast,
             snipping_set_asset_target,
             snipping_upload_untracked_asset,
             snipping_save_edited_untracked_asset,
@@ -3820,6 +3822,7 @@ pub fn run() {
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_set_desktop_session_token,
             cloud_mcp_get_status,
+            cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,

@@ -1907,6 +1907,14 @@ const TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES = new Set([
   "interrupted",
   "timed_out",
 ]);
+const TODO_QUEUE_STORAGE_DISCARDED_STATUSES = new Set([
+  "cancelled",
+  "completed",
+  "deleted",
+  "failed",
+  "timed_out",
+  "duplicate_ignored",
+]);
 const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
 const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
 const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
@@ -6901,11 +6909,26 @@ function createTodoQueueItemFromVoiceAgentTodoEntry(entry, toolCall, parentArgs 
 }
 
 function getTodoQueuePendingFieldsFromItem(item, source = "") {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  const remoteCommand = item?.remoteCommand && typeof item.remoteCommand === "object"
+    ? item.remoteCommand
+    : item?.remote_command && typeof item.remote_command === "object"
+      ? item.remote_command
+      : {};
   const targetInfo = getTodoQueueExplicitTerminalTargetInfo(item);
   const targetAgentId = getTodoQueueTargetAgentId(item);
   const targetColorSlot = getTodoQueueTargetColorSlot(item);
   const targetTerminalName = getTodoQueueTargetTerminalName(item);
   const targetTerminalColor = getTodoQueueTargetTerminalColor(item);
+  const commandId = queueState.commandId || getTodoQueueRemoteCommandId(item);
+  const dispatchId = queueState.dispatchId
+    || queueState.todoDispatchId
+    || getTodoQueueRemoteCommandDispatchId(item);
+  const todoId = queueState.todoId
+    || getTodoQueueItemTodoId(item)
+    || String(remoteCommand.todoId || remoteCommand.todo_id || "").trim();
+  const dispatchSource = remoteCommand.dispatchSource || remoteCommand.dispatch_source || item?.dispatchSource || item?.dispatch_source || null;
+  const dispatchTarget = remoteCommand.dispatchTarget || remoteCommand.dispatch_target || item?.dispatchTarget || item?.dispatch_target || null;
   const targetExplicit = Boolean(
     targetAgentId
       || targetInfo.hasExplicitTerminalTarget
@@ -6915,6 +6938,11 @@ function getTodoQueuePendingFieldsFromItem(item, source = "") {
   );
   return {
     source,
+    ...(commandId ? { commandId } : {}),
+    ...(dispatchId ? { dispatchId, todoDispatchId: dispatchId } : {}),
+    ...(todoId ? { todoId } : {}),
+    ...(dispatchSource && typeof dispatchSource === "object" ? { dispatchSource } : {}),
+    ...(dispatchTarget && typeof dispatchTarget === "object" ? { dispatchTarget } : {}),
     ...(targetAgentId ? { targetAgentId, targetRole: targetAgentId } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
@@ -8970,6 +8998,116 @@ function getTodoQueueItemStorageRehydrated(item) {
   });
 }
 
+function getTodoQueueItemStorageIdentity(item) {
+  if (!item || typeof item !== "object") {
+    return "";
+  }
+
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  const workspaceId = String(
+    item.workspaceId
+      || item.workspace_id
+      || item.remoteCommand?.todoWorkspaceId
+      || item.remoteCommand?.todo_workspace_id
+      || queueState.workspaceId
+      || queueState.workspace_id
+      || "",
+  ).trim();
+  const dispatchId = String(
+    queueState.dispatchId
+      || queueState.todoDispatchId
+      || getTodoQueueRemoteCommandDispatchId(item)
+      || "",
+  ).trim();
+  if (dispatchId) {
+    return `dispatch:${workspaceId}:${dispatchId}`;
+  }
+
+  const commandId = String(queueState.commandId || getTodoQueueRemoteCommandId(item) || "").trim();
+  if (commandId && normalizeTodoQueueSource(item.source) === TODO_QUEUE_SOURCE_REMOTE_CONTROL) {
+    return `command:${workspaceId}:${commandId}`;
+  }
+
+  const todoId = String(queueState.todoId || getTodoQueueItemTodoId(item) || "").trim();
+  if (todoId) {
+    return `todo:${workspaceId}:${todoId}`;
+  }
+
+  const itemId = String(item.id || item.itemId || "").trim();
+  return itemId ? `item:${workspaceId}:${itemId}` : "";
+}
+
+function getTodoQueueItemStorageStatus(item) {
+  const status = normalizeTodoQueueLifecycleStatus(
+    item?.todoStatus
+      || item?.todo_status
+      || item?.cloudStatus
+      || item?.cloud_status
+      || item?.status,
+  );
+  if (status) {
+    return status;
+  }
+  return item?.todoDeletedAt || item?.todo_deleted_at || item?.deletedAt || item?.deleted_at
+    ? "deleted"
+    : "";
+}
+
+function getTodoQueueItemStorageStatusRank(item) {
+  const status = getTodoQueueItemStorageStatus(item);
+  if (["deleted", "cancelled"].includes(status)) {
+    return 70;
+  }
+  if (["completed"].includes(status)) {
+    return 65;
+  }
+  if (["failed", "timed_out"].includes(status)) {
+    return 60;
+  }
+  if (["interrupted", "paused"].includes(status)) {
+    return 50;
+  }
+  if (["running"].includes(status)) {
+    return 40;
+  }
+  if (["queued"].includes(status)) {
+    return 30;
+  }
+  if (["listed"].includes(status)) {
+    return 20;
+  }
+  return 10;
+}
+
+function getTodoQueueItemStorageUpdatedMs(item) {
+  const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
+  return Math.max(
+    Date.parse(String(item?.todoStatusUpdatedAt || item?.todo_status_updated_at || "")) || 0,
+    Date.parse(String(queueState.updatedAt || queueState.updated_at || "")) || 0,
+    Date.parse(String(item?.updatedAt || item?.updated_at || "")) || 0,
+    Date.parse(String(queueState.queuedAt || queueState.queued_at || "")) || 0,
+    Date.parse(String(item?.createdAt || item?.created_at || "")) || 0,
+  );
+}
+
+function preferTodoQueueStorageItem(existing, candidate) {
+  if (!existing) {
+    return candidate;
+  }
+  const existingRank = getTodoQueueItemStorageStatusRank(existing);
+  const candidateRank = getTodoQueueItemStorageStatusRank(candidate);
+  if (candidateRank !== existingRank) {
+    return candidateRank > existingRank ? candidate : existing;
+  }
+  return getTodoQueueItemStorageUpdatedMs(candidate) >= getTodoQueueItemStorageUpdatedMs(existing)
+    ? candidate
+    : existing;
+}
+
+function todoQueueItemShouldPersistToStorage(item) {
+  return !TODO_QUEUE_STORAGE_DISCARDED_STATUSES.has(getTodoQueueItemStorageStatus(item));
+}
+
 function buildTodoQueuePendingItemsFromPersistedQueue(items, workspaceId = "") {
   const startedAtMs = Date.now();
   return (Array.isArray(items) ? items : []).reduce((pendingItems, item) => {
@@ -9525,10 +9663,20 @@ function normalizeTodoQueueItem(item) {
 }
 
 function normalizeTodoQueueItems(items) {
-  return (Array.isArray(items) ? items : [])
+  const keyed = new Map();
+  const unkeyed = [];
+  (Array.isArray(items) ? items : [])
     .map(normalizeTodoQueueItem)
     .filter(Boolean)
-    .slice(0, TODO_QUEUE_MAX_ITEMS);
+    .forEach((item) => {
+      const key = getTodoQueueItemStorageIdentity(item);
+      if (!key) {
+        unkeyed.push(item);
+        return;
+      }
+      keyed.set(key, preferTodoQueueStorageItem(keyed.get(key), item));
+    });
+  return [...keyed.values(), ...unkeyed].slice(0, TODO_QUEUE_MAX_ITEMS);
 }
 
 function readTodoQueueItems(storageKey) {
@@ -9539,7 +9687,8 @@ function readTodoQueueItems(storageKey) {
   try {
     return normalizeTodoQueueItems(JSON.parse(window.localStorage.getItem(storageKey) || "[]"))
       .map(getTodoQueueItemStorageRehydrated)
-      .filter(Boolean);
+      .filter(Boolean)
+      .filter(todoQueueItemShouldPersistToStorage);
   } catch {
     return [];
   }
@@ -9551,7 +9700,8 @@ function writeTodoQueueItems(storageKey, items) {
   }
 
   try {
-    const storageItems = normalizeTodoQueueItems(items);
+    const storageItems = normalizeTodoQueueItems(items)
+      .filter(todoQueueItemShouldPersistToStorage);
     window.localStorage.setItem(storageKey, JSON.stringify(storageItems));
   } catch {
     // The queue is a convenience layer; storage failures should not interrupt terminal work.
@@ -13698,7 +13848,26 @@ function TerminalView({
 
   const recordTodoQueueRemoteCommandReceipt = useCallback((item, status, fields = {}) => {
     const workspaceId = String(fields.workspaceId || item?.workspaceId || terminalWorkspace?.id || "").trim();
-    const receiptKey = getTodoQueueRemoteCommandReceiptKey(item, workspaceId);
+    const commandId = String(fields.commandId || fields.command_id || getTodoQueueRemoteCommandId(item) || "").trim();
+    const dispatchId = String(
+      fields.dispatchId
+        || fields.dispatch_id
+        || fields.todoDispatchId
+        || fields.todo_dispatch_id
+        || getTodoQueueRemoteCommandDispatchId(item)
+        || "",
+    ).trim();
+    const receiptItem = commandId
+      ? {
+        ...(item || {}),
+        remoteCommand: {
+          ...(item?.remoteCommand || item?.remote_command || {}),
+          commandId,
+          ...(dispatchId ? { todoDispatchId: dispatchId } : {}),
+        },
+      }
+      : item;
+    const receiptKey = getTodoQueueRemoteCommandReceiptKey(receiptItem, workspaceId);
     if (!receiptKey) {
       return "";
     }
@@ -13707,7 +13876,7 @@ function TerminalView({
     const currentReceipts = pruneTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptsRef.current, nowMs);
     const existingReceipt = currentReceipts[receiptKey] || null;
     const nextReceipt = {
-      commandId: getTodoQueueRemoteCommandId(item),
+      commandId,
       itemId: String(item?.id || item?.itemId || existingReceipt?.itemId || ""),
       receivedAtMs: Number(existingReceipt?.receivedAtMs || nowMs),
       status: normalizeTodoQueueRemoteCommandReceiptStatus(status),
@@ -13724,7 +13893,6 @@ function TerminalView({
       todoQueueRemoteCommandReceiptStorageKeyRef.current,
       nextReceipts,
     );
-    const dispatchId = getTodoQueueRemoteCommandDispatchId(item);
     if (dispatchId) {
       const dispatchSource = fields.dispatchSource
         || fields.dispatch_source
@@ -17646,6 +17814,8 @@ function TerminalView({
       ? "completed"
       : ["cancelled", "canceled"].includes(normalizedReason)
         ? "cancelled"
+        : ["removed", "remove", "deleted", "delete"].includes(normalizedReason)
+          ? "cancelled"
         : ["paused", "parked", "resume_ready", "resume_requested", "parked_task_waiting", "parked_task_resume_ready", "resume_in_progress"].includes(normalizedReason)
           ? "paused"
         : ["interrupted", "provider_turn_interrupted"].includes(normalizedReason)
@@ -17667,8 +17837,13 @@ function TerminalView({
       const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
       if (item) {
         recordTodoQueueRemoteCommandReceipt(item, remoteReceiptStatus, {
+          commandId: pendingItem.commandId || fields.commandId || fields.command_id || "",
+          dispatchId: pendingItem.dispatchId || pendingItem.todoDispatchId || fields.dispatchId || fields.dispatch_id || fields.todoDispatchId || fields.todo_dispatch_id || "",
+          dispatchSource: pendingItem.dispatchSource || fields.dispatchSource || fields.dispatch_source,
+          dispatchTarget: pendingItem.dispatchTarget || fields.dispatchTarget || fields.dispatch_target,
           ...terminalAssignmentFields,
           reason,
+          source: fields.source || pendingItem.source || getTodoQueueItemAutoQueueSource(item),
           workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
         });
       }
@@ -20650,6 +20825,7 @@ function TerminalView({
 
   const removeTodoQueueItem = useCallback((itemId) => {
     const item = todoQueueItemsRef.current.find((candidate) => candidate.id === itemId) || null;
+    const source = item ? getTodoQueueItemAutoQueueSource(item) : TODO_QUEUE_SOURCE_TODO_AUTO;
     const planTask = getTodoQueueItemPlanTask(item);
     if (planTask) {
       void recordVoicePlanTaskStatus(planTask, "cancelled", {
@@ -20657,7 +20833,7 @@ function TerminalView({
         reason: "removed",
       });
     }
-    clearTodoQueueItemPending(itemId, "removed");
+    clearTodoQueueItemPending(itemId, "removed", item ? getTodoQueuePendingFieldsFromItem(item, source) : { source });
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
     ), {
@@ -21262,6 +21438,7 @@ function TerminalView({
     const source = item ? getTodoQueueItemAutoQueueSource(item) : TODO_QUEUE_SOURCE_TODO_AUTO;
     clearTodoQueueItemPending(safeItemId, "cancelled", {
       source,
+      ...(item ? getTodoQueuePendingFieldsFromItem(item, source) : {}),
     });
     const planTask = getTodoQueueItemPlanTask(item);
     if (planTask) {

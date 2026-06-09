@@ -36,6 +36,7 @@ export const SNIPPING_OVERLAY_HASH = "#/snipping-overlay";
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
+const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 const SNIPPING_MODIFIER_CODES = new Set([
@@ -659,7 +660,18 @@ export function SnippingOverlayWindow() {
   const [drag, setDrag] = useState(null);
   const [error, setError] = useState("");
   const [capturing, setCapturing] = useState(false);
+  const [overlayMonitor, setOverlayMonitor] = useState(null);
   const dragRef = useRef(null);
+
+  const snapshotUrl = useMemo(() => {
+    const snapshotPath = text(overlayMonitor?.snapshotPath || overlayMonitor?.snapshot_path);
+    if (!snapshotPath) return "";
+    try {
+      return convertFileSrc(snapshotPath);
+    } catch {
+      return "";
+    }
+  }, [overlayMonitor]);
 
   const selection = useMemo(() => {
     if (!drag) return null;
@@ -684,11 +696,51 @@ export function SnippingOverlayWindow() {
     }
   }, []);
 
-  useEffect(() => {
-    invoke("snipping_area_overlay_status").catch((statusError) => {
-      setError(getErrorMessage(statusError, "Unable to prepare snipping overlay."));
-    });
+  const applyOverlayMonitor = useCallback((monitor) => {
+    setOverlayMonitor(monitor && typeof monitor === "object" ? monitor : null);
+    setError("");
+    setCapturing(false);
+    dragRef.current = null;
+    setDrag(null);
   }, []);
+
+  const loadOverlayStatus = useCallback(async () => {
+    try {
+      const status = await invoke("snipping_area_overlay_status");
+      applyOverlayMonitor(status?.monitor || null);
+    } catch (statusError) {
+      const message = getErrorMessage(statusError, "Unable to prepare snipping overlay.");
+      if (!message.includes("No active snipping overlay monitor")) {
+        setError(message);
+      }
+    }
+  }, [applyOverlayMonitor]);
+
+  useEffect(() => {
+    loadOverlayStatus();
+  }, [loadOverlayStatus]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenOverlayStarted = null;
+
+    listen(SNIPPING_AREA_OVERLAY_STARTED_EVENT, (event) => {
+      if (!cancelled) {
+        applyOverlayMonitor(event.payload?.monitor || event.payload || null);
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+      } else {
+        unlistenOverlayStarted = unlisten;
+      }
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      unlistenOverlayStarted?.();
+    };
+  }, [applyOverlayMonitor]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -755,12 +807,7 @@ export function SnippingOverlayWindow() {
     setCapturing(true);
     setError("");
     const overlayWindow = getCurrentWindow();
-    let hiddenBeforeCapture = false;
     try {
-      if (!isMacPlatform()) {
-        await overlayWindow.hide();
-        hiddenBeforeCapture = true;
-      }
       await invoke("snipping_finish_area_snip", {
         request: {
           x: left,
@@ -771,19 +818,11 @@ export function SnippingOverlayWindow() {
         },
       });
       try {
-        await overlayWindow.close();
+        await overlayWindow.hide();
       } catch {
-        // Rust also closes the overlay after capture.
+        // Rust also hides the overlay after capture.
       }
     } catch (captureError) {
-      if (hiddenBeforeCapture) {
-        try {
-          await overlayWindow.show();
-          await overlayWindow.setFocus();
-        } catch {
-          // The backend may have already closed the overlay after a failed capture.
-        }
-      }
       setCapturing(false);
       setError(getErrorMessage(captureError, "Unable to capture selected area."));
     }
@@ -796,6 +835,7 @@ export function SnippingOverlayWindow() {
         onMouseDown={beginDrag}
         onMouseMove={updateDrag}
         onMouseUp={finishDrag}
+        style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}
       >
         {selection && (
           <SnippingSelectionBox
@@ -1013,7 +1053,10 @@ const SnippingOverlayRoot = styled.main`
   position: fixed;
   inset: 0;
   overflow: hidden;
-  background: transparent;
+  background:
+    var(--snipping-overlay-snapshot, transparent)
+    center / 100% 100%
+    no-repeat;
   color: #f8fafc;
   font-family:
     Inter,

@@ -1279,6 +1279,21 @@ fn cloud_mcp_outbox_idempotency_key(
             parts.push(value);
         }
     }
+    let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    if matches!(
+        normalized_kind.as_str(),
+        "workspace_todo_dispatch_status" | "todo_dispatch_status" | "todo_dispatch_update"
+    ) {
+        if let Some(status) =
+            cloud_mcp_payload_text(payload, &["status", "dispatch_status", "dispatchStatus"])
+        {
+            parts.push(status);
+        }
+        if parts.is_empty() {
+            return format!("event:{event_kind}:{payload_hash}");
+        }
+        return format!("event:{event_kind}:{}:{payload_hash}", parts.join(":"));
+    }
     if parts.is_empty() {
         format!("event:{event_kind}:{payload_hash}")
     } else {
@@ -11341,6 +11356,11 @@ async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMc
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
 }
 
+#[tauri::command]
+async fn cloud_mcp_get_cached_workspace_todos() -> Result<Value, String> {
+    Ok(cloud_mcp_todo_mirror_workspace_todos_from_store().unwrap_or_else(|| json!({})))
+}
+
 async fn cloud_mcp_refresh_live_runtime_status_if_connected(
     state: &CloudMcpState,
 ) -> Result<(), String> {
@@ -15313,6 +15333,7 @@ async fn cloud_mcp_record_todo_dispatch_status(
                 payload["dispatchTarget"] = dispatch_target;
             }
             for (target_key, source_keys) in [
+                ("repo_id", &["repo_id", "repoId"][..]),
                 (
                     "target_agent_id",
                     &["target_agent_id", "targetAgentId", "agent_id", "agentId"][..],
@@ -15378,6 +15399,52 @@ async fn cloud_mcp_record_todo_dispatch_status(
             ] {
                 if cloud_mcp_payload_text(&payload, &[target_key]).is_none() {
                     if let Some(value) = cloud_mcp_payload_text(&details, source_keys) {
+                        payload[target_key] = json!(value);
+                    }
+                }
+            }
+            for (target_key, source_keys) in [
+                (
+                    "workspace_id",
+                    &[
+                        "workspace_id",
+                        "workspaceId",
+                        "target_workspace_id",
+                        "targetWorkspaceId",
+                    ][..],
+                ),
+                (
+                    "workspaceId",
+                    &[
+                        "workspaceId",
+                        "workspace_id",
+                        "targetWorkspaceId",
+                        "target_workspace_id",
+                    ][..],
+                ),
+                (
+                    "target_workspace_id",
+                    &["target_workspace_id", "targetWorkspaceId", "workspace_id", "workspaceId"][..],
+                ),
+                (
+                    "targetWorkspaceId",
+                    &["targetWorkspaceId", "target_workspace_id", "workspaceId", "workspace_id"][..],
+                ),
+            ] {
+                if cloud_mcp_payload_text(&payload, &[target_key]).is_none() {
+                    if let Some(value) =
+                        cloud_mcp_payload_text(&details, source_keys).or_else(|| {
+                            source_keys.iter().find_map(|source_key| {
+                                cloud_mcp_payload_text(&payload, &["dispatch_target", *source_key])
+                                    .or_else(|| {
+                                        cloud_mcp_payload_text(
+                                            &payload,
+                                            &["dispatchTarget", *source_key],
+                                        )
+                                    })
+                            })
+                        })
+                    {
                         payload[target_key] = json!(value);
                     }
                 }
@@ -16614,22 +16681,29 @@ fn cloud_mcp_todo_mirror_row_matches_request(
 }
 
 fn cloud_mcp_todo_mirror_dispatch_status_is_terminal(status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
     matches!(
-        status,
+        status.as_str(),
         "completed"
+            | "complete"
+            | "done"
             | "failed"
             | "cancelled"
             | "canceled"
             | "timed_out"
             | "timeout"
+            | "deleted"
+            | "removed"
             | "rejected"
+            | "skipped"
             | "duplicate_ignored"
     )
 }
 
 fn cloud_mcp_todo_mirror_dispatch_status_is_quiescent(status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
     matches!(
-        status,
+        status.as_str(),
         "paused" | "interrupted" | "attention_required" | "blocked" | "parked"
     )
 }
@@ -16988,7 +17062,11 @@ fn cloud_mcp_todo_mirror_dedupe_rows(rows: Vec<Value>) -> Vec<Value> {
     for row in rows {
         let row = cloud_mcp_todo_mirror_enrich_status_row(row);
         if let Some(key) = cloud_mcp_todo_mirror_status_row_key(&row) {
-            keyed.insert(key, row);
+            let next = match keyed.remove(&key) {
+                Some(existing) => cloud_mcp_todo_mirror_preferred_row(existing, row),
+                None => row,
+            };
+            keyed.insert(key, next);
         } else {
             unkeyed.push(row);
         }
@@ -17009,6 +17087,60 @@ fn cloud_mcp_todo_mirror_dedupe_rows(rows: Vec<Value>) -> Vec<Value> {
     });
     rows.truncate(CLOUD_MCP_TODO_MIRROR_STATUS_MAX_ROWS);
     rows
+}
+
+fn cloud_mcp_todo_mirror_row_status_rank(row: &Value) -> u8 {
+    let status = cloud_mcp_payload_text(row, &["status", "dispatch_status", "dispatchStatus"])
+        .unwrap_or_else(|| "listed".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "deleted" | "removed" | "cancelled" | "canceled" => 80,
+        "completed" | "complete" | "done" => 75,
+        "failed" | "timed_out" | "timeout" | "rejected" | "skipped" => 70,
+        "paused" | "parked" | "interrupted" | "attention_required" | "blocked" => 60,
+        "running" | "active" | "processing" => 50,
+        "submitted" | "accepted" | "sending" => 45,
+        "queued" | "pending" | "requested" => 40,
+        "listed" | "ready" => 30,
+        _ => 10,
+    }
+}
+
+fn cloud_mcp_todo_mirror_row_updated_text(row: &Value) -> String {
+    cloud_mcp_payload_text(
+        row,
+        &[
+            "updated_at",
+            "updatedAt",
+            "last_seen_at",
+            "lastSeenAt",
+            "completed_at",
+            "completedAt",
+            "created_at",
+            "createdAt",
+        ],
+    )
+    .unwrap_or_default()
+}
+
+fn cloud_mcp_todo_mirror_preferred_row(existing: Value, candidate: Value) -> Value {
+    let existing_rank = cloud_mcp_todo_mirror_row_status_rank(&existing);
+    let candidate_rank = cloud_mcp_todo_mirror_row_status_rank(&candidate);
+    if candidate_rank != existing_rank {
+        return if candidate_rank > existing_rank {
+            candidate
+        } else {
+            existing
+        };
+    }
+    if cloud_mcp_todo_mirror_row_updated_text(&candidate)
+        >= cloud_mcp_todo_mirror_row_updated_text(&existing)
+    {
+        candidate
+    } else {
+        existing
+    }
 }
 
 fn cloud_mcp_todo_mirror_status_rows_from_response(value: &Value) -> Vec<Value> {
@@ -17043,15 +17175,34 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
     let observer_workspace_id = workspace_id.unwrap_or_default();
     for row in rows {
         let row_kind = cloud_mcp_todo_mirror_row_kind(row);
-        let Some(key) = cloud_mcp_todo_mirror_status_row_key(row) else {
+        let Some(status_row_key) = cloud_mcp_todo_mirror_status_row_key(row) else {
             continue;
         };
+        let target_workspace_id =
+            cloud_mcp_todo_mirror_row_column(row, &["target_workspace_id", "targetWorkspaceId"]);
+        let origin_workspace_id = cloud_mcp_todo_mirror_row_column(
+            row,
+            &[
+                "todo_workspace_id",
+                "todoWorkspaceId",
+                "requested_by_workspace_id",
+                "requestedByWorkspaceId",
+                "workspace_id",
+                "workspaceId",
+            ],
+        );
+        let effective_workspace_id = if !observer_workspace_id.is_empty() {
+            observer_workspace_id.to_string()
+        } else if !target_workspace_id.is_empty() {
+            target_workspace_id.clone()
+        } else {
+            origin_workspace_id.clone()
+        };
         let key = format!(
-            "{}::{}::{}::{}",
-            cloud_mcp_todo_mirror_entry_key(Some(base_url), Some(repo_id), Some(observer_workspace_id)),
+            "{}::{}::{}",
+            cloud_mcp_todo_mirror_entry_key(Some(base_url), None, Some(&effective_workspace_id)),
             row_kind,
-            repo_id,
-            key
+            status_row_key
         );
         let todo_batch_id = cloud_mcp_todo_mirror_row_column(
             row,
@@ -17070,8 +17221,6 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
         let todo_id = cloud_mcp_todo_mirror_row_column(row, &["todo_id", "todoId", "id"]);
         let target_device_id =
             cloud_mcp_todo_mirror_row_column(row, &["target_device_id", "targetDeviceId"]);
-        let target_workspace_id =
-            cloud_mcp_todo_mirror_row_column(row, &["target_workspace_id", "targetWorkspaceId"]);
         let origin_device_id = cloud_mcp_todo_mirror_row_column(
             row,
             &[
@@ -17081,17 +17230,6 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
                 "requestedByDeviceId",
                 "device_id",
                 "deviceId",
-            ],
-        );
-        let origin_workspace_id = cloud_mcp_todo_mirror_row_column(
-            row,
-            &[
-                "todo_workspace_id",
-                "todoWorkspaceId",
-                "requested_by_workspace_id",
-                "requestedByWorkspaceId",
-                "workspace_id",
-                "workspaceId",
             ],
         );
         let status = if row_kind == "dispatch" {
@@ -17113,6 +17251,15 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
             ],
         );
         let row_json = serde_json::to_string(row).unwrap_or_else(|_| "{}".to_string());
+        cloud_mcp_todo_mirror_delete_semantic_duplicates(
+            conn,
+            table_name,
+            &key,
+            &row_kind,
+            &dispatch_id,
+            &command_id,
+            &todo_id,
+        )?;
         let sql = format!(
             "INSERT INTO {table_name}(
                 key, row_kind, base_url, repo_id, workspace_id,
@@ -17152,7 +17299,7 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
                 row_kind,
                 base_url,
                 repo_id,
-                observer_workspace_id,
+                effective_workspace_id,
                 todo_batch_id,
                 dispatch_id,
                 command_id,
@@ -17181,6 +17328,43 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
             rows,
         );
     }
+    Ok(())
+}
+
+fn cloud_mcp_todo_mirror_delete_semantic_duplicates(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    canonical_key: &str,
+    row_kind: &str,
+    dispatch_id: &str,
+    command_id: &str,
+    todo_id: &str,
+) -> Result<(), String> {
+    let mut id_clauses = Vec::new();
+    let mut params = vec![canonical_key.to_string(), row_kind.to_string()];
+    if !dispatch_id.is_empty() {
+        id_clauses.push("dispatch_id=?".to_string());
+        params.push(dispatch_id.to_string());
+    }
+    if !command_id.is_empty() {
+        id_clauses.push("command_id=?".to_string());
+        params.push(command_id.to_string());
+    }
+    if row_kind == "todo" && !todo_id.is_empty() {
+        id_clauses.push("todo_id=?".to_string());
+        params.push(todo_id.to_string());
+    }
+    if id_clauses.is_empty() {
+        return Ok(());
+    }
+
+    let sql = format!(
+        "DELETE FROM {table_name}
+         WHERE key<>? AND row_kind=? AND ({})",
+        id_clauses.join(" OR ")
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+        .map_err(|error| format!("Unable to delete duplicate todo mirror rows: {error}"))?;
     Ok(())
 }
 
@@ -17294,10 +17478,24 @@ async fn cloud_mcp_update_todo_mirror_from_response(
     };
     let repo_id = cloud_mcp_payload_text(payload, &["repo_id", "repoId"])
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repo_id"]))
-        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repoId"]));
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "repoId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["repo_id", "repoId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "repo_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "repoId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspaceTodos", "repo_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspaceTodos", "repoId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspace_todos", "repo_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspace_todos", "repoId"]));
     let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
         .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspace_id"]))
-        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspaceId"]));
+        .or_else(|| cloud_mcp_payload_text(payload, &["payload", "workspaceId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspace_id", "workspaceId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["data", "workspaceId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspaceTodos", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspaceTodos", "workspaceId"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspace_todos", "workspace_id"]))
+        .or_else(|| cloud_mcp_payload_text(response, &["workspace_todos", "workspaceId"]));
     if let Ok(conn) = cloud_mcp_open_todo_mirror_conn() {
         let _ = cloud_mcp_update_todo_mirror_conn(
             &conn,
@@ -17437,7 +17635,7 @@ fn cloud_mcp_todo_mirror_dispatch_rows_from_conn(
         params.push(now_ms.saturating_sub(max_age_ms).to_string());
     }
     if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
-        clauses.push("repo_id=?".to_string());
+        clauses.push("(repo_id=? OR repo_id='')".to_string());
         params.push(repo_id.to_string());
     }
     let include_all = cloud_mcp_payload_bool(input, &["include_all"], false)
@@ -20028,6 +20226,188 @@ mod cloud_mcp_tests {
         assert_eq!(status["count"].as_u64(), Some(1));
         assert_eq!(status["aggregate"]["status"].as_str(), Some("running"));
         assert_eq!(status["terminal"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn todo_mirror_cancel_replaces_repo_scoped_queued_duplicate() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let queued = json!({
+            "kind": "todo_status",
+            "items": [{
+                "dispatchId": "dispatch-1",
+                "commandId": "command-1",
+                "todoId": "todo-1",
+                "todoWorkspaceId": "workspace-a",
+                "targetWorkspaceId": "workspace-a",
+                "targetDeviceId": "device-a",
+                "dispatchStatus": "queued",
+                "updatedAt": "2026-06-07T00:00:00Z"
+            }]
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            Some("repo-1"),
+            Some("workspace-a"),
+            &queued,
+        )
+        .unwrap());
+
+        let cancelled = json!({
+            "kind": "todo_status",
+            "items": [{
+                "dispatchId": "dispatch-1",
+                "commandId": "command-1",
+                "todoId": "todo-1",
+                "todoWorkspaceId": "workspace-a",
+                "targetWorkspaceId": "workspace-a",
+                "targetDeviceId": "device-a",
+                "dispatchStatus": "cancelled",
+                "updatedAt": "2026-06-07T00:01:00Z"
+            }]
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            &cancelled,
+        )
+        .unwrap());
+
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_todo_mirror_rows WHERE dispatch_id='dispatch-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+        let status = cloud_mcp_todo_mirror_status_from_conn(
+            &conn,
+            Some("repo-1"),
+            Some("workspace-a"),
+            &json!({"dispatch_id": "dispatch-1"}),
+            None,
+        )
+        .expect("cancelled status");
+        assert_eq!(status["count"].as_u64(), Some(1));
+        assert_eq!(status["items"][0]["dispatchStatus"].as_str(), Some("cancelled"));
+        assert_eq!(status["aggregate"]["terminal"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn todo_mirror_key_uses_row_workspace_when_payload_context_is_missing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "kind": "todo_status",
+            "items": [{
+                "dispatchId": "dispatch-row-workspace",
+                "commandId": "command-row-workspace",
+                "targetWorkspaceId": "workspace-row",
+                "dispatchStatus": "queued",
+                "updatedAt": "2026-06-07T00:00:00Z"
+            }]
+        });
+
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &response,
+        )
+        .unwrap());
+
+        let (key, workspace_id): (String, String) = conn
+            .query_row(
+                "SELECT key, workspace_id FROM workspace_todo_mirror_rows WHERE dispatch_id='dispatch-row-workspace'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected_key_prefix = format!(
+            "{}::dispatch::",
+            cloud_mcp_todo_mirror_entry_key(
+                Some("https://cloud.example"),
+                None,
+                Some("workspace-row")
+            )
+        );
+        assert!(key.starts_with(&expected_key_prefix));
+        assert_eq!(workspace_id, "workspace-row");
+
+        let status = cloud_mcp_todo_mirror_status_from_conn(
+            &conn,
+            None,
+            Some("workspace-row"),
+            &json!({"dispatch_id": "dispatch-row-workspace"}),
+            None,
+        )
+        .expect("workspace-scoped status");
+        assert_eq!(status["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn todo_mirror_dedupe_prefers_terminal_dispatch_status() {
+        let rows = cloud_mcp_todo_mirror_rows_from_response(&json!({
+            "kind": "todo_status",
+            "items": [
+                {
+                    "dispatchId": "dispatch-1",
+                    "commandId": "command-1",
+                    "dispatchStatus": "queued",
+                    "updatedAt": "2026-06-07T00:00:00Z"
+                },
+                {
+                    "dispatchId": "dispatch-1",
+                    "commandId": "command-1",
+                    "dispatchStatus": "cancelled",
+                    "updatedAt": "2026-06-07T00:00:01Z"
+                }
+            ]
+        }));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["dispatchStatus"].as_str(), Some("cancelled"));
+        assert_eq!(rows[0]["terminal"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn todo_dispatch_status_idempotency_key_changes_with_payload() {
+        let queued = json!({
+            "todo_dispatch_id": "dispatch-1",
+            "command_id": "command-1",
+            "workspace_id": "workspace-a",
+            "status": "queued"
+        });
+        let cancelled = json!({
+            "todo_dispatch_id": "dispatch-1",
+            "command_id": "command-1",
+            "workspace_id": "workspace-a",
+            "status": "cancelled"
+        });
+        let queued_key = cloud_mcp_outbox_idempotency_key(
+            "workspace_todo_dispatch_status",
+            &queued,
+            "hash-queued",
+            None,
+        );
+        let cancelled_key = cloud_mcp_outbox_idempotency_key(
+            "workspace_todo_dispatch_status",
+            &cancelled,
+            "hash-cancelled",
+            None,
+        );
+
+        assert_ne!(queued_key, cancelled_key);
+        assert!(queued_key.contains("hash-queued"));
+        assert!(cancelled_key.contains("hash-cancelled"));
     }
 
     #[test]

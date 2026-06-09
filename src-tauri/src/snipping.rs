@@ -11,11 +11,13 @@ use xcap::{image::ImageFormat as XcapImageFormat, Monitor as XcapMonitor};
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
+const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
 const SNIPPING_TOAST_WINDOW_LABEL: &str = "snipping-toasts";
 const SNIPPING_PIN_WINDOW_PREFIX: &str = "snipping-pin";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
+const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
@@ -98,6 +100,7 @@ extern "C" {
 struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
     active_area_monitor: Arc<StdMutex<Option<SnippingAreaMonitor>>>,
+    active_area_snapshot: Arc<StdMutex<Option<xcap::image::RgbaImage>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
     asset_target: Arc<StdMutex<SnippingAssetTarget>>,
 }
@@ -107,6 +110,7 @@ impl SnippingState {
         Self {
             shortcut_manager: SnippingShortcutManager::new(),
             active_area_monitor: Arc::new(StdMutex::new(None)),
+            active_area_snapshot: Arc::new(StdMutex::new(None)),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
             asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
         }
@@ -324,6 +328,12 @@ struct SnippingSettings {
     area_snip: String,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SnippingDismissedToasts {
+    paths: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnippingEnabledUpdateRequest {
@@ -382,6 +392,14 @@ struct SnippingAnnotationEditorRequest {
     paths: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingCaptureToastDismissRequest {
+    id: Option<String>,
+    path: Option<String>,
+    local_path: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SnippingAreaMonitor {
@@ -394,6 +412,9 @@ struct SnippingAreaMonitor {
     capture_y: i32,
     capture_width: u32,
     capture_height: u32,
+    snapshot_path: Option<String>,
+    snapshot_width: u32,
+    snapshot_height: u32,
 }
 
 fn default_snipping_settings() -> SnippingSettings {
@@ -411,6 +432,15 @@ fn snipping_shortcut_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
 
     Ok(app_data_dir.join(SNIPPING_SHORTCUT_SETTINGS_FILE))
+}
+
+fn snipping_dismissed_toasts_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
+
+    Ok(app_data_dir.join(SNIPPING_DISMISSED_TOASTS_FILE))
 }
 
 fn snipping_shortcut_error_text(error: String) -> String {
@@ -926,7 +956,9 @@ fn set_snipping_enabled_for(
             SnippingShortcutAction::AreaSnip,
             settings.area_snip,
         );
+        prewarm_snipping_overlay_window(app);
     } else {
+        snipping_set_active_area_snapshot(app, None)?;
         snipping_set_active_area_monitor(app, None)?;
         snipping_close_area_overlay(app);
     }
@@ -1048,6 +1080,9 @@ fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor,
                 capture_y,
                 capture_width,
                 capture_height,
+                snapshot_path: None,
+                snapshot_width: 0,
+                snapshot_height: 0,
             });
         }
     }
@@ -1084,6 +1119,9 @@ fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor,
         capture_y,
         capture_width,
         capture_height,
+        snapshot_path: None,
+        snapshot_width: 0,
+        snapshot_height: 0,
     })
 }
 
@@ -1128,6 +1166,91 @@ fn xcap_monitor_for_full(app: &AppHandle) -> Result<XcapMonitor, String> {
         .find(|monitor| monitor.is_primary().unwrap_or(false))
         .or_else(|| XcapMonitor::all().ok().and_then(|mut monitors| monitors.drain(..).next()))
         .ok_or_else(|| "No monitor is available for screenshot capture.".to_string())
+}
+
+fn snipping_overlay_snapshot_path() -> Result<PathBuf, String> {
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let tmp_dir = root.join(".tmp");
+    fs::create_dir_all(&tmp_dir).map_err(|error| {
+        format!(
+            "Unable to create snipping temp directory {}: {error}",
+            tmp_dir.display()
+        )
+    })?;
+    Ok(tmp_dir.join(format!(
+        ".snipping-overlay-{}-{}.jpg",
+        cloud_mcp_now_ms(),
+        uuid::Uuid::new_v4()
+    )))
+}
+
+fn snipping_remove_snapshot_file(path: Option<&str>) {
+    let Some(path) = path.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let _ = fs::remove_file(path);
+}
+
+fn snipping_prepare_area_snapshot(
+    mut area_monitor: SnippingAreaMonitor,
+) -> Result<(SnippingAreaMonitor, xcap::image::RgbaImage), String> {
+    let monitor = xcap_monitor_for_area(&area_monitor)?;
+    let image = monitor
+        .capture_image()
+        .map_err(|error| format!("Unable to capture screen for area snip: {error}"))?;
+    let snapshot_path = snipping_overlay_snapshot_path()?;
+    xcap::image::DynamicImage::ImageRgba8(image.clone())
+        .to_rgb8()
+        .save_with_format(&snapshot_path, XcapImageFormat::Jpeg)
+        .map_err(|error| {
+            format!(
+                "Unable to write snipping overlay preview {}: {error}",
+                snapshot_path.display()
+            )
+        })?;
+
+    area_monitor.snapshot_width = image.width();
+    area_monitor.snapshot_height = image.height();
+    area_monitor.snapshot_path = Some(snapshot_path.display().to_string());
+    Ok((area_monitor, image))
+}
+
+fn snipping_crop_snapshot_image(
+    image: &xcap::image::RgbaImage,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    let image_width = image.width().max(1);
+    let image_height = image.height().max(1);
+    let crop_x = x.min(image_width.saturating_sub(1));
+    let crop_y = y.min(image_height.saturating_sub(1));
+    let crop_width = width.min(image_width.saturating_sub(crop_x)).max(1);
+    let crop_height = height.min(image_height.saturating_sub(crop_y)).max(1);
+    Ok(
+        xcap::image::imageops::crop_imm(image, crop_x, crop_y, crop_width, crop_height)
+            .to_image(),
+    )
+}
+
+fn snipping_crop_area_preview_snapshot(
+    area_monitor: &SnippingAreaMonitor,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    let snapshot_path = area_monitor
+        .snapshot_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "No frozen snip snapshot is available.".to_string())?;
+    let image = xcap::image::open(snapshot_path)
+        .map_err(|error| format!("Unable to read frozen snip snapshot {snapshot_path}: {error}"))?
+        .to_rgba8();
+    snipping_crop_snapshot_image(&image, x, y, width, height)
 }
 
 #[cfg(target_os = "macos")]
@@ -1324,25 +1447,93 @@ fn show_snipping_toast_window(app: &AppHandle) {
     });
 }
 
+fn snipping_capture_toast_path(value: &Value) -> Option<String> {
+    value
+        .get("path")
+        .or_else(|| value.get("localPath"))
+        .or_else(|| value.get("local_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| {
+                    item.get("path")
+                        .or_else(|| item.get("localPath"))
+                        .or_else(|| item.get("local_path"))
+                        .and_then(Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn snipping_read_dismissed_toast_paths(app: &AppHandle) -> HashSet<String> {
+    let Ok(path) = snipping_dismissed_toasts_path(app) else {
+        return HashSet::new();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    serde_json::from_str::<SnippingDismissedToasts>(&contents)
+        .map(|dismissed| {
+            dismissed
+                .paths
+                .into_iter()
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snipping_write_dismissed_toast_paths(
+    app: &AppHandle,
+    paths: &HashSet<String>,
+) -> Result<(), String> {
+    let file = snipping_dismissed_toasts_path(app)?;
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create snipping settings directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut sorted_paths = paths.iter().cloned().collect::<Vec<_>>();
+    sorted_paths.sort();
+    let contents = serde_json::to_string_pretty(&SnippingDismissedToasts {
+        paths: sorted_paths,
+    })
+    .map_err(|error| format!("Unable to serialize dismissed snips: {error}"))?;
+    fs::write(&file, contents)
+        .map_err(|error| format!("Unable to write dismissed snips {}: {error}", file.display()))
+}
+
+fn snipping_capture_toast_is_dismissed(value: &Value, dismissed_paths: &HashSet<String>) -> bool {
+    snipping_capture_toast_path(value)
+        .map(|path| dismissed_paths.contains(&path))
+        .unwrap_or(false)
+}
+
 fn snipping_push_recent_capture_toast(app: &AppHandle, payload: Value) {
+    let dismissed_paths = snipping_read_dismissed_toast_paths(app);
+    if snipping_capture_toast_is_dismissed(&payload, &dismissed_paths) {
+        return;
+    }
+
     let recent_capture_toasts = app.state::<SnippingState>().recent_capture_toasts.clone();
     let Ok(mut guard) = recent_capture_toasts.lock() else {
         return;
     };
 
-    let path = payload
-        .get("path")
-        .or_else(|| payload.get("localPath"))
-        .or_else(|| payload.get("local_path"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    if !path.is_empty() {
+    if let Some(path) = snipping_capture_toast_path(&payload) {
         guard.retain(|item| {
-            item.get("path")
-                .or_else(|| item.get("localPath"))
-                .or_else(|| item.get("local_path"))
-                .and_then(Value::as_str)
+            snipping_capture_toast_path(item)
                 .map(|item_path| item_path != path)
                 .unwrap_or(true)
         });
@@ -1352,16 +1543,76 @@ fn snipping_push_recent_capture_toast(app: &AppHandle, payload: Value) {
 }
 
 fn snipping_recent_capture_toasts_for(app: &AppHandle) -> Value {
+    let dismissed_paths = snipping_read_dismissed_toast_paths(app);
     let items = app
         .state::<SnippingState>()
         .recent_capture_toasts
         .lock()
-        .map(|guard| guard.clone())
+        .map(|guard| {
+            guard
+                .iter()
+                .filter(|item| !snipping_capture_toast_is_dismissed(item, &dismissed_paths))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     json!({
         "kind": "snipping_recent_capture_toasts",
         "items": items,
     })
+}
+
+fn snipping_dismiss_capture_toast_for(
+    app: &AppHandle,
+    request: SnippingCaptureToastDismissRequest,
+) -> Result<Value, String> {
+    let dismissed_path = request
+        .path
+        .or(request.local_path)
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
+    let dismissed_id = request
+        .id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty());
+
+    let mut dismissed_paths = snipping_read_dismissed_toast_paths(app);
+    if let Some(path) = dismissed_path.as_ref() {
+        dismissed_paths.insert(path.clone());
+        snipping_write_dismissed_toast_paths(app, &dismissed_paths)?;
+    }
+
+    let recent_capture_toasts = app.state::<SnippingState>().recent_capture_toasts.clone();
+    if let Ok(mut guard) = recent_capture_toasts.lock() {
+        guard.retain(|item| {
+            let path_matches = dismissed_path
+                .as_ref()
+                .and_then(|path| snipping_capture_toast_path(item).map(|item_path| item_path == *path))
+                .unwrap_or(false);
+            let id_matches = dismissed_id
+                .as_ref()
+                .and_then(|id| {
+                    item.get("id")
+                        .or_else(|| item.get("untrackedId"))
+                        .or_else(|| item.get("untracked_id"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            item.get("item").and_then(|nested| {
+                                nested
+                                    .get("id")
+                                    .or_else(|| nested.get("untrackedId"))
+                                    .or_else(|| nested.get("untracked_id"))
+                                    .and_then(Value::as_str)
+                            })
+                        })
+                        .map(|item_id| item_id == id)
+                })
+                .unwrap_or(false);
+            !(path_matches || id_matches)
+        });
+    }
+
+    Ok(snipping_recent_capture_toasts_for(app))
 }
 
 fn snipping_prepare_capture_path(mode: &str) -> Result<(PathBuf, PathBuf), String> {
@@ -1778,8 +2029,10 @@ fn ensure_snipping_overlay_window(
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
-    .focused(true)
+    .focused(false)
     .accept_first_mouse(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
     .transparent(true)
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
@@ -1791,6 +2044,19 @@ fn ensure_snipping_overlay_window(
     Ok(window)
 }
 
+fn prewarm_snipping_overlay_window(app: &AppHandle) {
+    let app_for_task = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Ok(monitor) = snipping_current_area_monitor(&app_for_task) else {
+            return;
+        };
+        let Ok(window) = ensure_snipping_overlay_window(&app_for_task, &monitor) else {
+            return;
+        };
+        let _ = window.hide();
+    });
+}
+
 fn snipping_set_active_area_monitor(
     app: &AppHandle,
     monitor: Option<SnippingAreaMonitor>,
@@ -1800,8 +2066,49 @@ fn snipping_set_active_area_monitor(
         .active_area_monitor
         .lock()
         .map_err(|_| "Unable to lock snipping overlay state.".to_string())?;
-    *guard = monitor;
+    let next_snapshot_path = monitor
+        .as_ref()
+        .and_then(|next_monitor| next_monitor.snapshot_path.as_deref())
+        .map(str::to_string);
+    let previous = std::mem::replace(&mut *guard, monitor);
+    if let Some(previous_monitor) = previous {
+        let previous_snapshot_path = previous_monitor.snapshot_path.as_deref();
+        if previous_snapshot_path != next_snapshot_path.as_deref() {
+            snipping_remove_snapshot_file(previous_snapshot_path);
+        }
+    }
     Ok(())
+}
+
+fn snipping_set_active_area_snapshot(
+    app: &AppHandle,
+    snapshot: Option<xcap::image::RgbaImage>,
+) -> Result<(), String> {
+    let state = app.state::<SnippingState>();
+    let mut guard = state
+        .active_area_snapshot
+        .lock()
+        .map_err(|_| "Unable to lock snipping snapshot state.".to_string())?;
+    *guard = snapshot;
+    Ok(())
+}
+
+fn snipping_crop_active_area_snapshot(
+    app: &AppHandle,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    let state = app.state::<SnippingState>();
+    let guard = state
+        .active_area_snapshot
+        .lock()
+        .map_err(|_| "Unable to lock snipping snapshot state.".to_string())?;
+    let image = guard
+        .as_ref()
+        .ok_or_else(|| "No frozen snip snapshot is available.".to_string())?;
+    snipping_crop_snapshot_image(image, x, y, width, height)
 }
 
 fn snipping_active_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
@@ -1821,13 +2128,17 @@ fn snipping_begin_area_snip_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
-    let monitor = snipping_current_area_monitor(app)?;
+    let (monitor, snapshot) = snipping_prepare_area_snapshot(snipping_current_area_monitor(app)?)?;
+    snipping_set_active_area_snapshot(app, Some(snapshot))?;
     snipping_set_active_area_monitor(app, Some(monitor.clone()))?;
     let window = ensure_snipping_overlay_window(app, &monitor)?;
+    let _ = window.emit(SNIPPING_AREA_OVERLAY_STARTED_EVENT, json!({
+        "kind": "snipping_area_overlay_started",
+        "monitor": monitor.clone(),
+    }));
     window
         .show()
         .map_err(|error| format!("Unable to show snipping overlay: {error}"))?;
-    let _ = window.set_focus();
 
     Ok(json!({
         "kind": "snipping_area_started",
@@ -1879,12 +2190,32 @@ fn snipping_finish_area_snip_for(
     let selection_height = (request.height.max(0.0) * scale_factor).round() as u32;
 
     if selection_width < SNIPPING_MIN_AREA_PIXELS || selection_height < SNIPPING_MIN_AREA_PIXELS {
+        snipping_set_active_area_snapshot(app, None)?;
         snipping_set_active_area_monitor(app, None)?;
-        snipping_close_area_overlay(app);
+        snipping_hide_area_overlay(app);
         return Err("Snip area is too small.".to_string());
     }
 
     let image_result = (|| -> Result<xcap::image::RgbaImage, String> {
+        if area_monitor.snapshot_path.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
+            return snipping_crop_active_area_snapshot(
+                app,
+                selection_x,
+                selection_y,
+                selection_width,
+                selection_height,
+            )
+            .or_else(|_| {
+                snipping_crop_area_preview_snapshot(
+                    &area_monitor,
+                    selection_x,
+                    selection_y,
+                    selection_width,
+                    selection_height,
+                )
+            });
+        }
+
         let monitor = xcap_monitor_for_area(&area_monitor)?;
         let monitor_width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
         let monitor_height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
@@ -1894,8 +2225,9 @@ fn snipping_finish_area_snip_for(
         let height = selection_height.min(monitor_height.saturating_sub(y)).max(1);
         snipping_capture_area_image(app, &monitor, x, y, width, height)
     })();
+    snipping_set_active_area_snapshot(app, None)?;
     snipping_set_active_area_monitor(app, None)?;
-    snipping_close_area_overlay(app);
+    snipping_hide_area_overlay(app);
     snipping_save_image(app, image_result?, "area", "overlay", String::new())
 }
 
@@ -1991,6 +2323,14 @@ fn snipping_recent_capture_toasts(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn snipping_dismiss_capture_toast(
+    app: AppHandle,
+    request: SnippingCaptureToastDismissRequest,
+) -> Result<Value, String> {
+    snipping_dismiss_capture_toast_for(&app, request)
+}
+
+#[tauri::command]
 fn snipping_set_asset_target(
     app: AppHandle,
     request: SnippingAssetTargetRequest,
@@ -2055,8 +2395,9 @@ fn snipping_copy_untracked_asset_to_clipboard(path: String) -> Result<Value, Str
 
 #[tauri::command]
 fn snipping_cancel_area_snip(app: AppHandle) -> Result<Value, String> {
+    snipping_set_active_area_snapshot(&app, None)?;
     snipping_set_active_area_monitor(&app, None)?;
-    snipping_close_area_overlay(&app);
+    snipping_hide_area_overlay(&app);
     Ok(json!({
         "kind": "snipping_area_cancelled",
     }))

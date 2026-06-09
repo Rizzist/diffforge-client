@@ -10194,7 +10194,7 @@ impl CoordinationKernel {
         if root == self.paths.repo_path.as_path() {
             crate::ensure_architecture_agent_guide(root)?;
         }
-        let contract = diffforge_agent_contract_markdown();
+        let contract = diffforge_agent_contract_markdown(root != self.paths.repo_path.as_path());
         let mut generated = Vec::new();
         if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
             generated.push("AGENTS.md");
@@ -25595,7 +25595,21 @@ enum GeneratedFileCleanup {
     Unchanged,
 }
 
-fn diffforge_agent_contract_markdown() -> String {
+fn diffforge_agent_contract_markdown(managed_terminal: bool) -> String {
+    if !managed_terminal {
+        return format!(
+            "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
+# Diff Forge workspace note\n\n\
+This repository is known to Diff Forge, but ordinary terminals opened outside Diff Forge AI are not managed agent sessions. Work normally from the visible project root unless the user asks otherwise; do not use Diff Forge coordination lifecycle MCP tools from an outside terminal.\n\n\
+Managed Diff Forge AI terminals receive private session-scoped launch config, environment, and worktree instructions separately. If this file is visible in a regular terminal, it is informational only and does not require task leases, patch submission, or agent worktree routing.\n\n\
+## Architecture Graphs\n\n\
+- Diff Forge architecture graphs are repo-scoped artifacts under `.agents/architectures`.\n\
+- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `.agents/architectures/graphs/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
+- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
+- Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality`, and api-corridor route/step props when updating existing graphs.\n\
+{DIFFFORGE_AGENT_CONTRACT_END}\n"
+        );
+    }
     format!(
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge agent coordination contract\n\n\
@@ -27720,9 +27734,10 @@ mod tests {
         assert!(!repo.join(".codex").join("config.toml").exists());
         assert!(!repo.join(".claude").join("settings.local.json").exists());
         let repo_agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
-        assert!(repo_agents.contains("visible project root"));
-        assert!(repo_agents.contains("COORDINATION_AGENT_BRANCH_ROOT"));
-        assert!(repo_agents.contains("coordination-kernel.submit_patch"));
+        assert!(repo_agents.contains("ordinary terminals opened outside Diff Forge AI"));
+        assert!(repo_agents.contains("informational only"));
+        assert!(!repo_agents.contains("COORDINATION_AGENT_BRANCH_ROOT"));
+        assert!(!repo_agents.contains("coordination-kernel.submit_patch"));
         let worktree_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap();
         assert!(worktree_agents.contains("coordination-kernel.start_task"));
         let worktree_codex =
@@ -28802,6 +28817,7 @@ Appwrite > Session Store: create session
                 repo_path: Some(process_path_text(&repo)),
                 agent_id: Some(agent_id.clone()),
                 agent_slot_id,
+                session_id: Some(session_id.clone()),
                 slot_key,
                 ..crate::coordination::mcp::McpContext::default()
             },

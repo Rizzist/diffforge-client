@@ -50,6 +50,14 @@ pub const TOOL_NAMES: &[&str] = &[
     "submit_patch",
     "submit_patch_status",
 ];
+const TERMINAL_SESSION_TOOL_NAMES: &[&str] = &[
+    "start_task",
+    "acquire_lease",
+    "checkpoint",
+    "complete_task",
+    "submit_patch",
+    "submit_patch_status",
+];
 const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "workspace_mcp__sync_manifest",
     "workspace_mcp__list_servers",
@@ -3025,20 +3033,21 @@ fn handle_json_rpc(context: &McpContext, request: Value) -> Value {
             })
         }
         "tools/list" => {
+            let tools = coordination_tools_for_context(context);
             record_mcp_client_event_async(
                 context,
                 "mcp_agent_tools_listed",
                 json!({
                     "method": "tools/list",
-                    "tool_count": TOOL_NAMES.len(),
-                    "tools": TOOL_NAMES,
+                    "tool_count": tools.len(),
+                    "tools": tools,
                 }),
             );
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "tools": TOOL_NAMES.iter().map(|name| json!({
+                    "tools": tools.iter().map(|name| json!({
                         "name": name,
                         "description": tool_description(name),
                         "inputSchema": tool_input_schema(name)
@@ -3161,8 +3170,27 @@ fn record_mcp_client_event_async(context: &McpContext, event_type: &'static str,
     });
 }
 
+fn coordination_context_has_terminal_session(context: &McpContext) -> bool {
+    context
+        .session_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn coordination_tools_for_context(context: &McpContext) -> Vec<&'static str> {
+    if coordination_context_has_terminal_session(context) {
+        return TOOL_NAMES.to_vec();
+    }
+    TOOL_NAMES
+        .iter()
+        .copied()
+        .filter(|tool| !TERMINAL_SESSION_TOOL_NAMES.contains(tool))
+        .collect()
+}
+
 pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Value {
-    if !TOOL_NAMES.contains(&tool) {
+    let allowed_tools = coordination_tools_for_context(context);
+    if !allowed_tools.contains(&tool) {
         record_mcp_client_event(
             context,
             "mcp_agent_tool_failed",
@@ -3176,7 +3204,7 @@ pub fn dispatch_tool(context: &McpContext, tool: &str, mut input: Value) -> Valu
         return api_error(
             "unknown_tool",
             format!("Unknown coordination tool: {tool}"),
-            json!({"allowed_tools": TOOL_NAMES}),
+            json!({"allowed_tools": allowed_tools}),
         );
     }
     let explicit_task_id = value_has_nonempty_string(&input, "task_id");
@@ -5734,6 +5762,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("todo_id"));
+    }
+
+    #[test]
+    fn lifecycle_tools_are_hidden_without_terminal_session_context() {
+        let external_context = McpContext::default();
+        let external_tools = coordination_tools_for_context(&external_context);
+        for tool in TERMINAL_SESSION_TOOL_NAMES {
+            assert!(!external_tools.contains(tool));
+        }
+        assert!(external_tools.contains(&"create_plan"));
+
+        let denied = dispatch_tool(
+            &external_context,
+            "start_task",
+            json!({"plan": "Patch code"}),
+        );
+        assert_eq!(denied["ok"].as_bool(), Some(false));
+        assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
+        assert!(!denied["error"]["details"]["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.as_str() == Some("start_task")));
+
+        let session_context = McpContext {
+            session_id: Some("session-1".to_string()),
+            ..McpContext::default()
+        };
+        let session_tools = coordination_tools_for_context(&session_context);
+        for tool in TERMINAL_SESSION_TOOL_NAMES {
+            assert!(session_tools.contains(tool));
+        }
     }
 
     #[test]

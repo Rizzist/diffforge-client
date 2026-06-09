@@ -14,6 +14,7 @@ const REFRESH_DEBOUNCE_MS = 180;
 const CARD_LIMIT = 6;
 const VISIBLE_CARD_LIMIT = 4;
 const RECENT_FINISHED_MS = 5 * 60 * 1000;
+const WORKSPACE_TODOS_CACHE_KEY = "diffforge.activityOverlay.workspaceTodos";
 
 function runOverlayWindowAction(action) {
   try {
@@ -50,6 +51,29 @@ function dataValue(value) {
   const object = jsonObject(value);
   const data = jsonObject(object?.data);
   return data || object || {};
+}
+
+function readCachedWorkspaceTodos() {
+  if (typeof window === "undefined") {
+    return {};
+  }
+  try {
+    return jsonObject(window.localStorage.getItem(WORKSPACE_TODOS_CACHE_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeCachedWorkspaceTodos(value) {
+  const workspaceTodos = jsonObject(value);
+  if (typeof window === "undefined" || !workspaceTodos) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(WORKSPACE_TODOS_CACHE_KEY, JSON.stringify(workspaceTodos));
+  } catch {
+    // Cache hydration is best-effort; the Rust mirror remains the source of truth.
+  }
 }
 
 function numberValue(value, fallback = 0) {
@@ -734,6 +758,7 @@ function selectActivityCards(todoCards, transferCards) {
 
 function useActivityOverlayData() {
   const [state, setState] = useState({
+    cachedWorkspaceTodos: readCachedWorkspaceTodos(),
     cloudStatus: null,
     errors: [],
     library: null,
@@ -747,6 +772,26 @@ function useActivityOverlayData() {
       return;
     }
     refreshInFlightRef.current = true;
+    const cachedTodosPromise = invoke("cloud_mcp_get_cached_workspace_todos")
+      .then((value) => {
+        const cachedWorkspaceTodos = jsonObject(value) || {};
+        writeCachedWorkspaceTodos(cachedWorkspaceTodos);
+        setState((current) => ({
+          ...current,
+          cachedWorkspaceTodos,
+          errors: current.errors.filter((entry) => entry !== "todos"),
+          updatedAt: Date.now(),
+        }));
+        return cachedWorkspaceTodos;
+      })
+      .catch(() => {
+        setState((current) => ({
+          ...current,
+          errors: Array.from(new Set([...current.errors, "todos"])),
+          updatedAt: Date.now(),
+        }));
+        return null;
+      });
     const [cloudStatusResult, libraryResult] = await Promise.allSettled([
       invoke("cloud_mcp_get_status"),
       invoke("cloud_mcp_list_workspace_assets", {
@@ -756,18 +801,32 @@ function useActivityOverlayData() {
         repoPath: "",
       }),
     ]);
+    const refreshedWorkspaceTodos = await cachedTodosPromise;
     refreshInFlightRef.current = false;
     setState((current) => {
       const errors = [];
+      if (!refreshedWorkspaceTodos) {
+        errors.push("todos");
+      }
       if (cloudStatusResult.status === "rejected") {
         errors.push("cloud");
       }
       if (libraryResult.status === "rejected") {
         errors.push("assets");
       }
+      const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
+      const cachedWorkspaceTodos = refreshedWorkspaceTodos || current.cachedWorkspaceTodos;
+      const cloudWorkspaceTodos = cloudStatusResult.status === "fulfilled"
+        ? workspaceTodosFromStatus(cloudStatus)
+        : {};
+      const nextWorkspaceTodos = Object.keys(cloudWorkspaceTodos).length
+        ? cloudWorkspaceTodos
+        : cachedWorkspaceTodos;
+      writeCachedWorkspaceTodos(nextWorkspaceTodos);
       return {
         ...current,
-        cloudStatus: cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus,
+        cachedWorkspaceTodos: nextWorkspaceTodos,
+        cloudStatus,
         errors,
         library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
         updatedAt: Date.now(),
@@ -839,7 +898,10 @@ function useActivityOverlayData() {
 
 export default function ActivityOverlayWindow() {
   const data = useActivityOverlayData();
-  const todoCards = useMemo(() => normalizeTodoCards(data.cloudStatus), [data.cloudStatus]);
+  const todoCards = useMemo(
+    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }),
+    [data.cachedWorkspaceTodos],
+  );
   const transferCards = useMemo(
     () => normalizeTransferCards(data.library),
     [data.library],
@@ -902,19 +964,6 @@ export default function ActivityOverlayWindow() {
           data-tone={statusToneName}
           onMouseDown={dragOverlayWindow}
         >
-          <OverlayChrome data-tauri-drag-region>
-            <ChromeLights aria-hidden="true">
-              <ChromeLight />
-              <ChromeLight />
-              <ChromeLight />
-            </ChromeLights>
-            <ForgeMark aria-hidden="true">df</ForgeMark>
-            <ChromeCopy>
-              <ChromeTitle>Diff Forge AI</ChromeTitle>
-              <ChromeMeta>{hasWork ? `${totalCount} local items` : "local work quiet"}</ChromeMeta>
-            </ChromeCopy>
-          </OverlayChrome>
-
           <OverlayBody data-tauri-drag-region aria-live="polite">
             {visibleCards.length ? visibleCards.map(renderRow) : (
               <ListEmpty data-tauri-drag-region>No local activity</ListEmpty>
@@ -958,10 +1007,10 @@ const MinimalRoot = styled.main`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 9px 11px 8px;
+  padding: 11px 12px 8px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   color: var(--forge-text, #f4f7fa);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
@@ -1000,89 +1049,6 @@ const MinimalRoot = styled.main`
   &:active {
     cursor: grabbing;
   }
-`;
-
-const OverlayChrome = styled.header`
-  flex: 0 0 33px;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: auto 24px minmax(0, 1fr);
-  align-items: center;
-  gap: 9px;
-  padding: 0 1px 8px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.075);
-  cursor: grab;
-  -webkit-app-region: drag;
-
-  &:active {
-    cursor: grabbing;
-  }
-`;
-
-const ChromeLights = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 6px;
-`;
-
-const ChromeLight = styled.span`
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: rgba(238, 98, 88, 0.58);
-
-  &:nth-child(2) {
-    background: rgba(224, 165, 65, 0.52);
-  }
-
-  &:nth-child(3) {
-    background: rgba(48, 180, 116, 0.5);
-  }
-`;
-
-const ForgeMark = styled.div`
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  border: 1px solid rgba(240, 244, 248, 0.08);
-  border-radius: 7px;
-  color: rgba(245, 247, 250, 0.82);
-  background: rgba(255, 255, 255, 0.075);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 9px;
-  font-weight: 760;
-  line-height: 1;
-`;
-
-const ChromeCopy = styled.div`
-  min-width: 0;
-  display: grid;
-  gap: 3px;
-`;
-
-const ChromeTitle = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: rgba(245, 247, 250, 0.9);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const ChromeMeta = styled.div`
-  min-width: 0;
-  overflow: hidden;
-  color: rgba(182, 192, 204, 0.54);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 9px;
-  font-weight: 560;
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 `;
 
 const OverlayBody = styled.div`

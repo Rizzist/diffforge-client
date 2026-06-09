@@ -277,8 +277,23 @@ export default function SnippingQuickAccess() {
     }
   }, [snips.length]);
 
-  const dismissSnip = useCallback((snipId) => {
-    setSnips((current) => current.filter((snip) => snip.id !== snipId));
+  const dismissSnip = useCallback((snipOrId) => {
+    const snipId = typeof snipOrId === "string" ? snipOrId : text(snipOrId?.id);
+    const localPath = typeof snipOrId === "string" ? "" : assetLocalPath(snipOrId);
+    if (!snipId && !localPath) return;
+
+    setSnips((current) => current.filter((snip) => (
+      snip.id !== snipId && snip.localPath !== localPath
+    )));
+
+    if (localPath) {
+      invoke("snipping_dismiss_capture_toast", {
+        request: {
+          id: snipId,
+          path: localPath,
+        },
+      }).catch(() => {});
+    }
   }, []);
 
   const runSnipAction = useCallback(async (snip, action) => {
@@ -295,7 +310,7 @@ export default function SnippingQuickAccess() {
     try {
       if (action === "delete") {
         await invoke("diffforge_delete_untracked_asset", { path: snip.localPath });
-        dismissSnip(snip.id);
+        dismissSnip(snip);
       } else if (action === "copy") {
         const status = await copySnipToClipboard(snip);
         setTransientStatus(setSnips, snip.id, status);
@@ -336,9 +351,6 @@ export default function SnippingQuickAccess() {
       <QuickAccessRoot aria-label="Snip quick access" aria-live="polite">
         {snips.map((snip) => {
           const busy = busyIds.has(snip.id);
-          const dimensions = snip.width > 0 && snip.height > 0
-            ? `${Math.round(snip.width)} x ${Math.round(snip.height)}`
-            : "";
 
           return (
             <QuickAccessCard data-busy={busy ? "true" : "false"} key={snip.id}>
@@ -346,14 +358,9 @@ export default function SnippingQuickAccess() {
                 {snip.previewUrl ? (
                   <img alt={snip.name} draggable={false} src={snip.previewUrl} />
                 ) : (
-                  <span>{snip.name}</span>
+                  <span>Preview unavailable</span>
                 )}
               </QuickAccessPreview>
-
-              <QuickAccessBody>
-                <strong>{snip.name}</strong>
-                <span>{snip.status || dimensions || "Untracked snip"}</span>
-              </QuickAccessBody>
 
               <QuickAccessActions>
                 <QuickAccessButton aria-label={`Copy ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "copy")} title="Copy image" type="button">
@@ -373,7 +380,7 @@ export default function SnippingQuickAccess() {
                 </QuickAccessButton>
               </QuickAccessActions>
 
-              <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip.id)} title="Dismiss" type="button">
+              <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip)} title="Dismiss" type="button">
                 <Close aria-hidden="true" />
               </QuickAccessDismissButton>
             </QuickAccessCard>
@@ -876,108 +883,86 @@ const QuickAccessRoot = styled.aside`
 
 const QuickAccessCard = styled.article`
   position: relative;
-  display: grid;
-  grid-template-columns: 96px minmax(0, 1fr);
-  align-items: center;
-  width: 292px;
-  min-height: 92px;
-  padding: 8px;
-  gap: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 16px;
-  background: rgba(9, 12, 18, 0.82);
-  box-shadow:
-    0 18px 42px rgba(0, 0, 0, 0.34),
-    0 0 0 1px rgba(0, 0, 0, 0.2);
+  display: inline-grid;
+  width: fit-content;
+  max-width: calc(100vw - 24px);
+  padding: 0;
+  border: 0;
+  border-radius: 18px;
+  background: transparent;
   pointer-events: auto;
   transform: translateX(0);
   transition:
-    border-color 150ms ease,
-    box-shadow 150ms ease,
     transform 150ms ease;
 
   &:hover,
   &:focus-within {
-    border-color: rgba(255, 255, 255, 0.34);
-    box-shadow:
-      0 22px 52px rgba(0, 0, 0, 0.44),
-      0 0 0 1px rgba(255, 255, 255, 0.09);
     transform: translateX(2px);
   }
 `;
 
 const QuickAccessPreview = styled.div`
-  width: 96px;
-  height: 72px;
+  display: grid;
+  width: fit-content;
+  max-width: min(292px, calc(100vw - 24px));
+  max-height: 210px;
   overflow: hidden;
-  border-radius: 11px;
-  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 18px;
+  background: rgba(9, 12, 18, 0.72);
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.36),
+    0 0 0 1px rgba(0, 0, 0, 0.18);
 
   img {
     display: block;
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
+    width: auto;
+    height: auto;
+    max-width: min(292px, calc(100vw - 24px));
+    max-height: 210px;
+    object-fit: contain;
     user-select: none;
   }
 
   span {
     display: grid;
-    width: 100%;
-    height: 100%;
+    width: 220px;
+    height: 132px;
     place-items: center;
-    padding: 8px;
+    padding: 16px;
     color: rgba(248, 250, 252, 0.62);
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 800;
     text-align: center;
   }
 `;
 
-const QuickAccessBody = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 4px;
-  padding-right: 4px;
-
-  strong,
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  strong {
-    color: #f8fafc;
-    font-size: 13px;
-    font-weight: 850;
-  }
-
-  span {
-    color: rgba(248, 250, 252, 0.62);
-    font-size: 11px;
-    font-weight: 700;
-  }
-`;
-
 const QuickAccessActions = styled.div`
   position: absolute;
-  right: 8px;
+  left: 50%;
   bottom: 8px;
   z-index: 2;
   display: inline-flex;
   gap: 5px;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  background: rgba(7, 10, 16, 0.72);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(14px);
   opacity: 0;
-  transform: translateY(4px);
+  pointer-events: none;
+  transform: translate(-50%, 6px);
   transition:
     opacity 140ms ease,
     transform 140ms ease;
 
   ${QuickAccessCard}:hover &,
-  ${QuickAccessCard}:focus-within & {
+  ${QuickAccessCard}:focus-within &,
+  ${QuickAccessCard}[data-busy="true"] & {
     opacity: 1;
-    transform: translateY(0);
+    pointer-events: auto;
+    transform: translate(-50%, 0);
   }
 `;
 
@@ -986,11 +971,10 @@ const QuickAccessButton = styled.button`
   width: 25px;
   height: 25px;
   place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 999px;
   color: #f8fafc;
-  background: rgba(7, 10, 16, 0.72);
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.24);
+  background: rgba(255, 255, 255, 0.07);
   cursor: pointer;
 
   svg {
@@ -1021,17 +1005,20 @@ const QuickAccessButton = styled.button`
 const QuickAccessDismissButton = styled(QuickAccessButton)`
   position: absolute;
   top: 50%;
-  left: -11px;
+  left: 8px;
   z-index: 3;
   opacity: 0;
-  transform: translate(-4px, -50%);
+  pointer-events: none;
+  transform: translate(-6px, -50%);
   transition:
     opacity 140ms ease,
     transform 140ms ease;
 
   ${QuickAccessCard}:hover &,
-  ${QuickAccessCard}:focus-within & {
+  ${QuickAccessCard}:focus-within &,
+  ${QuickAccessCard}[data-busy="true"] & {
     opacity: 1;
+    pointer-events: auto;
     transform: translate(0, -50%);
   }
 `;
