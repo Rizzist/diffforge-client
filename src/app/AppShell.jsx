@@ -515,7 +515,7 @@ import {
 } from "./appStyles";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
+import ArchitectureWorkspaceView, { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
@@ -1084,6 +1084,31 @@ const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
+const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
+
+function purgeWorkspaceTodoQueueLocalStorage(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120);
+  if (!safeWorkspaceId || typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+  try {
+    const doomedKeys = [];
+    for (let index = 0; index < window.localStorage.length; index += 1) {
+      const key = window.localStorage.key(index) || "";
+      if (
+        key.startsWith(TODO_QUEUE_WORKSPACE_STORAGE_PREFIX)
+        && key.endsWith(`.${safeWorkspaceId}`)
+      ) {
+        doomedKeys.push(key);
+      }
+    }
+    doomedKeys.forEach((key) => window.localStorage.removeItem(key));
+  } catch {
+    // Workspace deletion should not fail on storage cleanup.
+  }
+}
 
 function normalizeWorkspaceThreadPromptAcceptanceText(value) {
   return String(value || "")
@@ -4781,8 +4806,17 @@ function normalizeWorkspaceSettings(value) {
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
         const rootWasEmptyAtSelection = Boolean(settings?.rootWasEmptyAtSelection);
+        const gitWorktreesEnabled = Boolean(settings?.gitWorktreesEnabled);
 
-        if (!workspaceId || (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT && !hasCustomTerminalRoles)) {
+        if (
+          !workspaceId
+          || (
+            !rootDirectory
+            && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
+            && !hasCustomTerminalRoles
+            && !gitWorktreesEnabled
+          )
+        ) {
           return null;
         }
 
@@ -4791,6 +4825,7 @@ function normalizeWorkspaceSettings(value) {
           {
             rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
             rootWasEmptyAtSelection: rootDirectory ? rootWasEmptyAtSelection : false,
+            gitWorktreesEnabled,
             terminalCount,
             terminalRoles,
           },
@@ -5326,6 +5361,10 @@ function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
   return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
 }
 
+function getWorkspaceGitWorktreesEnabled(workspaceSettings, workspaceId) {
+  return Boolean(workspaceSettings?.[workspaceId]?.gitWorktreesEnabled);
+}
+
 function workspaceRuntimeActivationKey(workspaceId, repoPath) {
   const safeWorkspaceId = String(workspaceId || "").trim();
   const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
@@ -5588,6 +5627,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const currentSettings = settings?.[workspaceId] || {};
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
   const hasRootWasEmptyAtSelection = Object.prototype.hasOwnProperty.call(nextValues, "rootWasEmptyAtSelection");
+  const hasGitWorktreesEnabled = Object.prototype.hasOwnProperty.call(nextValues, "gitWorktreesEnabled");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
@@ -5611,8 +5651,18 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     fallbackRole,
   );
   const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+  const gitWorktreesEnabled = Boolean(
+    hasGitWorktreesEnabled
+      ? nextValues.gitWorktreesEnabled
+      : currentSettings.gitWorktreesEnabled,
+  );
 
-  if (!rootDirectory && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT && !hasCustomTerminalRoles) {
+  if (
+    !rootDirectory
+    && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
+    && !hasCustomTerminalRoles
+    && !gitWorktreesEnabled
+  ) {
     delete nextSettings[workspaceId];
     return nextSettings;
   }
@@ -5620,6 +5670,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   nextSettings[workspaceId] = {
     rootDirectory,
     rootWasEmptyAtSelection,
+    gitWorktreesEnabled,
     terminalCount,
     terminalRoles,
   };
@@ -5695,6 +5746,7 @@ export default function App() {
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
+  const [workspaceGitWorktreesEnabledDraft, setWorkspaceGitWorktreesEnabledDraft] = useState(false);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
@@ -5741,6 +5793,11 @@ export default function App() {
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
   const [cloudSqliteResetSelectedWorkspaceId, setCloudSqliteResetSelectedWorkspaceId] = useState("");
   const [cloudSqliteResetSelectedRepoKeys, setCloudSqliteResetSelectedRepoKeys] = useState({});
+  const [cloudRepoCatalogState, setCloudRepoCatalogState] = useState("idle");
+  const [cloudRepoCatalog, setCloudRepoCatalog] = useState(null);
+  const [cloudRepoCatalogError, setCloudRepoCatalogError] = useState("");
+  const [cloudRepoCatalogBusyRepoId, setCloudRepoCatalogBusyRepoId] = useState("");
+  const [cloudRepoCatalogDismissedIds, setCloudRepoCatalogDismissedIds] = useState({});
   const [tokenomicsCloudResetState, setTokenomicsCloudResetState] = useState("idle");
   const [tokenomicsCloudResetMessage, setTokenomicsCloudResetMessage] = useState("");
   const [tokenomicsCloudResetError, setTokenomicsCloudResetError] = useState("");
@@ -6758,6 +6815,295 @@ export default function App() {
     });
   }, []);
 
+  const [architectureHub, setArchitectureHub] = useState({
+    catalog: null,
+    error: "",
+    state: "idle",
+    updatedAt: 0,
+  });
+  const [architectureHubGraphState, setArchitectureHubGraphState] = useState({
+    architectureGraphLists: {},
+    architectureSelectedGraphId: "",
+    architectureSelectedRepoPath: "",
+  });
+  const architectureHubRef = useRef(architectureHub);
+  architectureHubRef.current = architectureHub;
+  const architectureHubCatalogInFlightRef = useRef(false);
+  const architectureHubGraphListInFlightRef = useRef(new Set());
+
+  const architectureHubEntries = useMemo(() => {
+    const catalog = architectureHub.catalog;
+    if (!catalog || typeof catalog !== "object") return [];
+    const entries = [];
+    if (catalog.global && typeof catalog.global === "object") {
+      entries.push(catalog.global);
+    }
+    (Array.isArray(catalog.workspaces) ? catalog.workspaces : []).forEach((group) => {
+      (Array.isArray(group?.repositories) ? group.repositories : []).forEach((repo) => {
+        if (repo && typeof repo === "object") entries.push(repo);
+      });
+    });
+    (Array.isArray(catalog.orphanRepositories) ? catalog.orphanRepositories : []).forEach((repo) => {
+      if (repo && typeof repo === "object") entries.push(repo);
+    });
+    return entries;
+  }, [architectureHub.catalog]);
+
+  const findArchitectureHubEntry = useCallback((repoPath) => {
+    const key = workspaceArchitectureRepoKey(repoPath);
+    if (!key) return null;
+    return architectureHubEntries.find((entry) => (
+      workspaceArchitectureRepoKey(entry?.path || entry?.rootDirectory || entry?.root_directory) === key
+    )) || null;
+  }, [architectureHubEntries]);
+
+  const refreshArchitectureHubCatalog = useCallback((options = {}) => {
+    if (architectureHubCatalogInFlightRef.current) {
+      return Promise.resolve(architectureHubRef.current.catalog);
+    }
+    if (!options.refresh && architectureHubRef.current.catalog) {
+      return Promise.resolve(architectureHubRef.current.catalog);
+    }
+    architectureHubCatalogInFlightRef.current = true;
+    setArchitectureHub((current) => ({ ...current, error: "", state: "loading" }));
+    const workspaceList = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+      .map((workspace) => ({
+        workspaceId: graphText(workspace?.id),
+        workspaceName: graphText(workspace?.name),
+        rootDirectory: cleanWorkspaceRootDirectory(
+          getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace?.id)
+            || defaultWorkingDirectoryRef.current,
+        ),
+      }))
+      .filter((workspace) => workspace.workspaceId && workspace.rootDirectory);
+    return invoke("cloud_mcp_architecture_hub_catalog", { workspaces: workspaceList })
+      .then((catalog) => {
+        setArchitectureHub({
+          catalog,
+          error: graphText(catalog?.cloudError),
+          state: "ready",
+          updatedAt: Date.now(),
+        });
+        return catalog;
+      })
+      .catch((error) => {
+        setArchitectureHub((current) => ({
+          ...current,
+          error: getErrorMessage(error, "Unable to load the architecture catalog."),
+          state: current.catalog ? "ready" : "error",
+        }));
+        return null;
+      })
+      .finally(() => {
+        architectureHubCatalogInFlightRef.current = false;
+      });
+  }, []);
+
+  const resolveArchitectureHubSyncContext = useCallback((repoPath) => {
+    const entry = findArchitectureHubEntry(repoPath);
+    if (!entry) return null;
+    if (graphText(entry.scopeKind) === "workspace") {
+      return {
+        workspaceId: graphText(entry.workspaceId),
+        workspaceName: graphText(entry.workspaceName),
+        queueWorkspaceId: graphText(entry.workspaceId),
+        queueWorkspaceName: graphText(entry.workspaceName),
+      };
+    }
+    return {
+      workspaceId: graphText(entry.workspaceId)
+        || graphText(architectureHubRef.current.catalog?.globalWorkspaceId)
+        || "account-global",
+      workspaceName: graphText(entry.workspaceName) || graphText(entry.name),
+      queueWorkspaceId: "",
+      queueWorkspaceName: "",
+      scopeRepoId: graphText(entry.repoId),
+      scopeGitRepoIdentityId: graphText(entry.gitRepoIdentityId),
+    };
+  }, [findArchitectureHubEntry]);
+
+  const refreshArchitectureHubGraphList = useCallback((repoPath, options = {}) => {
+    const safeRepoPath = cleanWorkspaceRootDirectory(repoPath);
+    if (!safeRepoPath) return Promise.resolve([]);
+    const entry = findArchitectureHubEntry(safeRepoPath);
+    if (entry && graphText(entry.scopeKind) === "workspace") {
+      const catalogGroups = architectureHubRef.current.catalog?.workspaces;
+      const group = (Array.isArray(catalogGroups) ? catalogGroups : []).find((candidate) => (
+        graphText(candidate?.workspaceId) === graphText(entry.workspaceId)
+      ));
+      return refreshWorkspaceArchitectureGraphList(entry.workspaceId, safeRepoPath, {
+        ...options,
+        workspaceName: graphText(entry.workspaceName),
+        workspaceRootDirectory: graphText(group?.rootDirectory),
+      });
+    }
+
+    const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
+    const existingEntry = (architectureHubGraphState.architectureGraphLists || {})[repoKey] || null;
+    const existingGraphs = Array.isArray(existingEntry?.graphs) ? existingEntry.graphs : [];
+    if (!options.refresh && existingEntry?.state === "ready") {
+      return Promise.resolve(existingGraphs);
+    }
+    if (architectureHubGraphListInFlightRef.current.has(repoKey)) {
+      return Promise.resolve(existingGraphs);
+    }
+    architectureHubGraphListInFlightRef.current.add(repoKey);
+    const requestedAt = Date.now();
+    setArchitectureHubGraphState((current) => ({
+      ...current,
+      architectureGraphLists: {
+        ...(current.architectureGraphLists || {}),
+        [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+          ...(current.architectureGraphLists?.[repoKey] || {}),
+          requestedAt,
+          state: options.silent && current.architectureGraphLists?.[repoKey]?.state
+            ? current.architectureGraphLists[repoKey].state
+            : "loading",
+        }),
+      },
+    }));
+    const context = resolveArchitectureHubSyncContext(safeRepoPath) || {
+      workspaceId: "account-global",
+      workspaceName: "",
+      scopeRepoId: "",
+      scopeGitRepoIdentityId: "",
+    };
+    const localListPromise = invoke("architecture_graphs_list", { repoPath: safeRepoPath });
+    const cloudListPromise = invoke("cloud_mcp_get_workspace_architectures", {
+      repoPath: safeRepoPath,
+      workspaceId: context.workspaceId,
+      workspaceName: context.workspaceName,
+      ...(context.scopeRepoId ? {
+        scopeRepoId: context.scopeRepoId,
+        scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
+      } : {}),
+    }).catch(() => null);
+    return Promise.all([localListPromise, cloudListPromise])
+      .then(([result, cloudResult]) => {
+        const localGraphs = jsonArray(result?.graphs);
+        const cloudGraphs = jsonArray(cloudResult?.graphs || cloudResult?.architectures);
+        const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
+        if (localGraphs.length && context.workspaceId) {
+          invoke("cloud_mcp_sync_workspace_architectures", {
+            graphs: localGraphs,
+            reason: options.reason || "architecture_hub_graph_list_sync",
+            repoPath: safeRepoPath,
+            workspaceId: context.workspaceId,
+            workspaceName: context.workspaceName,
+            ...(context.scopeRepoId ? {
+              scopeRepoId: context.scopeRepoId,
+              scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
+            } : {}),
+          }).catch(() => {});
+        }
+        setArchitectureHubGraphState((current) => ({
+          ...current,
+          architectureGraphLists: {
+            ...(current.architectureGraphLists || {}),
+            [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+              architectureRoot: result?.architectureRoot || result?.architecture_root,
+              graphs,
+              navTree: graphs,
+              repoPath: safeRepoPath,
+              requestedAt,
+              state: "ready",
+              updatedAt: Date.now(),
+            }),
+          },
+        }));
+        return graphs;
+      })
+      .catch((error) => {
+        const message = getErrorMessage(error, "Unable to load architecture graphs.");
+        setArchitectureHubGraphState((current) => ({
+          ...current,
+          architectureGraphLists: {
+            ...(current.architectureGraphLists || {}),
+            [repoKey]: workspaceArchitectureGraphListEntry(safeRepoPath, {
+              ...(current.architectureGraphLists?.[repoKey] || {}),
+              error: message,
+              requestedAt,
+              state: "error",
+              updatedAt: Date.now(),
+            }),
+          },
+        }));
+        if (!options.silent) throw error;
+        return existingGraphs;
+      })
+      .finally(() => {
+        architectureHubGraphListInFlightRef.current.delete(repoKey);
+      });
+  }, [
+    architectureHubGraphState.architectureGraphLists,
+    findArchitectureHubEntry,
+    refreshWorkspaceArchitectureGraphList,
+    resolveArchitectureHubSyncContext,
+  ]);
+
+  const architectureHubGraphLists = useMemo(() => {
+    const merged = {};
+    Object.values(workspaceGraphState || {}).forEach((stateEntry) => {
+      Object.assign(merged, stateEntry?.architectureGraphLists || {});
+    });
+    Object.assign(merged, architectureHubGraphState.architectureGraphLists || {});
+    return merged;
+  }, [architectureHubGraphState.architectureGraphLists, workspaceGraphState]);
+
+  const updateArchitectureHubSelection = useCallback(({ graphId, repoPath } = {}) => {
+    setArchitectureHubGraphState((current) => {
+      const nextRepoPath = graphText(repoPath) || current.architectureSelectedRepoPath;
+      const nextGraphId = graphText(graphId);
+      if (
+        current.architectureSelectedRepoPath === nextRepoPath
+        && current.architectureSelectedGraphId === nextGraphId
+      ) {
+        return current;
+      }
+      return {
+        ...current,
+        architectureSelectedGraphId: nextGraphId,
+        architectureSelectedRepoPath: nextRepoPath,
+      };
+    });
+  }, []);
+
+  const copyArchitectureHubGraph = useCallback(({ graphId, sourceRepoPath, targetRepoPath } = {}) => {
+    const safeGraphId = graphText(graphId);
+    const safeSource = cleanWorkspaceRootDirectory(sourceRepoPath);
+    const safeTarget = cleanWorkspaceRootDirectory(targetRepoPath);
+    if (!safeGraphId || !safeSource || !safeTarget) {
+      return Promise.reject(new Error("Architecture graph copy requires a graph and target."));
+    }
+    return invoke("architecture_graph_copy", {
+      graphId: safeGraphId,
+      sourceRepoPath: safeSource,
+      targetRepoPath: safeTarget,
+    }).then((result) => {
+      const context = resolveArchitectureHubSyncContext(safeTarget);
+      if (context?.workspaceId && result?.graph) {
+        void invoke("cloud_mcp_sync_workspace_architecture", {
+          graph: result.graph,
+          reason: "architecture_graph_copy",
+          repoPath: safeTarget,
+          workspaceId: context.workspaceId,
+          workspaceName: context.workspaceName || "",
+          ...(context.scopeRepoId ? {
+            scopeRepoId: context.scopeRepoId,
+            scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
+          } : {}),
+        }).catch(() => {});
+      }
+      void refreshArchitectureHubGraphList(safeTarget, { refresh: true, silent: true });
+      return result;
+    });
+  }, [refreshArchitectureHubGraphList, resolveArchitectureHubSyncContext]);
+
+  useEffect(() => {
+    if (visibleView !== "architectures" || authState !== "authenticated") return;
+    void refreshArchitectureHubCatalog();
+  }, [authState, refreshArchitectureHubCatalog, visibleView]);
+
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
     const snapshotRepoPath = graphSnapshotRepoPath(snapshot);
@@ -7583,6 +7929,7 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceGitWorktreesEnabledDraft(false);
     setWorkspaceRootDraft("");
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
@@ -7658,6 +8005,7 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceGitWorktreesEnabledDraft(false);
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -8595,6 +8943,20 @@ export default function App() {
       } catch (error) {
         warnings.push(`Live-state cleanup warning: ${getErrorMessage(error, "Unable to notify cloud live state.")}`);
       }
+
+      try {
+        // Local todo state is removed with the workspace; the cloud keeps
+        // tombstoned rows so a recreated workspace with the same name or
+        // identity never re-imports ghost todos.
+        await invoke("cloud_mcp_archive_workspace_todos", {
+          workspaceId: targetWorkspaceId,
+          workspaceName,
+          reason: "workspace_removed",
+        });
+      } catch (error) {
+        warnings.push(`Todo cleanup warning: ${getErrorMessage(error, "Unable to archive workspace todos.")}`);
+      }
+      purgeWorkspaceTodoQueueLocalStorage(targetWorkspaceId);
 
       await invoke("delete_workspace_local_metadata", {
         repoPath,
@@ -9763,6 +10125,8 @@ export default function App() {
     );
     const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
+    const currentGitWorktreesEnabled = getWorkspaceGitWorktreesEnabled(workspaceSettings, selectedWorkspace.id);
+    const gitWorktreesEnabled = Boolean(workspaceGitWorktreesEnabledDraft);
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
       workspaceSettings,
@@ -9832,6 +10196,7 @@ export default function App() {
         [terminalIndex, terminalRoles[index]]
       )));
       const rootChanged = rootDirectory !== currentRootDirectory;
+      const gitWorktreesChanged = gitWorktreesEnabled !== currentGitWorktreesEnabled;
       const rootWasEmptyAtSelection = rootDirectory
         ? rootChanged
           ? Boolean(normalizedRoot?.emptyDirectory)
@@ -9846,7 +10211,7 @@ export default function App() {
         nextTerminalIndexSet.has(terminalIndex)
         && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
-      const terminalIndexesToClose = rootChanged
+      const terminalIndexesToClose = rootChanged || gitWorktreesChanged
         ? currentTerminalIndexes
         : Array.from(new Set([
           ...removedTerminalIndexes,
@@ -9855,7 +10220,7 @@ export default function App() {
       let nextWorkspace = selectedWorkspace;
 
 
-      if (rootChanged) {
+      if (rootChanged || gitWorktreesChanged) {
         clearPreparedWorkspaceTerminals(selectedWorkspace.id);
         workspaceAgentLaunchKeyRef.current = "";
         workspaceAgentBatchInFlightKeyRef.current = "";
@@ -9874,7 +10239,7 @@ export default function App() {
               agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
               nextTerminalCount: terminalCount,
               previousTerminalCount: currentTerminalCount,
-              reason: "settings_root_change",
+              reason: rootChanged ? "settings_root_change" : "settings_worktree_policy_change",
               terminalIndex,
               waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
               workspaceId: selectedWorkspace.id,
@@ -9940,6 +10305,15 @@ export default function App() {
         }
       }
 
+      if (nextMcpRepoPath && (rootChanged || gitWorktreesChanged)) {
+        await invoke("coordination_update_repo_policy", {
+          repoPath: nextMcpRepoPath,
+          input: {
+            agent_worktree_required: gitWorktreesEnabled,
+          },
+        });
+      }
+
       if (workspaceNameValue !== selectedWorkspace.name) {
         const result = await invoke("update_workspace", {
           token,
@@ -9962,6 +10336,7 @@ export default function App() {
         const nextSettings = updateWorkspaceLocalSettings(settings, selectedWorkspace.id, {
           rootDirectory,
           rootWasEmptyAtSelection,
+          gitWorktreesEnabled,
           terminalCount,
           terminalRoles,
         });
@@ -9970,7 +10345,7 @@ export default function App() {
         return nextSettings;
       });
 
-      if (rootChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
+      if (rootChanged || gitWorktreesChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
         const nextDisplayRows = getWorkspaceDisplayTerminalRows(
           workspaceTerminalDisplayLayoutsRef.current,
           selectedWorkspace.id,
@@ -9996,6 +10371,7 @@ export default function App() {
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
+      setWorkspaceGitWorktreesEnabledDraft(gitWorktreesEnabled);
       setWorkspaceSettingsState("idle");
       setWorkspaceSettingsMessage("Workspace settings saved.");
       closeWorkspaceSettings();
@@ -10014,6 +10390,7 @@ export default function App() {
     expireDesktopSession,
     workspaceNameDraft,
     workspaceRootDraft,
+    workspaceGitWorktreesEnabledDraft,
     workspaceTerminalCountDraft,
     workspaceTerminalRolesDraft,
     workspaceSettings,
@@ -12215,6 +12592,9 @@ export default function App() {
       workspaceSettings,
     ],
   );
+  const selectedWorkspaceGitWorktreesEnabled = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceGitWorktreesEnabled(workspaceSettings, selectedWorkspace.id)
+    : false;
   const activatedWorkspaceTerminalRoles = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
@@ -14855,6 +15235,16 @@ export default function App() {
     cloudSqliteResetRepoCards.filter((card) => Boolean(cloudSqliteResetSelectedRepoKeys?.[card.key]))
   ), [cloudSqliteResetRepoCards, cloudSqliteResetSelectedRepoKeys]);
   const cloudSqliteResetSelectedRepoCount = cloudSqliteResetSelectedRepoCards.length;
+  const cloudOrphanRepos = useMemo(() => {
+    const repos = Array.isArray(cloudRepoCatalog?.repos) ? cloudRepoCatalog.repos : [];
+    return repos.filter((repo) => {
+      const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
+      if (!repoId || cloudRepoCatalogDismissedIds?.[repoId]) {
+        return false;
+      }
+      return Boolean(repo?.orphan);
+    });
+  }, [cloudRepoCatalog, cloudRepoCatalogDismissedIds]);
   const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
     || cloudSqliteResetState === "resetting";
   const isCloudSqliteRepoResetting = cloudSqliteResetState === "repo_resetting"
@@ -15420,22 +15810,39 @@ export default function App() {
     setCloudSqliteResetState("repo_resetting");
     try {
       const checkpointMessages = [];
-      for (const repoCard of cloudSqliteResetSelectedRepoCards) {
-        const response = await invoke("cloud_mcp_reset_server_state", {
-          repoPath: repoCard.repoPath,
-          workspaceId: cloudSqliteResetWorkspaceId,
-          workspaceName: cloudSqliteResetWorkspaceName || null,
-          resetScope: "repo",
-        });
-        checkpointMessages.push(getCloudSqliteResetCheckpointMessage(unwrapCloudCommandData(response, {})));
+      const failures = [];
+      let completedCount = 0;
+      for (const [repoIndex, repoCard] of cloudSqliteResetSelectedRepoCards.entries()) {
+        setCloudSqliteResetMessage(
+          `Resetting ${repoCard.repoLabel} (${repoIndex + 1}/${repoCount})...`,
+        );
+        try {
+          const response = await invoke("cloud_mcp_reset_server_state", {
+            repoPath: repoCard.repoPath,
+            workspaceId: cloudSqliteResetWorkspaceId,
+            workspaceName: cloudSqliteResetWorkspaceName || null,
+            resetScope: "repo",
+          });
+          checkpointMessages.push(getCloudSqliteResetCheckpointMessage(unwrapCloudCommandData(response, {})));
+          completedCount += 1;
+        } catch (error) {
+          failures.push(`${repoCard.repoLabel}: ${getErrorMessage(error, "reset failed")}`);
+        }
       }
       const checkpointMessage = checkpointMessages.find((message) => message === "queued cloud checkpoint refresh")
         || checkpointMessages.find((message) => message === "refreshed cloud checkpoint")
         || checkpointMessages[0]
         || "cloud checkpoint refresh skipped";
-      setCloudSqliteResetMessage(
-        `Server state reset complete for ${repoCount} repositor${repoCount === 1 ? "y" : "ies"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
-      );
+      if (completedCount > 0) {
+        setCloudSqliteResetMessage(
+          `Server state reset complete for ${completedCount}/${repoCount} repositor${repoCount === 1 ? "y" : "ies"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
+        );
+      } else {
+        setCloudSqliteResetMessage("");
+      }
+      if (failures.length > 0) {
+        setCloudSqliteResetError(`Some repositories failed to reset — ${failures.join("; ")}`);
+      }
     } catch (error) {
       setCloudSqliteResetError(getErrorMessage(error, "Unable to reset selected repositories."));
     } finally {
@@ -15446,6 +15853,80 @@ export default function App() {
     cloudSqliteResetWorkspaceId,
     cloudSqliteResetWorkspaceName,
   ]);
+
+  const loadCloudRepoCatalog = useCallback(async () => {
+    setCloudRepoCatalogState("loading");
+    setCloudRepoCatalogError("");
+    try {
+      const response = await invoke("cloud_mcp_account_repo_catalog");
+      const data = unwrapCloudCommandData(response, {});
+      setCloudRepoCatalog(data && typeof data === "object" ? data : {});
+      setCloudRepoCatalogState("ready");
+    } catch (error) {
+      setCloudRepoCatalogError(getErrorMessage(error, "Unable to load the cloud repo catalog."));
+      setCloudRepoCatalogState("error");
+    }
+  }, []);
+
+  const deleteOrphanCloudRepo = useCallback(async (repo) => {
+    const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
+    if (!repoId) {
+      return;
+    }
+    const repoLabel = String(
+      repo?.git_repo_display_name || repo?.gitRepoDisplayName || repoId,
+    ).trim();
+    const stateTotal = Number(repo?.state_total ?? repo?.stateTotal ?? 0) || 0;
+    const confirmed = window.confirm(
+      `Delete "${repoLabel}" from the cloud? ${stateTotal} stored row${stateTotal === 1 ? "" : "s"} of repo state and its registration will be removed. Devices, billing, and tokenomics are preserved. Local files are not touched.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+    // Cloud artifacts are keyed by workspace, so target the workspace this
+    // repo was last recorded under rather than the currently selected one.
+    const recordedWorkspaceId = (Array.isArray(repo?.workspaces) ? repo.workspaces : [])
+      .map((workspace) => String(workspace?.workspace_id || workspace?.workspaceId || "").trim())
+      .find(Boolean)
+      || cloudSqliteResetWorkspaceId;
+    setCloudRepoCatalogBusyRepoId(repoId);
+    setCloudRepoCatalogError("");
+    try {
+      await invoke("cloud_mcp_reset_server_state", {
+        repoPath: cloudSqliteResetWorkspaceRoot || defaultWorkingDirectoryRef.current || "",
+        workspaceId: recordedWorkspaceId || cloudSqliteResetWorkspaceId,
+        workspaceName: null,
+        resetScope: "repo_delete",
+        repoIdOverride: repoId,
+      });
+      setCloudRepoCatalog((current) => {
+        if (!current || !Array.isArray(current.repos)) {
+          return current;
+        }
+        return {
+          ...current,
+          repos: current.repos.filter((entry) => (
+            String(entry?.repo_id || entry?.repoId || "").trim() !== repoId
+          )),
+        };
+      });
+    } catch (error) {
+      setCloudRepoCatalogError(getErrorMessage(error, `Unable to delete ${repoLabel} from the cloud.`));
+    } finally {
+      setCloudRepoCatalogBusyRepoId("");
+    }
+  }, [
+    cloudSqliteResetWorkspaceId,
+    cloudSqliteResetWorkspaceRoot,
+  ]);
+
+  const dismissOrphanCloudRepo = useCallback((repoId) => {
+    const key = String(repoId || "").trim();
+    if (!key) {
+      return;
+    }
+    setCloudRepoCatalogDismissedIds((current) => ({ ...(current || {}), [key]: true }));
+  }, []);
 
   const resetWorkspaceServerState = useCallback(async () => {
     setCloudSqliteResetMessage("");
@@ -20964,6 +21445,7 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     ));
+    setWorkspaceGitWorktreesEnabledDraft(Boolean(selectedWorkspaceGitWorktreesEnabled));
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -20972,6 +21454,7 @@ export default function App() {
     selectedWorkspace?.id,
     selectedWorkspace?.name,
     selectedWorkspaceRootDirectory,
+    selectedWorkspaceGitWorktreesEnabled,
     selectedWorkspaceTerminalCount,
     selectedWorkspaceTerminalRoles,
     workspaceTerminalFallbackRole,
@@ -21439,14 +21922,14 @@ export default function App() {
                         <span>Files</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="Architecture"
+                        aria-label="History"
                         data-active={activeView === "architecture"}
                         onClick={() => showView("architecture")}
-                        title="Architecture"
+                        title="Todo, task, and scan history"
                         type="button"
                       >
                         <ButtonForgeIcon aria-hidden="true" />
-                        <span>Architecture</span>
+                        <span>History</span>
                       </RailActionButton>
                       <RailActionButton
                         aria-label="MCPs"
@@ -21461,6 +21944,17 @@ export default function App() {
                     </>
                   )}
                   <RailGlobalActions aria-label="Global controls">
+                    <RailActionButton
+                      aria-label="Architectures"
+                      data-active={activeView === "architectures"}
+                      data-scope="global"
+                      onClick={() => showView("architectures")}
+                      title="Architectures"
+                      type="button"
+                    >
+                      <ButtonForgeIcon aria-hidden="true" />
+                      <span>Architectures</span>
+                    </RailActionButton>
                     <RailActionButton
                       aria-label="Assets"
                       data-active={activeView === "assets"}
@@ -22155,6 +22649,72 @@ export default function App() {
                           <span>{isCloudSqliteWorkspaceResetting ? "Resetting..." : "Reset workspace state"}</span>
                         </PrimaryDangerButton>
                       </AccountCardFooter>
+                      <SetupField>
+                        <SettingsLabel>Cloud repos without a workspace</SettingsLabel>
+                        {cloudRepoCatalogState === "idle" ? (
+                          <SettingsHint>
+                            Load the account repo catalog to find cloud repo state that no
+                            workspace references, then keep or delete each repo.
+                          </SettingsHint>
+                        ) : null}
+                        {cloudRepoCatalogState === "ready" && cloudOrphanRepos.length === 0 ? (
+                          <SettingsHint>
+                            All cloud repo state is attached to a workspace.
+                          </SettingsHint>
+                        ) : null}
+                        {cloudOrphanRepos.map((repo) => {
+                          const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
+                          const repoLabel = String(
+                            repo?.git_repo_display_name || repo?.gitRepoDisplayName || repoId,
+                          ).trim();
+                          const stateTotal = Number(repo?.state_total ?? repo?.stateTotal ?? 0) || 0;
+                          const lastWorkspaceName = (Array.isArray(repo?.workspaces) ? repo.workspaces : [])
+                            .map((workspace) => String(workspace?.workspace_name || workspace?.workspaceName || "").trim())
+                            .find(Boolean);
+                          const isBusy = cloudRepoCatalogBusyRepoId === repoId;
+                          return (
+                            <AccountCardFooter key={repoId}>
+                              <SettingsHint>
+                                {repoLabel}
+                                {lastWorkspaceName ? ` — last seen in "${lastWorkspaceName}"` : ""}
+                                {` · ${stateTotal} stored row${stateTotal === 1 ? "" : "s"}`}
+                              </SettingsHint>
+                              <SecondaryButton
+                                disabled={isBusy}
+                                onClick={() => dismissOrphanCloudRepo(repoId)}
+                                type="button"
+                              >
+                                <span>Keep</span>
+                              </SecondaryButton>
+                              <PrimaryDangerButton
+                                disabled={Boolean(cloudRepoCatalogBusyRepoId)}
+                                onClick={() => deleteOrphanCloudRepo(repo)}
+                                type="button"
+                              >
+                                {isBusy ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                                <span>{isBusy ? "Deleting..." : "Delete from cloud"}</span>
+                              </PrimaryDangerButton>
+                            </AccountCardFooter>
+                          );
+                        })}
+                        {cloudRepoCatalogError && <FormMessage $state="error">{cloudRepoCatalogError}</FormMessage>}
+                        <AccountCardFooter>
+                          <SettingsHint>
+                            {cloudRepoCatalogState === "ready"
+                              ? `${cloudOrphanRepos.length} unattached repo${cloudOrphanRepos.length === 1 ? "" : "s"} in the cloud.`
+                              : "Repos synced to the cloud but missing from every workspace."}
+                          </SettingsHint>
+                          <SecondaryButton
+                            disabled={cloudRepoCatalogState === "loading"}
+                            onClick={loadCloudRepoCatalog}
+                            type="button"
+                          >
+                            {cloudRepoCatalogState === "loading" ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                            <span>{cloudRepoCatalogState === "loading" ? "Loading..." : cloudRepoCatalogState === "ready" ? "Refresh cloud repos" : "Load cloud repos"}</span>
+                          </SecondaryButton>
+                        </AccountCardFooter>
+                      </SetupField>
+
                       <AccountCardFooter>
                         <SettingsHint>
                           Tokenomics: reset this device only, then resync.
@@ -22320,6 +22880,22 @@ export default function App() {
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
+                </ForgeWorkspace>
+              ) : visibleView === "architectures" ? (
+                <ForgeWorkspace aria-label="Architectures" data-motion={viewMotion}>
+                  <ArchitectureHubView
+                    catalog={architectureHub.catalog}
+                    catalogError={architectureHub.error}
+                    catalogState={architectureHub.state}
+                    graphLists={architectureHubGraphLists}
+                    onCopyGraph={copyArchitectureHubGraph}
+                    onGraphListRefresh={refreshArchitectureHubGraphList}
+                    onRefreshCatalog={refreshArchitectureHubCatalog}
+                    onSelectionChange={updateArchitectureHubSelection}
+                    resolveRepoSyncContext={resolveArchitectureHubSyncContext}
+                    selectedGraphId={architectureHubGraphState.architectureSelectedGraphId}
+                    selectedRepoPath={architectureHubGraphState.architectureSelectedRepoPath}
+                  />
                 </ForgeWorkspace>
               ) : visibleView === "assets" ? (
                 <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
@@ -22687,6 +23263,29 @@ export default function App() {
                           roleOptions={workspaceTerminalRoleOptions}
                           value={workspaceTerminalRolesDraft}
                         />
+                      </WorkspaceSettingsSection>
+
+                      <WorkspaceSettingsSection>
+                        <div>
+                          <PanelKicker>Git agent edits</PanelKicker>
+                          <SettingsHint>Direct mode is the default. Isolated worktrees remain available when a workspace needs patch-style submission.</SettingsHint>
+                        </div>
+                        <div>
+                          <SettingsLabel>File authority</SettingsLabel>
+                          <McpSwitchButton
+                            aria-pressed={workspaceGitWorktreesEnabledDraft}
+                            disabled={isWorkspaceSettingsBusy}
+                            onClick={() => {
+                              setWorkspaceGitWorktreesEnabledDraft((value) => !value);
+                              setWorkspaceSettingsError("");
+                              setWorkspaceSettingsMessage("");
+                            }}
+                            type="button"
+                          >
+                            <span aria-hidden="true" />
+                            {workspaceGitWorktreesEnabledDraft ? "Isolated worktrees" : "Direct repo edits"}
+                          </McpSwitchButton>
+                        </div>
                       </WorkspaceSettingsSection>
 
                       <WorkspaceSettingsSection>

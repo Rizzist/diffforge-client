@@ -5266,7 +5266,7 @@ export default function ArchitectureWorkspaceView({
   const activeWorkspaceId = workspace?.id || "";
   const activeWorkspaceName = workspace?.name || "";
   const repoPath = activeWorkspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
-  const [viewMode, setViewMode] = useState("architectures");
+  const [viewMode, setViewMode] = useState("todoHistory");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
 	  const [finishPlanState, setFinishPlanState] = useState({ error: "", planRef: "" });
 	  const [finishedPlanRefs, setFinishedPlanRefs] = useState(() => new Set());
@@ -5285,10 +5285,8 @@ export default function ArchitectureWorkspaceView({
     [activeWorkspaceId, visibleTasks, workspaceTodos],
   );
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
-  const toolbarMeta = viewMode === "architectures"
-    ? `Architectures · repo scoped · ${repoLabel}`
-    : viewMode === "todoHistory"
-      ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
+  const toolbarMeta = viewMode === "todoHistory"
+    ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
     : viewMode === "scannedResult"
       ? `Scanned Result · architecture scan · ${repoLabel}`
       : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
@@ -5414,13 +5412,6 @@ export default function ArchitectureWorkspaceView({
       <ArchitectureToolbar>
         <ViewToggleGroup aria-label="Architecture view mode">
           <ViewToggleButton
-            data-active={viewMode === "architectures" ? "true" : "false"}
-            onClick={() => setViewMode("architectures")}
-            type="button"
-          >
-            Architectures
-          </ViewToggleButton>
-          <ViewToggleButton
             data-active={viewMode === "todoHistory" ? "true" : "false"}
             onClick={() => setViewMode("todoHistory")}
             type="button"
@@ -5445,23 +5436,7 @@ export default function ArchitectureWorkspaceView({
         <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
       </ArchitectureToolbar>
 
-      {viewMode === "architectures" ? (
-        <ArchitecturesPanel
-          queueWorkspaceId={activeWorkspaceId}
-          queueWorkspaceName={activeWorkspaceName}
-          repoLabel={repoLabel}
-          repoPath={repoPath}
-          graphLists={architectureGraphLists}
-          onGraphListRefresh={onArchitectureGraphListRefresh}
-          onSelectionChange={onArchitectureSelectionChange}
-          repositoryScan={architectureRepositoryScanSnapshot}
-          repositoryScanError={architectureRepositoryScanError}
-          repositoryScanState={architectureRepositoryScanState}
-          workspaceSelectedGraphId={architectureSelectedGraphId}
-          workspaceSelectedRepoPath={architectureSelectedRepoPath}
-          tasks={visibleTasks}
-        />
-      ) : viewMode === "todoHistory" ? (
+      {viewMode === "todoHistory" ? (
         <TodosHistoryPanel
           items={todoHistoryItems}
           repoLabel={repoLabel}
@@ -5491,17 +5466,126 @@ export default function ArchitectureWorkspaceView({
   );
 }
 
+export function ArchitectureHubView({
+  catalog = null,
+  catalogState = "idle",
+  catalogError = "",
+  onRefreshCatalog = null,
+  graphLists = {},
+  onCopyGraph = null,
+  onGraphListRefresh = null,
+  onSelectionChange = null,
+  resolveRepoSyncContext = null,
+  selectedGraphId = "",
+  selectedRepoPath = "",
+}) {
+  const repositoryGroups = useMemo(() => {
+    if (!catalog || typeof catalog !== "object") return [];
+    const groups = [];
+    const globalEntry = jsonObject(catalog.global);
+    if (globalEntry) {
+      groups.push({
+        id: "global",
+        kind: "global",
+        label: "Global",
+        repositories: [globalEntry],
+      });
+    }
+    jsonArray(catalog.workspaces).forEach((workspaceGroup) => {
+      const workspaceId = text(workspaceGroup?.workspaceId);
+      const repositories = jsonArray(workspaceGroup?.repositories);
+      if (!workspaceId) return;
+      groups.push({
+        id: `workspace-${workspaceId}`,
+        kind: "workspace",
+        label: text(workspaceGroup?.workspaceName) || workspaceId,
+        repositories,
+      });
+    });
+    const orphanRepositories = jsonArray(catalog.orphanRepositories);
+    if (orphanRepositories.length) {
+      groups.push({
+        id: "orphans",
+        kind: "orphan",
+        label: "Other synced repos",
+        repositories: orphanRepositories,
+      });
+    }
+    return groups;
+  }, [catalog]);
+
+  const repositoryScan = useMemo(() => ({
+    repositories: repositoryGroups.flatMap((group) => group.repositories),
+  }), [repositoryGroups]);
+  const repositoryCount = repositoryScan.repositories.length;
+  const scanState = catalogState === "ready" || catalog ? "ready" : catalogState;
+  const builtAtMs = Number(catalog?.builtAtMs || 0);
+  const toolbarMeta = [
+    "Architectures · account level",
+    `${repositoryCount} repo${repositoryCount === 1 ? "" : "s"}`,
+    builtAtMs ? `cached ${new Date(builtAtMs).toLocaleTimeString()}` : "",
+    catalog && catalog.cloudIndexAvailable === false ? "cloud index offline" : "",
+  ].filter(Boolean).join(" · ");
+
+  return (
+    <ArchitectureSurface aria-label="Architectures" data-state={scanState}>
+      <ArchitectureToolbar>
+        <ViewToggleGroup aria-label="Architecture hub mode">
+          <ViewToggleButton data-active="true" type="button">
+            Architectures
+          </ViewToggleButton>
+          <ViewToggleButton
+            data-active="false"
+            disabled={catalogState === "loading"}
+            onClick={() => {
+              if (typeof onRefreshCatalog === "function") onRefreshCatalog({ refresh: true });
+            }}
+            type="button"
+          >
+            {catalogState === "loading" ? "Refreshing…" : "Refresh"}
+          </ViewToggleButton>
+        </ViewToggleGroup>
+        <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
+      </ArchitectureToolbar>
+      <ArchitecturesPanel
+        graphLists={graphLists}
+        onCopyGraph={onCopyGraph}
+        onGraphListRefresh={onGraphListRefresh}
+        onSelectionChange={onSelectionChange}
+        repoLabel="account"
+        repoPath=""
+        repositoryGroups={repositoryGroups}
+        repositoryScan={repositoryScan}
+        repositoryScanError={catalogError}
+        repositoryScanState={scanState}
+        resolveRepoSyncContext={resolveRepoSyncContext}
+        workspaceSelectedGraphId={selectedGraphId}
+        workspaceSelectedRepoPath={selectedRepoPath}
+      />
+      {catalogError && catalogState === "ready" && (
+        <ArchitectureErrorToast aria-live="polite" role="status" title={catalogError}>
+          <strong>Architecture catalog issue</strong>
+          <span>{catalogError}</span>
+        </ArchitectureErrorToast>
+      )}
+    </ArchitectureSurface>
+  );
+}
+
 function ArchitecturesPanel({
   graphLists = {},
   onGraphListRefresh = null,
   onSelectionChange = null,
+  onCopyGraph = null,
   queueWorkspaceId = "",
   queueWorkspaceName = "",
   repoLabel,
   repoPath,
+  repositoryGroups = null,
   repositoryScan = null,
   repositoryScanError = "",
   repositoryScanState = "idle",
+  resolveRepoSyncContext = null,
   workspaceSelectedGraphId = "",
   workspaceSelectedRepoPath = "",
   tasks = [],
@@ -5524,11 +5608,45 @@ function ArchitecturesPanel({
   const [agentEditMarkers, setAgentEditMarkers] = useState([]);
   const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
   const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
+  const [dragGraph, setDragGraph] = useState(null);
   const selectedGraphDirtyRef = useRef(false);
 
   useEffect(() => {
     selectedGraphDirtyRef.current = selectedGraphDirty;
   }, [selectedGraphDirty]);
+
+  const repoSyncContext = useCallback((repo = "") => {
+    const targetRepo = text(repo);
+    if (typeof resolveRepoSyncContext === "function" && targetRepo) {
+      const context = resolveRepoSyncContext(targetRepo);
+      if (context && typeof context === "object") {
+        return {
+          workspaceId: text(context.workspaceId),
+          workspaceName: text(context.workspaceName),
+          queueWorkspaceId: text(context.queueWorkspaceId),
+          queueWorkspaceName: text(context.queueWorkspaceName),
+          scopeRepoId: text(context.scopeRepoId),
+          scopeGitRepoIdentityId: text(context.scopeGitRepoIdentityId),
+        };
+      }
+    }
+    return {
+      workspaceId: text(queueWorkspaceId),
+      workspaceName: text(queueWorkspaceName),
+      queueWorkspaceId: text(queueWorkspaceId),
+      queueWorkspaceName: text(queueWorkspaceName),
+      scopeRepoId: "",
+      scopeGitRepoIdentityId: "",
+    };
+  }, [queueWorkspaceId, queueWorkspaceName, resolveRepoSyncContext]);
+  const selectedRepoSyncContext = useMemo(
+    () => repoSyncContext(selectedRepoPath),
+    [repoSyncContext, selectedRepoPath],
+  );
+  const syncWorkspaceId = selectedRepoSyncContext.workspaceId;
+  const syncWorkspaceName = selectedRepoSyncContext.workspaceName;
+  const dispatchWorkspaceId = selectedRepoSyncContext.queueWorkspaceId;
+  const dispatchWorkspaceName = selectedRepoSyncContext.queueWorkspaceName;
 
   useEffect(() => {
     const nextRepositories = jsonArray(repositoryScan?.repositories);
@@ -5668,7 +5786,7 @@ function ArchitecturesPanel({
   }, [loadGraphList, selectedGraphListCacheEntry, selectedRepoPath]);
 
   useEffect(() => {
-    if (!selectedRepoPath || !queueWorkspaceId) {
+    if (!selectedRepoPath || !syncWorkspaceId) {
       return undefined;
     }
     let cancelled = false;
@@ -5688,15 +5806,15 @@ function ArchitecturesPanel({
         .filter(Boolean);
       if (
         eventWorkspaceId
-        && eventWorkspaceId !== queueWorkspaceId
-        && !workspaceIds.includes(queueWorkspaceId)
+        && eventWorkspaceId !== syncWorkspaceId
+        && !workspaceIds.includes(syncWorkspaceId)
       ) {
         return;
       }
       void loadGraphList(selectedRepoPath, {
         refresh: true,
         silent: true,
-        workspaceName: queueWorkspaceName,
+        workspaceName: syncWorkspaceName,
       });
     }).then((unlisten) => {
       if (cancelled) {
@@ -5709,7 +5827,7 @@ function ArchitecturesPanel({
       cancelled = true;
       if (unlistenArchitecture) unlistenArchitecture();
     };
-  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+  }, [loadGraphList, selectedRepoPath, syncWorkspaceId, syncWorkspaceName]);
 
   useEffect(() => {
     let cancelled = false;
@@ -5730,8 +5848,12 @@ function ArchitecturesPanel({
       ? invoke("cloud_mcp_hydrate_workspace_architecture", {
         refs: [hydrateRef],
         repoPath: selectedRepoPath,
-        workspaceId: queueWorkspaceId,
-        workspaceName: queueWorkspaceName,
+        workspaceId: syncWorkspaceId,
+        workspaceName: syncWorkspaceName,
+        ...(selectedRepoSyncContext.scopeRepoId ? {
+          scopeRepoId: selectedRepoSyncContext.scopeRepoId,
+          scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
+        } : {}),
       }).then((result) => {
         const hydratedGraph = jsonArray(result?.items || result?.graphs)[0];
         if (hydratedGraph) return hydratedGraph;
@@ -5816,8 +5938,11 @@ function ArchitecturesPanel({
     selectedRepoPath,
   ]);
   const agentEditMarkersStorageKey = useMemo(
-    () => architectureAgentEditMarkersStorageKey(queueWorkspaceId, selectedRepoPath || repoPath),
-    [queueWorkspaceId, repoPath, selectedRepoPath],
+    () => architectureAgentEditMarkersStorageKey(
+      syncWorkspaceId || queueWorkspaceId,
+      selectedRepoPath || repoPath,
+    ),
+    [queueWorkspaceId, repoPath, selectedRepoPath, syncWorkspaceId],
   );
   const visibleAgentEditMarkers = useMemo(
     () => architectureVisibleAgentEditMarkers(agentEditMarkers, tasks, graphs),
@@ -5917,13 +6042,17 @@ function ArchitecturesPanel({
         setDraftLocationMode("root");
         setDraftFolderPath("");
         setSaveState("idle");
-        if (queueWorkspaceId) {
+        if (syncWorkspaceId) {
           void invoke("cloud_mcp_sync_workspace_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_create",
             repoPath: selectedRepoPath,
-            workspaceId: queueWorkspaceId,
-            workspaceName: queueWorkspaceName,
+            workspaceId: syncWorkspaceId,
+            workspaceName: syncWorkspaceName,
+            ...(selectedRepoSyncContext.scopeRepoId ? {
+              scopeRepoId: selectedRepoSyncContext.scopeRepoId,
+              scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
+            } : {}),
           }).catch(() => {});
         }
         void loadGraphList(selectedRepoPath, { refresh: true });
@@ -5932,7 +6061,7 @@ function ArchitecturesPanel({
         setSaveState("idle");
         setError(nextError?.message || String(nextError || "Unable to create architecture graph."));
       });
-  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+  }, [draftFolderPath, draftGraphTemplate, draftLocationMode, draftTitle, loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
 
   const saveGraph = useCallback((graph) => {
     if (!selectedRepoPath) return Promise.reject(new Error("Select a repository first."));
@@ -5947,13 +6076,17 @@ function ArchitecturesPanel({
         setSelectedGraph(nextGraph);
         setSelectedGraphId(result?.graphId || nextGraph.id);
         setSaveState("idle");
-        if (queueWorkspaceId) {
+        if (syncWorkspaceId) {
           void invoke("cloud_mcp_sync_workspace_architecture", {
             graph: nextGraph,
             reason: "architecture_graph_save",
             repoPath: selectedRepoPath,
-            workspaceId: queueWorkspaceId,
-            workspaceName: queueWorkspaceName,
+            workspaceId: syncWorkspaceId,
+            workspaceName: syncWorkspaceName,
+            ...(selectedRepoSyncContext.scopeRepoId ? {
+              scopeRepoId: selectedRepoSyncContext.scopeRepoId,
+              scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
+            } : {}),
           }).catch(() => {});
         }
         void loadGraphList(selectedRepoPath, { refresh: true });
@@ -5964,7 +6097,7 @@ function ArchitecturesPanel({
         setError(nextError?.message || String(nextError || "Unable to save architecture graph."));
         throw nextError;
       });
-  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
 
   const handleRevisionRestored = useCallback((result) => {
     const nextGraph = result?.graph || null;
@@ -5973,17 +6106,21 @@ function ArchitecturesPanel({
     if (nextGraphId) setSelectedGraphId(nextGraphId);
     setCreatingGraph(false);
     setSelectedGraphDirty(false);
-    if (queueWorkspaceId && nextGraph) {
+    if (syncWorkspaceId && nextGraph) {
       void invoke("cloud_mcp_sync_workspace_architecture", {
         graph: nextGraph,
         reason: "architecture_revision_restore",
         repoPath: selectedRepoPath,
-        workspaceId: queueWorkspaceId,
-        workspaceName: queueWorkspaceName,
+        workspaceId: syncWorkspaceId,
+        workspaceName: syncWorkspaceName,
+        ...(selectedRepoSyncContext.scopeRepoId ? {
+          scopeRepoId: selectedRepoSyncContext.scopeRepoId,
+          scopeGitRepoIdentityId: selectedRepoSyncContext.scopeGitRepoIdentityId,
+        } : {}),
       }).catch(() => {});
     }
     void loadGraphList(selectedRepoPath, { refresh: true });
-  }, [loadGraphList, queueWorkspaceId, queueWorkspaceName, selectedRepoPath]);
+  }, [loadGraphList, selectedRepoPath, selectedRepoSyncContext, syncWorkspaceId, syncWorkspaceName]);
 
   const renderTreeRows = useCallback((emptyDepth = 0) => (
     <>
@@ -6006,19 +6143,32 @@ function ArchitecturesPanel({
 
         const rowMarker = architectureAgentEditMarkerForGraph(row.graph, visibleAgentEditMarkers);
         const rowMarkerTitle = architectureAgentEditMarkerTitle(rowMarker);
+        const draggable = typeof onCopyGraph === "function";
         return (
           <ArchitectureTreeRow
             data-active={row.graph.id === selectedGraphId && !creatingGraph ? "true" : "false"}
             data-agent-edit={rowMarker ? rowMarker.status : undefined}
             data-kind="graph"
+            draggable={draggable || undefined}
             key={`graph-${row.graph.id}`}
             onClick={() => {
               setSelectedGraphId(row.graph.id);
               setCreatingGraph(false);
               setRevisionBrowser((current) => ({ ...current, open: false }));
             }}
+            onDragEnd={draggable ? () => setDragGraph(null) : undefined}
+            onDragStart={draggable ? (event) => {
+              const payload = { graphId: row.graph.id, sourceRepoPath: selectedRepoPath };
+              setDragGraph(payload);
+              try {
+                event.dataTransfer.setData("application/x-diffforge-architecture-graph", JSON.stringify(payload));
+                event.dataTransfer.effectAllowed = "copy";
+              } catch {
+                // dataTransfer can be unavailable in some webviews; state carries the payload.
+              }
+            } : undefined}
             style={{ "--tree-depth": row.depth }}
-            title={[row.graph.filePath, rowMarkerTitle].filter(Boolean).join("\n")}
+            title={[row.graph.filePath, rowMarkerTitle, draggable ? "Drag onto a repo or Global to copy" : ""].filter(Boolean).join("\n")}
             type="button"
           >
             <ArchitectureTreeGlyph data-kind="graph" aria-hidden="true" />
@@ -6046,10 +6196,96 @@ function ArchitecturesPanel({
     creatingGraph,
     graphState,
     graphs.length,
+    onCopyGraph,
     selectedGraphId,
+    selectedRepoPath,
     treeRows,
     visibleAgentEditMarkers,
   ]);
+
+  const repositoryGroupList = useMemo(() => (
+    (Array.isArray(repositoryGroups) ? repositoryGroups : [])
+      .map((group) => ({
+        id: text(group?.id) || text(group?.label) || "group",
+        label: text(group?.label) || "Repositories",
+        kind: text(group?.kind) || "workspace",
+        repositories: jsonArray(group?.repositories),
+      }))
+      .filter((group) => group.repositories.length || group.kind === "global")
+  ), [repositoryGroups]);
+
+  const handleRepoGraphDrop = useCallback((repo) => (event) => {
+    if (typeof onCopyGraph !== "function") return;
+    event.preventDefault();
+    const targetRepoPath = architectureRepoPathFromEntry(repo);
+    let payload = dragGraph;
+    try {
+      const raw = event.dataTransfer.getData("application/x-diffforge-architecture-graph");
+      if (raw) payload = JSON.parse(raw);
+    } catch {
+      // fall back to in-memory drag payload
+    }
+    setDragGraph(null);
+    const graphId = text(payload?.graphId);
+    const sourceRepoPath = text(payload?.sourceRepoPath);
+    if (!graphId || !sourceRepoPath || !targetRepoPath) return;
+    if (architectureRepoPathKey(sourceRepoPath) === architectureRepoPathKey(targetRepoPath)) return;
+    Promise.resolve(onCopyGraph({ graphId, sourceRepoPath, targetRepoPath }))
+      .then(() => {
+        if (architectureRepoPathKey(targetRepoPath) === architectureRepoPathKey(selectedRepoPath)) {
+          void loadGraphList(targetRepoPath, { refresh: true, silent: true });
+        }
+      })
+      .catch((nextError) => {
+        setError(nextError?.message || String(nextError || "Unable to copy architecture graph."));
+      });
+  }, [dragGraph, loadGraphList, onCopyGraph, selectedRepoPath]);
+
+  const renderRepoRow = useCallback((repo) => {
+    const repoKind = scannedResultGraphKind(repo);
+    const architectureRepoPath = architectureRepoPathFromEntry(repo);
+    const dropEnabled = typeof onCopyGraph === "function"
+      && dragGraph
+      && architectureRepoPathKey(text(dragGraph.sourceRepoPath)) !== architectureRepoPathKey(architectureRepoPath);
+    const scopeKind = text(repo?.scopeKind);
+    const glyphKind = scopeKind === "global"
+      ? "folder"
+      : repoKind === "git" ? "repo" : "folder";
+    return (
+      <ArchitectureTreeRepoGroup key={repo.id}>
+        <ArchitectureTreeRow
+          data-active={architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) ? "true" : "false"}
+          data-drop-enabled={dropEnabled ? "true" : undefined}
+          data-kind={glyphKind}
+          onClick={() => {
+            setSelectedRepoPath(architectureRepoPath);
+            setSelectedGraphId("");
+            setSelectedGraph(null);
+            setCreatingGraph(false);
+            setRevisionBrowser((current) => ({ ...current, open: false }));
+          }}
+          onDragOver={dropEnabled ? (event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          } : undefined}
+          onDrop={dropEnabled ? handleRepoGraphDrop(repo) : undefined}
+          style={{ "--tree-depth": 0 }}
+          title={[architectureRepoPath, dropEnabled ? "Drop to copy graph here" : ""].filter(Boolean).join("\n")}
+          type="button"
+        >
+          <ArchitectureTreeGlyph data-kind={glyphKind} aria-hidden="true" />
+          <span>{repo.name}</span>
+          <em>{scopeKind === "global" ? "global" : scopeKind === "orphan" ? "synced" : scannedResultEntryKindLabel(repo)}</em>
+          <em>{repo.graphCount}</em>
+        </ArchitectureTreeRow>
+        {architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) && (
+          <ArchitectureTreeBranch>
+            {renderTreeRows(1)}
+          </ArchitectureTreeBranch>
+        )}
+      </ArchitectureTreeRepoGroup>
+    );
+  }, [dragGraph, handleRepoGraphDrop, onCopyGraph, renderTreeRows, selectedRepoPath]);
 
   return (
     <ArchitecturesShell data-nav-collapsed={navCollapsed ? "true" : "false"}>
@@ -6089,38 +6325,22 @@ function ArchitecturesPanel({
             </ArchitectureNavHeaderActions>
           </ArchitectureNavHeader>
           <ArchitectureTree>
-            {singleRepository ? renderTreeRows(0) : repositories.map((repo) => {
-              const repoKind = scannedResultGraphKind(repo);
-              const architectureRepoPath = architectureRepoPathFromEntry(repo);
-              return (
-                <ArchitectureTreeRepoGroup key={repo.id}>
-                  <ArchitectureTreeRow
-                    data-active={architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) ? "true" : "false"}
-                    data-kind={repoKind === "git" ? "repo" : "folder"}
-                    onClick={() => {
-                      setSelectedRepoPath(architectureRepoPath);
-                      setSelectedGraphId("");
-                      setSelectedGraph(null);
-                      setCreatingGraph(false);
-                      setRevisionBrowser((current) => ({ ...current, open: false }));
-                    }}
-                    style={{ "--tree-depth": 0 }}
-                    title={architectureRepoPath}
-                    type="button"
-                  >
-                    <ArchitectureTreeGlyph data-kind={repoKind === "git" ? "repo" : "folder"} aria-hidden="true" />
-                    <span>{repo.name}</span>
-                    <em>{scannedResultEntryKindLabel(repo)}</em>
-                    <em>{repo.graphCount}</em>
-                  </ArchitectureTreeRow>
-                  {architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) && (
-                    <ArchitectureTreeBranch>
-                      {renderTreeRows(1)}
-                    </ArchitectureTreeBranch>
-                  )}
-                </ArchitectureTreeRepoGroup>
-              );
-            })}
+            {repositoryGroupList.length ? (
+              <>
+                {repositoryGroupList.map((group) => (
+                  <ArchitectureTreeRepoGroup key={`group-${group.id}`}>
+                    <ArchitectureTreeGroupLabel title={group.label}>
+                      <span>{group.label}</span>
+                      <em>{group.repositories.length}</em>
+                    </ArchitectureTreeGroupLabel>
+                    {group.repositories.map((repo) => renderRepoRow(repo))}
+                    {!group.repositories.length && (
+                      <ArchitectureTreeEmpty style={{ "--tree-depth": 0 }}>Empty</ArchitectureTreeEmpty>
+                    )}
+                  </ArchitectureTreeRepoGroup>
+                ))}
+              </>
+            ) : singleRepository ? renderTreeRows(0) : repositories.map((repo) => renderRepoRow(repo))}
             {repoState === "ready" && !repositories.length && (
               <ArchitectureEmptyNote>No repository roots detected.</ArchitectureEmptyNote>
             )}
@@ -6183,8 +6403,8 @@ function ArchitecturesPanel({
               onDirtyChange={setSelectedGraphDirty}
               onOpenRevisions={openRevisionBrowser}
               onSave={saveGraph}
-              queueWorkspaceId={queueWorkspaceId}
-              queueWorkspaceName={queueWorkspaceName}
+              queueWorkspaceId={dispatchWorkspaceId}
+              queueWorkspaceName={dispatchWorkspaceName}
               saveState={saveState}
               selectedRepo={selectedRepo}
             />
@@ -9597,6 +9817,36 @@ const ArchitectureTreeRepoGroup = styled.div`
   min-width: 0;
 `;
 
+const ArchitectureTreeGroupLabel = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  margin: 8px 0 2px;
+  padding: 0 6px;
+  color: rgba(148, 163, 184, 0.78);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+
+  &:first-child {
+    margin-top: 2px;
+  }
+
+  span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  em {
+    font-style: normal;
+    font-weight: 600;
+    color: rgba(100, 116, 139, 0.9);
+  }
+`;
+
 const ArchitectureTreeBranch = styled.div`
   display: grid;
   align-content: start;
@@ -9620,6 +9870,11 @@ const ArchitectureTreeRow = styled.button`
   font: inherit;
   text-align: left;
   cursor: pointer;
+
+  &[data-drop-enabled="true"] {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(56, 189, 248, 0.08);
+  }
 
   span {
     min-width: 0;

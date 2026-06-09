@@ -374,6 +374,10 @@ fn bool_i64(value: bool) -> i64 {
     }
 }
 
+fn repo_policy_requires_agent_worktree(policy: &Value) -> bool {
+    policy["agent_worktree_required"].as_i64().unwrap_or(0) == 1
+}
+
 fn required_trimmed<'a>(value: &'a str, key: &str) -> Result<&'a str, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2665,7 +2669,7 @@ impl CoordinationKernel {
                     integrator_enabled, integrator_agent_id, integrator_model,
                     integrator_reasoning_effort, policy_json,
                     created_at, updated_at
-                ) VALUES(?1, ?2, 0, NULL, 'off', 0, 1, 1, 1, 1, 1, 1,
+                ) VALUES(?1, ?2, 0, NULL, 'off', 0, 1, 1, 1, 0, 1, 1,
                     'detect_and_reject_patch', 'reject_patch', 'coordination_only', 1, 1,
                     'local_only', 0, 0, 0, 0, 0, 0, 0, 1,
                     0, 'codex', 'gpt-5.5', 'xhigh', NULL, ?3, ?3)",
@@ -3367,7 +3371,7 @@ impl CoordinationKernel {
                 return Err(
                     "Stopped task resource intent status must be cancelled or interrupted."
                         .to_string(),
-                )
+                );
             }
         };
         self.conn
@@ -3453,7 +3457,7 @@ impl CoordinationKernel {
             _ => {
                 return Err(
                     "Stopped terminal task status must be cancelled or interrupted.".to_string(),
-                )
+                );
             }
         };
         let task = self.query_one(
@@ -3541,7 +3545,7 @@ impl CoordinationKernel {
         let status = match normalized_status.as_str() {
             "done" | "completed" | "skipped" => normalized_status.as_str(),
             _ => {
-                return Err("complete_task status must be done, completed, or skipped.".to_string())
+                return Err("complete_task status must be done, completed, or skipped.".to_string());
             }
         };
         let session = self.ensure_session_active(session_id, agent_id)?;
@@ -5025,6 +5029,38 @@ impl CoordinationKernel {
         if task_id.is_empty() {
             return Ok(None);
         }
+        self.apply_terminal_todo_plan_update(
+            Some(task_id),
+            agent_id,
+            session_id,
+            input,
+            "coordination-kernel.checkpoint",
+        )
+    }
+
+    pub fn update_terminal_todo_plan(
+        &self,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        input: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.apply_terminal_todo_plan_update(
+            None,
+            agent_id,
+            session_id,
+            input,
+            "coordination-kernel.update_plan",
+        )
+    }
+
+    fn apply_terminal_todo_plan_update(
+        &self,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+        session_id: Option<&str>,
+        input: &Value,
+        source: &str,
+    ) -> Result<Option<Value>, String> {
         let requested_current = optional_i64_field(
             input,
             &[
@@ -5108,7 +5144,8 @@ impl CoordinationKernel {
             return Ok(None);
         }
 
-        let Some(plan_id) = self.terminal_todo_plan_plan_id_from_input_or_task(input, task_id)?
+        let Some(plan_id) =
+            self.terminal_todo_plan_plan_id_from_input_or_task(input, task_id.unwrap_or(""))?
         else {
             return Ok(None);
         };
@@ -5269,7 +5306,7 @@ impl CoordinationKernel {
                 "agent",
                 actor_id,
                 EventRefs {
-                    task_id: Some(task_id.to_string()),
+                    task_id: task_id.map(str::to_string),
                     agent_id: agent_id.map(str::to_string),
                     session_id: session_id.map(str::to_string),
                     resource_id: Some(plan_id.clone()),
@@ -5283,7 +5320,7 @@ impl CoordinationKernel {
                     "step_title": next_title,
                     "step_updates": step_updates_payload,
                     "plan_status": resolved_plan_status,
-                    "source": "coordination-kernel.checkpoint",
+                    "source": source,
                 }),
             )?;
             Ok(json!({
@@ -6210,8 +6247,8 @@ impl CoordinationKernel {
                             }),
                         )?;
                         return Err(format!(
-                        "slot_busy: agent slot {slot_key} already has active session {active_session_id}."
-                    ));
+                            "slot_busy: agent slot {slot_key} already has active session {active_session_id}."
+                        ));
                     }
                 }
 
@@ -6370,12 +6407,17 @@ impl CoordinationKernel {
                 ));
             }
         }
-        let mut enforcement_mode = requested_enforcement_mode
-            .unwrap_or(if write_enabled {
+        let default_enforcement_mode = if write_enabled {
+            if repo_policy_requires_agent_worktree(&self.repo_policy()?) {
                 "worktree_required"
             } else {
-                "read_only"
-            })
+                "bounded_direct_edit"
+            }
+        } else {
+            "read_only"
+        };
+        let mut enforcement_mode = requested_enforcement_mode
+            .unwrap_or(default_enforcement_mode)
             .to_string();
         let mut write_root = self.paths.repo_path.display().to_string();
         let mut worktree_id = None;
@@ -10194,7 +10236,9 @@ impl CoordinationKernel {
         if root == self.paths.repo_path.as_path() {
             crate::ensure_architecture_agent_guide(root)?;
         }
-        let contract = diffforge_agent_contract_markdown(root != self.paths.repo_path.as_path());
+        let managed_terminal = root != self.paths.repo_path.as_path()
+            || !repo_policy_requires_agent_worktree(&self.repo_policy()?);
+        let contract = diffforge_agent_contract_markdown(managed_terminal);
         let mut generated = Vec::new();
         if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
             generated.push("AGENTS.md");
@@ -12027,7 +12071,7 @@ impl CoordinationKernel {
     }
 
     pub fn active_file_watcher_targets(&self) -> Result<Vec<Value>, String> {
-        self.query_json(
+        let mut targets = self.query_json(
             "SELECT w.id AS worktree_id,
                     w.path,
                     w.branch_name,
@@ -12045,7 +12089,33 @@ impl CoordinationKernel {
              GROUP BY w.id, w.path, w.branch_name, w.agent_slot_id, s.agent_id
              ORDER BY w.path ASC",
             &[],
-        )
+        )?;
+        let repo_root = process_path_text(&self.paths.repo_path);
+        let direct = self.query_one(
+            "SELECT COUNT(*) AS active_session_count
+             FROM agent_sessions
+             WHERE status='active'
+               AND task_id IS NOT NULL
+               AND task_id <> ''
+               AND enforcement_mode='bounded_direct_edit'
+               AND (worktree_id IS NULL OR worktree_id = '')
+               AND write_root IS NOT NULL
+               AND write_root <> ''",
+            &[],
+            "Unable to count direct edit watcher targets.",
+        )?;
+        if direct["active_session_count"].as_i64().unwrap_or(0) > 0 {
+            targets.push(json!({
+                "worktree_id": Value::Null,
+                "path": repo_root,
+                "branch_name": Value::Null,
+                "agent_slot_id": Value::Null,
+                "agent_id": Value::Null,
+                "active_session_count": direct["active_session_count"].clone(),
+                "file_authority": "bounded_direct_edit",
+            }));
+        }
+        Ok(targets)
     }
 
     pub fn list_file_watchers(&self) -> Result<Value, String> {
@@ -12158,12 +12228,45 @@ impl CoordinationKernel {
              ORDER BY s.updated_at DESC",
             &[],
         )?;
+        let direct_sessions = self
+            .query_json(
+                "SELECT s.id AS session_id,
+                        s.task_id,
+                        s.agent_id,
+                        s.agent_slot_id,
+                        s.write_root
+                 FROM agent_sessions s
+                 WHERE s.status='active'
+                   AND s.task_id IS NOT NULL
+                   AND s.task_id <> ''
+                   AND s.enforcement_mode='bounded_direct_edit'
+                   AND (s.worktree_id IS NULL OR s.worktree_id = '')
+                   AND s.write_root IS NOT NULL
+                   AND s.write_root <> ''
+                 ORDER BY s.updated_at DESC",
+                &[],
+            )?
+            .into_iter()
+            .filter(|session| {
+                session["write_root"]
+                    .as_str()
+                    .map(|write_root| {
+                        same_path_text(write_root, &process_path_text(&self.paths.repo_path))
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
         self.emit_event(
             "change_scan_started",
             "kernel",
             REPO_ID,
             EventRefs::default(),
-            json!({"session_count": sessions.len(), "scanner": "git_status"}),
+            json!({
+                "session_count": sessions.len() + direct_sessions.len(),
+                "worktree_session_count": sessions.len(),
+                "direct_session_count": direct_sessions.len(),
+                "scanner": "git_status"
+            }),
         )?;
         let mut changes = Vec::new();
         let mut warnings = Vec::new();
@@ -12233,6 +12336,90 @@ impl CoordinationKernel {
                     violation_id: violation_id.as_deref(),
                     summary: Some("Workspace change scan"),
                     details: json!({"untracked": changed_file.untracked}),
+                })?;
+                changes.push(change);
+            }
+        }
+        if !direct_sessions.is_empty() {
+            for changed_file in self.changed_files(&self.paths.repo_path)? {
+                reject_path_escape(&changed_file.path)?;
+                let resource_key = path_to_file_resource(&changed_file.path);
+                let mut recorded_with_lease = false;
+                for session in &direct_sessions {
+                    let session_id = session["session_id"].as_str().unwrap_or_default();
+                    let task_id = session["task_id"].as_str().unwrap_or_default();
+                    let agent_id = session["agent_id"].as_str().unwrap_or_default();
+                    let agent_slot_id = session["agent_slot_id"].as_str();
+                    if let Some(lease) =
+                        self.find_covering_lease(task_id, agent_id, session_id, &resource_key)?
+                    {
+                        let change = self.record_workspace_change(WorkspaceChangeInput {
+                            task_id: Some(task_id),
+                            agent_id: Some(agent_id),
+                            agent_slot_id,
+                            session_id: Some(session_id),
+                            worktree_id: None,
+                            change_source: "watcher_scan",
+                            path: &changed_file.path,
+                            resource_key: &resource_key,
+                            change_kind: &changed_file.change_kind,
+                            lease: Some(&lease),
+                            violation_id: None,
+                            summary: Some("Direct repo change scan"),
+                            details: json!({
+                                "untracked": changed_file.untracked,
+                                "file_authority": "bounded_direct_edit",
+                                "shared_direct_root": true,
+                            }),
+                        })?;
+                        changes.push(change);
+                        recorded_with_lease = true;
+                    }
+                }
+                if recorded_with_lease {
+                    continue;
+                }
+                let Some(session) = direct_sessions.first() else {
+                    continue;
+                };
+                let session_id = session["session_id"].as_str().unwrap_or_default();
+                let task_id = session["task_id"].as_str().unwrap_or_default();
+                let agent_id = session["agent_id"].as_str().unwrap_or_default();
+                let agent_slot_id = session["agent_slot_id"].as_str();
+                let violation_id = self.create_workspace_violation(
+                    Some(task_id),
+                    Some(agent_id),
+                    Some(session_id),
+                    None,
+                    "unleased_write",
+                    Some(&changed_file.path),
+                    Some(&resource_key),
+                    "warning",
+                    json!({
+                        "change_source": "watcher_scan",
+                        "change_kind": changed_file.change_kind,
+                        "file_authority": "bounded_direct_edit",
+                        "shared_direct_root": true,
+                    }),
+                )?;
+                let change = self.record_workspace_change(WorkspaceChangeInput {
+                    task_id: Some(task_id),
+                    agent_id: Some(agent_id),
+                    agent_slot_id,
+                    session_id: Some(session_id),
+                    worktree_id: None,
+                    change_source: "watcher_scan",
+                    path: &changed_file.path,
+                    resource_key: &resource_key,
+                    change_kind: &changed_file.change_kind,
+                    lease: None,
+                    violation_id: Some(&violation_id),
+                    summary: Some("Direct repo change scan"),
+                    details: json!({
+                        "untracked": changed_file.untracked,
+                        "file_authority": "bounded_direct_edit",
+                        "shared_direct_root": true,
+                    }),
                 })?;
                 changes.push(change);
             }
@@ -14288,7 +14475,7 @@ impl CoordinationKernel {
             )?;
         }
         let policy = self.repo_policy()?;
-        let worktree_required = policy["agent_worktree_required"].as_i64().unwrap_or(1) == 1;
+        let worktree_required = repo_policy_requires_agent_worktree(&policy);
         let Some(worktree_id) = worktree_id.filter(|value| !value.trim().is_empty()) else {
             self.create_workspace_violation(
                 Some(task_id),
@@ -19021,7 +19208,11 @@ impl CoordinationKernel {
             ));
         }
         if environment.unwrap_or("sandbox") == "prod" {
-            return Ok(api_error("prod_sql_blocked", "Production SQL is blocked without explicit human approval and configured credentials.", json!({})));
+            return Ok(api_error(
+                "prod_sql_blocked",
+                "Production SQL is blocked without explicit human approval and configured credentials.",
+                json!({}),
+            ));
         }
         Ok(api_error(
             "sql_execution_not_configured",
@@ -19623,7 +19814,7 @@ impl CoordinationKernel {
                 context_run_id,
                 None,
                 assigned_role,
-                Some("Complete the direct agent task in the assigned worktree."),
+                Some("Complete the coordinated agent task using the reported completion mode."),
             )?;
             let Some(task_id) = task["id"].as_str().map(str::to_string) else {
                 return Err("Created task did not return an id.".to_string());
@@ -19748,8 +19939,8 @@ impl CoordinationKernel {
                     "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal todo plan.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
-                    "Use normal shell and edit tools from the visible project root; Git-managed writes must target the assigned agent branch root explicitly.",
-                    "Managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
+                    "Use normal shell and edit tools after leases, following the reported file authority: direct sessions edit leased files in the selected repo root; isolated sessions edit leased files in COORDINATION_AGENT_BRANCH_ROOT.",
+                    "Worktree/managed patch sessions finish with submit_patch; direct/activity/remote sessions finish with complete_task."
                 ],
                 "cloud_mcp": {
                     "mode": "automatic_rust_lifecycle",
@@ -20116,15 +20307,11 @@ impl CoordinationKernel {
             &mut checks,
             context,
             "policy.worktree_required",
+            "aligned",
             if value_i64(&policy, "agent_worktree_required") == 1 {
-                "aligned"
+                "Write-enabled app-launched agents use isolated Git worktrees."
             } else {
-                "violation"
-            },
-            if value_i64(&policy, "agent_worktree_required") == 1 {
-                "Write-enabled app-launched agents require isolated worktrees."
-            } else {
-                "agent_worktree_required is disabled, so app-launched agents could edit the control workspace."
+                "Write-enabled app-launched agents use leased direct edits in the selected repo root."
             },
             json!({"agent_worktree_required": value_i64(&policy, "agent_worktree_required")}),
         );
@@ -21622,7 +21809,6 @@ impl CoordinationKernel {
             "integrator_reasoning_effort",
         ];
         let hard_gates = [
-            "agent_worktree_required",
             "patch_lease_validation_required",
             "merge_gate_required",
             "merge_requires_clean_target",
@@ -21698,6 +21884,9 @@ impl CoordinationKernel {
                         .map_err(|error| format!("Unable to update repo policy {key}: {error}"))?;
                 }
             }
+        }
+        if patch.get("agent_worktree_required").is_some() {
+            self.write_agent_contract_files(&self.paths.repo_path)?;
         }
         self.emit_event(
             "repo_policy_updated",
@@ -22786,7 +22975,9 @@ impl CoordinationKernel {
             }));
         }
 
-        if repo_has_git(&self.paths.repo_path) {
+        let repo_is_git = repo_has_git(&self.paths.repo_path);
+        let worktrees_required = repo_policy_requires_agent_worktree(&self.repo_policy()?);
+        if repo_is_git && worktrees_required {
             let worktree = self.create_worktree_for_session(agent_id, session_id, task_id)?;
             return Ok(json!({
                 "changed": true,
@@ -22804,6 +22995,11 @@ impl CoordinationKernel {
 
         let now = now_rfc3339();
         let write_root = self.paths.repo_path.display().to_string();
+        let reason = if repo_is_git {
+            "general_worker_git_direct_policy"
+        } else {
+            "general_worker_no_git"
+        };
         self.conn
             .execute(
                 "UPDATE agent_sessions
@@ -22830,7 +23026,7 @@ impl CoordinationKernel {
                 "enforcement_mode": "bounded_direct_edit",
                 "file_authority": "bounded_direct_edit",
                 "write_root": write_root,
-                "reason": "general_worker_no_git",
+                "reason": reason,
             }),
         )?;
         Ok(json!({
@@ -22840,6 +23036,7 @@ impl CoordinationKernel {
             "completion_mode": "complete_task",
             "session_mode": "direct_edit",
             "write_root": write_root,
+            "reason": reason,
         }))
     }
 
@@ -22871,14 +23068,20 @@ impl CoordinationKernel {
             }));
         }
 
-        if !repo_has_git(&self.paths.repo_path) {
+        let repo_is_git = repo_has_git(&self.paths.repo_path);
+        let worktrees_required = repo_policy_requires_agent_worktree(&self.repo_policy()?);
+        if !repo_is_git || !worktrees_required {
             return Ok(json!({
                 "changed": false,
                 "enforcement_mode": "bounded_direct_edit",
                 "file_authority": "bounded_direct_edit",
                 "completion_mode": "complete_task",
                 "write_root": session["write_root"].clone(),
-                "reason": "repo_not_git",
+                "reason": if repo_is_git {
+                    "repo_policy_direct_git_edit"
+                } else {
+                    "repo_not_git"
+                },
             }));
         }
 
@@ -25601,7 +25804,7 @@ fn diffforge_agent_contract_markdown(managed_terminal: bool) -> String {
             "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge workspace note\n\n\
 This repository is known to Diff Forge, but ordinary terminals opened outside Diff Forge AI are not managed agent sessions. Work normally from the visible project root unless the user asks otherwise; do not use Diff Forge coordination lifecycle MCP tools from an outside terminal.\n\n\
-Managed Diff Forge AI terminals receive private session-scoped launch config, environment, and worktree instructions separately. If this file is visible in a regular terminal, it is informational only and does not require task leases, patch submission, or agent worktree routing.\n\n\
+Managed Diff Forge AI terminals receive private session-scoped launch config, environment, and file-authority instructions separately. If this file is visible in a regular terminal, it is informational only and does not require task leases, patch submission, or direct-edit routing.\n\n\
 ## Architecture Graphs\n\n\
 - Diff Forge architecture graphs are repo-scoped artifacts under `.agents/architectures`.\n\
 - For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `.agents/architectures/graphs/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
@@ -25613,23 +25816,23 @@ Managed Diff Forge AI terminals receive private session-scoped launch config, en
     format!(
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge agent coordination contract\n\n\
-This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, and patch submission.\n\n\
+This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, direct completion, and optional patch submission.\n\n\
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
 2. Architecture graph-only work is the direct-live exception: if the only edits are `.agents/architectures/graphs/*.arch`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the graph file directly in the visible repo root, then report the graph path in the final summary.\n\
 3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission, then syncs its lifecycle to Cloud history in the background.\n\
 4. Use `coordination-kernel.acquire_lease` with the exact `task_id` returned by `start_task` and normalized `resource_key` values such as `file:index.html` or `glob:src/**`; do not send `paths[]` to `acquire_lease`. If the lease response queues you behind an active lease or unmerged patch, do not recreate that file, do not sleep or poll manually, and do not mark the work done. Stop on the blocked work; Rust will wake and resume this same terminal after the dependency patch is accepted, integration is refreshed, and the file is ready. Continue only with non-overlapping files whose leases succeed.\n\
-5. Use normal shell and edit tools after the lease. In Git workspaces, your terminal starts in the visible project root, not inside `.agents/worktrees`; the visible root is read-only for writes except live architecture graph sources at `.agents/architectures/graphs/*.arch`. Target the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT` explicitly for every Git-managed code or doc edit. In non-Git direct-edit workspaces, edits stay inside the bounded project root. Never directly edit the shared Git project root or another agent slot's worktree.\n\
+5. Use normal shell and edit tools after the lease. Follow the active session file authority: `bounded_direct_edit` edits leased files directly in the visible repo root, while `worktree_required` edits leased files only inside the assigned agent branch root in `COORDINATION_AGENT_BRANCH_ROOT`. Do not sidestep into `.agents/worktrees` when the session is direct, and never edit another agent slot's worktree.\n\
 6. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
-7. When finished with non-architecture graph edits, call `coordination-kernel.submit_patch` with that `task_id`. It returns a `submit_job_id`; use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
+7. When finished with non-architecture graph edits, follow the active session `completion_mode`: call `coordination-kernel.complete_task` for direct/activity work, or `coordination-kernel.submit_patch` only when the session reports `worktree_required`/`submit_patch`. If `submit_patch` returns a `submit_job_id`, use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
 8. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Diff Forge's Rust app/kernel fetches Cloud context packs and publishes visible task lifecycle, checkpoint summaries, lane claims, and merge context through the Rust cloud event path.\n\
-- Use the local coordination kernel for leases, patch submission, and merge safety.\n\
-- For Git-managed files, edit only through the assigned agent worktree/branch root when one is provided; use the visible project root for inspection.\n\
-- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and submit only through submit_patch, then poll submit_patch_status when needed.\n\
-- Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n\
+- Use the local coordination kernel for leases, completion, patch submission when enabled, and merge safety.\n\
+- For Git-managed files, obey the active file authority: direct sessions edit the visible repo root after leases; isolated sessions edit only through the assigned agent worktree/branch root.\n\
+- Autonomous intent-resolution tasks should treat current integration as source of truth, preserve every compatible task intent without asking the user, and finish through the reported completion mode.\n\
+- Do not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path when isolated worktree submission is enabled.\n\
 \n\
 ## Workspace MCP gateway\n\n\
 - Diff Forge also mounts `workspace-mcp-gateway` when workspace MCPs are installed. Call `workspace_mcp__sync_manifest` before using workspace MCP tools after config changes or when tool availability is unclear.\n\
@@ -25637,7 +25840,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 \n\
 ## Architecture graphs\n\n\
 - Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, normally `.agents/architectures` in the selected repo.\n\
-- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews; this is the only visible-root direct-write exception in Git workspaces. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
+- Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are `.agents/architectures/graphs/*.arch`.\n\
 - For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
 - Before creating a generic architecture doc, inspect the architecture MCP context and existing `.agents/architectures/graphs/*.arch` files.\n\
@@ -26422,6 +26625,12 @@ mod tests {
         repo
     }
 
+    fn enable_agent_worktrees(kernel: &CoordinationKernel) {
+        kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
+    }
+
     fn run(cwd: &Path, command: &str, args: &[&str]) {
         let output = Command::new(command)
             .current_dir(cwd)
@@ -26745,7 +26954,7 @@ mod tests {
         let repo = temp_repo("schema");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let policy = kernel.repo_policy().unwrap();
-        assert_eq!(policy["agent_worktree_required"].as_i64(), Some(1));
+        assert_eq!(policy["agent_worktree_required"].as_i64(), Some(0));
         assert_eq!(policy["patch_lease_validation_required"].as_i64(), Some(1));
         assert_eq!(policy["merge_gate_required"].as_i64(), Some(1));
         assert_eq!(
@@ -26914,6 +27123,81 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+    }
+
+    #[test]
+    fn update_plan_ticks_steps_without_task_id() {
+        let repo = init_git_repo("taskless_terminal_todo_plan_update");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let created = json!({
+            "plan_id": "local-plan-update",
+            "todo_id": "local-plan-update-todo-1",
+            "compact_plan": {
+                "plan_id": "local-plan-update",
+                "todo_id": "local-plan-update-todo-1",
+                "title": "Taskless plan ticking",
+                "status": "listed",
+                "current_step_index": 0,
+                "steps": [
+                    {
+                        "id": "local-plan-update-todo-1",
+                        "todo_id": "local-plan-update-todo-1",
+                        "index": 0,
+                        "title": "First step",
+                        "status": "listed"
+                    },
+                    {
+                        "id": "local-plan-update-todo-2",
+                        "todo_id": "local-plan-update-todo-2",
+                        "index": 1,
+                        "title": "Second step",
+                        "status": "listed"
+                    }
+                ]
+            }
+        });
+        kernel
+            .record_terminal_todo_plan_from_create_plan(
+                &created,
+                &json!({
+                    "workspace_id": "workspace-test",
+                    "agent_id": "codex",
+                    "session_id": "session-test"
+                }),
+            )
+            .unwrap()
+            .unwrap();
+
+        let updated = kernel
+            .update_terminal_todo_plan(
+                Some("codex"),
+                Some("session-test"),
+                &json!({
+                    "plan_id": "local-plan-update",
+                    "completed_step_index": 0,
+                    "current_step_detail": "Working on the second step",
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let steps = updated["plan"]["steps"].as_array().unwrap();
+        assert_eq!(steps[0]["status"].as_str(), Some("completed"));
+        assert_eq!(steps[1]["status"].as_str(), Some("in_progress"));
+        assert_eq!(updated["plan"]["current_step_index"].as_i64(), Some(1));
+
+        let finished = kernel
+            .update_terminal_todo_plan(
+                Some("codex"),
+                Some("session-test"),
+                &json!({
+                    "plan_id": "local-plan-update",
+                    "completed_step_index": 1,
+                    "plan_status": "completed",
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished["plan"]["status"].as_str(), Some("completed"));
     }
 
     #[test]
@@ -27209,9 +27493,20 @@ mod tests {
         let repo = temp_repo("policy_gate");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
 
-        assert!(kernel
+        let enabled_worktrees = kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
+        assert_eq!(
+            enabled_worktrees["data"]["agent_worktree_required"].as_i64(),
+            Some(1)
+        );
+        let disabled_worktrees = kernel
             .update_repo_policy(&json!({"agent_worktree_required": false}))
-            .is_err());
+            .unwrap();
+        assert_eq!(
+            disabled_worktrees["data"]["agent_worktree_required"].as_i64(),
+            Some(0)
+        );
         assert!(kernel
             .update_repo_policy(&json!({"patch_lease_validation_required": 0}))
             .is_err());
@@ -27226,7 +27521,7 @@ mod tests {
             .is_err());
 
         let policy = kernel.repo_policy().unwrap();
-        assert_eq!(policy["agent_worktree_required"].as_i64(), Some(1));
+        assert_eq!(policy["agent_worktree_required"].as_i64(), Some(0));
         assert_eq!(policy["patch_lease_validation_required"].as_i64(), Some(1));
         assert_eq!(policy["merge_gate_required"].as_i64(), Some(1));
         assert_eq!(
@@ -27259,6 +27554,7 @@ mod tests {
     fn concurrent_task_history_records_integration_batch_members() {
         let repo = init_git_repo("concurrent_batch_members");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         kernel
             .update_repo_policy(&json!({"integrator_enabled": true}))
             .unwrap();
@@ -27402,6 +27698,7 @@ mod tests {
             ],
         );
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         kernel
             .update_repo_policy(&json!({"integrator_enabled": true}))
             .unwrap();
@@ -27662,6 +27959,9 @@ mod tests {
     fn mcp_activation_files_are_slot_stable_and_worktree_scoped() {
         let repo = init_git_repo("mcp_activation");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
         let session = kernel
             .create_session_for_slot_key(
                 "codex-01",
@@ -28514,6 +28814,7 @@ command = "diffforge --diff-forge-write-guard"
             &[
                 "start_task",
                 "create_plan",
+                "update_plan",
                 "architecture_context",
                 "architecture_list",
                 "architecture_icon_reference",
@@ -29031,7 +29332,7 @@ Appwrite > Session Store: create session
     }
 
     #[test]
-    fn agent_mcp_start_task_promotes_late_git_direct_session_to_worktree() {
+    fn agent_mcp_start_task_keeps_late_git_direct_session_direct_by_default() {
         let repo = temp_repo("mcp_start_task_late_git_promote");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let context = kernel
@@ -29071,19 +29372,7 @@ Appwrite > Session Store: create session
         );
 
         assert_eq!(started["ok"].as_bool(), Some(true));
-        assert_eq!(
-            started["data"]["authority"]["changed"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(
-            started["data"]["authority"]["enforcement_mode"].as_str(),
-            Some("worktree_required")
-        );
-        let worktree_path = started["data"]["authority"]["worktree_path"]
-            .as_str()
-            .unwrap();
-        assert!(PathBuf::from(worktree_path).exists());
-        assert!(repo.join(".gitignore").exists());
+        assert!(started["data"]["authority"].is_null());
 
         let session = kernel
             .query_one(
@@ -29094,14 +29383,17 @@ Appwrite > Session Store: create session
             .unwrap();
         assert_eq!(
             session["enforcement_mode"].as_str(),
-            Some("worktree_required")
+            Some("bounded_direct_edit")
         );
-        assert!(session["worktree_id"].as_str().is_some());
-        assert_eq!(session["write_root"].as_str(), Some(worktree_path));
+        assert!(session["worktree_id"].as_str().is_none());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(write_root, repo.canonicalize().unwrap());
     }
 
     #[test]
-    fn agent_mcp_acquire_lease_promotes_late_git_direct_session_to_worktree() {
+    fn agent_mcp_acquire_lease_keeps_late_git_direct_session_direct_by_default() {
         let repo = temp_repo("mcp_acquire_late_git_promote");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let context = kernel
@@ -29160,15 +29452,13 @@ Appwrite > Session Store: create session
         );
 
         assert_eq!(lease["ok"].as_bool(), Some(true));
-        assert_eq!(lease["data"]["authority"]["changed"].as_bool(), Some(true));
+        assert!(lease["data"]["authority"].is_null());
         assert_eq!(
-            lease["data"]["authority"]["file_authority"].as_str(),
-            Some("git_worktree_patch")
+            lease["data"]["write_guidance"].as_str(),
+            Some(
+                "After this lease, edit the leased files directly under the selected repo root; Diff Forge still validates lease coverage and this task finishes with complete_task."
+            )
         );
-        let worktree_path = lease["data"]["authority"]["worktree_path"]
-            .as_str()
-            .unwrap();
-        assert!(PathBuf::from(worktree_path).exists());
         let session = kernel
             .query_one(
                 "SELECT enforcement_mode, worktree_id, write_root FROM agent_sessions WHERE id=?1",
@@ -29178,10 +29468,13 @@ Appwrite > Session Store: create session
             .unwrap();
         assert_eq!(
             session["enforcement_mode"].as_str(),
-            Some("worktree_required")
+            Some("bounded_direct_edit")
         );
-        assert!(session["worktree_id"].as_str().is_some());
-        assert_eq!(session["write_root"].as_str(), Some(worktree_path));
+        assert!(session["worktree_id"].as_str().is_none());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(write_root, repo.canonicalize().unwrap());
     }
 
     #[test]
@@ -30044,7 +30337,7 @@ Appwrite > Session Store: create session
     }
 
     #[test]
-    fn no_git_session_degrades_to_coordination_only() {
+    fn no_git_session_defaults_to_bounded_direct_edit() {
         let repo = temp_repo("nogit");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
@@ -30053,7 +30346,7 @@ Appwrite > Session Store: create session
             .unwrap();
         assert_eq!(
             session["enforcementMode"].as_str(),
-            Some("coordination_only")
+            Some("bounded_direct_edit")
         );
     }
 
@@ -30152,9 +30445,57 @@ Appwrite > Session Store: create session
     }
 
     #[test]
+    fn general_worker_resolves_git_file_authority_to_bounded_direct_edit_by_default() {
+        let repo = init_git_repo("general_worker_git_direct_default");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-general-git-direct"),
+                Some("workspace-general-git-direct"),
+                Some("General Git Direct Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-general-git-direct"),
+                Some("general_worker"),
+            )
+            .unwrap();
+
+        let authority = kernel
+            .resolve_general_worker_file_authority(
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(authority["changed"].as_bool(), Some(true));
+        assert_eq!(
+            authority["enforcement_mode"].as_str(),
+            Some("bounded_direct_edit")
+        );
+        assert_eq!(
+            authority["file_authority"].as_str(),
+            Some("bounded_direct_edit")
+        );
+        assert_eq!(authority["completion_mode"].as_str(), Some("complete_task"));
+        assert_eq!(
+            authority["reason"].as_str(),
+            Some("general_worker_git_direct_policy")
+        );
+        assert!(authority["worktree_id"].as_str().is_none());
+    }
+
+    #[test]
     fn general_worker_resolves_git_file_authority_to_managed_worktree() {
         let repo = init_git_repo("general_worker_git");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
         let context = kernel
             .prepare_terminal_context_for_slot(
                 "Codex",
@@ -30209,6 +30550,7 @@ Appwrite > Session Store: create session
     fn prepared_slot_refresh_preserves_active_session_worktree_owner() {
         let repo = init_git_repo("prepared_slot_owner_rebind");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let context = kernel
             .prepare_terminal_context_for_slot(
                 "Codex",
@@ -30295,6 +30637,7 @@ Appwrite > Session Store: create session
     fn managed_patch_session_rejects_complete_task_without_submit_patch() {
         let repo = init_git_repo("managed_complete_reject");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let session = kernel
             .create_session_for_slot_key(
                 "codex-01",
@@ -30516,6 +30859,7 @@ Appwrite > Session Store: create session
     fn recovery_interrupts_active_session_with_missing_worktree_path() {
         let repo = init_git_repo("missing_worktree_recovery");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let session = kernel
@@ -31445,6 +31789,7 @@ Appwrite > Session Store: create session
     fn same_pty_session_reuses_slot_session_and_worktree() {
         let repo = init_git_repo("same_pty_slot_reuse");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let first = kernel
@@ -32208,6 +32553,7 @@ Appwrite > Session Store: create session
     fn worktree_session_and_patch_without_lease_fails() {
         let repo = init_git_repo("patch_no_lease");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32245,6 +32591,7 @@ Appwrite > Session Store: create session
     fn patch_without_lease_resolves_after_late_lease_revalidation() {
         let repo = init_git_repo("patch_late_lease_revalidation");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32335,6 +32682,7 @@ Appwrite > Session Store: create session
     fn shutdown_git_skip_worktree_violation_auto_resolves_after_revalidation() {
         let repo = init_git_repo("shutdown_git_skip_worktree_violation");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32432,6 +32780,7 @@ Appwrite > Session Store: create session
     fn stale_shutdown_git_skip_violation_from_previous_session_does_not_block_submit() {
         let repo = init_git_repo("stale_shutdown_git_skip_violation");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32529,6 +32878,7 @@ Appwrite > Session Store: create session
     fn kernel_recovery_auto_resolves_recovered_shutdown_worktree_violations() {
         let repo = init_git_repo("kernel_recovery_shutdown_git_skip");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let session = kernel
@@ -32592,6 +32942,7 @@ Appwrite > Session Store: create session
     fn kernel_recovery_preserves_real_invalid_worktree_violations() {
         let repo = init_git_repo("kernel_recovery_real_invalid_worktree");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let session = kernel
@@ -32643,6 +32994,7 @@ Appwrite > Session Store: create session
     fn dirty_project_root_blocks_patch_submission() {
         let repo = init_git_repo("dirty_root_blocks_patch");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32699,6 +33051,7 @@ Appwrite > Session Store: create session
     fn recovered_direct_project_root_write_auto_resolves_on_submit() {
         let repo = init_git_repo("dirty_root_recovered_patch");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel
@@ -32788,6 +33141,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_from_previous_task_auto_resolves_on_submit() {
         let repo = init_git_repo("stale_root_write_previous_task");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let old_task = kernel
@@ -32865,6 +33219,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_from_restarted_slot_auto_resolves_on_submit() {
         let repo = init_git_repo("stale_root_write_restarted_slot");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let first = kernel
             .create_session_for_slot_key(
                 "slot-restart",
@@ -32973,6 +33328,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_does_not_resolve_when_root_still_dirty() {
         let repo = init_git_repo("stale_root_write_root_dirty");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let old_task = kernel
@@ -33042,6 +33398,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_does_not_resolve_without_active_lease() {
         let repo = init_git_repo("stale_root_write_missing_lease");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let old_task = kernel
@@ -33095,6 +33452,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_does_not_resolve_when_stale_file_absent_from_diff() {
         let repo = init_git_repo("stale_root_write_absent_file");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let old_task = kernel
@@ -33159,6 +33517,7 @@ Appwrite > Session Store: create session
     fn stale_direct_project_root_write_from_different_worktree_is_not_resolved() {
         let repo = init_git_repo("stale_root_write_different_worktree");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let first = kernel
             .create_session_for_slot_key(
                 "slot-a",
@@ -33265,6 +33624,7 @@ Appwrite > Session Store: create session
     fn worktree_patch_with_active_lease_passes() {
         let repo = init_git_repo("patch_with_lease");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        enable_agent_worktrees(&kernel);
         let agent = kernel.create_or_get_agent("Codex", "codex", None).unwrap();
         let agent_id = agent["id"].as_str().unwrap();
         let task = kernel

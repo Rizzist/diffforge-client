@@ -44,6 +44,9 @@ pub const WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME: &str =
     "coordination_kernel_workspace_mcp_exposure_mode";
 pub const CRASH_TODO_RESUME_MIGRATION_VERSION: i64 = 20;
 pub const CRASH_TODO_RESUME_MIGRATION_NAME: &str = "coordination_kernel_crash_todo_resume";
+pub const OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION: i64 = 21;
+pub const OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME: &str =
+    "coordination_kernel_optional_git_worktrees_policy";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -598,7 +601,7 @@ CREATE TABLE IF NOT EXISTS repo_policies(
   per_agent_db_required INTEGER NOT NULL DEFAULT 1,
   shadow_validation_required INTEGER NOT NULL DEFAULT 1,
   prod_requires_human INTEGER NOT NULL DEFAULT 1,
-  agent_worktree_required INTEGER NOT NULL DEFAULT 1,
+  agent_worktree_required INTEGER NOT NULL DEFAULT 0,
   patch_lease_validation_required INTEGER NOT NULL DEFAULT 1,
   merge_gate_required INTEGER NOT NULL DEFAULT 1,
   root_repo_write_policy TEXT NOT NULL DEFAULT 'detect_and_reject_patch',

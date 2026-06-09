@@ -724,15 +724,6 @@ function hudCardKind(card) {
   return "todo";
 }
 
-function hudCardChip(card) {
-  if (statusKey(card?.status) === "done") return "Done";
-  const kind = hudCardKind(card);
-  if (kind === "upload") return "Upload";
-  if (kind === "download") return "Download";
-  if (kind === "transfer") return "Sync";
-  return text(card?.eyebrow, "Todo");
-}
-
 function activityCardPriority(card) {
   const status = statusKey(card?.status);
   const kind = hudCardKind(card);
@@ -896,6 +887,77 @@ function useActivityOverlayData() {
   return state;
 }
 
+function summaryLabel(stats) {
+  const parts = [];
+  if (stats.todos) {
+    parts.push(`${stats.todos} ${stats.todos === 1 ? "todo" : "todos"}`);
+  }
+  if (stats.transfers) {
+    parts.push(`${stats.transfers} ${stats.transfers === 1 ? "asset" : "assets"}`);
+  }
+  return parts.join(" · ") || "all clear";
+}
+
+function RowGlyph({ kind, status, tone }) {
+  const state = statusKey(status);
+  const spinning = kind !== "todo" && state === "active";
+  let shape;
+  if (state === "failed") {
+    shape = (
+      <>
+        <path d="M6 2.9v3.6" />
+        <circle cx="6" cy="9.1" r="0.8" fill="currentColor" stroke="none" />
+      </>
+    );
+  } else if (state === "done") {
+    shape = <path d="M2.8 6.3l2.2 2.3 4.2-4.7" />;
+  } else if (kind === "upload") {
+    shape = (
+      <>
+        <path d="M6 9.6V2.8" />
+        <path d="M3.3 5.4L6 2.7l2.7 2.7" />
+      </>
+    );
+  } else if (kind === "download") {
+    shape = (
+      <>
+        <path d="M6 2.4v6.8" />
+        <path d="M3.3 6.6L6 9.3l2.7-2.7" />
+      </>
+    );
+  } else if (kind === "transfer") {
+    shape = (
+      <>
+        <path d="M9.9 6A3.9 3.9 0 1 1 8.8 3.3" />
+        <path d="M9.1 1.4l.2 2.1-2.1.2" />
+      </>
+    );
+  } else if (state === "queued") {
+    shape = <circle cx="6" cy="6" r="3.5" />;
+  } else {
+    shape = (
+      <>
+        <circle cx="6" cy="6" r="3.5" />
+        <circle cx="6" cy="6" r="1" fill="currentColor" stroke="none" />
+      </>
+    );
+  }
+  return (
+    <GlyphBadge aria-hidden="true" data-spin={spinning ? "true" : "false"} data-tone={tone}>
+      <svg
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.4"
+        viewBox="0 0 12 12"
+      >
+        {shape}
+      </svg>
+    </GlyphBadge>
+  );
+}
+
 export default function ActivityOverlayWindow() {
   const data = useActivityOverlayData();
   const todoCards = useMemo(
@@ -936,21 +998,29 @@ export default function ActivityOverlayWindow() {
   }, []);
   const renderRow = useCallback((card) => {
     const kind = hudCardKind(card);
+    const state = statusKey(card.status);
     const tone = card.tone || statusTone(card.status);
+    const isTransfer = card.lane === "transfers";
     const progress = clampPercent(card.progress ?? statusProgress(card.status));
-    const chip = hudCardChip(card);
+    const detail = isTransfer ? "" : text(card.detail);
+    const statusLabel = isTransfer
+      ? state === "done" ? "done" : firstText(card.meta, `${progress}%`)
+      : text(card.eyebrow, "listed");
     return (
-      <OverlayRow data-tauri-drag-region data-tone={tone} key={card.id}>
-        <RowSignal aria-hidden="true" data-kind={kind} data-tone={tone} />
-        <RowMain data-tauri-drag-region>
-          <RowTitle>{card.title}</RowTitle>
-          {card.lane === "transfers" ? (
-            <RowProgress aria-hidden="true">
-              <RowProgressFill data-kind={kind} data-tone={tone} style={{ width: `${progress}%` }} />
-            </RowProgress>
+      <OverlayRow data-tauri-drag-region key={card.id}>
+        <RowGlyph kind={kind} status={card.status} tone={tone} />
+        <RowBody data-tauri-drag-region>
+          <RowLine>
+            <RowTitle>{card.title}</RowTitle>
+            {detail ? <RowDetail>{detail}</RowDetail> : null}
+            <RowStatus data-tone={tone}>{statusLabel}</RowStatus>
+          </RowLine>
+          {isTransfer && state !== "done" && state !== "failed" ? (
+            <RowTrack aria-hidden="true">
+              <RowTrackFill data-tone={tone} style={{ width: `${progress}%` }} />
+            </RowTrack>
           ) : null}
-        </RowMain>
-        <RowChip data-tone={tone}>{chip}</RowChip>
+        </RowBody>
       </OverlayRow>
     );
   }, []);
@@ -959,32 +1029,57 @@ export default function ActivityOverlayWindow() {
     <>
       <OverlayGlobalStyle />
       <OverlayShell>
-        <MinimalRoot
+        <OverlayCard
           data-tauri-drag-region
           data-tone={statusToneName}
           onMouseDown={dragOverlayWindow}
         >
+          <OverlayHeader data-tauri-drag-region>
+            <HeaderDot data-live={hasWork ? "true" : "false"} data-tone={statusToneName} />
+            <HeaderTitle>Activity</HeaderTitle>
+            <HeaderSummary>{summaryLabel(stats)}</HeaderSummary>
+          </OverlayHeader>
+
           <OverlayBody data-tauri-drag-region aria-live="polite">
             {visibleCards.length ? visibleCards.map(renderRow) : (
-              <ListEmpty data-tauri-drag-region>No local activity</ListEmpty>
+              <OverlayEmpty data-tauri-drag-region>
+                <EmptyGlyph aria-hidden="true">
+                  <svg
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.3"
+                    viewBox="0 0 16 16"
+                  >
+                    <circle cx="8" cy="8" r="5.6" />
+                    <path d="M5.6 8.2l1.7 1.7 3.1-3.6" />
+                  </svg>
+                </EmptyGlyph>
+                <EmptyTitle>All clear</EmptyTitle>
+                <EmptyHint>no todos queued · no assets syncing</EmptyHint>
+              </OverlayEmpty>
             )}
           </OverlayBody>
 
-          <MinimalFooter data-tauri-drag-region>
-            <LiveDot data-active={hasWork ? "true" : "false"} />
-            <span>{data.errors.length ? "snapshot pending" : "local only"}</span>
+          <OverlayFooter data-tauri-drag-region>
+            <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updatedAt)}`}</span>
             <FooterSpacer />
-            <span>{hiddenCount ? `+${hiddenCount} more` : `updated ${timeAgo(data.updatedAt)}`}</span>
-          </MinimalFooter>
-        </MinimalRoot>
+            {hiddenCount ? <span>+{hiddenCount} more</span> : null}
+          </OverlayFooter>
+        </OverlayCard>
       </OverlayShell>
     </>
   );
 }
 
 const softPulse = keyframes`
-  0%, 100% { opacity: 0.55; }
+  0%, 100% { opacity: 0.45; }
   50% { opacity: 1; }
+`;
+
+const spin = keyframes`
+  to { transform: rotate(360deg); }
 `;
 
 const OverlayShell = styled.div`
@@ -999,7 +1094,7 @@ const OverlayShell = styled.div`
   clip-path: inset(0 round 18px);
 `;
 
-const MinimalRoot = styled.main`
+const OverlayCard = styled.main`
   width: 100%;
   height: 100%;
   max-width: 100vw;
@@ -1007,26 +1102,22 @@ const MinimalRoot = styled.main`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 11px 12px 8px;
+  padding: 12px 14px 9px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
   color: var(--forge-text, #f4f7fa);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
   line-height: 1.2;
-  background:
-    radial-gradient(circle at 60% 0%, rgba(255, 255, 255, 0.045), transparent 34%),
-    linear-gradient(180deg, rgba(13, 15, 19, 0.94), rgba(5, 6, 8, 0.965)),
-    rgba(5, 6, 8, 0.96);
-  border: 1px solid rgba(240, 244, 248, 0.095);
+  background: linear-gradient(180deg, rgba(17, 18, 23, 0.92), rgba(9, 10, 13, 0.95));
+  border: 1px solid rgba(255, 255, 255, 0.085);
   border-radius: 18px;
   box-shadow:
-    0 14px 34px rgba(0, 0, 0, 0.22),
-    inset 0 1px 0 rgba(255, 255, 255, 0.055),
-    inset 0 -1px 0 rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
+    0 18px 44px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(24px) saturate(1.2);
+  -webkit-backdrop-filter: blur(24px) saturate(1.2);
   clip-path: inset(0 round 18px);
   contain: paint;
   cursor: grab;
@@ -1035,15 +1126,15 @@ const MinimalRoot = styled.main`
   -webkit-app-region: drag;
 
   &[data-tone="danger"] {
-    border-color: rgba(239, 107, 107, 0.28);
+    border-color: rgba(240, 127, 127, 0.26);
   }
 
   &[data-tone="warn"] {
-    border-color: rgba(223, 165, 90, 0.28);
+    border-color: rgba(227, 169, 99, 0.22);
   }
 
   &[data-tone="hot"] {
-    border-color: rgba(125, 176, 255, 0.24);
+    border-color: rgba(130, 173, 255, 0.2);
   }
 
   &:active {
@@ -1051,13 +1142,78 @@ const MinimalRoot = styled.main`
   }
 `;
 
+const OverlayHeader = styled.header`
+  flex: 0 0 auto;
+  min-width: 0;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: grab;
+  -webkit-app-region: drag;
+
+  &:active {
+    cursor: grabbing;
+  }
+`;
+
+const HeaderDot = styled.span`
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: rgba(107, 116, 128, 0.9);
+
+  &[data-tone="good"] {
+    background: rgba(78, 213, 152, 0.95);
+  }
+
+  &[data-tone="warn"] {
+    background: rgba(227, 169, 99, 0.95);
+  }
+
+  &[data-tone="hot"] {
+    background: rgba(130, 173, 255, 0.95);
+  }
+
+  &[data-tone="danger"] {
+    background: rgba(240, 127, 127, 0.95);
+  }
+
+  &[data-live="true"] {
+    animation: ${softPulse} 1.8s ease-in-out infinite;
+  }
+`;
+
+const HeaderTitle = styled.span`
+  flex: 0 0 auto;
+  color: rgba(235, 240, 247, 0.5);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  text-transform: uppercase;
+`;
+
+const HeaderSummary = styled.span`
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: rgba(160, 169, 181, 0.75);
+  font-size: 10px;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
 const OverlayBody = styled.div`
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  display: grid;
-  align-content: start;
-  gap: 4px;
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   cursor: grab;
   -webkit-app-region: drag;
@@ -1068,145 +1224,204 @@ const OverlayBody = styled.div`
 `;
 
 const OverlayRow = styled.div`
+  flex: 0 0 auto;
   min-width: 0;
-  height: 30px;
+  height: 32px;
   display: grid;
-  grid-template-columns: 7px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
-  padding: 3px 0;
+  gap: 9px;
   cursor: grab;
   -webkit-app-region: drag;
+
+  & + & {
+    border-top: 1px solid rgba(255, 255, 255, 0.045);
+  }
 
   &:active {
     cursor: grabbing;
   }
 `;
 
-const RowSignal = styled.span`
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: rgba(125, 176, 255, 0.76);
+const GlyphBadge = styled.span`
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  color: rgba(130, 173, 255, 0.85);
+
+  & > svg {
+    width: 12px;
+    height: 12px;
+  }
 
   &[data-tone="good"] {
-    background: rgba(60, 203, 127, 0.78);
+    color: rgba(78, 213, 152, 0.85);
   }
 
   &[data-tone="warn"] {
-    background: rgba(223, 165, 90, 0.86);
+    color: rgba(227, 169, 99, 0.9);
+  }
+
+  &[data-tone="danger"] {
+    color: rgba(240, 127, 127, 0.9);
+  }
+
+  &[data-tone="muted"] {
+    color: rgba(107, 116, 128, 0.9);
+  }
+
+  &[data-spin="true"] > svg {
+    animation: ${spin} 1.6s linear infinite;
   }
 `;
 
-const RowMain = styled.div`
+const RowBody = styled.div`
   min-width: 0;
   display: grid;
   align-content: center;
-  gap: 5px;
+  gap: 4px;
 `;
 
-const RowTitle = styled.div`
+const RowLine = styled.div`
   min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+`;
+
+const RowTitle = styled.span`
+  min-width: 0;
+  flex: 0 1 auto;
   overflow: hidden;
-  color: rgba(245, 247, 250, 0.82);
-  font-size: 11px;
-  font-weight: 650;
+  color: rgba(240, 244, 249, 0.92);
+  font-size: 11.5px;
+  font-weight: 550;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const RowDetail = styled.span`
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: rgba(150, 158, 170, 0.6);
+  font-size: 9.5px;
+  font-weight: 500;
   line-height: 1;
   text-overflow: ellipsis;
   white-space: nowrap;
 `;
 
-const RowChip = styled.div`
-  max-width: 58px;
-  overflow: hidden;
-  padding: 3px 6px;
-  border: 1px solid rgba(240, 244, 248, 0.08);
-  border-radius: 5px;
-  color: rgba(182, 192, 204, 0.58);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 9px;
-  font-weight: 650;
+const RowStatus = styled.span`
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: rgba(130, 173, 255, 0.85);
+  font-size: 9.5px;
+  font-weight: 620;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
-  text-overflow: ellipsis;
   text-transform: lowercase;
   white-space: nowrap;
 
   &[data-tone="good"] {
-    color: rgba(60, 203, 127, 0.75);
-    border-color: rgba(60, 203, 127, 0.16);
+    color: rgba(78, 213, 152, 0.85);
   }
 
   &[data-tone="warn"] {
-    color: rgba(223, 165, 90, 0.78);
-    border-color: rgba(223, 165, 90, 0.18);
+    color: rgba(227, 169, 99, 0.9);
   }
 
-  &[data-tone="hot"] {
-    color: rgba(125, 176, 255, 0.78);
-    border-color: rgba(125, 176, 255, 0.18);
+  &[data-tone="danger"] {
+    color: rgba(240, 127, 127, 0.9);
+  }
+
+  &[data-tone="muted"] {
+    color: rgba(107, 116, 128, 0.9);
   }
 `;
 
-const RowProgress = styled.div`
+const RowTrack = styled.div`
   height: 2px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(230, 236, 245, 0.07);
+  background: rgba(255, 255, 255, 0.07);
 `;
 
-const RowProgressFill = styled.div`
+const RowTrackFill = styled.div`
   height: 100%;
-  min-width: 5%;
+  min-width: 4%;
   border-radius: inherit;
-  background: rgba(125, 176, 255, 0.82);
-  transition: width 180ms ease;
+  background: rgba(130, 173, 255, 0.9);
+  transition: width 240ms ease;
+
+  &[data-tone="good"] {
+    background: rgba(78, 213, 152, 0.9);
+  }
 
   &[data-tone="warn"] {
-    background: rgba(223, 165, 90, 0.82);
+    background: rgba(227, 169, 99, 0.9);
+  }
+
+  &[data-tone="danger"] {
+    background: rgba(240, 127, 127, 0.9);
   }
 `;
 
-const ListEmpty = styled.div`
-  height: 52px;
+const OverlayEmpty = styled.div`
+  flex: 1 1 auto;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  color: rgba(122, 132, 147, 0.62);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  font-size: 10px;
-  font-weight: 560;
+  justify-content: center;
+  gap: 5px;
+`;
+
+const EmptyGlyph = styled.span`
+  display: grid;
+  place-items: center;
+  color: rgba(107, 116, 128, 0.7);
+
+  & > svg {
+    width: 18px;
+    height: 18px;
+  }
+`;
+
+const EmptyTitle = styled.span`
+  color: rgba(220, 226, 234, 0.78);
+  font-size: 11px;
+  font-weight: 600;
   line-height: 1;
 `;
 
-const MinimalFooter = styled.footer`
+const EmptyHint = styled.span`
+  color: rgba(122, 132, 147, 0.6);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1;
+`;
+
+const OverlayFooter = styled.footer`
   flex: 0 0 auto;
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding-top: 2px;
-  color: var(--forge-text-muted, #7a8493);
+  padding-top: 5px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  color: rgba(122, 132, 147, 0.65);
   cursor: grab;
   font-size: 9px;
-  font-weight: 600;
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
   text-transform: lowercase;
   -webkit-app-region: drag;
 
   &:active {
     cursor: grabbing;
-  }
-`;
-
-const LiveDot = styled.span`
-  width: 6px;
-  height: 6px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--forge-text-disabled, #505966);
-
-  &[data-active="true"] {
-    background: var(--forge-blue-soft, #7db0ff);
-    animation: ${softPulse} 1.2s ease-in-out infinite;
   }
 `;
 

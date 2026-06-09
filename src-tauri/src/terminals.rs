@@ -1228,8 +1228,8 @@ struct WorkspaceGitBootstrapFlight {
     future: Shared<BoxFuture<'static, WorkspaceGitBootstrapResult>>,
 }
 
-fn workspace_git_bootstrap_flights()
--> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
+fn workspace_git_bootstrap_flights(
+) -> &'static StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>> {
     static FLIGHTS: OnceLock<StdMutex<HashMap<String, WorkspaceGitBootstrapFlight>>> =
         OnceLock::new();
     FLIGHTS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -1419,7 +1419,14 @@ async fn terminal_workspace_topology_scan_for_launch_from_cache(
         }
     }
 
-    let mounts = workspace_project_mounts(workspace_root);
+    // The mount scan walks the filesystem and may shell out to git; keep it off
+    // the async runtime threads so a slow disk cannot stall unrelated commands.
+    let mounts = {
+        let scan_root = workspace_root.to_path_buf();
+        tauri::async_runtime::spawn_blocking(move || workspace_project_mounts(&scan_root))
+            .await
+            .unwrap_or_default()
+    };
     let scanned_ms = scanned_ms_override.unwrap_or_else(terminal_now_ms);
     let mut cache = cache.write().await;
     cache.insert(
@@ -2692,9 +2699,12 @@ fn terminal_coordination_launch_target_with_mounts(
             TerminalSessionMode::ManagedPatch | TerminalSessionMode::General
         );
     let has_git_or_selected_empty_bootstrap = has_git || selected_workspace_empty_git_bootstrap;
+    let git_worktrees_enabled = has_git_or_selected_empty_bootstrap
+        && terminal_agent_worktrees_enabled_for_root(&target_root);
     let enforcement_mode = match session_mode {
+        TerminalSessionMode::ManagedPatch if git_worktrees_enabled => "worktree_required",
         TerminalSessionMode::ManagedPatch if has_git_or_selected_empty_bootstrap => {
-            "worktree_required"
+            "bounded_direct_edit"
         }
         TerminalSessionMode::ManagedPatch => {
             return Err(
@@ -2702,9 +2712,9 @@ fn terminal_coordination_launch_target_with_mounts(
                     .to_string(),
             );
         }
-        TerminalSessionMode::General if has_git_or_selected_empty_bootstrap => "worktree_required",
+        TerminalSessionMode::General if git_worktrees_enabled => "worktree_required",
         TerminalSessionMode::General => "bounded_direct_edit",
-        TerminalSessionMode::DirectEdit if has_git => "worktree_required",
+        TerminalSessionMode::DirectEdit if git_worktrees_enabled && has_git => "worktree_required",
         TerminalSessionMode::DirectEdit => "bounded_direct_edit",
         TerminalSessionMode::Activity => "activity_only",
         TerminalSessionMode::RemoteOps => "remote_unmanaged",
@@ -2714,13 +2724,24 @@ fn terminal_coordination_launch_target_with_mounts(
     Ok(TerminalCoordinationLaunchTarget {
         root: target_root,
         enforcement_mode,
-        requires_git_bootstrap: if matches!(session_mode, TerminalSessionMode::General) {
-            selected_workspace_empty_git_bootstrap
-        } else {
-            enforcement_mode == "worktree_required"
-        },
+        requires_git_bootstrap: enforcement_mode == "worktree_required"
+            && (!matches!(session_mode, TerminalSessionMode::General)
+                || selected_workspace_empty_git_bootstrap),
         allows_git_init: selected_workspace_empty_git_bootstrap,
     })
+}
+
+fn terminal_agent_worktrees_enabled_for_root(root: &Path) -> bool {
+    let Ok((kernel, _)) =
+        crate::coordination::CoordinationKernel::open_for_terminal_launch(root, None)
+    else {
+        return false;
+    };
+    kernel
+        .repo_policy()
+        .ok()
+        .and_then(|policy| policy["agent_worktree_required"].as_i64())
+        == Some(1)
 }
 
 fn terminal_context_requires_isolated_worktree(
@@ -4474,9 +4495,9 @@ async fn terminal_open(
         );
     }
 
-    let cloud_output_observer_enabled = !cloud_mcp_agent_uses_activity_hooks(
-        &terminal_metadata_for_log.agent_id,
-    ) && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
+    let cloud_output_observer_enabled =
+        !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
+            && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
@@ -4729,9 +4750,15 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
         }
 
         let repo_key = target.label.clone();
-        let db_key = target.db_path.as_ref().map(|path| workspace_path_display(path));
-        match crate::coordination::CoordinationKernel::init(&target.repo_path, target.db_path.clone())
-            .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
+        let db_key = target
+            .db_path
+            .as_ref()
+            .map(|path| workspace_path_display(path));
+        match crate::coordination::CoordinationKernel::init(
+            &target.repo_path,
+            target.db_path.clone(),
+        )
+        .and_then(|kernel| kernel.recover_crashed_terminal_sessions())
         {
             Ok(mut report) => {
                 scanned_sessions += report["scannedSessions"].as_u64().unwrap_or(0);
@@ -4747,10 +4774,8 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                             if let Some(db_key) = &db_key {
                                 object.insert("dbPath".to_string(), json!(db_key));
                             }
-                            object.insert(
-                                "recoverySource".to_string(),
-                                json!(target.source.clone()),
-                            );
+                            object
+                                .insert("recoverySource".to_string(), json!(target.source.clone()));
                         }
                         interrupted_tasks.push(task.clone());
                     }
@@ -4763,10 +4788,8 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                             if let Some(db_key) = &db_key {
                                 object.insert("dbPath".to_string(), json!(db_key));
                             }
-                            object.insert(
-                                "recoverySource".to_string(),
-                                json!(target.source.clone()),
-                            );
+                            object
+                                .insert("recoverySource".to_string(), json!(target.source.clone()));
                         }
                         crashed_terminals.push(terminal.clone());
                     }
@@ -4777,10 +4800,7 @@ fn terminal_recover_crashed_sessions_report(roots: Option<Vec<String>>) -> Resul
                     if let Some(db_key) = db_key {
                         object.insert("dbPath".to_string(), json!(db_key));
                     }
-                    object.insert(
-                        "recoverySource".to_string(),
-                        json!(target.source.clone()),
-                    );
+                    object.insert("recoverySource".to_string(), json!(target.source.clone()));
                 }
                 workspace_reports.push(report);
             }
@@ -7848,8 +7868,8 @@ async fn terminal_try_crash_todo_resume_prompt_once(
         Some(PathBuf::from(&coordination_db_path)),
     )
     .and_then(|kernel| {
-        let _ =
-            kernel.record_session_provider_session_id(&coordination_session_id, &provider_session_id);
+        let _ = kernel
+            .record_session_provider_session_id(&coordination_session_id, &provider_session_id);
         kernel.claim_crashed_todo_resume_for_provider_session(
             &coordination_session_id,
             &provider_session_id,
@@ -8635,7 +8655,11 @@ fn terminal_architecture_graph_path_from_text(value: &str) -> String {
         return String::new();
     };
     let is_boundary = |ch: char| {
-        ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ',')
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ','
+            )
     };
     let mut start = 0usize;
     for (index, ch) in haystack[..marker_index].char_indices() {
@@ -8757,7 +8781,12 @@ fn terminal_architecture_activity_payload(
     let cwd = terminal_activity_hook_string(event, &["cwd"]).unwrap_or_else(|| repo_path.clone());
     let graph_id = terminal_activity_hook_string(
         event,
-        &["graphId", "graph_id", "architectureGraphId", "architecture_graph_id"],
+        &[
+            "graphId",
+            "graph_id",
+            "architectureGraphId",
+            "architecture_graph_id",
+        ],
     )
     .unwrap_or_else(|| terminal_architecture_graph_id_from_path(&graph_file_path));
     let graph_title = terminal_activity_hook_string(
@@ -11572,6 +11601,14 @@ mod terminal_tests {
         repo
     }
 
+    fn terminal_enable_agent_worktrees(repo: &Path) {
+        let (kernel, _) =
+            crate::coordination::CoordinationKernel::open_for_terminal_launch(repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
+    }
+
     fn terminal_test_repo_with_commit(name: &str) -> PathBuf {
         let repo = terminal_test_repo(name);
         fs::write(repo.join("README.md"), "initial\n").unwrap();
@@ -11889,8 +11926,30 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_uses_worktree_for_git_root() {
+    fn general_terminal_launch_target_uses_direct_edit_for_git_root_by_default() {
         let repo = terminal_test_repo("general_git_launch_target");
+
+        let target = terminal_coordination_launch_target(
+            &repo,
+            None,
+            None,
+            false,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
+        assert!(!target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_uses_worktree_when_policy_enabled() {
+        let repo = terminal_test_repo("general_git_worktree_policy_launch_target");
+        terminal_enable_agent_worktrees(&repo);
 
         let target = terminal_coordination_launch_target(
             &repo,
@@ -11931,8 +11990,32 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_bootstraps_only_empty_selected_workspace() {
+    fn general_terminal_launch_target_keeps_empty_selected_workspace_direct_by_default() {
         let empty_workspace = terminal_test_directory("general_empty_selected_launch_target");
+
+        let target = terminal_coordination_launch_target(
+            &empty_workspace,
+            None,
+            None,
+            true,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
+        assert!(!target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&empty_workspace.canonicalize().unwrap())
+        );
+        assert!(!empty_workspace.join(".git").exists());
+    }
+
+    #[test]
+    fn general_terminal_launch_target_bootstraps_empty_selected_workspace_when_policy_enabled() {
+        let empty_workspace =
+            terminal_test_directory("general_empty_selected_worktree_policy_launch_target");
+        terminal_enable_agent_worktrees(&empty_workspace);
 
         let target = terminal_coordination_launch_target(
             &empty_workspace,
@@ -11973,8 +12056,8 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
-        assert!(target.requires_git_bootstrap);
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
+        assert!(!target.requires_git_bootstrap);
         assert!(target.allows_git_init);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
@@ -12060,7 +12143,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -12068,8 +12151,8 @@ mod terminal_tests {
     }
 
     #[test]
-    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected()
-     {
+    fn general_terminal_launch_target_makes_ambiguous_container_activity_only_until_project_selected(
+    ) {
         let container = terminal_test_directory("general_multi_repo_container");
         let frontend = container.join("frontend");
         let backend = container.join("backend");
@@ -12111,7 +12194,7 @@ mod terminal_tests {
             TerminalSessionMode::General,
         )
         .unwrap();
-        assert_eq!(selected.enforcement_mode, "worktree_required");
+        assert_eq!(selected.enforcement_mode, "bounded_direct_edit");
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
             normalized_path_key(&frontend.canonicalize().unwrap())
@@ -12198,7 +12281,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
         assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
@@ -12231,7 +12314,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(selected.enforcement_mode, "worktree_required");
+        assert_eq!(selected.enforcement_mode, "bounded_direct_edit");
         assert!(!selected.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&selected.root.canonicalize().unwrap()),
@@ -12240,7 +12323,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn direct_edit_launch_target_uses_worktree_policy_for_git_root() {
+    fn direct_edit_launch_target_uses_direct_policy_for_git_root_by_default() {
         let repo = terminal_test_repo("direct_edit_git_launch_target");
 
         let target = terminal_coordination_launch_target(
@@ -12252,8 +12335,8 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(target.enforcement_mode, "worktree_required");
-        assert!(target.requires_git_bootstrap);
+        assert_eq!(target.enforcement_mode, "bounded_direct_edit");
+        assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),
             normalized_path_key(&repo.canonicalize().unwrap())
@@ -12601,28 +12684,24 @@ mod terminal_tests {
         assert_eq!(prompt.kind, "approval");
         assert_eq!(prompt.text.as_deref(), Some("Approve this edit?"));
 
-        assert!(
-            terminal_activity_hook_manual_prompt(
-                "PreToolUse",
-                &json!({
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "toolUseId": "tool-auto",
-                    "promptingUserKind": "approval"
-                }),
-            )
-            .is_none()
-        );
-        assert!(
-            terminal_activity_hook_manual_prompt(
-                "PreToolUse",
-                &json!({
-                    "hookEventName": "PreToolUse",
-                    "toolUseId": "tool-observed"
-                }),
-            )
-            .is_none()
-        );
+        assert!(terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "toolUseId": "tool-auto",
+                "promptingUserKind": "approval"
+            }),
+        )
+        .is_none());
+        assert!(terminal_activity_hook_manual_prompt(
+            "PreToolUse",
+            &json!({
+                "hookEventName": "PreToolUse",
+                "toolUseId": "tool-observed"
+            }),
+        )
+        .is_none());
     }
 
     #[test]
@@ -12819,51 +12898,41 @@ mod terminal_tests {
             42,
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "never"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--profile", "diffforge-test-profile"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
         assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-hook-trust")
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
         assert!(!args.iter().any(|arg| arg == "--cd"));
-        assert!(
-            args.iter()
-                .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") })
-        );
-        assert!(
-            args.iter()
-                .any(|arg| arg.contains("--coordination-mcp-proxy"))
-        );
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.args=") }));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("--coordination-mcp-proxy")));
         assert!(!args.iter().any(|arg| arg.contains("--coordination-mcp''")));
-        assert!(
-            args.iter()
-                .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.command=") })
-        );
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.coordination-kernel.command=") }));
         assert!(args.iter().any(|arg| {
             arg.starts_with("mcp_servers.coordination-kernel.tools.start_task.approval_mode=")
         }));
-        assert!(
-            args.iter()
-                .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.command=") })
-        );
-        assert!(
-            args.iter()
-                .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.args=") })
-        );
-        assert!(
-            args.iter()
-                .any(|arg| { arg.contains("--workspace-mcp-gateway") })
-        );
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.command=") }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.workspace-mcp-gateway.args=") }));
+        assert!(args
+            .iter()
+            .any(|arg| { arg.contains("--workspace-mcp-gateway") }));
         assert!(args.iter().any(|arg| {
             arg.starts_with(
                 "mcp_servers.workspace-mcp-gateway.tools.workspace_mcp__sync_manifest.approval_mode="
@@ -12874,16 +12943,12 @@ mod terminal_tests {
                 "mcp_servers.workspace-mcp-gateway.tools.appwrite-api__appwrite_search_tools.approval_mode="
             )
         }));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") })
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("mcp_servers.codex_apps."))
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| { arg.starts_with("mcp_servers.cloud-diffforge.args=") }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
         assert_eq!(
             args.iter()
                 .filter(|arg| arg.as_str() == "--no-alt-screen")
@@ -12916,10 +12981,9 @@ mod terminal_tests {
             42,
         );
 
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--dangerously-bypass-hook-trust")
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
     }
 
     #[test]
@@ -13053,20 +13117,16 @@ mod terminal_tests {
         assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
         assert!(!args.iter().any(|arg| arg.starts_with("plugins.")));
         assert!(!args.iter().any(|arg| arg.contains("computer-use")));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.contains("browser@openai-bundled"))
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("browser@openai-bundled")));
         assert!(!args.iter().any(|arg| arg.contains("codex_apps")));
-        assert!(
-            args.iter()
-                .any(|arg| arg.starts_with("mcp_servers.coordination-kernel."))
-        );
-        assert!(
-            args.iter()
-                .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway."))
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.coordination-kernel.")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.workspace-mcp-gateway.")));
     }
 
     #[test]
@@ -13139,19 +13199,15 @@ mod terminal_tests {
             42,
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--add-dir", worktree_path.as_str()])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--add-dir", "/tmp/repo-root-override"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", worktree_path.as_str()]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", "/tmp/repo-root-override"]));
         let allowed_tools = args
             .windows(2)
             .find_map(|pair| {
@@ -13173,11 +13229,9 @@ mod terminal_tests {
         ] {
             assert!(allowed_tools.split(',').any(|allowed| allowed == tool));
         }
-        assert!(
-            allowed_tools
-                .split(',')
-                .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)"))
-        );
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Write"));
         let mcp_config = args
@@ -13185,33 +13239,24 @@ mod terminal_tests {
             .find_map(|pair| (pair[0] == "--mcp-config").then(|| pair[1].as_str()))
             .unwrap();
         assert_eq!(mcp_config, claude_config_path);
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--mcp-config", "/tmp/unsafe-claude-mcp.json"])
-        );
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--mcp-config", "/tmp/unsafe-claude-mcp.json"]));
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
         assert!(!mcp_config.contains("\"coordination-kernel\""));
         assert!(!mcp_config.contains("terminal_launch_args"));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--allow-dangerously-skip-permissions")
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--allow-dangerously-skip-permissions"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
         let settings_arg = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
@@ -13225,13 +13270,11 @@ mod terminal_tests {
             settings["permissions"]["defaultMode"].as_str(),
             Some("acceptEdits")
         );
-        assert!(
-            settings["hooks"]["PreToolUse"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit"))
-        );
+        assert!(settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
         assert_eq!(settings["sandbox"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             settings["sandbox"]["allowUnsandboxedCommands"].as_bool(),
@@ -13289,31 +13332,25 @@ mod terminal_tests {
             43,
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--add-dir", direct_root_text.as_str()])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", direct_root_text.as_str()]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
         let settings_arg = args
             .windows(2)
             .find_map(|pair| (pair[0] == "--settings").then(|| pair[1].as_str()))
             .unwrap();
         let settings: Value = serde_json::from_str(settings_arg).unwrap();
-        assert!(
-            settings["hooks"]["PreToolUse"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit"))
-        );
+        assert!(settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hook| hook["matcher"].as_str() == Some("Edit|Write|NotebookEdit")));
         assert!(settings_arg.contains("--diff-forge-write-guard"));
         let allowed_tools = args
             .windows(2)
@@ -13322,16 +13359,12 @@ mod terminal_tests {
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(
-            allowed_tools
-                .split(',')
-                .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)"))
-        );
-        assert!(
-            allowed_tools
-                .split(',')
-                .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)"))
-        );
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") && allowed.ends_with("/**)")));
+        assert!(allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Write(//") && allowed.ends_with("/**)")));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
     }
 
@@ -13382,24 +13415,18 @@ mod terminal_tests {
             44,
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--add-dir", repo_text.as_str()])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1"))
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--permission-mode", "acceptEdits"])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--permission-mode", "bypassPermissions"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair[0] == "--add-dir" && pair[1].contains(".agents/worktrees/1")));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
         assert!(!args.windows(2).any(|pair| pair[0] == "--settings"));
         let allowed_tools = args
             .windows(2)
@@ -13408,16 +13435,12 @@ mod terminal_tests {
                     .then(|| pair[1].as_str())
             })
             .unwrap();
-        assert!(
-            !allowed_tools
-                .split(',')
-                .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//"))
-        );
-        assert!(
-            !allowed_tools
-                .split(',')
-                .any(|allowed| allowed.contains(&format!("{}/**", repo_text)))
-        );
+        assert!(!allowed_tools
+            .split(',')
+            .any(|allowed| allowed.starts_with("Edit(//") || allowed.starts_with("Write(//")));
+        assert!(!allowed_tools
+            .split(',')
+            .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));
     }
 
     #[test]
@@ -13496,7 +13519,7 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert!(reason.contains("no active task-owned worktree"));
+        assert!(reason.contains("no active task-owned file authority"));
     }
 
     #[test]
@@ -13640,11 +13663,8 @@ mod terminal_tests {
         .unwrap_err();
 
         assert!(error.contains("direct Git repository edit"));
-        assert!(
-            error.contains(
-                "apply_patch must target this terminal's assigned worktree path explicitly"
-            )
-        );
+        assert!(error
+            .contains("apply_patch must target this terminal's assigned worktree path explicitly"));
     }
 
     #[test]
@@ -13763,7 +13783,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn diff_forge_write_guard_promotes_late_git_direct_session_and_denies_root_edit() {
+    fn diff_forge_write_guard_allows_late_git_direct_session_with_active_lease() {
         let repo = terminal_test_directory("write_guard_late_git_direct");
         let kernel = crate::coordination::CoordinationKernel::init(&repo, None).unwrap();
         let session = kernel
@@ -13819,7 +13839,7 @@ mod terminal_tests {
             }
         });
 
-        let error = diff_forge_write_guard_decision(
+        let decision = diff_forge_write_guard_decision(
             "codex",
             &hook_input,
             &repo,
@@ -13827,10 +13847,9 @@ mod terminal_tests {
             "codex",
             &identity,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("direct Git repository edit"));
-        assert!(error.contains(".agents/worktrees/slot1"));
+        assert!(decision.is_none());
         let session = kernel
             .query_json(
                 "SELECT enforcement_mode, worktree_id, write_root FROM agent_sessions WHERE id=?1",
@@ -13842,14 +13861,13 @@ mod terminal_tests {
             .unwrap();
         assert_eq!(
             session["enforcement_mode"].as_str(),
-            Some("worktree_required")
+            Some("bounded_direct_edit")
         );
-        assert!(session["worktree_id"].as_str().is_some());
-        assert!(
-            session["write_root"]
-                .as_str()
-                .is_some_and(|value| value.contains(".agents/worktrees/slot1"))
-        );
+        assert!(session["worktree_id"].as_str().is_none());
+        let write_root = PathBuf::from(session["write_root"].as_str().unwrap_or_default())
+            .canonicalize()
+            .unwrap();
+        assert_eq!(write_root, repo.canonicalize().unwrap());
     }
 
     #[test]
@@ -13931,7 +13949,7 @@ mod terminal_tests {
         )
         .unwrap_err();
 
-        if !error.contains("no active task-owned worktree") {
+        if !error.contains("no active task-owned file authority") {
             panic!("nested guard error: {error}");
         }
     }
@@ -14048,7 +14066,7 @@ mod terminal_tests {
         )
         .unwrap_err();
 
-        if !error.contains("no active task-owned worktree") {
+        if !error.contains("no active task-owned file authority") {
             panic!("nested guard error: {error}");
         }
     }
@@ -14085,7 +14103,7 @@ mod terminal_tests {
         )
         .unwrap_err();
 
-        if !error.contains("no active task-owned worktree") {
+        if !error.contains("no active task-owned file authority") {
             panic!("nested guard error: {error}");
         }
     }
@@ -14211,11 +14229,9 @@ mod terminal_tests {
                 .count(),
             1
         );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("mcp_servers.codex_apps."))
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.codex_apps.")));
     }
 
     #[test]
@@ -14232,11 +14248,9 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert!(
-            env_vars
-                .iter()
-                .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1")
-        );
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1"));
         let config_paths = env_vars
             .iter()
             .filter_map(|(key, value)| (key == OPENCODE_TUI_CONFIG_ENV).then_some(value))
@@ -14336,31 +14350,23 @@ mod terminal_tests {
                 .count(),
             1
         );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "never"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--profile", "diffforge-test-profile"])
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--profile", "diffforge-test-profile"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-hook-trust")
-        );
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
-        assert!(
-            !args
-                .windows(2)
-                .any(|pair| pair == ["--cd", "/tmp/custom-cwd"])
-        );
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
     }
 
     #[test]
@@ -14391,14 +14397,12 @@ mod terminal_tests {
             7,
         );
 
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--ask-for-approval", "never"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--profile", "diffforge-activity-profile"])
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--profile", "diffforge-activity-profile"]));
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(!args.iter().any(|arg| arg == "--sandbox"));
     }

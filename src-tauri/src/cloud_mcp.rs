@@ -4663,6 +4663,9 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
             | "workspace_todos_snapshot"
             | "workspace_todo_listed_created"
             | "workspace_todo_remote_listed"
+            | "workspace_todo_workspace_removed"
+            | "workspace_todos_workspace_removed"
+            | "workspace_todos_archived"
             | "todo_queue_snapshot"
             | "todo_queue_state"
             | "workspace_todo_dispatch_requested"
@@ -4801,9 +4804,77 @@ fn cloud_mcp_workspace_catalog_repo_id(
         })
 }
 
+const CLOUD_MCP_WORKSPACE_CATALOG_GIT_REPO_LIMIT: usize = 32;
+
+/// Precomputes the git identity and mounted git repo list for every workspace
+/// root in a catalog snapshot. Each repo identity costs several git
+/// subprocesses, so callers run this on a blocking thread instead of inside
+/// the async command itself.
+fn cloud_mcp_workspace_catalog_git_context(
+    workspaces: &Value,
+) -> HashMap<String, (Value, Vec<Value>)> {
+    let mut by_root = HashMap::new();
+    let Some(items) = workspaces.as_array() else {
+        return by_root;
+    };
+    for workspace in items.iter().take(64) {
+        let Some(repo_path) = cloud_mcp_payload_text(
+            workspace,
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "workspace_root_directory",
+                "workspaceRootDirectory",
+                "workingDirectory",
+                "rootDirectory",
+            ],
+        )
+        .filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let root = Path::new(&repo_path);
+        let key = normalized_path_key(root);
+        if by_root.contains_key(&key) {
+            continue;
+        }
+        let identity = cloud_mcp_git_repo_identity_for_path(root);
+        let git_repos = cloud_mcp_workspace_catalog_git_repos(root);
+        by_root.insert(key, (identity, git_repos));
+    }
+    by_root
+}
+
+fn cloud_mcp_workspace_catalog_git_repos(workspace_root: &Path) -> Vec<Value> {
+    cloud_mcp_container_project_mounts(workspace_root)
+        .into_iter()
+        .filter(|mount| mount.has_git)
+        .take(CLOUD_MCP_WORKSPACE_CATALOG_GIT_REPO_LIMIT)
+        .map(|mount| {
+            let mut entry = json!({
+                "repo_id": cloud_mcp_repo_id_for_root(&mount.root_path),
+                "repoId": cloud_mcp_repo_id_for_root(&mount.root_path),
+                "repo_path": workspace_path_display(&mount.root_path),
+                "repoPath": workspace_path_display(&mount.root_path),
+                "workspace_relative_path": mount.workspace_relative_path.clone(),
+                "workspaceRelativePath": mount.workspace_relative_path,
+                "project_name": mount.project_name.clone(),
+                "projectName": mount.project_name,
+                "has_agents": mount.has_agents,
+                "hasAgents": mount.has_agents,
+            });
+            let identity = cloud_mcp_git_repo_identity_for_path(&mount.root_path);
+            cloud_mcp_apply_git_identity_to_value(&mut entry, &identity);
+            entry
+        })
+        .collect()
+}
+
 fn cloud_mcp_normalize_workspace_catalog_items(
     state: &CloudMcpState,
     workspaces: &Value,
+    git_context: &HashMap<String, (Value, Vec<Value>)>,
 ) -> Result<Vec<Value>, String> {
     let workspace_items = workspaces
         .as_array()
@@ -4919,13 +4990,28 @@ fn cloud_mcp_normalize_workspace_catalog_items(
         });
         if !repo_path.trim().is_empty() {
             let root = Path::new(&repo_path);
-            let git_identity = cloud_mcp_git_repo_identity_for_path(root);
+            let (git_identity, git_repos) = git_context
+                .get(&normalized_path_key(root))
+                .cloned()
+                .unwrap_or_else(|| {
+                    (
+                        cloud_mcp_git_repo_identity_for_path(root),
+                        cloud_mcp_workspace_catalog_git_repos(root),
+                    )
+                });
             cloud_mcp_apply_git_identity_to_value(&mut workspace_value, &git_identity);
             if let Some(object) = workspace_value.as_object_mut() {
                 object.insert(
                     "workspace_location_fingerprint".to_string(),
                     json!(cloud_mcp_workspace_location_fingerprint(root)),
                 );
+                // Catalog every git repo mounted in this workspace, not just the
+                // root, so the cloud can map repo state to workspace membership
+                // and detect repos no workspace references anymore.
+                object.insert("git_repo_count".to_string(), json!(git_repos.len()));
+                object.insert("gitRepoCount".to_string(), json!(git_repos.len()));
+                object.insert("git_repos".to_string(), json!(git_repos.clone()));
+                object.insert("gitRepos".to_string(), json!(git_repos));
             }
         }
         normalized_workspaces.push(workspace_value);
@@ -4944,8 +5030,16 @@ async fn cloud_mcp_sync_device_workspace_catalog(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "device_workspace_catalog_snapshot".to_string());
+    let git_context = {
+        let workspaces = workspaces.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_workspace_catalog_git_context(&workspaces)
+        })
+        .await
+        .unwrap_or_default()
+    };
     let normalized_workspaces =
-        cloud_mcp_normalize_workspace_catalog_items(state.inner(), &workspaces)?;
+        cloud_mcp_normalize_workspace_catalog_items(state.inner(), &workspaces, &git_context)?;
     let workspace_count = normalized_workspaces.len();
     let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
@@ -6361,7 +6455,12 @@ async fn cloud_mcp_ws_request_with_timeout(
     response_timeout: Duration,
 ) -> Result<Value, String> {
     let mut last_error = String::new();
-    let retry_transient_errors = request_kind != "hard_reset_cloud_sqlite";
+    // Destructive resets must never be re-sent on timeout: the server may still
+    // be processing the first request, and a retry doubles the heavy work.
+    let retry_transient_errors = !matches!(
+        request_kind,
+        "hard_reset_cloud_sqlite" | "server_reset_cloud_state"
+    );
     for attempt in 0..2 {
         match cloud_mcp_ws_request_once_with_timeout(state, request_kind, payload, response_timeout)
             .await
@@ -7667,6 +7766,7 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         }
         "/v1/tokenomics/reset-device" => Some("tokenomics_reset_device_cloud"),
         "/v1/cloud/server-reset" => Some("server_reset_cloud_state"),
+        "/v1/cloud/repo-catalog" => Some("account_repo_catalog"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -13304,6 +13404,8 @@ async fn cloud_mcp_reset_server_state(
     workspace_id: String,
     workspace_name: Option<String>,
     reset_scope: Option<String>,
+    repo_id_override: Option<String>,
+    dry_run: Option<bool>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         repo_path.clone(),
@@ -13319,19 +13421,30 @@ async fn cloud_mcp_reset_server_state(
         .to_ascii_lowercase();
     let reset_scope = match requested_reset_scope.as_str() {
         "repo" | "repository" | "git_repo" | "git-repo" => "repo",
+        "repo_delete" | "repo-delete" | "repo_purge" | "repo-purge" => "repo_delete",
         "workspace" | "workspace_runtime" | "workspace-runtime" => "workspace",
         "account" | "account_runtime" | "account-runtime" => "account_runtime",
         _ => "repo",
     };
+    // Cloud-only repos have no local checkout, so the caller may address them
+    // by the repo id recorded in the account catalog instead of a local path.
+    let repo_id = repo_id_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| req.repo_id.clone());
+    let dry_run = dry_run.unwrap_or(false);
     let payload = json!({
         "source": "rust-diffforge-server-state-reset",
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": req.repo_id,
+        "repo_id": repo_id,
         "repo_path": req.root_display,
         "workspace_root": req.root_display,
         "workspace_id": workspace_id,
         "workspace_name": workspace_name,
         "scope": reset_scope,
+        "dry_run": dry_run,
         "confirm": "reset_server_state",
         "preserve": {
             "devices": true,
@@ -13353,10 +13466,32 @@ async fn cloud_mcp_reset_server_state(
     });
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/server-reset", &payload).await?;
-    {
+    if !dry_run {
         let mut snapshots = state.runtime_snapshots.lock().await;
         *snapshots = CloudMcpRuntimeSnapshots::default();
     }
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_account_repo_catalog(
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-account-repo-catalog",
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/repo-catalog", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 
@@ -13586,6 +13721,66 @@ fn cloud_mcp_architecture_payload_base(
     payload
 }
 
+fn cloud_mcp_apply_architecture_scope(
+    payload: &mut Value,
+    scope_repo_id: Option<&str>,
+    scope_git_repo_identity_id: Option<&str>,
+) {
+    let Some(scope_repo_id) = scope_repo_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.insert("repo_id".to_string(), json!(scope_repo_id));
+    object.insert("repoId".to_string(), json!(scope_repo_id));
+    let scope_git = scope_git_repo_identity_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match scope_git {
+        Some(identity_id) => {
+            object.insert("git_repo_identity_id".to_string(), json!(identity_id));
+            object.insert("gitRepoIdentityId".to_string(), json!(identity_id));
+        }
+        None => {
+            // Scoped payloads (account-global graphs, orphan repo caches) must
+            // not inherit the local directory's git identity: the scope repo id
+            // is the account-stable identity key.
+            for key in [
+                "git_repo_identity",
+                "gitRepoIdentity",
+                "git_repo_present",
+                "gitRepoPresent",
+                "git_repo_identity_id",
+                "gitRepoIdentityId",
+                "git_repo_identity_kind",
+                "gitRepoIdentityKind",
+                "git_repo_display_name",
+                "gitRepoDisplayName",
+                "git_repo_root",
+                "gitRepoRoot",
+                "git_repo_canonical_remote",
+                "gitRepoCanonicalRemote",
+                "git_repo_canonical_remote_hash",
+                "gitRepoCanonicalRemoteHash",
+                "git_repo_remote_count",
+                "gitRepoRemoteCount",
+                "git_repo_remotes",
+                "gitRepoRemotes",
+                "git_branch",
+                "gitBranch",
+                "git_head_sha",
+                "gitHeadSha",
+            ] {
+                object.remove(key);
+            }
+        }
+    }
+}
+
 fn cloud_mcp_architecture_graphs_payload(value: Value) -> Vec<Value> {
     if let Some(items) = value.as_array() {
         return items.clone();
@@ -13694,14 +13889,41 @@ async fn cloud_mcp_get_workspace_architectures(
     repo_path: String,
     workspace_id: Option<String>,
     workspace_name: Option<String>,
+    scope_repo_id: Option<String>,
+    scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    let payload = cloud_mcp_architecture_payload_base(
+    let mut payload = cloud_mcp_architecture_payload_base(
         &req,
         workspace_id.as_deref().unwrap_or_default(),
         workspace_name.as_deref(),
         "architecture_index_pull",
     );
+    cloud_mcp_apply_architecture_scope(
+        &mut payload,
+        scope_repo_id.as_deref(),
+        scope_git_repo_identity_id.as_deref(),
+    );
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/list", &payload)
+            .await?;
+    Ok(response.get("data").cloned().unwrap_or(response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_list_account_architectures(
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-architecture",
+        "reason": "architecture_account_index_pull",
+        "scope": "account",
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/list", &payload)
             .await?;
@@ -13716,6 +13938,8 @@ async fn cloud_mcp_sync_workspace_architectures(
     workspace_name: Option<String>,
     graphs: Value,
     reason: Option<String>,
+    scope_repo_id: Option<String>,
+    scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         repo_path,
@@ -13727,6 +13951,11 @@ async fn cloud_mcp_sync_workspace_architectures(
         &workspace_id,
         workspace_name.as_deref(),
         reason.as_deref().unwrap_or("architecture_index_sync"),
+    );
+    cloud_mcp_apply_architecture_scope(
+        &mut payload,
+        scope_repo_id.as_deref(),
+        scope_git_repo_identity_id.as_deref(),
     );
     let graph_items = cloud_mcp_architecture_graphs_payload(graphs)
         .into_iter()
@@ -13753,6 +13982,8 @@ async fn cloud_mcp_sync_workspace_architecture(
     workspace_name: Option<String>,
     graph: Value,
     reason: Option<String>,
+    scope_repo_id: Option<String>,
+    scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         repo_path,
@@ -13764,6 +13995,11 @@ async fn cloud_mcp_sync_workspace_architecture(
         &workspace_id,
         workspace_name.as_deref(),
         reason.as_deref().unwrap_or("architecture_graph_save"),
+    );
+    cloud_mcp_apply_architecture_scope(
+        &mut payload,
+        scope_repo_id.as_deref(),
+        scope_git_repo_identity_id.as_deref(),
     );
     let graph = cloud_mcp_prepare_architecture_graph(graph);
     if let Some(object) = payload.as_object_mut() {
@@ -13788,6 +14024,8 @@ async fn cloud_mcp_hydrate_workspace_architecture(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     refs: Value,
+    scope_repo_id: Option<String>,
+    scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         repo_path.clone(),
@@ -13809,6 +14047,11 @@ async fn cloud_mcp_hydrate_workspace_architecture(
         workspace_id.as_deref().unwrap_or_default(),
         workspace_name.as_deref(),
         "architecture_content_hydrate",
+    );
+    cloud_mcp_apply_architecture_scope(
+        &mut payload,
+        scope_repo_id.as_deref(),
+        scope_git_repo_identity_id.as_deref(),
     );
     if let Some(object) = payload.as_object_mut() {
         object.insert("refs".to_string(), json!(refs_array));
@@ -13848,6 +14091,193 @@ async fn cloud_mcp_hydrate_workspace_architecture(
         object.insert("hydratedCount".to_string(), json!(saved_count));
     }
     Ok(data)
+}
+
+#[tauri::command]
+async fn cloud_mcp_architecture_hub_catalog(
+    state: State<'_, CloudMcpState>,
+    terminal_state: State<'_, TerminalState>,
+    workspaces: Value,
+) -> Result<Value, String> {
+    let built_at_ms = cloud_mcp_now_ms();
+    let global_entry_base =
+        tauri::async_runtime::spawn_blocking(architecture_global_root_value)
+            .await
+            .map_err(|error| format!("Architecture global root worker failed: {error}"))??;
+    let global_root_display =
+        cloud_mcp_payload_text(&global_entry_base, &["rootDirectory", "root_directory"])
+            .unwrap_or_default();
+    let global_entry = json!({
+        "id": "global-architectures",
+        "name": "Global",
+        "path": global_root_display,
+        "relativePath": ".",
+        "hasGit": false,
+        "architectureRoot": global_entry_base["architectureRoot"].clone(),
+        "graphCount": global_entry_base["graphCount"].clone(),
+        "scopeKind": "global",
+        "repoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "workspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+        "workspaceName": "Global",
+    });
+
+    let mut covered_identity_keys = HashSet::<String>::new();
+    covered_identity_keys.insert(ARCHITECTURE_GLOBAL_REPO_ID.to_string());
+    let mut workspace_groups = Vec::new();
+    for workspace in workspaces.as_array().cloned().unwrap_or_default() {
+        let workspace_id =
+            cloud_mcp_payload_text(&workspace, &["workspaceId", "workspace_id", "id"])
+                .unwrap_or_default();
+        let workspace_name =
+            cloud_mcp_payload_text(&workspace, &["workspaceName", "workspace_name", "name"])
+                .unwrap_or_default();
+        let root_directory = cloud_mcp_payload_text(
+            &workspace,
+            &["rootDirectory", "root_directory", "repoPath", "repo_path"],
+        )
+        .unwrap_or_default();
+        if workspace_id.is_empty() || root_directory.is_empty() {
+            continue;
+        }
+        let Ok(root) = resolve_workspace_root_directory(Some(root_directory.as_str())) else {
+            continue;
+        };
+        let topology =
+            terminal_workspace_topology_scan_for_launch(terminal_state.inner(), &root).await;
+        let repositories =
+            architecture_repositories_from_mounts(&root, &topology.mounts).repositories;
+        let mut repo_entries = Vec::new();
+        for repo in repositories {
+            let repo_path = PathBuf::from(&repo.path);
+            let repo_id = cloud_mcp_repo_id_for_root(&repo_path);
+            let identity = cloud_mcp_git_repo_identity_for_path(&repo_path);
+            let git_repo_identity_id = cloud_mcp_payload_text(
+                &identity,
+                &["git_repo_identity_id", "gitRepoIdentityId"],
+            )
+            .unwrap_or_default();
+            covered_identity_keys.insert(repo_id.clone());
+            if !git_repo_identity_id.is_empty() {
+                covered_identity_keys.insert(git_repo_identity_id.clone());
+            }
+            let mut entry = serde_json::to_value(&repo).unwrap_or_else(|_| json!({}));
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("scopeKind".to_string(), json!("workspace"));
+                object.insert("repoId".to_string(), json!(repo_id));
+                object.insert(
+                    "gitRepoIdentityId".to_string(),
+                    json!(git_repo_identity_id),
+                );
+                object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+                object.insert("workspaceName".to_string(), json!(workspace_name.clone()));
+            }
+            repo_entries.push(entry);
+        }
+        workspace_groups.push(json!({
+            "workspaceId": workspace_id,
+            "workspaceName": workspace_name,
+            "rootDirectory": workspace_path_display(&root),
+            "repositories": repo_entries,
+        }));
+    }
+
+    let account_list = {
+        let device_profile = cloud_mcp_desktop_device_profile();
+        let payload = json!({
+            "source": "rust-diffforge-architecture",
+            "reason": "architecture_hub_catalog",
+            "scope": "account",
+            "device": device_profile.clone(),
+            "device_id": device_profile["device_id"].clone(),
+            "deviceId": device_profile["device_id"].clone(),
+            "ts_ms": cloud_mcp_now_ms(),
+        });
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/workspace/architectures/list", &payload)
+            .await
+            .map(|response| response.get("data").cloned().unwrap_or(response))
+            .ok()
+    };
+    let mut cloud_error = String::new();
+    if account_list.is_none() {
+        cloud_error = "Cloud architecture index is unavailable; showing local repos only.".to_string();
+    }
+    let mut orphan_groups = BTreeMap::<String, Vec<Value>>::new();
+    if let Some(account_list) = &account_list {
+        for row in account_list
+            .get("graphs")
+            .or_else(|| account_list.get("architectures"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+        {
+            let identity_key = cloud_mcp_payload_text(&row, &["identity_key", "identityKey"])
+                .or_else(|| cloud_mcp_payload_text(&row, &["repo_id", "repoId"]))
+                .unwrap_or_default();
+            if identity_key.is_empty() || covered_identity_keys.contains(&identity_key) {
+                continue;
+            }
+            orphan_groups.entry(identity_key).or_default().push(row);
+        }
+    }
+    let mut orphan_entries = Vec::new();
+    for (identity_key, rows) in orphan_groups {
+        let first = rows.first().cloned().unwrap_or_else(|| json!({}));
+        let orphan_identity = identity_key.clone();
+        let orphan_root = tauri::async_runtime::spawn_blocking(move || {
+            architecture_orphan_root_dir(&orphan_identity)
+        })
+        .await
+        .map_err(|error| format!("Architecture orphan root worker failed: {error}"))??;
+        let name = cloud_mcp_payload_text(
+            &first,
+            &[
+                "git_repo_display_name",
+                "gitRepoDisplayName",
+                "workspace_name",
+                "workspaceName",
+            ],
+        )
+        .or_else(|| {
+            cloud_mcp_payload_text(&first, &["workspace_root", "workspaceRoot"]).and_then(
+                |root| {
+                    root.replace('\\', "/")
+                        .split('/')
+                        .filter(|part| !part.is_empty())
+                        .next_back()
+                        .map(str::to_string)
+                },
+            )
+        })
+        .unwrap_or_else(|| identity_key.clone());
+        orphan_entries.push(json!({
+            "id": format!("orphan-{identity_key}"),
+            "name": name,
+            "path": workspace_path_display(&orphan_root),
+            "relativePath": ".",
+            "hasGit": false,
+            "architectureRoot": workspace_path_display(&orphan_root.join(".agents").join("architectures")),
+            "graphCount": rows.len(),
+            "scopeKind": "orphan",
+            "repoId": cloud_mcp_payload_text(&first, &["repo_id", "repoId"]).unwrap_or_else(|| identity_key.clone()),
+            "gitRepoIdentityId": cloud_mcp_payload_text(&first, &["git_repo_identity_id", "gitRepoIdentityId"]).unwrap_or_default(),
+            "identityKey": identity_key,
+            "workspaceId": cloud_mcp_payload_text(&first, &["workspace_id", "workspaceId"]).unwrap_or_default(),
+            "workspaceName": cloud_mcp_payload_text(&first, &["workspace_name", "workspaceName"]).unwrap_or_default(),
+        }));
+    }
+
+    Ok(json!({
+        "kind": "architecture_hub_catalog",
+        "version": 1,
+        "builtAtMs": built_at_ms,
+        "global": global_entry,
+        "workspaces": workspace_groups,
+        "orphanRepositories": orphan_entries,
+        "cloudIndexAvailable": account_list.is_some(),
+        "cloudError": cloud_error,
+        "globalRepoId": ARCHITECTURE_GLOBAL_REPO_ID,
+        "globalWorkspaceId": ARCHITECTURE_GLOBAL_WORKSPACE_ID,
+    }))
 }
 
 fn cloud_mcp_asset_payload_base(
@@ -15121,6 +15551,95 @@ async fn cloud_mcp_sync_workspace_todos(
         ),
         Err(error) => log_terminal_status_event(
             "backend.workspace_todos.sync_error",
+            json!({
+                "error": clean_terminal_telemetry_text(error),
+                "workspaceId": workspace_id,
+            }),
+        ),
+    }
+    result
+}
+
+fn cloud_mcp_todo_mirror_purge_workspace(workspace_id: &str) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Ok(0);
+    }
+    let conn = cloud_mcp_open_todo_mirror_conn()?;
+    let mut removed = conn
+        .execute(
+            "DELETE FROM workspace_todo_mirror_rows
+             WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1",
+            rusqlite::params![workspace_id],
+        )
+        .map_err(|error| format!("Unable to purge todo mirror rows for workspace: {error}"))?;
+    removed += conn
+        .execute(
+            "DELETE FROM workspace_todo_mirror_snapshots WHERE workspace_id=?1",
+            rusqlite::params![workspace_id],
+        )
+        .map_err(|error| {
+            format!("Unable to purge todo mirror snapshots for workspace: {error}")
+        })?;
+    Ok(removed)
+}
+
+#[tauri::command]
+async fn cloud_mcp_archive_workspace_todos(
+    state: State<'_, CloudMcpState>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Workspace todo archive requires a workspace id.".to_string());
+    }
+    // Local state is removed immediately; the cloud keeps tombstoned rows so a
+    // recreated workspace with the same identity starts without ghost todos.
+    let purged_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "event_kind": "workspace_todo_workspace_removed",
+        "source": "rust-diffforge-workspace-removed",
+        "client_request_id": format!(
+            "workspace-archive-{}-{}",
+            workspace_id,
+            cloud_mcp_now_ms()
+        ),
+        "reason": reason.unwrap_or_else(|| "workspace_removed".to_string()),
+        "workspace_id": workspace_id.clone(),
+        "workspaceId": workspace_id.clone(),
+        "workspace_name": workspace_name.clone().unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machineId": device_profile["device_id"].clone(),
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    log_terminal_status_event(
+        "backend.workspace_todos.workspace_archive_send",
+        json!({
+            "workspaceId": workspace_id,
+            "purgedMirrorRows": purged_mirror_rows,
+        }),
+    );
+    let result =
+        cloud_mcp_post_event_endpoint(state.inner(), "workspace_todo_workspace_removed", &payload)
+            .await;
+    match &result {
+        Ok(value) => log_terminal_status_event(
+            "backend.workspace_todos.workspace_archive_result",
+            json!({
+                "ok": true,
+                "result": value,
+                "workspaceId": workspace_id,
+            }),
+        ),
+        Err(error) => log_terminal_status_event(
+            "backend.workspace_todos.workspace_archive_error",
             json!({
                 "error": clean_terminal_telemetry_text(error),
                 "workspaceId": workspace_id,
@@ -17389,6 +17908,55 @@ fn cloud_mcp_todo_mirror_upsert_rows(
     )
 }
 
+fn cloud_mcp_todo_mirror_collect_removed_todo_ids(value: &Value, ids: &mut Vec<String>, depth: usize) {
+    if depth > 3 {
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    for key in [
+        "removed_todo_ids",
+        "removedTodoIds",
+        "deleted_todo_ids",
+        "deletedTodoIds",
+    ] {
+        if let Some(items) = object.get(key).and_then(Value::as_array) {
+            for item in items.iter().filter_map(Value::as_str) {
+                let item = item.trim().to_string();
+                if !item.is_empty() && !ids.contains(&item) {
+                    ids.push(item);
+                }
+            }
+        }
+    }
+    for key in ["payload", "data", "workspace_todos", "workspaceTodos"] {
+        if let Some(nested) = object.get(key) {
+            cloud_mcp_todo_mirror_collect_removed_todo_ids(nested, ids, depth + 1);
+        }
+    }
+}
+
+fn cloud_mcp_todo_mirror_apply_removed_todo_ids(
+    conn: &rusqlite::Connection,
+    removed_todo_ids: &[String],
+) -> Result<usize, String> {
+    let mut removed = 0usize;
+    for todo_id in removed_todo_ids {
+        let todo_id = todo_id.trim();
+        if todo_id.is_empty() {
+            continue;
+        }
+        removed += conn
+            .execute(
+                "DELETE FROM workspace_todo_mirror_rows WHERE todo_id=?1",
+                rusqlite::params![todo_id],
+            )
+            .map_err(|error| format!("Unable to remove deleted todo mirror rows: {error}"))?;
+    }
+    Ok(removed)
+}
+
 fn cloud_mcp_update_todo_mirror_conn(
     conn: &rusqlite::Connection,
     source: &str,
@@ -17401,7 +17969,9 @@ fn cloud_mcp_update_todo_mirror_conn(
         .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
     let workspace_todos = cloud_mcp_extract_workspace_todos(response);
     let rows = cloud_mcp_todo_mirror_rows_from_response(response);
-    if workspace_todos.is_none() && rows.is_empty() {
+    let mut removed_todo_ids = Vec::new();
+    cloud_mcp_todo_mirror_collect_removed_todo_ids(response, &mut removed_todo_ids, 0);
+    if workspace_todos.is_none() && rows.is_empty() && removed_todo_ids.is_empty() {
         return Ok(false);
     }
     let now_ms = cloud_mcp_now_ms();
@@ -17456,6 +18026,9 @@ fn cloud_mcp_update_todo_mirror_conn(
         &history_rows,
         now_ms,
     )?;
+    // Deletions win over any row carried in the same payload: a deleted todo id
+    // must never survive in the mirror, or it re-imports as a ghost later.
+    cloud_mcp_todo_mirror_apply_removed_todo_ids(conn, &removed_todo_ids)?;
     Ok(true)
 }
 
@@ -18029,11 +18602,6 @@ struct CloudMcpAgentCreatePlanTodoRows {
     dispatch_rows: Vec<Value>,
 }
 
-struct CloudMcpAgentCreatePlanSyncPayloads {
-    snapshot: Value,
-    dispatches: Vec<Value>,
-}
-
 fn cloud_mcp_agent_plan_text(value: &str, max_chars: usize) -> String {
     value
         .replace(|character: char| character.is_control(), " ")
@@ -18054,19 +18622,6 @@ fn cloud_mcp_agent_create_plan_required_text(
         .map(|value| cloud_mcp_agent_plan_text(&value, 256))
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("create_plan generated invalid todo plan row without {label}."))
-}
-
-fn cloud_mcp_agent_create_plan_cloud_row(row: &Value) -> Value {
-    let mut row = row.clone();
-    if let Some(object) = row.as_object_mut() {
-        object.remove("local_only");
-        object.remove("localOnly");
-        object.insert("server_sync_queued".to_string(), json!(true));
-        object.insert("serverSyncQueued".to_string(), json!(true));
-        object.insert("cloud_sync_status".to_string(), json!("queued"));
-        object.insert("cloudSyncStatus".to_string(), json!("queued"));
-    }
-    row
 }
 
 fn cloud_mcp_validate_agent_create_plan_rows(
@@ -18192,166 +18747,6 @@ fn cloud_mcp_validate_agent_create_plan_rows(
     }
 
     Ok(())
-}
-
-fn cloud_mcp_agent_create_plan_sync_payloads(
-    rows: &CloudMcpAgentCreatePlanTodoRows,
-) -> Result<CloudMcpAgentCreatePlanSyncPayloads, String> {
-    cloud_mcp_validate_agent_create_plan_rows(rows)?;
-
-    let first_row = rows
-        .todo_rows
-        .first()
-        .ok_or_else(|| "create_plan generated invalid todo plan without todos.".to_string())?;
-    let repo_id = cloud_mcp_payload_text(first_row, &["repo_id", "repoId"]).unwrap_or_default();
-    let repo_path = cloud_mcp_payload_text(
-        first_row,
-        &["repo_path", "repoPath", "workspace_root", "workspaceRoot"],
-    )
-    .unwrap_or_default();
-    let workspace_id =
-        cloud_mcp_payload_text(first_row, &["workspace_id", "workspaceId"]).unwrap_or_default();
-    let workspace_name =
-        cloud_mcp_payload_text(first_row, &["workspace_name", "workspaceName"]).unwrap_or_default();
-    let device_id = cloud_mcp_payload_text(first_row, &["device_id", "deviceId"])
-        .unwrap_or_else(|| "rust-diffforge-desktop".to_string());
-    let device_name = cloud_mcp_payload_text(first_row, &["device_name", "deviceName"])
-        .unwrap_or_else(|| "Desktop".to_string());
-    let primary_todo_id = cloud_mcp_agent_create_plan_required_text(
-        &rows.compact_plan,
-        &["todo_id", "todoId", "primary_todo_id", "primaryTodoId"],
-        "todo_id",
-    )?;
-    let todo_ids = rows
-        .todo_rows
-        .iter()
-        .map(|row| cloud_mcp_agent_create_plan_required_text(row, &["todo_id", "todoId", "id"], "todo_id"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let todos = rows
-        .todo_rows
-        .iter()
-        .map(cloud_mcp_agent_create_plan_cloud_row)
-        .collect::<Vec<_>>();
-    let dispatches = rows
-        .dispatch_rows
-        .iter()
-        .map(|row| {
-            let mut row = cloud_mcp_agent_create_plan_cloud_row(row);
-            if let Some(object) = row.as_object_mut() {
-                object.insert(
-                    "event_kind".to_string(),
-                    json!("workspace_todo_dispatch_requested"),
-                );
-                object.insert(
-                    "eventKind".to_string(),
-                    json!("workspace_todo_dispatch_requested"),
-                );
-                object.insert("source".to_string(), json!("rust-diffforge-agent-create-plan"));
-                object.insert("reason".to_string(), json!("agent_create_plan_step_listed"));
-                object.insert("mode".to_string(), json!("listed"));
-                object.insert("send_mode".to_string(), json!("listed"));
-                object.insert("sendMode".to_string(), json!("listed"));
-                object.insert("client_id".to_string(), json!(CLOUD_MCP_RUST_CLIENT_ID));
-                object.insert("ts_ms".to_string(), json!(cloud_mcp_now_ms()));
-            }
-            row
-        })
-        .collect::<Vec<_>>();
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let mut snapshot = json!({
-        "event_kind": "workspace_todo_snapshot",
-        "eventKind": "workspace_todo_snapshot",
-        "source": "rust-diffforge-agent-create-plan",
-        "reason": "agent_create_plan",
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "repo_id": repo_id,
-        "repoId": repo_id,
-        "repo_path": repo_path,
-        "repoPath": repo_path,
-        "workspace_root": repo_path,
-        "workspaceRoot": repo_path,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name,
-        "workspaceName": workspace_name,
-        "device": device_profile,
-        "device_id": device_id,
-        "deviceId": device_id,
-        "machine_id": device_id,
-        "machineId": device_id,
-        "device_name": device_name,
-        "machine_name": device_name,
-        "snapshot_full": false,
-        "snapshotFull": false,
-        "prune_missing": false,
-        "pruneMissing": false,
-        "plan_id": rows.plan_id,
-        "planId": rows.plan_id,
-        "todo_batch_id": rows.plan_id,
-        "todoBatchId": rows.plan_id,
-        "batch_id": rows.plan_id,
-        "batchId": rows.plan_id,
-        "todo_id": primary_todo_id,
-        "todoId": primary_todo_id,
-        "primary_todo_id": primary_todo_id,
-        "primaryTodoId": primary_todo_id,
-        "todo_ids": todo_ids,
-        "todoIds": todo_ids,
-        "plan": rows.compact_plan,
-        "compact_plan": rows.compact_plan,
-        "compactPlan": rows.compact_plan,
-        "todos": todos,
-        "dispatches": dispatches,
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    cloud_mcp_limit_workspace_todo_sync_payload(&mut snapshot);
-
-    Ok(CloudMcpAgentCreatePlanSyncPayloads {
-        snapshot,
-        dispatches,
-    })
-}
-
-fn cloud_mcp_queue_agent_create_plan_todo_sync(
-    base_url: &str,
-    rows: &CloudMcpAgentCreatePlanTodoRows,
-) -> Result<Value, String> {
-    let payloads = cloud_mcp_agent_create_plan_sync_payloads(rows)?;
-    let snapshot_sync = cloud_mcp_queue_event_background(
-        base_url,
-        "workspace_todo_snapshot",
-        &payloads.snapshot,
-        "agent_create_plan_todo_snapshot",
-    )?;
-    let mut dispatch_syncs = Vec::with_capacity(payloads.dispatches.len());
-    for dispatch in &payloads.dispatches {
-        dispatch_syncs.push(cloud_mcp_queue_event_background(
-            base_url,
-            "workspace_todo_dispatch_requested",
-            dispatch,
-            "agent_create_plan_todo_dispatch",
-        )?);
-    }
-    Ok(json!({
-        "ok": true,
-        "kind": "todo_plan_cloud_sync",
-        "background": true,
-        "durable": true,
-        "server_sync_queued": true,
-        "serverSyncQueued": true,
-        "plan_id": rows.plan_id,
-        "planId": rows.plan_id,
-        "todo_id": rows.compact_plan["todo_id"].clone(),
-        "todoId": rows.compact_plan["todoId"].clone(),
-        "todo_ids": rows.compact_plan["todo_ids"].clone(),
-        "todoIds": rows.compact_plan["todoIds"].clone(),
-        "todo_batch_id": rows.plan_id,
-        "todoBatchId": rows.plan_id,
-        "event_count": dispatch_syncs.len() + 1,
-        "eventCount": dispatch_syncs.len() + 1,
-        "snapshot": snapshot_sync,
-        "dispatches": dispatch_syncs,
-    }))
 }
 
 fn cloud_mcp_agent_create_plan_step_body(step: &Value) -> Option<(String, String, Value)> {
@@ -18627,10 +19022,10 @@ fn cloud_mcp_agent_create_plan_todo_rows(
             "plan": plan_metadata,
             "plan_task": plan_metadata,
             "planTask": plan_metadata,
-            "local_only": false,
-            "localOnly": false,
-            "server_sync_queued": true,
-            "serverSyncQueued": true,
+            "local_only": true,
+            "localOnly": true,
+            "server_sync_queued": false,
+            "serverSyncQueued": false,
         });
 
         let mut todo_row = common.clone();
@@ -18753,12 +19148,7 @@ pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
     let workspace_name = input["workspace_name"]
         .as_str()
         .or_else(|| input["workspaceName"].as_str());
-    let base_url = base_url_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .unwrap_or_else(cloud_mcp_base_url);
-    let now_ms = cloud_mcp_now_ms();
+    let _ = base_url_override;
     let now = cloud_mcp_rfc3339_now();
     let rows = cloud_mcp_agent_create_plan_todo_rows(
         repo_id.as_deref(),
@@ -18771,54 +19161,12 @@ pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
         &cloud_mcp_desktop_device_profile(),
         &now,
     )?;
-    let sync = cloud_mcp_queue_agent_create_plan_todo_sync(&base_url, &rows)?;
-    let conn = cloud_mcp_open_todo_mirror_conn()?;
-    cloud_mcp_todo_mirror_init_conn(&conn)
-        .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
-    cloud_mcp_todo_mirror_upsert_rows_into(
-        &conn,
-        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
-        "coordination-kernel.create_plan",
-        Some(base_url.as_str()),
-        repo_id.as_deref(),
-        workspace_id,
-        &rows.todo_rows,
-        now_ms,
-    )?;
-    cloud_mcp_todo_mirror_upsert_rows_into(
-        &conn,
-        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
-        "coordination-kernel.create_plan",
-        Some(base_url.as_str()),
-        repo_id.as_deref(),
-        workspace_id,
-        &rows.dispatch_rows,
-        now_ms,
-    )?;
-    cloud_mcp_todo_mirror_upsert_rows_into(
-        &conn,
-        CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
-        "coordination-kernel.create_plan",
-        Some(base_url.as_str()),
-        repo_id.as_deref(),
-        workspace_id,
-        &rows.dispatch_rows,
-        now_ms,
-    )?;
-    let history_filter = json!({
-        "batch_id": rows.plan_id,
-        "limit": rows.dispatch_rows.len().max(1),
-    });
-    let history = cloud_mcp_todo_history_from_conn(
-        &conn,
-        repo_id.as_deref(),
-        workspace_id,
-        &history_filter,
-    );
+    // Plans are a Plans-tab visualization with todo_id-backed step identity.
+    // They never become queue todos: no mirror rows, no history rows, and no
+    // workspace todo events leave this function.
     let plan_id = rows.plan_id.clone();
     let plan_title = rows.plan_title.clone();
-    let todo_count = rows.todo_rows.len();
-    let dispatch_count = rows.dispatch_rows.len();
+    let step_count = rows.todo_rows.len();
     let compact_plan = rows.compact_plan.clone();
     let primary_todo_id = cloud_mcp_agent_create_plan_required_text(
         &compact_plan,
@@ -18828,11 +19176,13 @@ pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
     let task_id_ignored = cloud_mcp_payload_text(input, &["task_id", "taskId"]).is_some();
     Ok(json!({
         "kind": "todo_plan",
-        "source": "local_todo_history",
-        "local_only": false,
-        "localOnly": false,
-        "server_sync_queued": true,
-        "serverSyncQueued": true,
+        "source": "local_terminal_todo_plan",
+        "local_only": true,
+        "localOnly": true,
+        "server_sync_queued": false,
+        "serverSyncQueued": false,
+        "todos_generated": false,
+        "todosGenerated": false,
         "task_id_required": false,
         "taskIdRequired": false,
         "start_task_required": false,
@@ -18848,19 +19198,19 @@ pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
         "title": plan_title,
         "todo_batch_id": plan_id.clone(),
         "todoBatchId": plan_id,
-        "count": dispatch_count,
-        "todo_count": todo_count,
-        "todoCount": todo_count,
-        "dispatch_count": dispatch_count,
-        "dispatchCount": dispatch_count,
-        "todos": rows.todo_rows,
-        "dispatches": rows.dispatch_rows,
+        "count": 0,
+        "todo_count": 0,
+        "todoCount": 0,
+        "dispatch_count": 0,
+        "dispatchCount": 0,
+        "step_count": step_count,
+        "stepCount": step_count,
+        "todos": [],
+        "dispatches": [],
         "compact_plan": compact_plan.clone(),
         "compactPlan": compact_plan,
-        "history": history,
-        "sync": sync,
-        "stored_in": ["workspace_todo_mirror_rows", "workspace_todo_history_rows"],
-        "storedIn": ["workspace_todo_mirror_rows", "workspace_todo_history_rows"],
+        "stored_in": ["terminal_todo_plans", "terminal_todo_plan_steps"],
+        "storedIn": ["terminal_todo_plans", "terminal_todo_plan_steps"],
     }))
 }
 
@@ -20354,6 +20704,67 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn todo_mirror_applies_removed_todo_ids_from_payloads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let listed = json!({
+            "workspace_todos": {
+                "items": [{
+                    "todoId": "todo-ghost",
+                    "todoStatus": "listed",
+                    "workspaceId": "workspace-a",
+                    "deviceId": "device-a",
+                    "updatedAt": "2026-06-09T00:00:00Z"
+                }]
+            }
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            &listed,
+        )
+        .unwrap());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_todo_mirror_rows WHERE todo_id='todo-ghost'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // A payload carrying only removed ids must still be applied and must
+        // delete the mirror row so the ghost cannot re-import later.
+        let removal = json!({
+            "event_kind": "workspace_todo_snapshot",
+            "workspace_id": "workspace-a",
+            "payload": {
+                "removed_todo_ids": ["todo-ghost"],
+            }
+        });
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            &removal,
+        )
+        .unwrap());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_todo_mirror_rows WHERE todo_id='todo-ghost'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn todo_mirror_dedupe_prefers_terminal_dispatch_status() {
         let rows = cloud_mcp_todo_mirror_rows_from_response(&json!({
             "kind": "todo_status",
@@ -20587,9 +20998,7 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn create_plan_rows_are_todo_backed_history_without_task() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+    fn create_plan_is_plan_only_without_task() {
         let input = json!({
             "task_id": "ignored-task-id",
             "plan_id": "plan-1",
@@ -20598,7 +21007,7 @@ mod cloud_mcp_tests {
                 "Inspect current create_plan",
                 {
                     "title": "Patch create_plan",
-                    "detail": "Write todo mirror and history rows instead of terminal todo plan rows."
+                    "detail": "Render the plan in the Plans tab without generating todos."
                 }
             ]
         });
@@ -20623,45 +21032,17 @@ mod cloud_mcp_tests {
             Some(2)
         );
         assert_eq!(rows.todo_rows.len(), 2);
-        assert_eq!(rows.dispatch_rows.len(), 2);
         assert!(cloud_mcp_validate_agent_create_plan_rows(&rows).is_ok());
         assert!(rows.todo_rows.iter().all(|row| {
             row["plan_id"].as_str() == Some("plan-1")
                 && row["todo_id"].as_str().is_some_and(|value| !value.is_empty())
-                && row["localOnly"].as_bool() == Some(false)
-                && row["serverSyncQueued"].as_bool() == Some(true)
+                && row["localOnly"].as_bool() == Some(true)
+                && row["serverSyncQueued"].as_bool() == Some(false)
         }));
         assert!(rows
             .dispatch_rows
             .iter()
             .all(|row| row.get("task_id").is_none() && row.get("taskId").is_none()));
-        assert!(rows
-            .dispatch_rows
-            .iter()
-            .all(|row| row["dispatchStatus"].as_str() == Some("listed")));
-
-        let sync_payloads = cloud_mcp_agent_create_plan_sync_payloads(&rows).unwrap();
-        assert_eq!(
-            sync_payloads.snapshot["event_kind"].as_str(),
-            Some("workspace_todo_snapshot")
-        );
-        assert_eq!(sync_payloads.snapshot["plan_id"].as_str(), Some("plan-1"));
-        assert_eq!(
-            sync_payloads.snapshot["todo_id"].as_str(),
-            Some("plan-1-todo-1")
-        );
-        assert_eq!(
-            sync_payloads.snapshot["todos"].as_array().map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(sync_payloads.dispatches.len(), 2);
-        assert!(sync_payloads.dispatches.iter().all(|row| {
-            row["event_kind"].as_str() == Some("workspace_todo_dispatch_requested")
-                && row["source"].as_str() == Some("rust-diffforge-agent-create-plan")
-                && row["plan_id"].as_str() == Some("plan-1")
-                && row["todo_id"].as_str().is_some_and(|value| !value.is_empty())
-                && row["localOnly"].is_null()
-        }));
 
         let mut invalid_rows = rows.clone();
         invalid_rows.todo_rows[0]
@@ -20677,60 +21058,31 @@ mod cloud_mcp_tests {
             .unwrap_err()
             .contains("todo_id"));
 
-        cloud_mcp_todo_mirror_upsert_rows_into(
-            &conn,
-            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
-            "test-create-plan",
-            Some("https://cloud.example"),
-            Some("repo-1"),
+        let created = cloud_mcp_record_agent_create_plan_todos(
+            Some("/repo"),
             Some("workspace-a"),
-            &rows.todo_rows,
-            1,
+            None,
+            Some("agent-a"),
+            Some("session-a"),
+            &input,
         )
         .unwrap();
-        cloud_mcp_todo_mirror_upsert_rows_into(
-            &conn,
-            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
-            "test-create-plan",
-            Some("https://cloud.example"),
-            Some("repo-1"),
-            Some("workspace-a"),
-            &rows.dispatch_rows,
-            1,
-        )
-        .unwrap();
-        cloud_mcp_todo_mirror_upsert_rows_into(
-            &conn,
-            CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
-            "test-create-plan",
-            Some("https://cloud.example"),
-            Some("repo-1"),
-            Some("workspace-a"),
-            &rows.dispatch_rows,
-            1,
-        )
-        .unwrap();
-
-        let history = cloud_mcp_todo_history_from_conn(
-            &conn,
-            Some("repo-1"),
-            Some("workspace-a"),
-            &json!({"batch_id": "plan-1"}),
-        );
-        assert_eq!(history["kind"].as_str(), Some("todo_history"));
-        assert_eq!(history["history_source"].as_str(), Some("sqlite_history"));
-        assert_eq!(history["count"].as_u64(), Some(2));
-        assert_eq!(history["aggregate"]["status"].as_str(), Some("listed"));
+        assert_eq!(created["plan_id"].as_str(), Some("plan-1"));
+        assert_eq!(created["todo_id"].as_str(), Some("plan-1-todo-1"));
+        assert_eq!(created["todos_generated"].as_bool(), Some(false));
+        assert_eq!(created["server_sync_queued"].as_bool(), Some(false));
+        assert_eq!(created["local_only"].as_bool(), Some(true));
+        assert_eq!(created["todos"].as_array().map(Vec::len), Some(0));
+        assert_eq!(created["dispatches"].as_array().map(Vec::len), Some(0));
+        assert_eq!(created["step_count"].as_u64(), Some(2));
         assert_eq!(
-            history["items"][0]["plan"]["steps"].as_array().map(Vec::len),
+            created["stored_in"],
+            json!(["terminal_todo_plans", "terminal_todo_plan_steps"])
+        );
+        assert_eq!(
+            created["compact_plan"]["steps"].as_array().map(Vec::len),
             Some(2)
         );
-
-        let workspace_todos =
-            cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, Some("repo-1"), Some("workspace-a"))
-                .unwrap();
-        assert_eq!(workspace_todos["count"].as_u64(), Some(2));
-        assert_eq!(workspace_todos["dispatch_count"].as_u64(), Some(2));
     }
 
     #[tokio::test]

@@ -25,6 +25,7 @@ use super::{
 pub const TOOL_NAMES: &[&str] = &[
     "start_task",
     "create_plan",
+    "update_plan",
     "architecture_context",
     "architecture_list",
     "architecture_icon_reference",
@@ -3271,6 +3272,7 @@ fn dispatch_tool_result(
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
         "create_plan" => kernel_create_plan(&kernel, &input),
+        "update_plan" => kernel_update_plan(&kernel, &input),
         "architecture_context" => kernel_architecture_context(&kernel, &input),
         "architecture_list" => kernel_architecture_list(&kernel, &input),
         "architecture_icon_reference" => kernel_architecture_icon_reference(&kernel, &input),
@@ -3805,20 +3807,20 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
         (agent_id, session_id)
     {
         match kernel.promote_late_git_direct_session_file_authority(
-                agent_id,
-                session_id,
-                Some(&started_task_id),
-            ) {
-                Ok(resolution) if resolution["changed"].as_bool() == Some(true) => resolution,
-                Ok(_) => Value::Null,
-                Err(error) => {
-                    return Ok(api_error(
-                        "late_git_promotion_failed",
-                        "Git appeared after this terminal launched, but Diff Forge could not promote the running session to an isolated worktree. Do not edit the visible repo root.",
-                        json!({"error": error, "task_id": started_task_id}),
-                    ))
-                }
+            agent_id,
+            session_id,
+            Some(&started_task_id),
+        ) {
+            Ok(resolution) if resolution["changed"].as_bool() == Some(true) => resolution,
+            Ok(_) => Value::Null,
+            Err(error) => {
+                return Ok(api_error(
+                    "late_git_promotion_failed",
+                    "Git appeared after this terminal launched, but Diff Forge could not promote the running session to an isolated worktree. Do not edit the visible repo root.",
+                    json!({"error": error, "task_id": started_task_id}),
+                ));
             }
+        }
     } else {
         Value::Null
     };
@@ -3901,24 +3903,55 @@ fn kernel_create_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Valu
         }
         object.insert(
             "stored_in".to_string(),
-            json!([
-                "terminal_todo_plans",
-                "terminal_todo_plan_steps",
-                "workspace_todo_mirror_rows",
-                "workspace_todo_history_rows"
-            ]),
+            json!(["terminal_todo_plans", "terminal_todo_plan_steps"]),
         );
         object.insert(
             "storedIn".to_string(),
-            json!([
-                "terminal_todo_plans",
-                "terminal_todo_plan_steps",
-                "workspace_todo_mirror_rows",
-                "workspace_todo_history_rows"
-            ]),
+            json!(["terminal_todo_plans", "terminal_todo_plan_steps"]),
         );
     }
     Ok(api_ok(created))
+}
+
+fn kernel_update_plan(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let plan_ref = ["plan_id", "planId", "todo_id", "todoId"]
+        .iter()
+        .find_map(|key| input[*key].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if plan_ref.is_none() {
+        return Ok(api_error(
+            "update_plan_missing_plan_id",
+            "update_plan requires the plan_id (or todo_id) returned by create_plan.",
+            json!({}),
+        ));
+    }
+    let agent_id = input["agent_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
+    let session_id = input["session_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty());
+    match kernel.update_terminal_todo_plan(agent_id, session_id, input)? {
+        Some(updated) => Ok(api_ok(json!({
+            "kind": "todo_plan_update",
+            "task_id_required": false,
+            "taskIdRequired": false,
+            "plan_id": plan_ref,
+            "planId": plan_ref,
+            "event_id": updated["event_id"].clone(),
+            "plan": updated["plan"].clone(),
+            "compact_plan": updated["compact_plan"].clone(),
+            "compactPlan": updated["compact_plan"].clone(),
+            "stored_in": ["terminal_todo_plans", "terminal_todo_plan_steps"],
+            "storedIn": ["terminal_todo_plans", "terminal_todo_plan_steps"],
+        }))),
+        None => Ok(api_error(
+            "update_plan_no_update_applied",
+            "update_plan found no matching plan or no plan fields to apply. Pass the plan_id from create_plan plus step fields such as completed_step_index, current_step_index, step_updates, or plan_status.",
+            json!({"plan_id": plan_ref}),
+        )),
+    }
 }
 
 fn start_task_brief_for_agent(brief: &Value) -> Value {
@@ -4445,10 +4478,18 @@ fn kernel_acquire_lease(kernel: &CoordinationKernel, input: &Value) -> Result<Va
             data.insert("authority".to_string(), authority_resolution);
         }
         if cloud_file_resource_key(resource_key) {
-            data.insert(
-                "write_guidance".to_string(),
-                json!("After this lease, use normal edit tools against the shared repo paths; Diff Forge hooks route permitted writes into this task's assigned worktree and block anything outside the lease."),
-            );
+            let write_guidance = match enforcement_mode.as_str() {
+                "worktree_required" => {
+                    "After this lease, use normal edit tools against the assigned agent branch root in COORDINATION_AGENT_BRANCH_ROOT; Diff Forge blocks anything outside the lease."
+                }
+                "bounded_direct_edit" => {
+                    "After this lease, edit the leased files directly under the selected repo root; Diff Forge still validates lease coverage and this task finishes with complete_task."
+                }
+                _ => {
+                    "After this lease, use normal edit tools only within the granted local file authority and finish with the reported completion_mode."
+                }
+            };
+            data.insert("write_guidance".to_string(), json!(write_guidance));
         }
     }
     Ok(response)
@@ -4630,7 +4671,7 @@ fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value
                 "checkpoint_task_not_found",
                 "checkpoint requires an existing active task.",
                 json!({"task_id": task_id}),
-            ))
+            ));
         }
     };
     let task_status = task["status"].as_str().unwrap_or_default();
@@ -5330,8 +5371,9 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion, then preserves its lifecycle to Cloud history in the background.".to_string(),
-        "create_plan" => "Create a todo-backed plan without start_task or task_id. Rust assigns a stable plan_id and todo_id-backed steps, writes terminal_todo_plans plus local todo history immediately, and queues background Cloud sync.".to_string(),
-        "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly so the Architecture tab reloads file changes live.".to_string(),
+        "create_plan" => "Create a live plan rendered in the Plans tab without start_task or task_id. Rust assigns a stable plan_id and todo_id-backed step identities and writes terminal_todo_plans immediately. The plan never generates queue todos, dispatches, or Cloud todo sync; tick or revise steps via update_plan (no task needed) or checkpoint as work progresses.".to_string(),
+        "update_plan" => "Advance or revise a Plans-tab plan created by create_plan without start_task or task_id. Pass plan_id plus completed_step_index, current_step_index, step title/detail fields, step_updates, or plan_status; the Plans tab updates live.".to_string(),
+        "architecture_context" => "Return the repo-scoped Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path, plus globalArchitecturesRoot/globalGraphsRoot for account-global graphs that sync across devices. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .agents/architectures/graphs/*.arch directly (or write into globalGraphsRoot for account-wide cross-repo graphs) so the Architectures tab reloads file changes live.".to_string(),
         "architecture_list" => "List repo-scoped architecture graphs stored under .agents/architectures/graphs/*.arch for the selected repo.".to_string(),
         "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
         "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
@@ -5389,7 +5431,7 @@ fn tool_input_schema(name: &str) -> Value {
                 "title": {"type": "string", "description": "Optional short plan title."},
                 "steps": {
                     "type": "array",
-                    "description": "Ordered plan steps. Each step is recorded as a listed todo in the same todo batch and queued for background Cloud sync. Rust generates todo_id values when omitted.",
+                    "description": "Ordered plan steps rendered in the Plans tab. Steps carry stable todo_id identities for checkpoint ticks but never become queue todos. Rust generates todo_id values when omitted.",
                     "items": {
                         "oneOf": [
                             {"type": "string"},
@@ -5413,6 +5455,34 @@ fn tool_input_schema(name: &str) -> Value {
                 "current_step_detail": {"type": "string", "description": "Optional detail stored as plan metadata."}
             },
             "required": ["steps"],
+            "additionalProperties": true
+        }),
+        "update_plan" => json!({
+            "type": "object",
+            "properties": {
+                "plan_id": {"type": "string", "description": "Required plan_id (or todo_id) returned by create_plan."},
+                "completed_step_index": {"type": "integer", "description": "Optional zero-based step index to tick as completed. The next step becomes current automatically."},
+                "current_step_index": {"type": "integer", "description": "Optional zero-based step index to mark in progress. Earlier steps are completed; later steps return to queued."},
+                "current_step_title": {"type": "string", "description": "Optional replacement title for the current step."},
+                "current_step_detail": {"type": "string", "description": "Optional live detail describing what the agent is doing on the current step."},
+                "plan_step_status": {"type": "string", "description": "Optional status for the current step: in_progress, completed, skipped, or blocked."},
+                "plan_status": {"type": "string", "description": "Optional terminal todo plan status: active, completed, interrupted, or blocked."},
+                "step_updates": {
+                    "type": "array",
+                    "description": "Optional per-step revisions. Each entry targets one step by step_index with optional title, detail, and status.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step_index": {"type": "integer", "description": "Zero-based step index to revise."},
+                            "title": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "status": {"type": "string", "description": "queued, in_progress, completed, skipped, or blocked."}
+                        },
+                        "additionalProperties": true
+                    }
+                }
+            },
+            "required": ["plan_id"],
             "additionalProperties": true
         }),
         "architecture_context" => json!({
@@ -5747,8 +5817,8 @@ mod tests {
     fn create_plan_schema_is_todo_backed_without_task_id() {
         let description = tool_description("create_plan");
         assert!(description.contains("without start_task or task_id"));
-        assert!(description.contains("todo history"));
-        assert!(description.contains("background Cloud sync"));
+        assert!(description.contains("Plans tab"));
+        assert!(description.contains("never generates queue todos"));
 
         let schema = tool_input_schema("create_plan");
         let required = schema["required"].as_array().unwrap();

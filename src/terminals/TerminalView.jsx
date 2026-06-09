@@ -1896,6 +1896,9 @@ const TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const TODO_QUEUE_REMOTE_COMMAND_RECEIPTS_PREFIX = "diffforge.todoQueue.remoteCommandReceipts.v1";
 const TODO_QUEUE_REMOTE_COMMAND_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 const TODO_QUEUE_REMOTE_COMMAND_RECEIPT_MAX_ITEMS = 400;
+const TODO_QUEUE_DELETED_RECEIPTS_PREFIX = "diffforge.todoQueue.deletedTodoIds.v1";
+const TODO_QUEUE_DELETED_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TODO_QUEUE_DELETED_RECEIPT_MAX_ITEMS = 500;
 const TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES = new Set([
   "queued",
   "sending",
@@ -6258,6 +6261,58 @@ function getTodoQueueRemoteCommandReceiptStorageKey(workspaceId) {
   return `${TODO_QUEUE_REMOTE_COMMAND_RECEIPTS_PREFIX}.${safeWorkspaceId}`;
 }
 
+function getTodoQueueDeletedReceiptStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+
+  return `${TODO_QUEUE_DELETED_RECEIPTS_PREFIX}.${safeWorkspaceId}`;
+}
+
+function readTodoQueueDeletedReceipts(storageKey, nowMs = Date.now()) {
+  if (!canUseTodoQueueStorage()) {
+    return {};
+  }
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+    if (!raw || typeof raw !== "object") {
+      return {};
+    }
+    const entries = Object.entries(raw)
+      .map(([todoId, deletedAtMs]) => [String(todoId || "").trim(), Number(deletedAtMs) || 0])
+      .filter(([todoId, deletedAtMs]) => (
+        todoId && deletedAtMs && nowMs - deletedAtMs <= TODO_QUEUE_DELETED_RECEIPT_TTL_MS
+      ))
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, TODO_QUEUE_DELETED_RECEIPT_MAX_ITEMS);
+    return Object.fromEntries(entries);
+  } catch {
+    return {};
+  }
+}
+
+function recordTodoQueueDeletedReceipts(storageKey, todoIds, nowMs = Date.now()) {
+  if (!canUseTodoQueueStorage()) {
+    return;
+  }
+  const safeTodoIds = (Array.isArray(todoIds) ? todoIds : [todoIds])
+    .map((todoId) => String(todoId || "").trim())
+    .filter(Boolean);
+  if (!safeTodoIds.length) {
+    return;
+  }
+  try {
+    const receipts = readTodoQueueDeletedReceipts(storageKey, nowMs);
+    safeTodoIds.forEach((todoId) => {
+      receipts[todoId] = nowMs;
+    });
+    window.localStorage.setItem(storageKey, JSON.stringify(receipts));
+  } catch {
+    // Deleted receipts are a ghost-suppression convenience; storage failures
+    // should not interrupt terminal work.
+  }
+}
+
 function getOrchestratorVoiceHistoryWorkspaceId(workspaceId) {
   return String(workspaceId || "default").trim() || "default";
 }
@@ -9706,6 +9761,29 @@ function writeTodoQueueItems(storageKey, items) {
   } catch {
     // The queue is a convenience layer; storage failures should not interrupt terminal work.
   }
+}
+
+function collectWorkspaceTodoSyncRemovedIds(result) {
+  const ids = new Set();
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 3) {
+      return;
+    }
+    ["removedTodoIds", "removed_todo_ids", "deletedTodoIds", "deleted_todo_ids"].forEach((key) => {
+      const items = value[key];
+      if (Array.isArray(items)) {
+        items.forEach((todoId) => {
+          const safeTodoId = String(todoId || "").trim();
+          if (safeTodoId) {
+            ids.add(safeTodoId);
+          }
+        });
+      }
+    });
+    ["payload", "data", "result"].forEach((key) => visit(value[key], depth + 1));
+  };
+  visit(result);
+  return [...ids];
 }
 
 function buildTodoQueueCloudSyncItem(item, {
@@ -13605,6 +13683,10 @@ function TerminalView({
     () => getTodoQueueRemoteCommandReceiptStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
+  const todoQueueDeletedReceiptStorageKey = useMemo(
+    () => getTodoQueueDeletedReceiptStorageKey(terminalWorkspace?.id),
+    [terminalWorkspace?.id],
+  );
   const workspaceTodoDeviceMap = useMemo(
     () => buildWorkspaceTodoDeviceMap(knownDevices, connectedDevices),
     [connectedDevices, knownDevices],
@@ -13735,6 +13817,33 @@ function TerminalView({
         todos: payload,
         workspaceId,
         workspaceName: terminalWorkspace?.name || "",
+      }).then((result) => {
+        // The server reports tombstoned ids back (including snapshot items it
+        // rejected as resurrections); prune them locally so ghosts self-heal.
+        const removedIds = collectWorkspaceTodoSyncRemovedIds(result);
+        if (!removedIds.length) {
+          return;
+        }
+        recordTodoQueueDeletedReceipts(
+          getTodoQueueDeletedReceiptStorageKey(workspaceId),
+          removedIds,
+        );
+        const removedSet = new Set(removedIds);
+        setTodoQueueItems((currentItems) => {
+          const nextItems = currentItems.filter((item) => (
+            !removedSet.has(String(item?.id || "").trim())
+          ));
+          if (nextItems.length === currentItems.length) {
+            return currentItems;
+          }
+          writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
+          logTerminalStatus("frontend.todo_queue.server_tombstones_pruned", {
+            prunedCount: currentItems.length - nextItems.length,
+            removedIdCount: removedIds.length,
+            workspaceId,
+          });
+          return nextItems;
+        });
       }).catch((error) => {
         logTerminalStatus("frontend.todo_queue.cloud_sync_error", {
           message: error?.message || String(error || ""),
@@ -17683,12 +17792,14 @@ function TerminalView({
         workspaceId: terminalWorkspace?.id || "",
       });
       writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
-      syncTodoQueueItemsToCloud(nextItems, {
-        force: options.force === true,
-        immediate: options.immediate === true,
-        reason: options.reason || "todo_queue_items_updated",
-        removedTodoIds: options.removedTodoIds,
-      });
+      if (options.skipCloudSync !== true) {
+        syncTodoQueueItemsToCloud(nextItems, {
+          force: options.force === true,
+          immediate: options.immediate === true,
+          reason: options.reason || "todo_queue_items_updated",
+          removedTodoIds: options.removedTodoIds,
+        });
+      }
       return nextItems;
     });
   }, [syncTodoQueueItemsToCloud, terminalWorkspace?.id]);
@@ -17709,9 +17820,12 @@ function TerminalView({
         .map((item) => String(item?.id || "").trim())
         .filter(Boolean),
     );
+    const deletedReceipts = readTodoQueueDeletedReceipts(todoQueueDeletedReceiptStorageKey);
     const importCandidates = listedTodos.filter((item) => {
       const todoId = getWorkspaceTodoIdentity(item);
-      return todoId && !existingIds.has(todoId);
+      // Locally deleted todos must never re-import from a stale cloud or
+      // mirror snapshot: local deletion has priority over remote state.
+      return todoId && !existingIds.has(todoId) && !deletedReceipts[todoId];
     });
     if (!importCandidates.length) {
       return;
@@ -17774,9 +17888,10 @@ function TerminalView({
         });
         return currentItems.concat(additions);
       }, {
-        force: true,
-        immediate: true,
+        // The cloud already owns these todos; echo-syncing them back would
+        // resurrect server tombstones and feed the ghost loop.
         reason: "cloud_listed_todos_imported",
+        skipCloudSync: true,
       });
     };
     void importListedTodos();
@@ -17789,6 +17904,7 @@ function TerminalView({
     terminalWorkspace?.id,
     terminalWorkspace?.name,
     terminalWorkspaceWorkingDirectory,
+    todoQueueDeletedReceiptStorageKey,
     updateTodoQueueItems,
     workspaceTodos,
   ]);
@@ -20834,6 +20950,7 @@ function TerminalView({
       });
     }
     clearTodoQueueItemPending(itemId, "removed", item ? getTodoQueuePendingFieldsFromItem(item, source) : { source });
+    recordTodoQueueDeletedReceipts(todoQueueDeletedReceiptStorageKey, [itemId]);
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
     ), {
@@ -20845,6 +20962,7 @@ function TerminalView({
   }, [
     clearTodoQueueItemPending,
     recordVoicePlanTaskStatus,
+    todoQueueDeletedReceiptStorageKey,
     updateTodoQueueItems,
   ]);
 

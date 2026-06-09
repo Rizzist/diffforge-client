@@ -1011,10 +1011,11 @@ fn apply_claude_coordinated_auto_approval_args(
         .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_PROJECT_ROOT"))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| coordination.repo_path.clone());
-    let branch_root = terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
-        .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| coordination.repo_path.clone());
+    let branch_root =
+        terminal_coordination_env_value(coordination, "COORDINATION_AGENT_BRANCH_ROOT")
+            .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_WORKTREE_PATH"))
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| coordination.repo_path.clone());
     let coordination_root = if worktree_required {
         view_root.clone()
     } else {
@@ -1504,7 +1505,10 @@ fn terminal_activity_env_vars(
 ) -> Vec<(String, String)> {
     let activity_path = terminal_activity_events_path(pane_id, instance_id);
     vec![
-        ("DIFFFORGE_TERMINAL_PANE_ID".to_string(), pane_id.to_string()),
+        (
+            "DIFFFORGE_TERMINAL_PANE_ID".to_string(),
+            pane_id.to_string(),
+        ),
         (
             "DIFFFORGE_TERMINAL_INSTANCE_ID".to_string(),
             instance_id.to_string(),
@@ -1515,7 +1519,9 @@ fn terminal_activity_env_vars(
         ),
         (
             "DIFFFORGE_TERMINAL_INDEX".to_string(),
-            terminal_index.map(|index| index.to_string()).unwrap_or_default(),
+            terminal_index
+                .map(|index| index.to_string())
+                .unwrap_or_default(),
         ),
         (
             "DIFFFORGE_TERMINAL_PROVIDER".to_string(),
@@ -1542,8 +1548,13 @@ fn extend_terminal_activity_env_vars(
     terminal_index: Option<u16>,
     provider_id: &str,
 ) {
-    let activity_env =
-        terminal_activity_env_vars(pane_id, instance_id, workspace_id, terminal_index, provider_id);
+    let activity_env = terminal_activity_env_vars(
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        provider_id,
+    );
     for (key, value) in activity_env {
         env_vars.retain(|(existing_key, _)| existing_key != &key);
         env_vars.push((key, value));
@@ -1584,7 +1595,7 @@ fn refresh_codex_activity_hook_profile_for_terminal(
             return Err(format!(
                 "Unable to read Codex hooks config {}: {error}",
                 hooks_path.display()
-            ))
+            ));
         }
     };
     let mut hooks_json: Value = serde_json::from_str(&body).map_err(|error| {
@@ -1750,7 +1761,10 @@ fn ensure_codex_activity_hooks(value: &mut Value, scoped_command: &str) -> usize
     added
 }
 
-fn sync_codex_profile_inline_hooks(profile_path: &Path, hooks_json: &Value) -> Result<bool, String> {
+fn sync_codex_profile_inline_hooks(
+    profile_path: &Path,
+    hooks_json: &Value,
+) -> Result<bool, String> {
     let body = fs::read_to_string(profile_path).map_err(|error| {
         format!(
             "Unable to read Codex profile config {}: {error}",
@@ -1789,7 +1803,8 @@ fn strip_codex_profile_inline_hook_events(body: &str) -> String {
         if let Some(section) = terminal_toml_section_header_name(lines[index]) {
             if codex_toml_section_is_inline_hook_event(&section) {
                 index += 1;
-                while index < lines.len() && terminal_toml_section_header_name(lines[index]).is_none()
+                while index < lines.len()
+                    && terminal_toml_section_header_name(lines[index]).is_none()
                 {
                     index += 1;
                 }
@@ -1855,29 +1870,26 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
     .unwrap_or_else(|| "unknown".to_string());
     let pane_id = terminal_cli_arg_or_env(args, "--pane-id", &["DIFFFORGE_TERMINAL_PANE_ID"])
         .unwrap_or_default();
-    let instance_id = terminal_cli_arg_or_env(
-        args,
-        "--instance-id",
-        &["DIFFFORGE_TERMINAL_INSTANCE_ID"],
-    )
-    .and_then(|value| value.parse::<u64>().ok())
-    .unwrap_or(0);
+    let instance_id =
+        terminal_cli_arg_or_env(args, "--instance-id", &["DIFFFORGE_TERMINAL_INSTANCE_ID"])
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
     let workspace_id = terminal_cli_arg_or_env(
         args,
         "--workspace-id",
-        &["DIFFFORGE_TERMINAL_WORKSPACE_ID", "COORDINATION_WORKSPACE_ID"],
+        &[
+            "DIFFFORGE_TERMINAL_WORKSPACE_ID",
+            "COORDINATION_WORKSPACE_ID",
+        ],
     )
     .unwrap_or_default();
     let terminal_index =
         terminal_cli_arg_or_env(args, "--terminal-index", &["DIFFFORGE_TERMINAL_INDEX"])
             .unwrap_or_default();
-    let activity_path = terminal_cli_arg_or_env(
-        args,
-        "--events-path",
-        &["DIFFFORGE_ACTIVITY_EVENTS_PATH"],
-    )
-    .map(PathBuf::from)
-    .unwrap_or_else(|| terminal_activity_events_path(&pane_id, instance_id));
+    let activity_path =
+        terminal_cli_arg_or_env(args, "--events-path", &["DIFFFORGE_ACTIVITY_EVENTS_PATH"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| terminal_activity_events_path(&pane_id, instance_id));
     let debug_path =
         terminal_cli_arg_or_env(args, "--debug-path", &["DIFFFORGE_ACTIVITY_DEBUG_PATH"])
             .map(PathBuf::from)
@@ -2041,7 +2053,11 @@ fn diff_forge_architecture_graph_path_from_text(value: &str) -> String {
         return String::new();
     };
     let is_boundary = |ch: char| {
-        ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ',')
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | ','
+            )
     };
     let mut start = 0usize;
     for (index, ch) in haystack[..marker_index].char_indices() {
@@ -2120,12 +2136,20 @@ fn diff_forge_activity_hook_record(
             .to_string()
     };
     let hook_bool = |keys: &[&str]| -> bool {
-        keys.iter()
-            .any(|key| hook_input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+        keys.iter().any(|key| {
+            hook_input
+                .get(*key)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
     };
     let tool_bool = |keys: &[&str]| -> bool {
-        keys.iter()
-            .any(|key| tool_input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+        keys.iter().any(|key| {
+            tool_input
+                .get(*key)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
     };
     let first_string = |values: Vec<String>| -> String {
         values
@@ -2149,10 +2173,7 @@ fn diff_forge_activity_hook_record(
         hook_string(&["agent_type", "agentType"]),
         tool_string(&["agent_type", "agentType", "subagent_type", "subagentType"]),
     ]);
-    let agent_transcript_path = hook_string(&[
-        "agent_transcript_path",
-        "agentTranscriptPath",
-    ]);
+    let agent_transcript_path = hook_string(&["agent_transcript_path", "agentTranscriptPath"]);
     let last_message = hook_string(&[
         "last_assistant_message",
         "lastAssistantMessage",
@@ -2208,25 +2229,66 @@ fn diff_forge_activity_hook_record(
         tool_string(&["approval_status", "approvalStatus"]),
     ]);
     let prompting_user_kind = first_string(vec![
-        hook_string(&["prompting_user_kind", "promptingUserKind", "prompting_kind", "promptingKind"]),
-        tool_string(&["prompting_user_kind", "promptingUserKind", "prompting_kind", "promptingKind"]),
+        hook_string(&[
+            "prompting_user_kind",
+            "promptingUserKind",
+            "prompting_kind",
+            "promptingKind",
+        ]),
+        tool_string(&[
+            "prompting_user_kind",
+            "promptingUserKind",
+            "prompting_kind",
+            "promptingKind",
+        ]),
     ]);
     let prompting_user_source = first_string(vec![
-        hook_string(&["prompting_user_source", "promptingUserSource", "prompting_source", "promptingSource"]),
-        tool_string(&["prompting_user_source", "promptingUserSource", "prompting_source", "promptingSource"]),
+        hook_string(&[
+            "prompting_user_source",
+            "promptingUserSource",
+            "prompting_source",
+            "promptingSource",
+        ]),
+        tool_string(&[
+            "prompting_user_source",
+            "promptingUserSource",
+            "prompting_source",
+            "promptingSource",
+        ]),
     ]);
     let prompting_user_text = first_string(vec![
-        hook_string(&["prompting_user_text", "promptingUserText", "prompting_text", "promptingText"]),
-        tool_string(&["prompting_user_text", "promptingUserText", "prompting_text", "promptingText"]),
+        hook_string(&[
+            "prompting_user_text",
+            "promptingUserText",
+            "prompting_text",
+            "promptingText",
+        ]),
+        tool_string(&[
+            "prompting_user_text",
+            "promptingUserText",
+            "prompting_text",
+            "promptingText",
+        ]),
     ]);
-    let manual_approval_required = hook_bool(&["manual_approval_required", "manualApprovalRequired"])
-        || tool_bool(&["manual_approval_required", "manualApprovalRequired"]);
-    let provider_blocked_for_user = hook_bool(&["provider_blocked_for_user", "providerBlockedForUser"])
-        || tool_bool(&["provider_blocked_for_user", "providerBlockedForUser"]);
+    let manual_approval_required =
+        hook_bool(&["manual_approval_required", "manualApprovalRequired"])
+            || tool_bool(&["manual_approval_required", "manualApprovalRequired"]);
+    let provider_blocked_for_user =
+        hook_bool(&["provider_blocked_for_user", "providerBlockedForUser"])
+            || tool_bool(&["provider_blocked_for_user", "providerBlockedForUser"]);
     let requires_user_input = hook_bool(&["requires_user_input", "requiresUserInput"])
         || tool_bool(&["requires_user_input", "requiresUserInput"]);
-    let prompting_user = hook_bool(&["prompting_user", "promptingUser", "terminal_is_prompting_user", "terminalIsPromptingUser"])
-        || tool_bool(&["prompting_user", "promptingUser", "terminal_is_prompting_user", "terminalIsPromptingUser"]);
+    let prompting_user = hook_bool(&[
+        "prompting_user",
+        "promptingUser",
+        "terminal_is_prompting_user",
+        "terminalIsPromptingUser",
+    ]) || tool_bool(&[
+        "prompting_user",
+        "promptingUser",
+        "terminal_is_prompting_user",
+        "terminalIsPromptingUser",
+    ]);
     json!({
         "timestampMs": current_time_ms(),
         "provider": provider,
@@ -2507,9 +2569,9 @@ fn diff_forge_write_guard_decision(
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| coordination_root.to_path_buf());
-        if let Some(reason) =
-            diff_forge_apply_patch_git_write_denial_reason(command, &cwd, slot_key, agent_kind, identity)?
-        {
+        if let Some(reason) = diff_forge_apply_patch_git_write_denial_reason(
+            command, &cwd, slot_key, agent_kind, identity,
+        )? {
             return Err(reason);
         }
         return Ok(None);
@@ -2575,11 +2637,13 @@ struct DiffForgeActiveGitWriteAuthority {
     agent_id: String,
     session_id: String,
     worktree_root: PathBuf,
+    uses_worktree: bool,
 }
 
 #[derive(Debug, Clone)]
 struct DiffForgeGitWriteRoute {
     mapped_path: PathBuf,
+    direct_root: bool,
 }
 
 fn diff_forge_tool_is_apply_patch(tool_key: &str) -> bool {
@@ -2606,11 +2670,7 @@ fn diff_forge_apply_patch_git_write_denial_reason(
                 if !path.is_empty() {
                     let absolute = claude_guard_resolved_path(&PathBuf::from(path), cwd);
                     if let Some(reason) = diff_forge_git_write_denial_reason(
-                        &absolute,
-                        slot_key,
-                        agent_kind,
-                        identity,
-                        true,
+                        &absolute, slot_key, agent_kind, identity, true,
                     )? {
                         return Ok(Some(format!(
                             "{reason} apply_patch must target this terminal's assigned worktree path explicitly."
@@ -2671,25 +2731,33 @@ fn diff_forge_shell_git_write_denial_reason(
             .iter()
             .all(|path| diff_forge_path_is_architecture_artifact(path));
 
-    let mut cwd_is_slot_worktree_git_root = false;
+    let mut cwd_requires_explicit_file_lease = false;
     if let Some(repo_root) = diff_forge_nearest_git_root(cwd) {
         if !diff_forge_path_is_slot_worktree_root(&repo_root, slot_key) {
             if !only_architecture_artifact_targets {
-                if let Some(reason) = diff_forge_git_write_denial_reason(
-                    &repo_root, slot_key, agent_kind, identity, false,
-                )? {
-                    return Ok(Some(format!(
-                        "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
-                    )));
+                if let Some(route) =
+                    diff_forge_git_write_route(&repo_root, slot_key, agent_kind, identity, false)?
+                {
+                    if terminal_paths_equal(&repo_root, &route.mapped_path) {
+                        cwd_requires_explicit_file_lease = route.direct_root;
+                    } else {
+                        let reason = format!(
+                            "Diff Forge denied this direct Git repository edit. Edit the assigned worktree path instead: {}",
+                            route.mapped_path.display()
+                        );
+                        return Ok(Some(format!(
+                            "{reason} Shell commands that mutate Git repositories must target the assigned worktree path."
+                        )));
+                    }
                 }
             }
         } else {
             diff_forge_git_write_route(&repo_root, slot_key, agent_kind, identity, false)?;
-            cwd_is_slot_worktree_git_root = true;
+            cwd_requires_explicit_file_lease = true;
         }
     }
 
-    if candidate_paths.is_empty() && cwd_is_slot_worktree_git_root {
+    if candidate_paths.is_empty() && cwd_requires_explicit_file_lease {
         return Ok(Some(
             "Diff Forge denied this mutating shell command because it did not expose an explicit file path to verify a write lease. Use Edit/Write/apply_patch or name the target file in the shell command after acquiring its lease."
                 .to_string(),
@@ -2899,6 +2967,7 @@ fn diff_forge_git_write_route(
             }
             return Ok(Some(DiffForgeGitWriteRoute {
                 mapped_path: candidate_path,
+                direct_root: false,
             }));
         }
     }
@@ -2922,6 +2991,7 @@ fn diff_forge_git_write_route(
         }
         return Ok(Some(DiffForgeGitWriteRoute {
             mapped_path: candidate_path,
+            direct_root: false,
         }));
     }
     if diff_forge_path_is_in_other_slot_worktree(&repo_root, slot_key) {
@@ -2932,6 +3002,28 @@ fn diff_forge_git_write_route(
     }
 
     let authority = diff_forge_active_git_write_authority(&repo_root, slot_key, identity)?;
+    if !authority.uses_worktree {
+        if !terminal_paths_equal(&authority.worktree_root, &repo_root) {
+            return Err(format!(
+                "Diff Forge denied this Git write because direct session root {} does not match Git root {}.",
+                authority.worktree_root.display(),
+                repo_root.display()
+            ));
+        }
+        let resource_key = diff_forge_file_resource_key(&candidate_path, &repo_root);
+        if require_lease {
+            diff_forge_validate_active_write_lease(
+                &repo_root,
+                identity,
+                &authority,
+                resource_key.as_deref(),
+            )?;
+        }
+        return Ok(Some(DiffForgeGitWriteRoute {
+            mapped_path: candidate_path,
+            direct_root: true,
+        }));
+    }
     let worktree = authority.worktree_root.clone();
     let relative = candidate_path.strip_prefix(&repo_root).map_err(|_| {
         format!(
@@ -2951,6 +3043,7 @@ fn diff_forge_git_write_route(
     }
     Ok(Some(DiffForgeGitWriteRoute {
         mapped_path: worktree.join(relative),
+        direct_root: false,
     }))
 }
 
@@ -3116,6 +3209,8 @@ fn diff_forge_active_git_write_authority(
         .or_else(|| session["write_root"].as_str())
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string);
+    let mut uses_worktree =
+        session_worktree_id.is_some() || session_enforcement_mode == "worktree_required";
     if session_worktree_id.is_none() {
         if session_enforcement_mode == "bounded_direct_edit" {
             let promotion = kernel.promote_late_git_direct_session_file_authority(
@@ -3129,16 +3224,42 @@ fn diff_forge_active_git_write_authority(
                     .or_else(|| promotion["agent_branch_root"].as_str())
                     .filter(|value| !value.trim().is_empty())
                     .map(str::to_string);
+                uses_worktree = true;
+            } else {
+                uses_worktree = false;
+                if let Some(write_root) = promotion["write_root"]
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    worktree_path = Some(write_root.to_string());
+                }
             }
         }
     }
     let Some(worktree_path) = worktree_path else {
         return Err(
-            "Diff Forge denied this Git write because this task has no assigned worktree. Call acquire_lease for the file before editing."
+            "Diff Forge denied this Git write because this task has no assigned file authority. Call acquire_lease for the file before editing."
                 .to_string(),
         );
     };
     let worktree_root = claude_guard_existing_or_parent_canonical_path(Path::new(&worktree_path));
+    if !uses_worktree {
+        let repo_root = claude_guard_existing_or_parent_canonical_path(repo_root);
+        if !terminal_paths_equal(&worktree_root, &repo_root) {
+            return Err(format!(
+                "Diff Forge denied this Git write because direct session root {} does not match Git root {}.",
+                worktree_root.display(),
+                repo_root.display()
+            ));
+        }
+        return Ok(DiffForgeActiveGitWriteAuthority {
+            task_id: task_id.to_string(),
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            worktree_root,
+            uses_worktree,
+        });
+    }
     if !diff_forge_path_is_slot_worktree_root(&worktree_root, slot_key) {
         return Err(format!(
             "Diff Forge denied this Git write because {} is not this terminal slot's assigned worktree.",
@@ -3150,6 +3271,7 @@ fn diff_forge_active_git_write_authority(
         agent_id: agent_id.to_string(),
         session_id: session_id.to_string(),
         worktree_root,
+        uses_worktree,
     })
 }
 
@@ -3214,8 +3336,7 @@ fn diff_forge_validate_active_write_lease(
 
     Err(format!(
         "Diff Forge denied this Git write because task {} has no active write lease covering {}. Call coordination-kernel.acquire_lease for this file before editing.",
-        authority.task_id,
-        resource_key
+        authority.task_id, resource_key
     ))
 }
 
@@ -3251,7 +3372,7 @@ fn diff_forge_task_status_is_terminal(status: &str) -> bool {
 }
 
 fn diff_forge_start_task_required_message() -> String {
-    "Diff Forge denied this Git write because this terminal has no active task-owned worktree. Call coordination-kernel.start_task, acquire_lease for the file, then use normal edit tools; Diff Forge will route permitted writes into the assigned worktree."
+    "Diff Forge denied this Git write because this terminal has no active task-owned file authority. Call coordination-kernel.start_task, acquire_lease for the file, then use normal edit tools within the reported file authority."
         .to_string()
 }
 
@@ -5449,12 +5570,19 @@ fn apply_codex_coordinated_exec_args(
     for tool in TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS {
         append_codex_mcp_tool_approval_arg(&mut codex_config_args, "workspace-mcp-gateway", tool);
     }
-    if let Some(value) = terminal_coordination_env_value(
-        coordination,
-        "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS",
-    ) {
-        for tool in value.split(',').map(str::trim).filter(|tool| !tool.is_empty()) {
-            append_codex_mcp_tool_approval_arg(&mut codex_config_args, "workspace-mcp-gateway", tool);
+    if let Some(value) =
+        terminal_coordination_env_value(coordination, "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS")
+    {
+        for tool in value
+            .split(',')
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+        {
+            append_codex_mcp_tool_approval_arg(
+                &mut codex_config_args,
+                "workspace-mcp-gateway",
+                tool,
+            );
         }
     }
     codex_config_args.push("-c".to_string());

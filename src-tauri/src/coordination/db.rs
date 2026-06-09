@@ -14,14 +14,16 @@ use super::schema::{
     DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
     DEPENDENCY_GRAPH_SCHEMA_SQL, INITIAL_MIGRATION_NAME, INITIAL_MIGRATION_VERSION,
     INTEGRATOR_POLICY_MIGRATION_NAME, INTEGRATOR_POLICY_MIGRATION_VERSION, MIGRATION_NAME,
-    MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME, RUNTIME_GUARD_MIGRATION_VERSION,
-    RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME, SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL,
-    SUBMIT_JOB_MIGRATION_NAME, SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL,
-    TASK_LIFECYCLE_MIGRATION_NAME, TASK_LIFECYCLE_MIGRATION_VERSION,
-    TASK_SOURCE_TODO_REFS_MIGRATION_NAME, TASK_SOURCE_TODO_REFS_MIGRATION_VERSION,
-    TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME, TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION,
-    TERMINAL_TODO_PLAN_MIGRATION_NAME, TERMINAL_TODO_PLAN_MIGRATION_VERSION,
-    TERMINAL_TODO_PLAN_SCHEMA_SQL, WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
+    MIGRATION_VERSION, OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME,
+    OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION, RUNTIME_GUARD_MIGRATION_NAME,
+    RUNTIME_GUARD_MIGRATION_VERSION, RUNTIME_GUARD_SCHEMA_SQL, SLOT_MIGRATION_NAME,
+    SLOT_MIGRATION_VERSION, SLOT_SCHEMA_SQL, SUBMIT_JOB_MIGRATION_NAME,
+    SUBMIT_JOB_MIGRATION_VERSION, SUBMIT_JOB_SCHEMA_SQL, TASK_LIFECYCLE_MIGRATION_NAME,
+    TASK_LIFECYCLE_MIGRATION_VERSION, TASK_SOURCE_TODO_REFS_MIGRATION_NAME,
+    TASK_SOURCE_TODO_REFS_MIGRATION_VERSION, TERMINAL_LAUNCH_EPOCH_MIGRATION_NAME,
+    TERMINAL_LAUNCH_EPOCH_MIGRATION_VERSION, TERMINAL_TODO_PLAN_MIGRATION_NAME,
+    TERMINAL_TODO_PLAN_MIGRATION_VERSION, TERMINAL_TODO_PLAN_SCHEMA_SQL,
+    WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_NAME,
     WORKSPACE_MCP_AGENT_CONFIG_ACCESS_MIGRATION_VERSION,
     WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_NAME, WORKSPACE_MCP_APPROVAL_POLICY_MIGRATION_VERSION,
     WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_NAME, WORKSPACE_MCP_EXPOSURE_MODE_MIGRATION_VERSION,
@@ -635,6 +637,7 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_workspace_mcp_secrets_migration(connection)?);
     diagnostics.push(apply_workspace_mcp_exposure_mode_migration(connection)?);
     diagnostics.push(apply_crash_todo_resume_migration(connection)?);
+    diagnostics.push(apply_optional_git_worktrees_policy_migration(connection)?);
 
     Ok(diagnostics)
 }
@@ -716,6 +719,42 @@ fn apply_crash_todo_resume_migration(
         )?
     };
     migration.details.splice(0..0, details);
+    Ok(migration)
+}
+
+fn apply_optional_git_worktrees_policy_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION,
+            OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let now = super::kernel::now_rfc3339();
+    let changed =
+        with_sqlite_lock_retry("Unable to disable optional Git worktrees policy", || {
+            connection.execute(
+                "UPDATE repo_policies
+             SET agent_worktree_required=0, updated_at=?1
+             WHERE agent_worktree_required<>0",
+                [&now],
+            )
+        })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION,
+        OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        [format!(
+            "repo_policies.agent_worktree_required disabled_rows={changed}"
+        )],
+    );
     Ok(migration)
 }
 
@@ -1650,12 +1689,12 @@ mod tests {
         let (connection, existed, diagnostics) = open_connection(&paths).unwrap();
 
         assert!(existed);
-        assert!(diagnostics
-            .migrations
-            .iter()
-            .any(|migration| migration.details.iter().any(|detail| {
-                detail == "agent_sessions.provider_session_id pre_bootstrap_added"
-            })));
+        assert!(diagnostics.migrations.iter().any(|migration| {
+            migration
+                .details
+                .iter()
+                .any(|detail| detail == "agent_sessions.provider_session_id pre_bootstrap_added")
+        }));
         let columns = connection
             .prepare("PRAGMA table_info(agent_sessions)")
             .unwrap()

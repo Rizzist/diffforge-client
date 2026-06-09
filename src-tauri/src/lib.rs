@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     io::{Read, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -107,7 +107,7 @@ const TERMINAL_CLOSE_COMMAND_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_WAIT_MS: u64 = 12_000;
 const TERMINAL_CLOSE_ALL_COORDINATION_WAIT_MS: u64 = 750;
 const TERMINAL_DROP_CLEANUP_TRACKER_WAIT_MS: u64 = 1_500;
-const TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS: u64 = 3_000;
+const TERMINAL_WORKSPACE_TOPOLOGY_CACHE_FRESH_MS: u64 = 15_000;
 const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
@@ -3756,6 +3756,8 @@ pub fn run() {
             architecture_graph_revision_read,
             architecture_graph_revision_restore,
             architecture_graph_delete,
+            architecture_global_root,
+            architecture_graph_copy,
             delete_workspace_local_metadata,
             run_forge_prompt,
             agent_thread_turn_start,
@@ -3844,6 +3846,7 @@ pub fn run() {
             tokenomics_record_usage,
             cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_reset_server_state,
+            cloud_mcp_account_repo_catalog,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
             cloud_mcp_sync_device_workspace_catalog,
@@ -3852,6 +3855,8 @@ pub fn run() {
             cloud_mcp_update_voice_plan_steps,
             cloud_mcp_get_workspace_architectures,
             cloud_mcp_sync_workspace_architectures,
+            cloud_mcp_list_account_architectures,
+            cloud_mcp_architecture_hub_catalog,
             cloud_mcp_sync_workspace_architecture,
             cloud_mcp_hydrate_workspace_architecture,
             cloud_mcp_list_workspace_assets,
@@ -3870,6 +3875,7 @@ pub fn run() {
             diffforge_untrack_workspace_asset,
             diffforge_promote_untracked_asset,
             cloud_mcp_sync_workspace_todos,
+            cloud_mcp_archive_workspace_todos,
             cloud_mcp_request_workspace_todo_dispatch,
             cloud_mcp_record_todo_dispatch_status,
             cloud_mcp_get_activity,
