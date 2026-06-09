@@ -22,6 +22,7 @@
 
         try {
           const isAudioWidget = window.location.hash === "#/audio-widget";
+          const isActivityOverlay = window.location.hash === "#/activity-overlay";
           const rawSettings = isAudioWidget
             ? window.localStorage.getItem(AUDIO_WIDGET_THEME_STORAGE_KEY)
             : window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
@@ -39,11 +40,17 @@
             document.documentElement.dataset.audioWidget = "true";
             document.documentElement.dataset.audioWidgetTheme = theme;
           }
+          if (isActivityOverlay) {
+            document.documentElement.dataset.activityOverlay = "true";
+          }
         } catch {
           document.documentElement.dataset.forgeTheme = THEME_DEFAULT;
           if (window.location.hash === "#/audio-widget") {
             document.documentElement.dataset.audioWidget = "true";
             document.documentElement.dataset.audioWidgetTheme = THEME_DEFAULT;
+          }
+          if (window.location.hash === "#/activity-overlay") {
+            document.documentElement.dataset.activityOverlay = "true";
           }
         }
       })();
@@ -69,6 +76,16 @@
         min-height: 0;
         overflow: hidden;
         border-radius: 999px;
+        background: transparent !important;
+      }
+
+      html[data-activity-overlay="true"],
+      html[data-activity-overlay="true"] body,
+      html[data-activity-overlay="true"] #app {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+        border-radius: 18px;
         background: transparent !important;
       }
     </style>

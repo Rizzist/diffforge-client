@@ -1,6 +1,6 @@
-const ACTIVITY_OVERLAY_DEFAULT_WIDTH: f64 = 406.0;
-const ACTIVITY_OVERLAY_DEFAULT_HEIGHT: f64 = 244.0;
-const ACTIVITY_OVERLAY_CORNER_MARGIN: i32 = 22;
+const ACTIVITY_OVERLAY_DEFAULT_WIDTH: f64 = 360.0;
+const ACTIVITY_OVERLAY_DEFAULT_HEIGHT: f64 = 216.0;
+const ACTIVITY_OVERLAY_CORNER_MARGIN: i32 = 18;
 
 fn size_activity_overlay_window(window: &tauri::WebviewWindow) {
     let _ = window.set_size(tauri::LogicalSize::new(
@@ -14,18 +14,14 @@ fn position_activity_overlay_window(window: &tauri::WebviewWindow) {
         return;
     };
     let work_area = monitor.work_area();
-    let x = work_area.position.x
-        + work_area.size.width as i32
-        - ACTIVITY_OVERLAY_DEFAULT_WIDTH as i32
-        - ACTIVITY_OVERLAY_CORNER_MARGIN;
+    let x = work_area.position.x + ACTIVITY_OVERLAY_CORNER_MARGIN;
     let y = work_area.position.y + ACTIVITY_OVERLAY_CORNER_MARGIN;
-    let _ = window.set_position(tauri::PhysicalPosition::new(x.max(work_area.position.x), y));
+    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
 fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(ACTIVITY_OVERLAY_WINDOW_LABEL) {
         size_activity_overlay_window(&window);
-        position_activity_overlay_window(&window);
         return Ok(window);
     }
 
@@ -50,6 +46,7 @@ fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindo
     .map_err(|error| format!("Unable to create activity overlay: {error}"))?;
 
     position_activity_overlay_window(&window);
+    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
     Ok(window)
 }
 

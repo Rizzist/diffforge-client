@@ -3795,6 +3795,8 @@ pub fn run() {
             snipping_begin_area_snip,
             snipping_area_overlay_status,
             snipping_finish_area_snip,
+            snipping_recent_capture_toasts,
+            snipping_copy_untracked_asset_to_clipboard,
             snipping_cancel_area_snip,
             audio_widget_status,
             show_audio_widget,

@@ -522,6 +522,7 @@ import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.j
 import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
+import SnippingToastStack, { SNIPPING_TOAST_HASH } from "../snipping/SnippingToastStack.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
 import AccountTokenomicsView, { startAccountTokenomicsStartupScan } from "../tokenomics/AccountTokenomicsView.jsx";
 
@@ -5592,6 +5593,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 export default function App() {
   if (window.location.hash === SNIPPING_OVERLAY_HASH) {
     return <SnippingOverlayWindow />;
+  }
+
+  if (window.location.hash === SNIPPING_TOAST_HASH) {
+    return <SnippingToastStack />;
   }
 
   if (window.location.hash === ACTIVITY_OVERLAY_HASH) {

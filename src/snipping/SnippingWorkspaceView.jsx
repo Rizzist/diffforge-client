@@ -98,7 +98,7 @@ function fallbackSnippingStatus() {
   const area = defaultAreaShortcut();
 
   return {
-    enabled: false,
+    enabled: true,
     fullScreenshot: {
       shortcut: full,
       defaultShortcut: full,
@@ -663,10 +663,12 @@ export function SnippingOverlayWindow() {
 
   const selection = useMemo(() => {
     if (!drag) return null;
-    const left = Math.min(drag.startX, drag.endX);
-    const top = Math.min(drag.startY, drag.endY);
-    const width = Math.abs(drag.endX - drag.startX);
-    const height = Math.abs(drag.endY - drag.startY);
+    const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
+    const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
+    const left = Math.max(0, Math.min(drag.startX, drag.endX));
+    const top = Math.max(0, Math.min(drag.startY, drag.endY));
+    const width = Math.min(Math.abs(drag.endX - drag.startX), Math.max(0, viewportWidth - left));
+    const height = Math.min(Math.abs(drag.endY - drag.startY), Math.max(0, viewportHeight - top));
     return { left, top, width, height };
   }, [drag]);
 
@@ -699,39 +701,51 @@ export function SnippingOverlayWindow() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [closeOverlay]);
 
+  const overlayPoint = useCallback((event) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(rect.width, event.clientX - rect.left)),
+      y: Math.max(0, Math.min(rect.height, event.clientY - rect.top)),
+    };
+  }, []);
+
   const beginDrag = useCallback((event) => {
     if (event.button !== 0 || capturing) return;
     event.preventDefault();
+    const point = overlayPoint(event);
     const nextDrag = {
-      startX: event.clientX,
-      startY: event.clientY,
-      endX: event.clientX,
-      endY: event.clientY,
+      startX: point.x,
+      startY: point.y,
+      endX: point.x,
+      endY: point.y,
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [capturing]);
+  }, [capturing, overlayPoint]);
 
   const updateDrag = useCallback((event) => {
     if (!dragRef.current || capturing) return;
+    const point = overlayPoint(event);
     const nextDrag = {
       ...dragRef.current,
-      endX: event.clientX,
-      endY: event.clientY,
+      endX: point.x,
+      endY: point.y,
     };
     dragRef.current = nextDrag;
     setDrag(nextDrag);
-  }, [capturing]);
+  }, [capturing, overlayPoint]);
 
   const finishDrag = useCallback(async () => {
     const currentDrag = dragRef.current;
     dragRef.current = null;
     if (!currentDrag || capturing) return;
 
-    const left = Math.min(currentDrag.startX, currentDrag.endX);
-    const top = Math.min(currentDrag.startY, currentDrag.endY);
-    const width = Math.abs(currentDrag.endX - currentDrag.startX);
-    const height = Math.abs(currentDrag.endY - currentDrag.startY);
+    const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
+    const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
+    const left = Math.max(0, Math.min(currentDrag.startX, currentDrag.endX));
+    const top = Math.max(0, Math.min(currentDrag.startY, currentDrag.endY));
+    const width = Math.min(Math.abs(currentDrag.endX - currentDrag.startX), Math.max(0, viewportWidth - left));
+    const height = Math.min(Math.abs(currentDrag.endY - currentDrag.startY), Math.max(0, viewportHeight - top));
 
     if (width < 4 || height < 4) {
       closeOverlay();
@@ -740,7 +754,13 @@ export function SnippingOverlayWindow() {
 
     setCapturing(true);
     setError("");
+    const overlayWindow = getCurrentWindow();
+    let hiddenBeforeCapture = false;
     try {
+      if (!isMacPlatform()) {
+        await overlayWindow.hide();
+        hiddenBeforeCapture = true;
+      }
       await invoke("snipping_finish_area_snip", {
         request: {
           x: left,
@@ -751,11 +771,19 @@ export function SnippingOverlayWindow() {
         },
       });
       try {
-        await getCurrentWindow().close();
+        await overlayWindow.close();
       } catch {
         // Rust also closes the overlay after capture.
       }
     } catch (captureError) {
+      if (hiddenBeforeCapture) {
+        try {
+          await overlayWindow.show();
+          await overlayWindow.setFocus();
+        } catch {
+          // The backend may have already closed the overlay after a failed capture.
+        }
+      }
       setCapturing(false);
       setError(getErrorMessage(captureError, "Unable to capture selected area."));
     }
@@ -769,7 +797,6 @@ export function SnippingOverlayWindow() {
         onMouseMove={updateDrag}
         onMouseUp={finishDrag}
       >
-        <SnippingOverlayShade aria-hidden="true" />
         {selection && (
           <SnippingSelectionBox
             aria-hidden="true"
@@ -783,10 +810,6 @@ export function SnippingOverlayWindow() {
             <span>{Math.round(selection.width)} x {Math.round(selection.height)}</span>
           </SnippingSelectionBox>
         )}
-        <SnippingOverlayHint>
-          <ScreenshotMonitor aria-hidden="true" />
-          <span>{capturing ? "Capturing selected area..." : "Drag to snip / Esc cancels"}</span>
-        </SnippingOverlayHint>
         {error && <SnippingOverlayError>{error}</SnippingOverlayError>}
       </SnippingOverlayRoot>
     </>
@@ -990,6 +1013,7 @@ const SnippingOverlayRoot = styled.main`
   position: fixed;
   inset: 0;
   overflow: hidden;
+  background: transparent;
   color: #f8fafc;
   font-family:
     Inter,
@@ -1001,59 +1025,30 @@ const SnippingOverlayRoot = styled.main`
     sans-serif;
 `;
 
-const SnippingOverlayShade = styled.div`
-  position: absolute;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(1px);
-`;
-
 const SnippingSelectionBox = styled.div`
   position: absolute;
-  border: 2px solid rgba(255, 205, 132, 0.98);
-  border-radius: 4px;
-  background: rgba(255, 205, 132, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.96);
+  border-radius: 1px;
+  background: rgba(225, 229, 236, 0.18);
   box-shadow:
-    0 0 0 9999px rgba(0, 0, 0, 0.18),
-    0 0 28px rgba(255, 205, 132, 0.22);
+    0 0 0 1px rgba(11, 14, 19, 0.16),
+    0 2px 8px rgba(11, 14, 19, 0.16);
+  pointer-events: none;
 
   span {
     position: absolute;
-    right: 6px;
-    bottom: 6px;
-    padding: 3px 6px;
-    border: 1px solid rgba(255, 255, 255, 0.16);
-    border-radius: 999px;
-    background: rgba(7, 9, 13, 0.74);
-    color: #ffe2b3;
-    font-size: 11px;
-    font-weight: 760;
-  }
-`;
-
-const SnippingOverlayHint = styled.div`
-  position: absolute;
-  top: 18px;
-  left: 50%;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 11px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 999px;
-  background: rgba(7, 9, 13, 0.72);
-  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.22);
-  transform: translateX(-50%);
-
-  svg {
-    width: 16px;
-    height: 16px;
-    color: #ffd18b;
-  }
-
-  span {
-    font-size: 12px;
-    font-weight: 760;
+    left: 0;
+    top: calc(100% + 5px);
+    padding: 2px 5px;
+    border: 1px solid rgba(255, 255, 255, 0.62);
+    border-radius: 4px;
+    background: rgba(244, 246, 249, 0.86);
+    box-shadow: 0 1px 4px rgba(11, 14, 19, 0.18);
+    color: rgba(18, 22, 28, 0.78);
+    font-size: 10px;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+    line-height: 1.2;
     white-space: nowrap;
   }
 `;
