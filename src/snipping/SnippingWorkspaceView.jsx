@@ -24,6 +24,7 @@ import {
   ButtonRefreshIcon,
   ButtonSnippingIcon,
   FormMessage,
+  McpSwitchButton,
   PrimaryButton,
   SecondaryButton,
   SettingsHint,
@@ -97,6 +98,7 @@ function fallbackSnippingStatus() {
   const area = defaultAreaShortcut();
 
   return {
+    enabled: false,
     fullScreenshot: {
       shortcut: full,
       defaultShortcut: full,
@@ -258,6 +260,7 @@ export default function SnippingWorkspaceView({
   const [capturingShortcut, setCapturingShortcut] = useState("");
   const [lastCapture, setLastCapture] = useState(null);
 
+  const snippingEnabled = Boolean(status?.enabled);
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
   const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
@@ -269,16 +272,19 @@ export default function SnippingWorkspaceView({
   const permissionMissing = Boolean(
     permissions.screenCaptureRequired && !permissions.screenCaptureGranted,
   );
-  const shortcutReady = !permissionMissing
+  const shortcutReady = snippingEnabled
+    && !permissionMissing
     && !fullError
     && !areaError
     && !shortcutConflictError
     && Boolean(status?.fullScreenshot?.registered)
     && Boolean(status?.areaSnip?.registered);
   const savingShortcut = actionState === "saving";
+  const togglingSnipping = actionState === "toggling";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
   const openingPermissions = actionState === "opening-permissions";
+  const captureDisabled = !snippingEnabled || capturingFull || capturingArea || togglingSnipping;
 
   const snips = useMemo(() => (
     assetItems(untrackedLibrary)
@@ -294,6 +300,22 @@ export default function SnippingWorkspaceView({
       setError("");
     } catch (statusError) {
       setError(getErrorMessage(statusError, "Unable to load snipping settings."));
+    }
+  }, []);
+
+  const setSnippingEnabled = useCallback(async (enabled) => {
+    setActionState("toggling");
+    setError("");
+    try {
+      const nextStatus = await invoke("set_snipping_enabled", {
+        request: { enabled },
+      });
+      setStatus(nextStatus || fallbackSnippingStatus());
+      setCapturingShortcut("");
+    } catch (toggleError) {
+      setError(getErrorMessage(toggleError, "Unable to update snipping switch."));
+    } finally {
+      setActionState("idle");
     }
   }, []);
 
@@ -342,6 +364,7 @@ export default function SnippingWorkspaceView({
   }, []);
 
   const captureFull = useCallback(async () => {
+    if (!snippingEnabled) return;
     setActionState("capturing-full");
     setError("");
     try {
@@ -355,9 +378,10 @@ export default function SnippingWorkspaceView({
     } finally {
       setActionState("idle");
     }
-  }, [onUntrackedRefresh]);
+  }, [onUntrackedRefresh, snippingEnabled]);
 
   const captureArea = useCallback(async () => {
+    if (!snippingEnabled) return;
     setActionState("capturing-area");
     setError("");
     try {
@@ -367,7 +391,7 @@ export default function SnippingWorkspaceView({
     } finally {
       setActionState("idle");
     }
-  }, []);
+  }, [snippingEnabled]);
 
   const openSnip = useCallback(async (asset) => {
     const localPath = assetLocalPath(asset);
@@ -452,9 +476,20 @@ export default function SnippingWorkspaceView({
             <h2>Snipping</h2>
             <p>Screenshot and area snip straight into local-only untracked assets.</p>
           </div>
-          <AudioStatePill data-installed={shortcutReady}>
-            {shortcutReady ? "Ready" : permissionMissing ? "Needs access" : "Check shortcuts"}
-          </AudioStatePill>
+          <SnippingHeaderActions>
+            <McpSwitchButton
+              aria-pressed={snippingEnabled ? "true" : "false"}
+              disabled={togglingSnipping}
+              onClick={() => setSnippingEnabled(!snippingEnabled)}
+              type="button"
+            >
+              <span aria-hidden="true" />
+              {togglingSnipping ? "Switching" : snippingEnabled ? "On" : "Off"}
+            </McpSwitchButton>
+            <AudioStatePill data-installed={shortcutReady}>
+              {!snippingEnabled ? "Disabled" : shortcutReady ? "Ready" : permissionMissing ? "Needs access" : "Check shortcuts"}
+            </AudioStatePill>
+          </SnippingHeaderActions>
         </AudioHeroRow>
 
         <SnippingActionGrid>
@@ -462,18 +497,21 @@ export default function SnippingWorkspaceView({
             <AudioDeviceHeader>
               <div>
                 <SettingsLabel>Capture</SettingsLabel>
-                <SettingsHint>Manual snips save into the untracked snips folder.</SettingsHint>
+                <SettingsHint>{snippingEnabled
+                  ? "Manual snips save into the untracked snips folder."
+                  : "Turn on Snipping before taking screenshots."}
+                </SettingsHint>
               </div>
-              <AudioStatePill data-installed={!capturingFull && !capturingArea}>
-                {capturingFull || capturingArea ? "Capturing" : "Local only"}
+              <AudioStatePill data-installed={snippingEnabled && !capturingFull && !capturingArea}>
+                {!snippingEnabled ? "Disabled" : capturingFull || capturingArea ? "Capturing" : "Local only"}
               </AudioStatePill>
             </AudioDeviceHeader>
             <SnippingButtonGrid>
-              <PrimaryButton disabled={capturingFull || capturingArea} onClick={captureFull} type="button">
+              <PrimaryButton disabled={captureDisabled} onClick={captureFull} type="button">
                 <ScreenshotMonitor aria-hidden="true" />
                 <span>{capturingFull ? "Capturing..." : "Take screenshot"}</span>
               </PrimaryButton>
-              <SecondaryButton disabled={capturingFull || capturingArea} onClick={captureArea} type="button">
+              <SecondaryButton disabled={captureDisabled} onClick={captureArea} type="button">
                 <CropFree aria-hidden="true" />
                 <span>{capturingArea ? "Opening..." : "Select area"}</span>
               </SecondaryButton>
@@ -503,7 +541,7 @@ export default function SnippingWorkspaceView({
               </SnippingInfoTile>
               <SnippingInfoTile>
                 <span>Shortcuts</span>
-                <strong>{status?.fullScreenshot?.registered && status?.areaSnip?.registered ? "Registered" : "Unavailable"}</strong>
+                <strong>{!snippingEnabled ? "Disabled" : status?.fullScreenshot?.registered && status?.areaSnip?.registered ? "Registered" : "Unavailable"}</strong>
               </SnippingInfoTile>
             </SnippingPermissionGrid>
             {permissionMissing && (
@@ -522,10 +560,10 @@ export default function SnippingWorkspaceView({
           <AudioDeviceHeader>
             <div>
               <SettingsLabel>Bindings</SettingsLabel>
-              <SettingsHint>Global hotkeys are registered at app startup and stay live outside this tab.</SettingsHint>
+              <SettingsHint>Global hotkeys are registered only while Snipping is on.</SettingsHint>
             </div>
-            <AudioStatePill data-installed={!fullError && !areaError && !shortcutConflictError}>
-              {savingShortcut ? "Saving" : fullError || areaError || shortcutConflictError ? "Conflict" : "Ready"}
+            <AudioStatePill data-installed={snippingEnabled && !fullError && !areaError && !shortcutConflictError}>
+              {!snippingEnabled ? "Disabled" : savingShortcut ? "Saving" : fullError || areaError || shortcutConflictError ? "Conflict" : "Ready"}
             </AudioStatePill>
           </AudioDeviceHeader>
 
@@ -782,6 +820,15 @@ const SnippingActionGrid = styled.div`
   @media (max-width: 820px) {
     grid-template-columns: 1fr;
   }
+`;
+
+const SnippingHeaderActions = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  flex-wrap: wrap;
 `;
 
 const SnippingButtonGrid = styled.div`

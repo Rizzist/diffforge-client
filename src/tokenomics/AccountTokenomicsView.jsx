@@ -291,17 +291,92 @@ function todayAggregate(dailyRows, selectedProvider, selectedAccountKey, selecte
   return aggregateRows(rows);
 }
 
-function filterLimits(limits, selectedProvider, selectedAccountKey = "all", selectedDeviceId = "all") {
+function filterLimits(limits, selectedProvider, selectedAccountKey = "all") {
   if (!Array.isArray(limits)) return [];
   return limits.filter((limit) => (
     (selectedProvider === "all" || providerKey(limit) === selectedProvider)
       && (selectedAccountKey === "all" || rowProviderAccountKey(limit) === selectedAccountKey)
-      && (selectedDeviceId === "all" || rowDeviceId(limit) === selectedDeviceId)
   ));
 }
 
+function limitNumberOrNull(...values) {
+  for (const value of values) {
+    if (value == null || value === "") continue;
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function parseLimitTimestamp(value) {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  if (Number.isFinite(number) && number > 0) {
+    return new Date(number < 1_000_000_000_000 ? number * 1000 : number);
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function limitResetDate(limit = {}) {
+  const direct = parseLimitTimestamp(limit.reset_at ?? limit.resetAt ?? limit.limit_resets_at ?? limit.limitResetsAt);
+  if (direct) return direct;
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  const updatedAt = parseLimitTimestamp(limit.updated_at ?? limit.updatedAt ?? limit.last_known_at ?? limit.lastKnownAt);
+  if (resetAfterSeconds != null && updatedAt) {
+    return new Date(updatedAt.getTime() + Math.max(0, resetAfterSeconds) * 1000);
+  }
+  return null;
+}
+
+function hasKnownLimitPercent(limit = {}) {
+  return limitNumberOrNull(
+    limit.remaining_percent,
+    limit.remainingPercent,
+    limit.used_percent,
+    limit.usedPercent,
+    limit.limit_used_percent,
+    limit.limitUsedPercent,
+  ) != null;
+}
+
+function clientProjectedLimit(limit = {}) {
+  const resetDate = limitResetDate(limit);
+  if (!resetDate || !hasKnownLimitPercent(limit)) return limit;
+  const secondsUntilReset = Math.round((resetDate.getTime() - Date.now()) / 1000);
+  if (secondsUntilReset > 0) {
+    return {
+      ...limit,
+      reset_after_seconds: secondsUntilReset,
+      resetAfterSeconds: secondsUntilReset,
+    };
+  }
+  return {
+    ...limit,
+    used: 0,
+    allowance: 100,
+    remaining: 100,
+    used_percent: 0,
+    usedPercent: 0,
+    limit_used_percent: 0,
+    limitUsedPercent: 0,
+    remaining_percent: 100,
+    remainingPercent: 100,
+    reset_after_seconds: 0,
+    resetAfterSeconds: 0,
+    status_label: "Available",
+    statusLabel: "Available",
+    reset_label: "Provider window reset; waiting for live refresh",
+    resetLabel: "Provider window reset; waiting for live refresh",
+    client_estimated: true,
+    clientEstimated: true,
+  };
+}
+
 function mergeLimits(limits, windowKind) {
-  const rows = limits.filter((limit) => String(limit?.window_kind || limit?.windowKind || "") === windowKind);
+  const rows = limits
+    .filter((limit) => String(limit?.window_kind || limit?.windowKind || limit?.limit_kind || limit?.limitKind || "") === windowKind)
+    .map(clientProjectedLimit);
   if (!rows.length) {
     return {
       windowKind,

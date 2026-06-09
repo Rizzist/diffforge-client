@@ -3787,6 +3787,7 @@ pub fn run() {
             reset_audio_shortcuts,
             snipping_status,
             snipping_shortcuts_status,
+            set_snipping_enabled,
             set_snipping_shortcut,
             reset_snipping_shortcuts,
             open_snipping_permissions,

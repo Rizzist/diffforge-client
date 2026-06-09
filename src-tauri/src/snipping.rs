@@ -39,10 +39,10 @@ struct SnippingShortcutManager {
 
 impl SnippingShortcutManager {
     fn new() -> Self {
-        let bindings = default_snipping_shortcut_bindings();
+        let settings = default_snipping_settings();
         Self {
-            state: Arc::new(StdMutex::new(SnippingShortcutManagerState::from_bindings(
-                &bindings,
+            state: Arc::new(StdMutex::new(SnippingShortcutManagerState::from_settings(
+                &settings,
             ))),
         }
     }
@@ -52,7 +52,7 @@ impl SnippingShortcutManager {
             .lock()
             .map(|state| state.clone())
             .unwrap_or_else(|_| {
-                SnippingShortcutManagerState::from_bindings(&default_snipping_shortcut_bindings())
+                SnippingShortcutManagerState::from_settings(&default_snipping_settings())
             })
     }
 
@@ -75,20 +75,23 @@ impl SnippingShortcutManager {
 
 #[derive(Clone)]
 struct SnippingShortcutManagerState {
+    enabled: bool,
     full_screenshot: SnippingShortcutRegistration,
     area_snip: SnippingShortcutRegistration,
 }
 
 impl SnippingShortcutManagerState {
-    fn from_bindings(bindings: &SnippingShortcutBindings) -> Self {
+    fn from_settings(settings: &SnippingSettings) -> Self {
         Self {
-            full_screenshot: SnippingShortcutRegistration::new(bindings.full_screenshot.clone()),
-            area_snip: SnippingShortcutRegistration::new(bindings.area_snip.clone()),
+            enabled: settings.enabled,
+            full_screenshot: SnippingShortcutRegistration::new(settings.full_screenshot.clone()),
+            area_snip: SnippingShortcutRegistration::new(settings.area_snip.clone()),
         }
     }
 
-    fn bindings(&self) -> SnippingShortcutBindings {
-        SnippingShortcutBindings {
+    fn settings(&self) -> SnippingSettings {
+        SnippingSettings {
+            enabled: self.enabled,
             full_screenshot: self.full_screenshot.shortcut.clone(),
             area_snip: self.area_snip.shortcut.clone(),
         }
@@ -110,6 +113,10 @@ impl SnippingShortcutManagerState {
             SnippingShortcutAction::FullScreenshot => self.full_screenshot = registration,
             SnippingShortcutAction::AreaSnip => self.area_snip = registration,
         }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 }
 
@@ -207,6 +214,7 @@ struct SnippingPermissionStatus {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SnippingSettingsStatus {
+    enabled: bool,
     full_screenshot: SnippingShortcutRegistrationStatus,
     area_snip: SnippingShortcutRegistrationStatus,
     permissions: SnippingPermissionStatus,
@@ -215,9 +223,19 @@ struct SnippingSettingsStatus {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct SnippingShortcutBindings {
+struct SnippingSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
     full_screenshot: String,
+    #[serde(default)]
     area_snip: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingEnabledUpdateRequest {
+    enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -253,8 +271,9 @@ struct SnippingAreaMonitor {
     scale_factor: f64,
 }
 
-fn default_snipping_shortcut_bindings() -> SnippingShortcutBindings {
-    SnippingShortcutBindings {
+fn default_snipping_settings() -> SnippingSettings {
+    SnippingSettings {
+        enabled: false,
         full_screenshot: SnippingShortcutAction::FullScreenshot.default_shortcut(),
         area_snip: SnippingShortcutAction::AreaSnip.default_shortcut(),
     }
@@ -316,13 +335,11 @@ fn validate_snipping_shortcut_for_action(
     Ok(())
 }
 
-fn sanitized_snipping_shortcut_bindings(
-    bindings: SnippingShortcutBindings,
-) -> SnippingShortcutBindings {
-    let defaults = default_snipping_shortcut_bindings();
-    let mut full_screenshot = normalize_snipping_shortcut_text(&bindings.full_screenshot)
+fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
+    let defaults = default_snipping_settings();
+    let mut full_screenshot = normalize_snipping_shortcut_text(&settings.full_screenshot)
         .unwrap_or(defaults.full_screenshot.clone());
-    let mut area_snip = normalize_snipping_shortcut_text(&bindings.area_snip)
+    let mut area_snip = normalize_snipping_shortcut_text(&settings.area_snip)
         .unwrap_or(defaults.area_snip.clone());
 
     if validate_snipping_shortcut_for_action(
@@ -344,28 +361,29 @@ fn sanitized_snipping_shortcut_bindings(
         area_snip = defaults.area_snip.clone();
     }
 
-    SnippingShortcutBindings {
+    SnippingSettings {
+        enabled: settings.enabled,
         full_screenshot,
         area_snip,
     }
 }
 
-fn read_snipping_shortcut_bindings(app: &AppHandle) -> SnippingShortcutBindings {
+fn read_snipping_settings(app: &AppHandle) -> SnippingSettings {
     let Ok(path) = snipping_shortcut_settings_path(app) else {
-        return default_snipping_shortcut_bindings();
+        return default_snipping_settings();
     };
     let Ok(contents) = fs::read_to_string(path) else {
-        return default_snipping_shortcut_bindings();
+        return default_snipping_settings();
     };
 
-    serde_json::from_str::<SnippingShortcutBindings>(&contents)
-        .map(sanitized_snipping_shortcut_bindings)
-        .unwrap_or_else(|_| default_snipping_shortcut_bindings())
+    serde_json::from_str::<SnippingSettings>(&contents)
+        .map(sanitized_snipping_settings)
+        .unwrap_or_else(|_| default_snipping_settings())
 }
 
-fn write_snipping_shortcut_bindings(
+fn write_snipping_settings(
     app: &AppHandle,
-    bindings: &SnippingShortcutBindings,
+    settings: &SnippingSettings,
 ) -> Result<(), String> {
     let path = snipping_shortcut_settings_path(app)?;
     if let Some(parent) = path.parent() {
@@ -376,8 +394,8 @@ fn write_snipping_shortcut_bindings(
             )
         })?;
     }
-    let contents = serde_json::to_string_pretty(bindings)
-        .map_err(|error| format!("Unable to encode snipping shortcuts: {error}"))?;
+    let contents = serde_json::to_string_pretty(&sanitized_snipping_settings(settings.clone()))
+        .map_err(|error| format!("Unable to encode snipping settings: {error}"))?;
     fs::write(&path, contents).map_err(|error| {
         format!(
             "Unable to write snipping shortcut settings {}: {error}",
@@ -463,6 +481,7 @@ fn snipping_status_from_state(
 ) -> Result<SnippingSettingsStatus, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     Ok(SnippingSettingsStatus {
+        enabled: state.enabled,
         full_screenshot: snipping_shortcut_registration_status(
             SnippingShortcutAction::FullScreenshot,
             state.full_screenshot,
@@ -542,22 +561,68 @@ fn register_snipping_shortcut_registration(
 }
 
 fn register_snipping_shortcuts(app: &AppHandle) {
-    let bindings = read_snipping_shortcut_bindings(app);
-    let mut state = SnippingShortcutManagerState::from_bindings(&bindings);
+    let settings = read_snipping_settings(app);
+    let mut state = SnippingShortcutManagerState::from_settings(&settings);
 
-    state.full_screenshot = register_snipping_shortcut_registration(
-        app,
-        SnippingShortcutAction::FullScreenshot,
-        bindings.full_screenshot,
-    );
-    state.area_snip = register_snipping_shortcut_registration(
-        app,
-        SnippingShortcutAction::AreaSnip,
-        bindings.area_snip,
-    );
+    if settings.enabled {
+        state.full_screenshot = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::FullScreenshot,
+            settings.full_screenshot,
+        );
+        state.area_snip = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::AreaSnip,
+            settings.area_snip,
+        );
+    }
 
     app.state::<SnippingState>().shortcut_manager.replace(state);
     emit_snipping_shortcuts_changed(app);
+}
+
+fn unregister_snipping_shortcuts_for_state(app: &AppHandle, state: &SnippingShortcutManagerState) {
+    unregister_snipping_shortcut(app, &state.full_screenshot.shortcut);
+    unregister_snipping_shortcut(app, &state.area_snip.shortcut);
+}
+
+fn set_snipping_enabled_for(
+    app: &AppHandle,
+    request: SnippingEnabledUpdateRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    let manager = app.state::<SnippingState>().shortcut_manager.clone();
+    let state = manager.snapshot();
+
+    unregister_snipping_shortcuts_for_state(app, &state);
+
+    let settings = SnippingSettings {
+        enabled: request.enabled,
+        full_screenshot: state.full_screenshot.shortcut.clone(),
+        area_snip: state.area_snip.shortcut.clone(),
+    };
+    write_snipping_settings(app, &settings)?;
+
+    let mut next_state = SnippingShortcutManagerState::from_settings(&settings);
+    next_state.set_enabled(request.enabled);
+    if request.enabled {
+        next_state.full_screenshot = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::FullScreenshot,
+            settings.full_screenshot,
+        );
+        next_state.area_snip = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::AreaSnip,
+            settings.area_snip,
+        );
+    } else {
+        snipping_set_active_area_monitor(app, None)?;
+        snipping_close_area_overlay(app);
+    }
+
+    manager.replace(next_state);
+    emit_snipping_shortcuts_changed(app);
+    snipping_status_for(app)
 }
 
 fn set_snipping_shortcut_for(
@@ -584,6 +649,14 @@ fn set_snipping_shortcut_for(
         return snipping_status_for(app);
     }
 
+    if !state.enabled {
+        manager.set_registration(action, SnippingShortcutRegistration::new(next_shortcut));
+        let settings = manager.snapshot().settings();
+        write_snipping_settings(app, &settings)?;
+        emit_snipping_shortcuts_changed(app);
+        return snipping_status_for(app);
+    }
+
     unregister_snipping_shortcut(app, &previous.shortcut);
 
     let next_registration =
@@ -600,8 +673,8 @@ fn set_snipping_shortcut_for(
 
     manager.set_registration(action, next_registration);
 
-    let bindings = manager.snapshot().bindings();
-    write_snipping_shortcut_bindings(app, &bindings)?;
+    let settings = manager.snapshot().settings();
+    write_snipping_settings(app, &settings)?;
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
 }
@@ -610,23 +683,27 @@ fn reset_snipping_shortcuts_for(app: &AppHandle) -> Result<SnippingSettingsStatu
     let manager = app.state::<SnippingState>().shortcut_manager.clone();
     let state = manager.snapshot();
 
-    unregister_snipping_shortcut(app, &state.full_screenshot.shortcut);
-    unregister_snipping_shortcut(app, &state.area_snip.shortcut);
+    unregister_snipping_shortcuts_for_state(app, &state);
 
-    let bindings = default_snipping_shortcut_bindings();
-    write_snipping_shortcut_bindings(app, &bindings)?;
+    let settings = SnippingSettings {
+        enabled: state.enabled,
+        ..default_snipping_settings()
+    };
+    write_snipping_settings(app, &settings)?;
 
-    let mut next_state = SnippingShortcutManagerState::from_bindings(&bindings);
-    next_state.full_screenshot = register_snipping_shortcut_registration(
-        app,
-        SnippingShortcutAction::FullScreenshot,
-        bindings.full_screenshot,
-    );
-    next_state.area_snip = register_snipping_shortcut_registration(
-        app,
-        SnippingShortcutAction::AreaSnip,
-        bindings.area_snip,
-    );
+    let mut next_state = SnippingShortcutManagerState::from_settings(&settings);
+    if settings.enabled {
+        next_state.full_screenshot = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::FullScreenshot,
+            settings.full_screenshot,
+        );
+        next_state.area_snip = register_snipping_shortcut_registration(
+            app,
+            SnippingShortcutAction::AreaSnip,
+            settings.area_snip,
+        );
+    }
     manager.replace(next_state);
 
     emit_snipping_shortcuts_changed(app);
@@ -765,11 +842,25 @@ fn snipping_save_image(
     Ok(payload)
 }
 
+fn ensure_snipping_enabled(app: &AppHandle) -> Result<(), String> {
+    if app
+        .state::<SnippingState>()
+        .shortcut_manager
+        .snapshot()
+        .enabled
+    {
+        return Ok(());
+    }
+
+    Err("Snipping is disabled. Turn it on before taking snips.".to_string())
+}
+
 fn snipping_capture_full_for(
     app: &AppHandle,
     reason: &str,
     shortcut: String,
 ) -> Result<Value, String> {
+    ensure_snipping_enabled(app)?;
     let monitor = xcap_monitor_for_full(app)?;
     let image = monitor
         .capture_image()
@@ -848,6 +939,7 @@ fn snipping_begin_area_snip_for(
     reason: &str,
     shortcut: String,
 ) -> Result<Value, String> {
+    ensure_snipping_enabled(app)?;
     let monitor = snipping_current_area_monitor(app)?;
     snipping_set_active_area_monitor(app, Some(monitor.clone()))?;
     let window = ensure_snipping_overlay_window(app, &monitor)?;
@@ -922,6 +1014,14 @@ fn snipping_status(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
 #[tauri::command]
 fn snipping_shortcuts_status(app: AppHandle) -> Result<SnippingSettingsStatus, String> {
     snipping_status_for(&app)
+}
+
+#[tauri::command]
+fn set_snipping_enabled(
+    app: AppHandle,
+    request: SnippingEnabledUpdateRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    set_snipping_enabled_for(&app, request)
 }
 
 #[tauri::command]

@@ -2055,6 +2055,11 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default();
+    let device_aliases = summary
+        .get("device_aliases")
+        .or_else(|| summary.get("deviceAliases"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let event_kind = if force_full || force_resync {
         "tokenomics_hourly_usage_snapshot"
     } else {
@@ -2070,6 +2075,8 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
+        "device_aliases": device_aliases.clone(),
+        "deviceAliases": device_aliases,
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
         "machine_name": device_profile["machine_name"].clone(),
@@ -12946,6 +12953,11 @@ async fn cloud_mcp_sync_tokenomics_state(
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default();
+    let device_aliases = summary
+        .get("device_aliases")
+        .or_else(|| summary.get("deviceAliases"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
     let event_kind = if is_delta {
         "tokenomics_delta"
     } else {
@@ -12963,6 +12975,8 @@ async fn cloud_mcp_sync_tokenomics_state(
         "account_scoped": true,
         "device": device_profile.clone(),
         "device_id": device_profile["device_id"].clone(),
+        "device_aliases": device_aliases.clone(),
+        "deviceAliases": device_aliases,
         "device_name": device_profile["device_name"].clone(),
         "machine_id": device_profile["device_id"].clone(),
         "machine_name": device_profile["machine_name"].clone(),

@@ -453,6 +453,8 @@ import {
   SettingsHint,
   SettingsIdentityGrid,
   SettingsIdentityItem,
+  SettingsRepoCard,
+  SettingsRepoGrid,
   CreditUsageTrack,
   CreditUsageFill,
   LowCreditWarningToast,
@@ -1014,6 +1016,7 @@ const AGENT_STATUS_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const WORKSPACE_SETTINGS_STORAGE_KEY = "diffforge.workspaceSettings.v1";
 const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
+const WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY = "diffforge.workspaceCoordinationTargets.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
@@ -4191,6 +4194,107 @@ function dedupeWorkspaceCoordinationTargets(targets) {
     });
 }
 
+function normalizeWorkspaceCoordinationTargetsCacheRecord(value, fallbackRoot = "") {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const rootDirectory = cleanWorkspaceRootDirectory(
+    source.rootDirectory
+      || source.root_directory
+      || source.repoPath
+      || source.repo_path
+      || fallbackRoot,
+  );
+  if (!rootDirectory) {
+    return null;
+  }
+
+  const targets = dedupeWorkspaceCoordinationTargets(
+    Array.isArray(source.targets) ? source.targets : [],
+  );
+  if (!targets.length) {
+    return null;
+  }
+
+  return {
+    container: Boolean(source.container),
+    rootDirectory,
+    targets,
+    workspaceKind: String(source.workspaceKind || source.workspace_kind || "").trim(),
+  };
+}
+
+function readWorkspaceCoordinationTargetsCache() {
+  const cache = new Map();
+  try {
+    const rawStorage = window.localStorage.getItem(WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY);
+    if (!rawStorage) {
+      return cache;
+    }
+
+    const parsed = JSON.parse(rawStorage);
+    const records = parsed?.records && typeof parsed.records === "object" && !Array.isArray(parsed.records)
+      ? parsed.records
+      : parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed
+        : {};
+
+    Object.entries(records).forEach(([rootKey, record]) => {
+      if (rootKey === "version") {
+        return;
+      }
+      const normalized = normalizeWorkspaceCoordinationTargetsCacheRecord(record);
+      const normalizedRootKey = getWorkspaceRootIdentity(normalized?.rootDirectory || "");
+      if (normalizedRootKey) {
+        cache.set(normalizedRootKey, normalized);
+      }
+    });
+  } catch {
+    // Cached scan data is an optimization; workspace-open scans can rebuild it.
+  }
+  return cache;
+}
+
+function persistWorkspaceCoordinationTargetsCache(cache) {
+  try {
+    const records = {};
+    cache.forEach((record) => {
+      const normalized = normalizeWorkspaceCoordinationTargetsCacheRecord(record);
+      const rootKey = getWorkspaceRootIdentity(normalized?.rootDirectory || "");
+      if (!rootKey) {
+        return;
+      }
+      records[rootKey] = {
+        container: normalized.container,
+        rootDirectory: normalized.rootDirectory,
+        savedAtMs: Date.now(),
+        targets: normalized.targets,
+        workspaceKind: normalized.workspaceKind,
+      };
+    });
+    window.localStorage.setItem(
+      WORKSPACE_COORDINATION_TARGETS_STORAGE_KEY,
+      JSON.stringify({ version: 1, records }),
+    );
+  } catch {
+    // The app can still discover repositories during workspace open without cache writes.
+  }
+}
+
+function getCloudSqliteResetCheckpointMessage(data) {
+  const backups = Array.isArray(data?.backups) ? data.backups : [];
+  const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
+  const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
+  if (backgroundCheckpoint?.queued) {
+    return "queued cloud checkpoint refresh";
+  }
+  if (backgroundCheckpoint?.error) {
+    return "could not queue cloud checkpoint refresh";
+  }
+  if (updatedBackupCount > 0) {
+    return "refreshed cloud checkpoint";
+  }
+  return "cloud checkpoint refresh skipped";
+}
+
 function isWindowsSystemRootDirectory(value) {
   const cleaned = cleanWorkspaceRootDirectory(value)
     .replace(/\\/g, "/")
@@ -5585,8 +5689,8 @@ export default function App() {
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
-  const [cloudSqliteResetSelectedRepoPath, setCloudSqliteResetSelectedRepoPath] = useState("");
-  const [cloudSqliteResetScope, setCloudSqliteResetScope] = useState("repo");
+  const [cloudSqliteResetSelectedWorkspaceId, setCloudSqliteResetSelectedWorkspaceId] = useState("");
+  const [cloudSqliteResetSelectedRepoKeys, setCloudSqliteResetSelectedRepoKeys] = useState({});
   const [tokenomicsCloudResetState, setTokenomicsCloudResetState] = useState("idle");
   const [tokenomicsCloudResetMessage, setTokenomicsCloudResetMessage] = useState("");
   const [tokenomicsCloudResetError, setTokenomicsCloudResetError] = useState("");
@@ -5695,7 +5799,7 @@ export default function App() {
   const tokenomicsSyncPendingRefreshRef = useRef(false);
   const tokenomicsForceResyncRef = useRef(null);
   const cloudMcpStartupWarmupKeyRef = useRef("");
-  const workspaceCoordinationTargetsCacheRef = useRef(new Map());
+  const workspaceCoordinationTargetsCacheRef = useRef(readWorkspaceCoordinationTargetsCache());
   const workspaceCoordinationTargetsStateKeyRef = useRef("");
   const [workspaceCoordinationTargetsByRoot, setWorkspaceCoordinationTargetsByRoot] = useState({});
   const workspaceTerminalRoleOptions = useMemo(
@@ -6130,6 +6234,7 @@ export default function App() {
     const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
     const nextTargetsByRoot = {};
     let cacheHitCount = 0;
+    let cacheUpdated = false;
     let fallbackCount = 0;
     let scanSnapshotCount = 0;
 
@@ -6148,8 +6253,17 @@ export default function App() {
         ? workspaceCoordinationTargetResponseFromScanSnapshot(scanSnapshot, entry.rootDirectory)
         : null;
       if (scanResponse?.targets?.length) {
-        workspaceCoordinationTargetsCacheRef.current.set(rootKey, scanResponse);
-        nextTargetsByRoot[rootKey] = scanResponse;
+        const normalizedScanResponse = normalizeWorkspaceCoordinationTargetsCacheRecord(
+          scanResponse,
+          entry.rootDirectory,
+        );
+        if (normalizedScanResponse) {
+          workspaceCoordinationTargetsCacheRef.current.set(rootKey, normalizedScanResponse);
+          nextTargetsByRoot[rootKey] = normalizedScanResponse;
+          cacheUpdated = true;
+        } else {
+          nextTargetsByRoot[rootKey] = scanResponse;
+        }
         scanSnapshotCount += 1;
         return;
       }
@@ -6165,10 +6279,13 @@ export default function App() {
         null,
         entry.rootDirectory,
       );
-      workspaceCoordinationTargetsCacheRef.current.set(rootKey, fallbackResponse);
       nextTargetsByRoot[rootKey] = fallbackResponse;
       fallbackCount += 1;
     });
+
+    if (cacheUpdated) {
+      persistWorkspaceCoordinationTargetsCache(workspaceCoordinationTargetsCacheRef.current);
+    }
 
     const nextTargetsStateKey = JSON.stringify(
       Object.entries(nextTargetsByRoot)
@@ -14474,99 +14591,158 @@ export default function App() {
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
-  const cloudSqliteResetTargets = useMemo(() => {
-    const targets = [];
+  const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
+  const cloudSqliteResetWorkspaces = useMemo(() => {
+    const resetWorkspaces = [];
     const seen = new Set();
     workspaces.forEach((workspace) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
         return;
       }
-      const workspaceName = String(workspace?.name || workspaceId).trim();
+      if (seen.has(workspaceId)) {
+        return;
+      }
+      seen.add(workspaceId);
       const workspaceRoot = (
         getWorkspaceRootDirectory(workspaceSettings, workspaceId)
         || defaultWorkingDirectory
         || ""
       );
-      if (!workspaceRoot) {
-        return;
-      }
-      const discoveredTargets = dedupeWorkspaceCoordinationTargets(
-        getWorkspaceCoordinationTargetsForRoot(
-          workspaceCoordinationTargetsByRoot,
-          workspaceRoot,
-        ),
-      );
-      const gitTargets = discoveredTargets.filter(workspaceCoordinationTargetIsGitRepo);
-      const repoTargets = gitTargets.length ? gitTargets : discoveredTargets;
-      const usableTargets = repoTargets.length
-        ? repoTargets
-        : [{
-          repoPath: workspaceRoot,
-          workspaceRelativePath: "",
-          projectKind: "workspace",
-          hasGit: false,
-        }];
-      usableTargets.forEach((target) => {
-        const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || workspaceRoot);
-        const repoIdentity = getWorkspaceRootIdentity(repoPath);
-        if (!repoPath || !repoIdentity) {
-          return;
-        }
-        const key = `${workspaceId}:${repoIdentity}`;
-        if (seen.has(key)) {
-          return;
-        }
-        seen.add(key);
-        const repoLabel = workspaceCoordinationTargetRepoLabel(target);
-        targets.push({
-          key,
-          workspaceId,
-          workspaceName,
-          workspaceRoot,
-          repoPath,
-          repoLabel,
-          label: `${workspaceName} / ${repoLabel}`,
-          target,
-        });
+      resetWorkspaces.push({
+        workspaceId,
+        workspaceName: String(workspace?.name || workspaceId).trim(),
+        workspaceRoot: cleanWorkspaceRootDirectory(workspaceRoot),
       });
     });
-    return targets;
+    return resetWorkspaces;
   }, [
     defaultWorkingDirectory,
-    workspaceCoordinationTargetsByRoot,
     workspaceSettings,
     workspaces,
   ]);
-  const cloudSqliteResetTarget = useMemo(() => {
-    const selectedKey = String(cloudSqliteResetSelectedRepoPath || "").trim();
+  const cloudSqliteResetWorkspace = useMemo(() => {
+    const selectedResetWorkspaceId = String(cloudSqliteResetSelectedWorkspaceId || "").trim();
     return (
-      cloudSqliteResetTargets.find((target) => target.key === selectedKey)
-      || cloudSqliteResetTargets[0]
+      cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === selectedResetWorkspaceId)
+      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === selectedWorkspace?.id)
+      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === activatedWorkspace?.id)
+      || cloudSqliteResetWorkspaces.find((workspace) => workspace.workspaceId === defaultWorkspace?.id)
+      || cloudSqliteResetWorkspaces[0]
       || null
     );
-  }, [cloudSqliteResetSelectedRepoPath, cloudSqliteResetTargets]);
-  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetTarget?.workspaceId || "").trim();
-  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetTarget?.workspaceName || "").trim();
-  const cloudSqliteResetRepoPath = String(cloudSqliteResetTarget?.repoPath || "").trim();
-  const cloudSqliteResetRepoLabel = String(cloudSqliteResetTarget?.repoLabel || "Repository").trim();
+  }, [
+    activatedWorkspace?.id,
+    cloudSqliteResetSelectedWorkspaceId,
+    cloudSqliteResetWorkspaces,
+    defaultWorkspace?.id,
+    selectedWorkspace?.id,
+  ]);
+  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetWorkspace?.workspaceId || "").trim();
+  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetWorkspace?.workspaceName || "").trim();
+  const cloudSqliteResetWorkspaceRoot = cleanWorkspaceRootDirectory(
+    cloudSqliteResetWorkspace?.workspaceRoot || "",
+  );
+  const cloudSqliteResetRepoCards = useMemo(() => {
+    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetWorkspaceRoot) {
+      return [];
+    }
+    const discoveredTargets = dedupeWorkspaceCoordinationTargets(
+      getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        cloudSqliteResetWorkspaceRoot,
+      ),
+    );
+    const gitTargets = discoveredTargets.filter(workspaceCoordinationTargetIsGitRepo);
+    const seen = new Set();
+    return gitTargets
+      .map((target) => {
+        const repoPath = cleanWorkspaceRootDirectory(target?.repoPath || "");
+        const repoIdentity = getWorkspaceRootIdentity(repoPath);
+        if (!repoPath || !repoIdentity || seen.has(repoIdentity)) {
+          return null;
+        }
+        seen.add(repoIdentity);
+        const repoLabel = workspaceCoordinationTargetRepoLabel(target);
+        const relativePath = String(target?.workspaceRelativePath || "").trim();
+        return {
+          key: `${cloudSqliteResetWorkspaceId}:${repoIdentity}`,
+          repoIdentity,
+          repoLabel,
+          repoPath,
+          relativePath,
+          target,
+        };
+      })
+      .filter(Boolean);
+  }, [
+    cloudSqliteResetWorkspaceId,
+    cloudSqliteResetWorkspaceRoot,
+    workspaceCoordinationTargetsByRoot,
+  ]);
+  const cloudSqliteResetSelectedRepoCards = useMemo(() => (
+    cloudSqliteResetRepoCards.filter((card) => Boolean(cloudSqliteResetSelectedRepoKeys?.[card.key]))
+  ), [cloudSqliteResetRepoCards, cloudSqliteResetSelectedRepoKeys]);
+  const cloudSqliteResetSelectedRepoCount = cloudSqliteResetSelectedRepoCards.length;
   const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
     || cloudSqliteResetState === "resetting";
   const isCloudSqliteRepoResetting = cloudSqliteResetState === "repo_resetting"
     || cloudSqliteResetState === "resetting";
-  const cloudSqliteResetDisabled = isCloudSqliteResetting
+  const isCloudSqliteWorkspaceResetting = cloudSqliteResetState === "workspace_resetting";
+  const cloudSqliteRepoResetDisabled = isCloudSqliteResetting
     || !cloudSqliteResetWorkspaceId
-    || !cloudSqliteResetRepoPath;
+    || cloudSqliteResetSelectedRepoCount === 0;
+  const cloudSqliteWorkspaceResetDisabled = isCloudSqliteResetting
+    || !cloudSqliteResetWorkspaceId
+    || !cloudSqliteResetWorkspaceRoot;
   const isTokenomicsCloudResetting = tokenomicsCloudResetState === "resetting";
   const tokenomicsCloudResetDisabled = isTokenomicsCloudResetting
     || authState !== "authenticated"
     || !isPaidUser(user);
   useEffect(() => {
-    const nextKey = cloudSqliteResetTarget?.key || "";
-    if (nextKey !== cloudSqliteResetSelectedRepoPath) {
-      setCloudSqliteResetSelectedRepoPath(nextKey);
+    const nextWorkspaceId = cloudSqliteResetWorkspace?.workspaceId || "";
+    if (nextWorkspaceId !== cloudSqliteResetSelectedWorkspaceId) {
+      setCloudSqliteResetSelectedWorkspaceId(nextWorkspaceId);
     }
-  }, [cloudSqliteResetSelectedRepoPath, cloudSqliteResetTarget?.key]);
+  }, [cloudSqliteResetSelectedWorkspaceId, cloudSqliteResetWorkspace?.workspaceId]);
+  useEffect(() => {
+    const validKeys = new Set(cloudSqliteResetRepoCards.map((card) => card.key));
+    setCloudSqliteResetSelectedRepoKeys((current) => {
+      const next = {};
+      Object.keys(current || {}).forEach((key) => {
+        if (validKeys.has(key)) {
+          next[key] = true;
+        }
+      });
+      const currentKeys = Object.keys(current || {}).sort();
+      const nextKeys = Object.keys(next).sort();
+      if (
+        currentKeys.length === nextKeys.length
+        && currentKeys.every((key, index) => key === nextKeys[index])
+      ) {
+        return current;
+      }
+      return next;
+    });
+  }, [cloudSqliteResetRepoCards]);
+  const toggleCloudSqliteResetRepoCard = useCallback((repoKey) => {
+    if (isCloudSqliteResetting) {
+      return;
+    }
+    const key = String(repoKey || "").trim();
+    if (!key) {
+      return;
+    }
+    setCloudSqliteResetSelectedRepoKeys((current) => {
+      const next = { ...(current || {}) };
+      if (next[key]) {
+        delete next[key];
+      } else {
+        next[key] = true;
+      }
+      return next;
+    });
+  }, [isCloudSqliteResetting]);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const workspaceGitPullSelectedPaths = useMemo(
@@ -15053,21 +15229,18 @@ export default function App() {
   const activatedArchitectureRepositoryScanState = activatedWorkspaceGraphState.architectureRepositoryScanState || "idle";
   const activatedArchitectureRepositoryScanSnapshot = activatedWorkspaceGraphState.architectureRepositoryScanSnapshot || null;
 
-  const hardResetCloudSqlite = useCallback(async () => {
+  const resetSelectedRepoServerStates = useCallback(async () => {
     setCloudSqliteResetMessage("");
     setCloudSqliteResetError("");
 
-    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetRepoPath) {
-      setCloudSqliteResetError("Choose a workspace repository before resetting server state.");
+    if (!cloudSqliteResetWorkspaceId || cloudSqliteResetSelectedRepoCards.length === 0) {
+      setCloudSqliteResetError("Select at least one repository before resetting server state.");
       return;
     }
 
-    const resetScopeLabel = cloudSqliteResetScope === "workspace" ? "workspace" : "repository";
-    const resetTargetLabel = cloudSqliteResetScope === "workspace"
-      ? cloudSqliteResetWorkspaceName
-      : `${cloudSqliteResetWorkspaceName} / ${cloudSqliteResetRepoLabel}`;
+    const repoCount = cloudSqliteResetSelectedRepoCards.length;
     const confirmed = window.confirm(
-      `Reset server state for this ${resetScopeLabel}: ${resetTargetLabel}? Devices, billing history, and tokenomics are preserved.`,
+      `Reset server state for ${repoCount} selected repositor${repoCount === 1 ? "y" : "ies"} in ${cloudSqliteResetWorkspaceName || "this workspace"}? Devices, billing history, and tokenomics are preserved.`,
     );
     if (!confirmed) {
       return;
@@ -15075,38 +15248,72 @@ export default function App() {
 
     setCloudSqliteResetState("repo_resetting");
     try {
-      const response = await invoke("cloud_mcp_reset_server_state", {
-        repoPath: cloudSqliteResetRepoPath,
-        workspaceId: cloudSqliteResetWorkspaceId,
-        workspaceName: cloudSqliteResetWorkspaceName || null,
-        resetScope: cloudSqliteResetScope,
-      });
-      const data = unwrapCloudCommandData(response, {});
-      const backups = Array.isArray(data?.backups) ? data.backups : [];
-      const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
-      const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
-      let checkpointMessage = "cloud checkpoint refresh skipped";
-      if (backgroundCheckpoint?.queued) {
-        checkpointMessage = "queued cloud checkpoint refresh";
-      } else if (backgroundCheckpoint?.error) {
-        checkpointMessage = "could not queue cloud checkpoint refresh";
-      } else if (updatedBackupCount > 0) {
-        checkpointMessage = "refreshed cloud checkpoint";
+      const checkpointMessages = [];
+      for (const repoCard of cloudSqliteResetSelectedRepoCards) {
+        const response = await invoke("cloud_mcp_reset_server_state", {
+          repoPath: repoCard.repoPath,
+          workspaceId: cloudSqliteResetWorkspaceId,
+          workspaceName: cloudSqliteResetWorkspaceName || null,
+          resetScope: "repo",
+        });
+        checkpointMessages.push(getCloudSqliteResetCheckpointMessage(unwrapCloudCommandData(response, {})));
       }
+      const checkpointMessage = checkpointMessages.find((message) => message === "queued cloud checkpoint refresh")
+        || checkpointMessages.find((message) => message === "refreshed cloud checkpoint")
+        || checkpointMessages[0]
+        || "cloud checkpoint refresh skipped";
       setCloudSqliteResetMessage(
-        `Server state reset complete for ${resetTargetLabel}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
+        `Server state reset complete for ${repoCount} repositor${repoCount === 1 ? "y" : "ies"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
       );
     } catch (error) {
-      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset server state."));
+      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset selected repositories."));
     } finally {
       setCloudSqliteResetState("idle");
     }
   }, [
-    cloudSqliteResetRepoLabel,
-    cloudSqliteResetRepoPath,
-    cloudSqliteResetScope,
+    cloudSqliteResetSelectedRepoCards,
     cloudSqliteResetWorkspaceId,
     cloudSqliteResetWorkspaceName,
+  ]);
+
+  const resetWorkspaceServerState = useCallback(async () => {
+    setCloudSqliteResetMessage("");
+    setCloudSqliteResetError("");
+
+    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetWorkspaceRoot) {
+      setCloudSqliteResetError("Choose a workspace before resetting workspace server state.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Reset workspace server state for ${cloudSqliteResetWorkspaceName || "this workspace"}? Workspace todos and plans are cleared. Devices, billing history, and tokenomics are preserved.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setCloudSqliteResetState("workspace_resetting");
+    try {
+      const response = await invoke("cloud_mcp_reset_server_state", {
+        repoPath: cloudSqliteResetWorkspaceRoot,
+        workspaceId: cloudSqliteResetWorkspaceId,
+        workspaceName: cloudSqliteResetWorkspaceName || null,
+        resetScope: "workspace",
+      });
+      const data = unwrapCloudCommandData(response, {});
+      const checkpointMessage = getCloudSqliteResetCheckpointMessage(data);
+      setCloudSqliteResetMessage(
+        `Workspace server state reset complete for ${cloudSqliteResetWorkspaceName || "workspace"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
+      );
+    } catch (error) {
+      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset workspace server state."));
+    } finally {
+      setCloudSqliteResetState("idle");
+    }
+  }, [
+    cloudSqliteResetWorkspaceId,
+    cloudSqliteResetWorkspaceName,
+    cloudSqliteResetWorkspaceRoot,
   ]);
 
   const resetCurrentDeviceTokenomicsCloud = useCallback(async () => {
@@ -15118,25 +15325,16 @@ export default function App() {
       return;
     }
 
-    const confirmed = window.confirm(
-      "Reset cloud Tokenomics saved for this native device only? Other devices and billing history are preserved, and this device will immediately resync its local Tokenomics.",
-    );
+    const confirmed = window.confirm("Reset cloud Tokenomics for this device only and resync?");
     if (!confirmed) {
       return;
     }
 
     setTokenomicsCloudResetState("resetting");
     try {
-      const response = await invoke("cloud_mcp_reset_device_tokenomics");
-      const data = unwrapCloudCommandData(response, {});
+      await invoke("cloud_mcp_reset_device_tokenomics");
       tokenomicsSyncCursorRef.current = "";
-      const deletedRollups = Number(data?.deleted_rollups ?? data?.deletedRollups ?? 0) || 0;
-      const deletedDeviceIdentities = Number(
-        data?.deleted_device_identities ?? data?.deletedDeviceIdentities ?? 0,
-      ) || 0;
-      setTokenomicsCloudResetMessage(
-        `Reset this device's cloud Tokenomics (${deletedRollups} rollup rows, ${deletedDeviceIdentities} device identity rows) and queued a full device resync.`,
-      );
+      setTokenomicsCloudResetMessage("Device Tokenomics reset; full resync queued.");
     } catch (error) {
       setTokenomicsCloudResetError(getErrorMessage(error, "Unable to reset this device's cloud Tokenomics."));
     } finally {
@@ -21667,65 +21865,6 @@ export default function App() {
                         </AccountCardFooter>
                       </AccountCard>
 
-                      <AccountCard data-tone="blue">
-                        <AccountCardHeader>
-                          <div>
-                            <SettingsLabel>Tokenomics</SettingsLabel>
-                            <SettingsValue>Reset this device</SettingsValue>
-                            <SettingsHint>
-                              Clear only this native device's cloud Tokenomics rows, then resend this device's local Tokenomics through sync.
-                            </SettingsHint>
-                          </div>
-                          <AgentReadyPill data-tone="blue">
-                            {isTokenomicsCloudResetting ? (
-                              <PendingIcon aria-hidden="true" />
-                            ) : (
-                              <ButtonRefreshIcon aria-hidden="true" />
-                            )}
-                            <span>{isTokenomicsCloudResetting ? "Resetting" : "Device only"}</span>
-                          </AgentReadyPill>
-                        </AccountCardHeader>
-
-                        <SettingsIdentityGrid>
-                          <SettingsIdentityItem>
-                            <span>Scope</span>
-                            <strong>Native device</strong>
-                          </SettingsIdentityItem>
-                          <SettingsIdentityItem>
-                            <span>Preserved</span>
-                            <strong>Other devices</strong>
-                          </SettingsIdentityItem>
-                          <SettingsIdentityItem>
-                            <span>Billing</span>
-                            <strong>Preserved</strong>
-                          </SettingsIdentityItem>
-                          <SettingsIdentityItem>
-                            <span>After reset</span>
-                            <strong>Full device resync</strong>
-                          </SettingsIdentityItem>
-                        </SettingsIdentityGrid>
-
-                        {tokenomicsCloudResetError && <FormMessage $state="error">{tokenomicsCloudResetError}</FormMessage>}
-                        {tokenomicsCloudResetMessage && (
-                          <AgentInstallMessage data-tone="success">
-                            {tokenomicsCloudResetMessage}
-                          </AgentInstallMessage>
-                        )}
-
-                        <AccountCardFooter>
-                          <SettingsHint>
-                            Provider account identities, billing records, and every other device's Tokenomics stay intact.
-                          </SettingsHint>
-                          <PrimaryDangerButton
-                            disabled={tokenomicsCloudResetDisabled}
-                            onClick={resetCurrentDeviceTokenomicsCloud}
-                            type="button"
-                          >
-                            {isTokenomicsCloudResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                            <span>{isTokenomicsCloudResetting ? "Resetting..." : "Reset device Tokenomics"}</span>
-                          </PrimaryDangerButton>
-                        </AccountCardFooter>
-                      </AccountCard>
                     </AccountSettingsPanel>
 
                     <AccountSettingsPanel>
@@ -21756,62 +21895,58 @@ export default function App() {
                       </AccountCardHeader>
 
                       <SetupField>
-                        <SettingsLabel>Scope</SettingsLabel>
+                        <SettingsLabel>Workspace</SettingsLabel>
                         <WorkspaceSettingsSelectShell>
                           <WorkspaceSettingsSelect
-                            disabled={isCloudSqliteResetting}
-                            onChange={(event) => setCloudSqliteResetScope(event.target.value)}
-                            value={cloudSqliteResetScope}
+                            disabled={isCloudSqliteResetting || cloudSqliteResetWorkspaces.length === 0}
+                            onChange={(event) => {
+                              setCloudSqliteResetSelectedWorkspaceId(event.target.value);
+                              setCloudSqliteResetSelectedRepoKeys({});
+                            }}
+                            value={cloudSqliteResetWorkspaceId}
                           >
-                            <option value="repo">Repository server state</option>
-                            <option value="workspace">Workspace server state</option>
-                          </WorkspaceSettingsSelect>
-                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
-                        </WorkspaceSettingsSelectShell>
-                        <SettingsHint>
-                          Repository reset keeps workspace todos and plans. Workspace reset clears workspace todos and plans too.
-                        </SettingsHint>
-                      </SetupField>
-
-                      <SetupField>
-                        <SettingsLabel>Workspace / repository</SettingsLabel>
-                        <WorkspaceSettingsSelectShell>
-                          <WorkspaceSettingsSelect
-                            disabled={isCloudSqliteResetting || cloudSqliteResetTargets.length === 0}
-                            onChange={(event) => setCloudSqliteResetSelectedRepoPath(event.target.value)}
-                            value={cloudSqliteResetTarget?.key || ""}
-                          >
-                            {cloudSqliteResetTargets.length === 0 ? (
+                            {cloudSqliteResetWorkspaces.length === 0 ? (
                               <option value="">No workspaces found</option>
-                            ) : cloudSqliteResetTargets.map((target) => (
-                              <option key={target.key} value={target.key}>
-                                {target.label}
+                            ) : cloudSqliteResetWorkspaces.map((workspace) => (
+                              <option key={workspace.workspaceId} value={workspace.workspaceId}>
+                                {workspace.workspaceName}
                               </option>
                             ))}
                           </WorkspaceSettingsSelect>
                           <WorkspaceSettingsSelectIcon aria-hidden="true" />
                         </WorkspaceSettingsSelectShell>
-                        <SettingsHint>{cloudSqliteResetRepoPath || "Add or sync a workspace to reset its server state."}</SettingsHint>
+                        <SettingsHint>
+                          {cloudSqliteResetWorkspaceRoot || "Add or sync a workspace to reset its server state."}
+                        </SettingsHint>
                       </SetupField>
 
-                      <SettingsIdentityGrid>
-                        <SettingsIdentityItem>
-                          <span>Scope</span>
-                          <strong>{cloudSqliteResetScope === "workspace" ? "Workspace" : "Repository"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Workspace</span>
-                          <strong>{cloudSqliteResetWorkspaceName || "No workspace"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Repo</span>
-                          <strong>{cloudSqliteResetRepoPath ? cloudSqliteResetRepoLabel : "None"}</strong>
-                        </SettingsIdentityItem>
-                        <SettingsIdentityItem>
-                          <span>Preserved</span>
-                          <strong>Devices, billing, tokenomics</strong>
-                        </SettingsIdentityItem>
-                      </SettingsIdentityGrid>
+                      <SetupField>
+                        <SettingsLabel>Repositories</SettingsLabel>
+                        {cloudSqliteResetRepoCards.length > 0 ? (
+                          <SettingsRepoGrid>
+                            {cloudSqliteResetRepoCards.map((repoCard) => {
+                              const selected = Boolean(cloudSqliteResetSelectedRepoKeys?.[repoCard.key]);
+                              return (
+                                <SettingsRepoCard
+                                  data-selected={selected ? "true" : "false"}
+                                  disabled={isCloudSqliteResetting}
+                                  key={repoCard.key}
+                                  onClick={() => toggleCloudSqliteResetRepoCard(repoCard.key)}
+                                  type="button"
+                                >
+                                  {selected ? <ButtonCheckIcon aria-hidden="true" /> : <ButtonCodeIcon aria-hidden="true" />}
+                                  <strong>{repoCard.repoLabel}</strong>
+                                  <span>{repoCard.relativePath || repoCard.repoPath}</span>
+                                </SettingsRepoCard>
+                              );
+                            })}
+                          </SettingsRepoGrid>
+                        ) : (
+                          <SettingsHint>
+                            No repositories cached for this workspace yet. Open the workspace to refresh the scan.
+                          </SettingsHint>
+                        )}
+                      </SetupField>
 
                       {cloudSqliteResetError && <FormMessage $state="error">{cloudSqliteResetError}</FormMessage>}
                       {cloudSqliteResetMessage && (
@@ -21822,17 +21957,51 @@ export default function App() {
 
                       <AccountCardFooter>
                         <SettingsHint>
-                          This does not delete the workspace, local files, devices, billing history, or device-level tokenomics.
+                          {cloudSqliteResetSelectedRepoCount > 0
+                            ? `${cloudSqliteResetSelectedRepoCount} repositor${cloudSqliteResetSelectedRepoCount === 1 ? "y" : "ies"} selected.`
+                            : "Select repository cards to reset repo server state."}
                         </SettingsHint>
                         <PrimaryDangerButton
-                          disabled={cloudSqliteResetDisabled}
-                          onClick={hardResetCloudSqlite}
+                          disabled={cloudSqliteRepoResetDisabled}
+                          onClick={resetSelectedRepoServerStates}
                           type="button"
                         >
                           {isCloudSqliteRepoResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset server state"}</span>
+                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset selected repos"}</span>
                         </PrimaryDangerButton>
                       </AccountCardFooter>
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          Workspace reset clears workspace todos and plans; devices, billing, and tokenomics stay preserved.
+                        </SettingsHint>
+                        <PrimaryDangerButton
+                          disabled={cloudSqliteWorkspaceResetDisabled}
+                          onClick={resetWorkspaceServerState}
+                          type="button"
+                        >
+                          {isCloudSqliteWorkspaceResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isCloudSqliteWorkspaceResetting ? "Resetting..." : "Reset workspace state"}</span>
+                        </PrimaryDangerButton>
+                      </AccountCardFooter>
+                      <AccountCardFooter>
+                        <SettingsHint>
+                          Tokenomics: reset this device only, then resync.
+                        </SettingsHint>
+                        <PrimaryDangerButton
+                          disabled={tokenomicsCloudResetDisabled}
+                          onClick={resetCurrentDeviceTokenomicsCloud}
+                          type="button"
+                        >
+                          {isTokenomicsCloudResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{isTokenomicsCloudResetting ? "Resetting..." : "Reset Tokenomics"}</span>
+                        </PrimaryDangerButton>
+                      </AccountCardFooter>
+                      {tokenomicsCloudResetError && <FormMessage $state="error">{tokenomicsCloudResetError}</FormMessage>}
+                      {tokenomicsCloudResetMessage && (
+                        <AgentInstallMessage data-tone="success">
+                          {tokenomicsCloudResetMessage}
+                        </AgentInstallMessage>
+                      )}
                     </AccountCard>
                   </AccountSettingsPanel>
 

@@ -11254,6 +11254,78 @@ export const SettingsIdentityItem = styled.div`
   }
 `;
 
+export const SettingsRepoGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+`;
+
+export const SettingsRepoCard = styled.button`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 9px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(10, 14, 20, 0.58);
+  color: var(--forge-text);
+  cursor: pointer;
+  text-align: left;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
+
+  &:hover:not(:disabled),
+  &[data-selected="true"] {
+    border-color: rgba(124, 164, 255, 0.62);
+    background: rgba(43, 78, 128, 0.24);
+  }
+
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &[data-selected="true"] {
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.68;
+  }
+
+  svg {
+    grid-row: 1 / span 2;
+    width: 17px;
+    height: 17px;
+    color: var(--forge-accent-blue);
+  }
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 740;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-soft);
+    font-size: 11px;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
 export const CreditUsageTrack = styled.div`
   position: relative;
   width: 100%;
