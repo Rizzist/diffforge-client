@@ -1504,6 +1504,19 @@ struct WorkspaceDirectoryListing {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceRootBrowse {
+    working_directory: String,
+    parent_directory: Option<String>,
+    directories: Vec<String>,
+    truncated: bool,
+    empty_directory: bool,
+    git_repository: bool,
+    root_eligible: bool,
+    root_rejection_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceFileText {
     root: String,
     relative_path: String,
@@ -3789,6 +3802,7 @@ pub fn run() {
             docker_developer_action,
             forge_working_directory,
             validate_workspace_root_directory,
+            browse_workspace_root_directory,
             list_workspace_directory,
             read_workspace_file,
             read_workspace_file_image,
@@ -3857,6 +3871,9 @@ pub fn run() {
             snipping_save_edited_untracked_asset,
             snipping_open_annotation_editor,
             snipping_read_asset_data_url,
+            snipping_open_snip_float,
+            snipping_set_dispatch_targets,
+            snipping_dispatch_targets,
             snipping_open_annotation_editor_batch,
             snipping_copy_untracked_asset_to_clipboard,
             snipping_cancel_area_snip,
@@ -3936,6 +3953,9 @@ pub fn run() {
             diffforge_rename_untracked_asset,
             diffforge_save_untracked_data_url_asset,
             diffforge_save_untracked_text_asset,
+            hyperframe_transcribe_audio,
+            hyperframe_save_media_transcript,
+            hyperframe_media_transcript_status,
             diffforge_copy_asset_to_clipboard,
             diffforge_copy_image_data_url_to_clipboard,
             diffforge_untrack_workspace_asset,

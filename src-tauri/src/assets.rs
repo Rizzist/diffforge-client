@@ -995,3 +995,109 @@ fn diffforge_promote_untracked_asset(
         "library": diffforge_untracked_asset_library(None)?,
     }))
 }
+
+const HYPERFRAME_TRANSCRIBABLE_MEDIA_EXTENSIONS: [&str; 12] = [
+    "aac", "flac", "m4a", "m4v", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm", "wma",
+];
+const HYPERFRAME_TRANSCRIPT_SRT_SUFFIX: &str = "srt";
+const HYPERFRAME_TRANSCRIPT_JSON_SUFFIX: &str = "transcript.json";
+const HYPERFRAME_TRANSCRIPT_MAX_TEXT_BYTES: usize = 24 * 1024 * 1024;
+
+fn hyperframe_validated_media_path(raw_path: &str) -> Result<PathBuf, String> {
+    let cleaned = raw_path.trim();
+    if cleaned.is_empty() {
+        return Err("A media file path is required.".to_string());
+    }
+    let path = PathBuf::from(cleaned);
+    if !path.is_absolute() {
+        return Err("Media file paths must be absolute.".to_string());
+    }
+    if !path.is_file() {
+        return Err("The media file no longer exists on disk.".to_string());
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !HYPERFRAME_TRANSCRIBABLE_MEDIA_EXTENSIONS.contains(&extension.as_str()) {
+        return Err("Transcripts can only be attached to audio or video files.".to_string());
+    }
+    Ok(path)
+}
+
+fn hyperframe_transcript_sidecar_paths(media_path: &Path) -> (PathBuf, PathBuf) {
+    let file_name = media_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("media");
+    let parent = media_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    (
+        parent.join(format!("{file_name}.{HYPERFRAME_TRANSCRIPT_SRT_SUFFIX}")),
+        parent.join(format!("{file_name}.{HYPERFRAME_TRANSCRIPT_JSON_SUFFIX}")),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperframeSaveMediaTranscriptRequest {
+    media_path: String,
+    srt_text: String,
+    transcript_json: String,
+}
+
+#[tauri::command]
+fn hyperframe_save_media_transcript(
+    app: AppHandle,
+    request: HyperframeSaveMediaTranscriptRequest,
+) -> Result<Value, String> {
+    let media_path = hyperframe_validated_media_path(&request.media_path)?;
+    if request.srt_text.trim().is_empty() || request.transcript_json.trim().is_empty() {
+        return Err("Transcript content is empty; nothing to save.".to_string());
+    }
+    if request.srt_text.len() > HYPERFRAME_TRANSCRIPT_MAX_TEXT_BYTES
+        || request.transcript_json.len() > HYPERFRAME_TRANSCRIPT_MAX_TEXT_BYTES
+    {
+        return Err("Transcript content is too large to save.".to_string());
+    }
+    serde_json::from_str::<Value>(&request.transcript_json)
+        .map_err(|error| format!("Transcript JSON is invalid: {error}"))?;
+
+    let (srt_path, json_path) = hyperframe_transcript_sidecar_paths(&media_path);
+    fs::write(&srt_path, request.srt_text.as_bytes())
+        .map_err(|error| format!("Unable to save transcript SRT: {error}"))?;
+    fs::write(&json_path, request.transcript_json.as_bytes())
+        .map_err(|error| format!("Unable to save transcript JSON: {error}"))?;
+
+    // Sidecars live next to the media file, so tracked/untracked/cloud scope always
+    // matches the video automatically. Refresh the untracked library if applicable.
+    if diffforge_path_is_inside_untracked_assets(&media_path).unwrap_or(false) {
+        diffforge_emit_untracked_assets_updated(&app, "transcript-saved", None);
+    }
+
+    Ok(json!({
+        "jsonPath": json_path.display().to_string(),
+        "srtPath": srt_path.display().to_string(),
+    }))
+}
+
+#[tauri::command]
+fn hyperframe_media_transcript_status(media_path: String) -> Result<Value, String> {
+    let media_path = hyperframe_validated_media_path(&media_path)?;
+    let (srt_path, json_path) = hyperframe_transcript_sidecar_paths(&media_path);
+    let srt_exists = srt_path.is_file();
+    let json_exists = json_path.is_file();
+    let updated_at_ms = json_path
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(json!({
+        "exists": srt_exists && json_exists,
+        "jsonPath": if json_exists { json_path.display().to_string() } else { String::new() },
+        "srtPath": if srt_exists { srt_path.display().to_string() } else { String::new() },
+        "updatedAtMs": updated_at_ms,
+    }))
+}

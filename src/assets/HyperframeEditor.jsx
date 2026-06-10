@@ -3,6 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import styled, { keyframes } from "styled-components";
 import { AddCircle } from "@styled-icons/material-rounded/AddCircle";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
+import { Audiotrack } from "@styled-icons/material-rounded/Audiotrack";
 import { ArrowDownward } from "@styled-icons/material-rounded/ArrowDownward";
 import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
 import { CheckBox } from "@styled-icons/material-rounded/CheckBox";
@@ -11,22 +12,42 @@ import { Code } from "@styled-icons/material-rounded/Code";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { Image } from "@styled-icons/material-rounded/Image";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { Movie } from "@styled-icons/material-rounded/Movie";
+import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PhotoLibrary } from "@styled-icons/material-rounded/PhotoLibrary";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { RestartAlt } from "@styled-icons/material-rounded/RestartAlt";
 import { Save } from "@styled-icons/material-rounded/Save";
+import { Send } from "@styled-icons/material-rounded/Send";
+import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Timeline } from "@styled-icons/material-rounded/Timeline";
 import { VideoLibrary } from "@styled-icons/material-rounded/VideoLibrary";
+
+import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
+import { getMediaTranscriptStatus } from "./videoTranscription";
 
 const HYPERFRAME_VERSION = "1.0";
 const HYPERFRAME_MARKER = "diffforge-hyperframe";
 const HYPERFRAME_MANIFEST_SCRIPT_ID = "diffforge-hyperframe-manifest";
 const HYPERFRAME_DRAFT_PREFIX = "diffforge:hyperframe:draft:";
+const HYPERFRAME_AI_JOBS_PREFIX = "diffforge:hyperframe:aijobs:";
+const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const TODO_QUEUE_RECEIPTS_PREFIX = "diffforge.todoQueue.remoteCommandReceipts.v1";
+const AI_JOB_FADE_MS = 2600;
+const AI_JOB_UNDELIVERED_MS = 8000;
+const AI_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const AI_AGENT_OPTIONS = [
+  { id: "", label: "Any available agent" },
+  { id: "claude", label: "Claude Code" },
+  { id: "codex", label: "Codex" },
+  { id: "opencode", label: "OpenCode" },
+];
 const DEFAULT_CLIP_DURATION = 3;
 const DEFAULT_CANVAS = { height: 720, width: 1280 };
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 const ASSET_VIDEO_EXTENSIONS = new Set(["m4v", "mov", "mp4", "webm"]);
+const ASSET_AUDIO_EXTENSIONS = new Set(["aac", "flac", "m4a", "mp3", "ogg", "opus", "wav", "wma"]);
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -151,6 +172,14 @@ function assetIsVideo(asset) {
     || ASSET_VIDEO_EXTENSIONS.has(assetFileExtension(asset));
 }
 
+function assetIsAudio(asset) {
+  const mimeType = assetMimeType(asset).toLowerCase();
+  const kind = assetKind(asset).toLowerCase();
+  return mimeType.startsWith("audio/")
+    || kind === "audio"
+    || ASSET_AUDIO_EXTENSIONS.has(assetFileExtension(asset));
+}
+
 function assetIsHtml(asset) {
   const mimeType = assetMimeType(asset).toLowerCase();
   const extension = assetFileExtension(asset);
@@ -265,7 +294,13 @@ function hyperframeAssetReference(asset) {
   const id = assetKey(asset, `asset-${Math.random().toString(16).slice(2)}`);
   const localPath = assetLocalPath(asset);
   const mimeType = assetMimeType(asset);
-  const kind = assetIsImage(asset) ? "image" : assetIsVideo(asset) ? "video" : assetKind(asset);
+  const kind = assetIsImage(asset)
+    ? "image"
+    : assetIsVideo(asset)
+      ? "video"
+      : assetIsAudio(asset)
+        ? "audio"
+        : assetKind(asset);
   return {
     id,
     assetId: assetId(asset),
@@ -313,12 +348,20 @@ function normalizeHyperframeManifest(manifest, sourceAsset) {
   const timeline = jsonArray(input.timeline).map((clip, index) => {
     const object = jsonObject(clip) || {};
     const assetIdValue = text(object.assetId || object.asset_id || object.assetRef || object.asset_ref);
+    const sourceIn = clampNumber(object.sourceIn ?? object.source_in, 0, 86400, 0);
+    const rawSourceOut = object.sourceOut ?? object.source_out;
+    // sourceOut <= sourceIn (including the 0 default) means "play to the natural end".
+    const sourceOut = clampNumber(rawSourceOut, 0, 86400, 0);
     return {
       id: text(object.id, `clip-${index + 1}`),
       assetId: assetIdValue,
       duration: clampNumber(object.duration, 0.25, 3600, DEFAULT_CLIP_DURATION),
+      label: text(object.label),
+      sourceIn,
+      sourceOut: sourceOut > sourceIn ? sourceOut : 0,
       start: clampNumber(object.start, 0, 3600, index * DEFAULT_CLIP_DURATION),
       title: text(object.title),
+      transcriptExcerpt: text(object.transcriptExcerpt || object.transcript_excerpt).slice(0, 400),
       type: text(object.type || object.kind, "clip"),
     };
   });
@@ -460,11 +503,49 @@ function buildHyperframeHtml(manifest, assetMap, options = {}) {
   const timeline = [...(manifest.timeline || [])].sort((left, right) => Number(left.start || 0) - Number(right.start || 0));
   const duration = Math.max(Number(manifest.duration || 0), ...timeline.map((clip) => Number(clip.start || 0) + Number(clip.duration || 0)), 1);
   let activeClipId = "";
-  let videoElement = null;
-  const started = performance.now();
+  let mediaElement = null;
+  let activeClip = null;
+  let playing = true;
+  let clock = 0;
+  let lastNow = performance.now();
+  let lastPostAt = 0;
 
   function clipAt(time) {
     return timeline.find((clip) => time >= Number(clip.start || 0) && time < Number(clip.start || 0) + Number(clip.duration || 0)) || timeline[0] || null;
+  }
+
+  function clipSourceTime(clip, timelineTime) {
+    const sourceIn = Math.max(0, Number((clip && clip.sourceIn) || 0));
+    const sourceOut = Math.max(0, Number((clip && clip.sourceOut) || 0));
+    const offset = Math.max(0, timelineTime - Number((clip && clip.start) || 0));
+    let sourceTime = sourceIn + offset;
+    if (sourceOut > sourceIn) sourceTime = Math.min(sourceTime, Math.max(sourceIn, sourceOut - 0.04));
+    return sourceTime;
+  }
+
+  function syncMediaTime(force) {
+    if (!mediaElement || !activeClip) return;
+    const desired = clipSourceTime(activeClip, clock);
+    if (force || Math.abs((mediaElement.currentTime || 0) - desired) > 0.35) {
+      try { mediaElement.currentTime = desired; } catch {}
+    }
+  }
+
+  function playMedia() {
+    if (!mediaElement) return;
+    mediaElement.play().catch(() => {
+      mediaElement.muted = true;
+      mediaElement.play().catch(() => {});
+    });
+  }
+
+  function appendPlaceholder(title, subtitle) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "hf-placeholder";
+    placeholder.innerHTML = "<strong></strong><span></span>";
+    placeholder.querySelector("strong").textContent = title;
+    placeholder.querySelector("span").textContent = subtitle;
+    frame.appendChild(placeholder);
   }
 
   function renderClip(clip) {
@@ -472,39 +553,74 @@ function buildHyperframeHtml(manifest, assetMap, options = {}) {
     const nextId = clip && asset ? clip.id + ":" + asset.id : "placeholder";
     if (activeClipId === nextId) return;
     activeClipId = nextId;
+    activeClip = clip || null;
     frame.textContent = "";
-    videoElement = null;
-    if (asset && asset.src && String(asset.kind || "").toLowerCase() === "image") {
+    mediaElement = null;
+    const kind = asset ? String(asset.kind || "").toLowerCase() : "";
+    if (asset && asset.src && kind === "image") {
       const image = document.createElement("img");
       image.alt = asset.name || manifest.title || "Hyperframe asset";
       image.src = asset.src;
       frame.appendChild(image);
       return;
     }
-    if (asset && asset.src && String(asset.kind || "").toLowerCase() === "video") {
-      const video = document.createElement("video");
-      video.muted = true;
-      video.loop = true;
-      video.playsInline = true;
-      video.src = asset.src;
-      frame.appendChild(video);
-      videoElement = video;
-      video.play().catch(() => {});
+    if (asset && asset.src && (kind === "video" || kind === "audio")) {
+      const media = document.createElement(kind === "audio" ? "audio" : "video");
+      media.loop = false;
+      media.playsInline = true;
+      media.preload = "auto";
+      media.muted = false;
+      media.src = asset.src;
+      if (kind === "audio") media.style.display = "none";
+      frame.appendChild(media);
+      if (kind === "audio") appendPlaceholder(asset.name || clip.title || "Audio", "audio");
+      mediaElement = media;
+      syncMediaTime(true);
+      if (playing) playMedia();
       return;
     }
-    const placeholder = document.createElement("div");
-    placeholder.className = "hf-placeholder";
-    placeholder.innerHTML = "<strong></strong><span></span>";
-    placeholder.querySelector("strong").textContent = asset?.name || clip?.title || manifest.title || "Hyperframe";
-    placeholder.querySelector("span").textContent = asset ? (asset.kind || "asset") : "No clip";
-    frame.appendChild(placeholder);
+    appendPlaceholder(
+      (asset && asset.name) || (clip && clip.title) || manifest.title || "Hyperframe",
+      asset ? (asset.kind || "asset") : "No clip",
+    );
   }
 
+  function postState(now, force) {
+    if (!force && now - lastPostAt < 120) return;
+    lastPostAt = now;
+    try {
+      window.parent.postMessage({ duration, playing, time: clock, type: "hf-state" }, "*");
+    } catch {}
+  }
+
+  window.addEventListener("message", (event) => {
+    const data = event && event.data;
+    if (!data || data.type !== "hf-control") return;
+    if (data.action === "play") playing = true;
+    if (data.action === "pause") playing = false;
+    if (data.action === "toggle") playing = !playing;
+    if (data.action === "seek") {
+      clock = Math.max(0, Math.min(duration, Number(data.time || 0)));
+      renderClip(clipAt(clock));
+      syncMediaTime(true);
+    }
+    if (mediaElement) {
+      if (playing) playMedia();
+      else mediaElement.pause();
+    }
+    postState(performance.now(), true);
+  });
+
   function tick(now) {
-    const elapsed = ((now - started) / 1000) % duration;
-    const clip = clipAt(elapsed);
+    const previousClock = clock;
+    if (playing) clock = (clock + Math.max(0, now - lastNow) / 1000) % duration;
+    lastNow = now;
+    const clip = clipAt(clock);
     renderClip(clip);
-    if (progress) progress.style.width = String(Math.min(100, Math.max(0, elapsed / duration * 100))) + "%";
+    syncMediaTime(clock < previousClock);
+    if (mediaElement && playing && mediaElement.paused) playMedia();
+    if (progress) progress.style.width = String(Math.min(100, Math.max(0, clock / duration * 100))) + "%";
+    postState(now, false);
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
@@ -711,6 +827,7 @@ function isUntrackedAsset(asset) {
 function assetTypeLabel(asset) {
   if (assetIsImage(asset)) return "Image";
   if (assetIsVideo(asset)) return "Video";
+  if (assetIsAudio(asset)) return "Audio";
   if (assetLooksLikeHyperframe(asset)) return "Hyperframe";
   const extension = assetFileExtension(asset);
   return extension ? extension.toUpperCase() : shortLabel(assetKind(asset).toUpperCase(), 10);
@@ -718,9 +835,142 @@ function assetTypeLabel(asset) {
 
 function assetIcon(asset) {
   if (assetIsVideo(asset)) return <Movie aria-hidden="true" />;
+  if (assetIsAudio(asset)) return <Audiotrack aria-hidden="true" />;
   if (assetIsImage(asset)) return <Image aria-hidden="true" />;
   if (assetLooksLikeHyperframe(asset)) return <VideoLibrary aria-hidden="true" />;
   return <Code aria-hidden="true" />;
+}
+
+function formatTimecode(seconds) {
+  const safe = Math.max(0, numberValue(seconds, 0));
+  const minutes = Math.floor(safe / 60);
+  const remainder = safe - minutes * 60;
+  return `${minutes}:${remainder.toFixed(1).padStart(4, "0")}`;
+}
+
+// Mirrors getTodoQueueRemoteCommandReceiptStorageKey in TerminalView so the editor can
+// observe the lifecycle receipts the terminal records for queued remote todos.
+function todoQueueReceiptsStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+  return `${TODO_QUEUE_RECEIPTS_PREFIX}.${safeWorkspaceId}`;
+}
+
+function readTodoQueueReceipt(workspaceId, commandId) {
+  if (typeof window === "undefined" || !commandId) return null;
+  try {
+    const receipts = jsonObject(JSON.parse(window.localStorage.getItem(todoQueueReceiptsStorageKey(workspaceId)) || "{}")) || {};
+    return jsonObject(receipts[commandId]);
+  } catch {
+    return null;
+  }
+}
+
+const AI_JOB_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "timed_out", "released", "duplicate_ignored"]);
+
+function aiJobPhaseFromReceiptStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (["completed"].includes(normalized)) return "completed";
+  if (["failed", "cancelled", "canceled", "timed_out", "timeout", "duplicate_ignored", "released"].includes(normalized)) return "failed";
+  if (["sending", "submitted"].includes(normalized)) return "editing";
+  if (["paused", "parked", "resume_ready", "resume_requested", "interrupted"].includes(normalized)) return "paused";
+  if (normalized === "queued") return "queued";
+  return "";
+}
+
+function aiJobPhaseLabel(phase) {
+  switch (phase) {
+    case "editing":
+      return "Editing";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "paused":
+      return "Paused";
+    case "undelivered":
+      return "Not delivered";
+    default:
+      return "Queued";
+  }
+}
+
+function normalizeAiJob(job) {
+  const object = jsonObject(job);
+  if (!object) return null;
+  const commandId = text(object.commandId || object.id);
+  const workspaceId = text(object.workspaceId);
+  if (!commandId || !workspaceId) return null;
+  const rangeObject = jsonObject(object.range) || {};
+  const start = Math.max(0, numberValue(rangeObject.start, 0));
+  const end = Math.max(start, numberValue(rangeObject.end, start));
+  return {
+    agentId: text(object.agentId),
+    commandId,
+    completedAtMs: numberValue(object.completedAtMs, 0),
+    createdAtMs: numberValue(object.createdAtMs, Date.now()),
+    instruction: text(object.instruction).slice(0, 400),
+    phase: text(object.phase, "queued"),
+    range: end > start ? { end, start } : null,
+    workspaceId,
+    workspaceName: text(object.workspaceName, workspaceId),
+  };
+}
+
+function readAiJobs(storageKey) {
+  if (!storageKey || typeof window === "undefined") return [];
+  try {
+    const nowMs = Date.now();
+    return jsonArray(JSON.parse(window.localStorage.getItem(storageKey) || "[]"))
+      .map(normalizeAiJob)
+      .filter(Boolean)
+      .filter((job) => nowMs - job.createdAtMs < AI_JOB_MAX_AGE_MS)
+      .filter((job) => !(job.phase === "completed" && job.completedAtMs && nowMs - job.completedAtMs > AI_JOB_FADE_MS));
+  } catch {
+    return [];
+  }
+}
+
+function writeAiJobs(storageKey, jobs) {
+  if (!storageKey || typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(jsonArray(jobs).slice(0, 24)));
+  } catch {
+    // Job persistence is best-effort only.
+  }
+}
+
+function buildHyperframeTodoText({ instruction, manifest, range, rangeClips, sourcePath }) {
+  const mediaTranscriptLines = jsonArray(manifest.assets)
+    .filter((ref) => ["audio", "video"].includes(String(ref.kind || "").toLowerCase()))
+    .map((ref) => {
+      const transcript = jsonObject(ref.transcript) || {};
+      if (transcript.srtPath || transcript.jsonPath) {
+        return `Transcript for "${ref.name}" (asset ${ref.id}): SRT ${transcript.srtPath}${transcript.jsonPath ? `, word-level JSON ${transcript.jsonPath}` : ""}`;
+      }
+      return `No transcript attached for "${ref.name}" (asset ${ref.id}).`;
+    });
+  const lines = [
+    "[Hyperframe edit request]",
+    `Project: ${text(manifest.title, "Hyperframe")}`,
+    sourcePath ? `File: ${sourcePath}` : "",
+    `Canvas: ${manifest.canvas.width}x${manifest.canvas.height}, total duration ${timelineDuration(manifest.timeline, numberValue(manifest.duration, DEFAULT_CLIP_DURATION)).toFixed(2)}s`,
+    range
+      ? `Target timeline range: ${range.start.toFixed(2)}s to ${range.end.toFixed(2)}s${rangeClips.length ? ` (clips: ${rangeClips.map((clip) => `${clip.id}${clip.title ? ` "${clip.title}"` : ""}`).join(", ")})` : ""}`
+      : "Target timeline range: entire timeline",
+    ...mediaTranscriptLines,
+    mediaTranscriptLines.length
+      ? "Video/audio clips support sourceIn/sourceOut (seconds into the source media) for cutting. To cut or crop media, adjust clip sourceIn/sourceOut plus start/duration in the manifest timeline; use the transcript timestamps to find content. sourceOut 0 means play to the end."
+      : "",
+    "",
+    instruction,
+    "",
+    sourcePath
+      ? `Edit the hyperframe HTML file at ${sourcePath} directly. The project manifest is embedded as JSON in <script id="${HYPERFRAME_MANIFEST_SCRIPT_ID}" type="application/json">. Apply the requested change to the selected time range only and keep every other clip, asset reference, and setting intact. Keep the manifest valid JSON and the file a self-contained hyperframe document.`
+      : `The project manifest is embedded as JSON in <script id="${HYPERFRAME_MANIFEST_SCRIPT_ID}" type="application/json"> inside the hyperframe HTML document. Apply the requested change to the selected time range only and keep everything else intact.`,
+  ];
+  return lines.filter((line) => line !== "").join("\n");
 }
 
 export default function HyperframeEditor({
@@ -730,6 +980,7 @@ export default function HyperframeEditor({
   onBack,
   onRefreshTracked,
   onRefreshUntracked,
+  workspaces = [],
 }) {
   const [activePanel, setActivePanel] = useState("assets");
   const [busyKey, setBusyKey] = useState("");
@@ -741,15 +992,31 @@ export default function HyperframeEditor({
   const [manifest, setManifest] = useState(() => defaultHyperframeManifest(asset));
   const [selectedClipId, setSelectedClipId] = useState("");
   const [status, setStatus] = useState("Opening");
+  const [playerState, setPlayerState] = useState({ duration: 0, playing: true, time: 0 });
+  const [timelineSelection, setTimelineSelection] = useState(null);
+  const [aiWorkspaceId, setAiWorkspaceId] = useState("");
+  const [aiAgentId, setAiAgentId] = useState("");
+  const [aiInstruction, setAiInstruction] = useState("");
+  const [aiSendError, setAiSendError] = useState("");
+  const [aiJobs, setAiJobs] = useState([]);
   const loadRunRef = useRef(0);
+  const previewFrameRef = useRef(null);
+  const timelineStripRef = useRef(null);
+  const timelineDragRef = useRef(null);
+  const aiJobsLoadedKeyRef = useRef("");
+  const playerTimeRef = useRef(0);
+  const pendingSeekTimeRef = useRef(null);
+  const reloadFromDiskRef = useRef(() => {});
 
   const currentAssetKey = assetKey(asset);
   const draftKey = currentAssetKey ? `${HYPERFRAME_DRAFT_PREFIX}${currentAssetKey}` : "";
+  const aiJobsKey = currentAssetKey ? `${HYPERFRAME_AI_JOBS_PREFIX}${currentAssetKey}` : "";
 
   const availableAssets = useMemo(() => (
     dedupeAssets(assets)
       .filter((item) => assetLocalAvailable(item))
       .filter((item) => assetKey(item) !== currentAssetKey)
+      .filter((item) => !/\.(srt|transcript\.json)$/iu.test(assetName(item)))
       .sort((left, right) => assetName(left).localeCompare(assetName(right)))
   ), [assets, currentAssetKey]);
 
@@ -824,12 +1091,210 @@ export default function HyperframeEditor({
     return () => window.clearTimeout(timeout);
   }, [currentAssetKey, draftKey, loadedAssetKey, loading, manifest]);
 
+  useEffect(() => {
+    const handlePlayerMessage = (event) => {
+      const data = event?.data;
+      if (!data || data.type !== "hf-state") return;
+      if (previewFrameRef.current && event.source !== previewFrameRef.current.contentWindow) return;
+      const time = Math.max(0, numberValue(data.time, 0));
+      playerTimeRef.current = time;
+      setPlayerState({
+        duration: Math.max(0, numberValue(data.duration, 0)),
+        playing: data.playing !== false,
+        time,
+      });
+    };
+    window.addEventListener("message", handlePlayerMessage);
+    return () => window.removeEventListener("message", handlePlayerMessage);
+  }, []);
+
+  const sendPlayerCommand = useCallback((action, time) => {
+    try {
+      previewFrameRef.current?.contentWindow?.postMessage(
+        { action, time, type: "hf-control" },
+        "*",
+      );
+    } catch {
+      // The preview iframe may not be ready yet.
+    }
+    if (action === "play" || action === "pause") {
+      setPlayerState((current) => ({ ...current, playing: action === "play" }));
+    }
+    if (action === "seek") {
+      setPlayerState((current) => ({ ...current, time: Math.max(0, numberValue(time, 0)) }));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!aiJobsKey || aiJobsLoadedKeyRef.current === aiJobsKey) return;
+    aiJobsLoadedKeyRef.current = aiJobsKey;
+    setAiJobs(readAiJobs(aiJobsKey));
+  }, [aiJobsKey]);
+
+  useEffect(() => {
+    if (!aiJobsKey || aiJobsLoadedKeyRef.current !== aiJobsKey) return;
+    writeAiJobs(aiJobsKey, aiJobs);
+  }, [aiJobs, aiJobsKey]);
+
+  useEffect(() => {
+    if (!workspaces.length) return;
+    setAiWorkspaceId((current) => (
+      current && workspaces.some((workspace) => workspace.id === current)
+        ? current
+        : text(workspaces[0]?.id)
+    ));
+  }, [workspaces]);
+
+  const hasActiveAiJobs = aiJobs.some((job) => !AI_JOB_TERMINAL_STATUSES.has(job.phase) || job.phase === "completed");
+  useEffect(() => {
+    if (!hasActiveAiJobs) return undefined;
+    const syncJobs = () => {
+      const nowMs = Date.now();
+      let agentFinishedEditing = false;
+      setAiJobs((current) => {
+        let changed = false;
+        const next = current
+          .map((job) => {
+            if (job.phase === "completed" || job.phase === "failed") return job;
+            const receipt = readTodoQueueReceipt(job.workspaceId, job.commandId);
+            const receiptPhase = aiJobPhaseFromReceiptStatus(receipt?.status);
+            if (receiptPhase && receiptPhase !== job.phase) {
+              changed = true;
+              if (receiptPhase === "completed") {
+                agentFinishedEditing = true;
+              }
+              return {
+                ...job,
+                completedAtMs: receiptPhase === "completed" ? nowMs : job.completedAtMs,
+                phase: receiptPhase,
+              };
+            }
+            if (!receipt && job.phase === "queued" && nowMs - job.createdAtMs > AI_JOB_UNDELIVERED_MS) {
+              changed = true;
+              return { ...job, phase: "undelivered" };
+            }
+            return job;
+          })
+          .filter((job) => {
+            if (job.phase === "completed" && job.completedAtMs && nowMs - job.completedAtMs > AI_JOB_FADE_MS) {
+              changed = true;
+              return false;
+            }
+            return true;
+          });
+        return changed ? next : current;
+      });
+      if (agentFinishedEditing) {
+        window.setTimeout(() => reloadFromDiskRef.current?.(), 0);
+      }
+    };
+    syncJobs();
+    const timer = window.setInterval(syncJobs, 1500);
+    window.addEventListener("storage", syncJobs);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("storage", syncJobs);
+    };
+  }, [hasActiveAiJobs]);
+
+  const timelineTimeFromClientX = useCallback((clientX) => {
+    const strip = timelineStripRef.current;
+    if (!strip || !duration) return 0;
+    const bounds = strip.getBoundingClientRect();
+    if (!bounds.width) return 0;
+    const ratio = clampNumber((clientX - bounds.left) / bounds.width, 0, 1, 0);
+    return Number((ratio * duration).toFixed(2));
+  }, [duration]);
+
+  const handleTimelinePointerDown = useCallback((event) => {
+    if (event.button !== 0) return;
+    const startTime = timelineTimeFromClientX(event.clientX);
+    timelineDragRef.current = { moved: false, startClientX: event.clientX, startTime };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, [timelineTimeFromClientX]);
+
+  const handleTimelinePointerMove = useCallback((event) => {
+    const drag = timelineDragRef.current;
+    if (!drag) return;
+    if (!drag.moved && Math.abs(event.clientX - drag.startClientX) < 5) return;
+    drag.moved = true;
+    const currentTime = timelineTimeFromClientX(event.clientX);
+    setTimelineSelection({
+      end: Math.max(drag.startTime, currentTime),
+      start: Math.min(drag.startTime, currentTime),
+    });
+  }, [timelineTimeFromClientX]);
+
+  const handleTimelinePointerUp = useCallback((event) => {
+    const drag = timelineDragRef.current;
+    timelineDragRef.current = null;
+    if (!drag) return;
+    if (!drag.moved) {
+      sendPlayerCommand("seek", timelineTimeFromClientX(event.clientX));
+    }
+  }, [sendPlayerCommand, timelineTimeFromClientX]);
+
+  const selectClipRange = useCallback((clip) => {
+    const start = Math.max(0, numberValue(clip.start, 0));
+    setSelectedClipId(clip.id);
+    setTimelineSelection({
+      end: Number((start + Math.max(0.25, numberValue(clip.duration, DEFAULT_CLIP_DURATION))).toFixed(2)),
+      start: Number(start.toFixed(2)),
+    });
+  }, []);
+
   const updateManifest = useCallback((updater) => {
     setManifest((current) => {
       const next = typeof updater === "function" ? updater(current) : updater;
       return normalizeHyperframeManifest(next, asset);
     });
   }, [asset]);
+
+  const attachTranscriptToManifest = useCallback((localPath, result) => {
+    const safePath = text(localPath);
+    if (!safePath || !result?.srtPath) return;
+    updateManifest((current) => ({
+      ...current,
+      assets: jsonArray(current.assets).map((ref) => (
+        text(ref.localPath) === safePath
+          ? {
+            ...ref,
+            ...(result.durationSeconds ? { durationSeconds: result.durationSeconds } : {}),
+            transcript: {
+              generatedAt: new Date().toISOString(),
+              jsonPath: text(result.jsonPath),
+              language: text(result.language, "en"),
+              srtPath: text(result.srtPath),
+              tool: text(result.tool, "deepgram"),
+            },
+          }
+          : ref
+      )),
+    }));
+    setStatus("Transcript attached");
+  }, [updateManifest]);
+
+  const transcriptScanRef = useRef(new Set());
+  useEffect(() => {
+    if (loading) return;
+    jsonArray(manifest.assets)
+      .filter((ref) => ["audio", "video"].includes(String(ref.kind || "").toLowerCase()))
+      .filter((ref) => text(ref.localPath) && !jsonObject(ref.transcript))
+      .forEach((ref) => {
+        const path = text(ref.localPath);
+        if (transcriptScanRef.current.has(path)) return;
+        transcriptScanRef.current.add(path);
+        void getMediaTranscriptStatus(path).then((statusResult) => {
+          if (statusResult?.exists) {
+            attachTranscriptToManifest(path, {
+              jsonPath: statusResult.jsonPath,
+              srtPath: statusResult.srtPath,
+              tool: "existing",
+            });
+          }
+        });
+      });
+  }, [attachTranscriptToManifest, loading, manifest.assets]);
 
   const setTitle = useCallback((value) => {
     updateManifest((current) => ({ ...current, title: value }));
@@ -940,6 +1405,23 @@ export default function HyperframeEditor({
       setLoading(false);
     });
   }, [asset, draftKey]);
+
+  const reloadAgentChanges = useCallback(() => {
+    // Pull the agent's on-disk edit into the editor automatically, resuming
+    // playback where the user left off so the update feels seamless.
+    pendingSeekTimeRef.current = playerTimeRef.current;
+    clearDraft(draftKey);
+    const reload = async () => {
+      const loaded = await loadHyperframeAsset(asset);
+      setManifest(normalizeHyperframeManifest(loaded.manifest, asset));
+      setStatus("Agent changes loaded");
+    };
+    void reload().catch((nextError) => {
+      setError(nextError?.message || String(nextError || "Unable to load agent changes."));
+      setStatus("Reload failed");
+    });
+  }, [asset, draftKey]);
+  reloadFromDiskRef.current = reloadAgentChanges;
 
   const refreshLibraries = useCallback(async () => {
     await Promise.all([
@@ -1069,7 +1551,89 @@ export default function HyperframeEditor({
     }
   }, [exportManifestJson, exportPosterPng, exportProjectHtml, exportWebm]);
 
-  const panelTitle = activePanel === "timeline" ? "Timeline" : activePanel === "export" ? "Export" : "Assets";
+  const selectionClips = useMemo(() => {
+    if (!timelineSelection) return [];
+    return sortedTimeline.filter((clip) => {
+      const start = numberValue(clip.start, 0);
+      const end = start + numberValue(clip.duration, DEFAULT_CLIP_DURATION);
+      return end > timelineSelection.start && start < timelineSelection.end;
+    });
+  }, [sortedTimeline, timelineSelection]);
+
+  const aiWorkspace = useMemo(() => (
+    workspaces.find((workspace) => workspace.id === aiWorkspaceId) || null
+  ), [aiWorkspaceId, workspaces]);
+
+  const sendAiEdit = useCallback(() => {
+    const instruction = text(aiInstruction);
+    setAiSendError("");
+    if (!instruction) {
+      setAiSendError("Describe the edit you want first.");
+      return;
+    }
+    if (!aiWorkspace?.id) {
+      setAiSendError("Choose a workspace to send the edit to.");
+      return;
+    }
+    const commandId = `hyperframe-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+    const sourcePath = assetLocalPath(asset);
+    const todoText = buildHyperframeTodoText({
+      instruction,
+      manifest,
+      range: timelineSelection,
+      rangeClips: selectionClips,
+      sourcePath,
+    });
+    window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
+      detail: {
+        commandId,
+        item: {
+          createdAt: new Date().toISOString(),
+          id: commandId,
+          kind: "todo",
+          remoteCommand: {
+            commandId,
+            source: "hyperframe-editor",
+          },
+          source: "next-remote-control",
+          targetAgentId: aiAgentId || "",
+          text: todoText,
+          workspaceId: aiWorkspace.id,
+        },
+        source: "hyperframe-editor",
+        workspaceId: aiWorkspace.id,
+        workspaceName: aiWorkspace.name || "",
+      },
+    }));
+    setAiJobs((current) => [
+      {
+        agentId: aiAgentId || "",
+        commandId,
+        completedAtMs: 0,
+        createdAtMs: Date.now(),
+        instruction,
+        phase: "queued",
+        range: timelineSelection ? { ...timelineSelection } : null,
+        workspaceId: aiWorkspace.id,
+        workspaceName: aiWorkspace.name || aiWorkspace.id,
+      },
+      ...current,
+    ].slice(0, 24));
+    setAiInstruction("");
+    setStatus("Edit sent");
+  }, [aiAgentId, aiInstruction, aiWorkspace, asset, manifest, selectionClips, timelineSelection]);
+
+  const dismissAiJob = useCallback((commandId) => {
+    setAiJobs((current) => current.filter((job) => job.commandId !== commandId));
+  }, []);
+
+  const panelTitle = activePanel === "timeline"
+    ? "Timeline"
+    : activePanel === "export"
+      ? "Export"
+      : activePanel === "agent"
+        ? "AI Edit"
+        : "Assets";
 
   return (
     <HyperframeSurface aria-label="Hyperframe editor">
@@ -1102,15 +1666,44 @@ export default function HyperframeEditor({
       <HyperframeWorkspace>
         <HyperframePreviewPane>
           <HyperframePreviewFrame
+            onLoad={() => {
+              const pendingSeekTime = pendingSeekTimeRef.current;
+              if (pendingSeekTime == null) return;
+              pendingSeekTimeRef.current = null;
+              window.setTimeout(() => sendPlayerCommand("seek", pendingSeekTime), 60);
+            }}
+            ref={previewFrameRef}
             sandbox="allow-scripts"
             srcDoc={iframeHtml}
             title={`${manifest.title} preview`}
           />
+          <HyperframePlayerBar>
+            <HyperframeIconButton
+              aria-label={playerState.playing ? "Pause preview" : "Play preview"}
+              onClick={() => sendPlayerCommand(playerState.playing ? "pause" : "play")}
+              title={playerState.playing ? "Pause" : "Play"}
+              type="button"
+            >
+              {playerState.playing ? <Pause aria-hidden="true" /> : <PlayArrow aria-hidden="true" />}
+            </HyperframeIconButton>
+            <HyperframePlayerScrubber
+              aria-label="Preview position"
+              max={Math.max(playerState.duration, duration, 0.25)}
+              min="0"
+              onChange={(event) => sendPlayerCommand("seek", Number(event.target.value))}
+              step="0.05"
+              type="range"
+              value={Math.min(playerState.time, Math.max(playerState.duration, duration, 0.25))}
+            />
+            <HyperframePlayerTime>
+              {formatTimecode(playerState.time)} / {formatTimecode(Math.max(playerState.duration, duration))}
+            </HyperframePlayerTime>
+          </HyperframePlayerBar>
         </HyperframePreviewPane>
         <HyperframeInspector>
           <HyperframePanelHeader>
             <strong>{panelTitle}</strong>
-            <span>{activePanel === "assets" ? `${manifest.assets.length} included` : activePanel === "timeline" ? `${sortedTimeline.length} clip${sortedTimeline.length === 1 ? "" : "s"}` : `${exportedItems.length} output${exportedItems.length === 1 ? "" : "s"}`}</span>
+            <span>{activePanel === "assets" ? `${manifest.assets.length} included` : activePanel === "timeline" ? `${sortedTimeline.length} clip${sortedTimeline.length === 1 ? "" : "s"}` : activePanel === "agent" ? `${aiJobs.length} job${aiJobs.length === 1 ? "" : "s"}` : `${exportedItems.length} output${exportedItems.length === 1 ? "" : "s"}`}</span>
           </HyperframePanelHeader>
           {activePanel === "assets" && (
             <HyperframeAssetPicker>
@@ -1118,30 +1711,42 @@ export default function HyperframeEditor({
                 const key = assetKey(candidate);
                 const included = includedIds.has(key);
                 const preview = assetPreviewUrl(candidate);
+                const candidateLocalPath = assetLocalPath(candidate);
+                const isMedia = assetIsVideo(candidate) || assetIsAudio(candidate);
                 return (
-                  <HyperframeAssetOption
-                    aria-pressed={included}
-                    data-included={included ? "true" : "false"}
-                    key={key}
-                    onClick={() => toggleIncludedAsset(candidate)}
-                    title={assetLocalPath(candidate) || assetName(candidate)}
-                    type="button"
-                  >
-                    <HyperframeAssetCheck>
-                      {included ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
-                    </HyperframeAssetCheck>
-                    <HyperframeAssetThumb>
-                      {preview ? (
-                        <img alt="" draggable={false} src={preview} />
-                      ) : (
-                        assetIcon(candidate)
-                      )}
-                    </HyperframeAssetThumb>
-                    <HyperframeAssetText>
-                      <strong>{assetName(candidate)}</strong>
-                      <span>{assetTypeLabel(candidate)}</span>
-                    </HyperframeAssetText>
-                  </HyperframeAssetOption>
+                  <HyperframeAssetEntry key={key}>
+                    <HyperframeAssetOption
+                      aria-pressed={included}
+                      data-included={included ? "true" : "false"}
+                      onClick={() => toggleIncludedAsset(candidate)}
+                      title={candidateLocalPath || assetName(candidate)}
+                      type="button"
+                    >
+                      <HyperframeAssetCheck>
+                        {included ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
+                      </HyperframeAssetCheck>
+                      <HyperframeAssetThumb>
+                        {preview ? (
+                          <img alt="" draggable={false} src={preview} />
+                        ) : (
+                          assetIcon(candidate)
+                        )}
+                      </HyperframeAssetThumb>
+                      <HyperframeAssetText>
+                        <strong>{assetName(candidate)}</strong>
+                        <span>{assetTypeLabel(candidate)}</span>
+                      </HyperframeAssetText>
+                    </HyperframeAssetOption>
+                    {isMedia && candidateLocalPath ? (
+                      <HyperframeAssetChipRow>
+                        <MediaTranscriptChip
+                          localPath={candidateLocalPath}
+                          mediaName={assetName(candidate)}
+                          onTranscribed={(result) => attachTranscriptToManifest(candidateLocalPath, result)}
+                        />
+                      </HyperframeAssetChipRow>
+                    ) : null}
+                  </HyperframeAssetEntry>
                 );
               })}
               {!availableAssets.length && (
@@ -1188,6 +1793,18 @@ export default function HyperframeEditor({
                           <span>Duration</span>
                           <input min="0.25" onChange={(event) => updateClip(clip.id, { duration: event.target.value })} step="0.25" type="number" value={clip.duration} />
                         </label>
+                        {["audio", "video"].includes(String(ref?.kind || "").toLowerCase()) ? (
+                          <>
+                            <label title="Seconds into the source media where this clip starts playing">
+                              <span>Source in</span>
+                              <input min="0" onChange={(event) => updateClip(clip.id, { sourceIn: event.target.value })} step="0.1" type="number" value={clip.sourceIn || 0} />
+                            </label>
+                            <label title="Seconds into the source media where this clip stops (0 = play to end)">
+                              <span>Source out</span>
+                              <input min="0" onChange={(event) => updateClip(clip.id, { sourceOut: event.target.value })} step="0.1" type="number" value={clip.sourceOut || 0} />
+                            </label>
+                          </>
+                        ) : null}
                       </HyperframeClipFields>
                     </HyperframeTimelineClip>
                   );
@@ -1204,6 +1821,117 @@ export default function HyperframeEditor({
                 </HyperframeAddClipList>
               )}
             </HyperframeTimelinePanel>
+          )}
+          {activePanel === "agent" && (
+            <HyperframeAgentPanel>
+              <HyperframeAgentSelectionCard data-active={timelineSelection ? "true" : "false"}>
+                <strong>
+                  {timelineSelection
+                    ? `${formatTimecode(timelineSelection.start)} – ${formatTimecode(timelineSelection.end)}`
+                    : "Entire timeline"}
+                </strong>
+                <span>
+                  {timelineSelection
+                    ? `${selectionClips.length} clip${selectionClips.length === 1 ? "" : "s"} in range — drag on the timeline below to adjust`
+                    : "Drag across the timeline below to target a specific area"}
+                </span>
+                {timelineSelection ? (
+                  <HyperframeMiniButton onClick={() => setTimelineSelection(null)} type="button">
+                    <Close aria-hidden="true" />
+                    <span>Clear selection</span>
+                  </HyperframeMiniButton>
+                ) : null}
+              </HyperframeAgentSelectionCard>
+              <HyperframeAgentField>
+                <span>Workspace</span>
+                <select
+                  aria-label="Target workspace"
+                  onChange={(event) => setAiWorkspaceId(event.target.value)}
+                  value={aiWorkspaceId}
+                >
+                  {!workspaces.length ? <option value="">No workspaces available</option> : null}
+                  {workspaces.map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+                  ))}
+                </select>
+              </HyperframeAgentField>
+              <HyperframeAgentField>
+                <span>Coding agent</span>
+                <select
+                  aria-label="Target coding agent"
+                  onChange={(event) => setAiAgentId(event.target.value)}
+                  value={aiAgentId}
+                >
+                  {AI_AGENT_OPTIONS.map((option) => (
+                    <option key={option.id || "any"} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </HyperframeAgentField>
+              <HyperframeAgentField>
+                <span>What should change?</span>
+                <textarea
+                  aria-label="Edit instructions"
+                  onChange={(event) => setAiInstruction(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      event.preventDefault();
+                      sendAiEdit();
+                    }
+                  }}
+                  placeholder={timelineSelection
+                    ? "e.g. Make this section punchier: shorten the clips and add the logo poster at the end"
+                    : "e.g. Reorder the intro clips and tighten total duration to 12 seconds"}
+                  rows={4}
+                  value={aiInstruction}
+                />
+              </HyperframeAgentField>
+              <HyperframeAgentSendRow>
+                <span>{aiSendError || "Queued for the workspace's terminals — keep that workspace open."}</span>
+                <HyperframeAgentSendButton
+                  disabled={!workspaces.length || !text(aiInstruction)}
+                  onClick={sendAiEdit}
+                  title="Send edit to agent (Cmd/Ctrl+Enter)"
+                  type="button"
+                >
+                  <Send aria-hidden="true" />
+                  <span>Send to agent</span>
+                </HyperframeAgentSendButton>
+              </HyperframeAgentSendRow>
+              <HyperframeAgentJobList>
+                {aiJobs.map((job) => (
+                  <HyperframeAgentJob data-phase={job.phase} key={job.commandId}>
+                    <HyperframeAgentJobDot aria-hidden="true" data-phase={job.phase} />
+                    <HyperframeAgentJobBody>
+                      <strong title={job.instruction}>{shortLabel(job.instruction, 64)}</strong>
+                      <span>
+                        {job.range
+                          ? `${formatTimecode(job.range.start)} – ${formatTimecode(job.range.end)}`
+                          : "Entire timeline"}
+                        {" · "}
+                        {job.workspaceName}
+                        {job.agentId ? ` · ${AI_AGENT_OPTIONS.find((option) => option.id === job.agentId)?.label || job.agentId}` : ""}
+                      </span>
+                    </HyperframeAgentJobBody>
+                    <HyperframeAgentJobStatus data-phase={job.phase}>
+                      {aiJobPhaseLabel(job.phase)}
+                    </HyperframeAgentJobStatus>
+                    {["failed", "undelivered"].includes(job.phase) ? (
+                      <HyperframeIconButton
+                        aria-label="Dismiss job"
+                        onClick={() => dismissAiJob(job.commandId)}
+                        title="Dismiss"
+                        type="button"
+                      >
+                        <Close aria-hidden="true" />
+                      </HyperframeIconButton>
+                    ) : null}
+                  </HyperframeAgentJob>
+                ))}
+                {!aiJobs.length ? (
+                  <HyperframeEmpty>No AI edits sent yet.</HyperframeEmpty>
+                ) : null}
+              </HyperframeAgentJobList>
+            </HyperframeAgentPanel>
           )}
           {activePanel === "export" && (
             <HyperframeExportPanel>
@@ -1253,6 +1981,67 @@ export default function HyperframeEditor({
           )}
         </HyperframeInspector>
       </HyperframeWorkspace>
+      <HyperframeTimelineStripSection aria-label="Timeline">
+        <HyperframeTimelineStripHeader>
+          <span>
+            {timelineSelection
+              ? `Selected ${formatTimecode(timelineSelection.start)} – ${formatTimecode(timelineSelection.end)}`
+              : "Drag to select a timeline area · click to seek"}
+          </span>
+          <span>{formatTimecode(playerState.time)} / {formatTimecode(Math.max(playerState.duration, duration))}</span>
+        </HyperframeTimelineStripHeader>
+        <HyperframeTimelineStrip
+          onPointerDown={handleTimelinePointerDown}
+          onPointerMove={handleTimelinePointerMove}
+          onPointerUp={handleTimelinePointerUp}
+          ref={timelineStripRef}
+        >
+          {sortedTimeline.map((clip, index) => {
+            const start = numberValue(clip.start, 0);
+            const clipDuration = Math.max(0.25, numberValue(clip.duration, DEFAULT_CLIP_DURATION));
+            const ref = manifest.assets.find((item) => item.id === clip.assetId);
+            return (
+              <HyperframeTimelineBlock
+                data-selected={selectedClipId === clip.id ? "true" : "false"}
+                key={clip.id}
+                onDoubleClick={(event) => {
+                  event.stopPropagation();
+                  selectClipRange(clip);
+                }}
+                style={{
+                  left: `${(start / duration) * 100}%`,
+                  width: `${Math.max(1.2, (clipDuration / duration) * 100)}%`,
+                }}
+                title={`${ref?.name || clip.title || `Clip ${index + 1}`} — double-click to select range`}
+              >
+                <span>{shortLabel(ref?.name || clip.title || `Clip ${index + 1}`, 18)}</span>
+              </HyperframeTimelineBlock>
+            );
+          })}
+          {aiJobs.filter((job) => job.range).map((job) => (
+            <HyperframeTimelineJobBand
+              data-phase={job.phase}
+              key={`band-${job.commandId}`}
+              style={{
+                left: `${(job.range.start / duration) * 100}%`,
+                width: `${Math.max(0.8, ((job.range.end - job.range.start) / duration) * 100)}%`,
+              }}
+              title={`${aiJobPhaseLabel(job.phase)}: ${shortLabel(job.instruction, 60)}`}
+            />
+          ))}
+          {timelineSelection ? (
+            <HyperframeTimelineSelection
+              style={{
+                left: `${(timelineSelection.start / duration) * 100}%`,
+                width: `${Math.max(0.4, ((timelineSelection.end - timelineSelection.start) / duration) * 100)}%`,
+              }}
+            />
+          ) : null}
+          <HyperframeTimelinePlayhead
+            style={{ left: `${Math.min(100, (playerState.time / Math.max(playerState.duration, duration, 0.25)) * 100)}%` }}
+          />
+        </HyperframeTimelineStrip>
+      </HyperframeTimelineStripSection>
       <HyperframeDock aria-label="Hyperframe editor sections">
         <HyperframeDockButton aria-pressed={activePanel === "assets"} data-active={activePanel === "assets"} onClick={() => setActivePanel("assets")} type="button">
           <PhotoLibrary aria-hidden="true" />
@@ -1261,6 +2050,13 @@ export default function HyperframeEditor({
         <HyperframeDockButton aria-pressed={activePanel === "timeline"} data-active={activePanel === "timeline"} onClick={() => setActivePanel("timeline")} type="button">
           <Timeline aria-hidden="true" />
           <span>Timeline</span>
+        </HyperframeDockButton>
+        <HyperframeDockButton aria-pressed={activePanel === "agent"} data-active={activePanel === "agent"} onClick={() => setActivePanel("agent")} type="button">
+          <SmartToy aria-hidden="true" />
+          <span>AI Edit</span>
+          {aiJobs.some((job) => ["queued", "editing", "paused"].includes(job.phase)) ? (
+            <HyperframeDockBadge aria-hidden="true" />
+          ) : null}
         </HyperframeDockButton>
         <HyperframeDockButton aria-pressed={activePanel === "export"} data-active={activePanel === "export"} onClick={() => setActivePanel("export")} type="button">
           <FileDownload aria-hidden="true" />
@@ -1417,6 +2213,7 @@ const HyperframeWorkspace = styled.div`
 
 const HyperframePreviewPane = styled.div`
   display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -1490,6 +2287,19 @@ const HyperframeAssetOption = styled.button`
     border-color: rgba(94, 234, 212, 0.44);
     background: rgba(20, 184, 166, 0.1);
   }
+`;
+
+const HyperframeAssetEntry = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+`;
+
+const HyperframeAssetChipRow = styled.div`
+  display: flex;
+  min-width: 0;
+  justify-content: flex-start;
+  padding-left: 34px;
 `;
 
 const HyperframeAssetCheck = styled.span`
@@ -1818,7 +2628,7 @@ const HyperframeExportList = styled.ul`
 
 const HyperframeDock = styled.nav`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   padding: 10px 16px 14px;
   border-top: 1px solid rgba(148, 163, 184, 0.18);
@@ -1826,6 +2636,7 @@ const HyperframeDock = styled.nav`
 `;
 
 const HyperframeDockButton = styled.button`
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1848,5 +2659,402 @@ const HyperframeDockButton = styled.button`
     color: var(--forge-text);
     border-color: rgba(94, 234, 212, 0.46);
     background: rgba(20, 184, 166, 0.14);
+  }
+`;
+
+const hyperframePulse = keyframes`
+  0%, 100% {
+    opacity: 0.5;
+  }
+
+  50% {
+    opacity: 1;
+  }
+`;
+
+const hyperframeFadeOut = keyframes`
+  0%, 55% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
+  }
+`;
+
+const HyperframeDockBadge = styled.i`
+  position: absolute;
+  top: 7px;
+  right: 9px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #f2c24e;
+  animation: ${hyperframePulse} 1400ms ease-in-out infinite;
+`;
+
+const HyperframePlayerBar = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(2, 6, 23, 0.55);
+`;
+
+const HyperframePlayerScrubber = styled.input`
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  margin: 0;
+  accent-color: #5eead4;
+  cursor: pointer;
+  background: transparent;
+`;
+
+const HyperframePlayerTime = styled.span`
+  min-width: 86px;
+  color: var(--forge-muted);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+`;
+
+const HyperframeTimelineStripSection = styled.section`
+  display: grid;
+  gap: 5px;
+  padding: 8px 16px 4px;
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+`;
+
+const HyperframeTimelineStripHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--forge-muted);
+  font-size: 0.7rem;
+
+  span:last-child {
+    font-variant-numeric: tabular-nums;
+  }
+`;
+
+const HyperframeTimelineStrip = styled.div`
+  position: relative;
+  height: 52px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 8px;
+  background:
+    repeating-linear-gradient(90deg, rgba(148, 163, 184, 0.08) 0 1px, transparent 1px 10%),
+    rgba(2, 6, 23, 0.42);
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+`;
+
+const HyperframeTimelineBlock = styled.div`
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  display: grid;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 7px;
+  border: 1px solid rgba(94, 234, 212, 0.32);
+  border-radius: 6px;
+  background: rgba(13, 148, 136, 0.2);
+  pointer-events: auto;
+
+  span {
+    overflow: hidden;
+    color: rgba(240, 253, 250, 0.88);
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(96, 165, 250, 0.6);
+    background: rgba(37, 99, 235, 0.24);
+  }
+`;
+
+const HyperframeTimelineJobBand = styled.div`
+  position: absolute;
+  top: 2px;
+  height: 5px;
+  border-radius: 999px;
+  background: #94a3b8;
+  pointer-events: none;
+
+  &[data-phase="queued"],
+  &[data-phase="undelivered"] {
+    background: #94a3b8;
+  }
+
+  &[data-phase="editing"] {
+    background: #f2c24e;
+    animation: ${hyperframePulse} 1100ms ease-in-out infinite;
+  }
+
+  &[data-phase="paused"] {
+    background: #fb923c;
+  }
+
+  &[data-phase="failed"] {
+    background: #ef6b6b;
+  }
+
+  &[data-phase="completed"] {
+    background: #3ccb7f;
+    animation: ${hyperframeFadeOut} 2400ms ease forwards;
+  }
+`;
+
+const HyperframeTimelineSelection = styled.div`
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border: 1px solid rgba(96, 165, 250, 0.66);
+  border-top: 0;
+  border-bottom: 0;
+  background: rgba(59, 130, 246, 0.16);
+  pointer-events: none;
+`;
+
+const HyperframeTimelinePlayhead = styled.div`
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1.5px;
+  background: #f8fafc;
+  box-shadow: 0 0 8px rgba(248, 250, 252, 0.55);
+  pointer-events: none;
+`;
+
+const HyperframeAgentPanel = styled.div`
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 10px;
+  overflow: auto;
+  padding: 10px;
+`;
+
+const HyperframeAgentSelectionCard = styled.div`
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+  padding: 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.3);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.26);
+
+  strong {
+    font-size: 0.86rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  span {
+    color: var(--forge-muted);
+    font-size: 0.72rem;
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(96, 165, 250, 0.5);
+    border-style: solid;
+    background: rgba(37, 99, 235, 0.1);
+  }
+`;
+
+const HyperframeAgentField = styled.label`
+  display: grid;
+  gap: 5px;
+  color: var(--forge-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+
+  select,
+  textarea {
+    min-width: 0;
+    width: 100%;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 7px;
+    padding: 8px 9px;
+    color: var(--forge-text);
+    background: rgba(2, 6, 23, 0.4);
+    font: inherit;
+    font-weight: 500;
+  }
+
+  textarea {
+    resize: vertical;
+    min-height: 74px;
+    line-height: 1.45;
+  }
+
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid rgba(94, 234, 212, 0.4);
+    outline-offset: 1px;
+  }
+`;
+
+const HyperframeAgentSendRow = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+
+  > span {
+    min-width: 0;
+    color: var(--forge-muted);
+    font-size: 0.7rem;
+  }
+`;
+
+const HyperframeAgentSendButton = styled.button`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid rgba(94, 234, 212, 0.46);
+  border-radius: 8px;
+  padding: 7px 13px;
+  color: #042f2e;
+  background: #5eead4;
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 800;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover:not(:disabled) {
+    background: #99f6e4;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+`;
+
+const HyperframeAgentJobList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 7px;
+`;
+
+const HyperframeAgentJob = styled.div`
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.28);
+
+  &[data-phase="completed"] {
+    animation: ${hyperframeFadeOut} 2400ms ease forwards;
+  }
+
+  ${HyperframeIconButton} {
+    width: 24px;
+    height: 24px;
+
+    svg {
+      width: 14px;
+      height: 14px;
+    }
+  }
+`;
+
+const HyperframeAgentJobDot = styled.i`
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #94a3b8;
+
+  &[data-phase="editing"] {
+    background: #f2c24e;
+    animation: ${hyperframePulse} 1100ms ease-in-out infinite;
+  }
+
+  &[data-phase="paused"] {
+    background: #fb923c;
+  }
+
+  &[data-phase="failed"],
+  &[data-phase="undelivered"] {
+    background: #ef6b6b;
+  }
+
+  &[data-phase="completed"] {
+    background: #3ccb7f;
+  }
+`;
+
+const HyperframeAgentJobBody = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+
+  strong {
+    overflow: hidden;
+    font-size: 0.76rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-muted);
+    font-size: 0.68rem;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const HyperframeAgentJobStatus = styled.span`
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.14);
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-phase="editing"] {
+    color: #fde68a;
+    background: rgba(242, 194, 78, 0.16);
+  }
+
+  &[data-phase="paused"] {
+    color: #fed7aa;
+    background: rgba(251, 146, 60, 0.16);
+  }
+
+  &[data-phase="failed"],
+  &[data-phase="undelivered"] {
+    color: #fecaca;
+    background: rgba(239, 107, 107, 0.16);
+  }
+
+  &[data-phase="completed"] {
+    color: #bbf7d0;
+    background: rgba(60, 203, 127, 0.16);
   }
 `;

@@ -32,7 +32,7 @@ import { OpenInBrowser } from "@styled-icons/material-rounded/OpenInBrowser";
 import { Pending } from "@styled-icons/material-rounded/Pending";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { Settings } from "@styled-icons/material-rounded/Settings";
-import { ScreenshotMonitor } from "@styled-icons/material-rounded/ScreenshotMonitor";
+import { ContentCut } from "@styled-icons/material-rounded/ContentCut";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Terminal";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
@@ -12151,7 +12151,7 @@ export const ButtonProcessIcon = styled(Memory)`
   ${buttonIconSize}
 `;
 
-export const ButtonSnippingIcon = styled(ScreenshotMonitor)`
+export const ButtonSnippingIcon = styled(ContentCut)`
   ${buttonIconSize}
 `;
 
@@ -12189,4 +12189,300 @@ export const FileFolderTreeIcon = styled(FolderOpen)`
 export const FileDocumentIcon = styled(Description)`
   width: 16px;
   height: 16px;
+`;
+
+// --- Inline create-workspace panel (replaces the old modal) ---
+
+export const WorkspaceCreateLayer = styled(WorkspaceRuntimeLayer)`
+  &[data-visible="true"] {
+    z-index: 3;
+  }
+`;
+
+export const WorkspaceCreateSurface = styled.div`
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: start center;
+  padding: 28px 24px;
+  overflow: auto;
+  background: var(--forge-bg);
+`;
+
+export const WorkspaceCreateCard = styled.form`
+  display: grid;
+  width: min(720px, 100%);
+  gap: 18px;
+  padding: 22px;
+  border: 1px solid var(--forge-border);
+  border-radius: 14px;
+  background: var(--forge-surface);
+`;
+
+export const WorkspaceCreateHeader = styled.div`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+`;
+
+export const WorkspaceCreateSection = styled.section`
+  display: grid;
+  gap: 9px;
+`;
+
+export const WorkspaceCreatePathBar = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 9px;
+  background: var(--forge-surface-control);
+`;
+
+export const WorkspaceCreatePathText = styled.code`
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text);
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+`;
+
+export const WorkspaceCreatePathBadge = styled.span`
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: ${({ $tone }) => ($tone === "good" ? "#7bdc9d" : $tone === "warn" ? "#f5c466" : "var(--forge-text-muted, rgba(244,247,250,0.6))")};
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+export const WorkspaceCreateCdForm = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 11px;
+  border: 1px solid var(--forge-border);
+  border-radius: 9px;
+  background: var(--forge-bg-deep);
+
+  &:focus-within {
+    border-color: rgba(138, 216, 255, 0.34);
+  }
+`;
+
+export const WorkspaceCreateCdPrompt = styled.span`
+  flex: 0 0 auto;
+  color: #7bdc9d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  user-select: none;
+`;
+
+export const WorkspaceCreateCdInput = styled.input`
+  flex: 1;
+  min-width: 0;
+  border: none;
+  color: var(--forge-text);
+  background: transparent;
+  outline: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+
+  &::placeholder {
+    color: rgba(244, 247, 250, 0.32);
+  }
+`;
+
+export const WorkspaceCreateDirGrid = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  max-height: 168px;
+  overflow: auto;
+  padding: 2px;
+`;
+
+export const WorkspaceCreateDirChip = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 6px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: var(--forge-surface-raised);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+  transition: border-color 120ms ease, background 120ms ease;
+
+  > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 auto;
+    opacity: 0.7;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(138, 216, 255, 0.3);
+    background: var(--forge-surface-hover);
+  }
+
+  &[data-up="true"] {
+    color: rgba(244, 247, 250, 0.72);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+`;
+
+export const WorkspaceCreateAgentGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 9px;
+`;
+
+export const WorkspaceCreateAgentCard = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
+  border-radius: 10px;
+  background: ${({ $active }) => ($active ? "var(--forge-surface-selected)" : "var(--forge-surface-raised)")};
+  transition: border-color 120ms ease, background 120ms ease;
+
+  &[data-unavailable="true"] {
+    opacity: 0.55;
+  }
+`;
+
+export const WorkspaceCreateAgentLabel = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+
+  > strong {
+    overflow: hidden;
+    color: var(--forge-text);
+    font-size: 12.5px;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > span {
+    color: rgba(244, 247, 250, 0.5);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+`;
+
+export const WorkspaceCreateAgentStepper = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  background: var(--forge-bg-deep);
+
+  > strong {
+    min-width: 20px;
+    color: var(--forge-text);
+    text-align: center;
+    font-size: 12.5px;
+    font-weight: 800;
+  }
+`;
+
+export const WorkspaceCreateAgentStepButton = styled.button`
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  color: var(--forge-text);
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+
+  &:hover:not(:disabled) {
+    background: var(--forge-surface-hover);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.35;
+  }
+`;
+
+export const WorkspaceCreatePreviewRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+`;
+
+export const WorkspaceCreatePreviewDot = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px 3px 5px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  color: var(--forge-text);
+  background: var(--forge-bg-deep);
+  font-size: 10.5px;
+  font-weight: 750;
+
+  &::before {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: ${({ $color }) => $color || "#8bb8ff"};
+    content: "";
+  }
+`;
+
+export const WorkspaceCreateFooter = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
 `;

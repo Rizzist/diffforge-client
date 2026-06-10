@@ -10,10 +10,13 @@ export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.c
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
 
-const REFRESH_INTERVAL_MS = 4500;
-const REFRESH_DEBOUNCE_MS = 180;
+const REFRESH_DEBOUNCE_MS = 40;
 const CARD_LIMIT = 30;
 const RECENT_FINISHED_MS = 5 * 60 * 1000;
+const TRANSFER_LINGER_MS = 8000;
+const EXIT_CELEBRATE_MS = 1400;
+const EXIT_COLLAPSE_MS = 380;
+const TERMINAL_TODO_WINDOW_MS = 20000;
 const WORKSPACE_TODOS_CACHE_KEY = "diffforge.activityOverlay.workspaceTodos";
 
 function runOverlayWindowAction(action) {
@@ -585,6 +588,62 @@ function normalizeTodoCards(status, workspaceId = "") {
   );
 }
 
+function todoTerminalStatus(item) {
+  const status = statusKey(
+    item?.dispatchStatus
+      || item?.dispatch_status
+      || item?.todoStatus
+      || item?.todo_status
+      || item?.cloudStatus
+      || item?.cloud_status
+      || item?.status
+      || item?.state,
+    "",
+  );
+  if (["done", "failed", "stopped"].includes(status)) {
+    return status;
+  }
+  return "";
+}
+
+/// Recently terminal todos (done/failed/cancelled/interrupted) so the
+/// overlay can play the matching exit animation when an active row leaves.
+function normalizeTerminalTodoStates(status) {
+  const workspaceTodos = workspaceTodosFromStatus(status);
+  const states = new Map();
+  const record = (item) => {
+    const object = jsonObject(item) || {};
+    const terminal = todoTerminalStatus(object);
+    if (!terminal) {
+      return;
+    }
+    const updatedAt = todoUpdatedAt(object);
+    if (!updatedAt || Date.now() - updatedAt > TERMINAL_TODO_WINDOW_MS) {
+      return;
+    }
+    const id = todoIdentity(object, "");
+    if (id) {
+      states.set(`todo-${id}`, terminal);
+      states.set(`todo-dispatch-${id}`, terminal);
+    }
+  };
+  workspaceTodoCollection(
+    workspaceTodos,
+    ["items", "todos"],
+    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
+    "",
+    "todo",
+  ).forEach(record);
+  workspaceTodoCollection(
+    workspaceTodos,
+    ["dispatches", "todoDispatches", "todo_dispatches"],
+    ["dispatchesByWorkspace", "dispatches_by_workspace", "todoDispatchesByWorkspace", "todo_dispatches_by_workspace"],
+    "",
+    "dispatch",
+  ).forEach(record);
+  return states;
+}
+
 function assetLibraryTransfers(value) {
   const data = dataValue(value);
   return jsonArray(data.transfers);
@@ -858,18 +917,6 @@ function activityCardPriority(card) {
   return 1;
 }
 
-function selectActivityCards(todoCards, transferCards) {
-  return [...todoCards, ...transferCards]
-    .filter(Boolean)
-    .sort((left, right) => {
-      const rankDelta = activityCardPriority(right) - activityCardPriority(left);
-      if (rankDelta !== 0) {
-        return rankDelta;
-      }
-      return numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0);
-    })
-    .slice(0, CARD_LIMIT);
-}
 
 function useActivityOverlayContext() {
   const [context, setContext] = useState(() => readActivityOverlayContext());
@@ -922,15 +969,9 @@ function useActivityOverlayData(context) {
     refreshInFlightRef.current = true;
     const refreshContext = contextRef.current || {};
     const refreshContextKey = activityOverlayContextKey(refreshContext);
-    const todoRequest = refreshContext.workspaceId
-      ? {
-        repoPath: refreshContext.repoPath || "",
-        workspaceId: refreshContext.workspaceId,
-      }
-      : null;
-    const cachedTodosPromise = (todoRequest
-      ? invoke("cloud_mcp_get_cached_workspace_todos", todoRequest)
-      : Promise.resolve({}))
+    // The overlay always shows every active workspace; the mirror call is
+    // intentionally unscoped.
+    const cachedTodosPromise = invoke("cloud_mcp_get_cached_workspace_todos", {})
       .then((value) => {
         if (contextKeyRef.current !== refreshContextKey) {
           return null;
@@ -1023,7 +1064,6 @@ function useActivityOverlayData(context) {
 
   useEffect(() => {
     let cancelled = false;
-    let intervalId = 0;
     const unlisteners = [];
     const addListener = async (eventName, options = {}) => {
       try {
@@ -1043,18 +1083,11 @@ function useActivityOverlayData(context) {
       }
     };
 
-    intervalId = window.setInterval(() => {
-      void refresh({ localOnly: true });
-    }, REFRESH_INTERVAL_MS);
-
     void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT);
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
 
     return () => {
       cancelled = true;
-      if (intervalId) {
-        window.clearInterval(intervalId);
-      }
       if (refreshTimerRef.current) {
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = 0;
@@ -1087,11 +1120,19 @@ function summaryLabel(stats) {
   return parts.join(" · ") || "all clear";
 }
 
-function RowGlyph({ kind, status, tone }) {
+function RowGlyph({ celebrate = false, kind, status, tone }) {
   const state = statusKey(status);
-  const spinning = kind !== "todo" && state === "active";
+  const spinning = (kind !== "todo" && state === "active")
+    || (kind === "todo" && state === "queued" && !celebrate);
   let shape;
-  if (state === "failed") {
+  if (state === "stopped") {
+    shape = (
+      <>
+        <circle cx="6" cy="6" r="3.5" />
+        <path d="M3.6 8.4l4.8-4.8" />
+      </>
+    );
+  } else if (state === "failed") {
     shape = (
       <>
         <path d="M6 2.9v3.6" />
@@ -1122,7 +1163,8 @@ function RowGlyph({ kind, status, tone }) {
       </>
     );
   } else if (state === "queued") {
-    shape = <circle cx="6" cy="6" r="3.5" />;
+    // Open arc: reads as an in-progress spinner while the row is queued.
+    shape = <path d="M9.5 6A3.5 3.5 0 1 1 6 2.5" />;
   } else {
     shape = (
       <>
@@ -1132,7 +1174,12 @@ function RowGlyph({ kind, status, tone }) {
     );
   }
   return (
-    <GlyphBadge aria-hidden="true" data-spin={spinning ? "true" : "false"} data-tone={tone}>
+    <GlyphBadge
+      aria-hidden="true"
+      data-celebrate={celebrate ? state : undefined}
+      data-spin={spinning ? "true" : "false"}
+      data-tone={tone}
+    >
       <svg
         fill="none"
         stroke="currentColor"
@@ -1151,25 +1198,119 @@ export default function ActivityOverlayWindow() {
   const context = useActivityOverlayContext();
   const data = useActivityOverlayData(context);
   const todoCards = useMemo(
-    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, context.workspaceId),
-    [context.workspaceId, data.cachedWorkspaceTodos],
+    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, ""),
+    [data.cachedWorkspaceTodos],
+  );
+  const terminalTodoStates = useMemo(
+    () => normalizeTerminalTodoStates({ workspaceTodos: data.cachedWorkspaceTodos }),
+    [data.cachedWorkspaceTodos],
   );
   const transferCards = useMemo(
     () => normalizeTransferCards(data.library),
     [data.library],
   );
+  // Done transfers linger briefly, then exit; stale ones drop immediately.
+  // Purely event-driven otherwise, so a UI-only tick re-renders exactly when
+  // the soonest linger expires (no backend polling).
+  const [lingerTick, setLingerTick] = useState(0);
+  const liveTransferCards = useMemo(() => {
+    void lingerTick;
+    return transferCards.filter((card) => {
+      if (statusKey(card.status) !== "done") {
+        return true;
+      }
+      const updatedAt = numberValue(card.updatedAt, 0);
+      return updatedAt > 0 && Date.now() - updatedAt <= TRANSFER_LINGER_MS;
+    });
+  }, [lingerTick, transferCards]);
+
+  useEffect(() => {
+    const expiries = liveTransferCards
+      .filter((card) => statusKey(card.status) === "done")
+      .map((card) => numberValue(card.updatedAt, 0) + TRANSFER_LINGER_MS - Date.now())
+      .filter((delay) => Number.isFinite(delay));
+    if (!expiries.length) {
+      return undefined;
+    }
+    const timer = window.setTimeout(
+      () => setLingerTick((current) => current + 1),
+      Math.max(60, Math.min(...expiries) + 30),
+    );
+    return () => window.clearTimeout(timer);
+  }, [liveTransferCards]);
   const stats = useMemo(
-    () => summaryStats(todoCards, transferCards),
-    [todoCards, transferCards],
+    () => summaryStats(todoCards, liveTransferCards),
+    [todoCards, liveTransferCards],
   );
-  const activityCards = useMemo(
-    () => selectActivityCards(todoCards, transferCards),
-    [todoCards, transferCards],
-  );
-  const visibleCards = activityCards;
-  const totalCount = todoCards.length + transferCards.length;
-  const hiddenCount = Math.max(0, totalCount - visibleCards.length);
-  const hasWork = totalCount > 0;
+
+  // Exit lifecycle: when an active row leaves, keep it around to celebrate
+  // (pop/shake/fade on its glyph), then collapse it out of the list.
+  const [exitRows, setExitRows] = useState([]);
+  const prevTodoMapRef = useRef(new Map());
+  const prevTransferMapRef = useRef(new Map());
+  const exitTimersRef = useRef(new Map());
+
+  useEffect(() => () => {
+    exitTimersRef.current.forEach((timers) => timers.forEach((timer) => window.clearTimeout(timer)));
+    exitTimersRef.current.clear();
+  }, []);
+
+  const beginExit = useCallback((card, exitState) => {
+    const key = `exit-${card.id}`;
+    setExitRows((current) => {
+      if (current.some((row) => row.key === key)) {
+        return current;
+      }
+      return [...current, { card, exitState, key, phase: "celebrate" }];
+    });
+    const collapseTimer = window.setTimeout(() => {
+      setExitRows((current) => current.map((row) => (
+        row.key === key ? { ...row, phase: "collapse" } : row
+      )));
+    }, EXIT_CELEBRATE_MS);
+    const removeTimer = window.setTimeout(() => {
+      setExitRows((current) => current.filter((row) => row.key !== key));
+      exitTimersRef.current.delete(key);
+    }, EXIT_CELEBRATE_MS + EXIT_COLLAPSE_MS + 60);
+    exitTimersRef.current.set(key, [collapseTimer, removeTimer]);
+  }, []);
+
+  useEffect(() => {
+    const nextMap = new Map(todoCards.map((card) => [card.id, card]));
+    prevTodoMapRef.current.forEach((card, id) => {
+      if (!nextMap.has(id)) {
+        beginExit(card, terminalTodoStates.get(id) || "done");
+      }
+    });
+    prevTodoMapRef.current = nextMap;
+    // Active again (requeued): cancel a pending exit for the same id.
+    setExitRows((current) => current.filter((row) => !nextMap.has(row.card.id)));
+  }, [beginExit, terminalTodoStates, todoCards]);
+
+  useEffect(() => {
+    const nextMap = new Map(liveTransferCards.map((card) => [card.id, card]));
+    prevTransferMapRef.current.forEach((card, id) => {
+      if (!nextMap.has(id)) {
+        const state = statusKey(card.status);
+        beginExit(card, state === "failed" ? "failed" : state === "stopped" ? "stopped" : "done");
+      }
+    });
+    prevTransferMapRef.current = nextMap;
+  }, [beginExit, liveTransferCards]);
+
+  const exitTransferRows = exitRows.filter((row) => row.card.lane === "transfers");
+  const exitTodoRows = exitRows.filter((row) => row.card.lane !== "transfers");
+  const sortedTodoCards = useMemo(() => [...todoCards].sort((left, right) => {
+    const leftQueued = statusKey(left.status) === "queued" ? 0 : 1;
+    const rightQueued = statusKey(right.status) === "queued" ? 0 : 1;
+    if (leftQueued !== rightQueued) {
+      return leftQueued - rightQueued;
+    }
+    return numberValue(right.updatedAt, 0) - numberValue(left.updatedAt, 0);
+  }), [todoCards]);
+  const hasTransfers = liveTransferCards.length > 0 || exitTransferRows.length > 0;
+  const hasTodos = sortedTodoCards.length > 0 || exitTodoRows.length > 0;
+  const hasWork = hasTransfers || hasTodos;
   const statusToneName = data.errors.length
     ? "warn"
     : stats.transfers > 0
@@ -1186,26 +1327,41 @@ export default function ActivityOverlayWindow() {
 
     runOverlayWindowAction((windowHandle) => windowHandle.startDragging());
   }, []);
-  const renderRow = useCallback((card) => {
+
+  const renderRow = useCallback((card, exit = null) => {
     const kind = hudCardKind(card);
-    const state = statusKey(card.status);
-    const tone = card.tone || statusTone(card.status);
+    const state = exit ? exit.exitState : statusKey(card.status);
+    const tone = exit
+      ? exit.exitState === "done" ? "good" : exit.exitState === "failed" ? "danger" : "muted"
+      : card.tone || statusTone(card.status);
     const isTransfer = card.lane === "transfers";
     const progress = clampPercent(card.progress ?? statusProgress(card.status));
     const detail = isTransfer ? "" : text(card.detail);
-    const statusLabel = isTransfer
-      ? state === "done" ? "done" : firstText(card.meta, `${progress}%`)
-      : text(card.eyebrow, "listed");
+    const statusLabel = exit
+      ? exit.exitState === "done" ? "done" : exit.exitState === "failed" ? "failed" : "stopped"
+      : isTransfer
+        ? state === "done" ? "done" : firstText(card.meta, `${progress}%`)
+        : text(card.eyebrow, "listed");
     return (
-      <OverlayRow data-tauri-drag-region key={card.id}>
-        <RowGlyph kind={kind} status={card.status} tone={tone} />
+      <OverlayRow
+        data-exit-phase={exit ? exit.phase : undefined}
+        data-exit-state={exit ? exit.exitState : undefined}
+        data-tauri-drag-region
+        key={exit ? exit.key : card.id}
+      >
+        <RowGlyph
+          celebrate={Boolean(exit)}
+          kind={kind}
+          status={exit ? exit.exitState : card.status}
+          tone={tone}
+        />
         <RowBody data-tauri-drag-region>
           <RowLine>
             <RowTitle>{card.title}</RowTitle>
             {detail ? <RowDetail>{detail}</RowDetail> : null}
             <RowStatus data-tone={tone}>{statusLabel}</RowStatus>
           </RowLine>
-          {isTransfer && state !== "done" && state !== "failed" ? (
+          {!exit && isTransfer && state !== "done" && state !== "failed" ? (
             <RowTrack aria-hidden="true">
               <RowTrackFill data-tone={tone} style={{ width: `${progress}%` }} />
             </RowTrack>
@@ -1231,7 +1387,17 @@ export default function ActivityOverlayWindow() {
           </OverlayHeader>
 
           <OverlayBody data-tauri-drag-region aria-live="polite">
-            {visibleCards.length ? visibleCards.map(renderRow) : (
+            {hasTransfers && (
+              <>
+                <SectionLabel data-tauri-drag-region>Assets</SectionLabel>
+                {liveTransferCards.map((card) => renderRow(card))}
+                {exitTransferRows.map((row) => renderRow(row.card, row))}
+              </>
+            )}
+            {hasTransfers && hasTodos && <SectionLabel data-tauri-drag-region>Todos</SectionLabel>}
+            {sortedTodoCards.map((card) => renderRow(card))}
+            {exitTodoRows.map((row) => renderRow(row.card, row))}
+            {!hasWork && (
               <OverlayEmpty data-tauri-drag-region>
                 <EmptyGlyph aria-hidden="true">
                   <svg
@@ -1255,7 +1421,7 @@ export default function ActivityOverlayWindow() {
           <OverlayFooter data-tauri-drag-region>
             <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updatedAt)}`}</span>
             <FooterSpacer />
-            {hiddenCount ? <span>+{hiddenCount} more</span> : null}
+            <span>{stats.queued ? `${stats.queued} queued` : "live"}</span>
           </OverlayFooter>
         </OverlayCard>
       </OverlayShell>
@@ -1270,6 +1436,30 @@ const softPulse = keyframes`
 
 const spin = keyframes`
   to { transform: rotate(360deg); }
+`;
+
+const popIn = keyframes`
+  0% { transform: scale(0.4); opacity: 0.2; }
+  55% { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+`;
+
+const shake = keyframes`
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-2px); }
+  40% { transform: translateX(2px); }
+  60% { transform: translateX(-1.5px); }
+  80% { transform: translateX(1.5px); }
+`;
+
+const fadeDim = keyframes`
+  0% { opacity: 1; }
+  100% { opacity: 0.45; }
+`;
+
+const collapseOut = keyframes`
+  0% { max-height: 32px; opacity: 1; transform: translateY(0); }
+  100% { max-height: 0; opacity: 0; transform: translateY(8px); }
 `;
 
 const OverlayShell = styled.div`
@@ -1434,6 +1624,16 @@ const OverlayRow = styled.div`
   flex: 0 0 auto;
   min-width: 0;
   height: 32px;
+  max-height: 32px;
+  overflow: hidden;
+
+  &[data-exit-phase="collapse"] {
+    animation: ${collapseOut} ${EXIT_COLLAPSE_MS}ms ease forwards;
+  }
+
+  &[data-exit-state="failed"][data-exit-phase="celebrate"] {
+    animation: ${shake} 420ms ease;
+  }
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
@@ -1480,6 +1680,18 @@ const GlyphBadge = styled.span`
 
   &[data-spin="true"] > svg {
     animation: ${spin} 1.6s linear infinite;
+  }
+
+  &[data-celebrate="done"] > svg {
+    animation: ${popIn} 480ms cubic-bezier(0.2, 1.4, 0.4, 1);
+  }
+
+  &[data-celebrate="failed"] > svg {
+    animation: ${popIn} 360ms ease;
+  }
+
+  &[data-celebrate="stopped"] > svg {
+    animation: ${fadeDim} 600ms ease forwards;
   }
 `;
 
@@ -1574,6 +1786,17 @@ const RowTrackFill = styled.div`
   &[data-tone="danger"] {
     background: rgba(240, 127, 127, 0.9);
   }
+`;
+
+const SectionLabel = styled.span`
+  flex: 0 0 auto;
+  margin: 2px 0 1px;
+  color: rgba(122, 132, 147, 0.55);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  text-transform: uppercase;
 `;
 
 const OverlayEmpty = styled.div`

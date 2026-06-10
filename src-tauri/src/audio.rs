@@ -5326,3 +5326,277 @@ async fn insert_transcribed_text(
         shortcut: audio_push_to_talk_shortcut_for(&app),
     })
 }
+
+const HYPERFRAME_TRANSCRIBE_MAX_WAV_BYTES: usize = 96 * 1024 * 1024;
+const HYPERFRAME_DEEPGRAM_TIMEOUT_SECS: u64 = 600;
+const HYPERFRAME_WHISPER_FILE_TIMEOUT_SECS: u64 = 1_800;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyperframeTranscribeRequest {
+    provider: String,
+    api_key: Option<String>,
+    language: Option<String>,
+    audio_base64: String,
+}
+
+fn hyperframe_transcript_language(language: Option<String>) -> String {
+    let cleaned = language.unwrap_or_default().trim().to_lowercase();
+    if cleaned.is_empty()
+        || !cleaned
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        || cleaned.len() > 12
+    {
+        "en".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn hyperframe_transcript_number(value: &Value) -> f64 {
+    value.as_f64().unwrap_or(0.0).max(0.0)
+}
+
+async fn hyperframe_transcribe_with_deepgram(
+    api_key: String,
+    language: String,
+    audio_bytes: Vec<u8>,
+) -> Result<Value, String> {
+    let url = format!(
+        "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true&utterances=true&language={language}"
+    );
+    let client = http_client(Duration::from_secs(HYPERFRAME_DEEPGRAM_TIMEOUT_SECS))?;
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Token {api_key}"))
+        .header("Content-Type", "audio/wav")
+        .body(audio_bytes)
+        .send()
+        .await
+        .map_err(|error| format!("Deepgram transcription request failed: {error}"))?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Deepgram returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        let message = body
+            .get("err_msg")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("error").and_then(Value::as_str))
+            .unwrap_or("Deepgram rejected the transcription request.");
+        return Err(format!("Deepgram error ({status}): {message}"));
+    }
+
+    let utterances = body
+        .pointer("/results/utterances")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let text = entry.get("transcript").and_then(Value::as_str)?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "end": hyperframe_transcript_number(entry.get("end").unwrap_or(&Value::Null)),
+                        "start": hyperframe_transcript_number(entry.get("start").unwrap_or(&Value::Null)),
+                        "text": text,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let words = body
+        .pointer("/results/channels/0/alternatives/0/words")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let text = entry
+                        .get("punctuated_word")
+                        .and_then(Value::as_str)
+                        .or_else(|| entry.get("word").and_then(Value::as_str))?
+                        .trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "end": hyperframe_transcript_number(entry.get("end").unwrap_or(&Value::Null)),
+                        "start": hyperframe_transcript_number(entry.get("start").unwrap_or(&Value::Null)),
+                        "text": text,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let fallback_transcript = body
+        .pointer("/results/channels/0/alternatives/0/transcript")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let duration_seconds =
+        hyperframe_transcript_number(body.pointer("/metadata/duration").unwrap_or(&Value::Null));
+
+    let utterances = if utterances.is_empty() && !fallback_transcript.is_empty() {
+        vec![json!({
+            "end": duration_seconds,
+            "start": 0.0,
+            "text": fallback_transcript,
+        })]
+    } else {
+        utterances
+    };
+    if utterances.is_empty() {
+        return Err("Deepgram returned no transcript for this audio.".to_string());
+    }
+
+    Ok(json!({
+        "durationSeconds": duration_seconds,
+        "language": language,
+        "tool": "deepgram",
+        "utterances": utterances,
+        "words": words,
+    }))
+}
+
+fn hyperframe_transcribe_with_whisper(
+    runtime_path: PathBuf,
+    model_path: PathBuf,
+    recordings_directory: PathBuf,
+    language: String,
+    audio_bytes: Vec<u8>,
+) -> Result<Value, String> {
+    fs::create_dir_all(&recordings_directory)
+        .map_err(|error| format!("Unable to prepare transcription directory: {error}"))?;
+    let job_id = current_time_ms();
+    let audio_path = recordings_directory.join(format!("hyperframe-{job_id}.wav"));
+    let output_base = recordings_directory.join(format!("hyperframe-{job_id}"));
+    fs::write(&audio_path, &audio_bytes)
+        .map_err(|error| format!("Unable to prepare transcription audio: {error}"))?;
+
+    let runtime = runtime_path.display().to_string();
+    let model = model_path.display().to_string();
+    let audio = audio_path.display().to_string();
+    let output = output_base.display().to_string();
+    let threads = whisper_cli_thread_count().to_string();
+    let args = [
+        "-m", model.as_str(),
+        "-f", audio.as_str(),
+        "-l", language.as_str(),
+        "-t", threads.as_str(),
+        "-np",
+        "-oj",
+        "-of", output.as_str(),
+    ];
+    let capture = run_command_capture(
+        &runtime,
+        &args,
+        None,
+        Duration::from_secs(HYPERFRAME_WHISPER_FILE_TIMEOUT_SECS),
+        None,
+    );
+    let json_path = output_base.with_extension("json");
+    let parse_result = capture.and_then(|capture| {
+        if capture.exit_code != Some(0) {
+            return Err(format!(
+                "Local Whisper transcription failed: {}",
+                command_output_text(&capture.stdout, &capture.stderr)
+            ));
+        }
+        let body = fs::read_to_string(&json_path)
+            .map_err(|error| format!("Unable to read Whisper transcript output: {error}"))?;
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|error| format!("Whisper transcript output is invalid: {error}"))?;
+        let utterances = parsed
+            .get("transcription")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let text = entry.get("text").and_then(Value::as_str)?.trim();
+                        if text.is_empty() {
+                            return None;
+                        }
+                        let from_ms =
+                            hyperframe_transcript_number(entry.pointer("/offsets/from").unwrap_or(&Value::Null));
+                        let to_ms =
+                            hyperframe_transcript_number(entry.pointer("/offsets/to").unwrap_or(&Value::Null));
+                        Some(json!({
+                            "end": to_ms / 1000.0,
+                            "start": from_ms / 1000.0,
+                            "text": text,
+                        }))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if utterances.is_empty() {
+            return Err("Local Whisper returned no transcript for this audio.".to_string());
+        }
+        let duration_seconds = utterances
+            .iter()
+            .map(|entry| hyperframe_transcript_number(entry.get("end").unwrap_or(&Value::Null)))
+            .fold(0.0f64, f64::max);
+        Ok(json!({
+            "durationSeconds": duration_seconds,
+            "language": language,
+            "tool": "whisper-local",
+            "utterances": utterances,
+            "words": [],
+        }))
+    });
+    let _ = fs::remove_file(&audio_path);
+    let _ = fs::remove_file(&json_path);
+    parse_result
+}
+
+#[tauri::command]
+async fn hyperframe_transcribe_audio(
+    app: AppHandle,
+    request: HyperframeTranscribeRequest,
+) -> Result<Value, String> {
+    let provider = request.provider.trim().to_lowercase();
+    let language = hyperframe_transcript_language(request.language.clone());
+    if request.audio_base64.len() > HYPERFRAME_TRANSCRIBE_MAX_WAV_BYTES * 2 {
+        return Err("The extracted audio is too large to transcribe in one pass.".to_string());
+    }
+    let audio_bytes = general_purpose::STANDARD
+        .decode(request.audio_base64.trim())
+        .map_err(|error| format!("Extracted audio is not valid base64: {error}"))?;
+    if audio_bytes.len() > HYPERFRAME_TRANSCRIBE_MAX_WAV_BYTES {
+        return Err("The extracted audio is too large to transcribe in one pass.".to_string());
+    }
+    if audio_bytes.is_empty() {
+        return Err("No audio could be extracted from this media file.".to_string());
+    }
+
+    if provider == "deepgram" {
+        let api_key = clean_deepgram_api_key(request.api_key.as_deref().unwrap_or(""))?;
+        return hyperframe_transcribe_with_deepgram(api_key, language, audio_bytes).await;
+    }
+
+    let model_path = whisper_model_path(&app)?;
+    if !model_path.exists() {
+        return Err("Install the local Whisper model from the Audio tab first.".to_string());
+    }
+    let runtime_path = whisper_runtime_executable_path(&app)?
+        .ok_or_else(|| "Install the local Whisper runtime from the Audio tab first.".to_string())?;
+    let recordings_directory = whisper_model_directory(&app)?.join("recordings");
+    tauri::async_runtime::spawn_blocking(move || {
+        hyperframe_transcribe_with_whisper(
+            runtime_path,
+            model_path,
+            recordings_directory,
+            language,
+            audio_bytes,
+        )
+    })
+    .await
+    .map_err(|error| format!("Local Whisper transcription task failed: {error}"))?
+}

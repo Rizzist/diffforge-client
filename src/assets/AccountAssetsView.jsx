@@ -19,6 +19,7 @@ import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
 import { Settings } from "@styled-icons/material-rounded/Settings";
+import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
 import HyperframeEditor, {
   assetCanContainHyperframe,
   assetLooksLikeHyperframe,
@@ -482,6 +483,7 @@ export default function AccountAssetsView({
           onBack={() => setHyperframeEditor(null)}
           onRefreshTracked={onRefresh}
           onRefreshUntracked={onUntrackedRefresh}
+          workspaces={assetWorkspaces}
         />
       ) : assetMode === "untracked" ? (
         <UntrackedAssetsPanel
@@ -1354,6 +1356,9 @@ function AssetsPanel({
                 </AssetCardActions>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
+                  {localPath ? (
+                    <MediaTranscriptChip localPath={localPath} mediaName={name} />
+                  ) : null}
                   {syncedDeviceNames.length > 0 && (
                     <AssetCardMetaLine title={`Synced to: ${syncedDeviceNames.join(", ")}`}>
                       {syncedDeviceNames.length === 1
@@ -1890,6 +1895,9 @@ function UntrackedAssetsPanel({
                 </AssetCardActions>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
+                  {localPath ? (
+                    <MediaTranscriptChip localPath={localPath} mediaName={name} />
+                  ) : null}
                 </AssetCardCaption>
               </AssetCard>
             );

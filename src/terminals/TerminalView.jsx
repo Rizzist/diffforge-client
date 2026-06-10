@@ -796,6 +796,194 @@ const TerminalSurfaceLayer = styled.div`
   }
 `;
 
+const TERMINAL_TAB_AGENT_META = {
+  claude: { color: "#d97757", label: "Claude Code", short: "CL" },
+  codex: { color: "#7bdc9d", label: "Codex", short: "CX" },
+  generic: { color: "#9fb6d9", label: "Terminal", short: ">_" },
+  opencode: { color: "#68d8d6", label: "OpenCode", short: "OC" },
+};
+
+function getTerminalTabAgentMeta(role) {
+  return TERMINAL_TAB_AGENT_META[String(role || "").toLowerCase()] || TERMINAL_TAB_AGENT_META.generic;
+}
+
+const TerminalTabGroupShell = styled.div`
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+`;
+
+const TerminalTabStrip = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  align-items: flex-end;
+  gap: 3px;
+  min-width: 0;
+  padding: 4px 6px 0;
+  border-bottom: 1px solid rgba(230, 236, 245, 0.08);
+  background: #04060a;
+  overflow-x: auto;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(24, 34, 48, 0.1);
+    background: #ebedf1;
+  }
+
+  &[data-breakout="true"] {
+    border-bottom: 1px solid rgba(230, 236, 245, 0.12);
+  }
+`;
+
+const TerminalTab = styled.div`
+  display: inline-flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 190px;
+  padding: 4px 6px 4px 8px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  color: rgba(244, 247, 250, 0.6);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: background 110ms ease, color 110ms ease, border-color 110ms ease;
+
+  > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover {
+    color: rgba(244, 247, 250, 0.88);
+    background: rgba(230, 236, 245, 0.05);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(230, 236, 245, 0.12);
+    color: #f4f7fa;
+    background: #020304;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(24, 34, 48, 0.6);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: rgba(24, 34, 48, 0.9);
+    background: rgba(24, 34, 48, 0.05);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    border-color: rgba(24, 34, 48, 0.12);
+    color: #182230;
+    background: #ffffff;
+  }
+`;
+
+const TerminalTabGlyph = styled.span`
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  place-items: center;
+  border-radius: 4px;
+  color: #04060a;
+  background: ${({ $color }) => $color || "#9fb6d9"};
+  font-size: 7.5px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+`;
+
+const TerminalTabDot = styled.span`
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: ${({ $color }) => $color || "#8bb8ff"};
+`;
+
+const TerminalTabCloseGlyph = styled.span`
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border-radius: 4px;
+  color: rgba(244, 247, 250, 0.42);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+
+  &:hover {
+    color: #ff8d8d;
+    background: rgba(244, 63, 94, 0.14);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(24, 34, 48, 0.4);
+  }
+`;
+
+const TerminalTabAddButton = styled.button`
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  margin-bottom: 2px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  color: rgba(244, 247, 250, 0.5);
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+
+  &:hover:not(:disabled) {
+    color: #f4f7fa;
+    background: rgba(230, 236, 245, 0.07);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.35;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(24, 34, 48, 0.5);
+  }
+`;
+
+const TerminalTabContentStack = styled.div`
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+
+  > [data-terminal-panel-anchor="true"] {
+    position: absolute;
+    inset: 0;
+  }
+`;
+
 const TerminalSurfaceSlot = styled.div`
   position: absolute;
   top: 0;
@@ -817,6 +1005,11 @@ const TerminalSurfaceSlot = styled.div`
     filter 140ms ease,
     opacity 140ms ease;
   will-change: width, height, transform;
+
+  &[data-terminal-tab-hidden="true"] {
+    visibility: hidden;
+    pointer-events: none;
+  }
 
   &[data-terminal-breakout="true"][data-terminal-interacting="true"],
   &[data-terminal-dragging="true"] {
@@ -13692,6 +13885,25 @@ function TerminalView({
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
+  // cmux-style tab groups: each display row is a tab group showing one
+  // terminal at a time. Active tabs are tracked by terminal index so the
+  // selection survives rows being renumbered during drags.
+  const [activeTabTerminals, setActiveTabTerminals] = useState([]);
+  const tabVisibilityByTerminal = useMemo(() => {
+    const visibility = new Map();
+    cloneTerminalRows(activeDisplayRows).forEach((row) => {
+      const activeIndex = row.terminalIndexes.find((index) => activeTabTerminals.includes(index))
+        ?? row.terminalIndexes[0];
+      row.terminalIndexes.forEach((terminalIndex) => {
+        visibility.set(terminalIndex, terminalIndex === activeIndex);
+      });
+    });
+    return visibility;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeDisplayRowsSignature, activeTabTerminals]);
+  const visibleTabTerminalIndexes = useMemo(() => (
+    logicalTerminalIndexes.filter((terminalIndex) => tabVisibilityByTerminal.get(terminalIndex) !== false)
+  ), [logicalTerminalIndexes, tabVisibilityByTerminal]);
   const todoQueueVisible = Boolean(
     hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
@@ -14283,13 +14495,15 @@ function TerminalView({
       return targetTerminalIndex === surfaceSlotIndex ? surfaceSlotIndex : null;
     }
 
+    // Tab groups share one rect per row, so only the visible tab of each
+    // group may receive todo/file drops.
     return getTodoDropTargetFromPoint({
       clientX,
       clientY,
       containerRect,
       fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
       rects: getTerminalHitTestRects(),
-      terminalIndexes: logicalTerminalIndexes,
+      terminalIndexes: visibleTabTerminalIndexes,
     });
   }, [
     fullscreenActive,
@@ -14297,6 +14511,7 @@ function TerminalView({
     getTerminalHitTestRects,
     logicalTerminalIndexes,
     terminalBreakoutLayoutActive,
+    visibleTabTerminalIndexes,
   ]);
   const queueWorkspaceFileForTerminalIndex = useCallback((workspaceFile, targetTerminalIndex, source = "fileviewer_global_drop") => {
     if (!Number.isInteger(targetTerminalIndex)) {
@@ -22497,6 +22712,21 @@ function TerminalView({
     updateTodoDragState,
   ]);
 
+  const activateTerminalTabInRows = useCallback((rows, terminalIndex) => {
+    if (!Number.isInteger(terminalIndex)) {
+      return;
+    }
+    const row = cloneTerminalRows(rows).find((candidate) => (
+      candidate.terminalIndexes.includes(terminalIndex)
+    ));
+    setActiveTabTerminals((current) => [
+      ...current.filter((index) => (
+        index !== terminalIndex && !(row?.terminalIndexes || []).includes(index)
+      )),
+      terminalIndex,
+    ]);
+  }, []);
+
   const updateTerminalDragState = useCallback((updater) => {
     setTerminalDragState((currentState) => {
       const nextState = typeof updater === "function" ? updater(currentState) : updater;
@@ -22671,6 +22901,8 @@ function TerminalView({
           displayRows: nextRows,
           workspaceId: currentDrag.workspaceId,
         });
+        // The dropped terminal becomes the visible tab of its new group.
+        activateTerminalTabInRows(nextRows, currentDrag.terminalIndex);
       }
 
       updateTerminalDragState(null);
@@ -22715,6 +22947,7 @@ function TerminalView({
       window.removeEventListener("pointercancel", handlePointerCancel, true);
     };
   }, [
+    activateTerminalTabInRows,
     reorderWorkspaceTerminalDisplayLayout,
     scheduleTerminalBreakoutPlacementsFrame,
     stopTerminalDragListeners,
@@ -22937,6 +23170,88 @@ function TerminalView({
     todoDragActive,
     updateTerminalDragState,
   ]);
+
+  const selectTerminalTab = useCallback((terminalIndex) => {
+    activateTerminalTabInRows(activeDisplayRows, terminalIndex);
+    handleActivateTerminalPane({ paneId: getTerminalPaneId(terminalIndex) });
+  }, [activateTerminalTabInRows, activeDisplayRows, getTerminalPaneId, handleActivateTerminalPane]);
+
+  // Tabs select on click and start the grid drag (with live preview) once the
+  // pointer moves past a small threshold, mirroring cmux tab dragging.
+  const handleTerminalTabPointerDown = useCallback((event, terminalIndex) => {
+    if (event.button !== 0 || todoDragActive) {
+      return;
+    }
+    const groupContent = event.currentTarget
+      .closest("[data-terminal-tab-group='true']")
+      ?.querySelector?.("[data-terminal-tab-content='true']");
+    const surfaceRect = getPlainDomRect(groupContent?.getBoundingClientRect?.());
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const pointerId = event.pointerId;
+    const paneId = getTerminalPaneId(terminalIndex);
+    let disposed = false;
+
+    const cleanup = () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      window.removeEventListener("pointermove", handleMove, true);
+      window.removeEventListener("pointerup", handleUp, true);
+      window.removeEventListener("pointercancel", cleanup, true);
+    };
+
+    const handleMove = (moveEvent) => {
+      if (moveEvent.pointerId !== pointerId) {
+        return;
+      }
+      const distance = Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY);
+      if (distance < 5) {
+        return;
+      }
+      cleanup();
+      if (!surfaceRect) {
+        return;
+      }
+      handleBeginTerminalDrag({
+        clientX: moveEvent.clientX,
+        clientY: moveEvent.clientY,
+        paneId,
+        panelRect: surfaceRect,
+        pointerId,
+        surfaceRect,
+        terminalIndex,
+        workspaceId: terminalWorkspace?.id || "",
+      });
+    };
+
+    const handleUp = (upEvent) => {
+      if (upEvent.pointerId !== pointerId) {
+        return;
+      }
+      cleanup();
+      selectTerminalTab(terminalIndex);
+    };
+
+    window.addEventListener("pointermove", handleMove, { capture: true, passive: true });
+    window.addEventListener("pointerup", handleUp, { capture: true, passive: true });
+    window.addEventListener("pointercancel", cleanup, { capture: true });
+  }, [
+    getTerminalPaneId,
+    handleBeginTerminalDrag,
+    selectTerminalTab,
+    terminalWorkspace?.id,
+    todoDragActive,
+  ]);
+
+  const handleCloseTerminalTab = useCallback((terminalIndex) => {
+    closeWorkspaceTerminal?.({
+      terminalIndex,
+      threadId: getTerminalThread(terminalIndex)?.id || "",
+      workspaceId: terminalWorkspace?.id || "",
+    });
+  }, [closeWorkspaceTerminal, getTerminalThread, terminalWorkspace?.id]);
 
   useEffect(() => {
     if (!todoDragActive) {
@@ -23696,35 +24011,70 @@ function TerminalView({
                 id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
                 minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
               >
-                <ResizePanelGroup
-                  id={`workspace-terminal-cols-${terminalWorkspace.id}-${row.rowIndex}`}
-                  orientation="horizontal"
-                >
-                  {row.terminalIndexes.map((terminalIndex, columnIndex) => (
-                    <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
-                      {columnIndex > 0 && (
-                        <ResizeHandle
-                          data-direction="horizontal"
-                        />
-                      )}
-                      <ResizePanel
-                        data-terminal-column="true"
-                        data-terminal-leaf="true"
-                        defaultSize={`${100 / row.terminalIndexes.length}%`}
-                        id={`workspace-terminal-col-${terminalWorkspace.id}-${terminalIndex}`}
-                        minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                      >
-                        <TerminalPanelAnchor
-                          data-terminal-drag-placeholder={
-                            terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
-                          }
-                          data-terminal-index={terminalIndex}
-                          data-terminal-panel-anchor="true"
-                        />
-                      </ResizePanel>
-                    </Fragment>
-                  ))}
-                </ResizePanelGroup>
+                <TerminalTabGroupShell data-terminal-tab-group="true">
+                  <TerminalTabStrip aria-label="Terminal tabs" role="tablist">
+                    {row.terminalIndexes.map((terminalIndex) => {
+                      const tabMeta = getTerminalTabAgentMeta(getTerminalRole(terminalIndex));
+                      const tabActive = tabVisibilityByTerminal.get(terminalIndex) !== false;
+                      return (
+                        <TerminalTab
+                          aria-selected={tabActive}
+                          data-active={tabActive ? "true" : "false"}
+                          data-terminal-tab="true"
+                          key={`tab-${terminalWorkspace.id}-${terminalIndex}`}
+                          onPointerDown={(event) => handleTerminalTabPointerDown(event, terminalIndex)}
+                          role="tab"
+                          tabIndex={0}
+                          title={`${tabMeta.label} - terminal ${terminalIndex + 1}`}
+                        >
+                          <TerminalTabGlyph $color={tabMeta.color} aria-hidden="true">
+                            {tabMeta.short}
+                          </TerminalTabGlyph>
+                          <TerminalTabDot
+                            $color={terminalColorForSlot(terminalIndex)}
+                            aria-hidden="true"
+                          />
+                          <span>{tabMeta.label}</span>
+                          <TerminalTabCloseGlyph
+                            aria-label={`Close ${tabMeta.label} terminal`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleCloseTerminalTab(terminalIndex);
+                            }}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            role="button"
+                          >
+                            ×
+                          </TerminalTabCloseGlyph>
+                        </TerminalTab>
+                      );
+                    })}
+                    <TerminalTabAddButton
+                      aria-label="New terminal tab in this group"
+                      disabled={!splitWorkspaceTerminal}
+                      onClick={() => handleSplitTerminal({
+                        direction: "vertical",
+                        terminalIndex: row.terminalIndexes[row.terminalIndexes.length - 1],
+                      })}
+                      title="New terminal tab"
+                      type="button"
+                    >
+                      +
+                    </TerminalTabAddButton>
+                  </TerminalTabStrip>
+                  <TerminalTabContentStack data-terminal-tab-content="true">
+                    {row.terminalIndexes.map((terminalIndex) => (
+                      <TerminalPanelAnchor
+                        data-terminal-drag-placeholder={
+                          terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
+                        }
+                        data-terminal-index={terminalIndex}
+                        data-terminal-panel-anchor="true"
+                        key={`${terminalWorkspace.id}-${terminalIndex}`}
+                      />
+                    ))}
+                  </TerminalTabContentStack>
+                </TerminalTabGroupShell>
               </ResizePanel>
             </Fragment>
           ))}
@@ -23845,6 +24195,13 @@ function TerminalView({
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
             || fullscreenThisTerminal;
+          // Inactive tabs stay mounted (PTY preserved) but invisible: every
+          // tab in a group shares the group's anchor rect.
+          const tabHidden = !terminalBreakoutLayoutActive
+            && !fullscreenThisTerminal
+            && !draggingThisTerminal
+            && tabVisibilityByTerminal.get(terminalIndex) === false;
+          const slotTabMeta = getTerminalTabAgentMeta(getTerminalRole(terminalIndex));
 
           return (
             <TerminalSurfaceSlot
@@ -23856,10 +24213,36 @@ function TerminalView({
               data-terminal-index={terminalIndex}
               data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
               data-terminal-surface-slot="true"
+              data-terminal-tab-hidden={tabHidden ? "true" : "false"}
               key={`${terminalWorkspace.id}-${terminalIndex}`}
               onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
               style={getTerminalSlotStyle(terminalIndex)}
             >
+              {terminalBreakoutLayoutActive && !fullscreenThisTerminal && (
+                <TerminalTabStrip data-breakout="true" data-terminal-control="true">
+                  <TerminalTab as="div" data-active="true" data-terminal-control="true">
+                    <TerminalTabGlyph $color={slotTabMeta.color} aria-hidden="true">
+                      {slotTabMeta.short}
+                    </TerminalTabGlyph>
+                    <TerminalTabDot
+                      $color={terminalColorForSlot(terminalIndex)}
+                      aria-hidden="true"
+                    />
+                    <span>{slotTabMeta.label}</span>
+                    <TerminalTabCloseGlyph
+                      aria-label={`Close ${slotTabMeta.label} terminal`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleCloseTerminalTab(terminalIndex);
+                      }}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      role="button"
+                    >
+                      ×
+                    </TerminalTabCloseGlyph>
+                  </TerminalTab>
+                </TerminalTabStrip>
+              )}
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalBreakoutPlan && (
                 <TerminalBreakoutPlanPanel
                   aria-label={`Live terminal todo plan: ${breakoutPlanTitle}`}

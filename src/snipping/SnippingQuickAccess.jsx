@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
@@ -11,7 +11,6 @@ import { Gesture } from "@styled-icons/material-rounded/Gesture";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
-import { Save } from "@styled-icons/material-rounded/Save";
 import { Send } from "@styled-icons/material-rounded/Send";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
 import { Undo } from "@styled-icons/material-rounded/Undo";
@@ -25,14 +24,15 @@ const SNIP_DRAG_THRESHOLD_PX = 6;
 const SNIP_TOAST_WINDOW_WIDTH = 316;
 const SNIP_TOAST_WINDOW_HEIGHT = 560;
 const SNIP_TOAST_WINDOW_MARGIN = 18;
-const SNIP_QUEUE_DROP_WIDTH = 260;
-const SNIP_QUEUE_DROP_HEIGHT = 560;
 const SNIP_CARD_WIDTH = 208;
 const SNIP_CARD_HEIGHT = 132;
 const SNIP_CARD_GAP = 10;
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
+export const SNIPPING_FLOAT_HASH = "#/snipping-float";
+
+const SNIPPING_FLOAT_RETURNED_EVENT = "forge-snip-float-returned";
 
 const TOOL_OPTIONS = [
   { id: "pen", label: "Pen", Icon: Gesture },
@@ -201,101 +201,26 @@ function useFloatingWindowBody(kind) {
   }, [kind]);
 }
 
-function setSnipStatus(setSnips, setFloatingSnips, snipId, status) {
+function setSnipStatus(setSnips, snipId, status) {
   setSnips((current) => current.map((snip) => (
     snip.id === snipId ? { ...snip, status } : snip
   )));
-  setFloatingSnips((current) => current.map((item) => (
-    item.snip.id === snipId ? { ...item, snip: { ...item.snip, status } } : item
-  )));
 }
 
-function setTransientStatus(setSnips, setFloatingSnips, snipId, status) {
-  setSnipStatus(setSnips, setFloatingSnips, snipId, status);
+function setTransientStatus(setSnips, snipId, status) {
+  setSnipStatus(setSnips, snipId, status);
   window.setTimeout(() => {
     setSnips((current) => current.map((snip) => (
       snip.id === snipId && snip.status === status ? { ...snip, status: "" } : snip
     )));
-    setFloatingSnips((current) => current.map((item) => (
-      item.snip.id === snipId && item.snip.status === status
-        ? { ...item, snip: { ...item.snip, status: "" } }
-        : item
-    )));
-  }, 1700);
-}
-
-function clampNumber(value, min, max) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return min;
-  return Math.min(max, Math.max(min, numeric));
-}
-
-function moveSnipToIndex(snips, snipId, targetIndex) {
-  const currentIndex = snips.findIndex((snip) => snip.id === snipId);
-  if (currentIndex < 0) return snips;
-  const next = [...snips];
-  const [snip] = next.splice(currentIndex, 1);
-  next.splice(clampNumber(targetIndex, 0, next.length), 0, snip);
-  return next;
-}
-
-function queueIndexFromDropPoint(point, queuedCount, viewportHeight) {
-  const bottom = viewportHeight - SNIP_TOAST_WINDOW_MARGIN;
-  const cardCenterY = point.y + (SNIP_CARD_HEIGHT / 2);
-  const bottomDistance = bottom - cardCenterY;
-  return clampNumber(Math.round(bottomDistance / (SNIP_CARD_HEIGHT + SNIP_CARD_GAP)), 0, queuedCount);
-}
-
-function isPointInQueueDropZone(point, viewportHeight) {
-  return point.x <= SNIP_QUEUE_DROP_WIDTH
-    && point.y >= Math.max(0, viewportHeight - SNIP_QUEUE_DROP_HEIGHT);
-}
-
-async function setQuickAccessSurfaceMode(expanded) {
-  try {
-    const windowHandle = getCurrentWindow();
-    const monitor = await currentMonitor();
-    if (!monitor?.workArea) return null;
-
-    const scaleFactor = Math.max(0.1, Number(monitor.scaleFactor || window.devicePixelRatio || 1));
-    const workArea = monitor.workArea;
-    if (expanded) {
-      await windowHandle.setPosition(new PhysicalPosition(workArea.position.x, workArea.position.y));
-      await windowHandle.setSize(new LogicalSize(
-        Math.max(SNIP_TOAST_WINDOW_WIDTH, workArea.size.width / scaleFactor),
-        Math.max(SNIP_TOAST_WINDOW_HEIGHT, workArea.size.height / scaleFactor),
-      ));
-      return {
-        expanded: true,
-        height: workArea.size.height / scaleFactor,
-        width: workArea.size.width / scaleFactor,
-      };
-    }
-
-    await windowHandle.setSize(new LogicalSize(SNIP_TOAST_WINDOW_WIDTH, SNIP_TOAST_WINDOW_HEIGHT));
-    await windowHandle.setPosition(new PhysicalPosition(
-      workArea.position.x + SNIP_TOAST_WINDOW_MARGIN,
-      workArea.position.y + workArea.size.height - Math.round(SNIP_TOAST_WINDOW_HEIGHT * scaleFactor) - SNIP_TOAST_WINDOW_MARGIN,
-    ));
-    return {
-      expanded: false,
-      height: SNIP_TOAST_WINDOW_HEIGHT,
-      width: SNIP_TOAST_WINDOW_WIDTH,
-    };
-  } catch {
-    return null;
-  }
+  }, 2400);
 }
 
 export default function SnippingQuickAccess() {
   const [snips, setSnips] = useState([]);
-  const [floatingSnips, setFloatingSnips] = useState([]);
-  const [dragState, setDragState] = useState(null);
+  const [floatedSnips, setFloatedSnips] = useState([]);
   const [busyIds, setBusyIds] = useState(() => new Set());
   const hadSnipsRef = useRef(false);
-  const dragRef = useRef(null);
-  const surfaceExpandedRef = useRef(false);
-  const surfaceTransitionRef = useRef(null);
 
   useFloatingWindowBody("quick-access");
 
@@ -322,7 +247,6 @@ export default function SnippingQuickAccess() {
       if (disposed) return;
       const snip = snipToastFromPayload(event?.payload);
       if (!snip) return;
-      setFloatingSnips((current) => current.filter((item) => item.snip.localPath !== snip.localPath));
       setSnips((current) => [
         snip,
         ...current.filter((item) => item.localPath !== snip.localPath),
@@ -346,14 +270,39 @@ export default function SnippingQuickAccess() {
   }, []);
 
   useEffect(() => {
-    if (snips.length) {
+    let disposed = false;
+    let unlisten = null;
+    listen(SNIPPING_FLOAT_RETURNED_EVENT, (event) => {
+      if (disposed) return;
+      const path = text(event?.payload?.localPath || event?.payload?.local_path || event?.payload?.path);
+      if (!path) return;
+      setFloatedSnips((current) => current.filter((item) => item.localPath !== path));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (snips.length || floatedSnips.length) {
       hadSnipsRef.current = true;
       return;
     }
     if (hadSnipsRef.current) {
       getCurrentWindow().close().catch(() => {});
     }
-  }, [snips.length]);
+  }, [floatedSnips.length, snips.length]);
 
   const dismissSnip = useCallback((snipOrId) => {
     const snipId = typeof snipOrId === "string" ? snipOrId : text(snipOrId?.id);
@@ -363,12 +312,9 @@ export default function SnippingQuickAccess() {
     setSnips((current) => current.filter((snip) => (
       snip.id !== snipId && snip.localPath !== localPath
     )));
-    setFloatingSnips((current) => current.filter((item) => (
-      item.snip.id !== snipId && item.snip.localPath !== localPath
+    setFloatedSnips((current) => current.filter((item) => (
+      item.id !== snipId && item.localPath !== localPath
     )));
-    setDragState((current) => (
-      current && (current.snip.id === snipId || current.snip.localPath === localPath) ? null : current
-    ));
 
     if (localPath) {
       invoke("snipping_dismiss_capture_toast", {
@@ -380,153 +326,68 @@ export default function SnippingQuickAccess() {
     }
   }, []);
 
-  const expandDragSurface = useCallback(() => {
-    if (surfaceExpandedRef.current) {
-      return surfaceTransitionRef.current || Promise.resolve(null);
-    }
-    const transition = setQuickAccessSurfaceMode(true).then((metrics) => {
-      surfaceExpandedRef.current = Boolean(metrics?.expanded);
-      return metrics;
-    });
-    const trackedTransition = transition.finally(() => {
-      if (surfaceTransitionRef.current === trackedTransition) {
-        surfaceTransitionRef.current = null;
-      }
-    });
-    surfaceTransitionRef.current = trackedTransition;
-    return trackedTransition;
+  const floatOutSnip = useCallback((snip, x, y) => {
+    if (!snip?.localPath) return;
+    invoke("snipping_open_snip_float", {
+      path: snip.localPath,
+      x: Math.max(0, Math.round(x)),
+      y: Math.max(0, Math.round(y)),
+    })
+      .then(() => {
+        setFloatedSnips((current) => [
+          ...current.filter((item) => item.localPath !== snip.localPath),
+          snip,
+        ]);
+      })
+      .catch(() => {});
   }, []);
 
-  const restoreStackSurface = useCallback(() => {
-    const restore = async () => {
-      if (!surfaceExpandedRef.current || floatingSnips.length || dragRef.current) return null;
-      const metrics = await setQuickAccessSurfaceMode(false);
-      surfaceExpandedRef.current = Boolean(metrics?.expanded);
-      return metrics;
-    };
-    return surfaceTransitionRef.current ? surfaceTransitionRef.current.finally(restore) : restore();
-  }, [floatingSnips.length]);
-
-  useEffect(() => {
-    if (floatingSnips.length || dragState) {
-      expandDragSurface();
-    } else {
-      restoreStackSurface();
-    }
-  }, [dragState, expandDragSurface, floatingSnips.length, restoreStackSurface]);
-
-  const beginSnipDrag = useCallback((event, snip, origin = "queue") => {
+  // Pulling a card past the drag threshold detaches it into its own native
+  // window at the cursor, so it can live anywhere on screen (and over any
+  // Space). Dragging that window back over this dock returns it here.
+  const beginSnipDrag = useCallback((event, snip) => {
     if (event.button !== 0 || busyIds.has(snip.id)) return;
     event.preventDefault();
     event.stopPropagation();
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Pointer capture is best effort; the expanded surface still handles normal move events.
-    }
     const card = event.currentTarget.closest("[data-snip-card]");
     const rect = card?.getBoundingClientRect();
-    const floatingMatch = floatingSnips.find((item) => item.snip.id === snip.id);
-    const startX = origin === "floating" && floatingMatch ? floatingMatch.x : rect?.left || event.clientX;
-    const startY = origin === "floating" && floatingMatch ? floatingMatch.y : rect?.top || event.clientY;
     const offsetX = rect ? event.clientX - rect.left : SNIP_CARD_WIDTH / 2;
     const offsetY = rect ? event.clientY - rect.top : 16;
-
-    dragRef.current = {
-      active: true,
-      dragging: false,
-      origin,
-      pointerId: event.pointerId,
-      snip,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-      startX,
-      startY,
-      x: startX,
-      y: startY,
-      offsetX,
-      offsetY,
+    const startScreenX = event.screenX;
+    const startScreenY = event.screenY;
+    const pointerId = event.pointerId;
+    let finished = false;
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", onEnd, true);
+      window.removeEventListener("pointercancel", onEnd, true);
     };
-
-    expandDragSurface();
-  }, [busyIds, expandDragSurface, floatingSnips]);
+    const onMove = (moveEvent) => {
+      if (finished || moveEvent.pointerId !== pointerId) return;
+      const distance = Math.hypot(
+        moveEvent.screenX - startScreenX,
+        moveEvent.screenY - startScreenY,
+      );
+      if (distance < SNIP_DRAG_THRESHOLD_PX) return;
+      finished = true;
+      cleanup();
+      floatOutSnip(snip, moveEvent.screenX - offsetX, moveEvent.screenY - offsetY);
+    };
+    const onEnd = (endEvent) => {
+      if (endEvent.pointerId !== pointerId) return;
+      finished = true;
+      cleanup();
+    };
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", onEnd, true);
+    window.addEventListener("pointercancel", onEnd, true);
+  }, [busyIds, floatOutSnip]);
 
   const floatSnipFromKeyboard = useCallback((event, snip) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    expandDragSurface();
-    setFloatingSnips((current) => {
-      if (current.some((item) => item.snip.id === snip.id)) return current;
-      const x = Math.min(Math.max(SNIP_TOAST_WINDOW_MARGIN, window.innerWidth - SNIP_CARD_WIDTH - 40), window.innerWidth - SNIP_CARD_WIDTH - SNIP_TOAST_WINDOW_MARGIN);
-      const y = Math.min(Math.max(SNIP_TOAST_WINDOW_MARGIN, window.innerHeight - SNIP_CARD_HEIGHT - 40), window.innerHeight - SNIP_CARD_HEIGHT - SNIP_TOAST_WINDOW_MARGIN);
-      return [...current, { snip, x, y }];
-    });
-  }, [expandDragSurface]);
-
-  useEffect(() => {
-    const onPointerMove = (event) => {
-      const drag = dragRef.current;
-      if (!drag || drag.pointerId !== event.pointerId) return;
-      const distance = Math.hypot(
-        event.clientX - drag.startClientX,
-        event.clientY - drag.startClientY,
-      );
-      if (!drag.dragging && distance < SNIP_DRAG_THRESHOLD_PX) return;
-
-      if (!drag.dragging && drag.origin === "floating") {
-        setFloatingSnips((current) => current.filter((item) => item.snip.id !== drag.snip.id));
-      }
-
-      const nextX = clampNumber(event.clientX - drag.offsetX, 0, Math.max(0, window.innerWidth - SNIP_CARD_WIDTH));
-      const nextY = clampNumber(event.clientY - drag.offsetY, 0, Math.max(0, window.innerHeight - SNIP_CARD_HEIGHT));
-      const nextDrag = {
-        ...drag,
-        dragging: true,
-        x: nextX,
-        y: nextY,
-      };
-      dragRef.current = nextDrag;
-      setDragState(nextDrag);
-    };
-
-    const onPointerEnd = (event) => {
-      const drag = dragRef.current;
-      if (!drag || drag.pointerId !== event.pointerId) return;
-      dragRef.current = null;
-      setDragState(null);
-
-      if (!drag.dragging) {
-        restoreStackSurface();
-        return;
-      }
-
-      const dropPoint = {
-        x: drag.x + (SNIP_CARD_WIDTH / 2),
-        y: drag.y + (SNIP_CARD_HEIGHT / 2),
-      };
-      if (isPointInQueueDropZone(dropPoint, window.innerHeight)) {
-        const floatingIds = new Set(floatingSnips.map((item) => item.snip.id));
-        const queuedCount = snips.filter((item) => item.id !== drag.snip.id && !floatingIds.has(item.id)).length;
-        const targetIndex = queueIndexFromDropPoint(drag, queuedCount, window.innerHeight);
-        setFloatingSnips((current) => current.filter((item) => item.snip.id !== drag.snip.id));
-        setSnips((current) => moveSnipToIndex(current, drag.snip.id, targetIndex));
-      } else {
-        setFloatingSnips((current) => [
-          ...current.filter((item) => item.snip.id !== drag.snip.id),
-          { snip: drag.snip, x: drag.x, y: drag.y },
-        ]);
-      }
-    };
-
-    window.addEventListener("pointermove", onPointerMove, true);
-    window.addEventListener("pointerup", onPointerEnd, true);
-    window.addEventListener("pointercancel", onPointerEnd, true);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove, true);
-      window.removeEventListener("pointerup", onPointerEnd, true);
-      window.removeEventListener("pointercancel", onPointerEnd, true);
-    };
-  }, [floatingSnips, restoreStackSurface, snips]);
+    floatOutSnip(snip, SNIP_TOAST_WINDOW_WIDTH + 60, Math.max(40, window.screenY || 80));
+  }, [floatOutSnip]);
 
   const runSnipAction = useCallback(async (snip, action) => {
     if (!snip?.id) return;
@@ -538,9 +399,6 @@ export default function SnippingQuickAccess() {
     setSnips((current) => current.map((item) => (
       item.id === snip.id ? { ...item, status: "" } : item
     )));
-    setFloatingSnips((current) => current.map((item) => (
-      item.snip.id === snip.id ? { ...item, snip: { ...item.snip, status: "" } } : item
-    )));
 
     try {
       if (action === "delete") {
@@ -548,10 +406,10 @@ export default function SnippingQuickAccess() {
         dismissSnip(snip);
       } else if (action === "copy") {
         const status = await copySnipToClipboard(snip);
-        setTransientStatus(setSnips, setFloatingSnips, snip.id, status);
+        setTransientStatus(setSnips, snip.id, status);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: snip.localPath });
-        setTransientStatus(setSnips, setFloatingSnips, snip.id, "Editor opened");
+        setTransientStatus(setSnips, snip.id, "Editor opened");
       } else if (action === "upload") {
         await invoke("snipping_upload_untracked_asset", {
           request: {
@@ -560,10 +418,10 @@ export default function SnippingQuickAccess() {
             path: snip.localPath,
           },
         });
-        setTransientStatus(setSnips, setFloatingSnips, snip.id, "Tracked for upload");
+        setTransientStatus(setSnips, snip.id, "Tracked for upload");
       }
     } catch (error) {
-      setTransientStatus(setSnips, setFloatingSnips, snip.id, error?.message || String(error || "Action failed"));
+      setTransientStatus(setSnips, snip.id, error?.message || String(error || "Action failed"));
     } finally {
       setBusyIds((current) => {
         const next = new Set(current);
@@ -573,28 +431,29 @@ export default function SnippingQuickAccess() {
     }
   }, [dismissSnip]);
 
-  const floatingIds = useMemo(() => new Set(floatingSnips.map((item) => item.snip.id)), [floatingSnips]);
-  const activeDragId = dragState?.snip?.id || "";
-  const queuedSnips = useMemo(() => snips.filter((snip) => (
-    snip.id !== activeDragId && !floatingIds.has(snip.id)
-  )), [activeDragId, floatingIds, snips]);
+  const floatedPaths = useMemo(
+    () => new Set(floatedSnips.map((item) => item.localPath)),
+    [floatedSnips],
+  );
+  const queuedSnips = useMemo(
+    () => snips.filter((snip) => !floatedPaths.has(snip.localPath)),
+    [floatedPaths, snips],
+  );
 
-  const renderSnipCard = useCallback((snip, { dragOrigin = "queue", floating = false, style = null } = {}) => {
+  const renderSnipCard = useCallback((snip) => {
     const busy = busyIds.has(snip.id);
     return (
       <QuickAccessCard
         data-busy={busy ? "true" : "false"}
-        data-floating={floating ? "true" : "false"}
         data-snip-card
         key={snip.id}
-        style={style || undefined}
       >
         <QuickAccessDragButton
-          aria-label={`Drag ${snip.name}`}
+          aria-label={`Drag ${snip.name} out as its own window`}
           disabled={busy}
           onKeyDown={(event) => floatSnipFromKeyboard(event, snip)}
-          onPointerDown={(event) => beginSnipDrag(event, snip, dragOrigin)}
-          title="Drag preview"
+          onPointerDown={(event) => beginSnipDrag(event, snip)}
+          title="Drag out as a floating preview"
           type="button"
         >
           <DragIndicator aria-hidden="true" />
@@ -640,42 +499,140 @@ export default function SnippingQuickAccess() {
     );
   }, [beginSnipDrag, busyIds, dismissSnip, floatSnipFromKeyboard, runSnipAction]);
 
-  if (!snips.length) {
+  if (!snips.length && !floatedSnips.length) {
     return <SnipFloatingGlobalStyle />;
   }
 
   return (
     <>
       <SnipFloatingGlobalStyle />
-      <QuickAccessRoot aria-label="Snip quick access" aria-live="polite" data-expanded={floatingSnips.length || dragState ? "true" : "false"}>
-        <QueueDropZone aria-hidden="true" data-active={dragState ? "true" : "false"} />
+      <QuickAccessRoot aria-label="Snip quick access" aria-live="polite">
         <QueuedSnipStack>
           {queuedSnips.map((snip) => renderSnipCard(snip))}
         </QueuedSnipStack>
-        <FloatingSnipLayer>
-          {floatingSnips
-            .filter((item) => item.snip.id !== activeDragId)
-            .map((item) => renderSnipCard(item.snip, {
-              dragOrigin: "floating",
-              floating: true,
-              style: {
-                left: `${item.x}px`,
-                top: `${item.y}px`,
-              },
-            }))}
-          {dragState ? renderSnipCard(dragState.snip, {
-            dragOrigin: dragState.origin,
-            floating: true,
-            style: {
-              left: `${dragState.x}px`,
-              top: `${dragState.y}px`,
-            },
-          }) : null}
-        </FloatingSnipLayer>
       </QuickAccessRoot>
     </>
   );
 }
+
+export function SnippingFloatWindow() {
+  const localPath = useMemo(() => pathFromHash(SNIPPING_FLOAT_HASH), []);
+  const previewUrl = useMemo(() => assetPreviewUrl({ localPath }), [localPath]);
+  const name = useMemo(() => assetName({ localPath }), [localPath]);
+
+  useFloatingWindowBody("float");
+
+  const beginDrag = useCallback((event) => {
+    if (event.button !== 0 || event.target.closest("button")) return;
+    getCurrentWindow().startDragging().catch(() => {});
+  }, []);
+
+  const closeFloat = useCallback(() => {
+    getCurrentWindow().close().catch(() => {});
+  }, []);
+
+  const openEditor = useCallback(() => {
+    if (!localPath) return;
+    invoke("snipping_open_annotation_editor", { path: localPath }).catch(() => {});
+  }, [localPath]);
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeFloat();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [closeFloat]);
+
+  return (
+    <>
+      <SnipFloatingGlobalStyle />
+      <FloatWindowRoot
+        onDoubleClick={openEditor}
+        onMouseDown={beginDrag}
+        title={`${name} — drag anywhere, drag onto the queue to return, double-click to annotate`}
+      >
+        {previewUrl ? (
+          <img alt={name} draggable={false} src={previewUrl} />
+        ) : (
+          <span>Preview unavailable</span>
+        )}
+        <FloatCloseButton aria-label={`Close ${name}`} onClick={closeFloat} title="Close" type="button">
+          <Close aria-hidden="true" />
+        </FloatCloseButton>
+      </FloatWindowRoot>
+    </>
+  );
+}
+
+const FloatWindowRoot = styled.main`
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 12px;
+  background: rgba(9, 12, 18, 0.85);
+  clip-path: inset(0 round 12px);
+  cursor: grab;
+  user-select: none;
+
+  &:active {
+    cursor: grabbing;
+  }
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    pointer-events: none;
+  }
+
+  span {
+    color: rgba(248, 250, 252, 0.6);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  button {
+    opacity: 0;
+    transition: opacity 130ms ease;
+  }
+
+  &:hover button {
+    opacity: 1;
+  }
+`;
+
+const FloatCloseButton = styled.button`
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  color: #f8fafc;
+  background: rgba(7, 10, 16, 0.85);
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    border-color: rgba(239, 107, 107, 0.5);
+    background: rgba(76, 22, 26, 0.9);
+  }
+`;
 
 export function SnippingAnnotationEditorWindow() {
   const localPaths = useMemo(() => pathsFromHash(SNIPPING_EDITOR_HASH), []);
@@ -696,7 +653,40 @@ export function SnippingAnnotationEditorWindow() {
   const [status, setStatus] = useState("Loading image...");
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
   const [todoDraft, setTodoDraft] = useState("");
+  const [dispatchTargets, setDispatchTargets] = useState([]);
+  const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
+  const [targetThreadId, setTargetThreadId] = useState("");
   const annotations = annotationsByPath[activePath] || [];
+
+  useEffect(() => {
+    let disposed = false;
+    invoke("snipping_dispatch_targets")
+      .then((targets) => {
+        if (disposed || !Array.isArray(targets)) return;
+        setDispatchTargets(targets);
+        setTargetWorkspaceId((current) => {
+          if (current && targets.some((target) => target.workspaceId === current)) return current;
+          return text(targets[0]?.workspaceId);
+        });
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const targetWorkspace = useMemo(
+    () => dispatchTargets.find((target) => target.workspaceId === targetWorkspaceId) || null,
+    [dispatchTargets, targetWorkspaceId],
+  );
+
+  useEffect(() => {
+    setTargetThreadId((current) => {
+      if (!current) return current;
+      const threads = targetWorkspace?.threads || [];
+      return threads.some((thread) => thread.threadId === current) ? current : "";
+    });
+  }, [targetWorkspace]);
 
   useFloatingWindowBody("editor");
 
@@ -856,23 +846,44 @@ export function SnippingAnnotationEditorWindow() {
     }
   }, []);
 
-  const saveCopy = useCallback(async () => {
+  // Autosave chain: the first save of an original returns the new edited-copy
+  // path; every later autosave for that original updates the same copy in
+  // place. Re-opening the original in a fresh editor session starts a new
+  // version. Edited copies always update in place.
+  const autosaveTargetsRef = useRef({});
+  const autosaveTimerRef = useRef(0);
+  const persistAnnotatedImage = useCallback(async () => {
     const canvas = canvasRef.current;
-    if (!canvas || !activePath) return;
-    setStatus("Saving...");
+    if (!canvas || !activePath || !canvas.width || !canvas.height) return;
+    if (!(annotationsByPath[activePath] || []).length) return;
+    setStatus("Saving…");
     try {
       const imageDataUrl = canvas.toDataURL("image/png");
-      await invoke("snipping_save_edited_untracked_asset", {
+      const sourcePath = autosaveTargetsRef.current[activePath] || activePath;
+      const result = await invoke("snipping_save_edited_untracked_asset", {
         request: {
           imageDataUrl,
-          sourcePath: activePath,
+          sourcePath,
         },
       });
+      const savedPath = text(result?.local_path || result?.localPath || result?.path);
+      if (savedPath) {
+        autosaveTargetsRef.current[activePath] = savedPath;
+      }
       setStatus("Saved");
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to save annotated image."));
     }
-  }, [activePath]);
+  }, [activePath, annotationsByPath]);
+
+  useEffect(() => {
+    if (!(annotationsByPath[activePath] || []).length) return undefined;
+    window.clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = window.setTimeout(() => {
+      void persistAnnotatedImage();
+    }, 900);
+    return () => window.clearTimeout(autosaveTimerRef.current);
+  }, [activePath, annotationsByPath, persistAnnotatedImage]);
 
   const queueTodo = useCallback(async (event) => {
     event.preventDefault();
@@ -883,6 +894,10 @@ export function SnippingAnnotationEditorWindow() {
     }
     if (!localPaths.length) {
       setStatus("No images are ready yet");
+      return;
+    }
+    if (!targetWorkspaceId) {
+      setStatus("Pick a workspace first");
       return;
     }
     setStatus(`Queueing todo with ${localPaths.length} image${localPaths.length === 1 ? "" : "s"}...`);
@@ -905,14 +920,17 @@ export function SnippingAnnotationEditorWindow() {
         sourceName: name,
         sourcePath: activePath,
         sourcePaths: localPaths,
+        targetThreadId,
         text,
+        workspaceId: targetWorkspaceId,
+        workspaceName: String(targetWorkspace?.workspaceName || "").trim(),
       });
       setTodoDraft("");
       setStatus(`Queued todo with ${images.length} image${images.length === 1 ? "" : "s"}`);
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [activePath, annotationsByPath, localPaths, name, todoDraft]);
+  }, [activePath, annotationsByPath, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
     getCurrentWindow().close().catch(() => {});
@@ -984,10 +1002,6 @@ export function SnippingAnnotationEditorWindow() {
             <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
               <ContentCopy aria-hidden="true" />
             </EditorToolButton>
-            <EditorSaveButton onClick={saveCopy} title="Originals get one edited copy; edited copies save in place" type="button">
-              <Save aria-hidden="true" />
-              <span>Save</span>
-            </EditorSaveButton>
           </EditorToolbar>
         </EditorControlsStack>
 
@@ -1002,6 +1016,31 @@ export function SnippingAnnotationEditorWindow() {
           />
         </EditorCanvasStage>
         <EditorTodoComposer onSubmit={queueTodo}>
+          <EditorTargetSelect
+            aria-label="Target workspace"
+            onChange={(event) => setTargetWorkspaceId(event.target.value)}
+            value={targetWorkspaceId}
+          >
+            {!dispatchTargets.length && <option value="">No workspaces</option>}
+            {dispatchTargets.map((target) => (
+              <option key={target.workspaceId} value={target.workspaceId}>
+                {target.workspaceName || target.workspaceId}
+              </option>
+            ))}
+          </EditorTargetSelect>
+          <EditorTargetSelect
+            aria-label="Target terminal"
+            disabled={!(targetWorkspace?.threads || []).length}
+            onChange={(event) => setTargetThreadId(event.target.value)}
+            value={targetThreadId}
+          >
+            <option value="">Any terminal</option>
+            {(targetWorkspace?.threads || []).map((thread) => (
+              <option key={thread.threadId} value={thread.threadId}>
+                {thread.label}
+              </option>
+            ))}
+          </EditorTargetSelect>
           <input
             aria-label="Todo for coding agent"
             onChange={(event) => setTodoDraft(event.target.value)}
@@ -1056,12 +1095,32 @@ function drawAnnotation(context, annotation) {
   } else if (annotation.type === "arrow") {
     drawArrow(context, annotation.startX, annotation.startY, annotation.endX, annotation.endY, annotation.size || 5);
   } else if (annotation.type === "text") {
-    context.font = `800 ${annotation.size || 24}px Inter, system-ui, sans-serif`;
-    context.lineWidth = Math.max(3, (annotation.size || 24) / 8);
-    context.strokeStyle = "rgba(0, 0, 0, 0.45)";
-    context.strokeText(annotation.text, annotation.x, annotation.y);
-    context.fillStyle = annotation.color || "#ef4444";
-    context.fillText(annotation.text, annotation.x, annotation.y);
+    // Text sits on a solid card so it stays readable for humans and for AI
+    // agents consuming the annotated image.
+    const fontSize = annotation.size || 24;
+    context.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
+    const paddingX = Math.round(fontSize * 0.5);
+    const paddingY = Math.round(fontSize * 0.32);
+    const textWidth = context.measureText(annotation.text).width;
+    const boxX = annotation.x - paddingX;
+    const boxY = annotation.y - fontSize - paddingY;
+    const boxWidth = textWidth + paddingX * 2;
+    const boxHeight = fontSize + paddingY * 2;
+    const radius = Math.min(10, boxHeight / 3);
+    context.beginPath();
+    if (typeof context.roundRect === "function") {
+      context.roundRect(boxX, boxY, boxWidth, boxHeight, radius);
+    } else {
+      context.rect(boxX, boxY, boxWidth, boxHeight);
+    }
+    context.fillStyle = "rgba(9, 11, 16, 0.88)";
+    context.fill();
+    context.lineWidth = Math.max(2, fontSize / 12);
+    context.strokeStyle = annotation.color || "#ef4444";
+    context.stroke();
+    context.fillStyle = "#f8fafc";
+    context.textBaseline = "alphabetic";
+    context.fillText(annotation.text, annotation.x, annotation.y - paddingY / 2);
   }
 
   context.restore();
@@ -1116,36 +1175,6 @@ const QueuedSnipStack = styled.div`
   max-height: calc(100vh - 20px);
   overflow: hidden;
   pointer-events: none;
-`;
-
-const FloatingSnipLayer = styled.div`
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  pointer-events: none;
-`;
-
-const QueueDropZone = styled.div`
-  position: absolute;
-  left: 0;
-  bottom: 0;
-  z-index: 1;
-  width: ${SNIP_QUEUE_DROP_WIDTH}px;
-  height: min(${SNIP_QUEUE_DROP_HEIGHT}px, 100vh);
-  border: 1px solid transparent;
-  border-radius: 16px;
-  opacity: 0;
-  pointer-events: none;
-  transition:
-    opacity 120ms ease,
-    border-color 120ms ease,
-    background 120ms ease;
-
-  &[data-active="true"] {
-    border-color: rgba(147, 197, 253, 0.24);
-    background: rgba(37, 99, 235, 0.08);
-    opacity: 1;
-  }
 `;
 
 const QuickAccessCard = styled.article`
@@ -1658,30 +1687,6 @@ const StrokeControl = styled.label`
   }
 `;
 
-const EditorSaveButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  margin-left: auto;
-  padding: 8px 10px;
-  border: 1px solid rgba(89, 211, 153, 0.32);
-  border-radius: 10px;
-  color: #d8ffe9;
-  background: rgba(22, 101, 52, 0.34);
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 850;
-
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  &:hover {
-    border-color: rgba(89, 211, 153, 0.52);
-    background: rgba(22, 101, 52, 0.48);
-  }
-`;
 
 const EditorCanvasStage = styled.section`
   display: grid;
@@ -1702,6 +1707,21 @@ const EditorCanvasStage = styled.section`
       0 24px 70px rgba(0, 0, 0, 0.5),
       0 0 0 1px rgba(255, 255, 255, 0.08);
     cursor: crosshair;
+  }
+`;
+
+const EditorTargetSelect = styled.select`
+  max-width: 160px;
+  padding: 8px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #f8fafc;
+  background: rgba(15, 20, 28, 0.9);
+  font-size: 11.5px;
+  font-weight: 650;
+
+  &:disabled {
+    opacity: 0.5;
   }
 `;
 

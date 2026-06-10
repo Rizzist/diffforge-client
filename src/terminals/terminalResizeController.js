@@ -749,6 +749,8 @@ export function createTerminalResizeController({
       observer.disconnect();
     },
     flushScheduledResize,
+    getLastNativeAppliedSize: () => (lastNativeAppliedSize ? { ...lastNativeAppliedSize } : null),
+    hasPendingNativeResize: () => Boolean(pendingNativeRequest || nativeInFlight),
     resizeNow,
     schedule,
   };

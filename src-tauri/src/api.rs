@@ -641,6 +641,91 @@ async fn validate_workspace_root_directory(path: String) -> Result<ForgeWorkingD
     .map_err(|error| format!("Unable to validate workspace root directory: {error}"))?
 }
 
+/// Directory navigation for the inline create-workspace panel: unlike
+/// `validate_workspace_root_directory`, browsing may pass through directories
+/// (home, system folders) that are not eligible workspace roots — eligibility
+/// is reported separately so the UI can disable Create instead of blocking
+/// navigation.
+#[tauri::command]
+async fn browse_workspace_root_directory(
+    path: Option<String>,
+) -> Result<WorkspaceRootBrowse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw = path.unwrap_or_default();
+        let trimmed = raw.trim();
+        let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
+            let home = user_home_dir()
+                .ok_or_else(|| "Unable to resolve the home directory.".to_string())?;
+            if trimmed == "~" {
+                home
+            } else {
+                home.join(trimmed.trim_start_matches("~/"))
+            }
+        } else if trimmed.is_empty() {
+            default_working_directory()?
+        } else {
+            PathBuf::from(trimmed)
+        };
+        if expanded
+            .to_string_lossy()
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'\x7f')
+        {
+            return Err("Directory path is invalid.".to_string());
+        }
+        let canonical = expanded
+            .canonicalize()
+            .map_err(|error| format!("Unable to open that directory: {error}"))?;
+        let metadata = fs::metadata(&canonical)
+            .map_err(|error| format!("Unable to inspect that directory: {error}"))?;
+        if !metadata.is_dir() {
+            return Err("That path is not a directory.".to_string());
+        }
+
+        let mut directories = Vec::new();
+        let mut truncated = false;
+        let mut entry_count = 0usize;
+        if let Ok(read_dir) = fs::read_dir(&canonical) {
+            for entry in read_dir.flatten() {
+                entry_count += 1;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_directory = entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false);
+                if !is_directory {
+                    continue;
+                }
+                if directories.len() >= 200 {
+                    truncated = true;
+                    break;
+                }
+                directories.push(name);
+            }
+        }
+        directories.sort_by_key(|name| name.to_lowercase());
+
+        let rejection_reason = workspace_root_rejection_reason(&canonical);
+        Ok(WorkspaceRootBrowse {
+            working_directory: workspace_path_display(&canonical),
+            parent_directory: canonical
+                .parent()
+                .map(|parent| workspace_path_display(parent)),
+            directories,
+            truncated,
+            empty_directory: entry_count == 0,
+            git_repository: canonical.join(".git").exists(),
+            root_eligible: rejection_reason.is_none(),
+            root_rejection_reason: rejection_reason.map(str::to_string),
+        })
+    })
+    .await
+    .map_err(|error| format!("Unable to browse workspace directory: {error}"))?
+}
+
 #[tauri::command]
 async fn list_workspace_directory(
     root: String,

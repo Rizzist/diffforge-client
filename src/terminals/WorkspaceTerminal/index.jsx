@@ -4760,11 +4760,55 @@ function WorkspaceTerminal({
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
+    let lastTerminalSizeDesyncSignature = "";
+    const checkTerminalSizeDesyncOnInput = (reason) => {
+      const nativeSize = resizeController?.getLastNativeAppliedSize?.();
+      if (
+        !nativeSize
+        || resizeController?.hasPendingNativeResize?.()
+        || nativeSize.paneId !== paneId
+        || Number(nativeSize.instanceId || 0) !== Number(terminalInstanceId || 0)
+      ) {
+        return;
+      }
+
+      const terminalCols = Number(terminal?.cols || 0);
+      const terminalRows = Number(terminal?.rows || 0);
+      if (
+        !terminalCols
+        || !terminalRows
+        || (nativeSize.cols === terminalCols && nativeSize.rows === terminalRows)
+      ) {
+        return;
+      }
+
+      const signature = `${nativeSize.cols}x${nativeSize.rows}->${terminalCols}x${terminalRows}`;
+      if (signature !== lastTerminalSizeDesyncSignature) {
+        lastTerminalSizeDesyncSignature = signature;
+        logTerminalDiagnosticEvent("frontend.terminal_size_desync", {
+          isGenericTerminal,
+          nativeCols: nativeSize.cols,
+          nativeRows: nativeSize.rows,
+          paneId,
+          reason,
+          terminalCols,
+          terminalRows,
+          terminalIndex,
+        });
+      }
+      if (isGenericTerminal) {
+        resizeController?.resizeNow("interactive_input_size_desync", {
+          force: true,
+          forceNative: true,
+        });
+      }
+    };
     const noteTerminalInteractiveInput = (reason = "input", durationMs = 0) => {
       terminalGlobalRenderScheduler.noteInteractiveInput?.(renderSchedulerId, {
         durationMs,
         reason,
       });
+      checkTerminalSizeDesyncOnInput(reason);
     };
     terminalInstanceIdRef.current = terminalInstanceId;
     resetTerminalReadinessForEpoch({
@@ -4855,7 +4899,9 @@ function WorkspaceTerminal({
       lineHeight: 1.0,
       macOptionIsMeta: true,
       // Codex keeps cwd/status text on the live cursor row; do not let narrow resizes reflow stale worktree cells.
-      reflowCursorLine: false,
+      // Plain shells are the opposite: the cursor row is the prompt/input line and only the shell's WINCH redraw
+      // repaints it, so it must reflow with the rest of the buffer or resizes leave a stale gap in the input line.
+      reflowCursorLine: isGenericTerminal,
       scrollSensitivity: 1,
       scrollOnEraseInDisplay: false,
       scrollback: TERMINAL_DEFAULT_SCROLLBACK_ROWS,
@@ -8862,6 +8908,9 @@ function WorkspaceTerminal({
       container,
       defaultCols: TERMINAL_DEFAULT_COLS,
       defaultRows: TERMINAL_DEFAULT_ROWS,
+      // Plain shells repaint only the prompt row, and only on SIGWINCH; deferring the PTY resize
+      // behind the agent-tuned commit window leaves zsh wrapping the input line at a stale width.
+      ...(isGenericTerminal ? { nativeResizeCommitMs: 0, nativeResizeTrailingMs: 0 } : {}),
       instanceId: () => terminalInstanceId,
       maxCols: TERMINAL_MAX_COLS,
       maxRows: TERMINAL_MAX_ROWS,
@@ -11635,6 +11684,15 @@ function WorkspaceTerminal({
             title: "Terminal Running",
             visible: false,
           });
+          if (isGenericTerminal) {
+            // The PTY spawned at the size measured before open; any layout settle since then was
+            // frontend-only. Force one committed PTY resize so the shell's first prompt row is laid
+            // out at the real width before the user starts typing.
+            resizeController?.resizeNow("generic_shell_open_settled", {
+              force: true,
+              forceNative: true,
+            });
+          }
           scheduleCodingAgentInputReady("terminal_open_done");
         }
         const startupMs = performance.now() - openStartedAt;

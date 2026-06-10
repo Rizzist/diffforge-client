@@ -610,47 +610,6 @@ export default function SnippingWorkspaceView({
           </AudioRecorderOptionRow>
         </AudioDevicePanel>
 
-        <AudioDevicePanel>
-          <AudioDeviceHeader>
-            <div>
-              <SettingsLabel>Recent untracked snips</SettingsLabel>
-              <SettingsHint>These are local scratch files. Track them from Assets when they should sync.</SettingsHint>
-            </div>
-            <SecondaryButton disabled={untrackedLoading} onClick={() => onUntrackedRefresh?.({ silent: false })} type="button">
-              <ButtonRefreshIcon aria-hidden="true" />
-              <span>{untrackedLoading ? "Refreshing..." : "Refresh"}</span>
-            </SecondaryButton>
-          </AudioDeviceHeader>
-
-          {snips.length ? (
-            <SnipPreviewGrid>
-              {snips.map((asset) => {
-                const localPath = assetLocalPath(asset);
-                const previewUrl = assetPreviewUrl(asset);
-                return (
-                  <SnipPreviewCard key={asset?.id || localPath || assetName(asset)} type="button" onClick={() => openSnip(asset)}>
-                    {previewUrl ? (
-                      <img alt={assetName(asset)} draggable={false} src={previewUrl} />
-                    ) : (
-                      <SnipPreviewFallback aria-hidden="true">
-                        <ButtonFolderIcon />
-                      </SnipPreviewFallback>
-                    )}
-                    <span>
-                      <strong>{assetName(asset)}</strong>
-                      <small>{formatFileSize(asset?.sizeBytes || asset?.size_bytes)} / {formatRecentTime(assetModifiedMs(asset))}</small>
-                    </span>
-                  </SnipPreviewCard>
-                );
-              })}
-            </SnipPreviewGrid>
-          ) : (
-            <SnippingEmptyState>
-              {untrackedLoading ? "Loading snips..." : "No snips yet. Take a screenshot or select an area to create one."}
-            </SnippingEmptyState>
-          )}
-        </AudioDevicePanel>
-
         {error && <FormMessage $state="error">{error}</FormMessage>}
       </SnippingPanel>
     </AudioWorkspaceSurface>

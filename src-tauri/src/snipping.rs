@@ -103,6 +103,7 @@ struct SnippingState {
     active_area_snapshot: Arc<StdMutex<Option<Arc<xcap::image::RgbaImage>>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
     asset_target: Arc<StdMutex<SnippingAssetTarget>>,
+    dispatch_targets: Arc<StdMutex<Value>>,
 }
 
 impl SnippingState {
@@ -113,6 +114,7 @@ impl SnippingState {
             active_area_snapshot: Arc::new(StdMutex::new(None)),
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
             asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
+            dispatch_targets: Arc::new(StdMutex::new(Value::Array(Vec::new()))),
         }
     }
 }
@@ -1406,11 +1408,25 @@ fn ensure_snipping_toast_window(app: &AppHandle) -> Result<tauri::WebviewWindow,
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(false)
+    .visible_on_all_workspaces(true)
     .build()
     .map_err(|error| format!("Unable to create snipping preview window: {error}"))?;
 
     position_snipping_toast_window(app, &window);
     let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+    // The preview dock must stay visible over full-screen Spaces too (e.g.
+    // a full-screen browser the user swipes to).
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = window.ns_window() {
+        if !ns_window.is_null() {
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+            );
+        }
+    }
     Ok(window)
 }
 
@@ -1626,7 +1642,8 @@ fn snipping_prepare_capture_path(mode: &str) -> Result<(PathBuf, PathBuf), Strin
     Ok((target, tmp))
 }
 
-fn snipping_emit_untracked_image_saved(
+#[allow(clippy::too_many_arguments)]
+fn snipping_emit_untracked_image_saved_with_toast(
     app: &AppHandle,
     target: &Path,
     width: u32,
@@ -1635,6 +1652,7 @@ fn snipping_emit_untracked_image_saved(
     reason: &str,
     shortcut: String,
     original_path: Option<String>,
+    show_toast: bool,
 ) -> Result<Value, String> {
     let root = diffforge_prepare_untracked_asset_root()?;
     let item = diffforge_untracked_asset_item(&root, target).ok();
@@ -1659,9 +1677,35 @@ fn snipping_emit_untracked_image_saved(
     });
     diffforge_emit_untracked_assets_updated(app, "snip-saved", payload.get("item").cloned());
     snipping_push_recent_capture_toast(app, payload.clone());
-    show_snipping_toast_window(app);
+    if show_toast {
+        show_snipping_toast_window(app);
+    }
     let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
     Ok(payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snipping_emit_untracked_image_saved(
+    app: &AppHandle,
+    target: &Path,
+    width: u32,
+    height: u32,
+    mode: &str,
+    reason: &str,
+    shortcut: String,
+    original_path: Option<String>,
+) -> Result<Value, String> {
+    snipping_emit_untracked_image_saved_with_toast(
+        app,
+        target,
+        width,
+        height,
+        mode,
+        reason,
+        shortcut,
+        original_path,
+        true,
+    )
 }
 
 /// Writes a capture as PNG with fast compression. Default PNG settings spend
@@ -1829,7 +1873,9 @@ fn snipping_open_annotation_editor_for_paths(
     .min_inner_size(360.0, 260.0)
     .resizable(true)
     .decorations(false)
-    .always_on_top(true)
+    // Normal z-order: clicking the main Diff Forge window brings it in front
+    // of the annotation editor.
+    .always_on_top(false)
     .focused(true)
     .accept_first_mouse(true)
     .transparent(true)
@@ -1984,7 +2030,9 @@ fn snipping_save_edited_untracked_asset_for(
             target.display()
         )
     })?;
-    snipping_emit_untracked_image_saved(
+    // Autosaved in-place updates refresh the dock card quietly; only the
+    // first save of a new edited copy raises the dock window.
+    snipping_emit_untracked_image_saved_with_toast(
         app,
         &target,
         width,
@@ -1993,6 +2041,7 @@ fn snipping_save_edited_untracked_asset_for(
         "annotation-editor",
         String::new(),
         original_path,
+        !source_is_edited_copy,
     )
 }
 
@@ -2603,6 +2652,156 @@ fn snipping_save_edited_untracked_asset(
     request: SnippingEditedAssetRequest,
 ) -> Result<Value, String> {
     snipping_save_edited_untracked_asset_for(&app, request)
+}
+
+const SNIPPING_FLOAT_WINDOW_PREFIX: &str = "snip-float";
+const SNIPPING_FLOAT_RETURNED_EVENT: &str = "forge-snip-float-returned";
+const SNIPPING_FLOAT_LOGICAL_WIDTH: f64 = 240.0;
+
+fn snipping_windows_intersect(
+    left: (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>),
+    right: (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>),
+) -> bool {
+    let (left_pos, left_size) = left;
+    let (right_pos, right_size) = right;
+    let left_x2 = left_pos.x.saturating_add(left_size.width as i32);
+    let left_y2 = left_pos.y.saturating_add(left_size.height as i32);
+    let right_x2 = right_pos.x.saturating_add(right_size.width as i32);
+    let right_y2 = right_pos.y.saturating_add(right_size.height as i32);
+    left_pos.x < right_x2 && right_pos.x < left_x2 && left_pos.y < right_y2 && right_pos.y < left_y2
+}
+
+/// Opens one snip preview as its own small native window at the given
+/// logical screen position. Dragging it over the queue dock sends it back:
+/// the dock is notified and the float closes itself.
+#[tauri::command]
+fn snipping_open_snip_float(
+    app: AppHandle,
+    path: String,
+    x: f64,
+    y: f64,
+) -> Result<Value, String> {
+    let file = diffforge_local_asset_file(&path)?;
+    let (image_width, image_height) = xcap::image::image_dimensions(&file)
+        .map_err(|error| format!("Unable to read snip dimensions: {error}"))?;
+    let aspect = if image_width > 0 {
+        f64::from(image_height) / f64::from(image_width)
+    } else {
+        0.75
+    };
+    let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
+    let height = (width * aspect).clamp(60.0, 420.0);
+    let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
+    let encoded_path = snipping_url_token(&file.display().to_string());
+    let window = WebviewWindowBuilder::new(
+        &app,
+        label.clone(),
+        WebviewUrl::App(format!("index.html#/snipping-float/{encoded_path}").into()),
+    )
+    .title("Snip")
+    .inner_size(width, height)
+    .position(x.max(0.0), y.max(0.0))
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .focused(true)
+    .accept_first_mouse(true)
+    .skip_taskbar(true)
+    .visible_on_all_workspaces(true)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
+    .shadow(true)
+    .build()
+    .map_err(|error| format!("Unable to create snip float window: {error}"))?;
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = window.ns_window() {
+        if !ns_window.is_null() {
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+            );
+        }
+    }
+
+    // Drag-back-to-queue: once the float has been away from the dock at
+    // least once, moving it over the dock returns the snip to the queue.
+    let has_left_dock = Arc::new(AtomicBool::new(false));
+    let app_for_events = app.clone();
+    let float_label = label.clone();
+    let float_path = file.display().to_string();
+    window.on_window_event(move |event| {
+        if !matches!(event, tauri::WindowEvent::Moved(_)) {
+            return;
+        }
+        let Some(float_window) = app_for_events.get_webview_window(&float_label) else {
+            return;
+        };
+        let Some(dock_window) = app_for_events.get_webview_window(SNIPPING_TOAST_WINDOW_LABEL)
+        else {
+            return;
+        };
+        if !dock_window.is_visible().unwrap_or(false) {
+            return;
+        }
+        let (Ok(float_pos), Ok(float_size), Ok(dock_pos), Ok(dock_size)) = (
+            float_window.outer_position(),
+            float_window.outer_size(),
+            dock_window.outer_position(),
+            dock_window.outer_size(),
+        ) else {
+            return;
+        };
+        let overlapping =
+            snipping_windows_intersect((float_pos, float_size), (dock_pos, dock_size));
+        if !overlapping {
+            has_left_dock.store(true, Ordering::SeqCst);
+            return;
+        }
+        if !has_left_dock.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = app_for_events.emit_to(
+            SNIPPING_TOAST_WINDOW_LABEL,
+            SNIPPING_FLOAT_RETURNED_EVENT,
+            json!({
+                "kind": "snip_float_returned",
+                "path": float_path.clone(),
+                "local_path": float_path.clone(),
+                "localPath": float_path.clone(),
+            }),
+        );
+        let _ = float_window.close();
+    });
+
+    Ok(json!({
+        "kind": "snip_float_opened",
+        "label": label,
+        "path": file.display().to_string(),
+        "width": width,
+        "height": height,
+    }))
+}
+
+#[tauri::command]
+fn snipping_set_dispatch_targets(app: AppHandle, targets: Value) -> Result<Value, String> {
+    let state = app.state::<SnippingState>();
+    let mut guard = state
+        .dispatch_targets
+        .lock()
+        .map_err(|_| "Unable to lock snipping dispatch targets.".to_string())?;
+    *guard = if targets.is_array() { targets } else { Value::Array(Vec::new()) };
+    Ok(json!({"ok": true}))
+}
+
+#[tauri::command]
+fn snipping_dispatch_targets(app: AppHandle) -> Result<Value, String> {
+    app.state::<SnippingState>()
+        .dispatch_targets
+        .lock()
+        .map(|guard| guard.clone())
+        .map_err(|_| "Unable to lock snipping dispatch targets.".to_string())
 }
 
 #[tauri::command]

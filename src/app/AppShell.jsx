@@ -518,6 +518,27 @@ import {
   FileExpandIcon,
   FileFolderTreeIcon,
   FileDocumentIcon,
+  WorkspaceCreateLayer,
+  WorkspaceCreateSurface,
+  WorkspaceCreateCard,
+  WorkspaceCreateHeader,
+  WorkspaceCreateSection,
+  WorkspaceCreatePathBar,
+  WorkspaceCreatePathText,
+  WorkspaceCreatePathBadge,
+  WorkspaceCreateCdForm,
+  WorkspaceCreateCdPrompt,
+  WorkspaceCreateCdInput,
+  WorkspaceCreateDirGrid,
+  WorkspaceCreateDirChip,
+  WorkspaceCreateAgentGrid,
+  WorkspaceCreateAgentCard,
+  WorkspaceCreateAgentLabel,
+  WorkspaceCreateAgentStepper,
+  WorkspaceCreateAgentStepButton,
+  WorkspaceCreatePreviewRow,
+  WorkspaceCreatePreviewDot,
+  WorkspaceCreateFooter,
   VIEW_TRANSITION_MS
 } from "./appStyles";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
@@ -534,7 +555,9 @@ import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EV
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
+  SnippingFloatWindow,
   SNIPPING_EDITOR_HASH,
+  SNIPPING_FLOAT_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
@@ -2997,67 +3020,368 @@ function WorkspaceIdleState({ detail = "No workspace selected.", viewMotion }) {
   );
 }
 
-function FirstWorkspaceSetup({
-  chooseNewWorkspaceRootDirectory,
-  createFirstWorkspace,
+
+const WORKSPACE_CREATE_AGENT_ROLE_CAP = 8;
+
+function expandWorkspaceCreateAgentCounts(roleOptions, agentCounts) {
+  return roleOptions.flatMap((option) => (
+    Array.from({ length: Math.max(0, Number(agentCounts[option.id]) || 0) }, () => option.id)
+  ));
+}
+
+/**
+ * Inline create-workspace panel rendered in the main area right of the
+ * workspace rail. The directory is navigated like a shell: a cd input plus a
+ * browsable listing of subdirectories, and coding agents are picked with
+ * per-agent steppers instead of count + per-terminal dropdowns.
+ */
+function WorkspaceCreatePanel({
+  agentStatuses,
+  chooseNativeDirectory,
   defaultWorkingDirectory,
-  newWorkspaceRootDraft,
+  fallbackRole,
+  onClose,
+  onSubmit,
+  roleOptions,
+  rootDraft,
+  setRootDraft,
   setWorkspaceName,
-  useDefaultNewWorkspaceRoot,
+  visible,
   workspaceError,
   workspaceName,
   workspaceSyncState,
 }) {
+  const [browse, setBrowse] = useState(null);
+  const [browseError, setBrowseError] = useState("");
+  const [cdDraft, setCdDraft] = useState("");
+  const [agentCounts, setAgentCounts] = useState({});
+  const browseSeqRef = useRef(0);
+  const browseRef = useRef(null);
+  const creating = workspaceSyncState === "creating";
+
+  const browseTo = useCallback(async (path) => {
+    const seq = browseSeqRef.current + 1;
+    browseSeqRef.current = seq;
+    setBrowseError("");
+    try {
+      const result = await invoke("browse_workspace_root_directory", {
+        path: String(path || "").trim() || null,
+      });
+      if (browseSeqRef.current !== seq) {
+        return;
+      }
+      browseRef.current = result;
+      setBrowse(result);
+      if (result?.workingDirectory) {
+        setRootDraft(result.workingDirectory);
+      }
+    } catch (error) {
+      if (browseSeqRef.current !== seq) {
+        return;
+      }
+      setBrowseError(getErrorMessage(error, "Unable to open that directory."));
+    }
+  }, [setRootDraft]);
+
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    setCdDraft("");
+    setBrowseError("");
+    setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
+    void browseTo(rootDraft || defaultWorkingDirectory || "");
+    // Reset only when the panel opens; rootDraft changes are handled below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible || !rootDraft) {
+      return;
+    }
+    if (browseRef.current?.workingDirectory === rootDraft) {
+      return;
+    }
+    void browseTo(rootDraft);
+  }, [browseTo, rootDraft, visible]);
+
+  const submitCd = useCallback(() => {
+    const raw = cdDraft.trim();
+    if (!raw) {
+      return;
+    }
+    const command = raw.replace(/^cd\s+/i, "").trim() || "~";
+    const currentDirectory = browseRef.current?.workingDirectory
+      || rootDraft
+      || defaultWorkingDirectory
+      || "";
+    const isAbsolute = command === "~"
+      || command.startsWith("~/")
+      || command.startsWith("/")
+      || /^[A-Za-z]:[\\/]/.test(command);
+    const target = isAbsolute ? command : `${currentDirectory}/${command}`;
+    setCdDraft("");
+    void browseTo(target);
+  }, [browseTo, cdDraft, defaultWorkingDirectory, rootDraft]);
+
+  const adjustAgentCount = useCallback((roleId, delta) => {
+    setAgentCounts((current) => {
+      const totalOther = roleOptions.reduce((sum, option) => (
+        option.id === roleId ? sum : sum + Math.max(0, Number(current[option.id]) || 0)
+      ), 0);
+      const currentValue = Math.max(0, Number(current[roleId]) || 0);
+      const maxForRole = Math.min(
+        WORKSPACE_CREATE_AGENT_ROLE_CAP,
+        MAX_WORKSPACE_TERMINAL_COUNT - totalOther,
+      );
+      const nextValue = Math.max(0, Math.min(maxForRole, currentValue + delta));
+      if (nextValue === currentValue) {
+        return current;
+      }
+      return { ...current, [roleId]: nextValue };
+    });
+  }, [roleOptions]);
+
+  const terminalRoles = useMemo(
+    () => expandWorkspaceCreateAgentCounts(roleOptions, agentCounts),
+    [agentCounts, roleOptions],
+  );
+  const installedAgentById = useMemo(() => {
+    const byId = new Map();
+    (Array.isArray(agentStatuses) ? agentStatuses : []).forEach((agent) => {
+      if (agent?.id) {
+        byId.set(agent.id, agent);
+      }
+    });
+    return byId;
+  }, [agentStatuses]);
+  const roleLabelById = useMemo(() => {
+    const byId = new Map();
+    roleOptions.forEach((option) => byId.set(option.id, option));
+    return byId;
+  }, [roleOptions]);
+
+  const currentDirectory = browse?.workingDirectory || rootDraft || defaultWorkingDirectory || "";
+  const rootEligible = browse ? browse.rootEligible !== false : true;
+  const canCreate = Boolean(
+    !creating
+      && workspaceName.trim()
+      && currentDirectory
+      && rootEligible
+      && terminalRoles.length > 0,
+  );
+
   return (
-    <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
-      <SetupHeader>
-        <Kicker>First workspace</Kicker>
-        <DashboardTitle>Create your workspace</DashboardTitle>
-        <PageSubline>Name it and choose the project root that will be bound to this workspace.</PageSubline>
-      </SetupHeader>
-      {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
-      <SetupField>
-        <SettingsLabel>Workspace name</SettingsLabel>
-        <SetupInput
-          maxLength={80}
-          onChange={(event) => setWorkspaceName(event.target.value)}
-          placeholder="My workspace"
-          value={workspaceName}
-        />
-      </SetupField>
-      <WorkspaceRootChooser>
-        <SettingsLabel>Root directory</SettingsLabel>
-        <RootDirectoryInput
-          maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
-          placeholder={defaultWorkingDirectory || "Choose project root"}
-          readOnly
-          title={newWorkspaceRootDraft || defaultWorkingDirectory}
-          value={newWorkspaceRootDraft || defaultWorkingDirectory}
-        />
-        <WorkspaceRootActions>
-          <SecondaryButton
-            disabled={workspaceSyncState === "creating"}
-            onClick={chooseNewWorkspaceRootDirectory}
-            type="button"
-          >
-            <ButtonFolderIcon aria-hidden="true" />
-            <span>Choose directory</span>
-          </SecondaryButton>
-          <SecondaryButton
-            disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
-            onClick={useDefaultNewWorkspaceRoot}
-            type="button"
-          >
-            <ButtonFolderIcon aria-hidden="true" />
-            <span>Use app dir</span>
-          </SecondaryButton>
-        </WorkspaceRootActions>
-      </WorkspaceRootChooser>
-      <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
-        <ButtonForgeIcon aria-hidden="true" />
-        <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
-      </PrimaryButton>
-    </WorkspaceSetupPanel>
+    <WorkspaceCreateSurface>
+      <WorkspaceCreateCard
+        aria-busy={creating}
+        aria-label="Create workspace"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!canCreate) {
+            return;
+          }
+          onSubmit(event, terminalRoles);
+        }}
+      >
+        <WorkspaceCreateHeader>
+          <div>
+            <PanelKicker>{onClose ? "New workspace" : "First workspace"}</PanelKicker>
+            <PanelHeading>Create workspace</PanelHeading>
+          </div>
+          {onClose && (
+            <WorkspaceModalCloseButton
+              aria-label="Close create workspace"
+              disabled={creating}
+              onClick={onClose}
+              title="Close"
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </WorkspaceModalCloseButton>
+          )}
+        </WorkspaceCreateHeader>
+
+        <WorkspaceCreateSection>
+          <SettingsLabel>Name</SettingsLabel>
+          <WorkspaceSettingsInput
+            autoFocus
+            disabled={creating}
+            maxLength={80}
+            onChange={(event) => setWorkspaceName(event.target.value)}
+            placeholder="My workspace"
+            value={workspaceName}
+          />
+        </WorkspaceCreateSection>
+
+        <WorkspaceCreateSection>
+          <SettingsLabel>Project root</SettingsLabel>
+          <WorkspaceCreatePathBar>
+            <WorkspaceCreatePathText title={currentDirectory}>
+              {currentDirectory || "Choose a directory"}
+            </WorkspaceCreatePathText>
+            {browse?.gitRepository && (
+              <WorkspaceCreatePathBadge $tone="good">git</WorkspaceCreatePathBadge>
+            )}
+            {browse && !rootEligible && (
+              <WorkspaceCreatePathBadge $tone="warn">not usable</WorkspaceCreatePathBadge>
+            )}
+            {browse?.emptyDirectory && rootEligible && (
+              <WorkspaceCreatePathBadge>empty</WorkspaceCreatePathBadge>
+            )}
+          </WorkspaceCreatePathBar>
+          <WorkspaceCreateCdForm>
+            <WorkspaceCreateCdPrompt aria-hidden="true">cd</WorkspaceCreateCdPrompt>
+            <WorkspaceCreateCdInput
+              aria-label="Change directory"
+              disabled={creating}
+              maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
+              onChange={(event) => setCdDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  submitCd();
+                }
+              }}
+              placeholder="../sibling, ~/projects/app, or a subfolder below"
+              spellCheck={false}
+              value={cdDraft}
+            />
+          </WorkspaceCreateCdForm>
+          <WorkspaceCreateDirGrid aria-label="Subdirectories">
+            {browse?.parentDirectory && (
+              <WorkspaceCreateDirChip
+                data-up="true"
+                disabled={creating}
+                onClick={() => browseTo(browse.parentDirectory)}
+                title={browse.parentDirectory}
+                type="button"
+              >
+                <span>..</span>
+              </WorkspaceCreateDirChip>
+            )}
+            {(browse?.directories || []).map((name) => (
+              <WorkspaceCreateDirChip
+                disabled={creating}
+                key={name}
+                onClick={() => browseTo(`${currentDirectory}/${name}`)}
+                title={name}
+                type="button"
+              >
+                <FileFolderTreeIcon aria-hidden="true" />
+                <span>{name}</span>
+              </WorkspaceCreateDirChip>
+            ))}
+            {browse && !browse.directories?.length && !browse.parentDirectory && (
+              <SettingsHint>No subfolders here.</SettingsHint>
+            )}
+          </WorkspaceCreateDirGrid>
+          {browse?.truncated && (
+            <SettingsHint>Showing the first 200 folders; use cd to go deeper.</SettingsHint>
+          )}
+          {browse && !rootEligible && (
+            <FormMessage $state="error">
+              {browse.rootRejectionReason || "This directory cannot be a workspace root. Pick a project folder inside it."}
+            </FormMessage>
+          )}
+          {browseError && <FormMessage $state="error">{browseError}</FormMessage>}
+          <WorkspaceCreateFooter>
+            <SecondaryButton disabled={creating} onClick={chooseNativeDirectory} type="button">
+              <ButtonFolderIcon aria-hidden="true" />
+              <span>Browse...</span>
+            </SecondaryButton>
+            <SecondaryButton
+              disabled={!defaultWorkingDirectory || creating}
+              onClick={() => browseTo(defaultWorkingDirectory)}
+              type="button"
+            >
+              <ButtonFolderIcon aria-hidden="true" />
+              <span>App directory</span>
+            </SecondaryButton>
+          </WorkspaceCreateFooter>
+        </WorkspaceCreateSection>
+
+        <WorkspaceCreateSection>
+          <SettingsLabel>Coding agents</SettingsLabel>
+          <SettingsHint>
+            Pick how many of each agent open with this workspace. Drag the
+            counts up for parallel agents of the same kind.
+          </SettingsHint>
+          <WorkspaceCreateAgentGrid>
+            {roleOptions.map((option) => {
+              const count = Math.max(0, Number(agentCounts[option.id]) || 0);
+              const agent = installedAgentById.get(option.id);
+              const unavailable = option.id !== WORKSPACE_TERMINAL_ROLE_GENERIC
+                && agent
+                && !agent.installed;
+              return (
+                <WorkspaceCreateAgentCard
+                  $active={count > 0}
+                  data-unavailable={unavailable ? "true" : undefined}
+                  key={option.id}
+                >
+                  <WorkspaceCreateAgentLabel>
+                    <strong>{option.label}</strong>
+                    <span>
+                      {option.id === WORKSPACE_TERMINAL_ROLE_GENERIC
+                        ? "shell"
+                        : agent?.installed
+                          ? agent?.authenticated ? "ready" : "installed"
+                          : "agent"}
+                    </span>
+                  </WorkspaceCreateAgentLabel>
+                  <WorkspaceCreateAgentStepper>
+                    <WorkspaceCreateAgentStepButton
+                      aria-label={`Remove one ${option.label} terminal`}
+                      disabled={creating || count === 0}
+                      onClick={() => adjustAgentCount(option.id, -1)}
+                      type="button"
+                    >
+                      -
+                    </WorkspaceCreateAgentStepButton>
+                    <strong>{count}</strong>
+                    <WorkspaceCreateAgentStepButton
+                      aria-label={`Add one ${option.label} terminal`}
+                      disabled={creating}
+                      onClick={() => adjustAgentCount(option.id, 1)}
+                      type="button"
+                    >
+                      +
+                    </WorkspaceCreateAgentStepButton>
+                  </WorkspaceCreateAgentStepper>
+                </WorkspaceCreateAgentCard>
+              );
+            })}
+          </WorkspaceCreateAgentGrid>
+          <WorkspaceCreatePreviewRow aria-label="Terminals that will open">
+            {terminalRoles.length ? (
+              terminalRoles.map((roleId, index) => (
+                <WorkspaceCreatePreviewDot
+                  $color={TERMINAL_AGENT_COLOR_HEX_BY_SLOT[index % TERMINAL_AGENT_COLOR_HEX_BY_SLOT.length]}
+                  key={`${roleId}-${index}`}
+                >
+                  {roleLabelById.get(roleId)?.shortLabel || roleId}
+                </WorkspaceCreatePreviewDot>
+              ))
+            ) : (
+              <SettingsHint>Add at least one terminal to open with the workspace.</SettingsHint>
+            )}
+          </WorkspaceCreatePreviewRow>
+        </WorkspaceCreateSection>
+
+        {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
+
+        <WorkspaceCreateFooter>
+          <SettingsHint>
+            {terminalRoles.length} terminal{terminalRoles.length === 1 ? "" : "s"} will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
+          </SettingsHint>
+          <PrimaryButton disabled={!canCreate} type="submit">
+            <ButtonAddIcon aria-hidden="true" />
+            <span>{creating ? "Creating..." : "Create workspace"}</span>
+          </PrimaryButton>
+        </WorkspaceCreateFooter>
+      </WorkspaceCreateCard>
+    </WorkspaceCreateSurface>
   );
 }
 
@@ -5819,6 +6143,10 @@ export default function App() {
 
   if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {
     return <SnippingAnnotationEditorWindow />;
+  }
+
+  if (window.location.hash.startsWith(SNIPPING_FLOAT_HASH)) {
+    return <SnippingFloatWindow />;
   }
 
   if (window.location.hash === SNIPPING_TOAST_HASH) {
@@ -10212,7 +10540,11 @@ export default function App() {
     setNewWorkspaceRootDraft(defaultWorkingDirectory || "");
     setWorkspaceError("");
     setWorkspaceCreateModalOpen(true);
-  }, [defaultWorkingDirectory]);
+    // The create panel lives in the main workspace view, not a modal.
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      telemetrySource: "workspace_create_panel",
+    });
+  }, [defaultWorkingDirectory, showView]);
 
   const closeCreateWorkspaceModal = useCallback(() => {
     if (workspaceSyncState === "creating") {
@@ -10223,7 +10555,7 @@ export default function App() {
     setWorkspaceError("");
   }, [workspaceSyncState]);
 
-  const createFirstWorkspace = useCallback(async (event) => {
+  const createFirstWorkspace = useCallback(async (event, requestedTerminalRoles = null) => {
     event.preventDefault();
 
     const token = authStore.getToken();
@@ -10290,9 +10622,15 @@ export default function App() {
         ...existingWorkspaces.filter((item) => item.id !== workspace.id),
         workspace,
       ];
+      const terminalRoles = Array.isArray(requestedTerminalRoles) && requestedTerminalRoles.length
+        ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
+        : null;
       const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
         rootDirectory,
         rootWasEmptyAtSelection,
+        ...(terminalRoles
+          ? { terminalCount: terminalRoles.length, terminalRoles }
+          : {}),
       });
       const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
       const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(currentLifecycleSettings.enabledWorkspaceIds);
@@ -15284,6 +15622,40 @@ export default function App() {
     snippingAssetTarget.workspaceName,
   ]);
   useEffect(() => {
+    // Publish workspace + terminal targets so the annotation editor window
+    // can queue todos at a chosen workspace/terminal.
+    const targets = (Array.isArray(workspaces) ? workspaces : [])
+      .map((workspace) => {
+        const workspaceId = String(workspace?.id || "").trim();
+        if (!workspaceId) return null;
+        const entry = workspaceThreads?.[workspaceId] || {};
+        const threads = Object.entries(entry.threads || {})
+          .map(([threadId, thread]) => {
+            if (!thread || thread.archivedAt) return null;
+            const bindings = thread.providerBindings || {};
+            const binding = bindings[thread.currentAgent] || Object.values(bindings)[0] || {};
+            const label = String(
+              binding.terminalNickname
+                || binding.displayName
+                || thread.sessionName
+                || thread.title
+                || "",
+            ).trim();
+            if (!label) return null;
+            return { threadId, label };
+          })
+          .filter(Boolean)
+          .slice(0, 24);
+        return {
+          workspaceId,
+          workspaceName: String(workspace?.name || workspaceId).trim(),
+          threads,
+        };
+      })
+      .filter(Boolean);
+    invoke("snipping_set_dispatch_targets", { targets }).catch(() => {});
+  }, [workspaceThreads, workspaces]);
+  useEffect(() => {
     let disposed = false;
     let unlistenAnnotationTodo = null;
 
@@ -15357,6 +15729,9 @@ export default function App() {
               sourcePaths,
             },
             source: "snipping-annotation",
+            ...(String(payload.targetThreadId || payload.target_thread_id || "").trim()
+              ? { targetThreadId: String(payload.targetThreadId || payload.target_thread_id).trim() }
+              : {}),
             text,
             workspaceId,
           },
@@ -22466,13 +22841,18 @@ export default function App() {
                       aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW}
                       data-visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                     >
-                      <FirstWorkspaceSetup
-                        chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
-                        createFirstWorkspace={createFirstWorkspace}
+                      <WorkspaceCreatePanel
+                        agentStatuses={agentStatuses}
+                        chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
                         defaultWorkingDirectory={defaultWorkingDirectory}
-                        newWorkspaceRootDraft={newWorkspaceRootDraft}
+                        fallbackRole={workspaceTerminalFallbackRole}
+                        onClose={null}
+                        onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
+                        roleOptions={workspaceTerminalRoleOptions}
+                        rootDraft={newWorkspaceRootDraft}
+                        setRootDraft={setNewWorkspaceRootDraft}
                         setWorkspaceName={setWorkspaceName}
-                        useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
+                        visible={visibleView === DEFAULT_WORKSPACE_VIEW}
                         workspaceError={workspaceError}
                         workspaceName={workspaceName}
                         workspaceSyncState={workspaceSyncState}
@@ -22597,6 +22977,29 @@ export default function App() {
                       <WorkspaceIdleState detail={defaultWorkspaceIdleDetail} viewMotion={viewMotion} />
                     </WorkspaceRuntimeLayer>
                   )}
+                  <WorkspaceCreateLayer
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !workspaceCreateModalOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && workspaceCreateModalOpen}
+                  >
+                    {workspaceCreateModalOpen && (
+                      <WorkspaceCreatePanel
+                        agentStatuses={agentStatuses}
+                        chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
+                        defaultWorkingDirectory={defaultWorkingDirectory}
+                        fallbackRole={workspaceTerminalFallbackRole}
+                        onClose={closeCreateWorkspaceModal}
+                        onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
+                        roleOptions={workspaceTerminalRoleOptions}
+                        rootDraft={newWorkspaceRootDraft}
+                        setRootDraft={setNewWorkspaceRootDraft}
+                        setWorkspaceName={setWorkspaceName}
+                        visible={workspaceCreateModalOpen}
+                        workspaceError={workspaceError}
+                        workspaceName={workspaceName}
+                        workspaceSyncState={workspaceSyncState}
+                      />
+                    )}
+                  </WorkspaceCreateLayer>
                 </WorkspaceViewPane>
 
                 <WorkspaceViewPane
@@ -23254,13 +23657,18 @@ export default function App() {
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
                   {shouldShowWorkspaceSetup ? (
-                    <FirstWorkspaceSetup
-                      chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
-                      createFirstWorkspace={createFirstWorkspace}
+                    <WorkspaceCreatePanel
+                      agentStatuses={agentStatuses}
+                      chooseNativeDirectory={chooseNewWorkspaceRootDirectory}
                       defaultWorkingDirectory={defaultWorkingDirectory}
-                      newWorkspaceRootDraft={newWorkspaceRootDraft}
+                      fallbackRole={workspaceTerminalFallbackRole}
+                      onClose={null}
+                      onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
+                      roleOptions={workspaceTerminalRoleOptions}
+                      rootDraft={newWorkspaceRootDraft}
+                      setRootDraft={setNewWorkspaceRootDraft}
                       setWorkspaceName={setWorkspaceName}
-                      useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
+                      visible={visibleView === "files"}
                       workspaceError={workspaceError}
                       workspaceName={workspaceName}
                       workspaceSyncState={workspaceSyncState}
@@ -23797,105 +24205,6 @@ export default function App() {
                       </WorkspaceSettingsBusyPanel>
                     </WorkspaceSettingsBusyOverlay>
                   )}
-                </WorkspaceSettingsOverlay>
-              )}
-              {workspaceCreateModalOpen && (
-                <WorkspaceSettingsOverlay
-                  aria-label="Create workspace modal"
-                  onMouseDown={(event) => {
-                    if (event.target === event.currentTarget) {
-                      closeCreateWorkspaceModal();
-                    }
-                  }}
-                >
-                  <WorkspaceSettingsDialog
-                    aria-busy={workspaceSyncState === "creating"}
-                    aria-labelledby="workspace-create-title"
-                    aria-modal="true"
-                    role="dialog"
-                  >
-                    <WorkspaceSettingsDialogHeader>
-                      <WorkspaceSettingsHeaderMain>
-                        <div>
-                          <PanelKicker>New workspace</PanelKicker>
-                          <PanelHeading id="workspace-create-title">Create workspace</PanelHeading>
-                        </div>
-                        <SettingsHint>
-                          Choose a project root that is not already attached to another workspace.
-                        </SettingsHint>
-                      </WorkspaceSettingsHeaderMain>
-                      <WorkspaceSettingsHeaderActions>
-                        <WorkspaceModalCloseButton
-                          aria-label="Close create workspace"
-                          disabled={workspaceSyncState === "creating"}
-                          onClick={closeCreateWorkspaceModal}
-                          title="Close"
-                          type="button"
-                        >
-                          <ButtonCloseIcon aria-hidden="true" />
-                        </WorkspaceModalCloseButton>
-                      </WorkspaceSettingsHeaderActions>
-                    </WorkspaceSettingsDialogHeader>
-
-                    <WorkspaceSettingsForm onSubmit={createFirstWorkspace}>
-                      <WorkspaceSettingsSection>
-                        <WorkspaceSettingsTopGrid>
-                          <SetupField>
-                            <SettingsLabel>Name</SettingsLabel>
-                            <WorkspaceSettingsInput
-                              disabled={workspaceSyncState === "creating"}
-                              maxLength={80}
-                              minLength={1}
-                              onChange={(event) => {
-                                setWorkspaceName(event.target.value);
-                                setWorkspaceError("");
-                              }}
-                              placeholder="My workspace"
-                              value={workspaceName}
-                            />
-                          </SetupField>
-                          <WorkspaceRootChooser>
-                            <SettingsLabel>Root directory</SettingsLabel>
-                            <RootDirectoryInput
-                              disabled={workspaceSyncState === "creating"}
-                              maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
-                              placeholder={defaultWorkingDirectory || "Choose project root"}
-                              readOnly
-                              title={newWorkspaceRootDraft || defaultWorkingDirectory}
-                              value={newWorkspaceRootDraft || defaultWorkingDirectory}
-                            />
-                            <WorkspaceRootActions>
-                              <SecondaryButton
-                                disabled={workspaceSyncState === "creating"}
-                                onClick={chooseNewWorkspaceRootDirectory}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Choose directory</span>
-                              </SecondaryButton>
-                              <SecondaryButton
-                                disabled={!defaultWorkingDirectory || workspaceSyncState === "creating"}
-                                onClick={useDefaultNewWorkspaceRoot}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Use app dir</span>
-                              </SecondaryButton>
-                            </WorkspaceRootActions>
-                          </WorkspaceRootChooser>
-                        </WorkspaceSettingsTopGrid>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsActions>
-                        <PrimaryButton disabled={workspaceSyncState === "creating"} type="submit">
-                          <ButtonAddIcon aria-hidden="true" />
-                          <span>{workspaceSyncState === "creating" ? "Creating..." : "Create workspace"}</span>
-                        </PrimaryButton>
-                      </WorkspaceSettingsActions>
-                    </WorkspaceSettingsForm>
-
-                    {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
-                  </WorkspaceSettingsDialog>
                 </WorkspaceSettingsOverlay>
               )}
               </DashboardShell>
