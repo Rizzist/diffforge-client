@@ -7306,6 +7306,7 @@ export default function App() {
   const [architectureHub, setArchitectureHub] = useState({
     catalog: null,
     error: "",
+    refreshing: false,
     state: "idle",
     updatedAt: 0,
   });
@@ -7358,7 +7359,14 @@ export default function App() {
       return Promise.resolve(architectureHubRef.current.catalog);
     }
     architectureHubCatalogInFlightRef.current = true;
-    setArchitectureHub((current) => ({ ...current, error: "", state: "loading" }));
+    // Background refreshes never drop back to "loading" once a catalog is
+    // cached; that state flip is what made the hub visibly flicker.
+    setArchitectureHub((current) => ({
+      ...current,
+      error: "",
+      refreshing: true,
+      state: current.catalog ? current.state : "loading",
+    }));
     const workspaceList = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
       .map((workspace) => ({
         workspaceId: graphText(workspace?.id),
@@ -7374,6 +7382,7 @@ export default function App() {
         setArchitectureHub({
           catalog,
           error: graphText(catalog?.cloudError),
+          refreshing: false,
           state: "ready",
           updatedAt: Date.now(),
         });
@@ -7383,6 +7392,7 @@ export default function App() {
         setArchitectureHub((current) => ({
           ...current,
           error: getErrorMessage(error, "Unable to load the architecture catalog."),
+          refreshing: false,
           state: current.catalog ? "ready" : "error",
         }));
         return null;
@@ -7595,10 +7605,50 @@ export default function App() {
     });
   }, [refreshArchitectureHubGraphList, resolveArchitectureHubSyncContext]);
 
+  // Account-level data loads at app startup, not on first tab visit: the
+  // architecture hub catalog plus a background prefetch of every repo's graph
+  // list, so opening the Architectures tab never shows a loading flash.
   useEffect(() => {
-    if (!GLOBAL_TOOLS_VIEWS.has(visibleView) || authState !== "authenticated") return;
-    void refreshArchitectureHubCatalog();
-  }, [authState, refreshArchitectureHubCatalog, visibleView]);
+    if (authState !== "authenticated") return undefined;
+
+    let cancelled = false;
+    const prefetchTimers = new Set();
+
+    void refreshArchitectureHubCatalog().then((catalog) => {
+      if (cancelled || !catalog || typeof catalog !== "object") return;
+      const entries = [];
+      if (catalog.global && typeof catalog.global === "object") entries.push(catalog.global);
+      (Array.isArray(catalog.workspaces) ? catalog.workspaces : []).forEach((group) => {
+        (Array.isArray(group?.repositories) ? group.repositories : []).forEach((repo) => {
+          if (repo && typeof repo === "object") entries.push(repo);
+        });
+      });
+      (Array.isArray(catalog.folderRepositories) ? catalog.folderRepositories : []).forEach((repo) => {
+        if (repo && typeof repo === "object") entries.push(repo);
+      });
+      (Array.isArray(catalog.orphanRepositories) ? catalog.orphanRepositories : []).forEach((repo) => {
+        if (repo && typeof repo === "object") entries.push(repo);
+      });
+
+      entries.slice(0, 32).forEach((entry, index) => {
+        const repoPath = graphText(entry?.path || entry?.rootDirectory || entry?.root_directory);
+        if (!repoPath) return;
+        const timer = window.setTimeout(() => {
+          prefetchTimers.delete(timer);
+          if (!cancelled) {
+            void refreshArchitectureHubGraphList(repoPath, { silent: true });
+          }
+        }, 150 * index);
+        prefetchTimers.add(timer);
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      prefetchTimers.forEach((timer) => window.clearTimeout(timer));
+      prefetchTimers.clear();
+    };
+  }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -24129,6 +24179,7 @@ export default function App() {
                     architectures={{
                       catalog: architectureHub.catalog,
                       catalogError: architectureHub.error,
+                      catalogRefreshing: Boolean(architectureHub.refreshing),
                       catalogState: architectureHub.state,
                       graphLists: architectureHubGraphLists,
                       onCopyGraph: copyArchitectureHubGraph,

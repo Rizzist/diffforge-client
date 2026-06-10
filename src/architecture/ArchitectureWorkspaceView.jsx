@@ -5431,6 +5431,7 @@ export function ArchitectureHubView({
   catalog = null,
   catalogState = "idle",
   catalogError = "",
+  catalogRefreshing = false,
   onRefreshCatalog = null,
   graphLists = {},
   onCopyGraph = null,
@@ -5513,13 +5514,13 @@ export function ArchitectureHubView({
           </ViewToggleButton>
           <ViewToggleButton
             data-active="false"
-            disabled={catalogState === "loading"}
+            disabled={catalogState === "loading" || catalogRefreshing}
             onClick={() => {
               if (typeof onRefreshCatalog === "function") onRefreshCatalog({ refresh: true });
             }}
             type="button"
           >
-            {catalogState === "loading" ? "Refreshing…" : "Refresh"}
+            {catalogState === "loading" || catalogRefreshing ? "Refreshing…" : "Refresh"}
           </ViewToggleButton>
         </ViewToggleGroup>
         <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
@@ -5593,6 +5594,7 @@ function ArchitecturesPanel({
   const [folderCreateState, setFolderCreateState] = useState("idle");
   const selectedGraphDirtyRef = useRef(false);
   const selectedGraphLoadedKeyRef = useRef("");
+  const hydratedListRefreshKeysRef = useRef(new Set());
 
   useEffect(() => {
     selectedGraphDirtyRef.current = selectedGraphDirty;
@@ -5887,7 +5889,16 @@ function ArchitecturesPanel({
             : graph
         ));
         setGraphState("ready");
-        if (hydrateRef) {
+        // One post-hydration list refresh per graph. Without this guard a
+        // graph the cloud keeps reporting as hydration-pending re-triggers
+        // refresh -> new list -> hydrate -> refresh forever, which is what
+        // made the hub flicker and show "Refreshing" constantly.
+        if (hydrateRef && !hydratedListRefreshKeysRef.current.has(loadedKey)) {
+          hydratedListRefreshKeysRef.current.add(loadedKey);
+          if (hydratedListRefreshKeysRef.current.size > 200) {
+            hydratedListRefreshKeysRef.current.clear();
+            hydratedListRefreshKeysRef.current.add(loadedKey);
+          }
           void loadGraphList(selectedRepoPath, { refresh: true, silent: true });
         }
       })

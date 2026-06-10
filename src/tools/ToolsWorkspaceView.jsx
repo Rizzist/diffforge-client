@@ -354,6 +354,7 @@ export default function ToolsWorkspaceView({
             <ArchitectureHubView
               catalog={architectures.catalog}
               catalogError={architectures.catalogError}
+              catalogRefreshing={Boolean(architectures.catalogRefreshing)}
               catalogState={architectures.catalogState}
               graphLists={architectures.graphLists}
               onCopyGraph={architectures.onCopyGraph}
