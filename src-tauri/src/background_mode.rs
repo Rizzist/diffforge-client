@@ -5,9 +5,11 @@
 
 const BACKGROUND_MONITOR_WINDOW_LABEL: &str = "background-monitor";
 const BACKGROUND_MODE_CHANGED_EVENT: &str = "forge-background-mode-changed";
-const BACKGROUND_MONITOR_WIDTH: f64 = 380.0;
-const BACKGROUND_MONITOR_HEIGHT: f64 = 540.0;
+const BACKGROUND_MONITOR_WIDTH: f64 = 430.0;
+const BACKGROUND_MONITOR_HEIGHT: f64 = 600.0;
 const BACKGROUND_MONITOR_BLUR_TOGGLE_GRACE_MS: u64 = 350;
+const BACKGROUND_MONITOR_ANIM_EVENT: &str = "forge-background-monitor-anim";
+const BACKGROUND_MONITOR_CLOSE_ANIM_MS: u64 = 190;
 
 static APP_BACKGROUND_MODE: AtomicBool = AtomicBool::new(false);
 static BACKGROUND_MONITOR_LAST_BLUR_HIDE_MS: AtomicU64 = AtomicU64::new(0);
@@ -46,11 +48,15 @@ fn background_monitor_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
         let _ = window.set_visible_on_all_workspaces(true);
     }
     let blur_window = window.clone();
+    let blur_app = app.clone();
     window.on_window_event(move |event| {
         if let WindowEvent::Focused(false) = event {
+            if !blur_window.is_visible().unwrap_or(false) {
+                return;
+            }
             BACKGROUND_MONITOR_LAST_BLUR_HIDE_MS
                 .store(todo_dispatch_now_ms(), Ordering::Release);
-            let _ = blur_window.hide();
+            background_monitor_hide_animated(&blur_app, blur_window.clone(), true);
         }
     });
     Some(window)
@@ -64,7 +70,7 @@ fn background_monitor_position_for_anchor(
     window: &tauri::WebviewWindow,
     anchor_x: f64,
     anchor_y: f64,
-) -> tauri::PhysicalPosition<i32> {
+) -> (tauri::PhysicalPosition<i32>, &'static str) {
     let size = window.outer_size().unwrap_or(tauri::PhysicalSize {
         width: BACKGROUND_MONITOR_WIDTH as u32,
         height: BACKGROUND_MONITOR_HEIGHT as u32,
@@ -91,7 +97,8 @@ fn background_monitor_position_for_anchor(
         .clamp(monitor_position.x + margin, (monitor_right - width - margin).max(monitor_position.x + margin));
     let anchor_y = anchor_y as i32;
     let monitor_mid = monitor_position.y + (monitor_size.height as i32) / 2;
-    let raw_y = if anchor_y < monitor_mid {
+    let drops_below = anchor_y < monitor_mid;
+    let raw_y = if drops_below {
         anchor_y + margin * 2
     } else {
         anchor_y - height - margin * 2
@@ -100,19 +107,60 @@ fn background_monitor_position_for_anchor(
         monitor_position.y + margin,
         (monitor_bottom - height - margin).max(monitor_position.y + margin),
     );
-    tauri::PhysicalPosition::new(x, y)
+    (
+        tauri::PhysicalPosition::new(x, y),
+        // Animation origin: dropping below a menu-bar icon scales from the
+        // top edge; flying up from a taskbar icon scales from the bottom.
+        if drops_below { "top" } else { "bottom" },
+    )
+}
+
+fn background_monitor_emit_anim(app: &AppHandle, phase: &str, origin: Option<&str>) {
+    let mut payload = json!({ "phase": phase });
+    if let Some(origin) = origin {
+        payload["origin"] = json!(origin);
+    }
+    let _ = app.emit_to(
+        BACKGROUND_MONITOR_WINDOW_LABEL,
+        BACKGROUND_MONITOR_ANIM_EVENT,
+        payload,
+    );
+}
+
+/// Plays the close micro-animation in the webview, then hides the window.
+/// `only_if_unfocused` is the blur path: a quick refocus cancels the hide.
+fn background_monitor_hide_animated(
+    app: &AppHandle,
+    window: tauri::WebviewWindow,
+    only_if_unfocused: bool,
+) {
+    background_monitor_emit_anim(app, "close", None);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(BACKGROUND_MONITOR_CLOSE_ANIM_MS)).await;
+        let _ = app.run_on_main_thread(move || {
+            if only_if_unfocused && window.is_focused().unwrap_or(false) {
+                return;
+            }
+            let _ = window.hide();
+        });
+    });
 }
 
 fn background_monitor_show_at(app: &AppHandle, anchor: Option<(f64, f64)>) {
     let Some(window) = background_monitor_window(app) else {
         return;
     };
+    let mut origin = "top";
     if let Some((anchor_x, anchor_y)) = anchor {
-        let position = background_monitor_position_for_anchor(app, &window, anchor_x, anchor_y);
+        let (position, anchor_origin) =
+            background_monitor_position_for_anchor(app, &window, anchor_x, anchor_y);
+        origin = anchor_origin;
         let _ = window.set_position(tauri::Position::Physical(position));
     }
     let _ = window.show();
     let _ = window.set_focus();
+    background_monitor_emit_anim(app, "open", Some(origin));
 }
 
 /// Tray-click toggle: hide when visible; ignore the click that just
@@ -123,7 +171,7 @@ fn background_monitor_toggle_at(app: &AppHandle, anchor: Option<(f64, f64)>) {
         return;
     };
     if window.is_visible().unwrap_or(false) {
-        let _ = window.hide();
+        background_monitor_hide_animated(app, window, false);
         return;
     }
     let now = todo_dispatch_now_ms();
@@ -160,34 +208,60 @@ fn background_mode_emit_changed(app: &AppHandle, background: bool) {
     );
 }
 
+// Tray icons are NSStatusItems on macOS (and shell handles elsewhere):
+// creating or dropping them — and creating popover windows — off the main
+// thread crashes the app. The enter/exit commands run on the async command
+// runtime, so all UI work below is marshalled onto the main thread; the mode
+// flag flips synchronously so toggling stays race-free for callers.
 pub(crate) fn app_enter_background_internal(app: &AppHandle) {
     APP_BACKGROUND_MODE.store(true, Ordering::Release);
-    background_tray_create(app);
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.hide();
+    let main_app = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        background_tray_create(&main_app);
+        if let Some(main) = main_app.get_webview_window("main") {
+            let _ = main.hide();
+        }
+        // Pre-create the hidden popover so the first tray click is instant.
+        let _ = background_monitor_window(&main_app);
+        background_mode_emit_changed(&main_app, true);
+        log_terminal_status_event(
+            "backend.background_mode.entered",
+            json!({ "monitor_window": BACKGROUND_MONITOR_WINDOW_LABEL }),
+        );
+    });
+    if let Err(error) = scheduled {
+        APP_BACKGROUND_MODE.store(false, Ordering::Release);
+        log_terminal_status_event(
+            "backend.background_mode.enter_schedule_error",
+            json!({ "error": error.to_string() }),
+        );
     }
-    // Pre-create the hidden popover so the first tray click is instant.
-    let _ = background_monitor_window(app);
-    background_mode_emit_changed(app, true);
-    log_terminal_status_event(
-        "backend.background_mode.entered",
-        json!({ "monitor_window": BACKGROUND_MONITOR_WINDOW_LABEL }),
-    );
 }
 
 pub(crate) fn app_exit_background_internal(app: &AppHandle) {
     APP_BACKGROUND_MODE.store(false, Ordering::Release);
-    background_tray_remove(app);
-    if let Some(monitor) = app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
-        let _ = monitor.hide();
+    let main_app = app.clone();
+    let scheduled = app.run_on_main_thread(move || {
+        // Restore the main window FIRST: even if tray/popover teardown were
+        // to fail, the user always gets their window back.
+        let _ = restore_main_window(&main_app);
+        if let Some(main) = main_app.get_webview_window("main") {
+            let _ = main.show();
+            let _ = main.set_focus();
+        }
+        if let Some(monitor) = main_app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
+            let _ = monitor.hide();
+        }
+        background_tray_remove(&main_app);
+        background_mode_emit_changed(&main_app, false);
+        log_terminal_status_event("backend.background_mode.exited", json!({}));
+    });
+    if let Err(error) = scheduled {
+        log_terminal_status_event(
+            "backend.background_mode.exit_schedule_error",
+            json!({ "error": error.to_string() }),
+        );
     }
-    let _ = restore_main_window(app);
-    if let Some(main) = app.get_webview_window("main") {
-        let _ = main.show();
-        let _ = main.set_focus();
-    }
-    background_mode_emit_changed(app, false);
-    log_terminal_status_event("backend.background_mode.exited", json!({}));
 }
 
 #[tauri::command]

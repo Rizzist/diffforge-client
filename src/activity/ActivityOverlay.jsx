@@ -1196,7 +1196,11 @@ function RowGlyph({ celebrate = false, kind, status, tone }) {
   );
 }
 
-export default function ActivityOverlayWindow() {
+// The same activity surface renders in two hosts: the standalone overlay
+// window (Ctrl+Shift+Space) and embedded inside the background tray popover.
+// Embedded mode drops the window-drag affordances and the floating-card
+// chrome; data flows identically (shared localStorage context + invokes).
+export function ActivityOverlayPanel({ embedded = false }) {
   const context = useActivityOverlayContext();
   const data = useActivityOverlayData(context);
   const todoCards = useMemo(
@@ -1348,7 +1352,7 @@ export default function ActivityOverlayWindow() {
       <OverlayRow
         data-exit-phase={exit ? exit.phase : undefined}
         data-exit-state={exit ? exit.exitState : undefined}
-        data-tauri-drag-region
+        data-tauri-drag-region={embedded ? undefined : true}
         key={exit ? exit.key : card.id}
       >
         <RowGlyph
@@ -1357,7 +1361,7 @@ export default function ActivityOverlayWindow() {
           status={exit ? exit.exitState : card.status}
           tone={tone}
         />
-        <RowBody data-tauri-drag-region>
+        <RowBody data-tauri-drag-region={embedded ? undefined : true}>
           <RowLine>
             <RowTitle>{card.title}</RowTitle>
             {detail ? <RowDetail>{detail}</RowDetail> : null}
@@ -1371,61 +1375,70 @@ export default function ActivityOverlayWindow() {
         </RowBody>
       </OverlayRow>
     );
-  }, []);
+  }, [embedded]);
 
+  return (
+    <OverlayCard
+      data-embedded={embedded ? "true" : undefined}
+      data-tauri-drag-region={embedded ? undefined : true}
+      data-tone={statusToneName}
+      onMouseDown={embedded ? undefined : dragOverlayWindow}
+    >
+      <OverlayHeader data-tauri-drag-region={embedded ? undefined : true}>
+        <HeaderDot data-live={hasWork ? "true" : "false"} data-tone={statusToneName} />
+        <HeaderTitle>Activity</HeaderTitle>
+        <HeaderSummary>{summaryLabel(stats)}</HeaderSummary>
+      </OverlayHeader>
+
+      <OverlayBody data-tauri-drag-region={embedded ? undefined : true} aria-live="polite">
+        {hasTransfers && (
+          <>
+            <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Assets</SectionLabel>
+            {liveTransferCards.map((card) => renderRow(card))}
+            {exitTransferRows.map((row) => renderRow(row.card, row))}
+          </>
+        )}
+        {hasTransfers && hasTodos && (
+          <SectionLabel data-tauri-drag-region={embedded ? undefined : true}>Todos</SectionLabel>
+        )}
+        {sortedTodoCards.map((card) => renderRow(card))}
+        {exitTodoRows.map((row) => renderRow(row.card, row))}
+        {!hasWork && (
+          <OverlayEmpty data-tauri-drag-region={embedded ? undefined : true}>
+            <EmptyGlyph aria-hidden="true">
+              <svg
+                fill="none"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.3"
+                viewBox="0 0 16 16"
+              >
+                <circle cx="8" cy="8" r="5.6" />
+                <path d="M5.6 8.2l1.7 1.7 3.1-3.6" />
+              </svg>
+            </EmptyGlyph>
+            <EmptyTitle>All clear</EmptyTitle>
+            <EmptyHint>no todos queued · no assets syncing</EmptyHint>
+          </OverlayEmpty>
+        )}
+      </OverlayBody>
+
+      <OverlayFooter data-tauri-drag-region={embedded ? undefined : true}>
+        <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updatedAt)}`}</span>
+        <FooterSpacer />
+        <span>{stats.queued ? `${stats.queued} queued` : "live"}</span>
+      </OverlayFooter>
+    </OverlayCard>
+  );
+}
+
+export default function ActivityOverlayWindow() {
   return (
     <>
       <OverlayGlobalStyle />
       <OverlayShell>
-        <OverlayCard
-          data-tauri-drag-region
-          data-tone={statusToneName}
-          onMouseDown={dragOverlayWindow}
-        >
-          <OverlayHeader data-tauri-drag-region>
-            <HeaderDot data-live={hasWork ? "true" : "false"} data-tone={statusToneName} />
-            <HeaderTitle>Activity</HeaderTitle>
-            <HeaderSummary>{summaryLabel(stats)}</HeaderSummary>
-          </OverlayHeader>
-
-          <OverlayBody data-tauri-drag-region aria-live="polite">
-            {hasTransfers && (
-              <>
-                <SectionLabel data-tauri-drag-region>Assets</SectionLabel>
-                {liveTransferCards.map((card) => renderRow(card))}
-                {exitTransferRows.map((row) => renderRow(row.card, row))}
-              </>
-            )}
-            {hasTransfers && hasTodos && <SectionLabel data-tauri-drag-region>Todos</SectionLabel>}
-            {sortedTodoCards.map((card) => renderRow(card))}
-            {exitTodoRows.map((row) => renderRow(row.card, row))}
-            {!hasWork && (
-              <OverlayEmpty data-tauri-drag-region>
-                <EmptyGlyph aria-hidden="true">
-                  <svg
-                    fill="none"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="1.3"
-                    viewBox="0 0 16 16"
-                  >
-                    <circle cx="8" cy="8" r="5.6" />
-                    <path d="M5.6 8.2l1.7 1.7 3.1-3.6" />
-                  </svg>
-                </EmptyGlyph>
-                <EmptyTitle>All clear</EmptyTitle>
-                <EmptyHint>no todos queued · no assets syncing</EmptyHint>
-              </OverlayEmpty>
-            )}
-          </OverlayBody>
-
-          <OverlayFooter data-tauri-drag-region>
-            <span>{data.errors.length ? "snapshot pending" : `updated ${timeAgo(data.updatedAt)}`}</span>
-            <FooterSpacer />
-            <span>{stats.queued ? `${stats.queued} queued` : "live"}</span>
-          </OverlayFooter>
-        </OverlayCard>
+        <ActivityOverlayPanel />
       </OverlayShell>
     </>
   );
@@ -1506,6 +1519,20 @@ const OverlayCard = styled.main`
   user-select: none;
   -webkit-user-select: none;
   -webkit-app-region: drag;
+
+  &[data-embedded="true"] {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    clip-path: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    cursor: default;
+    -webkit-app-region: no-drag;
+    max-width: 100%;
+    max-height: 100%;
+  }
 
   &[data-tone="danger"] {
     border-color: rgba(240, 127, 127, 0.26);

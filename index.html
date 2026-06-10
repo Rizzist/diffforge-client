@@ -43,6 +43,9 @@
           if (isActivityOverlay) {
             document.documentElement.dataset.activityOverlay = "true";
           }
+          if (window.location.hash === "#/background-monitor") {
+            document.documentElement.dataset.backgroundMonitor = "true";
+          }
         } catch {
           document.documentElement.dataset.forgeTheme = THEME_DEFAULT;
           if (window.location.hash === "#/audio-widget") {
@@ -51,6 +54,9 @@
           }
           if (window.location.hash === "#/activity-overlay") {
             document.documentElement.dataset.activityOverlay = "true";
+          }
+          if (window.location.hash === "#/background-monitor") {
+            document.documentElement.dataset.backgroundMonitor = "true";
           }
         }
       })();
@@ -86,6 +92,15 @@
         min-height: 0;
         overflow: hidden;
         border-radius: 18px;
+        background: transparent !important;
+      }
+
+      html[data-background-monitor="true"],
+      html[data-background-monitor="true"] body,
+      html[data-background-monitor="true"] #app {
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
         background: transparent !important;
       }
     </style>
