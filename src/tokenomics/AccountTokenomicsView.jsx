@@ -169,59 +169,6 @@ function storageUsageModel(billingStatus = {}, summary = {}, liveStorageUsage = 
   };
 }
 
-function compactCreditId(value) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  return text.length > 24 ? `${text.slice(0, 10)}...${text.slice(-8)}` : text;
-}
-
-function creditHistoryRows(billingStatus, summary) {
-  const candidates = [
-    billingStatus?.credits?.usageHistory,
-    billingStatus?.credits?.usage_history,
-    billingStatus?.billingHistory,
-    billingStatus?.billing_history,
-    billingStatus?.creditLedger?.items,
-    billingStatus?.credit_ledger?.items,
-    summary?.credits?.usageHistory,
-    summary?.credits?.usage_history,
-  ];
-  const rows = candidates.find((candidate) => Array.isArray(candidate)) || [];
-  return rows.filter(Boolean).slice(0, 12);
-}
-
-function creditHistoryLabel(row = {}) {
-  const meter = String(row?.meter || row?.metadata?.meter || "").trim();
-  if (row?.description) return String(row.description);
-  if (meter === "todo_created") return `Todo created · todo_id ${compactCreditId(row?.entityId || row?.entity_id)}`;
-  if (meter === "task_created") return `Task created · task_id ${compactCreditId(row?.entityId || row?.entity_id)}`;
-  if (meter === "plan_created") return `Plan created · plan_id ${compactCreditId(row?.entityId || row?.entity_id)}`;
-  if (meter === "asset_transfer_mb") return "Asset transfer";
-  return row?.reason || "Diff Forge AI credit usage";
-}
-
-function creditHistoryMeta(row = {}) {
-  const parts = [];
-  const meter = String(row?.meter || row?.metadata?.meter || "").trim();
-  const source = String(row?.source || row?.metadata?.source || "").trim();
-  const entityId = compactCreditId(row?.entityId || row?.entity_id);
-  const bytes = formatCreditBytes(row?.bytes || row?.metadata?.bytes);
-  const createdAt = row?.createdAt || row?.created_at;
-  const date = createdAt ? new Date(createdAt) : null;
-  if (meter === "asset_transfer_mb" && bytes) parts.push(bytes);
-  if (entityId && !String(row?.description || "").includes(entityId)) parts.push(entityId);
-  if (source) parts.push(source);
-  if (date && !Number.isNaN(date.getTime())) {
-    parts.push(date.toLocaleString(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    }));
-  }
-  return parts.join(" · ");
-}
-
 function providerKey(row) {
   const agent = String(row?.agent_kind || row?.agentKind || "").toLowerCase();
   const provider = String(row?.provider || "").toLowerCase();
@@ -234,6 +181,12 @@ function providerKey(row) {
 function providerLabel(row) {
   const key = providerKey(row);
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[String(row?.provider || "").toLowerCase()] || row?.label || "Agent";
+}
+
+function providerDisplayName(providerId) {
+  if (providerId === "codex") return "Codex";
+  if (providerId === "claude") return "Claude Code";
+  return PROVIDERS.find((provider) => provider.id === providerId)?.label || providerId || "Provider";
 }
 
 function rowDeviceId(row) {
@@ -1222,6 +1175,46 @@ function CostCell({ value }) {
   return <td title={formatCostTitle(value)}>{formatCost(value)}</td>;
 }
 
+function LimitMetricCard({ icon: Icon, limit, title }) {
+  return (
+    <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta)}>
+      <MetricHeading>
+        <MetricName>
+          <Icon aria-hidden="true" />
+          <span>{title}</span>
+        </MetricName>
+        <MetricScore>
+          <strong>{limit.remainingPercent == null ? "—" : `${limit.remainingPercent}%`}</strong>
+          <span>{limit.paceDelta > 0 ? "▲" : "▼"}{Math.abs(limit.paceDelta)}%</span>
+        </MetricScore>
+      </MetricHeading>
+      <ProgressTrack>
+        <ProgressFill style={{ width: `${limit.remainingPercent ?? 0}%` }} />
+      </ProgressTrack>
+      <MetricFoot>
+        <span>{limit.resetLabel}</span>
+        <strong>{limit.statusLabel}</strong>
+      </MetricFoot>
+    </LimitCard>
+  );
+}
+
+function ProviderLimitGroup({ fiveHour, providerId, weekly }) {
+  return (
+    <ProviderLimitColumn>
+      <ProviderLimitHeading $provider={providerId}>
+        <strong>{providerDisplayName(providerId)}</strong>
+      </ProviderLimitHeading>
+      <PlanStatusLine>
+        <strong>{planStatusTitle(fiveHour, providerId)}</strong>
+        <span>{limitSourceText(fiveHour)}</span>
+      </PlanStatusLine>
+      <LimitMetricCard icon={ClockIcon} limit={fiveHour} title="5-Hour Session" />
+      <LimitMetricCard icon={CalendarIcon} limit={weekly} title="Weekly Limit" />
+    </ProviderLimitColumn>
+  );
+}
+
 export default function AccountTokenomicsView({ accountKey = "", billingStatus = null, storageUsage = null } = {}) {
   const [{
     summary,
@@ -1352,13 +1345,19 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     [modelRows, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
   );
   const credits = billingStatus?.credits || summary?.credits || {};
+  const providerLimitGroups = useMemo(() => (
+    ["codex", "claude"].map((providerId) => {
+      const providerLimits = filterLimits(summary?.limits, providerId, "all", selectedScopeKey);
+      return {
+        providerId,
+        fiveHour: mergeLimits(providerLimits, "5_hour"),
+        weekly: mergeLimits(providerLimits, "weekly"),
+      };
+    })
+  ), [selectedScopeKey, summary?.limits]);
   const storage = useMemo(
     () => storageUsageModel(billingStatus, summary, storageUsage),
     [billingStatus, storageUsage, summary],
-  );
-  const creditUsageHistory = useMemo(
-    () => creditHistoryRows(billingStatus, summary),
-    [billingStatus, summary],
   );
 
   return (
@@ -1440,58 +1439,35 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           </TokenomicsLoading>
         ) : null}
 
-        <PlanStatusLine>
-          <strong>{planStatusTitle(fiveHour, selectedProvider)}</strong>
-          <span>{limitSourceText(fiveHour)}</span>
-        </PlanStatusLine>
-        {openAiCredits ? (
-          <ProviderCreditsLine>
-            <span>OpenAI credits</span>
-            <strong>
-              {openAiCredits.unlimited ? "Unlimited" : formatCredits(openAiCredits.balance)}
-            </strong>
-          </ProviderCreditsLine>
-        ) : null}
-
-        <LimitCard tone={statusTone(fiveHour.remainingPercent, fiveHour.paceDelta)}>
-          <MetricHeading>
-            <MetricName>
-              <ClockIcon aria-hidden="true" />
-              <span>5-Hour Session</span>
-            </MetricName>
-            <MetricScore>
-              <strong>{fiveHour.remainingPercent == null ? "—" : `${fiveHour.remainingPercent}%`}</strong>
-              <span>{fiveHour.paceDelta > 0 ? "▲" : "▼"}{Math.abs(fiveHour.paceDelta)}%</span>
-            </MetricScore>
-          </MetricHeading>
-          <ProgressTrack>
-            <ProgressFill style={{ width: `${fiveHour.remainingPercent ?? 0}%` }} />
-          </ProgressTrack>
-          <MetricFoot>
-            <span>{fiveHour.resetLabel}</span>
-            <strong>{fiveHour.statusLabel}</strong>
-          </MetricFoot>
-        </LimitCard>
-
-        <LimitCard tone={statusTone(weekly.remainingPercent, weekly.paceDelta)}>
-          <MetricHeading>
-            <MetricName>
-              <CalendarIcon aria-hidden="true" />
-              <span>Weekly Limit</span>
-            </MetricName>
-            <MetricScore>
-              <strong>{weekly.remainingPercent == null ? "—" : `${weekly.remainingPercent}%`}</strong>
-              <span>{weekly.paceDelta > 0 ? "▲" : "▼"}{Math.abs(weekly.paceDelta)}%</span>
-            </MetricScore>
-          </MetricHeading>
-          <ProgressTrack>
-            <ProgressFill style={{ width: `${weekly.remainingPercent ?? 0}%` }} />
-          </ProgressTrack>
-          <MetricFoot>
-            <span>{weekly.resetLabel}</span>
-            <strong>{weekly.statusLabel}</strong>
-          </MetricFoot>
-        </LimitCard>
+        {selectedProvider === "all" ? (
+          <ProviderLimitGrid>
+            {providerLimitGroups.map((group) => (
+              <ProviderLimitGroup
+                key={group.providerId}
+                fiveHour={group.fiveHour}
+                providerId={group.providerId}
+                weekly={group.weekly}
+              />
+            ))}
+          </ProviderLimitGrid>
+        ) : (
+          <>
+            <PlanStatusLine>
+              <strong>{planStatusTitle(fiveHour, selectedProvider)}</strong>
+              <span>{limitSourceText(fiveHour)}</span>
+            </PlanStatusLine>
+            {openAiCredits ? (
+              <ProviderCreditsLine>
+                <span>OpenAI credits</span>
+                <strong>
+                  {openAiCredits.unlimited ? "Unlimited" : formatCredits(openAiCredits.balance)}
+                </strong>
+              </ProviderCreditsLine>
+            ) : null}
+            <LimitMetricCard icon={ClockIcon} limit={fiveHour} title="5-Hour Session" />
+            <LimitMetricCard icon={CalendarIcon} limit={weekly} title="Weekly Limit" />
+          </>
+        )}
 
         <ChartCard>
           <PanelTitle>
@@ -1632,19 +1608,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               <strong>{formatCredits(credits.termReservedCredits ?? credits.reserved_credits ?? credits.total?.reserved_credits)}</strong>
             </CreditMetric>
           </CreditsGrid>
-          <CreditHistoryList aria-label="Diff Forge credit usage history">
-            {creditUsageHistory.length ? creditUsageHistory.map((row) => (
-              <CreditHistoryItem key={row.id || row.dedupeKey || row.dedupe_key || `${row.meter}-${row.entityId || row.entity_id}`}>
-                <CreditHistoryText>
-                  <strong>{creditHistoryLabel(row)}</strong>
-                  <span>{creditHistoryMeta(row)}</span>
-                </CreditHistoryText>
-                <CreditHistoryAmount>{formatCredits(row.credits)} cr</CreditHistoryAmount>
-              </CreditHistoryItem>
-            )) : (
-              <CreditHistoryEmpty>No Diff Forge AI credit usage recorded yet.</CreditHistoryEmpty>
-            )}
-          </CreditHistoryList>
         </CreditsCard>
 
         <StorageCard>
@@ -1904,6 +1867,39 @@ const TokenomicsLoading = styled.div`
     color: #475569;
     border-color: rgba(37, 99, 235, 0.16);
     background: rgba(37, 99, 235, 0.07);
+  }
+`;
+
+const ProviderLimitGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 10px;
+  min-width: 0;
+`;
+
+const ProviderLimitColumn = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const ProviderLimitHeading = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 2px 1px;
+  color: ${({ $provider }) => providerAccent($provider)};
+  font-size: 12px;
+  font-weight: 950;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 `;
 
@@ -2491,84 +2487,6 @@ const CreditMetric = styled.div`
     strong {
       color: #0f172a;
     }
-  }
-`;
-
-const CreditHistoryList = styled.div`
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-`;
-
-const CreditHistoryItem = styled.div`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  padding: 7px 8px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 8px;
-  background: rgba(2, 6, 12, 0.18);
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(15, 23, 42, 0.08);
-    background: rgba(255, 255, 255, 0.78);
-  }
-`;
-
-const CreditHistoryText = styled.div`
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-
-  strong,
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  strong {
-    color: #e5eefb;
-    font-size: 11px;
-    font-weight: 900;
-  }
-
-  span {
-    color: #8794a8;
-    font-size: 9px;
-    font-weight: 800;
-  }
-
-  html[data-forge-theme="light"] & {
-    strong {
-      color: #0f172a;
-    }
-
-    span {
-      color: #64748b;
-    }
-  }
-`;
-
-const CreditHistoryAmount = styled.strong`
-  color: #fb923c;
-  font-size: 11px;
-  font-weight: 950;
-  white-space: nowrap;
-`;
-
-const CreditHistoryEmpty = styled.div`
-  min-width: 0;
-  padding: 7px 8px;
-  color: #8794a8;
-  font-size: 10px;
-  font-weight: 800;
-
-  html[data-forge-theme="light"] & {
-    color: #64748b;
   }
 `;
 

@@ -96,44 +96,33 @@ function pathsFromHash(prefix) {
   return [decoded].filter(Boolean);
 }
 
+// WebKit blocks fetch() on asset: URLs ("Load failed"), so image bytes come
+// through the backend as a data URL; this also keeps canvases untainted.
 function loadImageElementFromPath(localPath) {
-  const previewUrl = assetPreviewUrl({ localPath });
-  if (!previewUrl) {
+  if (!text(localPath)) {
     return Promise.reject(new Error("Image path is unavailable."));
   }
 
-  return fetch(previewUrl)
-    .then((response) => {
-      if (!response.ok) throw new Error(`Unable to read image: ${response.status}`);
-      return response.blob();
-    })
-    .then((blob) => new Promise((resolve, reject) => {
-      const objectUrl = URL.createObjectURL(blob);
+  return invoke("snipping_read_asset_data_url", { path: localPath })
+    .then((dataUrl) => new Promise((resolve, reject) => {
       const image = new window.Image();
-      image.onload = () => resolve({ image, objectUrl });
-      image.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error("Unable to load image."));
-      };
-      image.src = objectUrl;
+      image.onload = () => resolve({ image });
+      image.onerror = () => reject(new Error("Unable to load image."));
+      image.src = dataUrl;
     }));
 }
 
 async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
-  const { image, objectUrl } = await loadImageElementFromPath(localPath);
-  try {
-    const width = image.naturalWidth || image.width;
-    const height = image.naturalHeight || image.height;
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext("2d");
-    context.drawImage(image, 0, 0, width, height);
-    annotations.forEach((annotation) => drawAnnotation(context, annotation));
-    return canvas.toDataURL("image/png");
-  } finally {
-    URL.revokeObjectURL(objectUrl);
-  }
+  const { image } = await loadImageElementFromPath(localPath);
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d");
+  context.drawImage(image, 0, 0, width, height);
+  annotations.forEach((annotation) => drawAnnotation(context, annotation));
+  return canvas.toDataURL("image/png");
 }
 
 function snipToastFromPayload(payload) {
@@ -503,18 +492,15 @@ export function SnippingAnnotationEditorWindow() {
       if (!disposed) setStatus("Unable to load snip.");
     };
 
-    fetch(previewUrl)
-      .then((response) => {
-        if (!response.ok) throw new Error(`Unable to read snip: ${response.status}`);
-        return response.blob();
-      })
-      .then((blob) => {
+    // WebKit blocks fetch() on asset: URLs ("Load failed"); read the bytes
+    // through the backend instead, which also keeps the canvas untainted.
+    invoke("snipping_read_asset_data_url", { path: activePath })
+      .then((dataUrl) => {
         if (disposed) return;
-        objectUrl = URL.createObjectURL(blob);
-        image.src = objectUrl;
+        image.src = dataUrl;
       })
       .catch((error) => {
-        if (!disposed) setStatus(error?.message || "Unable to load snip.");
+        if (!disposed) setStatus(error?.message || String(error || "Unable to load snip."));
       });
 
     return () => {
@@ -693,11 +679,11 @@ export function SnippingAnnotationEditorWindow() {
       <SnipFloatingGlobalStyle />
       <EditorWindowRoot>
         <EditorTitleBar data-tauri-drag-region>
-          <div>
-            <strong>{multiImage ? "Annotate Selection" : "Annotate"}</strong>
-            <span>{multiImage ? `${name} · ${activeIndex + 1}/${localPaths.length}` : name}</span>
+          <div data-tauri-drag-region>
+            <strong data-tauri-drag-region>{multiImage ? "Annotate Selection" : "Annotate"}</strong>
+            <span data-tauri-drag-region>{multiImage ? `${name} · ${activeIndex + 1}/${localPaths.length}` : name}</span>
           </div>
-          <EditorStatus>{status}</EditorStatus>
+          <EditorStatus data-tauri-drag-region>{status}</EditorStatus>
           <FloatingButton aria-label="Close editor" onClick={closeEditor} title="Close" type="button">
             <Close aria-hidden="true" />
           </FloatingButton>
@@ -864,7 +850,6 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
     user-select: none;
   }
 
-  body[data-snipping-floating="editor"],
   body[data-snipping-floating="pinned"] {
     background: #070a10 !important;
   }
@@ -905,32 +890,30 @@ const QuickAccessCard = styled.article`
 `;
 
 const QuickAccessPreview = styled.div`
+  /* Fixed rectangular card: thin or extreme aspect snips letterbox inside it
+     instead of collapsing, and the hover action pill always has room. */
   display: grid;
-  width: fit-content;
-  max-width: min(292px, calc(100vw - 24px));
-  max-height: 210px;
+  width: min(208px, calc(100vw - 24px));
+  height: 132px;
+  place-items: center;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 18px;
-  background: rgba(9, 12, 18, 0.72);
+  border-radius: 14px;
+  background: rgba(9, 12, 18, 0.82);
   box-shadow:
-    0 18px 42px rgba(0, 0, 0, 0.36),
+    0 14px 34px rgba(0, 0, 0, 0.34),
     0 0 0 1px rgba(0, 0, 0, 0.18);
 
   img {
     display: block;
-    width: auto;
-    height: auto;
-    max-width: min(292px, calc(100vw - 24px));
-    max-height: 210px;
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
     user-select: none;
   }
 
   span {
     display: grid;
-    width: 220px;
-    height: 132px;
     place-items: center;
     padding: 16px;
     color: rgba(248, 250, 252, 0.62);
@@ -1167,8 +1150,11 @@ const EditorWindowRoot = styled.main`
   width: 100vw;
   height: 100vh;
   overflow: hidden;
-  background: #070a10;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 14px;
+  background: rgba(9, 11, 16, 0.97);
   color: #f8fafc;
+  clip-path: inset(0 round 14px);
   font-family:
     Inter,
     ui-sans-serif,
@@ -1184,11 +1170,15 @@ const EditorTitleBar = styled.header`
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
-  min-height: 50px;
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(12, 16, 24, 0.95);
-  cursor: move;
+  min-height: 42px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(13, 16, 23, 0.85);
+  cursor: grab;
+
+  &:active {
+    cursor: grabbing;
+  }
 
   > div {
     display: grid;

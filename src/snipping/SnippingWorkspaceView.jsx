@@ -857,7 +857,6 @@ export function SnippingOverlayWindow() {
         onMouseUp={finishDrag}
         style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}
       >
-        {!selection && <SnippingOverlayDim aria-hidden="true" />}
         {!selection && !capturing && (
           <SnippingOverlayHint aria-hidden="true">
             Drag to snip · Esc to cancel
@@ -1094,13 +1093,6 @@ const SnippingOverlayRoot = styled.main`
     sans-serif;
 `;
 
-const SnippingOverlayDim = styled.div`
-  position: absolute;
-  inset: 0;
-  background: rgba(8, 10, 14, 0.28);
-  pointer-events: none;
-`;
-
 const SnippingOverlayHint = styled.div`
   position: absolute;
   top: 28px;
@@ -1125,10 +1117,10 @@ const SnippingSelectionBox = styled.div`
   position: absolute;
   border: 1.5px solid rgba(125, 176, 255, 0.95);
   border-radius: 2px;
-  /* Spotlight: everything outside the selection is dimmed by the shadow. */
+  /* Subtle spotlight: hint the selection without darkening the screen. */
   box-shadow:
-    0 0 0 1px rgba(8, 10, 14, 0.4),
-    0 0 0 100000px rgba(8, 10, 14, 0.42);
+    0 0 0 1px rgba(8, 10, 14, 0.35),
+    0 0 0 100000px rgba(8, 10, 14, 0.14);
   pointer-events: none;
 
   span {

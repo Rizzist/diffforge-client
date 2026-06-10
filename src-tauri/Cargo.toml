@@ -47,6 +47,8 @@ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
+objc2-foundation = "0.3.1"
+block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

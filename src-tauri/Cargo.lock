@@ -4086,6 +4086,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
+ "block2",
  "cpal",
  "enigo",
  "futures-util",
@@ -4093,6 +4094,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",
+ "objc2-foundation",
  "portable-pty",
  "reqwest 0.12.28",
  "rusqlite",

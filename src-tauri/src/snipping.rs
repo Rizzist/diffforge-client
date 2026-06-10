@@ -908,6 +908,8 @@ fn register_snipping_shortcut_registration(
 }
 
 fn register_snipping_shortcuts(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    register_snipping_space_change_observer(app);
     let settings = read_snipping_settings(app);
     let mut state = SnippingShortcutManagerState::from_settings(&settings);
 
@@ -1824,14 +1826,15 @@ fn snipping_open_annotation_editor_for_paths(
         WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
     )
     .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
-    .inner_size(1080.0, 760.0)
+    .inner_size(820.0, 600.0)
     .min_inner_size(360.0, 260.0)
     .resizable(true)
     .decorations(false)
     .always_on_top(true)
     .focused(true)
     .accept_first_mouse(true)
-    .transparent(false)
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(true)
     .build()
@@ -2061,6 +2064,20 @@ fn ensure_snipping_overlay_window(
     .map_err(|error| format!("Unable to create snipping overlay: {error}"))?;
 
     size_snipping_overlay_window(&window, monitor);
+    // CanJoinAllSpaces alone does not join full-screen Spaces on macOS; the
+    // overlay needs FullScreenAuxiliary or it vanishes when the user swipes
+    // to a full-screen window mid-snip.
+    #[cfg(target_os = "macos")]
+    if let Ok(ns_window) = window.ns_window() {
+        if !ns_window.is_null() {
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
+            );
+        }
+    }
     Ok(window)
 }
 
@@ -2169,49 +2186,13 @@ fn snipping_begin_area_snip_for(
         .show()
         .map_err(|error| format!("Unable to show snipping overlay: {error}"))?;
     let _ = window.set_focus();
+    snipping_register_escape_cancel(app);
 
     // The frozen-frame JPEG is only a visual backdrop; write it off the hot
     // path so the selection overlay appears instantly, then announce it.
     let app_for_snapshot = app.clone();
     thread::spawn(move || {
-        let Ok(snapshot_path) = snipping_overlay_snapshot_path() else {
-            return;
-        };
-        // Pixel copy + JPEG encode both happen on this background thread.
-        if xcap::image::DynamicImage::ImageRgba8(image.as_ref().clone())
-            .to_rgb8()
-            .save_with_format(&snapshot_path, XcapImageFormat::Jpeg)
-            .is_err()
-        {
-            return;
-        }
-        let path_text = snapshot_path.display().to_string();
-        let state = app_for_snapshot.state::<SnippingState>();
-        let mut still_active = false;
-        if let Ok(mut guard) = state.active_area_monitor.lock() {
-            if let Some(active_monitor) = guard.as_mut() {
-                if active_monitor.snapshot_path.is_none() {
-                    active_monitor.snapshot_path = Some(path_text.clone());
-                    still_active = true;
-                }
-            }
-        }
-        if !still_active {
-            snipping_remove_snapshot_file(Some(&path_text));
-            return;
-        }
-        if let Some(overlay) =
-            app_for_snapshot.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL)
-        {
-            let _ = overlay.emit(
-                SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
-                json!({
-                    "kind": "snipping_area_overlay_snapshot",
-                    "snapshotPath": path_text.clone(),
-                    "snapshot_path": path_text,
-                }),
-            );
-        }
+        snipping_store_area_snapshot_backdrop(&app_for_snapshot, image);
     });
 
     Ok(json!({
@@ -2222,7 +2203,169 @@ fn snipping_begin_area_snip_for(
     }))
 }
 
+/// Writes the frozen-frame JPEG backdrop for the active snip session, swaps
+/// it into the active monitor state (deleting any previous backdrop file),
+/// and announces it to the overlay webview. Safe to call again mid-session,
+/// which is how Space switches refresh the freeze.
+fn snipping_store_area_snapshot_backdrop(
+    app: &AppHandle,
+    image: Arc<xcap::image::RgbaImage>,
+) {
+    let Ok(snapshot_path) = snipping_overlay_snapshot_path() else {
+        return;
+    };
+    // Pixel copy + JPEG encode both happen off the capture hot path.
+    if xcap::image::DynamicImage::ImageRgba8(image.as_ref().clone())
+        .to_rgb8()
+        .save_with_format(&snapshot_path, XcapImageFormat::Jpeg)
+        .is_err()
+    {
+        return;
+    }
+    let path_text = snapshot_path.display().to_string();
+    let state = app.state::<SnippingState>();
+    let mut still_active = false;
+    let mut previous_path = None;
+    if let Ok(mut guard) = state.active_area_monitor.lock() {
+        if let Some(active_monitor) = guard.as_mut() {
+            previous_path = active_monitor.snapshot_path.replace(path_text.clone());
+            active_monitor.snapshot_width = image.width();
+            active_monitor.snapshot_height = image.height();
+            still_active = true;
+        }
+    }
+    if !still_active {
+        snipping_remove_snapshot_file(Some(&path_text));
+        return;
+    }
+    if let Some(previous_path) = previous_path.filter(|previous| previous != &path_text) {
+        snipping_remove_snapshot_file(Some(&previous_path));
+    }
+    if let Some(overlay) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
+        let _ = overlay.emit(
+            SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
+            json!({
+                "kind": "snipping_area_overlay_snapshot",
+                "snapshotPath": path_text.clone(),
+                "snapshot_path": path_text,
+            }),
+        );
+    }
+}
+
+/// Re-freezes the active snip session after a macOS Space switch: captures
+/// the new Space below the overlay (so the stale backdrop is not in the
+/// shot), swaps the in-memory frozen frame, and refreshes the backdrop.
+#[cfg(target_os = "macos")]
+fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let Ok(area_monitor) = snipping_active_area_monitor(app) else {
+        return;
+    };
+    let app = app.clone();
+    thread::spawn(move || {
+        // Let the Space transition animation settle before re-capturing.
+        thread::sleep(Duration::from_millis(260));
+        let Ok(monitor) = xcap_monitor_for_area(&area_monitor) else {
+            return;
+        };
+        let width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
+        let height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
+        let Ok(image) = snipping_capture_area_image(&app, &monitor, 0, 0, width, height) else {
+            return;
+        };
+        let image = Arc::new(image);
+        if snipping_set_active_area_snapshot(&app, Some(Arc::clone(&image))).is_err() {
+            return;
+        }
+        snipping_store_area_snapshot_backdrop(&app, image);
+    });
+}
+
+#[cfg(target_os = "macos")]
+static SNIPPING_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Watches macOS Space changes while the app runs; when the user swipes to
+/// another Space mid-snip, the frozen backdrop re-freezes on that Space so
+/// area selection keeps working everywhere.
+#[cfg(target_os = "macos")]
+fn register_snipping_space_change_observer(app: &AppHandle) {
+    if SNIPPING_MACOS_SPACE_OBSERVER_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    snipping_set_macos_event_tap_app(app);
+    let _ = app.run_on_main_thread(move || {
+        let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+        let center = workspace.notificationCenter();
+        let block = block2::RcBlock::new(
+            move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                if let Some(app) = snipping_macos_event_tap_app() {
+                    snipping_refreeze_area_snapshot_for_space_change(&app);
+                }
+            },
+        );
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(objc2_app_kit::NSWorkspaceActiveSpaceDidChangeNotification),
+                None,
+                None,
+                &block,
+            )
+        };
+        // The observer lives for the app's lifetime.
+        std::mem::forget(token);
+    });
+}
+
+fn snipping_area_escape_shortcut() -> Shortcut {
+    Shortcut::new(None, Code::Escape)
+}
+
+/// While area-snip mode is active, Escape is grabbed globally so it always
+/// exits the mode — even when the overlay webview does not hold keyboard
+/// focus (e.g. right after swiping to a full-screen Space). The grab exists
+/// only for the lifetime of the mode; outside it, Escape reaches apps
+/// normally.
+fn snipping_register_escape_cancel(app: &AppHandle) {
+    let _ = app
+        .global_shortcut()
+        .unregister(snipping_area_escape_shortcut());
+    let _ = app.global_shortcut().on_shortcut(
+        snipping_area_escape_shortcut(),
+        |app, _shortcut, event| {
+            if event.state != ShortcutState::Pressed {
+                return;
+            }
+            let app = app.clone();
+            thread::spawn(move || {
+                let _ = snipping_cancel_area_snip_for(&app);
+            });
+        },
+    );
+}
+
+fn snipping_unregister_escape_cancel(app: &AppHandle) {
+    let _ = app
+        .global_shortcut()
+        .unregister(snipping_area_escape_shortcut());
+}
+
+fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
+    snipping_set_active_area_snapshot(app, None)?;
+    snipping_set_active_area_monitor(app, None)?;
+    snipping_hide_area_overlay(app);
+    Ok(json!({
+        "kind": "snipping_area_cancelled",
+    }))
+}
+
 fn snipping_hide_area_overlay(app: &AppHandle) {
+    snipping_unregister_escape_cancel(app);
     if let Some(window) = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL) {
         let _ = window.hide();
     }
@@ -2257,11 +2400,28 @@ fn snipping_finish_area_snip_for(
     request: SnippingAreaSelectionRequest,
 ) -> Result<Value, String> {
     let area_monitor = snipping_active_area_monitor(app)?;
-    let scale_factor = snipping_area_capture_scale(&area_monitor, request.scale_factor);
-    let selection_x = (request.x.max(0.0) * scale_factor).round() as u32;
-    let selection_y = (request.y.max(0.0) * scale_factor).round() as u32;
-    let selection_width = (request.width.max(0.0) * scale_factor).round() as u32;
-    let selection_height = (request.height.max(0.0) * scale_factor).round() as u32;
+    let fallback_scale = snipping_area_capture_scale(&area_monitor, request.scale_factor);
+    // Map CSS selection coordinates onto the frozen snapshot exactly. The
+    // snapshot is in physical pixels while the overlay reports logical
+    // pixels, so a hardcoded 1.0 scale crops up-left of the real selection
+    // on HiDPI displays. Deriving the scale per axis from the snapshot and
+    // window logical size is correct on every platform and mixed-DPI setup.
+    let logical_width = f64::from(area_monitor.width) / area_monitor.scale_factor.max(0.1);
+    let logical_height = f64::from(area_monitor.height) / area_monitor.scale_factor.max(0.1);
+    let scale_x = if area_monitor.snapshot_width > 0 && logical_width > 0.5 {
+        f64::from(area_monitor.snapshot_width) / logical_width
+    } else {
+        fallback_scale
+    };
+    let scale_y = if area_monitor.snapshot_height > 0 && logical_height > 0.5 {
+        f64::from(area_monitor.snapshot_height) / logical_height
+    } else {
+        fallback_scale
+    };
+    let selection_x = (request.x.max(0.0) * scale_x).round() as u32;
+    let selection_y = (request.y.max(0.0) * scale_y).round() as u32;
+    let selection_width = (request.width.max(0.0) * scale_x).round() as u32;
+    let selection_height = (request.height.max(0.0) * scale_y).round() as u32;
 
     if selection_width < SNIPPING_MIN_AREA_PIXELS || selection_height < SNIPPING_MIN_AREA_PIXELS {
         snipping_set_active_area_snapshot(app, None)?;
@@ -2272,7 +2432,7 @@ fn snipping_finish_area_snip_for(
 
     let image_result = (|| -> Result<xcap::image::RgbaImage, String> {
         // The in-memory frozen frame is what the user actually saw while
-        // selecting; always prefer it over re-capturing the live screen.
+        // selecting; prefer it over re-capturing the live screen.
         if let Ok(image) = snipping_crop_active_area_snapshot(
             app,
             selection_x,
@@ -2295,13 +2455,27 @@ fn snipping_finish_area_snip_for(
         }
 
         let monitor = xcap_monitor_for_area(&area_monitor)?;
-        let monitor_width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
-        let monitor_height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
-        let x = selection_x.min(monitor_width.saturating_sub(1));
-        let y = selection_y.min(monitor_height.saturating_sub(1));
-        let width = selection_width.min(monitor_width.saturating_sub(x)).max(1);
-        let height = selection_height.min(monitor_height.saturating_sub(y)).max(1);
-        snipping_capture_area_image(app, &monitor, x, y, width, height)
+        // macOS below-window capture works in logical points, so the live
+        // fallback uses the unscaled CSS selection there; other platforms
+        // crop a physical-pixel monitor image.
+        #[cfg(target_os = "macos")]
+        {
+            let x = request.x.max(0.0).round() as u32;
+            let y = request.y.max(0.0).round() as u32;
+            let width = (request.width.max(0.0).round() as u32).max(1);
+            let height = (request.height.max(0.0).round() as u32).max(1);
+            snipping_capture_area_image(app, &monitor, x, y, width, height)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let monitor_width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
+            let monitor_height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
+            let x = selection_x.min(monitor_width.saturating_sub(1));
+            let y = selection_y.min(monitor_height.saturating_sub(1));
+            let width = selection_width.min(monitor_width.saturating_sub(x)).max(1);
+            let height = selection_height.min(monitor_height.saturating_sub(y)).max(1);
+            snipping_capture_area_image(app, &monitor, x, y, width, height)
+        }
     })();
     snipping_set_active_area_snapshot(app, None)?;
     snipping_set_active_area_monitor(app, None)?;
@@ -2446,6 +2620,23 @@ fn snipping_open_pinned_window(app: AppHandle, path: String) -> Result<Value, St
 }
 
 #[tauri::command]
+fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
+    let file = diffforge_local_asset_file(&path)?;
+    let bytes = fs::read(&file)
+        .map_err(|error| format!("Unable to read asset {}: {error}", file.display()))?;
+    let mime = cloud_mcp_asset_mime_for_path(&file);
+    let mime = if mime.trim().is_empty() {
+        "image/png".to_string()
+    } else {
+        mime
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command]
 fn snipping_open_annotation_editor(app: AppHandle, path: String) -> Result<Value, String> {
     snipping_open_floating_asset_window(
         &app,
@@ -2473,10 +2664,5 @@ fn snipping_copy_untracked_asset_to_clipboard(path: String) -> Result<Value, Str
 
 #[tauri::command]
 fn snipping_cancel_area_snip(app: AppHandle) -> Result<Value, String> {
-    snipping_set_active_area_snapshot(&app, None)?;
-    snipping_set_active_area_monitor(&app, None)?;
-    snipping_hide_area_overlay(&app);
-    Ok(json!({
-        "kind": "snipping_area_cancelled",
-    }))
+    snipping_cancel_area_snip_for(&app)
 }

@@ -4016,6 +4016,11 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             None
         };
         let live_runtime_snapshot_for_mirror = live_runtime_snapshot.clone();
+        let devices_state_event = if event_kind == "devices_state" {
+            Some(event.clone())
+        } else {
+            None
+        };
         if event_kind.starts_with("voice_agent_") {
             cloud_mcp_log_voice_shared_ws(
                 "voice_agent.shared_ws.event_received",
@@ -4044,6 +4049,34 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
             if let Some(data) = live_runtime_snapshot {
                 runtime.live_runtime_status = Some(data);
+            }
+            // Device presence broadcasts arrive as `devices_state` events; merge
+            // them into the cached runtime status so the orchestrator tab shows
+            // other native/web devices connecting and disconnecting live instead
+            // of waiting for the next full runtime snapshot.
+            if let Some(update) = devices_state_event.as_ref() {
+                let status = runtime
+                    .live_runtime_status
+                    .get_or_insert_with(|| json!({}));
+                if !status.is_object() {
+                    *status = json!({});
+                }
+                if let Some(devices) = update.get("devices") {
+                    status["devices"] = devices.clone();
+                }
+                for key in [
+                    "device_count",
+                    "known_device_count",
+                    "registered_device_count",
+                    "connected_device_count",
+                    "native_connected_device_count",
+                    "web_connected_device_count",
+                    "hot_state",
+                ] {
+                    if let Some(value) = update.get(key) {
+                        status[key] = value.clone();
+                    }
+                }
             }
         }
         if let Some(data) = live_runtime_snapshot_for_mirror {
@@ -16504,6 +16537,18 @@ fn cloud_mcp_asset_library_prune_transfers(conn: &rusqlite::Connection) -> rusql
     Ok(())
 }
 
+static CLOUD_MCP_ASSET_LIBRARY_LAST_PRUNE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn cloud_mcp_try_open_asset_library_conn(path: &Path) -> Result<rusqlite::Connection, String> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|error| format!("Unable to open asset library SQLite cache: {error}"))?;
+    conn.busy_timeout(Duration::from_millis(2_500))
+        .map_err(|error| format!("Unable to configure asset library SQLite cache: {error}"))?;
+    cloud_mcp_asset_library_init_conn(&conn)
+        .map_err(|error| format!("Unable to initialize asset library SQLite cache: {error}"))?;
+    Ok(conn)
+}
+
 fn cloud_mcp_open_asset_library_conn() -> Result<rusqlite::Connection, String> {
     let path = cloud_mcp_asset_library_db_path()
         .ok_or_else(|| "Asset library cache path is unavailable.".to_string())?;
@@ -16511,13 +16556,35 @@ fn cloud_mcp_open_asset_library_conn() -> Result<rusqlite::Connection, String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create asset library cache directory: {error}"))?;
     }
-    let conn = rusqlite::Connection::open(path)
-        .map_err(|error| format!("Unable to open asset library SQLite cache: {error}"))?;
-    conn.busy_timeout(Duration::from_millis(2_500))
-        .map_err(|error| format!("Unable to configure asset library SQLite cache: {error}"))?;
-    cloud_mcp_asset_library_init_conn(&conn)
-        .map_err(|error| format!("Unable to initialize asset library SQLite cache: {error}"))?;
-    let _ = cloud_mcp_asset_library_prune_transfers(&conn);
+    // This file is a local cache (the cloud holds the durable state), so a
+    // transient or corrupted open must never break asset actions: retry once,
+    // then quarantine the file and start fresh.
+    let conn = match cloud_mcp_try_open_asset_library_conn(&path) {
+        Ok(conn) => conn,
+        Err(first_error) => {
+            std::thread::sleep(Duration::from_millis(120));
+            match cloud_mcp_try_open_asset_library_conn(&path) {
+                Ok(conn) => conn,
+                Err(_) => {
+                    eprintln!(
+                        "Asset library cache failed to open twice ({first_error}); recreating it."
+                    );
+                    let quarantine =
+                        path.with_extension(format!("corrupt-{}", cloud_mcp_now_ms()));
+                    let _ = fs::rename(&path, &quarantine);
+                    cloud_mcp_try_open_asset_library_conn(&path)?
+                }
+            }
+        }
+    };
+    // Pruning makes every open a writer; throttle it to avoid lock churn when
+    // progress reporters open connections in quick succession.
+    let now_ms = cloud_mcp_now_ms();
+    let last_prune_ms = CLOUD_MCP_ASSET_LIBRARY_LAST_PRUNE_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_prune_ms) > 10 * 60 * 1000 {
+        CLOUD_MCP_ASSET_LIBRARY_LAST_PRUNE_MS.store(now_ms, Ordering::Relaxed);
+        let _ = cloud_mcp_asset_library_prune_transfers(&conn);
+    }
     Ok(conn)
 }
 
