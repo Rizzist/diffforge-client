@@ -32,6 +32,19 @@ use super::{
     sql_classifier,
 };
 
+/// Reserved workspace id for the account-level default MCP registry. It lives
+/// in its own kernel database under the app data directory; new workspaces
+/// copy its installed servers, config, and secrets the first time their own
+/// registry is opened.
+pub const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID: &str = "account-global-mcp-defaults";
+
+/// Root directory that hosts the global MCP defaults kernel database.
+pub fn global_mcp_defaults_root_dir() -> Option<PathBuf> {
+    let root = crate::cloud_mcp_local_data_file_path("workspace-mcp")?.join("global-defaults");
+    fs::create_dir_all(&root).ok()?;
+    Some(root)
+}
+
 const SESSION_STALE_SECONDS: i64 = 1800;
 const DEFAULT_LEASE_TTL_SECONDS: i64 = 1800;
 const SHUTDOWN_COORDINATION_BUSY_TIMEOUT_MS: u64 = 250;
@@ -8157,6 +8170,13 @@ impl CoordinationKernel {
             return Err("workspace_id is required.".to_string());
         }
 
+        if workspace_id != GLOBAL_MCP_DEFAULTS_WORKSPACE_ID {
+            if let Err(error) = self.seed_workspace_mcp_registry_from_global_defaults(workspace_id)
+            {
+                eprintln!("Workspace MCP defaults seeding skipped: {error}");
+            }
+        }
+
         self.schedule_workspace_mcp_registry_background_refresh(workspace_id, workspace_name);
 
         let coordination_status =
@@ -8212,6 +8232,184 @@ impl CoordinationKernel {
             },
             "coordination_kernel": coordination_status,
         }))
+    }
+
+    fn mark_workspace_mcp_registry_seeded(
+        &self,
+        workspace_id: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_seed_state(workspace_id, source, seeded_at)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(workspace_id) DO NOTHING",
+                params![workspace_id, source, now],
+            )
+            .map_err(|error| format!("Unable to record workspace MCP seed state: {error}"))?;
+        Ok(())
+    }
+
+    /// First-touch inheritance: a workspace with no MCP servers or secrets of
+    /// its own copies the account-level global defaults registry once. After
+    /// seeding (or once the workspace has its own rows) the workspace is
+    /// independent and later edits to the defaults do not propagate.
+    fn seed_workspace_mcp_registry_from_global_defaults(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        if !self
+            .query_json(
+                "SELECT workspace_id FROM workspace_mcp_seed_state WHERE workspace_id=?1",
+                &[&workspace_id],
+            )?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let has_servers = !self
+            .query_json(
+                "SELECT id FROM workspace_mcp_servers WHERE workspace_id=?1 LIMIT 1",
+                &[&workspace_id],
+            )?
+            .is_empty();
+        let has_secrets = !self
+            .query_json(
+                "SELECT id FROM workspace_mcp_secrets WHERE workspace_id=?1 LIMIT 1",
+                &[&workspace_id],
+            )?
+            .is_empty();
+        if has_servers || has_secrets {
+            // Established registries keep their own configuration.
+            return self.mark_workspace_mcp_registry_seeded(&workspace_id, "existing_registry");
+        }
+
+        let Some(defaults_root) = global_mcp_defaults_root_dir() else {
+            return Ok(());
+        };
+        let defaults_db_path = defaults_root.join(".agents").join("kernel.sqlite");
+        if !defaults_db_path.exists()
+            || process_path_text(&defaults_db_path) == process_path_text(&self.paths.db_path)
+        {
+            // No defaults configured yet; stay unseeded so a later registry
+            // open inherits them once they exist.
+            return Ok(());
+        }
+
+        let defaults_kernel = CoordinationKernel::open(&defaults_root, None)?;
+        let default_servers = defaults_kernel.query_json(
+            "SELECT * FROM workspace_mcp_servers WHERE workspace_id=?1 ORDER BY name ASC",
+            &[&GLOBAL_MCP_DEFAULTS_WORKSPACE_ID],
+        )?;
+        let default_secrets = defaults_kernel.query_json(
+            "SELECT key, value FROM workspace_mcp_secrets WHERE workspace_id=?1 ORDER BY key ASC",
+            &[&GLOBAL_MCP_DEFAULTS_WORKSPACE_ID],
+        )?;
+        if default_servers.is_empty() && default_secrets.is_empty() {
+            return Ok(());
+        }
+
+        let now = now_rfc3339();
+        let text = |row: &Value, key: &str| -> String {
+            row[key].as_str().unwrap_or_default().to_string()
+        };
+        let optional_text = |row: &Value, key: &str| -> Option<String> {
+            row[key].as_str().map(str::to_string)
+        };
+        let flag = |row: &Value, key: &str, fallback: i64| -> i64 {
+            row[key]
+                .as_i64()
+                .or_else(|| row[key].as_bool().map(i64::from))
+                .unwrap_or(fallback)
+        };
+        for row in &default_servers {
+            let server_key = text(row, "server_key");
+            if server_key.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_mcp_servers(
+                        id, workspace_id, server_key, name, source_kind, source_label,
+                        package_ref, version, transport, command, args_json, url,
+                        env_schema_json, config_values_json, tools_json, install_state,
+                        workspace_enabled, approval_policy, exposure_mode,
+                        agent_config_access_enabled, agent_secret_config_access_enabled,
+                        agent_env_file_write_enabled, last_probe_status, last_probe_message,
+                        created_at, updated_at
+                    ) VALUES(
+                        ?1, ?2, ?3, ?4, ?5, ?6,
+                        ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16,
+                        ?17, ?18, ?19,
+                        ?20, ?21,
+                        ?22, 'not_connected', 'Inherited from global MCP defaults.',
+                        ?23, ?23
+                    )
+                    ON CONFLICT(workspace_id, server_key) DO NOTHING",
+                    params![
+                        uuid(),
+                        workspace_id,
+                        server_key,
+                        text(row, "name"),
+                        text(row, "source_kind"),
+                        text(row, "source_label"),
+                        optional_text(row, "package_ref"),
+                        optional_text(row, "version"),
+                        text(row, "transport"),
+                        optional_text(row, "command"),
+                        text(row, "args_json"),
+                        optional_text(row, "url"),
+                        text(row, "env_schema_json"),
+                        text(row, "config_values_json"),
+                        text(row, "tools_json"),
+                        text(row, "install_state"),
+                        flag(row, "workspace_enabled", 0),
+                        text(row, "approval_policy"),
+                        text(row, "exposure_mode"),
+                        flag(row, "agent_config_access_enabled", 1),
+                        flag(row, "agent_secret_config_access_enabled", 0),
+                        flag(row, "agent_env_file_write_enabled", 1),
+                        now,
+                    ],
+                )
+                .map_err(|error| {
+                    format!("Unable to copy global default MCP server into workspace: {error}")
+                })?;
+        }
+        for row in &default_secrets {
+            let key = text(row, "key");
+            let value = text(row, "value");
+            if key.is_empty() || value.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO workspace_mcp_secrets(
+                        id, workspace_id, key, value, created_at, updated_at
+                    ) VALUES(?1, ?2, ?3, ?4, ?5, ?5)
+                    ON CONFLICT(workspace_id, key) DO NOTHING",
+                    params![uuid(), workspace_id, key, value, now],
+                )
+                .map_err(|error| {
+                    format!("Unable to copy global default MCP secret into workspace: {error}")
+                })?;
+        }
+        self.mark_workspace_mcp_registry_seeded(&workspace_id, "global_defaults")?;
+        let _ = self.emit_event(
+            "workspace_mcp_defaults_seeded",
+            "kernel",
+            REPO_ID,
+            EventRefs::default(),
+            json!({
+                "workspace_id": workspace_id,
+                "server_count": default_servers.len(),
+                "secret_count": default_secrets.len(),
+            }),
+        );
+        Ok(())
     }
 
     fn workspace_mcp_secret_public_rows(&self, workspace_id: &str) -> Result<Vec<Value>, String> {
@@ -26005,7 +26203,7 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 - Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
 \n\
 ## Architecture graphs\n\n\
-- Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, normally `.agents/architectures` in the selected repo.\n\
+- Diff Forge architecture graphs are repo-scoped agent artifacts under `DIFFFORGE_ARCHITECTURES_ROOT`, a centralized per-repo global store outside the repo working tree; always use that absolute root (or `architecture_context.graphsRoot`) instead of assuming `.agents/architectures` inside the repo.\n\
 - Direct file edits to `.agents/architectures/graphs/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
 - Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are `.agents/architectures/graphs/*.arch`.\n\
 - For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `.agents/architectures/graphs/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\

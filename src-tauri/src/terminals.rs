@@ -11477,6 +11477,130 @@ async fn terminal_headless_output_snapshot(
     Ok(output.snapshot(&pane_id, instance.id))
 }
 
+const TERMINAL_WINDOW_LABEL_PREFIX: &str = "terminal-window-";
+const TERMINAL_WINDOW_CLOSED_EVENT: &str = "forge-terminal-window-closed";
+const TERMINAL_WINDOW_DEFAULT_WIDTH: f64 = 760.0;
+const TERMINAL_WINDOW_DEFAULT_HEIGHT: f64 = 520.0;
+
+fn terminal_window_label(pane_id: &str) -> String {
+    let safe = pane_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(160)
+        .collect::<String>();
+    format!("{TERMINAL_WINDOW_LABEL_PREFIX}{safe}")
+}
+
+fn emit_terminal_window_closed(app: &AppHandle, pane_id: &str) {
+    let _ = app.emit(
+        TERMINAL_WINDOW_CLOSED_EVENT,
+        json!({
+            "paneId": pane_id,
+        }),
+    );
+}
+
+/// Window Breakout: hosts one running terminal pane in its own native window.
+/// The PTY stays untouched; the window attaches as an extra output-transport
+/// subscriber, so opening and closing windows never restarts agents.
+#[tauri::command]
+async fn terminal_window_open(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    title: Option<String>,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let _ = get_terminal_instance(&state, &pane_id).await?;
+
+    let label = terminal_window_label(&pane_id);
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    let title_text = title
+        .map(|value| value.trim().chars().take(120).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Terminal".to_string());
+    let url = format!(
+        "index.html#/terminal-window?paneId={}&title={}",
+        percent_encode_query_component(&pane_id),
+        percent_encode_query_component(&title_text),
+    );
+
+    let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(url.into()))
+        .title(format!("{title_text} - Diff Forge"))
+        .inner_size(TERMINAL_WINDOW_DEFAULT_WIDTH, TERMINAL_WINDOW_DEFAULT_HEIGHT)
+        .min_inner_size(420.0, 260.0)
+        .resizable(true)
+        .decorations(false)
+        .focused(true)
+        .accept_first_mouse(true)
+        .transparent(true)
+        .background_color(Color(2, 3, 4, 255))
+        .shadow(true)
+        .build()
+        .map_err(|error| format!("Unable to create terminal window: {error}"))?;
+
+    let app_for_events = app.clone();
+    let pane_for_events = pane_id.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            emit_terminal_window_closed(&app_for_events, &pane_for_events);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn terminal_window_close(app: AppHandle, pane_id: String) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let label = terminal_window_label(&pane_id);
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.close();
+    } else {
+        // The window is already gone; still notify so toggles converge.
+        emit_terminal_window_closed(&app, &pane_id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn terminal_window_focus(app: AppHandle, pane_id: String) -> Result<bool, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let label = terminal_window_label(&pane_id);
+    let Some(window) = app.get_webview_window(&label) else {
+        return Ok(false);
+    };
+    let _ = window.show();
+    let _ = window.set_focus();
+    Ok(true)
+}
+
+#[tauri::command]
+async fn terminal_pane_runtime_info(
+    state: State<'_, TerminalState>,
+    pane_id: String,
+) -> Result<Value, String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let instance = get_terminal_instance(&state, &pane_id).await?;
+    let size = *instance.size.lock().await;
+    Ok(json!({
+        "instanceId": instance.id,
+        "cols": size.cols,
+        "rows": size.rows,
+    }))
+}
+
 #[tauri::command]
 async fn terminal_headless_output_delta(
     state: State<'_, TerminalState>,

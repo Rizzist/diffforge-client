@@ -14,13 +14,22 @@ const AUDIO_DEEPGRAM_API_KEY_STORAGE_KEY = "diffforge.audio.deepgramApiKey";
 const AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY = "diffforge.audio.deepgramLanguage";
 export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
 export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
+export const AUDIO_TRANSCRIPTION_PROVIDER_FORGE = "forge";
+const AUDIO_FORGE_LLM_CLEANUP_STORAGE_KEY = "diffforge.audio.forgeLlmCleanup";
 export const AUDIO_RECORDER_MODE_PUSH_TO_TALK = "push-to-talk";
 export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
+export const AUDIO_RECORDER_MODE_HYBRID = "hybrid";
+export const AUDIO_TRANSCRIPTION_STATUS_INSERTED = "inserted";
+export const AUDIO_TRANSCRIPTION_STATUS_CANCELLED = "cancelled";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO = "auto";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL = "manual";
 export const AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT = "diffforge:audio-orchestrator-submission-mode";
 export const AUDIO_WIDGET_THEME_DARK = "dark";
 export const AUDIO_WIDGET_THEME_LIGHT = "light";
+const AUDIO_WIDGET_STYLE_STORAGE_KEY = "diffforge.audio.widgetStyle";
+export const AUDIO_WIDGET_STYLE_BUBBLE = "bubble";
+export const AUDIO_WIDGET_STYLE_HIDDEN = "hidden";
+export const AUDIO_WIDGET_STYLE_BAR = "bar";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
@@ -38,15 +47,22 @@ function canUseStorage() {
 }
 
 function normalizeAudioTranscriptionProvider(value) {
-  return value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-    ? AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-    : AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+  if (
+    value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    || value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+  ) {
+    return value;
+  }
+
+  return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
 }
 
 function normalizeAudioRecorderMode(value) {
-  return value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
-    ? AUDIO_RECORDER_MODE_TOGGLE_TO_TALK
-    : AUDIO_RECORDER_MODE_PUSH_TO_TALK;
+  if (value === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK || value === AUDIO_RECORDER_MODE_HYBRID) {
+    return value;
+  }
+
+  return AUDIO_RECORDER_MODE_PUSH_TO_TALK;
 }
 
 export function normalizeOrchestratorVoiceSubmissionMode(value) {
@@ -59,14 +75,42 @@ export function normalizeAudioWidgetTheme(value) {
   return value === AUDIO_WIDGET_THEME_LIGHT ? AUDIO_WIDGET_THEME_LIGHT : AUDIO_WIDGET_THEME_DARK;
 }
 
+export function normalizeAudioWidgetStyle(value) {
+  if (value === AUDIO_WIDGET_STYLE_HIDDEN || value === AUDIO_WIDGET_STYLE_BAR) {
+    return value;
+  }
+
+  return AUDIO_WIDGET_STYLE_BUBBLE;
+}
+
+export function readAudioWidgetStyle() {
+  if (!canUseStorage()) {
+    return AUDIO_WIDGET_STYLE_BUBBLE;
+  }
+
+  return normalizeAudioWidgetStyle(window.localStorage.getItem(AUDIO_WIDGET_STYLE_STORAGE_KEY));
+}
+
+export function writeAudioWidgetStyle(style) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_WIDGET_STYLE_STORAGE_KEY, normalizeAudioWidgetStyle(style));
+  }
+}
+
 function inferAudioTranscriptionProvider(value) {
   const provider = normalizeAudioTranscriptionProvider(value?.provider);
 
-  if (provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
+  if (
+    provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    || provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+  ) {
     return provider;
   }
 
   const source = String(value?.source || "").toLowerCase();
+  if (source.includes("forge")) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+  }
   if (source.includes("deepgram") || source.includes("cloud")) {
     return AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   }
@@ -212,6 +256,17 @@ export function writeAudioTranscriptionProvider(provider) {
   }
 }
 
+export function readForgeLlmCleanup() {
+  return !canUseStorage()
+    || window.localStorage.getItem(AUDIO_FORGE_LLM_CLEANUP_STORAGE_KEY) !== "false";
+}
+
+export function writeForgeLlmCleanup(enabled) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(AUDIO_FORGE_LLM_CLEANUP_STORAGE_KEY, enabled ? "true" : "false");
+  }
+}
+
 export function readDeepgramApiKey() {
   if (!canUseStorage()) {
     return "";
@@ -280,10 +335,16 @@ function normalizeTranscriptionResult(value) {
     ? value.source.trim()
     : provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
       ? "deepgram-nova-3-live"
-      : "whisper-local";
+      : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        ? "forge-nova3-dictation"
+        : "whisper-local";
   const audioMs = Number(value.audioMs || value.durationMs || 0);
   const rawLanguage = typeof value.language === "string" ? value.language.trim() : "";
   const wordCount = text.split(/\s+/).filter(Boolean).length;
+
+  const sourceText = typeof value.sourceText === "string" && value.sourceText.trim() !== text
+    ? value.sourceText.trim()
+    : "";
 
   return {
     createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString(),
@@ -292,6 +353,10 @@ function normalizeTranscriptionResult(value) {
     language: rawLanguage ? normalizeDeepgramLanguage(rawLanguage) : "",
     provider,
     source,
+    sourceText,
+    status: value.status === AUDIO_TRANSCRIPTION_STATUS_CANCELLED
+      ? AUDIO_TRANSCRIPTION_STATUS_CANCELLED
+      : AUDIO_TRANSCRIPTION_STATUS_INSERTED,
     text,
     wordCount,
   };

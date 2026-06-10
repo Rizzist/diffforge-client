@@ -2,15 +2,20 @@ import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
+import { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { MCP_CATALOG } from "./mcpCatalog.js";
 
 const SECTIONS = [
+  { id: "architectures", label: "Architectures" },
+  { id: "mcps", label: "MCPs" },
   { id: "skills", label: "Skills" },
   { id: "clis", label: "CLIs" },
-  { id: "mcps", label: "MCPs" },
 ];
+
+export const GLOBAL_MCP_DEFAULTS_SCOPE = "global-defaults";
+const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -49,11 +54,76 @@ function cliSnapshotFromStatuses(statuses) {
 }
 
 export default function ToolsWorkspaceView({
-  defaultWorkingDirectory,
-  rootDirectory,
-  workspace,
+  architectures = null,
+  defaultWorkingDirectory = "",
+  initialSection = "",
+  workspaces = [],
 }) {
-  const [section, setSection] = useState("skills");
+  const [section, setSection] = useState(() => (
+    SECTIONS.some((entry) => entry.id === text(initialSection)) ? text(initialSection) : "architectures"
+  ));
+
+  // ---- MCP scope (global defaults vs per-workspace) ----
+  const [mcpScope, setMcpScope] = useState(GLOBAL_MCP_DEFAULTS_SCOPE);
+  const [mcpCatalogOpen, setMcpCatalogOpen] = useState(false);
+  const [globalMcpDefaults, setGlobalMcpDefaults] = useState({
+    error: "",
+    rootDirectory: "",
+    state: "loading",
+    workspaceId: GLOBAL_MCP_DEFAULTS_WORKSPACE_ID,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke("coordination_global_mcp_defaults_root")
+      .then((response) => {
+        if (cancelled) return;
+        const data = response?.data || response || {};
+        setGlobalMcpDefaults({
+          error: "",
+          rootDirectory: text(data.rootDirectory || data.root_directory),
+          state: "ready",
+          workspaceId: text(data.workspaceId || data.workspace_id, GLOBAL_MCP_DEFAULTS_WORKSPACE_ID),
+        });
+      })
+      .catch((error) => {
+        if (cancelled) return;
+        setGlobalMcpDefaults((current) => ({
+          ...current,
+          error: getErrorMessage(error, "Unable to resolve the global MCP defaults store."),
+          state: "error",
+        }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const workspaceOptions = useMemo(() => (
+    (Array.isArray(workspaces) ? workspaces : [])
+      .map((workspace) => ({
+        id: text(workspace?.id),
+        name: text(workspace?.name, text(workspace?.id, "Workspace")),
+        rootDirectory: text(workspace?.rootDirectory, defaultWorkingDirectory),
+      }))
+      .filter((workspace) => workspace.id)
+  ), [defaultWorkingDirectory, workspaces]);
+
+  const activeMcpScope = mcpScope !== GLOBAL_MCP_DEFAULTS_SCOPE
+    && workspaceOptions.some((workspace) => workspace.id === mcpScope)
+    ? mcpScope
+    : GLOBAL_MCP_DEFAULTS_SCOPE;
+  const activeMcpWorkspace = activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE
+    ? {
+      id: globalMcpDefaults.workspaceId,
+      name: "Global defaults",
+    }
+    : workspaceOptions.find((workspace) => workspace.id === activeMcpScope);
+  const activeMcpRootDirectory = activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE
+    ? globalMcpDefaults.rootDirectory
+    : text(activeMcpWorkspace?.rootDirectory, defaultWorkingDirectory);
+  const mcpScopeReady = activeMcpScope !== GLOBAL_MCP_DEFAULTS_SCOPE
+    || (globalMcpDefaults.state === "ready" && Boolean(globalMcpDefaults.rootDirectory));
 
   // ---- Skills (account-level, server synced) ----
   const [skillsDraft, setSkillsDraft] = useState("");
@@ -252,13 +322,14 @@ export default function ToolsWorkspaceView({
   }, [skillsDirty, skillsMeta, skillsRevision, skillsState]);
 
   return (
-    <ToolsLayout aria-label="Workspace tools">
-      <ToolsHeader>
+    <ToolsHubShell aria-label="Global toolkit" data-section={section}>
+      <ToolsHubHeader>
         <div>
-          <ToolsKicker>Tools</ToolsKicker>
-          <ToolsHeading>Skills, CLIs &amp; MCPs</ToolsHeading>
+          <ToolsKicker>Toolkit</ToolsKicker>
+          <ToolsHeading>Architectures, MCPs, Skills &amp; CLIs</ToolsHeading>
           <ToolsHint>
-            Skills and CLIs are account-level and sync across devices; MCP servers are managed per workspace.
+            Architectures and skills sync at the account level; CLIs live on this device.
+            MCPs have global defaults plus per-workspace settings.
           </ToolsHint>
         </div>
         <ToolsSectionNav aria-label="Tool sections" role="tablist">
@@ -275,272 +346,436 @@ export default function ToolsWorkspaceView({
             </ToolsSectionButton>
           ))}
         </ToolsSectionNav>
-      </ToolsHeader>
+      </ToolsHubHeader>
 
-      {section === "skills" && (
-        <ToolsPanel aria-label="Account skills">
-          <ToolsPanelTopline>
-            <div>
-              <ToolsPanelTitle>SKILLS.md</ToolsPanelTitle>
-              <ToolsPanelHint>
-                One shared playbook for your coding agents, synced at the account level.
-                Pair it with the CLIs below — skills describe how, CLIs do the work.
-              </ToolsPanelHint>
-            </div>
-            <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : skillsDirty ? "warn" : "good"}>
-              {skillsStatusLabel}
-            </ToolsStatusPill>
-          </ToolsPanelTopline>
-          <ToolsSkillsEditor
-            aria-label="SKILLS.md content"
-            disabled={skillsState === "loading" || skillsState === "saving"}
-            onChange={(event) => {
-              setSkillsDraft(event.target.value);
-              setSkillsDirty(true);
-            }}
-            placeholder={"# Skills\n\nDocument the repeatable workflows, commands, and conventions your agents should know…"}
-            spellCheck={false}
-            value={skillsDraft}
-          />
-          {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-          <ToolsPanelActions>
-            <ToolsGhostButton
-              disabled={skillsState === "loading" || skillsState === "saving"}
-              onClick={() => {
-                setSkillsDirty(false);
-                void loadAccountTools();
-              }}
-              type="button"
-            >
-              Reload
-            </ToolsGhostButton>
-            <ToolsPrimaryButton
-              disabled={!skillsDirty || skillsState === "saving" || skillsMeta.offline}
-              onClick={saveSkills}
-              type="button"
-            >
-              {skillsState === "saving" ? "Saving…" : "Save & sync"}
-            </ToolsPrimaryButton>
-          </ToolsPanelActions>
-        </ToolsPanel>
-      )}
-
-      {section === "clis" && (
-        <ToolsPanel aria-label="Coding CLIs">
-          <ToolsPanelTopline>
-            <div>
-              <ToolsPanelTitle>Coding CLIs</ToolsPanelTitle>
-              <ToolsPanelHint>
-                Install state lives on this device and is reported to your account, so every
-                device knows what is available where.
-              </ToolsPanelHint>
-            </div>
-            <ToolsGhostButton
-              disabled={cliState === "loading" || cliState === "refreshing"}
-              onClick={() => void refreshCliStatuses()}
-              type="button"
-            >
-              {cliState === "refreshing" ? "Refreshing…" : "Refresh"}
-            </ToolsGhostButton>
-          </ToolsPanelTopline>
-          {cliError && <ToolsError role="alert">{cliError}</ToolsError>}
-          {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
-          {cliState === "loading" ? (
-            <ToolsEmpty>Checking installed CLIs…</ToolsEmpty>
-          ) : (
-            <ToolsCliGrid>
-              {cliStatuses.map((status) => {
-                const provider = text(status?.provider || status?.id);
-                const busyAction = cliBusy[provider] || "";
-                const installed = Boolean(status?.installed);
-                const updateAvailable = Boolean(status?.npmUpdateAvailable || status?.npm_update_available);
-                const version = text(status?.version);
-                return (
-                  <ToolsCliCard data-installed={installed ? "true" : "false"} key={provider}>
-                    <ToolsCliTopline>
-                      <strong>{text(status?.label, provider)}</strong>
-                      <ToolsStatusPill data-tone={installed ? "good" : "muted"}>
-                        {busyAction
-                          ? `${busyAction === "install" ? "Installing" : busyAction === "update" ? "Updating" : "Uninstalling"}…`
-                          : installed
-                            ? version
-                              ? `Installed · ${version}`
-                              : "Installed"
-                            : "Not installed"}
-                      </ToolsStatusPill>
-                    </ToolsCliTopline>
-                    <ToolsCliMeta>
-                      {Boolean(status?.authenticated) && <span>signed in</span>}
-                      {updateAvailable && <span data-tone="warn">update available</span>}
-                      {text(status?.activeModel || status?.active_model) && (
-                        <span>{text(status?.activeModel || status?.active_model)}</span>
-                      )}
-                    </ToolsCliMeta>
-                    <ToolsCliActions>
-                      {!installed && (
-                        <ToolsPrimaryButton
-                          disabled={Boolean(busyAction)}
-                          onClick={() => void runCliAction(provider, "install")}
-                          type="button"
-                        >
-                          {busyAction === "install" ? "Installing…" : "Install"}
-                        </ToolsPrimaryButton>
-                      )}
-                      {installed && updateAvailable && (
-                        <ToolsPrimaryButton
-                          disabled={Boolean(busyAction)}
-                          onClick={() => void runCliAction(provider, "update")}
-                          type="button"
-                        >
-                          {busyAction === "update" ? "Updating…" : "Update"}
-                        </ToolsPrimaryButton>
-                      )}
-                      {installed && (
-                        <ToolsDangerButton
-                          disabled={Boolean(busyAction)}
-                          onClick={() => void runCliAction(provider, "uninstall")}
-                          type="button"
-                        >
-                          {busyAction === "uninstall" ? "Uninstalling…" : "Uninstall"}
-                        </ToolsDangerButton>
-                      )}
-                    </ToolsCliActions>
-                  </ToolsCliCard>
-                );
-              })}
-            </ToolsCliGrid>
-          )}
-
-          <ToolsPanelTopline>
-            <div>
-              <ToolsPanelTitle>Developer CLI catalog</ToolsPanelTitle>
-              <ToolsPanelHint>
-                {`${CLI_CATALOG.length} common developer CLIs. Detection runs on this device; installs use Homebrew or npm.`}
-              </ToolsPanelHint>
-            </div>
-            <ToolsSearchInput
-              aria-label="Filter CLI catalog"
-              onChange={(event) => setCatalogQuery(event.target.value)}
-              placeholder="Filter CLIs…"
-              type="search"
-              value={catalogQuery}
+      {section === "architectures" && (
+        <ToolsHubFill aria-label="Account architectures">
+          {architectures ? (
+            <ArchitectureHubView
+              catalog={architectures.catalog}
+              catalogError={architectures.catalogError}
+              catalogState={architectures.catalogState}
+              graphLists={architectures.graphLists}
+              onCopyGraph={architectures.onCopyGraph}
+              onGraphListRefresh={architectures.onGraphListRefresh}
+              onRefreshCatalog={architectures.onRefreshCatalog}
+              onSelectionChange={architectures.onSelectionChange}
+              resolveRepoSyncContext={architectures.resolveRepoSyncContext}
+              selectedGraphId={architectures.selectedGraphId}
+              selectedRepoPath={architectures.selectedRepoPath}
             />
-          </ToolsPanelTopline>
-          <ToolsCatalogGrid>
-            {visibleCatalog.map((entry) => {
-              const Icon = entry.icon;
-              const check = catalogChecks?.[entry.binary] || {};
-              const installed = Boolean(check.installed);
-              const busyAction = catalogBusy[entry.id] || "";
-              const manageable = Boolean(cliInstallManager(entry));
-              return (
-                <ToolsCatalogCard data-installed={installed ? "true" : "false"} key={entry.id}>
-                  <ToolsCatalogIcon aria-hidden="true">
-                    {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
-                  </ToolsCatalogIcon>
-                  <ToolsCatalogCopy>
-                    <strong>{entry.label}</strong>
-                    <span>{installed ? "installed" : "not installed"}</span>
-                  </ToolsCatalogCopy>
-                  {busyAction ? (
-                    <ToolsStatusPill data-tone="warn">
-                      {busyAction === "install" ? "Installing…" : "Removing…"}
-                    </ToolsStatusPill>
-                  ) : installed ? (
-                    manageable ? (
-                      <ToolsCatalogButton
-                        data-danger="true"
-                        onClick={() => void runCatalogAction(entry, "uninstall")}
-                        type="button"
-                      >
-                        Uninstall
-                      </ToolsCatalogButton>
-                    ) : (
-                      <ToolsStatusPill data-tone="good">Installed</ToolsStatusPill>
-                    )
-                  ) : manageable ? (
-                    <ToolsCatalogButton
-                      onClick={() => void runCatalogAction(entry, "install")}
-                      type="button"
-                    >
-                      Install
-                    </ToolsCatalogButton>
-                  ) : (
-                    <ToolsStatusPill data-tone="muted">Manual</ToolsStatusPill>
-                  )}
-                </ToolsCatalogCard>
-              );
-            })}
-          </ToolsCatalogGrid>
-        </ToolsPanel>
+          ) : (
+            <ToolsEmpty>Architectures are unavailable right now.</ToolsEmpty>
+          )}
+        </ToolsHubFill>
       )}
 
       {section === "mcps" && (
-        <>
-          <ToolsPanel aria-label="Popular MCP servers">
-            <ToolsPanelTopline>
-              <div>
-                <ToolsPanelTitle>Popular MCP servers</ToolsPanelTitle>
-                <ToolsPanelHint>
-                  Copy a launch command, then paste it into the marketplace box below to add it
-                  to this workspace.
-                </ToolsPanelHint>
-              </div>
-            </ToolsPanelTopline>
-            <ToolsCatalogGrid>
-              {MCP_CATALOG.map((entry) => {
-                const Icon = entry.icon;
-                return (
-                  <ToolsCatalogCard key={entry.id}>
-                    <ToolsCatalogIcon aria-hidden="true">
-                      {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
-                    </ToolsCatalogIcon>
-                    <ToolsCatalogCopy>
-                      <strong>{entry.label}</strong>
-                      <span title={entry.command}>{entry.command}</span>
-                    </ToolsCatalogCopy>
-                    <ToolsCatalogButton
-                      onClick={() => {
-                        navigator?.clipboard?.writeText?.(entry.command);
-                        setCliMessage(`Copied ${entry.label} command`);
-                        window.setTimeout(() => setCliMessage(""), 2000);
-                      }}
-                      type="button"
-                    >
-                      Copy
-                    </ToolsCatalogButton>
-                  </ToolsCatalogCard>
-                );
-              })}
-            </ToolsCatalogGrid>
-            {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
-          </ToolsPanel>
-          <McpsWorkspaceView
-          defaultWorkingDirectory={defaultWorkingDirectory}
-          rootDirectory={rootDirectory}
-          workspace={workspace}
-        />
-        </>
+        <ToolsMcpPane aria-label="MCP settings">
+          <ToolsScopeBar>
+            <ToolsScopeCopy>
+              <strong>MCP scope</strong>
+              <span>
+                {activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE
+                  ? "Global defaults are copied into every new workspace; existing workspaces keep their own settings."
+                  : "Workspace-level MCP settings override the global defaults for this workspace only."}
+              </span>
+            </ToolsScopeCopy>
+            <ToolsScopeControls>
+              <ToolsScopeSelect
+                aria-label="MCP settings scope"
+                onChange={(event) => setMcpScope(event.target.value)}
+                value={activeMcpScope}
+              >
+                <option value={GLOBAL_MCP_DEFAULTS_SCOPE}>Global defaults (new workspaces inherit)</option>
+                {workspaceOptions.map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+                ))}
+              </ToolsScopeSelect>
+              <ToolsGhostButton
+                onClick={() => setMcpCatalogOpen((open) => !open)}
+                type="button"
+              >
+                {mcpCatalogOpen ? "Hide popular servers" : "Popular servers"}
+              </ToolsGhostButton>
+            </ToolsScopeControls>
+          </ToolsScopeBar>
+          {mcpCatalogOpen && (
+            <ToolsPanel aria-label="Popular MCP servers">
+              <ToolsPanelTopline>
+                <div>
+                  <ToolsPanelTitle>Popular MCP servers</ToolsPanelTitle>
+                  <ToolsPanelHint>
+                    Copy a launch command, then paste it into the marketplace box below to add it
+                    to the selected scope.
+                  </ToolsPanelHint>
+                </div>
+              </ToolsPanelTopline>
+              <ToolsCatalogGrid>
+                {MCP_CATALOG.map((entry) => {
+                  const Icon = entry.icon;
+                  return (
+                    <ToolsCatalogCard key={entry.id}>
+                      <ToolsCatalogIcon aria-hidden="true">
+                        {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
+                      </ToolsCatalogIcon>
+                      <ToolsCatalogCopy>
+                        <strong>{entry.label}</strong>
+                        <span title={entry.command}>{entry.command}</span>
+                      </ToolsCatalogCopy>
+                      <ToolsCatalogButton
+                        onClick={() => {
+                          navigator?.clipboard?.writeText?.(entry.command);
+                          setCliMessage(`Copied ${entry.label} command`);
+                          window.setTimeout(() => setCliMessage(""), 2000);
+                        }}
+                        type="button"
+                      >
+                        Copy
+                      </ToolsCatalogButton>
+                    </ToolsCatalogCard>
+                  );
+                })}
+              </ToolsCatalogGrid>
+              {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
+            </ToolsPanel>
+          )}
+          {globalMcpDefaults.error && activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE && (
+            <ToolsError role="alert">{globalMcpDefaults.error}</ToolsError>
+          )}
+          <ToolsHubFill>
+            {mcpScopeReady && activeMcpWorkspace ? (
+              <McpsWorkspaceView
+                defaultWorkingDirectory={activeMcpRootDirectory || defaultWorkingDirectory}
+                key={activeMcpScope}
+                rootDirectory={activeMcpRootDirectory}
+                workspace={activeMcpWorkspace}
+              />
+            ) : (
+              <ToolsEmpty>
+                {globalMcpDefaults.state === "error"
+                  ? "The global MCP defaults store is unavailable."
+                  : "Loading MCP scope…"}
+              </ToolsEmpty>
+            )}
+          </ToolsHubFill>
+        </ToolsMcpPane>
       )}
-    </ToolsLayout>
+
+      {(section === "skills" || section === "clis") && (
+        <ToolsScroll>
+          <ToolsLayout>
+            {section === "skills" && (
+              <ToolsPanel aria-label="Account skills">
+                <ToolsPanelTopline>
+                  <div>
+                    <ToolsPanelTitle>SKILLS.md</ToolsPanelTitle>
+                    <ToolsPanelHint>
+                      One shared playbook for your coding agents, synced at the account level.
+                      Pair it with the CLIs below — skills describe how, CLIs do the work.
+                    </ToolsPanelHint>
+                  </div>
+                  <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : skillsDirty ? "warn" : "good"}>
+                    {skillsStatusLabel}
+                  </ToolsStatusPill>
+                </ToolsPanelTopline>
+                <ToolsSkillsEditor
+                  aria-label="SKILLS.md content"
+                  disabled={skillsState === "loading" || skillsState === "saving"}
+                  onChange={(event) => {
+                    setSkillsDraft(event.target.value);
+                    setSkillsDirty(true);
+                  }}
+                  placeholder={"# Skills\n\nDocument the repeatable workflows, commands, and conventions your agents should know…"}
+                  spellCheck={false}
+                  value={skillsDraft}
+                />
+                {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
+                <ToolsPanelActions>
+                  <ToolsGhostButton
+                    disabled={skillsState === "loading" || skillsState === "saving"}
+                    onClick={() => {
+                      setSkillsDirty(false);
+                      void loadAccountTools();
+                    }}
+                    type="button"
+                  >
+                    Reload
+                  </ToolsGhostButton>
+                  <ToolsPrimaryButton
+                    disabled={!skillsDirty || skillsState === "saving" || skillsMeta.offline}
+                    onClick={saveSkills}
+                    type="button"
+                  >
+                    {skillsState === "saving" ? "Saving…" : "Save & sync"}
+                  </ToolsPrimaryButton>
+                </ToolsPanelActions>
+              </ToolsPanel>
+            )}
+
+            {section === "clis" && (
+              <ToolsPanel aria-label="Coding CLIs">
+                <ToolsPanelTopline>
+                  <div>
+                    <ToolsPanelTitle>Coding CLIs</ToolsPanelTitle>
+                    <ToolsPanelHint>
+                      Install state lives on this device and is reported to your account, so every
+                      device knows what is available where.
+                    </ToolsPanelHint>
+                  </div>
+                  <ToolsGhostButton
+                    disabled={cliState === "loading" || cliState === "refreshing"}
+                    onClick={() => void refreshCliStatuses()}
+                    type="button"
+                  >
+                    {cliState === "refreshing" ? "Refreshing…" : "Refresh"}
+                  </ToolsGhostButton>
+                </ToolsPanelTopline>
+                {cliError && <ToolsError role="alert">{cliError}</ToolsError>}
+                {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
+                {cliState === "loading" ? (
+                  <ToolsEmpty>Checking installed CLIs…</ToolsEmpty>
+                ) : (
+                  <ToolsCliGrid>
+                    {cliStatuses.map((status) => {
+                      const provider = text(status?.provider || status?.id);
+                      const busyAction = cliBusy[provider] || "";
+                      const installed = Boolean(status?.installed);
+                      const updateAvailable = Boolean(status?.npmUpdateAvailable || status?.npm_update_available);
+                      const version = text(status?.version);
+                      return (
+                        <ToolsCliCard data-installed={installed ? "true" : "false"} key={provider}>
+                          <ToolsCliTopline>
+                            <strong>{text(status?.label, provider)}</strong>
+                            <ToolsStatusPill data-tone={installed ? "good" : "muted"}>
+                              {busyAction
+                                ? `${busyAction === "install" ? "Installing" : busyAction === "update" ? "Updating" : "Uninstalling"}…`
+                                : installed
+                                  ? version
+                                    ? `Installed · ${version}`
+                                    : "Installed"
+                                  : "Not installed"}
+                            </ToolsStatusPill>
+                          </ToolsCliTopline>
+                          <ToolsCliMeta>
+                            {Boolean(status?.authenticated) && <span>signed in</span>}
+                            {updateAvailable && <span data-tone="warn">update available</span>}
+                            {text(status?.activeModel || status?.active_model) && (
+                              <span>{text(status?.activeModel || status?.active_model)}</span>
+                            )}
+                          </ToolsCliMeta>
+                          <ToolsCliActions>
+                            {!installed && (
+                              <ToolsPrimaryButton
+                                disabled={Boolean(busyAction)}
+                                onClick={() => void runCliAction(provider, "install")}
+                                type="button"
+                              >
+                                {busyAction === "install" ? "Installing…" : "Install"}
+                              </ToolsPrimaryButton>
+                            )}
+                            {installed && updateAvailable && (
+                              <ToolsPrimaryButton
+                                disabled={Boolean(busyAction)}
+                                onClick={() => void runCliAction(provider, "update")}
+                                type="button"
+                              >
+                                {busyAction === "update" ? "Updating…" : "Update"}
+                              </ToolsPrimaryButton>
+                            )}
+                            {installed && (
+                              <ToolsDangerButton
+                                disabled={Boolean(busyAction)}
+                                onClick={() => void runCliAction(provider, "uninstall")}
+                                type="button"
+                              >
+                                {busyAction === "uninstall" ? "Uninstalling…" : "Uninstall"}
+                              </ToolsDangerButton>
+                            )}
+                          </ToolsCliActions>
+                        </ToolsCliCard>
+                      );
+                    })}
+                  </ToolsCliGrid>
+                )}
+
+                <ToolsPanelTopline>
+                  <div>
+                    <ToolsPanelTitle>Developer CLI catalog</ToolsPanelTitle>
+                    <ToolsPanelHint>
+                      {`${CLI_CATALOG.length} common developer CLIs. Detection runs on this device; installs use Homebrew or npm.`}
+                    </ToolsPanelHint>
+                  </div>
+                  <ToolsSearchInput
+                    aria-label="Filter CLI catalog"
+                    onChange={(event) => setCatalogQuery(event.target.value)}
+                    placeholder="Filter CLIs…"
+                    type="search"
+                    value={catalogQuery}
+                  />
+                </ToolsPanelTopline>
+                <ToolsCatalogGrid>
+                  {visibleCatalog.map((entry) => {
+                    const Icon = entry.icon;
+                    const check = catalogChecks?.[entry.binary] || {};
+                    const installed = Boolean(check.installed);
+                    const busyAction = catalogBusy[entry.id] || "";
+                    const manageable = Boolean(cliInstallManager(entry));
+                    return (
+                      <ToolsCatalogCard data-installed={installed ? "true" : "false"} key={entry.id}>
+                        <ToolsCatalogIcon aria-hidden="true">
+                          {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
+                        </ToolsCatalogIcon>
+                        <ToolsCatalogCopy>
+                          <strong>{entry.label}</strong>
+                          <span>{installed ? "installed" : "not installed"}</span>
+                        </ToolsCatalogCopy>
+                        {busyAction ? (
+                          <ToolsStatusPill data-tone="warn">
+                            {busyAction === "install" ? "Installing…" : "Removing…"}
+                          </ToolsStatusPill>
+                        ) : installed ? (
+                          manageable ? (
+                            <ToolsCatalogButton
+                              data-danger="true"
+                              onClick={() => void runCatalogAction(entry, "uninstall")}
+                              type="button"
+                            >
+                              Uninstall
+                            </ToolsCatalogButton>
+                          ) : (
+                            <ToolsStatusPill data-tone="good">Installed</ToolsStatusPill>
+                          )
+                        ) : manageable ? (
+                          <ToolsCatalogButton
+                            onClick={() => void runCatalogAction(entry, "install")}
+                            type="button"
+                          >
+                            Install
+                          </ToolsCatalogButton>
+                        ) : (
+                          <ToolsStatusPill data-tone="muted">Manual</ToolsStatusPill>
+                        )}
+                      </ToolsCatalogCard>
+                    );
+                  })}
+                </ToolsCatalogGrid>
+              </ToolsPanel>
+            )}
+          </ToolsLayout>
+        </ToolsScroll>
+      )}
+    </ToolsHubShell>
   );
 }
+
+const ToolsHubShell = styled.section`
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  color: var(--forge-text);
+`;
+
+const ToolsHubHeader = styled.header`
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+`;
+
+const ToolsHubFill = styled.div`
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+`;
+
+const ToolsScroll = styled.div`
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px 24px;
+`;
+
+const ToolsMcpPane = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  padding: 12px 16px 0;
+`;
+
+const ToolsScopeBar = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
+  border-radius: 10px;
+  background: rgba(13, 17, 23, 0.6);
+`;
+
+const ToolsScopeCopy = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+
+  strong {
+    font-size: 12px;
+    font-weight: 800;
+  }
+
+  span {
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 11px;
+  }
+`;
+
+const ToolsScopeControls = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+`;
+
+const ToolsScopeSelect = styled.select`
+  min-width: 220px;
+  padding: 8px 10px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.14));
+  border-radius: 8px;
+  color: var(--forge-text, #f4f7fa);
+  background: rgba(7, 9, 13, 0.6);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 176, 255, 0.35);
+    outline-offset: -1px;
+  }
+`;
 
 const ToolsLayout = styled.section`
   display: grid;
   align-content: start;
   width: min(1080px, 100%);
   justify-self: center;
+  margin: 0 auto;
   gap: 12px;
-  min-width: 0;
-`;
-
-const ToolsHeader = styled.header`
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
   min-width: 0;
 `;
 
@@ -752,6 +987,8 @@ const ToolsNotice = styled.p`
 
 const ToolsEmpty = styled.p`
   margin: 0;
+  align-self: center;
+  justify-self: center;
   color: var(--forge-text-muted, #7a8493);
   font-size: 12px;
 `;

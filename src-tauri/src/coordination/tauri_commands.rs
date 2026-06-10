@@ -906,6 +906,21 @@ pub fn coordination_get_workspace_mcp_status(
 }
 
 #[tauri::command]
+pub fn coordination_global_mcp_defaults_root() -> Result<Value, String> {
+    let root = super::kernel::global_mcp_defaults_root_dir()
+        .ok_or_else(|| "Global MCP defaults root is unavailable.".to_string())?;
+    let root_display = crate::workspace_path_display(&root);
+    Ok(api_ok(json!({
+        "root_directory": root_display,
+        "rootDirectory": root_display,
+        "workspace_id": super::kernel::GLOBAL_MCP_DEFAULTS_WORKSPACE_ID,
+        "workspaceId": super::kernel::GLOBAL_MCP_DEFAULTS_WORKSPACE_ID,
+        "workspace_name": "Global defaults",
+        "workspaceName": "Global defaults",
+    })))
+}
+
+#[tauri::command]
 pub fn coordination_workspace_mcp_registry(
     repo_path: Option<String>,
     db_path: Option<String>,

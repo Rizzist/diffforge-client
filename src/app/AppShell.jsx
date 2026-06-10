@@ -372,8 +372,6 @@ import {
   SetupField,
   SetupInput,
   BlankStatusStack,
-  WorkspaceSettingsOverlay,
-  WorkspaceSettingsDialog,
   WorkspaceSettingsBusyOverlay,
   WorkspaceSettingsBusyPanel,
   WorkspaceGitPullOverlay,
@@ -399,17 +397,10 @@ import {
   CrashRecoveryItemBody,
   CrashRecoveryMeta,
   CrashRecoveryActions,
-  WorkspaceSettingsForm,
   WorkspaceSettingsInput,
   WorkspaceSettingsSelect,
   WorkspaceSettingsSelectIcon,
   WorkspaceSettingsSelectShell,
-  RootDirectoryInput,
-  WorkspaceSettingsTopGrid,
-  WorkspaceRootChooser,
-  WorkspaceRootActions,
-  WorkspaceSettingsActions,
-  WorkspaceSettingsSection,
   TerminalCountGrid,
   TerminalCountButton,
   TerminalCountMeta,
@@ -543,7 +534,7 @@ import {
 } from "./appStyles";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import ArchitectureWorkspaceView, { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
+import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
@@ -552,6 +543,7 @@ import ActivityOverlayWindow, {
   ACTIVITY_OVERLAY_HASH,
 } from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
+import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
@@ -599,7 +591,8 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture", "mcps"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture"]);
+const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps"]);
 const WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE = Object.freeze({
   state: "idle",
   workspaceId: "",
@@ -5492,6 +5485,14 @@ function workspaceArchitectureGraphId(graph) {
   return graphText(graph?.id || graph?.architectureId || graph?.architecture_id || graph?.graphId || graph?.graph_id);
 }
 
+function workspaceArchitectureCloudSyncSignature(graphs) {
+  return JSON.stringify((Array.isArray(graphs) ? graphs : []).map((graph) => [
+    workspaceArchitectureGraphId(graph),
+    graphText(graph?.updatedAt || graph?.updated_at),
+    graphText(graph?.contentHash || graph?.content_hash),
+  ]));
+}
+
 function workspaceArchitectureGraphFilePath(graph) {
   return graphText(
     graph?.filePath
@@ -6161,6 +6162,10 @@ export default function App() {
     return <AudioWidgetWindow />;
   }
 
+  if (window.location.hash.startsWith(TERMINAL_WINDOW_HASH)) {
+    return <TerminalWindowHost />;
+  }
+
   const {
     status: authState,
     stage: authStage,
@@ -6285,6 +6290,10 @@ export default function App() {
   const workspaceGraphStateRef = useRef(workspaceGraphState);
   const workspaceArchitectureScanInFlightRef = useRef(new Set());
   const workspaceArchitectureGraphListInFlightRef = useRef(new Set());
+  // repoKey -> signature of the last graph list pushed to cloud. Prevents
+  // re-pushing identical snapshots on every list refresh, which the server
+  // would echo back as wake events and create a refresh/flicker loop.
+  const architectureCloudSyncSignatureRef = useRef({});
   const activeViewRef = useRef(activeView);
   const visibleViewRef = useRef(visibleView);
   const mainWindowFocusedRef = useRef(mainWindowFocused);
@@ -6360,6 +6369,11 @@ export default function App() {
   const workspaceMcpSyncKeyRef = useRef("");
   const workspaceCatalogSyncKeyRef = useRef("");
   const workspaceCloudSyncKeyRef = useRef("");
+  // Workspace ids deleted on this device this session, mapped to the delete
+  // timestamp. Catalog broadcasts and list responses must not re-add these
+  // unless the cloud entry is newer than the delete (an intentional revive);
+  // stale ghosts are filtered out and the tombstone is re-sent to the cloud.
+  const workspaceCatalogTombstonesRef = useRef(new Map());
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
   const tokenomicsSyncPendingRefreshRef = useRef(false);
@@ -7145,13 +7159,17 @@ export default function App() {
         const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
         const completedAt = Date.now();
         if (localGraphs.length) {
-          invoke("cloud_mcp_sync_workspace_architectures", {
-            graphs: localGraphs,
-            reason: options.reason || "workspace_architecture_graph_list_sync",
-            repoPath: safeRepoPath,
-            workspaceId: safeWorkspaceId,
-            workspaceName,
-          }).catch(() => {});
+          const syncSignature = workspaceArchitectureCloudSyncSignature(localGraphs);
+          if (architectureCloudSyncSignatureRef.current[repoKey] !== syncSignature) {
+            architectureCloudSyncSignatureRef.current[repoKey] = syncSignature;
+            invoke("cloud_mcp_sync_workspace_architectures", {
+              graphs: localGraphs,
+              reason: options.reason || "workspace_architecture_graph_list_sync",
+              repoPath: safeRepoPath,
+              workspaceId: safeWorkspaceId,
+              workspaceName,
+            }).catch(() => {});
+          }
         }
         setWorkspaceGraphState((current) => {
           const previous = current[stateKey] || {};
@@ -7289,6 +7307,8 @@ export default function App() {
   architectureHubRef.current = architectureHub;
   const architectureHubCatalogInFlightRef = useRef(false);
   const architectureHubGraphListInFlightRef = useRef(new Set());
+  const architectureHubGraphStateRef = useRef(architectureHubGraphState);
+  architectureHubGraphStateRef.current = architectureHubGraphState;
 
   const architectureHubEntries = useMemo(() => {
     const catalog = architectureHub.catalog;
@@ -7301,6 +7321,9 @@ export default function App() {
       (Array.isArray(group?.repositories) ? group.repositories : []).forEach((repo) => {
         if (repo && typeof repo === "object") entries.push(repo);
       });
+    });
+    (Array.isArray(catalog.folderRepositories) ? catalog.folderRepositories : []).forEach((repo) => {
+      if (repo && typeof repo === "object") entries.push(repo);
     });
     (Array.isArray(catalog.orphanRepositories) ? catalog.orphanRepositories : []).forEach((repo) => {
       if (repo && typeof repo === "object") entries.push(repo);
@@ -7398,7 +7421,7 @@ export default function App() {
     }
 
     const repoKey = workspaceArchitectureRepoKey(safeRepoPath);
-    const existingEntry = (architectureHubGraphState.architectureGraphLists || {})[repoKey] || null;
+    const existingEntry = (architectureHubGraphStateRef.current.architectureGraphLists || {})[repoKey] || null;
     const existingGraphs = Array.isArray(existingEntry?.graphs) ? existingEntry.graphs : [];
     if (!options.refresh && existingEntry?.state === "ready") {
       return Promise.resolve(existingGraphs);
@@ -7443,17 +7466,21 @@ export default function App() {
         const cloudGraphs = jsonArray(cloudResult?.graphs || cloudResult?.architectures);
         const graphs = workspaceArchitectureMergeGraphLists(localGraphs, cloudGraphs);
         if (localGraphs.length && context.workspaceId) {
-          invoke("cloud_mcp_sync_workspace_architectures", {
-            graphs: localGraphs,
-            reason: options.reason || "architecture_hub_graph_list_sync",
-            repoPath: safeRepoPath,
-            workspaceId: context.workspaceId,
-            workspaceName: context.workspaceName,
-            ...(context.scopeRepoId ? {
-              scopeRepoId: context.scopeRepoId,
-              scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
-            } : {}),
-          }).catch(() => {});
+          const syncSignature = workspaceArchitectureCloudSyncSignature(localGraphs);
+          if (architectureCloudSyncSignatureRef.current[repoKey] !== syncSignature) {
+            architectureCloudSyncSignatureRef.current[repoKey] = syncSignature;
+            invoke("cloud_mcp_sync_workspace_architectures", {
+              graphs: localGraphs,
+              reason: options.reason || "architecture_hub_graph_list_sync",
+              repoPath: safeRepoPath,
+              workspaceId: context.workspaceId,
+              workspaceName: context.workspaceName,
+              ...(context.scopeRepoId ? {
+                scopeRepoId: context.scopeRepoId,
+                scopeGitRepoIdentityId: context.scopeGitRepoIdentityId,
+              } : {}),
+            }).catch(() => {});
+          }
         }
         setArchitectureHubGraphState((current) => ({
           ...current,
@@ -7494,7 +7521,6 @@ export default function App() {
         architectureHubGraphListInFlightRef.current.delete(repoKey);
       });
   }, [
-    architectureHubGraphState.architectureGraphLists,
     findArchitectureHubEntry,
     refreshWorkspaceArchitectureGraphList,
     resolveArchitectureHubSyncContext,
@@ -7559,7 +7585,7 @@ export default function App() {
   }, [refreshArchitectureHubGraphList, resolveArchitectureHubSyncContext]);
 
   useEffect(() => {
-    if (visibleView !== "architectures" || authState !== "authenticated") return;
+    if (!GLOBAL_TOOLS_VIEWS.has(visibleView) || authState !== "authenticated") return;
     void refreshArchitectureHubCatalog();
   }, [authState, refreshArchitectureHubCatalog, visibleView]);
 
@@ -9389,6 +9415,7 @@ export default function App() {
 
     const deleteScopeKey = activeAccountScopeKey;
     const deletedAtIso = new Date().toISOString();
+    workspaceCatalogTombstonesRef.current.set(targetWorkspaceId, deletedAtIso);
     const storedWorkspaces = [
       ...nextWorkspaces,
       {
@@ -10337,6 +10364,38 @@ export default function App() {
     }
   }, []);
 
+  // Drops cloud catalog entries this device already deleted. A cloud entry
+  // updated after the local delete is an intentional revive and is kept; a
+  // stale ghost is filtered out and the cloud tombstone re-sent. Tombstones
+  // are released once the cloud stops listing the workspace.
+  const filterTombstonedCatalogItems = useCallback((items) => {
+    const tombstones = workspaceCatalogTombstonesRef.current;
+    if (!tombstones.size) {
+      return items;
+    }
+    const liveIds = new Set(items.map((item) => item.id));
+    [...tombstones.keys()].forEach((tombstonedId) => {
+      if (!liveIds.has(tombstonedId)) {
+        tombstones.delete(tombstonedId);
+      }
+    });
+    return items.filter((item) => {
+      const deletedAtIso = tombstones.get(item.id);
+      if (!deletedAtIso) {
+        return true;
+      }
+      if (String(item.updatedAt || "") > deletedAtIso) {
+        tombstones.delete(item.id);
+        return true;
+      }
+      void invoke("cloud_mcp_workspace_catalog_delete", {
+        workspaceId: item.id,
+        reason: "workspace_deleted_retry",
+      }).catch(() => {});
+      return false;
+    });
+  }, []);
+
   const loadWorkspaces = useCallback(async () => {
     setWorkspaceSyncState("loading");
     setWorkspaceError("");
@@ -10416,9 +10475,11 @@ export default function App() {
         if (activeAccountScopeKey !== scopeKey) {
           return;
         }
-        const cloudItems = (Array.isArray(result?.workspaces) ? result.workspaces : [])
-          .map(normalizeCatalogWorkspaceEntry)
-          .filter(Boolean);
+        const cloudItems = filterTombstonedCatalogItems(
+          (Array.isArray(result?.workspaces) ? result.workspaces : [])
+            .map(normalizeCatalogWorkspaceEntry)
+            .filter(Boolean),
+        );
         const { workspaces: merged, pendingUpserts, pendingDeletes } = reconcileWorkspaceCatalog(
           localItems,
           cloudItems,
@@ -10458,7 +10519,7 @@ export default function App() {
         // websocket reconnects and the catalog broadcast refreshes us.
       }
     })();
-  }, [activeAccountScopeKey, expireDesktopSession]);
+  }, [activeAccountScopeKey, expireDesktopSession, filterTombstonedCatalogItems]);
 
   useEffect(() => {
     if (!previousAccountScopeKeyRef.current) {
@@ -10504,9 +10565,11 @@ export default function App() {
       if (!Array.isArray(payload.workspaces)) {
         return;
       }
-      const cloudItems = payload.workspaces
-        .map(normalizeCatalogWorkspaceEntry)
-        .filter(Boolean);
+      const cloudItems = filterTombstonedCatalogItems(
+        payload.workspaces
+          .map(normalizeCatalogWorkspaceEntry)
+          .filter(Boolean),
+      );
       const localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
       const { workspaces: merged } = reconcileWorkspaceCatalog(localItems, cloudItems);
       workspacesRef.current = merged;
@@ -10533,12 +10596,13 @@ export default function App() {
         unlisten();
       }
     };
-  }, [activeAccountScopeKey, authState, user]);
+  }, [activeAccountScopeKey, authState, filterTombstonedCatalogItems, user]);
 
   const openCreateWorkspaceModal = useCallback(() => {
     setWorkspaceName("");
     setNewWorkspaceRootDraft(defaultWorkingDirectory || "");
     setWorkspaceError("");
+    setWorkspaceSettingsModalId("");
     setWorkspaceCreateModalOpen(true);
     // The create panel lives in the main workspace view, not a modal.
     showView(DEFAULT_WORKSPACE_VIEW, {
@@ -10553,6 +10617,9 @@ export default function App() {
 
     setWorkspaceCreateModalOpen(false);
     setWorkspaceError("");
+    // Closing the create panel lands on the neutral no-workspace-selected
+    // view instead of jumping back into the previously selected workspace.
+    setSelectedWorkspaceId("");
   }, [workspaceSyncState]);
 
   const createFirstWorkspace = useCallback(async (event, requestedTerminalRoles = null) => {
@@ -10724,7 +10791,13 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
-  }, []);
+    // Settings render inline in the main workspace pane, like the create
+    // panel, so make that pane visible and close the create panel if open.
+    setWorkspaceCreateModalOpen(false);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      telemetrySource: "workspace_settings_panel",
+    });
+  }, [showView]);
 
   const closeWorkspaceSettings = useCallback(() => {
     if (workspaceDeactivationInFlightRef.current) {
@@ -22726,29 +22799,19 @@ export default function App() {
                         <ButtonForgeIcon aria-hidden="true" />
                         <span>History</span>
                       </RailActionButton>
-                      <RailActionButton
-                        aria-label="Tools"
-                        data-active={activeView === "mcps"}
-                        onClick={() => showView("mcps")}
-                        title="Skills, CLIs, and MCPs"
-                        type="button"
-                      >
-                        <ButtonHubIcon aria-hidden="true" />
-                        <span>Tools</span>
-                      </RailActionButton>
                     </>
                   )}
                   <RailGlobalActions aria-label="Global controls">
                     <RailActionButton
-                      aria-label="Architectures"
-                      data-active={activeView === "architectures"}
+                      aria-label="Tools"
+                      data-active={GLOBAL_TOOLS_VIEWS.has(activeView)}
                       data-scope="global"
-                      onClick={() => showView("architectures")}
-                      title="Architectures"
+                      onClick={() => showView("tools")}
+                      title="Architectures, MCPs, Skills & CLIs"
                       type="button"
                     >
-                      <ButtonForgeIcon aria-hidden="true" />
-                      <span>Architectures</span>
+                      <ButtonHubIcon aria-hidden="true" />
+                      <span>Tools</span>
                     </RailActionButton>
                     <RailActionButton
                       aria-label="Assets"
@@ -22998,6 +23061,280 @@ export default function App() {
                         workspaceName={workspaceName}
                         workspaceSyncState={workspaceSyncState}
                       />
+                    )}
+                  </WorkspaceCreateLayer>
+                  <WorkspaceCreateLayer
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !isWorkspaceSettingsOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && isWorkspaceSettingsOpen}
+                  >
+                    {isWorkspaceSettingsOpen && (
+                      <WorkspaceCreateSurface>
+                        <WorkspaceCreateCard
+                          aria-busy={isWorkspaceSettingsBusy}
+                          aria-label="Workspace settings"
+                          onSubmit={saveWorkspaceSettings}
+                        >
+                          <WorkspaceCreateHeader>
+                            <div>
+                              <PanelKicker>Workspace settings</PanelKicker>
+                              <PanelHeading>{selectedWorkspace.name}</PanelHeading>
+                            </div>
+                            <WorkspaceModalCloseButton
+                              aria-label="Close workspace settings"
+                              disabled={isWorkspaceSettingsBusy}
+                              onClick={closeWorkspaceSettings}
+                              title="Close"
+                              type="button"
+                            >
+                              <ButtonCloseIcon aria-hidden="true" />
+                            </WorkspaceModalCloseButton>
+                          </WorkspaceCreateHeader>
+
+                          <WorkspaceSettingsHeaderMeta aria-label="Workspace summary">
+                            <WorkspaceSettingsMetaPill>
+                              <span>Runtime</span>
+                              <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
+                            </WorkspaceSettingsMetaPill>
+                            <WorkspaceSettingsMetaPill>
+                              <span>Terminals</span>
+                              <strong>
+                                {normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}
+                                {" "}
+                                {getWorkspaceTerminalRoleSummaryText(
+                                  normalizeWorkspaceTerminalRoles(
+                                    workspaceTerminalRolesDraft,
+                                    normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft),
+                                    workspaceTerminalFallbackRole,
+                                    workspaceTerminalRoleOptions,
+                                  ),
+                                  workspaceTerminalRoleOptions,
+                                )}
+                              </strong>
+                            </WorkspaceSettingsMetaPill>
+                            <WorkspaceSettingsMetaPill>
+                              <span>Default</span>
+                              <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
+                            </WorkspaceSettingsMetaPill>
+                          </WorkspaceSettingsHeaderMeta>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Name</SettingsLabel>
+                            <WorkspaceSettingsInput
+                              disabled={isWorkspaceSettingsBusy}
+                              maxLength={80}
+                              minLength={1}
+                              onChange={(event) => {
+                                setWorkspaceNameDraft(event.target.value);
+                                setWorkspaceSettingsError("");
+                                setWorkspaceSettingsMessage("");
+                              }}
+                              value={workspaceNameDraft}
+                            />
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Project root</SettingsLabel>
+                            <WorkspaceCreatePathBar>
+                              <WorkspaceCreatePathText title={workspaceRootDraft || selectedWorkspaceRootDisplay}>
+                                {workspaceRootDraft || selectedWorkspaceRootDisplay || defaultWorkingDirectory || "Choose project root"}
+                              </WorkspaceCreatePathText>
+                            </WorkspaceCreatePathBar>
+                            <WorkspaceCreateFooter>
+                              <SecondaryButton
+                                disabled={isWorkspaceSettingsBusy}
+                                onClick={chooseWorkspaceRootDirectory}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Choose directory</span>
+                              </SecondaryButton>
+                              <SecondaryButton
+                                disabled={!defaultWorkingDirectory || isWorkspaceSettingsBusy}
+                                onClick={useDefaultWorkspaceRoot}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Use app dir</span>
+                              </SecondaryButton>
+                            </WorkspaceCreateFooter>
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Terminal layout</SettingsLabel>
+                            <SettingsHint>Choose the total, then distribute panes across installed agent CLIs and plain terminals.</SettingsHint>
+                            <WorkspaceTerminalCountPicker
+                              disabled={isWorkspaceSettingsBusy}
+                              onChange={(count) => {
+                                const nextCount = normalizeWorkspaceTerminalCount(count);
+                                setWorkspaceTerminalCountDraft(count);
+                                setWorkspaceTerminalRolesDraft((roles) => (
+                                  normalizeWorkspaceTerminalRoles(
+                                    roles,
+                                    nextCount,
+                                    workspaceTerminalFallbackRole,
+                                    workspaceTerminalRoleOptions,
+                                  )
+                                ));
+                                setWorkspaceSettingsError("");
+                                setWorkspaceSettingsMessage("");
+                              }}
+                              roleOptions={workspaceTerminalRoleOptions}
+                              roles={workspaceTerminalRolesDraft}
+                              value={workspaceTerminalCountDraft}
+                            />
+                            <WorkspaceTerminalRolePicker
+                              count={workspaceTerminalCountDraft}
+                              disabled={isWorkspaceSettingsBusy}
+                              onChange={(roles) => {
+                                setWorkspaceTerminalRolesDraft(roles);
+                                setWorkspaceSettingsError("");
+                                setWorkspaceSettingsMessage("");
+                              }}
+                              roleOptions={workspaceTerminalRoleOptions}
+                              value={workspaceTerminalRolesDraft}
+                            />
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Agent safety mode</SettingsLabel>
+                            <SettingsHint>
+                              Coordinated is the default: agents edit the repo directly with file locking and terminal pause/resume.
+                              Safe adds isolated worktrees with patch submission. Direct removes every rail: agents edit immediately,
+                              can conflict, and cannot pause or resume.
+                            </SettingsHint>
+                            <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
+                              {AGENT_SESSION_MODE_OPTIONS.map((option) => {
+                                const active = workspaceAgentSessionModeDraft === option.value;
+                                const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
+                                return (
+                                  <AgentSafetyModeButton
+                                    aria-checked={active}
+                                    data-active={active ? "true" : "false"}
+                                    data-tone={option.tone}
+                                    disabled={isWorkspaceSettingsBusy}
+                                    key={option.value}
+                                    onClick={() => {
+                                      setWorkspaceSettingsError("");
+                                      setWorkspaceSettingsMessage("");
+                                      if (needsConfirm && !workspaceUnsafeModeArmed) {
+                                        setWorkspaceUnsafeModeArmed(true);
+                                        setWorkspaceSettingsMessage(
+                                          "Direct mode disables worktrees, locking, and pause/resume. Click Direct again to confirm.",
+                                        );
+                                        return;
+                                      }
+                                      setWorkspaceUnsafeModeArmed(false);
+                                      setWorkspaceAgentSessionModeDraft(option.value);
+                                    }}
+                                    role="radio"
+                                    type="button"
+                                  >
+                                    <strong>
+                                      {option.value === AGENT_SESSION_MODE_DIRECT && workspaceUnsafeModeArmed && !active
+                                        ? "Confirm Direct"
+                                        : option.label}
+                                    </strong>
+                                    <em>{option.description}</em>
+                                  </AgentSafetyModeButton>
+                                );
+                              })}
+                            </AgentSafetyModeGroup>
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Workspace state</SettingsLabel>
+                            <WorkspaceCreateFooter>
+                              {isSelectedWorkspaceActivated ? (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings")}
+                                  type="button"
+                                >
+                                  <ButtonCloseIcon aria-hidden="true" />
+                                  <span>{isWorkspaceSettingsDeactivating ? "Deactivating..." : "Deactivate"}</span>
+                                </SecondaryButton>
+                              ) : (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => requestWorkspaceActivation(selectedWorkspace.id, "workspace_settings")}
+                                  type="button"
+                                >
+                                  <ButtonTerminalIcon aria-hidden="true" />
+                                  <span>Activate</span>
+                                </SecondaryButton>
+                              )}
+                              {isSelectedWorkspaceDefault ? (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => setDefaultWorkspace("", "workspace_settings")}
+                                  type="button"
+                                >
+                                  <ButtonCloseIcon aria-hidden="true" />
+                                  <span>No default</span>
+                                </SecondaryButton>
+                              ) : (
+                                <SecondaryButton
+                                  disabled={isWorkspaceSettingsBusy}
+                                  onClick={() => setDefaultWorkspace(selectedWorkspace.id, "workspace_settings")}
+                                  type="button"
+                                >
+                                  <ButtonCheckIcon aria-hidden="true" />
+                                  <span>Set default</span>
+                                </SecondaryButton>
+                              )}
+                            </WorkspaceCreateFooter>
+                          </WorkspaceCreateSection>
+
+                          {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
+                          {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
+
+                          <WorkspaceCreateFooter>
+                            <PrimaryDangerButton
+                              disabled={isWorkspaceSettingsBusy}
+                              onClick={() => deleteWorkspaceFromForge(selectedWorkspace.id)}
+                              type="button"
+                            >
+                              <ButtonDeleteIcon aria-hidden="true" />
+                              <span>
+                                {isWorkspaceSettingsDeleting
+                                  ? "Deleting..."
+                                  : isWorkspaceDeleteConfirming
+                                    ? "Confirm delete"
+                                    : "Delete from Diff Forge"}
+                              </span>
+                            </PrimaryDangerButton>
+                            <PrimaryButton disabled={isWorkspaceSettingsBusy} type="submit">
+                              <ButtonCheckIcon aria-hidden="true" />
+                              <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>
+                            </PrimaryButton>
+                          </WorkspaceCreateFooter>
+                        </WorkspaceCreateCard>
+                      </WorkspaceCreateSurface>
+                    )}
+                    {isWorkspaceSettingsOpen && (isWorkspaceSettingsDeactivating || isWorkspaceSettingsDeleting) && (
+                      <WorkspaceSettingsBusyOverlay aria-live="polite" role="status">
+                        <WorkspaceSettingsBusyPanel aria-label={isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}>
+                          <WorkspaceCloseSpinner aria-hidden="true" />
+                          <WorkspaceCloseTitle>
+                            {isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}
+                          </WorkspaceCloseTitle>
+                          <WorkspaceCloseDetail>
+                            {isWorkspaceSettingsDeleting
+                              ? "Stopping workspace services, removing cloud live state, and cleaning Diff Forge metadata."
+                              : "Stopping file watchers, terminals, and workspace services before the runtime is released."}
+                          </WorkspaceCloseDetail>
+                          <WorkspaceCloseCounter>
+                            {isWorkspaceSettingsDeleting
+                              ? "Project files stay on disk"
+                              : workspaceDeactivateTotal > 0
+                              ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
+                              : "Stopping workspace runtime"}
+                          </WorkspaceCloseCounter>
+                          <WorkspaceCloseProgressTrack aria-hidden="true">
+                            <WorkspaceCloseProgressBar $progress={workspaceDeactivateProgress} />
+                          </WorkspaceCloseProgressTrack>
+                        </WorkspaceSettingsBusyPanel>
+                      </WorkspaceSettingsBusyOverlay>
                     )}
                   </WorkspaceCreateLayer>
                 </WorkspaceViewPane>
@@ -23709,20 +24046,25 @@ export default function App() {
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "architectures" ? (
-                <ForgeWorkspace aria-label="Architectures" data-motion={viewMotion}>
-                  <ArchitectureHubView
-                    catalog={architectureHub.catalog}
-                    catalogError={architectureHub.error}
-                    catalogState={architectureHub.state}
-                    graphLists={architectureHubGraphLists}
-                    onCopyGraph={copyArchitectureHubGraph}
-                    onGraphListRefresh={refreshArchitectureHubGraphList}
-                    onRefreshCatalog={refreshArchitectureHubCatalog}
-                    onSelectionChange={updateArchitectureHubSelection}
-                    resolveRepoSyncContext={resolveArchitectureHubSyncContext}
-                    selectedGraphId={architectureHubGraphState.architectureSelectedGraphId}
-                    selectedRepoPath={architectureHubGraphState.architectureSelectedRepoPath}
+              ) : GLOBAL_TOOLS_VIEWS.has(visibleView) ? (
+                <ForgeWorkspace aria-label="Global toolkit" data-motion={viewMotion}>
+                  <ToolsWorkspaceView
+                    architectures={{
+                      catalog: architectureHub.catalog,
+                      catalogError: architectureHub.error,
+                      catalogState: architectureHub.state,
+                      graphLists: architectureHubGraphLists,
+                      onCopyGraph: copyArchitectureHubGraph,
+                      onGraphListRefresh: refreshArchitectureHubGraphList,
+                      onRefreshCatalog: refreshArchitectureHubCatalog,
+                      onSelectionChange: updateArchitectureHubSelection,
+                      resolveRepoSyncContext: resolveArchitectureHubSyncContext,
+                      selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
+                      selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
+                    }}
+                    defaultWorkingDirectory={defaultWorkingDirectory}
+                    initialSection={visibleView === "mcps" ? "mcps" : "architectures"}
+                    workspaces={assetWorkspaceOptions}
                   />
                 </ForgeWorkspace>
               ) : visibleView === "assets" ? (
@@ -23785,18 +24127,6 @@ export default function App() {
                     onUninstallModel={uninstallAudioModel}
                     workspace={selectedWorkspace}
                   />
-                </ForgeWorkspace>
-              ) : visibleView === "mcps" ? (
-                <ForgeWorkspace aria-label="Workspace tools" data-motion={viewMotion}>
-                  {selectedWorkspace ? (
-                    <ToolsWorkspaceView
-                      defaultWorkingDirectory={defaultWorkingDirectory}
-                      rootDirectory={selectedWorkspaceFileRoot}
-                      workspace={selectedWorkspace}
-                    />
-                  ) : (
-                    <WorkspaceIdleState detail="Select a workspace to manage its tools." viewMotion={viewMotion} />
-                  )}
                 </ForgeWorkspace>
               ) : (
                 null
@@ -23899,314 +24229,6 @@ export default function App() {
                   </WorkspaceGitPullOverlay>
                 )}
               </WorkspaceViewStack>
-              {isWorkspaceSettingsOpen && (
-                <WorkspaceSettingsOverlay
-                  aria-label="Workspace settings modal"
-                  onMouseDown={(event) => {
-                    if (isWorkspaceSettingsBusy) {
-                      return;
-                    }
-
-                    if (event.target === event.currentTarget) {
-                      closeWorkspaceSettings();
-                    }
-                  }}
-                >
-                  <WorkspaceSettingsDialog
-                    aria-busy={isWorkspaceSettingsBusy}
-                    aria-labelledby="workspace-settings-title"
-                    aria-modal="true"
-                    role="dialog"
-                    >
-                      <WorkspaceSettingsDialogHeader>
-                        <WorkspaceSettingsHeaderMain>
-                          <div>
-                            <PanelKicker>Workspace settings</PanelKicker>
-                            <PanelHeading id="workspace-settings-title">{selectedWorkspace.name}</PanelHeading>
-                          </div>
-                          <WorkspaceSettingsHeaderMeta aria-label="Workspace summary">
-                            <WorkspaceSettingsMetaPill>
-                              <span>Runtime</span>
-                              <strong>{isSelectedWorkspaceActivated ? "Active" : "Idle"}</strong>
-                            </WorkspaceSettingsMetaPill>
-                            <WorkspaceSettingsMetaPill>
-                              <span>Terminals</span>
-                              <strong>
-                                {normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft)}
-                                {" "}
-                                {getWorkspaceTerminalRoleSummaryText(
-                                  normalizeWorkspaceTerminalRoles(
-                                    workspaceTerminalRolesDraft,
-                                    normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft),
-                                    workspaceTerminalFallbackRole,
-                                    workspaceTerminalRoleOptions,
-                                  ),
-                                  workspaceTerminalRoleOptions,
-                                )}
-                              </strong>
-                            </WorkspaceSettingsMetaPill>
-                            <WorkspaceSettingsMetaPill>
-                              <span>Default</span>
-                              <strong>{isSelectedWorkspaceDefault ? "On" : "Off"}</strong>
-                            </WorkspaceSettingsMetaPill>
-                          </WorkspaceSettingsHeaderMeta>
-                        </WorkspaceSettingsHeaderMain>
-                        <WorkspaceSettingsHeaderActions>
-                          {isSelectedWorkspaceActivated ? (
-                            <PrimaryDangerButton
-                              disabled={isWorkspaceSettingsBusy}
-                              onClick={() => deactivateWorkspace(selectedWorkspace.id, "workspace_settings")}
-                              type="button"
-                            >
-                              <ButtonCloseIcon aria-hidden="true" />
-                              <span>{isWorkspaceSettingsDeactivating ? "Deactivating..." : "Deactivate"}</span>
-                            </PrimaryDangerButton>
-                          ) : (
-                            <SecondaryButton
-                              disabled={isWorkspaceSettingsBusy}
-                              onClick={() => requestWorkspaceActivation(selectedWorkspace.id, "workspace_settings")}
-                              type="button"
-                            >
-                              <ButtonTerminalIcon aria-hidden="true" />
-                              <span>Activate</span>
-                            </SecondaryButton>
-                          )}
-                          {isSelectedWorkspaceDefault ? (
-                            <SecondaryButton
-                              disabled={isWorkspaceSettingsBusy}
-                              onClick={() => setDefaultWorkspace("", "workspace_settings")}
-                              type="button"
-                            >
-                              <ButtonCloseIcon aria-hidden="true" />
-                              <span>No default</span>
-                            </SecondaryButton>
-                          ) : (
-                            <SecondaryButton
-                              disabled={isWorkspaceSettingsBusy}
-                              onClick={() => setDefaultWorkspace(selectedWorkspace.id, "workspace_settings")}
-                              type="button"
-                            >
-                              <ButtonCheckIcon aria-hidden="true" />
-                              <span>Set default</span>
-                            </SecondaryButton>
-                          )}
-                          <WorkspaceModalCloseButton
-                            aria-label="Close workspace settings"
-                            disabled={isWorkspaceSettingsBusy}
-                            onClick={closeWorkspaceSettings}
-                            title="Close"
-                            type="button"
-                          >
-                            <ButtonCloseIcon aria-hidden="true" />
-                          </WorkspaceModalCloseButton>
-                        </WorkspaceSettingsHeaderActions>
-                      </WorkspaceSettingsDialogHeader>
-
-                    <WorkspaceSettingsForm onSubmit={saveWorkspaceSettings}>
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Workspace</PanelKicker>
-                          <SettingsHint>Name on the left, project root chooser on the right.</SettingsHint>
-                        </div>
-                        <WorkspaceSettingsTopGrid>
-                          <SetupField>
-                            <SettingsLabel>Name</SettingsLabel>
-                            <WorkspaceSettingsInput
-                              disabled={isWorkspaceSettingsBusy}
-                              maxLength={80}
-                              minLength={1}
-                              onChange={(event) => {
-                                setWorkspaceNameDraft(event.target.value);
-                                setWorkspaceSettingsError("");
-                                setWorkspaceSettingsMessage("");
-                              }}
-                              value={workspaceNameDraft}
-                            />
-                          </SetupField>
-                          <WorkspaceRootChooser>
-                            <SettingsLabel>Root directory</SettingsLabel>
-                            <RootDirectoryInput
-                              disabled={isWorkspaceSettingsBusy}
-                              maxLength={MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH}
-                              placeholder={defaultWorkingDirectory || "Choose project root"}
-                              readOnly
-                              title={workspaceRootDraft || selectedWorkspaceRootDisplay}
-                              value={workspaceRootDraft}
-                            />
-                            <WorkspaceRootActions>
-                              <SecondaryButton
-                                disabled={isWorkspaceSettingsBusy}
-                                onClick={chooseWorkspaceRootDirectory}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Choose directory</span>
-                              </SecondaryButton>
-                              <SecondaryButton
-                                disabled={!defaultWorkingDirectory || isWorkspaceSettingsBusy}
-                                onClick={useDefaultWorkspaceRoot}
-                                type="button"
-                              >
-                                <ButtonFolderIcon aria-hidden="true" />
-                                <span>Use app dir</span>
-                              </SecondaryButton>
-                            </WorkspaceRootActions>
-                          </WorkspaceRootChooser>
-                        </WorkspaceSettingsTopGrid>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Terminal layout</PanelKicker>
-                          <SettingsHint>Choose the total, then distribute panes across installed agent CLIs and plain terminals.</SettingsHint>
-                        </div>
-                        <WorkspaceTerminalCountPicker
-                          disabled={isWorkspaceSettingsBusy}
-                          onChange={(count) => {
-                            const nextCount = normalizeWorkspaceTerminalCount(count);
-                            setWorkspaceTerminalCountDraft(count);
-                            setWorkspaceTerminalRolesDraft((roles) => (
-                              normalizeWorkspaceTerminalRoles(
-                                roles,
-                                nextCount,
-                                workspaceTerminalFallbackRole,
-                                workspaceTerminalRoleOptions,
-                              )
-                            ));
-                            setWorkspaceSettingsError("");
-                            setWorkspaceSettingsMessage("");
-                          }}
-                          roleOptions={workspaceTerminalRoleOptions}
-                          roles={workspaceTerminalRolesDraft}
-                          value={workspaceTerminalCountDraft}
-                        />
-                        <WorkspaceTerminalRolePicker
-                          count={workspaceTerminalCountDraft}
-                          disabled={isWorkspaceSettingsBusy}
-                          onChange={(roles) => {
-                            setWorkspaceTerminalRolesDraft(roles);
-                            setWorkspaceSettingsError("");
-                            setWorkspaceSettingsMessage("");
-                          }}
-                          roleOptions={workspaceTerminalRoleOptions}
-                          value={workspaceTerminalRolesDraft}
-                        />
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Agent safety mode</PanelKicker>
-                          <SettingsHint>
-                            Coordinated is the default: agents edit the repo directly with file locking and terminal pause/resume.
-                            Safe adds isolated worktrees with patch submission. Direct removes every rail: agents edit immediately,
-                            can conflict, and cannot pause or resume.
-                          </SettingsHint>
-                        </div>
-                        <div>
-                          <SettingsLabel>Mode</SettingsLabel>
-                          <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
-                            {AGENT_SESSION_MODE_OPTIONS.map((option) => {
-                              const active = workspaceAgentSessionModeDraft === option.value;
-                              const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
-                              return (
-                                <AgentSafetyModeButton
-                                  aria-checked={active}
-                                  data-active={active ? "true" : "false"}
-                                  data-tone={option.tone}
-                                  disabled={isWorkspaceSettingsBusy}
-                                  key={option.value}
-                                  onClick={() => {
-                                    setWorkspaceSettingsError("");
-                                    setWorkspaceSettingsMessage("");
-                                    if (needsConfirm && !workspaceUnsafeModeArmed) {
-                                      setWorkspaceUnsafeModeArmed(true);
-                                      setWorkspaceSettingsMessage(
-                                        "Direct mode disables worktrees, locking, and pause/resume. Click Direct again to confirm.",
-                                      );
-                                      return;
-                                    }
-                                    setWorkspaceUnsafeModeArmed(false);
-                                    setWorkspaceAgentSessionModeDraft(option.value);
-                                  }}
-                                  role="radio"
-                                  type="button"
-                                >
-                                  <strong>
-                                    {option.value === AGENT_SESSION_MODE_DIRECT && workspaceUnsafeModeArmed && !active
-                                      ? "Confirm Direct"
-                                      : option.label}
-                                  </strong>
-                                  <em>{option.description}</em>
-                                </AgentSafetyModeButton>
-                              );
-                            })}
-                          </AgentSafetyModeGroup>
-                        </div>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsSection>
-                        <div>
-                          <PanelKicker>Danger zone</PanelKicker>
-                          <SettingsHint>
-                            Remove this workspace from Diff Forge cloud/live state and delete local Diff Forge metadata. Project files stay on disk.
-                          </SettingsHint>
-                        </div>
-                        <WorkspaceSettingsActions>
-                          <PrimaryDangerButton
-                            disabled={isWorkspaceSettingsBusy}
-                            onClick={() => deleteWorkspaceFromForge(selectedWorkspace.id)}
-                            type="button"
-                          >
-                            <ButtonDeleteIcon aria-hidden="true" />
-                            <span>
-                              {isWorkspaceSettingsDeleting
-                                ? "Deleting..."
-                                : isWorkspaceDeleteConfirming
-                                  ? "Confirm delete"
-                                  : "Delete from Diff Forge"}
-                            </span>
-                          </PrimaryDangerButton>
-                        </WorkspaceSettingsActions>
-                      </WorkspaceSettingsSection>
-
-                      <WorkspaceSettingsActions>
-                        <PrimaryButton disabled={isWorkspaceSettingsBusy} type="submit">
-                          <ButtonCheckIcon aria-hidden="true" />
-                          <span>{workspaceSettingsState === "saving" ? "Saving..." : "Save"}</span>
-                        </PrimaryButton>
-                      </WorkspaceSettingsActions>
-                    </WorkspaceSettingsForm>
-
-                    {workspaceSettingsError && <FormMessage $state="error">{workspaceSettingsError}</FormMessage>}
-                    {workspaceSettingsMessage && <AgentInstallMessage data-tone="success">{workspaceSettingsMessage}</AgentInstallMessage>}
-                  </WorkspaceSettingsDialog>
-                  {(isWorkspaceSettingsDeactivating || isWorkspaceSettingsDeleting) && (
-                    <WorkspaceSettingsBusyOverlay aria-live="polite" role="status">
-                      <WorkspaceSettingsBusyPanel aria-label={isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}>
-                        <WorkspaceCloseSpinner aria-hidden="true" />
-                        <WorkspaceCloseTitle>
-                          {isWorkspaceSettingsDeleting ? "Deleting workspace" : "Deactivating workspace"}
-                        </WorkspaceCloseTitle>
-                        <WorkspaceCloseDetail>
-                          {isWorkspaceSettingsDeleting
-                            ? "Stopping workspace services, removing cloud live state, and cleaning Diff Forge metadata."
-                            : "Stopping file watchers, terminals, and workspace services before the runtime is released."}
-                        </WorkspaceCloseDetail>
-                        <WorkspaceCloseCounter>
-                          {isWorkspaceSettingsDeleting
-                            ? "Project files stay on disk"
-                            : workspaceDeactivateTotal > 0
-                            ? `${workspaceDeactivateClosed}/${workspaceDeactivateTotal} ${workspaceDeactivateTerminalLabel}`
-                            : "Stopping workspace runtime"}
-                        </WorkspaceCloseCounter>
-                        <WorkspaceCloseProgressTrack aria-hidden="true">
-                          <WorkspaceCloseProgressBar $progress={workspaceDeactivateProgress} />
-                        </WorkspaceCloseProgressTrack>
-                      </WorkspaceSettingsBusyPanel>
-                    </WorkspaceSettingsBusyOverlay>
-                  )}
-                </WorkspaceSettingsOverlay>
-              )}
               </DashboardShell>
               {lowCreditToastVisible && (
                 <LowCreditWarningToast role="status" aria-live="polite">

@@ -6,6 +6,10 @@ const CLOUD_VOICE_AGENT_FAST_RESPONSE_HOLD_MS: u64 = 0;
 const CLOUD_VOICE_AGENT_TEXT_CONNECT_TIMEOUT_SECS: u64 = 40;
 const CLOUD_VOICE_AGENT_CONTRACT: &str = "diffforge.voice_agent.v1";
 const CLOUD_VOICE_AGENT_WS_PATH: &str = "/v1/voice/ws";
+const CLOUD_DICTATION_CONTRACT: &str = "diffforge.voice_dictation.v1";
+const CLOUD_DICTATION_WS_PATH: &str = "/v1/voice/dictation/ws";
+const CLOUD_DICTATION_START_TIMEOUT_SECS: u64 = 20;
+const CLOUD_DICTATION_RESULT_TIMEOUT_SECS: u64 = 45;
 
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
@@ -2097,10 +2101,17 @@ fn clean_deepgram_transcript_text(value: &str) -> Result<String, String> {
     Ok(cleaned)
 }
 
-fn deepgram_realtime_url(language: &str, sample_rate: u32) -> String {
-    format!(
+fn deepgram_realtime_url(language: &str, sample_rate: u32, keyterms: &[String]) -> String {
+    let mut url = format!(
         "{DEEPGRAM_LISTEN_WS_URL}?model={DEEPGRAM_MODEL}&language={language}&encoding=linear16&sample_rate={sample_rate}&channels=1&interim_results=true&smart_format=true"
-    )
+    );
+
+    for keyterm in keyterms {
+        url.push_str("&keyterm=");
+        url.push_str(&percent_encode_query_component(keyterm));
+    }
+
+    url
 }
 
 fn deepgram_error_from_body(body: &Value) -> Option<String> {
@@ -2321,7 +2332,8 @@ fn transcribe_whisper_audio_for(
     let model = model_path.display().to_string();
     let audio = audio_path.display().to_string();
     let thread_count = whisper_cli_thread_count().to_string();
-    let args = vec![
+    let bias_prompt = voice_dictionary_whisper_prompt(app);
+    let mut args = vec![
         "-m".to_string(),
         model.clone(),
         "-f".to_string(),
@@ -2338,6 +2350,10 @@ fn transcribe_whisper_audio_for(
         "1".to_string(),
         "-nf".to_string(),
     ];
+    if let Some(prompt) = bias_prompt.as_ref() {
+        args.push("--prompt".to_string());
+        args.push(prompt.clone());
+    }
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let cli_started_at = Instant::now();
     log_whisper_local_audio_event(
@@ -4943,7 +4959,8 @@ async fn run_deepgram_realtime_stream(
     finished_tx: oneshot::Sender<Result<WhisperTranscriptionResult, String>>,
 ) {
     let started_at = Instant::now();
-    let mut request = match deepgram_realtime_url(&language, sample_rate).into_client_request() {
+    let keyterms = voice_dictionary_bias_terms(&app);
+    let mut request = match deepgram_realtime_url(&language, sample_rate, &keyterms).into_client_request() {
         Ok(request) => request,
         Err(error) => {
             let message = format!("Unable to prepare Deepgram realtime stream: {error}");
@@ -5201,6 +5218,498 @@ async fn stop_deepgram_realtime_transcription(
             "text_chars": result.text.chars().count(),
             "segments": result.segments,
             "duration_ms": result.duration_ms,
+        }),
+    );
+    Ok(result)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ForgeDictationStartRequest {
+    llm_cleanup: Option<bool>,
+    language: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ForgeDictationStopRequest {
+    cancel: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ForgeDictationStartStatus {
+    active: bool,
+    language: String,
+    model: String,
+    sample_rate: u32,
+    llm_cleanup: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ForgeDictationResult {
+    text: String,
+    raw_text: String,
+    cancelled: bool,
+    llm_cleaned: bool,
+    audio_seconds: i64,
+}
+
+fn forge_dictation_result_from_payload(
+    payload: &Value,
+    cancel_requested: bool,
+) -> Result<ForgeDictationResult, String> {
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let raw_text = payload
+        .get("raw_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if text.is_empty() && raw_text.is_empty() {
+        if let Some(error) = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+        {
+            return Err(error.to_string());
+        }
+    }
+
+    Ok(ForgeDictationResult {
+        text: if text.is_empty() { raw_text.clone() } else { text },
+        raw_text,
+        cancelled: payload
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(cancel_requested),
+        llm_cleaned: payload
+            .get("llm_cleaned")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        audio_seconds: payload
+            .get("audio_seconds")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_forge_dictation_stream(
+    app: AppHandle,
+    ws_target: CloudMcpWsTarget,
+    auth_bearer: Option<String>,
+    start_request: Value,
+    mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut control_rx: mpsc::UnboundedReceiver<ForgeDictationControl>,
+    ready_tx: oneshot::Sender<Result<(), String>>,
+    finished_tx: oneshot::Sender<Result<ForgeDictationResult, String>>,
+) {
+    let mut ready_tx = Some(ready_tx);
+    let fail = |ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
+                finished_tx: oneshot::Sender<Result<ForgeDictationResult, String>>,
+                message: String| {
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(Err(message.clone()));
+        }
+        let _ = finished_tx.send(Err(message));
+    };
+
+    let request = match cloud_voice_agent_ws_request(&ws_target, auth_bearer.as_deref(), "", "") {
+        Ok(request) => request,
+        Err(error) => {
+            fail(&mut ready_tx, finished_tx, error);
+            return;
+        }
+    };
+
+    let (ws_stream, _) = match connect_async(request).await {
+        Ok(stream) => stream,
+        Err(error) if ws_target.route_token.is_some() => {
+            let direct_error = error.to_string();
+            let fallback =
+                cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), CLOUD_DICTATION_WS_PATH);
+            let fallback_request =
+                match cloud_voice_agent_ws_request(&fallback, auth_bearer.as_deref(), "", "") {
+                    Ok(request) => request,
+                    Err(error) => {
+                        fail(
+                            &mut ready_tx,
+                            finished_tx,
+                            format!("Unable to prepare cloud dictation balancer fallback: {error}"),
+                        );
+                        return;
+                    }
+                };
+            match connect_async(fallback_request).await {
+                Ok(stream) => stream,
+                Err(fallback_error) => {
+                    fail(
+                        &mut ready_tx,
+                        finished_tx,
+                        format!(
+                            "Unable to open cloud dictation WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        Err(error) => {
+            fail(
+                &mut ready_tx,
+                finished_tx,
+                format!("Unable to open cloud dictation WebSocket: {error}"),
+            );
+            return;
+        }
+    };
+
+    let (mut write, mut read) = ws_stream.split();
+    if let Err(error) = write
+        .send(Message::Text(start_request.to_string().into()))
+        .await
+    {
+        fail(
+            &mut ready_tx,
+            finished_tx,
+            format!("Unable to start cloud dictation stream: {error}"),
+        );
+        return;
+    }
+
+    // Wait for the server to accept the start frame. "voice_dictation_started"
+    // only arrives after the cloud reserved Diff Forge credits, so this is the
+    // client-visible credits gate too.
+    let start_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS));
+    tokio::pin!(start_deadline);
+    loop {
+        tokio::select! {
+            maybe_message = read.next() => {
+                match maybe_message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if write.send(Message::Pong(payload)).await.is_err() {
+                            fail(&mut ready_tx, finished_tx, "Cloud dictation closed before it started.".to_string());
+                            return;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        match payload.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                            "voice_dictation_started" => {
+                                if let Some(ready_tx) = ready_tx.take() {
+                                    let _ = ready_tx.send(Ok(()));
+                                }
+                            }
+                            "voice_dictation_error" => {
+                                let message = payload
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Cloud dictation could not start.")
+                                    .to_string();
+                                fail(&mut ready_tx, finished_tx, message);
+                                return;
+                            }
+                            _ => {}
+                        }
+                        if ready_tx.is_none() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        fail(&mut ready_tx, finished_tx, "Cloud dictation closed before the audio stream started.".to_string());
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        fail(&mut ready_tx, finished_tx, format!("Cloud dictation stream failed before it started: {error}"));
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut start_deadline => {
+                fail(&mut ready_tx, finished_tx, "Cloud dictation timed out while starting the audio stream.".to_string());
+                return;
+            }
+        }
+    }
+
+    let mut audio_open = true;
+    let mut control_open = true;
+    let mut finish_sent = false;
+    let mut cancel_requested = false;
+    let result: Result<ForgeDictationResult, String> = loop {
+        tokio::select! {
+            maybe_control = control_rx.recv(), if control_open => {
+                let (control_kind, cancel) = match maybe_control {
+                    Some(ForgeDictationControl::Cancel) => ("cancel", true),
+                    Some(ForgeDictationControl::Finish) => ("finish", false),
+                    None => {
+                        control_open = false;
+                        continue;
+                    }
+                };
+                cancel_requested = cancel_requested || cancel;
+                if !finish_sent {
+                    finish_sent = true;
+                    let frame = json!({
+                        "kind": control_kind,
+                        "contract": CLOUD_DICTATION_CONTRACT,
+                    });
+                    if let Err(error) = write.send(Message::Text(frame.to_string().into())).await {
+                        break Err(format!("Unable to finish cloud dictation: {error}"));
+                    }
+                }
+            }
+            maybe_audio = audio_rx.recv(), if audio_open => {
+                match maybe_audio {
+                    Some(audio_bytes) => {
+                        if !audio_bytes.is_empty() && !finish_sent {
+                            if let Err(error) = write.send(Message::Binary(audio_bytes.into())).await {
+                                break Err(format!("Unable to stream audio to Diff Forge Cloud: {error}"));
+                            }
+                        }
+                    }
+                    None => {
+                        audio_open = false;
+                    }
+                }
+            }
+            maybe_message = read.next() => {
+                match maybe_message {
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = write.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        match payload.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                            "voice_dictation_transcript" => {
+                                let transcript = payload
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_string();
+                                if !transcript.is_empty() {
+                                    let is_final = payload
+                                        .get("is_final")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false);
+                                    let _ = app.emit(
+                                        AUDIO_REALTIME_TRANSCRIPT_EVENT,
+                                        DeepgramRealtimeTranscriptEvent {
+                                            text: transcript,
+                                            is_final,
+                                            speech_final: is_final,
+                                        },
+                                    );
+                                }
+                            }
+                            "voice_dictation_final" => {
+                                break forge_dictation_result_from_payload(&payload, cancel_requested);
+                            }
+                            "voice_dictation_error" => {
+                                let message = payload
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("Cloud dictation failed.")
+                                    .to_string();
+                                break Err(message);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        break Err("Cloud dictation closed before returning a transcript.".to_string());
+                    }
+                    Some(Err(error)) => {
+                        break Err(format!("Cloud dictation stream failed: {error}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.finished",
+        json!({
+            "ok": result.is_ok(),
+            "cancelled": cancel_requested,
+        }),
+    );
+    let _ = finished_tx.send(result);
+}
+
+#[tauri::command]
+async fn start_forge_dictation_transcription(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    cloud_mcp_state: State<'_, CloudMcpState>,
+    request: ForgeDictationStartRequest,
+) -> Result<ForgeDictationStartStatus, String> {
+    let llm_cleanup = request.llm_cleanup.unwrap_or(true);
+    let language = clean_deepgram_language(request.language)?;
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.start.command",
+        json!({
+            "language": language.clone(),
+            "llm_cleanup": llm_cleanup,
+        }),
+    );
+    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+    let mut session_guard = audio_state.forge_dictation_stream.lock().await;
+
+    if session_guard.is_some() {
+        return Err("Diff Forge Cloud dictation is already active.".to_string());
+    }
+    if audio_state.deepgram_stream.lock().await.is_some() {
+        return Err("Deepgram realtime transcription is already active.".to_string());
+    }
+    if audio_state.cloud_voice_agent_stream.lock().await.is_some() {
+        return Err("Cloud voice agent stream is already active.".to_string());
+    }
+
+    cloud_mcp_wait_for_app_ws_auth(cloud_mcp_state.inner())
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!("Diff Forge Cloud dictation needs the signed-in Diff Forge AI connection. {error}")
+        })?;
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state.inner(),
+        &cloud_mcp_base_url(),
+        CLOUD_DICTATION_WS_PATH,
+    )
+    .await;
+
+    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
+    let (control_tx, control_rx) = mpsc::unbounded_channel::<ForgeDictationControl>();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (finished_tx, finished_rx) = oneshot::channel();
+
+    let start_request = json!({
+        "kind": "start",
+        "contract": CLOUD_DICTATION_CONTRACT,
+        "voice_session_id": format!("dictation-{}", uuid::Uuid::new_v4()),
+        "sample_rate": status.sample_rate,
+        "language": language.clone(),
+        "llm_cleanup": llm_cleanup,
+    });
+
+    tauri::async_runtime::spawn(run_forge_dictation_stream(
+        app,
+        ws_target,
+        auth_bearer,
+        start_request,
+        audio_rx,
+        control_rx,
+        ready_tx,
+        finished_tx,
+    ));
+
+    match timeout(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS), ready_rx).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => {
+            let _ = audio_state.input_worker.detach_realtime_stream();
+            return Err(error);
+        }
+        Ok(Err(_closed)) => {
+            let _ = audio_state.input_worker.detach_realtime_stream();
+            return Err("Cloud dictation closed before it was ready.".to_string());
+        }
+        Err(_elapsed) => {
+            let _ = audio_state.input_worker.detach_realtime_stream();
+            return Err("Cloud dictation timed out while connecting.".to_string());
+        }
+    }
+
+    *session_guard = Some(ForgeDictationSession {
+        control_tx,
+        finished_rx,
+    });
+
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.start.done",
+        json!({
+            "language": language.clone(),
+            "sample_rate": status.sample_rate,
+            "llm_cleanup": llm_cleanup,
+        }),
+    );
+
+    Ok(ForgeDictationStartStatus {
+        active: true,
+        language,
+        model: "nova-3".to_string(),
+        sample_rate: status.sample_rate,
+        llm_cleanup,
+    })
+}
+
+#[tauri::command]
+async fn stop_forge_dictation_transcription(
+    audio_state: State<'_, AudioState>,
+    request: Option<ForgeDictationStopRequest>,
+) -> Result<ForgeDictationResult, String> {
+    let cancel = request.map(|request| request.cancel).unwrap_or(false);
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.stop.command",
+        json!({
+            "cancel": cancel,
+        }),
+    );
+    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+    let session = {
+        let mut session_guard = audio_state.forge_dictation_stream.lock().await;
+        session_guard.take()
+    };
+    let Some(session) = session else {
+        log_audio_diagnostic_event("audio.forge_dictation.stop.inactive", json!({}));
+        return Ok(ForgeDictationResult {
+            text: String::new(),
+            raw_text: String::new(),
+            cancelled: cancel,
+            llm_cleaned: false,
+            audio_seconds: 0,
+        });
+    };
+
+    let _ = session.control_tx.send(if cancel {
+        ForgeDictationControl::Cancel
+    } else {
+        ForgeDictationControl::Finish
+    });
+    audio_state.input_worker.detach_realtime_stream()?;
+
+    let result = timeout(
+        Duration::from_secs(CLOUD_DICTATION_RESULT_TIMEOUT_SECS),
+        session.finished_rx,
+    )
+    .await
+    .map_err(|_| "Cloud dictation timed out while finishing.".to_string())?
+    .map_err(|_| "Cloud dictation stopped before returning a transcript.".to_string())??;
+
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.stop.done",
+        json!({
+            "text_chars": result.text.chars().count(),
+            "cancelled": result.cancelled,
+            "llm_cleaned": result.llm_cleaned,
         }),
     );
     Ok(result)

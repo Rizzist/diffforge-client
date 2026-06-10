@@ -4645,10 +4645,14 @@ async fn cloud_mcp_start_remote_command_listener(
                 }
             }
             if cloud_mcp_is_workspace_architecture_wake_event(&event_kind, &event) {
-                let _ = app.emit(
-                    CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT,
-                    event.clone(),
-                );
+                // Skip our own architecture pushes echoed back by the server;
+                // re-waking on them creates a refresh -> sync -> echo flicker loop.
+                if !cloud_mcp_event_originated_from_this_device(&event) {
+                    let _ = app.emit(
+                        CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT,
+                        event.clone(),
+                    );
+                }
                 continue;
             }
             if cloud_mcp_is_workspace_asset_wake_event(&event_kind, &event) {
@@ -4754,6 +4758,29 @@ fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, event: &Value) -> bo
                 .or_else(|| data.get("workspaceTodos"))
         })
         .is_some()
+}
+
+fn cloud_mcp_event_originated_from_this_device(event: &Value) -> bool {
+    let Some(event_device_id) = cloud_mcp_payload_text(event, &["device_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["deviceId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "device_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "deviceId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["device", "device_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["device", "deviceId"]))
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let device = cloud_mcp_desktop_device_profile();
+    [
+        cloud_mcp_payload_text(&device, &["device_id"]),
+        cloud_mcp_payload_text(&device, &["deviceId"]),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|value| value.trim().to_lowercase())
+    .any(|value| value == event_device_id)
 }
 
 fn cloud_mcp_is_workspace_architecture_wake_event(event_kind: &str, event: &Value) -> bool {
@@ -13952,6 +13979,24 @@ fn cloud_mcp_architecture_payload_base(
     });
     let identity = cloud_mcp_git_repo_identity_for_path(Path::new(&req.root_display));
     cloud_mcp_apply_git_identity_to_value(&mut payload, &identity);
+    let has_git_identity = identity
+        .get("git_repo_identity_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    if !has_git_identity {
+        // Non-git folders sync under a name-based identity so the same folder
+        // name converges to the same cloud rows on every device.
+        let folder_identity =
+            architecture_cloud_identity_for_repo_path(Path::new(&req.root_display));
+        if !folder_identity.is_empty() {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("repo_id".to_string(), json!(folder_identity.clone()));
+                object.insert("repoId".to_string(), json!(folder_identity));
+            }
+        }
+    }
     payload
 }
 
@@ -14394,6 +14439,12 @@ async fn cloud_mcp_architecture_hub_catalog(
             if !git_repo_identity_id.is_empty() {
                 covered_identity_keys.insert(git_repo_identity_id.clone());
             }
+            // Non-git workspace folders sync under a name-based identity;
+            // cover it so they do not duplicate as standalone folder entries.
+            let central_identity = architecture_repo_identity_slug(&repo_path);
+            if !central_identity.is_empty() {
+                covered_identity_keys.insert(central_identity);
+            }
             let mut entry = serde_json::to_value(&repo).unwrap_or_else(|_| json!({}));
             if let Some(object) = entry.as_object_mut() {
                 object.insert("scopeKind".to_string(), json!("workspace"));
@@ -14435,6 +14486,23 @@ async fn cloud_mcp_architecture_hub_catalog(
     if account_list.is_none() {
         cloud_error = "Cloud architecture index is unavailable; showing local repos only.".to_string();
     }
+    // Locally known central-store entries (named folders, agent-made folders,
+    // previously synced repos) show up even before any cloud round-trip.
+    let mut extra_entries = BTreeMap::<String, Value>::new();
+    let local_central_entries =
+        tauri::async_runtime::spawn_blocking(architecture_central_store_entries)
+            .await
+            .map_err(|error| format!("Architecture central store worker failed: {error}"))?
+            .unwrap_or_default();
+    for entry in local_central_entries {
+        let identity_key = cloud_mcp_payload_text(&entry, &["identityKey", "repoId"])
+            .unwrap_or_default();
+        if identity_key.is_empty() || covered_identity_keys.contains(&identity_key) {
+            continue;
+        }
+        extra_entries.insert(identity_key, entry);
+    }
+
     let mut orphan_groups = BTreeMap::<String, Vec<Value>>::new();
     if let Some(account_list) = &account_list {
         for row in account_list
@@ -14453,16 +14521,9 @@ async fn cloud_mcp_architecture_hub_catalog(
             orphan_groups.entry(identity_key).or_default().push(row);
         }
     }
-    let mut orphan_entries = Vec::new();
     for (identity_key, rows) in orphan_groups {
         let first = rows.first().cloned().unwrap_or_else(|| json!({}));
-        let orphan_identity = identity_key.clone();
-        let orphan_root = tauri::async_runtime::spawn_blocking(move || {
-            architecture_orphan_root_dir(&orphan_identity)
-        })
-        .await
-        .map_err(|error| format!("Architecture orphan root worker failed: {error}"))??;
-        let name = cloud_mcp_payload_text(
+        let cloud_name = cloud_mcp_payload_text(
             &first,
             &[
                 "git_repo_display_name",
@@ -14481,9 +14542,37 @@ async fn cloud_mcp_architecture_hub_catalog(
                         .map(str::to_string)
                 },
             )
+        });
+        if let Some(existing) = extra_entries.get_mut(&identity_key) {
+            // The folder already exists locally; cloud rows only improve the
+            // display name for entries that had to fall back to their slug.
+            if let Some(object) = existing.as_object_mut() {
+                let is_named_folder = object["scopeKind"].as_str() == Some("folder");
+                if !is_named_folder {
+                    if let Some(name) = cloud_name {
+                        object.insert("name".to_string(), json!(name));
+                    }
+                }
+            }
+            continue;
+        }
+        let orphan_identity = identity_key.clone();
+        let orphan_root = tauri::async_runtime::spawn_blocking(move || {
+            architecture_orphan_root_dir(&orphan_identity)
         })
-        .unwrap_or_else(|| identity_key.clone());
-        orphan_entries.push(json!({
+        .await
+        .map_err(|error| format!("Architecture orphan root worker failed: {error}"))??;
+        let is_named_folder = identity_key.starts_with("folder-");
+        let name = if is_named_folder {
+            cloud_name.unwrap_or_else(|| {
+                identity_key
+                    .trim_start_matches("folder-")
+                    .replace('-', " ")
+            })
+        } else {
+            cloud_name.unwrap_or_else(|| identity_key.clone())
+        };
+        extra_entries.insert(identity_key.clone(), json!({
             "id": format!("orphan-{identity_key}"),
             "name": name,
             "path": workspace_path_display(&orphan_root),
@@ -14491,7 +14580,7 @@ async fn cloud_mcp_architecture_hub_catalog(
             "hasGit": false,
             "architectureRoot": workspace_path_display(&orphan_root.join(".agents").join("architectures")),
             "graphCount": rows.len(),
-            "scopeKind": "orphan",
+            "scopeKind": if is_named_folder { "folder" } else { "orphan" },
             "repoId": cloud_mcp_payload_text(&first, &["repo_id", "repoId"]).unwrap_or_else(|| identity_key.clone()),
             "gitRepoIdentityId": cloud_mcp_payload_text(&first, &["git_repo_identity_id", "gitRepoIdentityId"]).unwrap_or_default(),
             "identityKey": identity_key,
@@ -14500,12 +14589,23 @@ async fn cloud_mcp_architecture_hub_catalog(
         }));
     }
 
+    let mut folder_entries = Vec::new();
+    let mut orphan_entries = Vec::new();
+    for (_, entry) in extra_entries {
+        if entry["scopeKind"].as_str() == Some("folder") {
+            folder_entries.push(entry);
+        } else {
+            orphan_entries.push(entry);
+        }
+    }
+
     Ok(json!({
         "kind": "architecture_hub_catalog",
         "version": 1,
         "builtAtMs": built_at_ms,
         "global": global_entry,
         "workspaces": workspace_groups,
+        "folderRepositories": folder_entries,
         "orphanRepositories": orphan_entries,
         "cloudIndexAvailable": account_list.is_some(),
         "cloudError": cloud_error,

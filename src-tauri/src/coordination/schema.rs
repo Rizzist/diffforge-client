@@ -50,6 +50,18 @@ pub const OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME: &str =
 pub const AGENT_SESSION_MODE_MIGRATION_VERSION: i64 = 22;
 pub const AGENT_SESSION_MODE_MIGRATION_NAME: &str = "coordination_kernel_agent_session_mode";
 
+pub const WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION: i64 = 23;
+pub const WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_seed_state";
+
+pub const WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_seed_state(
+  workspace_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  seeded_at TEXT NOT NULL
+);
+"#;
+
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version INTEGER PRIMARY KEY,

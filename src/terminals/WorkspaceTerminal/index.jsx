@@ -1647,6 +1647,7 @@ function WorkspaceTerminal({
   startupReady = true,
   terminalBreakoutActive = false,
   terminalSelectionMode = "pointerdown",
+  windowBreakoutHosted = false,
   terminalIndex = 0,
   terminalCount = 1,
   terminalRole = "",
@@ -1667,6 +1668,22 @@ function WorkspaceTerminal({
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
   const resizeControllerRef = useRef(null);
+  const windowBreakoutHostedRef = useRef(windowBreakoutHosted);
+
+  // While a pane is hosted in its own Window Breakout window, the native
+  // window owns the PTY size; the grid's resize controller stands down and
+  // re-asserts the grid geometry the moment the pane returns.
+  useEffect(() => {
+    const wasHosted = windowBreakoutHostedRef.current;
+    windowBreakoutHostedRef.current = windowBreakoutHosted;
+
+    if (wasHosted && !windowBreakoutHosted) {
+      resizeControllerRef.current?.resizeNow("window_breakout_return", {
+        force: true,
+        forceNative: true,
+      });
+    }
+  }, [windowBreakoutHosted]);
   const surfaceRef = useRef(null);
   const xtermRef = useRef(null);
   const terminalInstanceIdRef = useRef(0);
@@ -8904,7 +8921,7 @@ function WorkspaceTerminal({
     });
 
     resizeController = createTerminalResizeController({
-      canResize: () => hasOpenPty && !isDisposed,
+      canResize: () => hasOpenPty && !isDisposed && !windowBreakoutHostedRef.current,
       container,
       defaultCols: TERMINAL_DEFAULT_COLS,
       defaultRows: TERMINAL_DEFAULT_ROWS,

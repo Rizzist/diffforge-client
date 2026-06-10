@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest, Sha1};
-use std::path::Path;
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
@@ -63,38 +62,19 @@ pub struct TerminalCoordinationContext {
 
 impl TerminalCoordinationContext {
     fn architecture_root_path(&self) -> String {
-        Path::new(&self.repo_path)
-            .join(".agents")
-            .join("architectures")
-            .display()
-            .to_string()
+        crate::architecture_env_paths_for_repo(&self.repo_path).0
     }
 
     fn architecture_graphs_root_path(&self) -> String {
-        Path::new(&self.repo_path)
-            .join(".agents")
-            .join("architectures")
-            .join("graphs")
-            .display()
-            .to_string()
+        crate::architecture_env_paths_for_repo(&self.repo_path).1
     }
 
     fn architecture_guide_path(&self) -> String {
-        Path::new(&self.repo_path)
-            .join(".agents")
-            .join("architectures")
-            .join("AGENTS.md")
-            .display()
-            .to_string()
+        crate::architecture_env_paths_for_repo(&self.repo_path).2
     }
 
     fn architecture_icon_reference_path(&self) -> String {
-        Path::new(&self.repo_path)
-            .join(".agents")
-            .join("architectures")
-            .join("icon-aliases.json")
-            .display()
-            .to_string()
+        crate::architecture_env_paths_for_repo(&self.repo_path).3
     }
 
     pub fn file_authority(&self) -> &'static str {

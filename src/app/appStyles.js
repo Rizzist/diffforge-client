@@ -6574,7 +6574,7 @@ export const AudioRecorderActions = styled.div`
 
 export const AudioModeGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   min-width: 0;
 
@@ -7152,6 +7152,9 @@ export const AudioTabPanel = styled.div`
 `;
 
 export const AudioDictionaryPanel = styled.section`
+  display: grid;
+  align-content: start;
+  gap: 12px;
   min-height: 260px;
   min-width: 0;
   padding: 12px;
@@ -7164,6 +7167,240 @@ export const AudioDictionaryPanel = styled.section`
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
     background: var(--forge-surface-control);
+  }
+`;
+
+export const AudioRulesTabs = styled.div`
+  display: inline-flex;
+  gap: 4px;
+  min-width: 0;
+  padding: 3px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  background: rgba(7, 9, 13, 0.5);
+  justify-self: start;
+
+  html[data-forge-theme="light"] & {
+    background: rgba(0, 0, 0, 0.04);
+  }
+`;
+
+export const AudioRulesTab = styled.button`
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 780;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease;
+
+  &[aria-pressed="true"] {
+    color: var(--forge-text);
+    background: rgba(125, 160, 205, 0.18);
+  }
+
+  html[data-forge-theme="light"] &[aria-pressed="true"] {
+    color: var(--forge-blue);
+    background: rgba(0, 102, 204, 0.1);
+  }
+`;
+
+export const AudioRulesHint = styled.p`
+  margin: 0;
+  color: var(--forge-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+`;
+
+export const AudioRulesList = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+`;
+
+export const AudioRuleRow = styled.div`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  background: rgba(7, 9, 13, 0.5);
+
+  &[data-disabled="true"] {
+    opacity: 0.55;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.035),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  }
+`;
+
+export const AudioRuleFields = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+export const AudioRuleFieldRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 6px;
+  min-width: 0;
+
+  &[data-single="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+`;
+
+export const AudioRuleTextarea = styled.textarea`
+  min-width: 0;
+  min-height: 56px;
+  padding: 8px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text);
+  background: rgba(21, 27, 35, 0.78);
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  line-height: 1.4;
+  resize: vertical;
+
+  &:focus {
+    border-color: rgba(125, 160, 205, 0.44);
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(125, 160, 205, 0.12);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: var(--forge-surface);
+  }
+
+  html[data-forge-theme="light"] &:focus {
+    border-color: var(--forge-blue-soft);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
+  }
+`;
+
+export const AudioRuleToggle = styled.button`
+  display: inline-flex;
+  width: 30px;
+  min-height: 18px;
+  align-self: center;
+  align-items: center;
+  padding: 2px;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  background: rgba(125, 160, 205, 0.12);
+  cursor: pointer;
+  transition: background 140ms ease;
+
+  &::before {
+    content: "";
+    width: 12px;
+    height: 12px;
+    border-radius: 999px;
+    background: var(--forge-text-muted);
+    transition: transform 140ms ease, background 140ms ease;
+  }
+
+  &[aria-pressed="true"] {
+    background: rgba(75, 212, 170, 0.22);
+  }
+
+  &[aria-pressed="true"]::before {
+    transform: translateX(12px);
+    background: var(--forge-green);
+  }
+`;
+
+export const AudioRuleIconButton = styled.button`
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  align-self: center;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--forge-text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color 130ms ease, background 130ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover {
+    color: var(--forge-red, #ff6b6b);
+    background: rgba(255, 107, 107, 0.1);
+  }
+`;
+
+export const AudioRulesActionsRow = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+`;
+
+export const AudioRulesPreview = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px dashed var(--forge-border);
+  border-radius: 8px;
+
+  > strong {
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 780;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+`;
+
+export const AudioRulesPreviewResult = styled.pre`
+  margin: 0;
+  min-width: 0;
+  max-height: 140px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: 7px;
+  color: var(--forge-text-soft);
+  background: rgba(7, 9, 13, 0.55);
+  font-size: 12px;
+  font-family:
+    "Cascadia Mono",
+    "SFMono-Regular",
+    Consolas,
+    monospace;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text);
+    background: rgba(0, 0, 0, 0.045);
   }
 `;
 
@@ -7340,6 +7577,12 @@ export const AudioHistoryProvider = styled.span`
     background: rgba(75, 212, 170, 0.08);
   }
 
+  &[data-provider="forge"] {
+    border-color: rgba(255, 159, 67, 0.32);
+    color: var(--forge-orange, #ff9f43);
+    background: rgba(255, 159, 67, 0.1);
+  }
+
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 102, 204, 0.2);
     color: var(--forge-blue);
@@ -7350,6 +7593,27 @@ export const AudioHistoryProvider = styled.span`
     border-color: rgba(10, 127, 69, 0.2);
     color: var(--forge-green);
     background: rgba(10, 127, 69, 0.07);
+  }
+`;
+
+export const AudioHistoryStatusBadge = styled.span`
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  padding: 0 7px;
+  border: 1px solid rgba(255, 159, 67, 0.32);
+  border-radius: 999px;
+  color: var(--forge-orange, #ff9f43);
+  background: rgba(255, 159, 67, 0.1);
+  font-size: 10px;
+  font-weight: 780;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(193, 95, 0, 0.28);
+    color: #b35a00;
+    background: rgba(193, 95, 0, 0.08);
   }
 `;
 
@@ -7618,9 +7882,15 @@ export const AudioWidgetShell = styled.main`
   clip-path: inset(0 var(--audio-widget-shell-clip-right) 0 0 round 999px);
   transition:
     clip-path 190ms cubic-bezier(0.3, 0, 0.2, 1),
-    box-shadow 160ms ease;
+    box-shadow 160ms ease,
+    opacity 180ms ease;
   contain: paint;
   -webkit-app-region: drag;
+
+  &[data-concealed="true"] {
+    opacity: 0;
+    pointer-events: none;
+  }
 
   &::before,
   &::after {
@@ -7724,6 +7994,287 @@ export const AudioWidgetShell = styled.main`
   &[data-handoff="true"]::before,
   &[data-handoff="true"]::after {
     transition: none;
+  }
+`;
+
+export const AudioWidgetCancelButton = styled.button`
+  position: absolute;
+  z-index: 4;
+  top: 6px;
+  right: 8px;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(230, 236, 245, 0.18);
+  border-radius: 999px;
+  color: rgba(230, 236, 245, 0.85);
+  background: rgba(9, 11, 16, 0.82);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 130ms ease, background 130ms ease, color 130ms ease;
+  -webkit-app-region: no-drag;
+
+  ${AudioWidgetShell}:hover & {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  &:hover {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.92);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  ${AudioWidgetShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.14);
+    color: rgba(29, 29, 31, 0.78);
+    background: rgba(255, 255, 255, 0.92);
+  }
+
+  ${AudioWidgetShell}[data-theme="light"] &:hover {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.92);
+  }
+`;
+
+export const AudioWidgetLockBadge = styled.span`
+  position: absolute;
+  z-index: 4;
+  top: 7px;
+  left: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--forge-green, #4bd4aa);
+  font-size: 9px;
+  font-weight: 820;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  pointer-events: none;
+
+  &::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    animation: audioWidgetLockPulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes audioWidgetLockPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+`;
+
+export const AudioBarShell = styled.div`
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px);
+  transition: opacity 170ms ease, transform 220ms cubic-bezier(0.3, 0, 0.2, 1);
+
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+`;
+
+export const AudioBarSurface = styled.div`
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  gap: 10px;
+  overflow: hidden;
+  padding: 0 9px;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 16% 0%, rgba(125, 176, 255, 0.12), transparent 36%),
+    linear-gradient(180deg, rgba(37, 42, 49, 0.96), rgba(12, 15, 19, 0.97));
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.07) inset,
+    0 12px 30px rgba(0, 0, 0, 0.38);
+
+  ${AudioBarShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    background:
+      radial-gradient(circle at 16% 0%, rgba(0, 102, 204, 0.08), transparent 36%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.97));
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.96) inset,
+      0 10px 26px rgba(29, 29, 31, 0.16);
+  }
+`;
+
+export const AudioBarLogoButton = styled.button`
+  position: relative;
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+
+  img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+  }
+
+  &::after {
+    content: "\\00d7";
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: inherit;
+    color: #fff;
+    background: rgba(214, 69, 69, 0.94);
+    font-size: 15px;
+    font-weight: 800;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+
+  &:hover::after {
+    opacity: 1;
+  }
+`;
+
+export const AudioBarMeter = styled.div`
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  gap: 2.5px;
+
+  span {
+    width: 2.5px;
+    height: 100%;
+    border-radius: 999px;
+    background: hsl(var(--bar-hue, 204), 88%, 64%);
+    transform-origin: center;
+    transform: scaleY(var(--scale, 0.14));
+    animation: audioBarPulse var(--duration, 900ms) ease-in-out var(--delay, 0ms) infinite alternate;
+  }
+
+  @keyframes audioBarPulse {
+    from { transform: scaleY(var(--scale-low, 0.12)); }
+    to { transform: scaleY(var(--scale-high, 0.5)); }
+  }
+
+  ${AudioBarShell}[data-theme="light"] & span {
+    background: hsl(var(--bar-hue, 210), 80%, 46%);
+  }
+`;
+
+export const AudioBarStatusText = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-soft, rgba(230, 236, 245, 0.86));
+  font-size: 12px;
+  font-weight: 720;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  ${AudioBarShell}[data-theme="light"] & {
+    color: rgba(29, 29, 31, 0.85);
+  }
+`;
+
+export const AudioBarFinishButton = styled.button`
+  display: inline-flex;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(75, 212, 170, 0.42);
+  border-radius: 999px;
+  color: var(--forge-green, #4bd4aa);
+  background: rgba(75, 212, 170, 0.12);
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover:not(:disabled) {
+    color: #06120d;
+    background: var(--forge-green, #4bd4aa);
+  }
+
+  &:disabled {
+    opacity: 0.38;
+    cursor: default;
+  }
+`;
+
+export const AudioBarUndoButton = styled.button`
+  display: inline-flex;
+  min-height: 24px;
+  flex: none;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 159, 67, 0.4);
+  border-radius: 999px;
+  color: var(--forge-orange, #ff9f43);
+  background: rgba(255, 159, 67, 0.12);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease;
+
+  &:hover {
+    color: #160c02;
+    background: var(--forge-orange, #ff9f43);
+  }
+`;
+
+export const AudioBarNoticeProgress = styled.span`
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--forge-orange, #ff9f43);
+  transform-origin: left center;
+  animation: audioBarNoticeDrain 1s linear forwards;
+
+  @keyframes audioBarNoticeDrain {
+    from { transform: scaleX(1); }
+    to { transform: scaleX(0); }
+  }
+
+  [data-paused="true"] & {
+    animation-play-state: paused;
   }
 `;
 

@@ -3,11 +3,24 @@ const AUDIO_CANCEL_EVENT: &str = "forge-audio-cancel";
 const AUDIO_SHORTCUTS_CHANGED_EVENT: &str = "forge-audio-shortcuts-changed";
 const AUDIO_SHORTCUT_SETTINGS_FILE: &str = "audio-shortcuts.json";
 const AUDIO_HANDSFREE_INSERT_DELAY_MS: u64 = 160;
+const AUDIO_FN_KEY_SHORTCUT: &str = "Fn";
 #[cfg(target_os = "macos")]
 const MACOS_ACCESSIBILITY_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+#[cfg(target_os = "macos")]
+const MACOS_KEYBOARD_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.Keyboard-Settings.extension";
+#[cfg(target_os = "macos")]
+const MACOS_FN_KEY_CODE: u16 = 63;
 
 static AUDIO_PUSH_TO_TALK_IS_DOWN: AtomicBool = AtomicBool::new(false);
+static AUDIO_FN_BINDING_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_FN_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_FN_KEY_IS_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_FN_MONITOR_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
 #[cfg(windows)]
 static AUDIO_CONTEXT_MENU_HOOK_HANDLE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
@@ -433,11 +446,35 @@ fn parse_audio_shortcut(value: &str) -> Result<Shortcut, String> {
     Ok(Shortcut::new(Some(modifiers), key))
 }
 
+fn audio_shortcut_is_fn_key(shortcut: &str) -> bool {
+    matches!(
+        shortcut
+            .trim()
+            .replace([' ', '-', '_'], "")
+            .to_ascii_uppercase()
+            .as_str(),
+        "FN" | "FNKEY" | "GLOBE" | "GLOBEKEY" | "FNGLOBE"
+    )
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn audio_fn_key_unsupported_message() -> String {
+    "Fn key capture is only available on macOS. Most Windows and Linux keyboards handle Fn in firmware, so bind another key and use Hybrid mode instead.".to_string()
+}
+
 fn normalize_audio_shortcut_text(value: &str) -> Result<String, String> {
+    if audio_shortcut_is_fn_key(value) {
+        return Ok(AUDIO_FN_KEY_SHORTCUT.to_string());
+    }
+
     Ok(parse_audio_shortcut(value)?.into_string())
 }
 
 fn audio_shortcuts_conflict(left: &str, right: &str) -> bool {
+    if audio_shortcut_is_fn_key(left) || audio_shortcut_is_fn_key(right) {
+        return audio_shortcut_is_fn_key(left) && audio_shortcut_is_fn_key(right);
+    }
+
     match (parse_audio_shortcut(left), parse_audio_shortcut(right)) {
         (Ok(left), Ok(right)) => left.id() == right.id(),
         _ => false,
@@ -533,6 +570,17 @@ fn validate_audio_shortcut_for_action(
     action: AudioShortcutAction,
     shortcut: &str,
 ) -> Result<(), String> {
+    if audio_shortcut_is_fn_key(shortcut) {
+        if action != AudioShortcutAction::PushToTalk {
+            return Err("The Fn (Globe) key can only drive the record shortcut.".to_string());
+        }
+
+        #[cfg(target_os = "macos")]
+        return Ok(());
+        #[cfg(not(target_os = "macos"))]
+        return Err(audio_fn_key_unsupported_message());
+    }
+
     if action == AudioShortcutAction::PushToTalk
         && macos_push_to_talk_shortcut_needs_modifier(shortcut)
     {
@@ -734,6 +782,17 @@ fn register_audio_shortcut_handler(
 }
 
 fn unregister_audio_shortcut(app: &AppHandle, shortcut_text: &str) {
+    if audio_shortcut_is_fn_key(shortcut_text) {
+        AUDIO_FN_BINDING_ACTIVE.store(false, Ordering::Release);
+        log_audio_diagnostic_event(
+            "audio.shortcut.unregister_fn_done",
+            json!({
+                "shortcut": shortcut_text,
+            }),
+        );
+        return;
+    }
+
     match parse_audio_shortcut(shortcut_text) {
         Ok(shortcut) => {
             let result = app.global_shortcut().unregister(shortcut);
@@ -788,6 +847,10 @@ fn register_audio_shortcut_registration(
             }),
         );
         return deferred_audio_cancel_registration(shortcut);
+    }
+
+    if audio_shortcut_is_fn_key(&shortcut) {
+        return register_audio_fn_key_registration(app, action, shortcut);
     }
 
     if audio_shortcut_uses_windows_context_menu_hook(action, &shortcut) {
@@ -855,6 +918,159 @@ fn register_audio_shortcut_registration(
             }
         }
     }
+}
+
+fn register_audio_fn_key_registration(
+    app: &AppHandle,
+    action: AudioShortcutAction,
+    shortcut: String,
+) -> AudioShortcutRegistration {
+    if action != AudioShortcutAction::PushToTalk {
+        return AudioShortcutRegistration {
+            shortcut,
+            registered: false,
+            error: Some("The Fn (Globe) key can only drive the record shortcut.".to_string()),
+        };
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        register_audio_fn_key_monitors(app);
+        AUDIO_FN_BINDING_ACTIVE.store(true, Ordering::Release);
+        log_audio_diagnostic_event(
+            "audio.shortcut.register.fn_done",
+            json!({
+                "shortcut": shortcut,
+            }),
+        );
+
+        AudioShortcutRegistration {
+            shortcut,
+            registered: true,
+            error: None,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        AudioShortcutRegistration {
+            shortcut,
+            registered: false,
+            error: Some(audio_fn_key_unsupported_message()),
+        }
+    }
+}
+
+/// Emits a quiet gesture abort: another key was pressed while Fn was held, so
+/// this is an OS combo (fn+arrow, fn+backspace, ...) rather than a record
+/// gesture. The widget discards the capture without saving anything.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn emit_audio_push_to_talk_abort(app: &AppHandle) {
+    if !AUDIO_PUSH_TO_TALK_IS_DOWN.swap(false, Ordering::AcqRel) {
+        return;
+    }
+
+    emit_audio_push_to_talk_event(app, "aborted", false, AUDIO_FN_KEY_SHORTCUT.to_string());
+}
+
+#[cfg(target_os = "macos")]
+fn audio_fn_monitor_app_handle() -> Option<AppHandle> {
+    AUDIO_FN_MONITOR_APP
+        .get()
+        .and_then(|app_handle| app_handle.lock().ok().and_then(|guard| guard.clone()))
+}
+
+#[cfg(target_os = "macos")]
+fn audio_fn_handle_monitor_event(event: &objc2_app_kit::NSEvent) {
+    if !AUDIO_FN_BINDING_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+
+    let Some(app) = audio_fn_monitor_app_handle() else {
+        return;
+    };
+
+    let event_type = event.r#type();
+
+    if event_type == objc2_app_kit::NSEventType::FlagsChanged {
+        if event.keyCode() != MACOS_FN_KEY_CODE {
+            return;
+        }
+
+        let pressed = event
+            .modifierFlags()
+            .contains(objc2_app_kit::NSEventModifierFlags::Function);
+        if pressed == AUDIO_FN_KEY_IS_DOWN.swap(pressed, Ordering::AcqRel) {
+            return;
+        }
+
+        let state = if pressed {
+            ShortcutState::Pressed
+        } else {
+            ShortcutState::Released
+        };
+        log_audio_diagnostic_event(
+            "audio.ptt.fn_monitor.flags_changed",
+            json!({
+                "pressed": pressed,
+            }),
+        );
+        let _ = handle_audio_push_to_talk_state(app, state, AUDIO_FN_KEY_SHORTCUT.to_string());
+        return;
+    }
+
+    if event_type == objc2_app_kit::NSEventType::KeyDown
+        && AUDIO_FN_KEY_IS_DOWN.load(Ordering::Acquire)
+    {
+        log_audio_diagnostic_event("audio.ptt.fn_monitor.combo_abort", json!({}));
+        emit_audio_push_to_talk_abort(&app);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn register_audio_fn_key_monitors(app: &AppHandle) {
+    let app_slot = AUDIO_FN_MONITOR_APP.get_or_init(|| StdMutex::new(None));
+    if let Ok(mut slot) = app_slot.lock() {
+        *slot = Some(app.clone());
+    }
+
+    if AUDIO_FN_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let _ = app.run_on_main_thread(move || {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        let mask = NSEventMask::FlagsChanged | NSEventMask::KeyDown;
+
+        let global_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                audio_fn_handle_monitor_event(unsafe { event.as_ref() });
+            },
+        );
+        if let Some(token) =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+        {
+            // The monitors live for the app's lifetime.
+            std::mem::forget(token);
+        }
+
+        let local_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                audio_fn_handle_monitor_event(unsafe { event.as_ref() });
+                event.as_ptr()
+            },
+        );
+        let local_token = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block)
+        };
+        if let Some(token) = local_token {
+            std::mem::forget(token);
+        }
+
+        log_audio_diagnostic_event("audio.ptt.fn_monitor.installed", json!({}));
+    });
 }
 
 fn register_audio_shortcuts(app: &AppHandle) {
@@ -1438,6 +1654,22 @@ async fn open_audio_shortcut_permissions(
     {
         let _ = macos_request_accessibility_permission();
         macos_open_accessibility_settings()?;
+    }
+
+    Ok(audio_shortcuts_status_for(&app))
+}
+
+#[tauri::command]
+async fn open_macos_fn_key_settings(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(MACOS_KEYBOARD_SETTINGS_URL)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("Unable to open macOS keyboard settings: {error}"))?;
     }
 
     Ok(audio_shortcuts_status_for(&app))

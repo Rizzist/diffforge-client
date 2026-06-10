@@ -744,6 +744,7 @@ struct AudioState {
     download_lock: Arc<Mutex<()>>,
     cloud_voice_agent_stream: Arc<Mutex<Option<CloudVoiceAgentSession>>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
+    forge_dictation_stream: Arc<Mutex<Option<ForgeDictationSession>>>,
     input_worker: NativeAudioWorker,
     realtime_stream_lock: Arc<Mutex<()>>,
     shortcut_manager: AudioShortcutManager,
@@ -763,6 +764,16 @@ enum CloudVoiceAgentControl {
 
 struct DeepgramRealtimeSession {
     finished_rx: oneshot::Receiver<Result<WhisperTranscriptionResult, String>>,
+}
+
+struct ForgeDictationSession {
+    control_tx: mpsc::UnboundedSender<ForgeDictationControl>,
+    finished_rx: oneshot::Receiver<Result<ForgeDictationResult, String>>,
+}
+
+enum ForgeDictationControl {
+    Finish,
+    Cancel,
 }
 
 #[derive(Clone)]
@@ -2112,6 +2123,7 @@ include!("api.rs");
 include!("activity_overlay.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
+include!("voice_text_rules.rs");
 include!("snipping.rs");
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
@@ -3729,6 +3741,7 @@ pub fn run() {
             download_lock: Arc::new(Mutex::new(())),
             cloud_voice_agent_stream: Arc::new(Mutex::new(None)),
             deepgram_stream: Arc::new(Mutex::new(None)),
+            forge_dictation_stream: Arc::new(Mutex::new(None)),
             input_worker: NativeAudioWorker::new(),
             realtime_stream_lock: Arc::new(Mutex::new(())),
             shortcut_manager: AudioShortcutManager::new(),
@@ -3823,6 +3836,7 @@ pub fn run() {
             architecture_graph_revision_restore,
             architecture_graph_delete,
             architecture_global_root,
+            architecture_named_root,
             architecture_graph_copy,
             delete_workspace_local_metadata,
             run_forge_prompt,
@@ -3849,11 +3863,16 @@ pub fn run() {
             voice_orchestrator_diagnostic_log,
             read_orchestrator_voice_history,
             write_orchestrator_voice_history,
+            start_forge_dictation_transcription,
+            stop_forge_dictation_transcription,
             audio_shortcuts_status,
             audio_push_to_talk_status,
             open_audio_shortcut_permissions,
+            open_macos_fn_key_settings,
             set_audio_shortcut,
             reset_audio_shortcuts,
+            voice_text_rules_get,
+            voice_text_rules_set,
             snipping_status,
             snipping_shortcuts_status,
             set_snipping_enabled,
@@ -4006,6 +4025,10 @@ pub fn run() {
             terminal_close_all,
             terminal_headless_output_delta,
             terminal_headless_output_snapshot,
+            terminal_window_open,
+            terminal_window_close,
+            terminal_window_focus,
+            terminal_pane_runtime_info,
             terminal_live_sessions,
             coordination::tauri_commands::coordination_init,
             coordination::tauri_commands::coordination_workspace_targets,
@@ -4020,6 +4043,7 @@ pub fn run() {
             coordination::tauri_commands::coordination_get_file_watcher_status,
             coordination::tauri_commands::coordination_get_alignment_report,
             coordination::tauri_commands::coordination_get_workspace_mcp_status,
+            coordination::tauri_commands::coordination_global_mcp_defaults_root,
             coordination::tauri_commands::coordination_workspace_mcp_registry,
             coordination::tauri_commands::coordination_workspace_mcp_registry_background,
             coordination::tauri_commands::coordination_add_workspace_mcp_marketplace,

@@ -22,6 +22,7 @@ import { Api } from "@styled-icons/material-rounded/Api";
 import { Cached } from "@styled-icons/material-rounded/Cached";
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
 import { Computer } from "@styled-icons/material-rounded/Computer";
+import { CreateNewFolder } from "@styled-icons/material-rounded/CreateNewFolder";
 import { Dns } from "@styled-icons/material-rounded/Dns";
 import { Folder } from "@styled-icons/material-rounded/Folder";
 import { Groups } from "@styled-icons/material-rounded/Groups";
@@ -87,6 +88,21 @@ function architectureGraphListCacheEntry(graphLists, repoPath) {
 
 function architectureGraphContentHash(graph) {
   return text(graph?.contentHash || graph?.content_hash || graph?.hash);
+}
+
+function architectureGraphListSameContent(left, right) {
+  const leftList = Array.isArray(left) ? left : [];
+  const rightList = Array.isArray(right) ? right : [];
+  if (leftList.length !== rightList.length) return false;
+  return leftList.every((graph, index) => {
+    const other = rightList[index];
+    return text(graph?.id) === text(other?.id)
+      && text(graph?.title) === text(other?.title)
+      && text(graph?.updatedAt || graph?.updated_at) === text(other?.updatedAt || other?.updated_at)
+      && architectureGraphContentHash(graph) === architectureGraphContentHash(other)
+      && Number(graph?.nodeCount || 0) === Number(other?.nodeCount || 0)
+      && text(graph?.syncState || graph?.sync_state) === text(other?.syncState || other?.sync_state);
+  });
 }
 
 function architectureGraphCloudRef(graph) {
@@ -5444,6 +5460,15 @@ export function ArchitectureHubView({
         repositories,
       });
     });
+    const folderRepositories = jsonArray(catalog.folderRepositories);
+    if (folderRepositories.length) {
+      groups.push({
+        id: "folders",
+        kind: "folder",
+        label: "Folders",
+        repositories: folderRepositories,
+      });
+    }
     const orphanRepositories = jsonArray(catalog.orphanRepositories);
     if (orphanRepositories.length) {
       groups.push({
@@ -5460,6 +5485,13 @@ export function ArchitectureHubView({
     repositories: repositoryGroups.flatMap((group) => group.repositories),
   }), [repositoryGroups]);
   const repositoryCount = repositoryScan.repositories.length;
+  const createNamedFolder = useCallback(async (name) => {
+    const entry = await invoke("architecture_named_root", { name });
+    if (typeof onRefreshCatalog === "function") {
+      await onRefreshCatalog({ refresh: true });
+    }
+    return entry;
+  }, [onRefreshCatalog]);
   const scanState = catalogState === "ready" || catalog ? "ready" : catalogState;
   const builtAtMs = Number(catalog?.builtAtMs || 0);
   const toolbarMeta = [
@@ -5492,6 +5524,7 @@ export function ArchitectureHubView({
       <ArchitecturesPanel
         graphLists={graphLists}
         onCopyGraph={onCopyGraph}
+        onCreateNamedFolder={createNamedFolder}
         onGraphListRefresh={onGraphListRefresh}
         onSelectionChange={onSelectionChange}
         repoLabel="account"
@@ -5519,6 +5552,7 @@ function ArchitecturesPanel({
   onGraphListRefresh = null,
   onSelectionChange = null,
   onCopyGraph = null,
+  onCreateNamedFolder = null,
   queueWorkspaceId = "",
   queueWorkspaceName = "",
   repoLabel,
@@ -5551,7 +5585,11 @@ function ArchitecturesPanel({
   const [selectedGraphDirty, setSelectedGraphDirty] = useState(false);
   const [revisionBrowser, setRevisionBrowser] = useState({ graphId: "", open: false });
   const [dragGraph, setDragGraph] = useState(null);
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [draftFolderName, setDraftFolderName] = useState("");
+  const [folderCreateState, setFolderCreateState] = useState("idle");
   const selectedGraphDirtyRef = useRef(false);
+  const selectedGraphLoadedKeyRef = useRef("");
 
   useEffect(() => {
     selectedGraphDirtyRef.current = selectedGraphDirty;
@@ -5643,12 +5681,21 @@ function ArchitecturesPanel({
     if (!selectedRepoPath || !selectedGraphListCacheEntry) return;
     const nextGraphs = jsonArray(selectedGraphListCacheEntry.graphs || selectedGraphListCacheEntry.navTree);
     const cacheState = text(selectedGraphListCacheEntry.state, nextGraphs.length ? "ready" : "idle");
-    setGraphs(nextGraphs);
-    setRepositories((currentRepositories) => currentRepositories.map((repository) => (
-      architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === architectureRepoPathKey(selectedRepoPath)
-        ? { ...repository, graphCount: nextGraphs.length }
-        : repository
-    )));
+    setGraphs((current) => (architectureGraphListSameContent(current, nextGraphs) ? current : nextGraphs));
+    setRepositories((currentRepositories) => {
+      const repoKey = architectureRepoPathKey(selectedRepoPath);
+      if (!currentRepositories.some((repository) => (
+        architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
+          && Number(repository?.graphCount || 0) !== nextGraphs.length
+      ))) {
+        return currentRepositories;
+      }
+      return currentRepositories.map((repository) => (
+        architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
+          ? { ...repository, graphCount: nextGraphs.length }
+          : repository
+      ));
+    });
     setSelectedGraphId((current) => {
       const preferredGraphId = architectureRepoPathKey(workspaceSelectedRepoPath) === architectureRepoPathKey(selectedRepoPath)
         ? text(workspaceSelectedGraphId)
@@ -5688,12 +5735,21 @@ function ArchitecturesPanel({
     return listPromise
       .then((result) => {
         const nextGraphs = jsonArray(result?.graphs || result);
-        setGraphs(nextGraphs);
-        setRepositories((currentRepositories) => currentRepositories.map((repository) => (
-          architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === architectureRepoPathKey(repo)
-            ? { ...repository, graphCount: nextGraphs.length }
-            : repository
-        )));
+        setGraphs((current) => (architectureGraphListSameContent(current, nextGraphs) ? current : nextGraphs));
+        setRepositories((currentRepositories) => {
+          const repoKey = architectureRepoPathKey(repo);
+          if (!currentRepositories.some((repository) => (
+            architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
+              && Number(repository?.graphCount || 0) !== nextGraphs.length
+          ))) {
+            return currentRepositories;
+          }
+          return currentRepositories.map((repository) => (
+            architectureRepoPathKey(architectureRepoPathFromEntry(repository)) === repoKey
+              ? { ...repository, graphCount: nextGraphs.length }
+              : repository
+          ));
+        });
         setSelectedGraphId((current) => {
           const preferredGraphId = architectureRepoPathKey(workspaceSelectedRepoPath) === architectureRepoPathKey(repo)
             ? text(workspaceSelectedGraphId)
@@ -5774,6 +5830,7 @@ function ArchitecturesPanel({
   useEffect(() => {
     let cancelled = false;
     if (!selectedRepoPath || !selectedGraphId) {
+      selectedGraphLoadedKeyRef.current = "";
       setSelectedGraph(null);
       setSelectedGraphDirty(false);
       return () => {
@@ -5781,7 +5838,12 @@ function ArchitecturesPanel({
       };
     }
 
-    setGraphState("loading");
+    // Only flash the loading state when a different graph is being opened;
+    // background list refreshes re-run this effect and should stay silent.
+    const loadedKey = `${architectureRepoPathKey(selectedRepoPath)}::${selectedGraphId}`;
+    if (selectedGraphLoadedKeyRef.current !== loadedKey) {
+      setGraphState("loading");
+    }
     const selectedSummary = graphs.find((graph) => text(graph?.id) === selectedGraphId) || null;
     const hydrateRef = architectureGraphNeedsCloudHydration(selectedSummary)
       ? architectureGraphCloudRef(selectedSummary)
@@ -5812,7 +5874,15 @@ function ArchitecturesPanel({
       .then((graph) => {
         if (cancelled) return;
         if (selectedGraphDirtyRef.current) return;
-        setSelectedGraph(graph);
+        selectedGraphLoadedKeyRef.current = loadedKey;
+        setSelectedGraph((current) => (
+          current
+            && text(current?.id) === text(graph?.id)
+            && text(current?.source) === text(graph?.source)
+            && text(current?.updatedAt) === text(graph?.updatedAt)
+            ? current
+            : graph
+        ));
         setGraphState("ready");
         if (hydrateRef) {
           void loadGraphList(selectedRepoPath, { refresh: true, silent: true });
@@ -5951,6 +6021,30 @@ function ArchitecturesPanel({
   const closeRevisionBrowser = useCallback(() => {
     setRevisionBrowser((current) => ({ ...current, open: false }));
   }, []);
+
+  const submitNamedFolder = useCallback(() => {
+    const name = text(draftFolderName);
+    if (!name || typeof onCreateNamedFolder !== "function" || folderCreateState === "saving") return;
+    setFolderCreateState("saving");
+    setError("");
+    Promise.resolve(onCreateNamedFolder(name))
+      .then((entry) => {
+        const entryPath = text(entry?.rootDirectory || entry?.root_directory || entry?.path);
+        setCreatingFolder(false);
+        setDraftFolderName("");
+        setFolderCreateState("idle");
+        if (entryPath) {
+          setSelectedRepoPath(entryPath);
+          setSelectedGraphId("");
+          setSelectedGraph(null);
+          setCreatingGraph(false);
+        }
+      })
+      .catch((nextError) => {
+        setFolderCreateState("idle");
+        setError(nextError?.message || String(nextError || "Unable to create architecture folder."));
+      });
+  }, [draftFolderName, folderCreateState, onCreateNamedFolder]);
 
   const beginCreateGraph = useCallback((folderPath = "") => {
     const nextFolderPath = text(folderPath);
@@ -6194,7 +6288,7 @@ function ArchitecturesPanel({
       && dragGraph
       && architectureRepoPathKey(text(dragGraph.sourceRepoPath)) !== architectureRepoPathKey(architectureRepoPath);
     const scopeKind = text(repo?.scopeKind);
-    const glyphKind = scopeKind === "global"
+    const glyphKind = scopeKind === "global" || scopeKind === "folder"
       ? "folder"
       : repoKind === "git" ? "repo" : "folder";
     const repoActive = architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath);
@@ -6223,7 +6317,7 @@ function ArchitecturesPanel({
         >
           <ArchitectureTreeGlyph data-kind={glyphKind} aria-hidden="true" />
           <span>{repo.name}</span>
-          <em>{scopeKind === "global" ? "global" : scopeKind === "orphan" ? "synced" : scannedResultEntryKindLabel(repo)}</em>
+          <em>{scopeKind === "global" ? "global" : scopeKind === "folder" ? "folder" : scopeKind === "orphan" ? "synced" : scannedResultEntryKindLabel(repo)}</em>
           <em>{repo.graphCount}</em>
         </ArchitectureTreeRow>
         {repoActive && (
@@ -6244,6 +6338,20 @@ function ArchitecturesPanel({
               <strong>Architectures</strong>
             </ArchitectureNavTitle>
             <ArchitectureNavHeaderActions>
+              {typeof onCreateNamedFolder === "function" && (
+                <ArchitectureCreateGraphButton
+                  aria-label="Create named architecture folder"
+                  onClick={() => {
+                    setCreatingFolder((open) => !open);
+                    setDraftFolderName("");
+                    setCreatingGraph(false);
+                  }}
+                  title="Create a named architecture folder (not tied to any git repo; synced by name)"
+                  type="button"
+                >
+                  <CreateNewFolder aria-hidden="true" />
+                </ArchitectureCreateGraphButton>
+              )}
               <ArchitectureCreateGraphButton
                 aria-label="Create architecture graph"
                 disabled={!selectedRepoPath || saveState === "saving"}
@@ -6272,6 +6380,35 @@ function ArchitecturesPanel({
               </ArchitectureNavToggleButton>
             </ArchitectureNavHeaderActions>
           </ArchitectureNavHeader>
+          {creatingFolder && (
+            <ArchitectureFolderCreateForm
+              onSubmit={(event) => {
+                event.preventDefault();
+                submitNamedFolder();
+              }}
+            >
+              <input
+                aria-label="Architecture folder name"
+                autoFocus
+                disabled={folderCreateState === "saving"}
+                onChange={(event) => setDraftFolderName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    setCreatingFolder(false);
+                    setDraftFolderName("");
+                  }
+                }}
+                placeholder="Folder name (synced by name)"
+                value={draftFolderName}
+              />
+              <button
+                disabled={!draftFolderName.trim() || folderCreateState === "saving"}
+                type="submit"
+              >
+                {folderCreateState === "saving" ? "…" : "Add"}
+              </button>
+            </ArchitectureFolderCreateForm>
+          )}
           <ArchitectureTree>
             {repositoryGroupList.length ? (
               <>
@@ -9652,6 +9789,46 @@ const ArchitectureNavToggleButton = styled(ArchitectureIconButton)`
     display: block;
     width: 15px;
     height: 15px;
+  }
+`;
+
+const ArchitectureFolderCreateForm = styled.form`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+
+  input {
+    min-width: 0;
+    padding: 5px 8px;
+    border: 1px solid rgba(94, 234, 212, 0.28);
+    border-radius: 6px;
+    color: var(--forge-text, #f4f7fa);
+    background: rgba(7, 9, 13, 0.55);
+    font-size: 11.5px;
+    font-weight: 650;
+  }
+
+  input:focus-visible {
+    outline: 2px solid rgba(94, 234, 212, 0.32);
+    outline-offset: -1px;
+  }
+
+  button {
+    padding: 5px 10px;
+    border: 1px solid rgba(45, 212, 191, 0.32);
+    border-radius: 6px;
+    color: rgba(204, 251, 241, 0.95);
+    background: rgba(13, 148, 136, 0.2);
+    font-size: 11px;
+    font-weight: 750;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: default;
+    opacity: 0.45;
   }
 `;
 

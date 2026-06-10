@@ -10,6 +10,8 @@ import { Computer as DeviceComputerIcon } from "@styled-icons/material-rounded/C
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Devices as DeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
 import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
+import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
 import { North } from "@styled-icons/material-rounded/North";
@@ -1074,6 +1076,92 @@ const TerminalSurfaceSlot = styled.div`
 
   &[data-terminal-fullscreen="true"] {
     z-index: 240;
+  }
+`;
+
+const TerminalWindowBreakoutOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 32;
+  display: grid;
+  place-content: center;
+  gap: 7px;
+  text-align: center;
+  border-radius: inherit;
+  border: 1px dashed rgba(125, 160, 205, 0.32);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(125, 176, 255, 0.07), transparent 52%),
+    rgba(4, 6, 9, 0.94);
+
+  > strong {
+    min-width: 0;
+    overflow: hidden;
+    padding: 0 18px;
+    color: var(--forge-text-soft, rgba(230, 236, 245, 0.9));
+    font-size: 13px;
+    font-weight: 780;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > span {
+    color: var(--forge-text-muted, rgba(230, 236, 245, 0.5));
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.24);
+    background:
+      radial-gradient(circle at 50% 0%, rgba(0, 102, 204, 0.05), transparent 52%),
+      rgba(245, 245, 247, 0.96);
+  }
+`;
+
+const TerminalWindowBreakoutOverlayActions = styled.div`
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+`;
+
+const TerminalWindowBreakoutOverlayButton = styled.button`
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid rgba(125, 160, 205, 0.3);
+  border-radius: 999px;
+  color: var(--forge-text-soft, rgba(230, 236, 245, 0.88));
+  background: rgba(125, 160, 205, 0.1);
+  font-size: 11.5px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover {
+    color: #fff;
+    background: rgba(125, 160, 205, 0.26);
+  }
+
+  &[data-variant="return"]:hover {
+    color: #06120d;
+    background: var(--forge-green, #4bd4aa);
+    border-color: transparent;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text, #1d1d1f);
+    background: rgba(0, 102, 204, 0.08);
+    border-color: rgba(0, 102, 204, 0.22);
   }
 `;
 
@@ -11175,6 +11263,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onResumePlan,
   onSubmitDraft,
   onToggleTerminalBreakout,
+  onToggleWindowBreakout,
+  windowBreakoutActive = false,
   onToggleFullscreenPane,
   onUpdateItem,
   onVoiceAgentToolCall,
@@ -12987,6 +13077,19 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                 <ButtonHubIcon aria-hidden="true" />
               </WorkspaceToolControlButton>
               <WorkspaceToolControlButton
+                aria-label={windowBreakoutActive
+                  ? "Return terminals from their own windows"
+                  : "Break terminals out into their own windows"}
+                aria-pressed={windowBreakoutActive ? "true" : "false"}
+                data-active={windowBreakoutActive ? "true" : undefined}
+                data-control="window-breakout"
+                onClick={onToggleWindowBreakout}
+                title={windowBreakoutActive ? "Return windows" : "Window Breakout"}
+                type="button"
+              >
+                <OpenInNew aria-hidden="true" />
+              </WorkspaceToolControlButton>
+              <WorkspaceToolControlButton
                 aria-label={paneFullscreen ? "Exit workspace tools big view" : "Open workspace tools big view"}
                 onClick={onToggleFullscreenPane}
                 title={paneFullscreen ? "Exit big view" : "Big view"}
@@ -13851,6 +13954,9 @@ function TerminalView({
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
   const [terminalDragState, setTerminalDragState] = useState(null);
   const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
+  const [windowBreakoutPanes, setWindowBreakoutPanes] = useState({});
+  const windowBreakoutPanesRef = useRef(windowBreakoutPanes);
+  const closeWindowBreakoutRef = useRef(null);
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
@@ -17757,6 +17863,8 @@ function TerminalView({
       return;
     }
 
+    // Canvas breakout and Window Breakout are modes of the same grid.
+    closeWindowBreakoutRef.current?.();
     measureTerminalLayout();
     clearTerminalBreakoutTransitionTimer();
     const { placements } = buildCurrentBreakoutPlacements({ preserveExisting: true });
@@ -17815,6 +17923,166 @@ function TerminalView({
 
     closeTerminalBreakout();
   }, [closeTerminalBreakout, openTerminalBreakout]);
+
+  useEffect(() => {
+    windowBreakoutPanesRef.current = windowBreakoutPanes;
+  }, [windowBreakoutPanes]);
+
+  const windowBreakoutActive = Object.keys(windowBreakoutPanes).length > 0;
+
+  const getTerminalWindowTitle = useCallback((terminalIndex) => {
+    const threadName = String(getTerminalThread(terminalIndex)?.name || "").trim();
+    if (threadName) {
+      return threadName;
+    }
+
+    const agentName = String(getTerminalAgent(terminalIndex)?.name || "").trim();
+    return agentName
+      ? `${agentName} ${terminalIndex + 1}`
+      : `Terminal ${terminalIndex + 1}`;
+  }, [getTerminalAgent, getTerminalThread]);
+
+  // Window Breakout: every grid terminal becomes its own native window. The
+  // PTYs never restart; the windows attach as extra output subscribers, and
+  // the grid keeps slim placeholder cards until the panes return.
+  const openWindowBreakout = useCallback(async () => {
+    if (!hasVisibleWorkspaceTerminalPanes || !terminalWorkspace?.id) {
+      return;
+    }
+
+    closeTerminalBreakout();
+
+    const opened = {};
+    for (const terminalIndex of logicalTerminalIndexes) {
+      const paneId = getTerminalPaneId(terminalIndex);
+      if (!paneId) {
+        continue;
+      }
+      try {
+        // Sequential on purpose: parallel window creation races the macOS
+        // main-thread window builder.
+        // eslint-disable-next-line no-await-in-loop
+        await invoke("terminal_window_open", {
+          paneId,
+          title: getTerminalWindowTitle(terminalIndex),
+        });
+        opened[paneId] = true;
+      } catch {
+        // Panes that have not launched a PTY yet simply stay in the grid.
+      }
+    }
+
+    if (Object.keys(opened).length) {
+      setWindowBreakoutPanes((current) => ({ ...current, ...opened }));
+    }
+  }, [
+    closeTerminalBreakout,
+    getTerminalPaneId,
+    getTerminalWindowTitle,
+    hasVisibleWorkspaceTerminalPanes,
+    logicalTerminalIndexes,
+    terminalWorkspace?.id,
+  ]);
+
+  const closeWindowBreakout = useCallback(() => {
+    const paneIds = Object.keys(windowBreakoutPanesRef.current);
+    if (!paneIds.length) {
+      return;
+    }
+
+    setWindowBreakoutPanes({});
+    paneIds.forEach((paneId) => {
+      invoke("terminal_window_close", { paneId }).catch(() => {});
+    });
+  }, []);
+
+  useEffect(() => {
+    closeWindowBreakoutRef.current = closeWindowBreakout;
+  }, [closeWindowBreakout]);
+
+  const toggleWindowBreakout = useCallback(() => {
+    if (Object.keys(windowBreakoutPanesRef.current).length) {
+      closeWindowBreakout();
+      return;
+    }
+
+    void openWindowBreakout();
+  }, [closeWindowBreakout, openWindowBreakout]);
+
+  const returnTerminalWindowToGrid = useCallback((paneId) => {
+    invoke("terminal_window_close", { paneId }).catch(() => {});
+  }, []);
+
+  const focusTerminalWindow = useCallback((terminalIndex, paneId) => {
+    invoke("terminal_window_focus", { paneId })
+      .then((focused) => {
+        if (!focused) {
+          // The window vanished without an event (e.g. crash); reopen it.
+          return invoke("terminal_window_open", {
+            paneId,
+            title: getTerminalWindowTitle(terminalIndex),
+          });
+        }
+        return null;
+      })
+      .catch(() => {});
+  }, [getTerminalWindowTitle]);
+
+  // A breakout window closing (its close button, OS close, or our toggle)
+  // returns the pane to the grid and re-asserts the grid's PTY size.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(TERMINAL_WINDOW_CLOSED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const paneId = String(event.payload?.paneId || "");
+      if (!paneId) {
+        return;
+      }
+      setWindowBreakoutPanes((current) => {
+        if (!current[paneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[paneId];
+        return next;
+      });
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  // Close breakout windows whose panes no longer exist (terminal closed,
+  // workspace switched, agent slot reassigned).
+  useEffect(() => {
+    const currentPaneIds = Object.keys(windowBreakoutPanesRef.current);
+    if (!currentPaneIds.length) {
+      return;
+    }
+
+    const validPaneIds = new Set(
+      logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
+    );
+    currentPaneIds.forEach((paneId) => {
+      if (!validPaneIds.has(paneId)) {
+        invoke("terminal_window_close", { paneId }).catch(() => {});
+      }
+    });
+  }, [getTerminalPaneId, logicalTerminalIndexes]);
 
   const resetTerminalBreakoutLayout = useCallback(() => {
     if (!terminalBreakoutVisible) {
@@ -24503,10 +24771,36 @@ function TerminalView({
                 workspace={terminalWorkspace}
                 workspaceError={workspaceError}
                 workspaceRootWasEmptyAtSelection={terminalWorkspaceRootWasEmptyAtSelection}
+                windowBreakoutHosted={Boolean(windowBreakoutPanes[terminalPaneId])}
                 workspaceThreads={workspaceThreads}
                 workspaces={workspaces}
                 selectedWorkspaceThreadId={selectedWorkspaceThreadId}
               />
+              {Boolean(windowBreakoutPanes[terminalPaneId]) && !fullscreenThisTerminal && (
+                <TerminalWindowBreakoutOverlay data-terminal-control="true">
+                  <strong>{getTerminalWindowTitle(terminalIndex)}</strong>
+                  <span>Open in its own window</span>
+                  <TerminalWindowBreakoutOverlayActions>
+                    <TerminalWindowBreakoutOverlayButton
+                      onClick={() => focusTerminalWindow(terminalIndex, terminalPaneId)}
+                      title="Bring the terminal window to the front"
+                      type="button"
+                    >
+                      <OpenInNew aria-hidden="true" />
+                      <span>Focus window</span>
+                    </TerminalWindowBreakoutOverlayButton>
+                    <TerminalWindowBreakoutOverlayButton
+                      data-variant="return"
+                      onClick={() => returnTerminalWindowToGrid(terminalPaneId)}
+                      title="Close the window and return this terminal to the grid"
+                      type="button"
+                    >
+                      <Check aria-hidden="true" />
+                      <span>Return to grid</span>
+                    </TerminalWindowBreakoutOverlayButton>
+                  </TerminalWindowBreakoutOverlayActions>
+                </TerminalWindowBreakoutOverlay>
+              )}
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalActive && (
                 <TerminalBreakoutResizeHandles data-terminal-control="true">
                   {TERMINAL_BREAKOUT_RESIZE_HANDLES.map((handle) => (
@@ -24782,6 +25076,8 @@ function TerminalView({
                           onResumePlan={handleResumeTerminalPlan}
                           onSubmitDraft={submitTodoQueueDraft}
                           onToggleTerminalBreakout={toggleTerminalBreakout}
+                          onToggleWindowBreakout={toggleWindowBreakout}
+                          windowBreakoutActive={windowBreakoutActive}
                           onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
                           onUpdateItem={updateTodoQueueItemText}
                           onVoiceAgentToolCall={handleVoiceAgentToolCall}

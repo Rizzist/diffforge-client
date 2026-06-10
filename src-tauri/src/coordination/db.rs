@@ -32,8 +32,9 @@ use super::schema::{
     WORKSPACE_MCP_INDEX_SCHEMA_SQL, WORKSPACE_MCP_REGISTRY_MIGRATION_NAME,
     WORKSPACE_MCP_REGISTRY_MIGRATION_VERSION, WORKSPACE_MCP_REGISTRY_SCHEMA_SQL,
     WORKSPACE_MCP_SECRETS_MIGRATION_NAME, WORKSPACE_MCP_SECRETS_MIGRATION_VERSION,
-    WORKSPACE_MCP_SECRETS_SCHEMA_SQL, WORKTREE_TASK_BINDING_MIGRATION_NAME,
-    WORKTREE_TASK_BINDING_MIGRATION_VERSION,
+    WORKSPACE_MCP_SECRETS_SCHEMA_SQL, WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME,
+    WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION, WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL,
+    WORKTREE_TASK_BINDING_MIGRATION_NAME, WORKTREE_TASK_BINDING_MIGRATION_VERSION,
 };
 
 pub const REPO_ID: &str = "local";
@@ -640,8 +641,36 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_crash_todo_resume_migration(connection)?);
     diagnostics.push(apply_optional_git_worktrees_policy_migration(connection)?);
     diagnostics.push(apply_agent_session_mode_migration(connection)?);
+    diagnostics.push(apply_workspace_mcp_seed_state_migration(connection)?);
 
     Ok(diagnostics)
+}
+
+fn apply_workspace_mcp_seed_state_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION,
+            WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    with_sqlite_lock_retry("Unable to initialize workspace MCP seed state schema", || {
+        connection.execute_batch(WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL)
+    })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        WORKSPACE_MCP_SEED_STATE_MIGRATION_VERSION,
+        WORKSPACE_MCP_SEED_STATE_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        ["WORKSPACE_MCP_SEED_STATE_SCHEMA_SQL executed idempotently".to_string()],
+    );
+    Ok(migration)
 }
 
 fn apply_agent_session_mode_migration(
