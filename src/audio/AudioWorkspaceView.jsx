@@ -19,6 +19,7 @@ import {
   AUDIO_WIDGET_STYLE_BAR,
   AUDIO_WIDGET_STYLE_BUBBLE,
   AUDIO_WIDGET_STYLE_HIDDEN,
+  AUDIO_WIDGET_STYLE_PILL,
   AUDIO_WIDGET_THEME_DARK,
   AUDIO_WIDGET_THEME_LIGHT,
   AUDIO_WIDGET_THEME_STORAGE_KEY,
@@ -280,6 +281,9 @@ import {
   AudioBarFinishButton,
   AudioBarUndoButton,
   AudioBarNoticeProgress,
+  AudioPillShell,
+  AudioPillTooltip,
+  AudioPillMicButton,
   AudioWidgetFocusStage,
   AudioWidgetLogo,
   AudioWidgetMeter,
@@ -434,6 +438,8 @@ const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 const AUDIO_WIDGET_BAR_SIZE = { width: 332, height: 52 };
 const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 28;
+const AUDIO_WIDGET_PILL_SIZE = { width: 240, height: 96 };
+const AUDIO_WIDGET_PILL_BOTTOM_MARGIN = 4;
 const AUDIO_BAR_METER_BARS = 18;
 const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
@@ -487,6 +493,11 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     detail: "Centered bar while speaking",
     id: AUDIO_WIDGET_STYLE_BAR,
     label: "Bottom bar",
+  },
+  {
+    detail: "Closed pill, hover to dictate",
+    id: AUDIO_WIDGET_STYLE_PILL,
+    label: "Pill",
   },
 ];
 const AUDIO_HISTORY_ROW_HEIGHT = 124;
@@ -1975,9 +1986,11 @@ export default function AudioWorkspaceView({
               <SettingsHint>
                 {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
                   ? "A small centered bar shows at the bottom while you speak: hover the logo to cancel, hit the check to finish and paste."
-                  : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
-                    ? "The bubble stays invisible until you start speaking."
-                    : "The bubble stays visible and draggable at all times."}
+                  : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_PILL
+                    ? "A tiny closed pill sits bottom-center (above the Dock). Hover it for the dictate mic; speaking turns it into the bottom bar."
+                    : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
+                      ? "The bubble stays invisible until you start speaking."
+                      : "The bubble stays visible and draggable at all times."}
               </SettingsHint>
             </AudioCloudField>
           </AudioRecorderPanel>
@@ -3053,7 +3066,9 @@ export function AudioWidgetWindow() {
     || widgetState === "recording"
     || widgetState === "transcribing"
     || widgetState === "error";
-  const barVisible = widgetStyle === AUDIO_WIDGET_STYLE_BAR
+  const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR
+    || widgetStyle === AUDIO_WIDGET_STYLE_PILL;
+  const barVisible = usesBottomAnchoredStyle
     && (widgetActive || Boolean(cancelNotice));
 
   // Hidden and bar styles keep the window "visible" to the OS (global
@@ -3067,11 +3082,12 @@ export function AudioWidgetWindow() {
     runWidgetWindowAction((windowHandle) => windowHandle.setIgnoreCursorEvents(ignoreCursor));
   }, [barVisible, runWidgetWindowAction, widgetActive, widgetStyle]);
 
-  // Bottom-bar style: dock the window bottom-center of the active monitor
-  // while a session (or the cancelled notice) is live, then restore the
-  // user's bubble placement.
+  // Bottom-anchored styles (bar and pill) dock the window bottom-center of
+  // the active monitor; the user's bubble placement is restored on exit. The
+  // monitor work area keeps the pill above the macOS Dock / Windows taskbar,
+  // and in fullscreen (no dock) the same math sits closer to the bottom edge.
   useEffect(() => {
-    if (widgetStyle !== AUDIO_WIDGET_STYLE_BAR) {
+    if (!usesBottomAnchoredStyle) {
       const saved = barSavedPlacementRef.current;
       if (saved) {
         barSavedPlacementRef.current = null;
@@ -3085,32 +3101,40 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    if (barVisible) {
-      runWidgetWindowAction(async (windowHandle) => {
-        if (!barSavedPlacementRef.current) {
-          barSavedPlacementRef.current = {
-            position: await windowHandle.outerPosition(),
-          };
-        }
-        await windowHandle.setSize(
-          new LogicalSize(AUDIO_WIDGET_BAR_SIZE.width, AUDIO_WIDGET_BAR_SIZE.height),
-        );
-        const monitor = await currentMonitor();
-        if (monitor) {
-          const scale = monitor.scaleFactor || 1;
-          const x = monitor.position.x
-            + Math.round((monitor.size.width - (AUDIO_WIDGET_BAR_SIZE.width * scale)) / 2);
-          const y = monitor.position.y
-            + monitor.size.height
-            - Math.round((AUDIO_WIDGET_BAR_SIZE.height + AUDIO_WIDGET_BAR_BOTTOM_MARGIN) * scale);
-          await windowHandle.setPosition(new PhysicalPosition(x, y));
-        }
-      });
+    // The bar style has nothing to place while idle (the window is inert and
+    // invisible); the pill style is always anchored.
+    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR && !barVisible) {
+      return;
     }
-  }, [barVisible, runWidgetWindowAction, widgetStyle]);
+
+    const target = barVisible ? AUDIO_WIDGET_BAR_SIZE : AUDIO_WIDGET_PILL_SIZE;
+    const margin = barVisible ? AUDIO_WIDGET_BAR_BOTTOM_MARGIN : AUDIO_WIDGET_PILL_BOTTOM_MARGIN;
+
+    runWidgetWindowAction(async (windowHandle) => {
+      if (!barSavedPlacementRef.current) {
+        barSavedPlacementRef.current = {
+          position: await windowHandle.outerPosition(),
+        };
+      }
+      await windowHandle.setSize(new LogicalSize(target.width, target.height));
+      const monitor = await currentMonitor();
+      if (monitor) {
+        const scale = monitor.scaleFactor || 1;
+        const area = monitor.workArea?.size?.height
+          ? monitor.workArea
+          : { position: monitor.position, size: monitor.size };
+        const x = area.position.x
+          + Math.round((area.size.width - (target.width * scale)) / 2);
+        const y = area.position.y
+          + area.size.height
+          - Math.round((target.height + margin) * scale);
+        await windowHandle.setPosition(new PhysicalPosition(x, y));
+      }
+    });
+  }, [barVisible, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
 
   useEffect(() => {
-    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
+    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetStyle === AUDIO_WIDGET_STYLE_PILL) {
       return undefined;
     }
     const wantsFocus = widgetTargetMode === "focus";
@@ -3206,7 +3230,10 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+    if (
+      widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR
+      || widgetStyleRef.current === AUDIO_WIDGET_STYLE_PILL
+    ) {
       return;
     }
 
@@ -3665,7 +3692,12 @@ export function AudioWidgetWindow() {
     const salvageable = currentState === "transcribing"
       || (currentState === "recording" && Boolean(audioBuffer));
 
-    if (salvage && salvageable && widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
+    if (
+      salvage
+      && salvageable
+      && (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR
+        || widgetStyleRef.current === AUDIO_WIDGET_STYLE_PILL)
+    ) {
       showCancelNotice();
     }
 
@@ -4209,7 +4241,32 @@ export function AudioWidgetWindow() {
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
 
-  if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
+  if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetStyle === AUDIO_WIDGET_STYLE_PILL) {
+    if (widgetStyle === AUDIO_WIDGET_STYLE_PILL && !barVisible) {
+      const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
+      return (
+        <>
+          <GlobalStyle />
+          <AudioPillShell aria-label="Dictation pill" data-theme={audioWidgetTheme}>
+            <AudioPillTooltip role="tooltip">
+              {`Dictate (${dictateShortcutLabel})`}
+            </AudioPillTooltip>
+            <AudioPillMicButton
+              aria-label={`Dictate (${dictateShortcutLabel})`}
+              onClick={toggleTalk}
+              type="button"
+            >
+              <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
+                <rect height="11" rx="3" strokeLinejoin="round" width="6" x="9" y="2.5" />
+                <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" strokeLinecap="round" />
+                <path d="M12 18v3.5M8.5 21.5h7" strokeLinecap="round" />
+              </svg>
+            </AudioPillMicButton>
+          </AudioPillShell>
+        </>
+      );
+    }
+
     return (
       <>
         <GlobalStyle />

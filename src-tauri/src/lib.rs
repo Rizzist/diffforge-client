@@ -30,6 +30,7 @@ use tauri::{
     AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_notification::NotificationExt;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -2121,6 +2122,7 @@ include!("agent_sessions.rs");
 include!("terminals.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
+include!("todo_dispatch.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
@@ -2822,6 +2824,16 @@ fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Res
 
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
     let _ = cloud_mcp_signal_desktop_closing(&app_for_shutdown, "app_shutdown").await;
+
+    // In-flight todos cannot survive the process: label them interrupted
+    // (resume-pending) now so they are never orphaned as "running".
+    {
+        let sweep_app = app_for_shutdown.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            todo_dispatch_mark_active_receipts_interrupted(Some(&sweep_app), "app_shutdown")
+        })
+        .await;
+    }
 
     emit_app_shutdown_progress(
         &app_for_shutdown,
@@ -3761,6 +3773,28 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
+            cloud_mcp_start_tokenomics_scheduler(
+                app.handle().clone(),
+                app.state::<CloudMcpState>().inner().clone(),
+            );
+            {
+                // Crash recovery: anything still marked in-flight in the todo
+                // ledger is a leftover from a previous process and gets
+                // labelled interrupted (resume-pending) before the UI loads.
+                let sweep_app = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let marked = todo_dispatch_mark_active_receipts_interrupted(
+                        Some(&sweep_app),
+                        "app_crash_recovered",
+                    );
+                    if marked > 0 {
+                        log_terminal_status_event(
+                            "backend.todo_dispatch.crash_sweep",
+                            json!({ "marked": marked }),
+                        );
+                    }
+                });
+            }
             register_terminal_input_event_listener(app);
             register_terminal_coordination_event_bridge(app);
 
@@ -3972,6 +4006,10 @@ pub fn run() {
             diffforge_rename_untracked_asset,
             diffforge_save_untracked_data_url_asset,
             diffforge_save_untracked_text_asset,
+            todo_dispatch_receipts_get,
+            todo_dispatch_receipt_record,
+            todo_dispatch_receipts_import,
+            todo_dispatch_notify_queue_drained,
             hyperframe_transcribe_audio,
             hyperframe_save_media_transcript,
             hyperframe_media_transcript_status,

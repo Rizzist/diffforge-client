@@ -431,6 +431,63 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
     Value::Object(object)
 }
 
+/// Rust-owned tokenomics sync scheduling (previously a webview timer loop):
+/// kick a server-refresh resync without round-tripping through the UI.
+fn cloud_mcp_trigger_tokenomics_server_refresh(app: &AppHandle, state: &CloudMcpState) {
+    let refresh_app = app.clone();
+    let refresh_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cloud_mcp_enqueue_tokenomics_sync(
+            refresh_app,
+            &refresh_state,
+            "tokenomics_server_refresh".to_string(),
+            true,
+            true,
+        )
+        .await;
+    });
+}
+
+/// Startup scan + steady heartbeat for tokenomics sync, owned by the Rust
+/// runtime so it keeps running with no visible window. Skips ticks while no
+/// desktop session is signed in (the webview loop was gated the same way).
+pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudMcpState) {
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(1200)).await;
+        let mut ran_initial_scan = false;
+        loop {
+            let signed_in = cloud_mcp_authorization_bearer(&state)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if signed_in {
+                if ran_initial_scan {
+                    let _ = cloud_mcp_enqueue_tokenomics_sync(
+                        app.clone(),
+                        &state,
+                        "tokenomics_heartbeat".to_string(),
+                        false,
+                        false,
+                    )
+                    .await;
+                } else {
+                    ran_initial_scan = true;
+                    let _ = cloud_mcp_enqueue_tokenomics_sync(
+                        app.clone(),
+                        &state,
+                        "tokenomics_scan".to_string(),
+                        true,
+                        false,
+                    )
+                    .await;
+                }
+            }
+            sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
 fn cloud_mcp_background_sync_ensure_started(state: &CloudMcpState) {
     if state.background_sync.started.swap(true, Ordering::SeqCst) {
         return;
@@ -4619,6 +4676,7 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             if event_kind == "tokenomics_refresh_requested" {
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                cloud_mcp_trigger_tokenomics_server_refresh(&app, &state_clone);
                 continue;
             }
             if event_kind == "device_deleted" || event_kind == "device.removed" {
@@ -4636,6 +4694,7 @@ async fn cloud_mcp_start_remote_command_listener(
                     eprintln!("Unable to cache cloud Tokenomics state: {error}");
                 }
                 let _ = app.emit(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, event.clone());
+                cloud_mcp_trigger_tokenomics_server_refresh(&app, &state_clone);
                 continue;
             }
             if cloud_mcp_is_workspace_todo_wake_event(&event_kind, &event) {
@@ -4700,6 +4759,7 @@ async fn cloud_mcp_start_remote_command_listener(
                 .await;
                 continue;
             }
+            todo_dispatch_record_remote_intake(&app, &event);
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")

@@ -30,6 +30,7 @@ const AUDIO_WIDGET_STYLE_STORAGE_KEY = "diffforge.audio.widgetStyle";
 export const AUDIO_WIDGET_STYLE_BUBBLE = "bubble";
 export const AUDIO_WIDGET_STYLE_HIDDEN = "hidden";
 export const AUDIO_WIDGET_STYLE_BAR = "bar";
+export const AUDIO_WIDGET_STYLE_PILL = "pill";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
@@ -76,7 +77,11 @@ export function normalizeAudioWidgetTheme(value) {
 }
 
 export function normalizeAudioWidgetStyle(value) {
-  if (value === AUDIO_WIDGET_STYLE_HIDDEN || value === AUDIO_WIDGET_STYLE_BAR) {
+  if (
+    value === AUDIO_WIDGET_STYLE_HIDDEN
+    || value === AUDIO_WIDGET_STYLE_BAR
+    || value === AUDIO_WIDGET_STYLE_PILL
+  ) {
     return value;
   }
 

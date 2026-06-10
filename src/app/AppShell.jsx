@@ -8057,16 +8057,9 @@ export default function App() {
       }
       workspaceNotificationCueIdsRef.current.add(cue.id);
       workspaceNotificationSfxRef.current?.play(cue.kind);
-      const cueKind = String(cue.kind || "").trim().toLowerCase().replace(/_/g, ".");
-      if (cueKind === "approval.required" || cueKind === "user.input.required") {
-        const cueWorkspace = findWorkspaceById(workspacesRef.current, cue.workspaceId);
-        sendNativeNotification({
-          body: cueWorkspace?.name
-            ? `A coding agent in ${cueWorkspace.name} is waiting on a tool approval.`
-            : "A coding agent terminal is waiting on a tool approval.",
-          title: "Diff Forge: approval required",
-        });
-      }
+      // Approval/user-input native notifications are sent from Rust at the
+      // activity-hook source (todo_dispatch_observe_activity_hook), so they
+      // also fire with no visible window; the webview keeps only the SFX cue.
       const cueWorkspaceId = String(cue.workspaceId || "").trim();
       if (cueWorkspaceId) {
         const existingTimer = workspaceNotificationHighlightTimersRef.current.get(cueWorkspaceId);
@@ -13933,6 +13926,32 @@ export default function App() {
     () => JSON.stringify(terminalPresenceWorkspaces),
     [terminalPresenceWorkspaces],
   );
+  const selectedWorkspaceTerminalOptions = useMemo(() => {
+    const presenceWorkspace = terminalPresenceWorkspaces.find((candidate) => (
+      String(candidate?.workspaceId || "").trim() === String(selectedWorkspaceId || "").trim()
+    ));
+    return (Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [])
+      .map((terminal) => {
+        const terminalIndex = Number(terminal?.terminalIndex ?? terminal?.terminal_index);
+        if (!Number.isInteger(terminalIndex)) return null;
+        return {
+          agentId: String(terminal?.agentId || terminal?.agent_id || "").trim(),
+          agentLabel: String(terminal?.agentLabel || terminal?.agentDisplayName || "").trim(),
+          color: String(terminal?.color || "").trim(),
+          label: String(
+            terminal?.terminalNickname
+              || terminal?.terminalName
+              || terminal?.displayName
+              || terminal?.agentDisplayName
+              || "",
+          ).trim() || `Terminal ${terminalIndex + 1}`,
+          paneId: String(terminal?.paneId || terminal?.pane_id || "").trim(),
+          terminalIndex,
+          threadId: String(terminal?.threadId || terminal?.thread_id || "").trim(),
+        };
+      })
+      .filter(Boolean);
+  }, [selectedWorkspaceId, terminalPresenceWorkspaces]);
   useEffect(() => {
     terminalPresenceWorkspacesRef.current = terminalPresenceWorkspaces;
   }, [terminalPresenceWorkspaces]);
@@ -15216,107 +15235,27 @@ export default function App() {
       return undefined;
     }
 
-    let disposed = false;
-    let tokenomicsTimer = 0;
-    const accountKey = user?.id || user?.email || "paid-user";
-    tokenomicsSyncCursorRef.current = "";
-    const tokenomicsCursorFromSummary = (summary) => {
-      const direct = typeof summary?.sync_cursor === "string" ? summary.sync_cursor.trim() : "";
-      if (direct) return direct;
-      const hourly = Array.isArray(summary?.hourly) ? summary.hourly : [];
-      return hourly
-        .map((row) => String(row?.updated_at || row?.updatedAt || "").trim())
-        .filter(Boolean)
-        .sort()
-        .pop() || "";
-    };
-    const scheduleTokenomicsSync = (reason, delayMs = 0) => {
-      if (disposed) {
-        return;
-      }
-      if (tokenomicsTimer) {
-        window.clearTimeout(tokenomicsTimer);
-      }
-      tokenomicsTimer = window.setTimeout(() => {
-        tokenomicsTimer = 0;
-        void syncTokenomics(reason);
-      }, Math.max(0, Number(delayMs) || 0));
-    };
-    const syncTokenomics = async (reason) => {
-      if (disposed) {
-        return;
-      }
-      const hotDelayMs = getTerminalInputHotDelayMs(2000);
-      if (hotDelayMs > 0) {
-        scheduleTokenomicsSync(reason, hotDelayMs);
-        return;
-      }
-      const isServerRefresh = reason === "tokenomics_server_refresh";
-      if (isServerRefresh) {
-        tokenomicsSyncCursorRef.current = "";
-      }
-      if (tokenomicsSyncInFlightRef.current) {
-        if (isServerRefresh) {
-          tokenomicsSyncPendingRefreshRef.current = true;
-        }
-        return;
-      }
-      tokenomicsSyncInFlightRef.current = true;
-      try {
-        await invoke("cloud_mcp_schedule_tokenomics_sync", {
-          full: reason === "tokenomics_scan" || reason === "tokenomics_server_refresh",
-          reason,
-          resyncLast30Days: reason === "tokenomics_server_refresh",
-        });
-      } catch (error) {
-        if (!disposed) {
-          logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_sync.failed", {
-            message: getErrorMessage(error, "Unable to sync Tokenomics."),
-            reason,
-          });
-        }
-      } finally {
-        tokenomicsSyncInFlightRef.current = false;
-        if (tokenomicsSyncPendingRefreshRef.current && !disposed) {
-          tokenomicsSyncPendingRefreshRef.current = false;
-          syncTokenomics("tokenomics_server_refresh");
-        }
-      }
-    };
-    tokenomicsForceResyncRef.current = () => scheduleTokenomicsSync("tokenomics_server_refresh");
-
-    scheduleTokenomicsSync("tokenomics_scan", 1200);
-    let unlistenRefresh = null;
-    listen(CLOUD_MCP_TOKENOMICS_REFRESH_EVENT, () => {
-      if (!disposed) {
-        scheduleTokenomicsSync("tokenomics_server_refresh");
-      }
-    })
-      .then((handler) => {
-        unlistenRefresh = handler;
-      })
-      .catch((error) => {
-        logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_refresh_listener.failed", {
-          message: getErrorMessage(error, "Unable to listen for server Tokenomics refresh."),
+    // Tokenomics sync scheduling (startup scan, 60s heartbeat, server-refresh
+    // triggers) now runs in Rust (cloud_mcp_start_tokenomics_scheduler), so it
+    // keeps syncing with no visible window. The webview keeps only the manual
+    // force-resync hook used by the Tokenomics settings actions.
+    tokenomicsForceResyncRef.current = () => {
+      void invoke("cloud_mcp_schedule_tokenomics_sync", {
+        full: true,
+        reason: "tokenomics_server_refresh",
+        resyncLast30Days: true,
+      }).catch((error) => {
+        logBigViewSyncDiagnosticEvent("cloud_mcp.tokenomics_sync.failed", {
+          message: getErrorMessage(error, "Unable to sync Tokenomics."),
+          reason: "tokenomics_server_refresh",
         });
       });
-    const intervalId = window.setInterval(
-      () => scheduleTokenomicsSync("tokenomics_heartbeat"),
-      60 * 1000,
-    );
+    };
 
     return () => {
-      disposed = true;
       tokenomicsForceResyncRef.current = null;
-      if (tokenomicsTimer) {
-        window.clearTimeout(tokenomicsTimer);
-      }
-      if (typeof unlistenRefresh === "function") {
-        unlistenRefresh();
-      }
-      window.clearInterval(intervalId);
     };
-  }, [activeAccountScopeKey, authState, getTerminalInputHotDelayMs, user]);
+  }, [activeAccountScopeKey, authState, user]);
 
   useEffect(() => {
     if (
@@ -18350,12 +18289,9 @@ export default function App() {
             },
           }));
           playNotificationSfx("todo.arrived");
-          sendNativeNotification({
-            body: text.slice(0, 200),
-            title: targetWorkspace?.name
-              ? `Diff Forge: todo arrived for ${targetWorkspace.name}`
-              : "Diff Forge: remote todo arrived",
-          });
+          // The arrival native notification is sent from Rust at remote
+          // intake (todo_dispatch_record_remote_intake), before the webview
+          // ever sees the command.
           if (hasResolvedTerminalTarget) {
             terminalStatusEventEmitterRef.current?.({
               activityStatus: "queued",
@@ -24040,6 +23976,7 @@ export default function App() {
                       onArchitectureGraphListRefresh={refreshSelectedWorkspaceArchitectureGraphList}
                       onArchitectureSelectionChange={updateSelectedWorkspaceArchitectureSelection}
                       workspace={selectedWorkspace}
+                      workspaceTerminalOptions={selectedWorkspaceTerminalOptions}
                       workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                     />
                   ) : (

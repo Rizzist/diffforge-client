@@ -5232,6 +5232,7 @@ export default function ArchitectureWorkspaceView({
   onArchitectureGraphListRefresh = null,
   onArchitectureSelectionChange = null,
   workspace,
+  workspaceTerminalOptions = [],
   workspaceTodos = null,
 }) {
   const activeWorkspaceId = workspace?.id || "";
@@ -5412,6 +5413,8 @@ export default function ArchitectureWorkspaceView({
           items={todoHistoryItems}
           onFinishPlan={finishTerminalTodoPlan}
           repoLabel={repoLabel}
+          terminalOptions={workspaceTerminalOptions}
+          workspaceId={activeWorkspaceId}
         />
       )}
       {visibleArchitectureError && (
@@ -9079,6 +9082,49 @@ function ArchitectureCanvasEdge({
   );
 }
 
+const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
+const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
+const TODO_HISTORY_FINISHED_STATUSES = new Set([
+  "completed",
+  "cancelled",
+  "interrupted",
+  "failed",
+  "timed-out",
+  "deleted",
+]);
+const TODO_HISTORY_GROUP_ORDER = [
+  { hint: "Active in a terminal right now", id: "running", label: "Running" },
+  { hint: "Waiting for a free terminal", id: "queued", label: "Queued" },
+  { hint: "On the list, not queued yet", id: "listed", label: "Listed" },
+  { hint: "Completed, cancelled, or interrupted", id: "finished", label: "Finished" },
+];
+
+function todoHistoryGroupId(item) {
+  const status = text(item?.status);
+  if (status === "running" || status === "paused") return "running";
+  if (status === "queued") return "queued";
+  if (TODO_HISTORY_FINISHED_STATUSES.has(status)) return "finished";
+  return "listed";
+}
+
+function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }) {
+  return (
+    <TodoActionSelect
+      aria-label="Todo target terminal"
+      onChange={(event) => onSelect(item, event.target.value)}
+      onClick={(event) => event.stopPropagation()}
+      value={value}
+    >
+      <option value="">Any terminal</option>
+      {terminalOptions.map((terminal) => (
+        <option key={`${terminal.terminalIndex}-${terminal.paneId}`} value={String(terminal.terminalIndex)}>
+          {terminal.label}
+        </option>
+      ))}
+    </TodoActionSelect>
+  );
+}
+
 function TodosHistoryPanel({
   finishPlanError = "",
   finishedPlanRefs = null,
@@ -9086,8 +9132,82 @@ function TodosHistoryPanel({
   items = [],
   onFinishPlan = null,
   repoLabel,
+  terminalOptions = [],
+  workspaceId = "",
 }) {
   const [selectedTodoId, setSelectedTodoId] = useState("");
+  const [actionNotice, setActionNotice] = useState(null);
+  const [draftTargets, setDraftTargets] = useState({});
+  const actionRequestRef = useRef("");
+  const noticeTimerRef = useRef(0);
+
+  useEffect(() => {
+    const handleResult = (event) => {
+      const detail = event?.detail || {};
+      if (!detail.requestId || detail.requestId !== actionRequestRef.current) return;
+      actionRequestRef.current = "";
+      if (detail.ok) {
+        setActionNotice(null);
+        return;
+      }
+      setActionNotice({
+        action: text(detail.action),
+        reason: text(detail.reason, "The todo action could not be applied."),
+      });
+      window.clearTimeout(noticeTimerRef.current);
+      noticeTimerRef.current = window.setTimeout(() => setActionNotice(null), 4600);
+    };
+    window.addEventListener(TODO_HISTORY_CONTROL_RESULT_EVENT, handleResult);
+    return () => {
+      window.removeEventListener(TODO_HISTORY_CONTROL_RESULT_EVENT, handleResult);
+      window.clearTimeout(noticeTimerRef.current);
+    };
+  }, []);
+
+  const dispatchTodoAction = useCallback((item, action, extra = {}) => {
+    const requestId = `todo-history-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    actionRequestRef.current = requestId;
+    window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_EVENT, {
+      detail: {
+        action,
+        commandId: item.commandId,
+        dispatchId: item.dispatchId,
+        itemId: text(item.raw?.id),
+        promptEventId: item.promptEventId,
+        requestId,
+        todoId: item.todoId,
+        todoIds: item.todoIds,
+        workspaceId,
+        ...extra,
+      },
+    }));
+  }, [workspaceId]);
+
+  const queuedTargetValue = useCallback((item) => {
+    const raw = item.raw || {};
+    const index = Number(raw.targetTerminalIndex ?? raw.target_terminal_index);
+    return Number.isInteger(index) ? String(index) : "";
+  }, []);
+
+  const handleQueuedRetarget = useCallback((item, value) => {
+    const targetTerminalIndex = value === "" ? null : Number(value);
+    dispatchTodoAction(item, "retarget", {
+      generic: value === "",
+      targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
+    });
+  }, [dispatchTodoAction]);
+
+  const handleListedTargetDraft = useCallback((item, value) => {
+    setDraftTargets((current) => ({ ...current, [item.id]: value }));
+  }, []);
+
+  const groupedItems = useMemo(() => {
+    const groups = new Map(TODO_HISTORY_GROUP_ORDER.map((group) => [group.id, []]));
+    items.forEach((item) => {
+      groups.get(todoHistoryGroupId(item)).push(item);
+    });
+    return groups;
+  }, [items]);
 
   useEffect(() => {
     if (!items.length) {
@@ -9095,9 +9215,10 @@ function TodosHistoryPanel({
       return;
     }
     if (!items.some((item) => item.id === selectedTodoId)) {
-      setSelectedTodoId(items[0].id);
+      const firstGroupWithItems = TODO_HISTORY_GROUP_ORDER.find((group) => groupedItems.get(group.id)?.length);
+      setSelectedTodoId(firstGroupWithItems ? groupedItems.get(firstGroupWithItems.id)[0].id : items[0].id);
     }
-  }, [items, selectedTodoId]);
+  }, [groupedItems, items, selectedTodoId]);
 
   const selectedItem = items.find((item) => item.id === selectedTodoId)
     || items[0]
@@ -9118,38 +9239,142 @@ function TodosHistoryPanel({
           <TimelineKicker>Workspace todos</TimelineKicker>
           <TimelineTitle>{repoLabel}</TimelineTitle>
         </div>
-        <TimelineSummary>{items.length} todo{items.length === 1 ? "" : "s"} · newest first</TimelineSummary>
+        <TimelineSummary>{items.length} todo{items.length === 1 ? "" : "s"}</TimelineSummary>
       </TimelineHeader>
+      {actionNotice && (
+        <TodoHistoryNotice role="alert">
+          {actionNotice.reason}
+        </TodoHistoryNotice>
+      )}
       <HistorySplit>
         <TodoHistoryRail aria-label="Todos history list">
-          {items.map((item) => {
-            const selected = selectedItem?.id === item.id;
-            const relativeStamp = item.statusKind === "active"
-              ? "live now"
-              : formatRelativeTimeMs(item.updatedMs || item.endMs || item.createdMs) || "unknown";
-            const preview = text(item.body, item.title);
+          {TODO_HISTORY_GROUP_ORDER.map((group) => {
+            const groupItems = groupedItems.get(group.id) || [];
+            if (!groupItems.length) return null;
             return (
-              <TodoHistoryRow
-                aria-pressed={selected}
-                data-selected={selected ? "true" : "false"}
-                data-status={item.statusKind}
-                key={item.id}
-                onClick={() => setSelectedTodoId(item.id)}
-                type="button"
-              >
-                <TodoHistoryRowTop>
-                  <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
-                    {item.statusLabel}
-                  </StatusPill>
-                  <time>{relativeStamp}</time>
-                </TodoHistoryRowTop>
-                <TodoHistoryRowPreview>{preview}</TodoHistoryRowPreview>
-                <TodoHistoryRowMeta>
-                  <span>{item.target || item.source || "unassigned"}</span>
-                  {item.taskCount > 0 && <em>{item.taskCount} task{item.taskCount === 1 ? "" : "s"}</em>}
-                  {item.planCount > 0 && <em>{item.planCount} plan{item.planCount === 1 ? "" : "s"}</em>}
-                </TodoHistoryRowMeta>
-              </TodoHistoryRow>
+              <TodoHistoryGroup key={group.id}>
+                <TodoHistoryGroupLabel data-group={group.id} title={group.hint}>
+                  <span>{group.label}</span>
+                  <em>{groupItems.length}</em>
+                </TodoHistoryGroupLabel>
+                {groupItems.map((item) => {
+                  const selected = selectedItem?.id === item.id;
+                  const relativeStamp = item.statusKind === "active"
+                    ? "live now"
+                    : formatRelativeTimeMs(item.updatedMs || item.endMs || item.createdMs) || "unknown";
+                  const preview = text(item.body, item.title);
+                  return (
+                    <TodoHistoryRowShell data-selected={selected ? "true" : "false"} key={item.id}>
+                      <TodoHistoryRow
+                        aria-pressed={selected}
+                        data-selected={selected ? "true" : "false"}
+                        data-status={item.statusKind}
+                        onClick={() => setSelectedTodoId(item.id)}
+                        type="button"
+                      >
+                        <TodoHistoryRowTop>
+                          <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
+                            {item.statusLabel}
+                          </StatusPill>
+                          <time>{relativeStamp}</time>
+                        </TodoHistoryRowTop>
+                        <TodoHistoryRowPreview>{preview}</TodoHistoryRowPreview>
+                        <TodoHistoryRowMeta>
+                          <span>{item.target || item.source || "unassigned"}</span>
+                          {item.taskCount > 0 && <em>{item.taskCount} task{item.taskCount === 1 ? "" : "s"}</em>}
+                          {item.planCount > 0 && <em>{item.planCount} plan{item.planCount === 1 ? "" : "s"}</em>}
+                        </TodoHistoryRowMeta>
+                      </TodoHistoryRow>
+                      {group.id === "running" && (
+                        <TodoHistoryRowActions>
+                          <TodoActionButton
+                            data-danger="true"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "cancel");
+                            }}
+                            title="Stop this todo's terminal turn; the next queued todo dispatches automatically"
+                            type="button"
+                          >
+                            Stop
+                          </TodoActionButton>
+                        </TodoHistoryRowActions>
+                      )}
+                      {group.id === "queued" && (
+                        <TodoHistoryRowActions>
+                          <TodoHistoryTargetSelect
+                            item={item}
+                            onSelect={handleQueuedRetarget}
+                            terminalOptions={terminalOptions}
+                            value={queuedTargetValue(item)}
+                          />
+                          <TodoActionButton
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "unqueue");
+                            }}
+                            title="Move this todo back to the list"
+                            type="button"
+                          >
+                            Unqueue
+                          </TodoActionButton>
+                        </TodoHistoryRowActions>
+                      )}
+                      {group.id === "listed" && (
+                        <TodoHistoryRowActions>
+                          <TodoHistoryTargetSelect
+                            item={item}
+                            onSelect={handleListedTargetDraft}
+                            terminalOptions={terminalOptions}
+                            value={draftTargets[item.id] ?? queuedTargetValue(item)}
+                          />
+                          <TodoActionButton
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              const draftValue = draftTargets[item.id] ?? queuedTargetValue(item);
+                              const targetTerminalIndex = draftValue === "" ? null : Number(draftValue);
+                              dispatchTodoAction(item, "queue", {
+                                generic: draftValue === "",
+                                targetTerminalIndex: Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null,
+                              });
+                            }}
+                            title="Queue this todo"
+                            type="button"
+                          >
+                            Queue
+                          </TodoActionButton>
+                          <TodoActionButton
+                            data-danger="true"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "delete");
+                            }}
+                            title="Delete this listed todo"
+                            type="button"
+                          >
+                            Delete
+                          </TodoActionButton>
+                        </TodoHistoryRowActions>
+                      )}
+                      {group.id === "finished" && (
+                        <TodoHistoryRowActions>
+                          <TodoActionButton
+                            data-danger="true"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "delete");
+                            }}
+                            title="Delete this todo everywhere (tombstoned on the server)"
+                            type="button"
+                          >
+                            Delete
+                          </TodoActionButton>
+                        </TodoHistoryRowActions>
+                      )}
+                    </TodoHistoryRowShell>
+                  );
+                })}
+              </TodoHistoryGroup>
             );
           })}
         </TodoHistoryRail>
@@ -12987,6 +13212,7 @@ const TodoHistoryRow = styled.button`
   display: grid;
   gap: 5px;
   min-width: 0;
+  width: 100%;
   padding: 9px 10px;
   border: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 10px;
@@ -13005,6 +13231,116 @@ const TodoHistoryRow = styled.button`
     border-color: rgba(96, 165, 250, 0.45);
     background: rgba(30, 64, 175, 0.14);
   }
+`;
+
+const TodoHistoryGroup = styled.section`
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex-shrink: 0;
+`;
+
+const TodoHistoryGroupLabel = styled.header`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 2px 4px;
+  color: rgba(148, 163, 184, 0.85);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+
+  em {
+    color: rgba(148, 163, 184, 0.6);
+    font-style: normal;
+    font-weight: 750;
+  }
+
+  &[data-group="running"] span {
+    color: rgba(94, 234, 212, 0.92);
+  }
+
+  &[data-group="queued"] span {
+    color: rgba(125, 176, 255, 0.92);
+  }
+`;
+
+const TodoHistoryRowShell = styled.div`
+  position: relative;
+  min-width: 0;
+  flex-shrink: 0;
+`;
+
+const TodoHistoryRowActions = styled.div`
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: none;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.92);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+
+  ${TodoHistoryRowShell}:hover &,
+  ${TodoHistoryRowShell}:focus-within & {
+    display: inline-flex;
+  }
+`;
+
+const TodoActionButton = styled.button`
+  padding: 3px 8px;
+  border: 1px solid rgba(125, 176, 255, 0.3);
+  border-radius: 6px;
+  color: rgba(200, 222, 255, 0.95);
+  background: rgba(59, 130, 246, 0.12);
+  font-size: 10px;
+  font-weight: 760;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    background: rgba(59, 130, 246, 0.26);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    color: rgba(250, 180, 180, 0.92);
+    background: transparent;
+  }
+
+  &[data-danger="true"]:hover {
+    background: rgba(127, 29, 29, 0.24);
+  }
+`;
+
+const TodoActionSelect = styled.select`
+  max-width: 130px;
+  padding: 3px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 6px;
+  color: rgba(226, 232, 240, 0.95);
+  background: rgba(2, 6, 23, 0.85);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+`;
+
+const TodoHistoryNotice = styled.p`
+  margin: 0 0 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(223, 165, 90, 0.32);
+  border-radius: 8px;
+  color: rgba(240, 200, 140, 0.95);
+  background: rgba(63, 38, 10, 0.32);
+  font-size: 11px;
+  font-weight: 650;
 `;
 
 const TodoHistoryRowTop = styled.div`

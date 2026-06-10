@@ -239,6 +239,8 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
+const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
@@ -4827,6 +4829,99 @@ const TodoQueueDeleteButton = styled.button`
     color: #b42318;
     background: rgba(180, 35, 24, 0.08);
   }
+`;
+
+const TodoResumeOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, 0.55);
+  backdrop-filter: blur(2px);
+`;
+
+const TodoResumeDialog = styled.section`
+  display: grid;
+  gap: 10px;
+  width: min(520px, 100%);
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  padding: 16px;
+  border: 1px solid rgba(125, 176, 255, 0.28);
+  border-radius: 12px;
+  color: var(--forge-text, #f4f7fa);
+  background: rgba(8, 12, 20, 0.97);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+
+  > header {
+    display: grid;
+    gap: 3px;
+
+    strong {
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    span {
+      color: var(--forge-text-muted, #7a8493);
+      font-size: 11.5px;
+    }
+  }
+`;
+
+const TodoResumeRow = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 9px;
+  background: rgba(2, 6, 23, 0.4);
+
+  p {
+    margin: 0;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+`;
+
+const TodoResumeButton = styled.button`
+  padding: 6px 12px;
+  border: 1px solid rgba(94, 234, 212, 0.34);
+  border-radius: 7px;
+  color: rgba(204, 251, 241, 0.96);
+  background: rgba(13, 148, 136, 0.2);
+  font-size: 11px;
+  font-weight: 760;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    background: rgba(20, 184, 166, 0.3);
+  }
+
+  &[data-ghost="true"] {
+    border-color: rgba(148, 163, 184, 0.24);
+    color: var(--forge-text-soft, #b6c0cc);
+    background: transparent;
+  }
+
+  &[data-ghost="true"]:hover {
+    border-color: rgba(148, 163, 184, 0.4);
+  }
+`;
+
+const TodoResumeFooter = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 `;
 
 const TodoQueueError = styled.div`
@@ -10303,6 +10398,23 @@ function writeTodoQueueRemoteCommandReceipts(storageKey, receipts) {
   }
 }
 
+const TODO_DISPATCH_RECEIPTS_UPDATED_EVENT = "todo-dispatch-receipts-updated";
+
+// Newest-updatedAtMs-wins merge between the local in-memory receipts and a
+// Rust ledger snapshot, so neither rapid local writes nor Rust-side
+// settlements regress each other while an echo is in flight.
+function mergeTodoQueueReceiptsNewest(localReceipts, ledgerReceipts) {
+  const merged = { ...(ledgerReceipts && typeof ledgerReceipts === "object" ? ledgerReceipts : {}) };
+  Object.entries(localReceipts && typeof localReceipts === "object" ? localReceipts : {}).forEach(([key, receipt]) => {
+    const localUpdated = Number(receipt?.updatedAtMs || 0);
+    const ledgerUpdated = Number(merged[key]?.updatedAtMs || 0);
+    if (localUpdated > ledgerUpdated) {
+      merged[key] = receipt;
+    }
+  });
+  return pruneTodoQueueRemoteCommandReceipts(merged);
+}
+
 function getTodoQueueRemoteCommandId(item) {
   return String(item?.remoteCommand?.commandId || item?.remoteCommand?.id || item?.id || "").trim();
 }
@@ -10315,6 +10427,78 @@ function getTodoQueueRemoteCommandDispatchId(item) {
       || item?.todo_dispatch_id
       || "",
   ).trim();
+}
+
+const TODO_RESUME_DISMISSALS_PREFIX = "diffforge.todoQueue.resumeDismissals.v1";
+const TODO_RESUME_RECOVERY_REASONS = new Set([
+  "app_crash_recovered",
+  "app_shutdown",
+  "app_shutdown_recovered",
+]);
+
+function getTodoResumeDismissalStorageKey(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "default")
+    .replace(/[^\w.-]/g, "_")
+    .slice(0, 120) || "default";
+  return `${TODO_RESUME_DISMISSALS_PREFIX}.${safeWorkspaceId}`;
+}
+
+function readTodoResumeDismissals(workspaceId) {
+  if (!canUseTodoQueueStorage()) {
+    return new Set();
+  }
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(getTodoResumeDismissalStorageKey(workspaceId)) || "[]");
+    return new Set((Array.isArray(raw) ? raw : []).map((value) => String(value || "").trim()).filter(Boolean));
+  } catch {
+    return new Set();
+  }
+}
+
+function recordTodoResumeDismissal(workspaceId, itemId) {
+  if (!canUseTodoQueueStorage()) {
+    return;
+  }
+  try {
+    const dismissals = readTodoResumeDismissals(workspaceId);
+    dismissals.add(String(itemId || "").trim());
+    window.localStorage.setItem(
+      getTodoResumeDismissalStorageKey(workspaceId),
+      JSON.stringify([...dismissals].slice(-200)),
+    );
+  } catch {
+    // Dismissals are convenience state only.
+  }
+}
+
+// Matches a workspace-todo-history reference bundle (todo/dispatch/command
+// ids from the cloud snapshot) against a local queue item.
+function todoQueueItemMatchesHistoryRefs(item, detail = {}) {
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+  const ids = new Set(
+    [detail.itemId, detail.todoId, ...(Array.isArray(detail.todoIds) ? detail.todoIds : [])]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  );
+  const commandId = String(detail.commandId || "").trim();
+  const dispatchId = String(detail.dispatchId || "").trim();
+  const itemId = String(item.id || "").trim();
+  if (itemId && ids.has(itemId)) {
+    return true;
+  }
+  const remoteCommand = item.remoteCommand || item.remote_command || {};
+  if (commandId && String(remoteCommand.commandId || remoteCommand.command_id || "").trim() === commandId) {
+    return true;
+  }
+  if (dispatchId && String(remoteCommand.todoDispatchId || remoteCommand.todo_dispatch_id || "").trim() === dispatchId) {
+    return true;
+  }
+  const itemTodoId = String(
+    item.todoId || item.todo_id || item.clientTodoId || item.client_todo_id || "",
+  ).trim();
+  return Boolean(itemTodoId && ids.has(itemTodoId));
 }
 
 function getTodoQueueRemoteCommandReceiptKey(item, workspaceId = "") {
@@ -14299,7 +14483,63 @@ function TerminalView({
     const receipts = readTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKey);
     todoQueueRemoteCommandReceiptsRef.current = receipts;
     writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKey, receipts);
-  }, [todoQueueRemoteCommandReceiptStorageKey]);
+    // The Rust ledger is authoritative: import any legacy localStorage
+    // receipts once, then adopt the merged store (localStorage stays a
+    // write-through mirror for synchronous readers and other consumers).
+    const importWorkspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!importWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    invoke("todo_dispatch_receipts_import", {
+      receipts,
+      workspaceId: importWorkspaceId,
+    })
+      .then((result) => {
+        if (cancelled) return;
+        const ledger = result?.receipts && typeof result.receipts === "object" ? result.receipts : null;
+        if (!ledger) return;
+        const merged = mergeTodoQueueReceiptsNewest(todoQueueRemoteCommandReceiptsRef.current, ledger);
+        todoQueueRemoteCommandReceiptsRef.current = merged;
+        writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKeyRef.current, merged);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [terminalWorkspace?.id, todoQueueRemoteCommandReceiptStorageKey]);
+
+  useEffect(() => {
+    const receiptsWorkspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!receiptsWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let unlistenReceipts = null;
+    listen(TODO_DISPATCH_RECEIPTS_UPDATED_EVENT, (event) => {
+      if (cancelled) return;
+      const payload = event?.payload || {};
+      const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (eventWorkspaceId !== receiptsWorkspaceId) return;
+      const ledger = payload.receipts && typeof payload.receipts === "object" ? payload.receipts : null;
+      if (!ledger) return;
+      const merged = mergeTodoQueueReceiptsNewest(todoQueueRemoteCommandReceiptsRef.current, ledger);
+      todoQueueRemoteCommandReceiptsRef.current = merged;
+      writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKeyRef.current, merged);
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenReceipts = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenReceipts) unlistenReceipts();
+    };
+  }, [terminalWorkspace?.id]);
 
   useEffect(() => {
     const layout = readTerminalBreakoutLayout(terminalBreakoutStorageKey, logicalTerminalIndexes);
@@ -14419,6 +14659,24 @@ function TerminalView({
       todoQueueRemoteCommandReceiptStorageKeyRef.current,
       nextReceipts,
     );
+    // Mirror every transition into the authoritative Rust ledger; the pane id
+    // hint lets Rust settle this receipt from activity hooks if the webview
+    // is gone before the provider turn closes.
+    const rustReceiptPaneId = String(
+      fields.paneId
+        || fields.pane_id
+        || item?.remoteCommand?.targetTerminalId
+        || item?.targetTerminalId
+        || "",
+    ).trim();
+    void invoke("todo_dispatch_receipt_record", {
+      reason: "frontend_record",
+      receipt: {
+        ...nextReceipt,
+        ...(rustReceiptPaneId ? { paneId: rustReceiptPaneId } : {}),
+      },
+      workspaceId,
+    }).catch(() => {});
     if (dispatchId) {
       const dispatchSource = fields.dispatchSource
         || fields.dispatch_source
@@ -16105,14 +16363,13 @@ function TerminalView({
         && todoQueueTerminalInFlightPromptsRef.current.size === 0;
       if (todoQueueDrained) {
         playNotificationSfx("todo.queue.drained");
-        sendNativeNotification({
-          body: completedItem?.text
-            ? `Finished: ${String(completedItem.text).slice(0, 160)}`
-            : "The last queued todo finished.",
-          title: terminalWorkspace?.name
-            ? `Diff Forge: all todos done in ${terminalWorkspace.name}`
-            : "Diff Forge: all todos done",
-        });
+        // Native notification policy + dedupe live in Rust so it also fires
+        // when the queue drains without a visible window.
+        void invoke("todo_dispatch_notify_queue_drained", {
+          lastTodoText: completedItem?.text ? String(completedItem.text).slice(0, 160) : "",
+          workspaceId: terminalWorkspace?.id || "",
+          workspaceName: terminalWorkspace?.name || "",
+        }).catch(() => {});
       }
       setTodoQueueDispatchRevision((revision) => revision + 1);
       return;
@@ -20786,6 +21043,7 @@ function TerminalView({
             workspaceId,
           });
           setTodoQueueDispatchRevision((revision) => revision + 1);
+          markTodoQueueItemRunning(currentItem.id || currentItem.itemId, submittedAt);
           logTerminalStatus("frontend.todo_queue.in_flight_prompt_registered", {
             item: getTodoQueueItemLogSummary([currentItem])[0] || null,
             promptEventId: promptId,
@@ -21592,6 +21850,7 @@ function TerminalView({
       defaultWorkingDirectory,
       getTodoQueueTerminalSendTarget,
       handleWorkspaceTerminalLifecycle,
+      markTodoQueueItemRunning,
       onThreadTerminalLifecycle,
     recordVoicePlanTaskStatus,
     terminalWorkspace?.id,
@@ -21714,6 +21973,358 @@ function TerminalView({
     terminalWorkspace?.id,
     todoQueueItems,
   ]);
+
+  // A queued todo becomes "running" the moment the coding agent terminal
+  // receives the prompt (in-flight registration), not when the turn closes.
+  const markTodoQueueItemRunning = useCallback((itemId, submittedAt = "", reason = "terminal_prompt_submitted") => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+    const pendingItem = todoQueuePendingItemsRef.current[safeItemId] || null;
+    if (pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued") {
+      replaceTodoQueuePendingItems({
+        ...todoQueuePendingItemsRef.current,
+        [safeItemId]: { ...pendingItem, phase: "sending" },
+      });
+    }
+    updateTodoQueueItems((currentItems) => {
+      let changed = false;
+      const nextItems = currentItems.map((item) => {
+        if (String(item?.id || "").trim() !== safeItemId) {
+          return item;
+        }
+        if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "running") {
+          return item;
+        }
+        changed = true;
+        return getTodoQueueItemWithCloudStatus(item, "running", {
+          reason,
+          updatedAt: submittedAt || new Date().toISOString(),
+        });
+      });
+      return changed ? nextItems : currentItems;
+    }, {
+      force: true,
+      immediate: true,
+      reason: "todo_marked_running",
+    });
+  }, [replaceTodoQueuePendingItems, updateTodoQueueItems]);
+
+  const applyTodoHistoryTarget = useCallback((itemId, targetTerminalIndex) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+    updateTodoQueueItems((currentItems) => currentItems.map((item) => {
+      if (String(item?.id || "").trim() !== safeItemId) {
+        return item;
+      }
+      if (targetTerminalIndex == null) {
+        const next = { ...item };
+        delete next.targetColorSlot;
+        delete next.targetTerminalColor;
+        delete next.targetTerminalId;
+        delete next.targetTerminalIndex;
+        delete next.targetTerminalName;
+        delete next.targetThreadId;
+        return next;
+      }
+      const paneId = getTerminalPaneId(targetTerminalIndex);
+      const targetThread = getTerminalThread(targetTerminalIndex) || null;
+      const colorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
+      return {
+        ...item,
+        targetAgentId: getTerminalRole(targetTerminalIndex) || item.targetAgentId || "",
+        targetColorSlot: colorSlot,
+        targetTerminalColor: terminalColorForSlot(colorSlot ?? targetTerminalIndex),
+        targetTerminalId: paneId,
+        targetTerminalIndex,
+        targetThreadId: targetThread?.id || "",
+      };
+    }), {
+      force: true,
+      immediate: true,
+      reason: "todo_history_retarget",
+    });
+  }, [
+    getTerminalAgentColorSlot,
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    updateTodoQueueItems,
+  ]);
+
+  // Control bus for the workspace Todo History view: queue/unqueue/retarget/
+  // delete/cancel actions arrive as window events with cloud todo refs.
+  useEffect(() => {
+    const respond = (detail, ok, reason = "") => {
+      window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
+        detail: {
+          action: String(detail.action || ""),
+          ok,
+          reason,
+          requestId: String(detail.requestId || ""),
+          workspaceId: terminalWorkspace?.id || "",
+        },
+      }));
+    };
+
+    const handleTodoHistoryControl = (event) => {
+      const detail = event?.detail || {};
+      const action = String(detail.action || "").trim().toLowerCase();
+      const workspaceId = String(detail.workspaceId || "").trim();
+      if (!action) {
+        return;
+      }
+      if (workspaceId && terminalWorkspace?.id && workspaceId !== String(terminalWorkspace.id)) {
+        return;
+      }
+      logTerminalStatus("frontend.todo_history.control", {
+        action,
+        commandId: detail.commandId || "",
+        dispatchId: detail.dispatchId || "",
+        targetTerminalIndex: detail.targetTerminalIndex ?? "",
+        todoId: detail.todoId || "",
+        workspaceId: terminalWorkspace?.id || "",
+      });
+
+      if (action === "cancel") {
+        let matchedPrompt = null;
+        let matchedTerminalIndex = null;
+        todoQueueTerminalInFlightPromptsRef.current.forEach((prompt, terminalIndex) => {
+          if (matchedPrompt) {
+            return;
+          }
+          if (todoQueueItemMatchesHistoryRefs({
+            id: prompt?.itemId,
+            remoteCommand: { commandId: prompt?.commandId, todoDispatchId: prompt?.dispatchId },
+          }, detail) || (
+            String(detail.promptEventId || "").trim()
+            && String(prompt?.promptId || "").trim() === String(detail.promptEventId || "").trim()
+          )) {
+            matchedPrompt = prompt;
+            matchedTerminalIndex = terminalIndex;
+          }
+        });
+        if (!matchedPrompt) {
+          respond(detail, false, "This todo is not running in a terminal on this device.");
+          return;
+        }
+        const cancelItemId = String(matchedPrompt.itemId || "").trim();
+        respond(detail, true);
+        void interruptVoicePlanTaskTerminal({
+          inFlightPrompt: matchedPrompt,
+          reason: "todo_history_cancel",
+          terminalIndex: matchedTerminalIndex,
+        }).finally(() => {
+          if (cancelItemId) {
+            clearTodoQueueItemPending(cancelItemId, "cancelled", { reason: "todo_history_cancel" });
+            updateTodoQueueItems((currentItems) => currentItems.map((item) => (
+              String(item?.id || "").trim() === cancelItemId
+                ? getTodoQueueItemWithCloudStatus(item, "cancelled", { reason: "todo_history_cancel" })
+                : item
+            )), {
+              force: true,
+              immediate: true,
+              reason: "todo_history_cancel",
+            });
+          }
+          setTodoQueueDispatchRevision((revision) => revision + 1);
+        });
+        return;
+      }
+
+      const item = todoQueueItemsRef.current.find((candidate) => todoQueueItemMatchesHistoryRefs(candidate, detail)) || null;
+      if (!item && action === "delete") {
+        // Finished or remote-origin todos may not exist in the local queue;
+        // deletion still works by tombstoning the ids on the server (the
+        // tombstones also stop any device from re-importing them).
+        const tombstoneIds = [
+          ...new Set(
+            [detail.itemId, detail.todoId, ...(Array.isArray(detail.todoIds) ? detail.todoIds : [])]
+              .map((value) => String(value || "").trim())
+              .filter(Boolean),
+          ),
+        ];
+        if (!tombstoneIds.length) {
+          respond(detail, false, "This todo has no deletable id.");
+          return;
+        }
+        recordTodoQueueDeletedReceipts(
+          getTodoQueueDeletedReceiptStorageKey(terminalWorkspace?.id || ""),
+          tombstoneIds,
+        );
+        syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
+          force: true,
+          immediate: true,
+          reason: "todo_history_delete",
+          removedTodoIds: tombstoneIds,
+        });
+        respond(detail, true);
+        return;
+      }
+      if (!item) {
+        respond(detail, false, "This todo is not in this device's local todo list.");
+        return;
+      }
+      const itemId = String(item.id || "").trim();
+      const pendingItem = todoQueuePendingItemsRef.current[itemId] || null;
+
+      if (action === "queue") {
+        const targetTerminalIndex = normalizeTodoTerminalIndex(detail.targetTerminalIndex);
+        if (targetTerminalIndex != null || detail.generic === true) {
+          applyTodoHistoryTarget(itemId, targetTerminalIndex);
+        }
+        queueTodoQueueItem(itemId);
+        respond(detail, true);
+        return;
+      }
+      if (action === "retarget") {
+        applyTodoHistoryTarget(itemId, normalizeTodoTerminalIndex(detail.targetTerminalIndex));
+        respond(detail, true);
+        return;
+      }
+      if (action === "unqueue") {
+        if (pendingItem && getTodoQueuePendingPhase(pendingItem) !== "queued") {
+          respond(detail, false, "This todo is already being sent to a terminal; cancel it instead.");
+          return;
+        }
+        clearTodoQueueItemPending(itemId, "unqueued", { reason: "todo_history_unqueue" });
+        updateTodoQueueItems((currentItems) => currentItems.map((candidate) => (
+          String(candidate?.id || "").trim() === itemId
+            ? getTodoQueueItemWithCloudStatus(candidate, "listed", { reason: "todo_history_unqueue" })
+            : candidate
+        )), {
+          force: true,
+          immediate: true,
+          reason: "todo_history_unqueue",
+        });
+        respond(detail, true);
+        return;
+      }
+      if (action === "delete") {
+        if (pendingItem) {
+          respond(detail, false, "Unqueue this todo before deleting it.");
+          return;
+        }
+        removeTodoQueueItem(itemId);
+        respond(detail, true);
+        return;
+      }
+      respond(detail, false, `Unknown todo action: ${action}`);
+    };
+
+    window.addEventListener(TODO_HISTORY_CONTROL_EVENT, handleTodoHistoryControl);
+    return () => {
+      window.removeEventListener(TODO_HISTORY_CONTROL_EVENT, handleTodoHistoryControl);
+    };
+  }, [
+    applyTodoHistoryTarget,
+    clearTodoQueueItemPending,
+    interruptVoicePlanTaskTerminal,
+    queueTodoQueueItem,
+    removeTodoQueueItem,
+    syncTodoQueueItemsToCloud,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
+  // Crash/shutdown recovery: todos that were running when the app went away
+  // get labelled interrupted, and the workspace shows a resume modal for them.
+  const [crashResumeCandidates, setCrashResumeCandidates] = useState([]);
+  const crashResumeSweepKeyRef = useRef("");
+
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId || crashResumeSweepKeyRef.current === workspaceId) {
+      return undefined;
+    }
+    crashResumeSweepKeyRef.current = workspaceId;
+    const timer = window.setTimeout(() => {
+      const dismissed = readTodoResumeDismissals(workspaceId);
+      const interruptIds = new Set();
+      const candidates = [];
+      todoQueueItemsRef.current.forEach((item) => {
+        const itemId = String(item?.id || "").trim();
+        if (!itemId) {
+          return;
+        }
+        const status = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status);
+        const hasInFlight = Array.from(todoQueueTerminalInFlightPromptsRef.current.values())
+          .some((prompt) => String(prompt?.itemId || "").trim() === itemId);
+        const pendingItem = todoQueuePendingItemsRef.current[itemId] || null;
+        if (status === "running" && !hasInFlight && !pendingItem) {
+          // Running with no live dispatch state only happens after the app
+          // process went away mid-turn; label it interrupted.
+          interruptIds.add(itemId);
+          if (!dismissed.has(itemId)) {
+            candidates.push({
+              ...item,
+              todoStatus: "interrupted",
+              todoStatusReason: "app_shutdown_recovered",
+            });
+          }
+          return;
+        }
+        if (
+          status === "interrupted"
+          && TODO_RESUME_RECOVERY_REASONS.has(
+            String(item.todoStatusReason || item.todo_status_reason || "").trim(),
+          )
+          && !dismissed.has(itemId)
+        ) {
+          candidates.push(item);
+        }
+      });
+      if (interruptIds.size) {
+        logTerminalStatus("frontend.todo_queue.crash_recovery_marked", {
+          itemCount: interruptIds.size,
+          workspaceId,
+        });
+        updateTodoQueueItems((currentItems) => currentItems.map((item) => (
+          interruptIds.has(String(item?.id || "").trim())
+            ? getTodoQueueItemWithoutPersistedQueueState(
+              getTodoQueueItemWithCloudStatus(item, "interrupted", { reason: "app_shutdown_recovered" }),
+            )
+            : item
+        )), {
+          force: true,
+          immediate: true,
+          reason: "todo_crash_recovery_sweep",
+        });
+      }
+      if (candidates.length) {
+        setCrashResumeCandidates(candidates);
+      }
+    }, 2200);
+    return () => window.clearTimeout(timer);
+  }, [terminalWorkspace?.id, updateTodoQueueItems]);
+
+  const resumeCrashRecoveredTodo = useCallback((item) => {
+    const itemId = String(item?.id || "").trim();
+    if (!itemId) {
+      return;
+    }
+    recordTodoResumeDismissal(terminalWorkspace?.id || "", itemId);
+    setCrashResumeCandidates((current) => current.filter((candidate) => candidate.id !== itemId));
+    logTerminalStatus("frontend.todo_queue.crash_recovery_resume", {
+      itemId,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    // Re-queue the same todo id: the dispatcher re-prompts a terminal agent
+    // and the new prompt lands under the same todo in the history view.
+    queueTodoQueueItem(itemId);
+  }, [queueTodoQueueItem, terminalWorkspace?.id]);
+
+  const dismissCrashRecoveredTodo = useCallback((item) => {
+    const itemId = String(item?.id || "").trim();
+    if (!itemId) {
+      return;
+    }
+    recordTodoResumeDismissal(terminalWorkspace?.id || "", itemId);
+    setCrashResumeCandidates((current) => current.filter((candidate) => candidate.id !== itemId));
+  }, [terminalWorkspace?.id]);
 
   const pendingToolQueueIdRef = useRef("");
   const addWorkspaceToolTodo = useCallback((text, { send = false } = {}) => {
@@ -25158,6 +25769,51 @@ function TerminalView({
               </TodoDragPreview>
             )}
           </TerminalWorkspaceMain>
+      )}
+      {crashResumeCandidates.length > 0 && (
+        <TodoResumeOverlay aria-label="Resume interrupted todos" aria-modal="true" role="dialog">
+          <TodoResumeDialog>
+            <header>
+              <strong>Interrupted todos</strong>
+              <span>
+                {crashResumeCandidates.length === 1
+                  ? "A todo was still running when Diff Forge closed."
+                  : `${crashResumeCandidates.length} todos were still running when Diff Forge closed.`}
+                {" "}
+                Resume re-prompts a terminal agent with the same todo.
+              </span>
+            </header>
+            {crashResumeCandidates.map((item) => (
+              <TodoResumeRow key={item.id}>
+                <p title={item.text || ""}>{item.text || "Untitled todo"}</p>
+                <TodoResumeButton
+                  onClick={() => resumeCrashRecoveredTodo(item)}
+                  title="Queue this todo again with the same todo id"
+                  type="button"
+                >
+                  Resume
+                </TodoResumeButton>
+                <TodoResumeButton
+                  data-ghost="true"
+                  onClick={() => dismissCrashRecoveredTodo(item)}
+                  title="Keep it marked interrupted"
+                  type="button"
+                >
+                  Dismiss
+                </TodoResumeButton>
+              </TodoResumeRow>
+            ))}
+            <TodoResumeFooter>
+              <TodoResumeButton
+                data-ghost="true"
+                onClick={() => [...crashResumeCandidates].forEach((item) => dismissCrashRecoveredTodo(item))}
+                type="button"
+              >
+                Dismiss all
+              </TodoResumeButton>
+            </TodoResumeFooter>
+          </TodoResumeDialog>
+        </TodoResumeOverlay>
       )}
     </ForgeWorkspace>
   );

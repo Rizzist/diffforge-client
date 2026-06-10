@@ -8278,6 +8278,106 @@ export const AudioBarNoticeProgress = styled.span`
   }
 `;
 
+export const AudioPillShell = styled.div`
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  padding-bottom: 5px;
+`;
+
+export const AudioPillTooltip = styled.span`
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 13px;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 999px;
+  color: rgba(230, 236, 245, 0.92);
+  background: linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.97));
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+  font-size: 11.5px;
+  font-weight: 740;
+  white-space: nowrap;
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity 150ms ease, transform 180ms cubic-bezier(0.3, 0, 0.2, 1);
+
+  ${AudioPillShell}:hover & {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  ${AudioPillShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.1);
+    color: rgba(29, 29, 31, 0.9);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
+    box-shadow: 0 8px 20px rgba(29, 29, 31, 0.16);
+  }
+`;
+
+// Idle: a tiny closed pill hugging the bottom of the screen. Hover morphs
+// the same element into a round microphone button (Wispr-style).
+export const AudioPillMicButton = styled.button`
+  display: inline-flex;
+  width: 56px;
+  height: 8px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(230, 236, 245, 0.22);
+  border-radius: 999px;
+  color: #7db0ff;
+  background: rgba(230, 236, 245, 0.3);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  transition:
+    width 180ms cubic-bezier(0.3, 0, 0.2, 1),
+    height 180ms cubic-bezier(0.3, 0, 0.2, 1),
+    background 160ms ease,
+    border-color 160ms ease;
+
+  svg {
+    width: 17px;
+    height: 17px;
+    opacity: 0;
+    transition: opacity 120ms ease 60ms;
+  }
+
+  ${AudioPillShell}:hover & {
+    width: 40px;
+    height: 40px;
+    border-color: rgba(230, 236, 245, 0.18);
+    background:
+      radial-gradient(circle at 30% 18%, rgba(125, 176, 255, 0.2), transparent 55%),
+      linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.98));
+
+    svg {
+      opacity: 1;
+    }
+  }
+
+  &:hover {
+    color: #fff;
+  }
+
+  ${AudioPillShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.16);
+    color: var(--forge-blue, #0066cc);
+    background: rgba(29, 29, 31, 0.3);
+  }
+
+  ${AudioPillShell}[data-theme="light"]:hover & {
+    background:
+      radial-gradient(circle at 30% 18%, rgba(0, 102, 204, 0.1), transparent 55%),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
+  }
+`;
+
 export const AudioWidgetFocusStage = styled.div`
   position: relative;
   z-index: 2;

@@ -9238,6 +9238,7 @@ fn spawn_terminal_activity_hook_watcher(
                                 )
                                 .await;
                             });
+                            todo_dispatch_observe_activity_hook(&app, &payload);
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
                             if let Some(payload) = architecture_payload {
                                 let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
