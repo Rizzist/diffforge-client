@@ -3428,6 +3428,122 @@ async fn local_workspaces_store(
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
 }
 
+fn local_workspace_catalog_read_items(
+    app: &AppHandle,
+    scope_key: &str,
+) -> Result<Vec<Value>, String> {
+    let path = local_workspace_store_path(app, scope_key)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
+    let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+    Ok(value
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn local_workspace_catalog_write_items(
+    app: &AppHandle,
+    scope_key: &str,
+    items: &[Value],
+) -> Result<(), String> {
+    let path = local_workspace_store_path(app, scope_key)?;
+    let payload = json!({
+        "version": 1,
+        "workspaces": items,
+    });
+    let serialized = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("Unable to serialize local workspace catalog: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serialized)
+        .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
+    Ok(())
+}
+
+fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Rust-owned local catalog mutation: upserts a row in the scope store using
+/// the webview row schema. Runs without the webview so background flows
+/// (remote workspace management, outbox-driven sync) can commit locally.
+pub(crate) fn local_workspace_catalog_apply_upsert(
+    app: &AppHandle,
+    scope_key: &str,
+    workspace: &Value,
+) -> Result<(), String> {
+    let workspace_id =
+        local_workspace_catalog_text(workspace, &["workspace_id", "workspaceId", "id"])
+            .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
+    let workspace_name =
+        local_workspace_catalog_text(workspace, &["workspace_name", "workspaceName", "name"]);
+    let created_at =
+        local_workspace_catalog_text(workspace, &["created_at", "createdAt"]);
+    let updated_at = local_workspace_catalog_text(workspace, &["updated_at", "updatedAt"])
+        .unwrap_or_else(cloud_mcp_rfc3339_now);
+    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
+    let mut found = false;
+    for item in items.iter_mut() {
+        let item_id = local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]);
+        if item_id.as_deref() != Some(workspace_id.as_str()) {
+            continue;
+        }
+        found = true;
+        if let Some(object) = item.as_object_mut() {
+            if let Some(name) = workspace_name.clone() {
+                object.insert("name".to_string(), json!(name));
+            }
+            object.insert("updatedAt".to_string(), json!(updated_at.clone()));
+            object.insert("syncState".to_string(), json!("pending"));
+            object.remove("pendingDelete");
+        }
+    }
+    if !found {
+        items.push(json!({
+            "id": workspace_id,
+            "name": workspace_name.unwrap_or_else(|| "Workspace".to_string()),
+            "createdAt": created_at.unwrap_or_else(|| updated_at.clone()),
+            "updatedAt": updated_at,
+            "syncState": "pending",
+        }));
+    }
+    local_workspace_catalog_write_items(app, scope_key, &items)
+}
+
+/// Rust-owned local catalog delete: pure row removal, never a tombstone. The
+/// durable cloud delete rides the sync outbox, so no local marker is needed.
+pub(crate) fn local_workspace_catalog_apply_delete(
+    app: &AppHandle,
+    scope_key: &str,
+    workspace_id: &str,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err("Workspace delete requires a workspace id.".to_string());
+    }
+    let mut items = local_workspace_catalog_read_items(app, scope_key)?;
+    let before = items.len();
+    items.retain(|item| {
+        local_workspace_catalog_text(item, &["id", "workspace_id", "workspaceId"]).as_deref()
+            != Some(workspace_id)
+    });
+    let removed = before.saturating_sub(items.len());
+    if removed > 0 {
+        local_workspace_catalog_write_items(app, scope_key, &items)?;
+    }
+    Ok(removed)
+}
+
 #[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -3773,6 +3889,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             pty_pool.ensure_warm_async();
+            cloud_mcp_register_sync_status_app(app.handle());
             cloud_mcp_start_local_device_bridge();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             tauri::async_runtime::spawn(async move {

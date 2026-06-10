@@ -20609,6 +20609,43 @@ function TerminalView({
 	    todoQueuePendingItemsRef.current = {};
 	  }, []);
 
+  // A queued todo becomes "running" the moment the coding agent terminal
+  // receives the prompt (in-flight registration), not when the turn closes.
+  const markTodoQueueItemRunning = useCallback((itemId, submittedAt = "", reason = "terminal_prompt_submitted") => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+    const pendingItem = todoQueuePendingItemsRef.current[safeItemId] || null;
+    if (pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued") {
+      replaceTodoQueuePendingItems({
+        ...todoQueuePendingItemsRef.current,
+        [safeItemId]: { ...pendingItem, phase: "sending" },
+      });
+    }
+    updateTodoQueueItems((currentItems) => {
+      let changed = false;
+      const nextItems = currentItems.map((item) => {
+        if (String(item?.id || "").trim() !== safeItemId) {
+          return item;
+        }
+        if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "running") {
+          return item;
+        }
+        changed = true;
+        return getTodoQueueItemWithCloudStatus(item, "running", {
+          reason,
+          updatedAt: submittedAt || new Date().toISOString(),
+        });
+      });
+      return changed ? nextItems : currentItems;
+    }, {
+      force: true,
+      immediate: true,
+      reason: "todo_marked_running",
+    });
+  }, [replaceTodoQueuePendingItems, updateTodoQueueItems]);
+
   const sendTodoQueueItemToTerminal = useCallback(async ({
     allowGeneric = true,
     focusReason = "todo_dropdown_drop",
@@ -22022,43 +22059,6 @@ function TerminalView({
     terminalWorkspace?.id,
     todoQueueItems,
   ]);
-
-  // A queued todo becomes "running" the moment the coding agent terminal
-  // receives the prompt (in-flight registration), not when the turn closes.
-  const markTodoQueueItemRunning = useCallback((itemId, submittedAt = "", reason = "terminal_prompt_submitted") => {
-    const safeItemId = String(itemId || "").trim();
-    if (!safeItemId) {
-      return;
-    }
-    const pendingItem = todoQueuePendingItemsRef.current[safeItemId] || null;
-    if (pendingItem && getTodoQueuePendingPhase(pendingItem) === "queued") {
-      replaceTodoQueuePendingItems({
-        ...todoQueuePendingItemsRef.current,
-        [safeItemId]: { ...pendingItem, phase: "sending" },
-      });
-    }
-    updateTodoQueueItems((currentItems) => {
-      let changed = false;
-      const nextItems = currentItems.map((item) => {
-        if (String(item?.id || "").trim() !== safeItemId) {
-          return item;
-        }
-        if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) === "running") {
-          return item;
-        }
-        changed = true;
-        return getTodoQueueItemWithCloudStatus(item, "running", {
-          reason,
-          updatedAt: submittedAt || new Date().toISOString(),
-        });
-      });
-      return changed ? nextItems : currentItems;
-    }, {
-      force: true,
-      immediate: true,
-      reason: "todo_marked_running",
-    });
-  }, [replaceTodoQueuePendingItems, updateTodoQueueItems]);
 
   const applyTodoHistoryTarget = useCallback((itemId, targetTerminalIndex) => {
     const safeItemId = String(itemId || "").trim();

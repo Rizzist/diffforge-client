@@ -481,6 +481,9 @@ import {
   TitleBackgroundIcon,
   TitleMinimizeIcon,
   WindowBackgroundPill,
+  WindowSyncPill,
+  WindowSyncPillDot,
+  WindowSyncPillSpinner,
   TitleMaximizeIcon,
   TitleRestoreIcon,
   TitleCloseIcon,
@@ -3865,6 +3868,48 @@ function isCloudWorkspaceProgressReady(progress) {
   return String(progress?.status || "").toLowerCase() === "connected";
 }
 
+const CLOUD_SYNC_BLOCKED_STATUSES = [
+  "device_limit_reached",
+  "device_limit_exceeded",
+  "blocked",
+  "websocket_auth_missing",
+];
+
+function cloudSyncStatusFromRuntimeStatus(status) {
+  if (!status || typeof status !== "object") {
+    return null;
+  }
+  const connected = Boolean(
+    status.connected && (status.globalWsConnected ?? status.global_ws_connected),
+  );
+  const rawStatus = String(status.status || "").toLowerCase();
+  const pendingCount = Number(status.outboxPendingCount ?? status.outbox_pending_count ?? 0) || 0;
+  return {
+    connection: connected
+      ? "connected"
+      : CLOUD_SYNC_BLOCKED_STATUSES.includes(rawStatus)
+        ? "blocked"
+        : "connecting",
+    pendingCount,
+    syncing: connected && pendingCount > 0,
+    updatedAtMs: Date.now(),
+  };
+}
+
+function normalizeCloudSyncStatusEvent(payload) {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const connection = String(payload.connection || "connecting");
+  const pendingCount = Number(payload.pendingCount ?? payload.pending_count ?? 0) || 0;
+  return {
+    connection,
+    pendingCount,
+    syncing: Boolean(payload.syncing),
+    updatedAtMs: Number(payload.updatedAtMs ?? payload.updated_at_ms) || Date.now(),
+  };
+}
+
 function cloudWorkspaceLaunchState(progress) {
   const status = String(progress?.status || "").toLowerCase();
 
@@ -6282,6 +6327,12 @@ export default function App() {
   );
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
+  // True while the app is running on a saved session that could not be
+  // re-validated because the API was unreachable (offline grace). Cleared by
+  // the quiet re-validation that runs when the cloud connection returns.
+  const offlineSessionGraceRef = useRef(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
+  const cloudSyncConnectionRef = useRef("");
   const launchStartedAtRef = useRef(Date.now());
   const dashboardShellRef = useRef(null);
   const workspaceRailRef = useRef(null);
@@ -6384,7 +6435,6 @@ export default function App() {
   // timestamp. Catalog broadcasts and list responses must not re-add these
   // unless the cloud entry is newer than the delete (an intentional revive);
   // stale ghosts are filtered out and the tombstone is re-sent to the cloud.
-  const workspaceCatalogTombstonesRef = useRef(new Map());
   const tokenomicsSyncCursorRef = useRef("");
   const tokenomicsSyncInFlightRef = useRef(false);
   const tokenomicsSyncPendingRefreshRef = useRef(false);
@@ -9476,28 +9526,20 @@ export default function App() {
     workspaceAgentBatchInFlightSessionKeysRef.current.clear();
     setWorkspaceAgentBatchSentLaunchKey("");
 
-    // Local-first delete: the workspace leaves the UI instantly; cloud
-    // tombstone, runtime teardown, and metadata cleanup drain in background.
+    // Pure local delete: the workspace leaves the UI and the local store
+    // immediately — never a tombstone row. The cloud delete rides the durable
+    // sync outbox, so it survives offline stretches and background mode, and
+    // the Rust side filters the id out of stale lists/broadcasts until the
+    // delete drains.
     const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
       .filter((workspace) => workspace.id !== targetWorkspaceId);
     workspacesRef.current = nextWorkspaces;
     setWorkspaces(nextWorkspaces);
 
     const deleteScopeKey = activeAccountScopeKey;
-    const deletedAtIso = new Date().toISOString();
-    workspaceCatalogTombstonesRef.current.set(targetWorkspaceId, deletedAtIso);
-    const storedWorkspaces = [
-      ...nextWorkspaces,
-      {
-        id: targetWorkspaceId,
-        name: workspaceName,
-        updatedAt: deletedAtIso,
-        pendingDelete: true,
-      },
-    ];
     void invoke("local_workspaces_store", {
       scopeKey: deleteScopeKey,
-      workspaces: storedWorkspaces,
+      workspaces: nextWorkspaces,
     }).catch(() => {});
 
     const nextSettings = { ...(workspaceSettingsRef.current || {}) };
@@ -9569,18 +9611,18 @@ export default function App() {
 
     void (async () => {
       const warnings = [];
-      let catalogTombstoned = false;
 
       try {
-        // Authoritative cloud tombstone: broadcasts workspace_catalog_changed
-        // to every device so dashboards drop the workspace instantly.
+        // Durable cloud delete: hard-deletes the catalog rows, writes the
+        // deleted-ids ledger, and broadcasts workspace_catalog_changed to
+        // every device. Offline it queues on the outbox and drains later.
         await invoke("cloud_mcp_workspace_catalog_delete", {
           workspaceId: targetWorkspaceId,
           reason: "workspace_deleted",
+          scopeKey: deleteScopeKey,
         });
-        catalogTombstoned = true;
       } catch (error) {
-        warnings.push(`Cloud catalog cleanup warning: ${getErrorMessage(error, "Unable to tombstone cloud workspace.")}`);
+        warnings.push(`Cloud catalog cleanup warning: ${getErrorMessage(error, "Unable to delete cloud workspace.")}`);
       }
 
       try {
@@ -9628,16 +9670,6 @@ export default function App() {
         });
       } catch (error) {
         warnings.push(`Local metadata cleanup warning: ${getErrorMessage(error, "Unable to remove local workspace metadata.")}`);
-      }
-
-      if (catalogTombstoned) {
-        // Drop the local pendingDelete tombstone once the cloud acked.
-        const settledWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-          .filter((workspace) => workspace.id !== targetWorkspaceId);
-        void invoke("local_workspaces_store", {
-          scopeKey: deleteScopeKey,
-          workspaces: settledWorkspaces,
-        }).catch(() => {});
       }
 
       setWorkspaceError(warnings.length
@@ -9762,6 +9794,29 @@ export default function App() {
 
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
+      const isNetworkRestoreError = didTimeout
+        || /unable to validate desktop session/i.test(restoreError)
+        || /unable to read diff forge ai api response/i.test(restoreError)
+        || /returned 5\d\d/i.test(restoreError)
+        || /unable to prepare backend request/i.test(restoreError);
+      const storedUser = authStore.getSnapshot().user;
+
+      if (isNetworkRestoreError && storedUser) {
+        // Offline grace: the API was unreachable, not the session invalid.
+        // Enter the app on the saved session; the title-bar sync pill shows
+        // Connecting and the session re-validates quietly after reconnect.
+        offlineSessionGraceRef.current = true;
+        await recordCloudSigninDiagnostic(token, {
+          flowId: `restore-${validationFlowId}`,
+          step: "desktop_session.restore",
+          status: "warn",
+          message: "offline session grace: network failure during session restore",
+          details: { didTimeout, restoreError },
+        });
+        setAuthenticated(storedUser);
+        return;
+      }
+
       const signedOutMessage = didTimeout
         ? "Secure session check timed out. Sign in with the web app."
         : "Your desktop session expired. Sign in again with the web app.";
@@ -9779,6 +9834,37 @@ export default function App() {
       });
     }
   }, [setAuthenticated, setSignedOut, updateCloudWorkspaceProgress]);
+
+  const revalidateOfflineSessionQuietly = useCallback(async () => {
+    if (!offlineSessionGraceRef.current) {
+      return;
+    }
+    const token = authStore.getToken();
+    if (!isSafeAuthValue(token)) {
+      offlineSessionGraceRef.current = false;
+      return;
+    }
+    try {
+      const session = await invoke("validate_desktop_session", { token });
+      offlineSessionGraceRef.current = false;
+      if (session?.user) {
+        // Quiet refresh: update the stored user without resetting workspace
+        // state the user is already working in.
+        authStore.setAuthenticated(session.user);
+      }
+    } catch (error) {
+      const message = getErrorMessage(error, "");
+      const isNetworkError = /unable to validate desktop session/i.test(message)
+        || /unable to read diff forge ai api response/i.test(message)
+        || /returned 5\d\d/i.test(message)
+        || /unable to prepare backend request/i.test(message);
+      if (isNetworkError) {
+        return;
+      }
+      offlineSessionGraceRef.current = false;
+      expireDesktopSession(error);
+    }
+  }, [expireDesktopSession]);
 
   const completeDesktopLogin = useCallback(async (callbackUrl) => {
     const callback = parseAuthCallback(callbackUrl);
@@ -10434,38 +10520,6 @@ export default function App() {
     }
   }, []);
 
-  // Drops cloud catalog entries this device already deleted. A cloud entry
-  // updated after the local delete is an intentional revive and is kept; a
-  // stale ghost is filtered out and the cloud tombstone re-sent. Tombstones
-  // are released once the cloud stops listing the workspace.
-  const filterTombstonedCatalogItems = useCallback((items) => {
-    const tombstones = workspaceCatalogTombstonesRef.current;
-    if (!tombstones.size) {
-      return items;
-    }
-    const liveIds = new Set(items.map((item) => item.id));
-    [...tombstones.keys()].forEach((tombstonedId) => {
-      if (!liveIds.has(tombstonedId)) {
-        tombstones.delete(tombstonedId);
-      }
-    });
-    return items.filter((item) => {
-      const deletedAtIso = tombstones.get(item.id);
-      if (!deletedAtIso) {
-        return true;
-      }
-      if (String(item.updatedAt || "") > deletedAtIso) {
-        tombstones.delete(item.id);
-        return true;
-      }
-      void invoke("cloud_mcp_workspace_catalog_delete", {
-        workspaceId: item.id,
-        reason: "workspace_deleted_retry",
-      }).catch(() => {});
-      return false;
-    });
-  }, []);
-
   const loadWorkspaces = useCallback(async () => {
     setWorkspaceSyncState("loading");
     setWorkspaceError("");
@@ -10531,38 +10585,39 @@ export default function App() {
     } catch {
       localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
     }
-    // Rehydrate delete tombstones from persisted pendingDelete entries so a
-    // restart right after a delete still filters the workspace out of cloud
-    // responses while the cloud tombstone retry is in flight (zombie guard).
+    // Legacy stores may still hold pendingDelete tombstone rows from before
+    // catalog deletes became Rust-owned and durable. Migrate them: the durable
+    // delete removes the row from the store and queues the cloud delete on
+    // the outbox, so no tombstone bookkeeping survives.
     localItems.forEach((rawItem) => {
       const normalized = normalizeCatalogWorkspaceEntry(rawItem);
       if (normalized?.pendingDelete && normalized.id) {
-        workspaceCatalogTombstonesRef.current.set(
-          normalized.id,
-          String(normalized.updatedAt || new Date().toISOString()),
-        );
+        void invoke("cloud_mcp_workspace_catalog_delete", {
+          workspaceId: normalized.id,
+          reason: "workspace_deleted_offline",
+          scopeKey,
+        }).catch(() => {});
       }
     });
-    applyLoadedWorkspaces(
-      localItems
-        .map(normalizeCatalogWorkspaceEntry)
-        .filter((workspace) => workspace && !workspace.pendingDelete),
-    );
+    localItems = localItems
+      .map(normalizeCatalogWorkspaceEntry)
+      .filter((workspace) => workspace && !workspace.pendingDelete);
+    applyLoadedWorkspaces(localItems);
     setWorkspaceSyncState("idle");
     setWorkspaceListHydrated(true);
 
     void (async () => {
       try {
+        // The Rust list command already filters out workspaces whose catalog
+        // delete is still queued in the outbox.
         const result = await invoke("cloud_mcp_workspace_catalog_list");
         if (activeAccountScopeKey !== scopeKey) {
           return;
         }
-        const cloudItems = filterTombstonedCatalogItems(
-          (Array.isArray(result?.workspaces) ? result.workspaces : [])
-            .map(normalizeCatalogWorkspaceEntry)
-            .filter(Boolean),
-        );
-        const { workspaces: merged, pendingUpserts, pendingDeletes } = reconcileWorkspaceCatalog(
+        const cloudItems = (Array.isArray(result?.workspaces) ? result.workspaces : [])
+          .map(normalizeCatalogWorkspaceEntry)
+          .filter(Boolean);
+        const { workspaces: merged, pendingUpserts } = reconcileWorkspaceCatalog(
           localItems,
           cloudItems,
         );
@@ -10575,6 +10630,7 @@ export default function App() {
         for (const pending of pendingUpserts) {
           try {
             await invoke("cloud_mcp_workspace_catalog_upsert", {
+              scopeKey,
               workspace: {
                 workspace_id: pending.id,
                 workspace_name: pending.name,
@@ -10586,22 +10642,12 @@ export default function App() {
             // Retried on the next reconcile pass.
           }
         }
-        for (const pendingDeleteId of pendingDeletes) {
-          try {
-            await invoke("cloud_mcp_workspace_catalog_delete", {
-              workspaceId: pendingDeleteId,
-              reason: "workspace_deleted_offline",
-            });
-          } catch {
-            // Retried on the next reconcile pass.
-          }
-        }
       } catch {
         // Offline or cloud unavailable: the local list stands until the
         // websocket reconnects and the catalog broadcast refreshes us.
       }
     })();
-  }, [activeAccountScopeKey, expireDesktopSession, filterTombstonedCatalogItems]);
+  }, [activeAccountScopeKey, expireDesktopSession]);
 
   useEffect(() => {
     if (!previousAccountScopeKeyRef.current) {
@@ -10647,11 +10693,11 @@ export default function App() {
       if (!Array.isArray(payload.workspaces)) {
         return;
       }
-      const cloudItems = filterTombstonedCatalogItems(
-        payload.workspaces
-          .map(normalizeCatalogWorkspaceEntry)
-          .filter(Boolean),
-      );
+      // The Rust event forwarder already drops workspaces whose catalog
+      // delete is still queued in the outbox.
+      const cloudItems = payload.workspaces
+        .map(normalizeCatalogWorkspaceEntry)
+        .filter(Boolean);
       const localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
       const { workspaces: merged } = reconcileWorkspaceCatalog(localItems, cloudItems);
       workspacesRef.current = merged;
@@ -10678,7 +10724,7 @@ export default function App() {
         unlisten();
       }
     };
-  }, [activeAccountScopeKey, authState, filterTombstonedCatalogItems, user]);
+  }, [activeAccountScopeKey, authState, user]);
 
   const openCreateWorkspaceModal = useCallback(() => {
     setWorkspaceName("");
@@ -10809,7 +10855,8 @@ export default function App() {
       void (async () => {
         let catalogSynced = false;
         try {
-          await invoke("cloud_mcp_workspace_catalog_upsert", {
+          const catalogResponse = await invoke("cloud_mcp_workspace_catalog_upsert", {
+            scopeKey,
             workspace: {
               workspace_id: workspace.id,
               workspace_name: workspace.name,
@@ -10818,7 +10865,9 @@ export default function App() {
               updated_at: workspace.updatedAt,
             },
           });
-          catalogSynced = true;
+          // queued means the durable outbox holds it (offline); the row stays
+          // pending until the cloud list or broadcast confirms it.
+          catalogSynced = !catalogResponse?.queued;
         } catch (catalogError) {
           setWorkspaceError(
             `Workspace created locally; cloud sync is pending: ${getErrorMessage(
@@ -11125,12 +11174,18 @@ export default function App() {
           workspaces: renamedWorkspaces,
         }).catch(() => {});
         void invoke("cloud_mcp_workspace_catalog_upsert", {
+          scopeKey: renameScopeKey,
           workspace: {
             workspace_id: nextWorkspace.id,
             workspace_name: nextWorkspace.name,
             updated_at: renamedAtIso,
           },
-        }).then(() => {
+        }).then((response) => {
+          if (response?.queued) {
+            // Offline: the rename rides the durable outbox; it stays pending
+            // until the cloud confirms via list or broadcast.
+            return;
+          }
           const syncedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
             .map((workspace) => (
               workspace.id === nextWorkspace.id ? { ...workspace, syncState: "synced" } : workspace
@@ -12878,6 +12933,64 @@ export default function App() {
   }, [checkBackend]);
 
   useEffect(() => {
+    let cancelled = false;
+    let unlistenSyncStatus = null;
+
+    invoke("cloud_mcp_get_status").then((status) => {
+      if (cancelled) {
+        return;
+      }
+      const normalized = cloudSyncStatusFromRuntimeStatus(status);
+      if (normalized) {
+        setCloudSyncStatus((current) => (current ? current : normalized));
+      }
+    }).catch(() => {});
+
+    listen("cloud-mcp-sync-status", (event) => {
+      if (cancelled) {
+        return;
+      }
+      const normalized = normalizeCloudSyncStatusEvent(event?.payload);
+      if (!normalized) {
+        return;
+      }
+      setCloudSyncStatus(normalized);
+      if (normalized.connection === "connected") {
+        void revalidateOfflineSessionQuietly();
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSyncStatus = unlisten;
+    }).catch(() => {});
+
+    return () => {
+      cancelled = true;
+      if (unlistenSyncStatus) {
+        unlistenSyncStatus();
+      }
+    };
+  }, [revalidateOfflineSessionQuietly]);
+
+  useEffect(() => {
+    const connection = cloudSyncStatus?.connection || "";
+    const previous = cloudSyncConnectionRef.current;
+    cloudSyncConnectionRef.current = connection;
+    if (connection !== "connected" || previous === "connected" || !previous) {
+      return;
+    }
+    if (authState !== "authenticated" || !isPaidUser(user)) {
+      return;
+    }
+    // Reconnect after an offline stretch: reconcile the catalog right away so
+    // pending upserts/deletes captured offline re-push instead of waiting for
+    // the next app start. (The Rust outbox backlog drains on its own.)
+    loadWorkspaces();
+  }, [authState, cloudSyncStatus, loadWorkspaces, user]);
+
+  useEffect(() => {
     if (authState !== "authenticated") {
       setBillingStatus(null);
       setBillingStatusState("idle");
@@ -13154,18 +13267,19 @@ export default function App() {
       || workspaceState !== "initializing"
       || isLaunchScreenVisible
       || !workspaceListHydrated
-      || (isPaidUser(user) && !isCloudWorkspaceProgressReady(cloudWorkspaceProgress))
     ) {
       return undefined;
     }
 
+    // The cloud websocket is not a gate: workspaces are local-first and the
+    // title-bar sync pill reports Connecting/Syncing/Live Sync while the
+    // connection and outbox catch-up continue in the background.
     setWorkspaceState("ready");
     authStore.setMessage("Workspace ready.");
 
     return undefined;
   }, [
     authState,
-    cloudWorkspaceProgress,
     isLaunchScreenVisible,
     user,
     workspaceListHydrated,
@@ -13177,7 +13291,6 @@ export default function App() {
       authState !== "authenticated"
       || !isPaidUser(user)
       || !["initializing", "ready"].includes(workspaceState)
-      || !isCloudWorkspaceProgressReady(cloudWorkspaceProgress)
     ) {
       return undefined;
     }
@@ -13220,7 +13333,6 @@ export default function App() {
     agentStatuses,
     activeAccountScopeKey,
     authState,
-    cloudWorkspaceProgress,
     finishStartupAgentGate,
     loadWorkspaces,
     refreshAgentStatuses,
@@ -16884,7 +16996,6 @@ export default function App() {
       workspaceMcpSyncKeyRef.current = "";
       workspaceCloudSyncKeyRef.current = "";
       architectureCloudSyncSignatureRef.current = {};
-      workspaceCatalogTombstonesRef.current.clear();
       tokenomicsSyncCursorRef.current = "";
 
       const pendingWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
@@ -22454,6 +22565,31 @@ export default function App() {
   ]);
 
   const isConnectivityBlocked = authState !== "authenticated" && (apiState === "checking" || apiState === "offline");
+  const isPaidPlanUser = isPaidUser(user) || billingStatus?.planStatus === "paid";
+  const cloudSyncPillState = authState !== "authenticated"
+    ? null
+    : !isPaidPlanUser
+      ? "upgrade"
+      : (cloudSyncStatus?.connection || "connecting") !== "connected"
+        ? "connecting"
+        : cloudSyncStatus?.syncing || (cloudSyncStatus?.pendingCount || 0) > 0
+          ? "syncing"
+          : "live";
+  const cloudSyncPendingCount = Number(cloudSyncStatus?.pendingCount || 0);
+  const cloudSyncPillLabel = {
+    connecting: "Connecting",
+    live: "Live Sync",
+    syncing: "Syncing",
+    upgrade: "Upgrade",
+  }[cloudSyncPillState] || "";
+  const cloudSyncPillTitle = {
+    connecting: "Establishing the live cloud connection. Changes are saved locally and sync once connected.",
+    live: "Connected. Changes sync live to your account.",
+    syncing: cloudSyncPendingCount > 0
+      ? `Syncing ${cloudSyncPendingCount} queued change${cloudSyncPendingCount === 1 ? "" : "s"} to the cloud.`
+      : "Syncing queued changes to the cloud.",
+    upgrade: "Upgrade to unlock live cloud sync across your devices.",
+  }[cloudSyncPillState] || "";
   const shouldShowLaunchScreen = isLaunchScreenVisible || isConnectivityBlocked;
   const launchState = isConnectivityBlocked && apiState === "offline"
     ? "offline"
@@ -22554,6 +22690,24 @@ export default function App() {
               <TitleBackgroundIcon aria-hidden="true" />
               <span>Background</span>
             </WindowBackgroundPill>
+            {cloudSyncPillState ? (
+              <WindowSyncPill
+                aria-label={cloudSyncPillTitle}
+                data-platform={windowControlPlatform}
+                data-state={cloudSyncPillState}
+                data-window-control
+                onClick={cloudSyncPillState === "upgrade" ? openPricing : undefined}
+                title={cloudSyncPillTitle}
+                type="button"
+              >
+                {["syncing", "connecting"].includes(cloudSyncPillState) ? (
+                  <WindowSyncPillSpinner aria-hidden="true" />
+                ) : (
+                  <WindowSyncPillDot aria-hidden="true" />
+                )}
+                <span>{cloudSyncPillLabel}</span>
+              </WindowSyncPill>
+            ) : null}
             <WindowControlButton
               aria-label="Minimize"
               data-action="minimize"

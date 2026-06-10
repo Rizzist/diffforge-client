@@ -26,6 +26,7 @@
     "core:webview:allow-webview-hide",
     "core:webview:allow-webview-show",
     "deep-link:default",
+    "dialog:allow-confirm",
     "dialog:allow-open",
     "notification:default",
     "opener:default",

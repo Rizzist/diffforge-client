@@ -12736,6 +12736,104 @@ export const WindowBackgroundPill = styled.button`
   }
 `;
 
+export const WindowSyncPill = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: center;
+  padding: 3px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.88);
+  background: rgba(100, 116, 139, 0.12);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: default;
+
+  &[data-state="live"] {
+    border-color: rgba(74, 222, 128, 0.34);
+    color: rgba(187, 247, 208, 0.95);
+    background: rgba(34, 197, 94, 0.12);
+  }
+
+  &[data-state="syncing"] {
+    border-color: rgba(125, 176, 255, 0.34);
+    color: rgba(200, 222, 255, 0.92);
+    background: rgba(59, 130, 246, 0.12);
+  }
+
+  &[data-state="upgrade"] {
+    border-color: rgba(255, 170, 92, 0.4);
+    color: rgba(255, 214, 170, 0.95);
+    background: rgba(255, 122, 24, 0.14);
+    cursor: pointer;
+  }
+
+  &[data-state="upgrade"]:hover {
+    color: #ffffff;
+    background: rgba(255, 122, 24, 0.32);
+  }
+
+  &[data-platform="macos"] {
+    order: 5;
+    margin-left: 8px;
+  }
+
+  &[data-platform="windows"],
+  &[data-platform="linux"] {
+    margin-right: 8px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.32);
+    color: rgba(71, 85, 105, 0.92);
+    background: rgba(100, 116, 139, 0.08);
+  }
+
+  html[data-forge-theme="light"] &[data-state="live"] {
+    border-color: rgba(22, 163, 74, 0.32);
+    color: rgba(21, 128, 61, 0.95);
+    background: rgba(34, 197, 94, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-state="syncing"] {
+    border-color: rgba(37, 99, 235, 0.35);
+    color: rgba(29, 78, 216, 0.9);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-state="upgrade"] {
+    border-color: rgba(234, 88, 12, 0.36);
+    color: rgba(194, 65, 12, 0.95);
+    background: rgba(255, 122, 24, 0.1);
+  }
+
+  html[data-forge-theme="light"] &[data-state="upgrade"]:hover {
+    color: rgba(154, 52, 18, 1);
+    background: rgba(255, 122, 24, 0.2);
+  }
+`;
+
+export const WindowSyncPillSpinner = styled.span`
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: ${workspaceCloseSpin} 0.8s linear infinite;
+`;
+
+export const WindowSyncPillDot = styled.span`
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: currentColor;
+`;
+
 export const TitleMinimizeIcon = styled(Remove)`
   ${titleIconSize}
 `;

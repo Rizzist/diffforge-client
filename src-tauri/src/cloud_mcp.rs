@@ -58,7 +58,6 @@ const CLOUD_MCP_LOCAL_HOME_ENV: &str = "RUST_DIFFFORGE_HOME";
 const CLOUD_MCP_LOCAL_CACHE_DIR_ENV: &str = "RUST_DIFFFORGE_CACHE_DIR";
 const CLOUD_MCP_LOCAL_DATA_DIR_ENV: &str = "RUST_DIFFFORGE_DATA_DIR";
 const CLOUD_MCP_OUTBOX_DRAIN_LIMIT: usize = 24;
-const CLOUD_MCP_OUTBOX_DEAD_LETTER_ATTEMPTS: i64 = 25;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS: u64 = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX: usize = 512;
 const CLOUD_MCP_TERMINAL_CONTEXT_MISSING_BACKOFF_MS: u64 = 1_500;
@@ -78,6 +77,15 @@ const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
     "Mia", "Ned", "Ona", "Pam", "Ray", "Rex", "Sam", "Sue", "Taj", "Alex", "Matt",
     "Mike", "Noah", "Omar", "Ezra",
 ];
+
+const CLOUD_MCP_SYNC_STATUS_EVENT: &str = "cloud-mcp-sync-status";
+const CLOUD_MCP_SYNC_STATUS_MIN_EMIT_INTERVAL_MS: u64 = 300;
+
+static CLOUD_MCP_SYNC_STATUS_APP: OnceLock<AppHandle> = OnceLock::new();
+static CLOUD_MCP_SYNC_STATUS_CONNECTION: std::sync::Mutex<Option<&'static str>> =
+    std::sync::Mutex::new(None);
+static CLOUD_MCP_SYNC_STATUS_LAST: std::sync::Mutex<Option<(String, u64)>> =
+    std::sync::Mutex::new(None);
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
@@ -1200,7 +1208,10 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
     let reset_inflight_sql = format!(
         "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
          SET status='retrying', next_attempt_at_ms=0
-         WHERE status='in_flight';"
+         WHERE status='in_flight';
+         UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+         SET status='retrying', next_attempt_at_ms=0
+         WHERE status='dead_letter';"
     );
     conn.execute_batch(&format!(
         "
@@ -1258,6 +1269,26 @@ fn cloud_mcp_outbox_payload_hash(payload: &Value) -> String {
 
 fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> Option<String> {
     let normalized_kind = event_kind.trim().to_ascii_lowercase();
+    // Catalog mutations coalesce per workspace id with latest-wins semantics:
+    // an offline rename storm collapses to one upsert, and a delete supersedes
+    // any queued upsert for the same workspace (ids are never reused, so the
+    // reverse ordering cannot occur).
+    if matches!(
+        normalized_kind.as_str(),
+        "workspace_catalog_upsert" | "workspace_catalog_delete"
+    ) {
+        let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
+            .or_else(|| {
+                payload.get("workspace").and_then(|workspace| {
+                    cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                })
+            })
+            .unwrap_or_default();
+        if workspace_id.is_empty() {
+            return None;
+        }
+        return Some(format!("catalog:workspace:{workspace_id}"));
+    }
     let is_snapshot = matches!(
         normalized_kind.as_str(),
         "agent_installation_snapshot"
@@ -1475,16 +1506,19 @@ fn cloud_mcp_outbox_enqueue_event(
         ],
     )
     .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
-    conn.query_row(
-        &format!(
-            "SELECT outbox_id, idempotency_key, event_kind, payload_json, attempt_count
-             FROM {CLOUD_MCP_OUTBOX_TABLE}
-             WHERE idempotency_key=?1"
-        ),
-        rusqlite::params![idempotency_key],
-        cloud_mcp_outbox_row_from_statement_row,
-    )
-    .map_err(|error| format!("Unable to read queued Cloud sync outbox row: {error}"))
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT outbox_id, idempotency_key, event_kind, payload_json, attempt_count
+                 FROM {CLOUD_MCP_OUTBOX_TABLE}
+                 WHERE idempotency_key=?1"
+            ),
+            rusqlite::params![idempotency_key],
+            cloud_mcp_outbox_row_from_statement_row,
+        )
+        .map_err(|error| format!("Unable to read queued Cloud sync outbox row: {error}"))?;
+    cloud_mcp_emit_sync_status(None);
+    Ok(row)
 }
 
 fn cloud_mcp_outbox_claim_due_rows(limit: usize) -> Result<Vec<CloudMcpOutboxRow>, String> {
@@ -1544,6 +1578,91 @@ fn cloud_mcp_outbox_next_due_delay_ms() -> Option<u64> {
         .ok()??;
     let now = cloud_mcp_now_ms() as i64;
     Some(next_due.saturating_sub(now).max(0) as u64)
+}
+
+pub(crate) fn cloud_mcp_register_sync_status_app(app: &AppHandle) {
+    let _ = CLOUD_MCP_SYNC_STATUS_APP.set(app.clone());
+    cloud_mcp_emit_sync_status(None);
+}
+
+fn cloud_mcp_sync_connection_for_runtime(connected: bool, status: &str) -> &'static str {
+    if connected {
+        return "connected";
+    }
+    match status.trim().to_ascii_lowercase().as_str() {
+        "device_limit_reached" | "device_limit_exceeded" | "blocked" | "websocket_auth_missing" => {
+            "blocked"
+        }
+        _ => "connecting",
+    }
+}
+
+fn cloud_mcp_note_sync_connection(connected: bool, status: &str) {
+    let connection = cloud_mcp_sync_connection_for_runtime(connected, status);
+    if let Ok(mut current) = CLOUD_MCP_SYNC_STATUS_CONNECTION.lock() {
+        *current = Some(connection);
+    }
+    cloud_mcp_emit_sync_status(None);
+}
+
+// Pushes the live sync pill state ("connecting"/"connected"/"blocked" plus
+// outbox depth) to the webview. Deduped + rate limited so per-row outbox acks
+// do not flood the UI; connection or queue-empty transitions always emit.
+fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
+    let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() else {
+        return;
+    };
+    let connection = CLOUD_MCP_SYNC_STATUS_CONNECTION
+        .lock()
+        .ok()
+        .and_then(|value| *value)
+        .unwrap_or("connecting");
+    let (pending, retrying, dead_letter, oldest_pending_ms) = cloud_mcp_outbox_status_counts();
+    let syncing = syncing_hint.unwrap_or(connection == "connected" && pending > 0);
+    let fingerprint = format!("{connection}:{}:{syncing}", pending > 0);
+    let now = cloud_mcp_now_ms();
+    {
+        let Ok(mut last) = CLOUD_MCP_SYNC_STATUS_LAST.lock() else {
+            return;
+        };
+        if let Some((last_fingerprint, last_emit_ms)) = last.as_ref() {
+            let same_class = last_fingerprint == &fingerprint;
+            if same_class
+                && now.saturating_sub(*last_emit_ms) < CLOUD_MCP_SYNC_STATUS_MIN_EMIT_INTERVAL_MS
+            {
+                return;
+            }
+        }
+        *last = Some((fingerprint, now));
+    }
+    let _ = app.emit(
+        CLOUD_MCP_SYNC_STATUS_EVENT,
+        json!({
+            "connection": connection,
+            "pendingCount": pending,
+            "retryingCount": retrying,
+            "deadLetterCount": dead_letter,
+            "oldestPendingMs": oldest_pending_ms,
+            "syncing": syncing,
+            "updatedAtMs": now,
+        }),
+    );
+}
+
+fn cloud_mcp_outbox_release_backoff_now() -> Result<usize, String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let released = conn
+        .execute(
+            &format!(
+                "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                 SET status='retrying', next_attempt_at_ms=0
+                 WHERE status IN ('queued', 'retrying', 'dead_letter')
+                   AND next_attempt_at_ms>0"
+            ),
+            [],
+        )
+        .map_err(|error| format!("Unable to release Cloud sync outbox backoff: {error}"))?;
+    Ok(released)
 }
 
 fn cloud_mcp_outbox_status_counts() -> (usize, usize, usize, Option<u64>) {
@@ -1613,6 +1732,7 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
         ],
     )
     .map_err(|error| format!("Unable to mark Cloud sync outbox row acked: {error}"))?;
+    cloud_mcp_emit_sync_status(None);
     Ok(())
 }
 
@@ -1635,22 +1755,48 @@ fn cloud_mcp_outbox_retry_delay_ms(attempt_count: i64, idempotency_key: &str) ->
     base + jitter
 }
 
+// Server-side contract rejections will never succeed on retry (for example an
+// upsert for a workspace id already in the deleted-ids ledger). Without a
+// dead-letter horizon these would spin forever, so they park as 'rejected'.
+fn cloud_mcp_outbox_error_is_permanent_rejection(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        // Error codes (kept in case transports start surfacing them) plus the
+        // exact server messages the app websocket surfaces today.
+        "workspace_catalog_deleted",
+        "workspace_catalog_invalid",
+        "workspace_catalog_limit",
+        "workspace_delete_requires_workspace_id",
+        "idempotency_conflict",
+        "workspace ids are unique and cannot be reused",
+        "id is required to upsert a workspace",
+        "id is required to delete a workspace",
+        "reached the workspace limit",
+        "idempotency key was reused with a different payload",
+        "workspace delete requires a workspace_id",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
 fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(), String> {
     let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
     let next_attempt_count = row.attempt_count.saturating_add(1);
-    let status = if next_attempt_count >= CLOUD_MCP_OUTBOX_DEAD_LETTER_ATTEMPTS {
-        "dead_letter"
+    // Offline mode can keep rows failing for hours or days; rows never park as
+    // dead letters. The backoff caps at 5 minutes and the websocket-ready path
+    // releases the whole backlog immediately on reconnect. Only contract
+    // rejections the server will never accept park as 'rejected'.
+    let (status, next_attempt_at) = if cloud_mcp_outbox_error_is_permanent_rejection(error) {
+        ("rejected", 0)
     } else {
-        "retrying"
-    };
-    let next_attempt_at = if status == "dead_letter" {
-        0
-    } else {
-        now.saturating_add(cloud_mcp_outbox_retry_delay_ms(
-            next_attempt_count,
-            &row.idempotency_key,
-        ))
+        (
+            "retrying",
+            now.saturating_add(cloud_mcp_outbox_retry_delay_ms(
+                next_attempt_count,
+                &row.idempotency_key,
+            )),
+        )
     };
     conn.execute(
         &format!(
@@ -1672,6 +1818,7 @@ fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(
         ],
     )
     .map_err(|error| format!("Unable to mark Cloud sync outbox row retrying: {error}"))?;
+    cloud_mcp_emit_sync_status(None);
     Ok(())
 }
 
@@ -1684,6 +1831,8 @@ fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
         | "todo_dispatch_update"
         | "remote_command_ack"
         | "remote_command_result"
+        | "workspace_catalog_upsert"
+        | "workspace_catalog_delete"
         | "lane_claim"
         | "lane_claimed"
         | "lane_release"
@@ -1849,6 +1998,7 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                 Ok(rows) => {
                     if !rows.is_empty() {
                         drained_any = true;
+                        cloud_mcp_emit_sync_status(Some(true));
                     }
                     for row in rows {
                         let result = cloud_mcp_send_outbox_row_now(&state, &row).await;
@@ -3206,7 +3356,10 @@ async fn cloud_mcp_set_connection_error(state: &CloudMcpState, error: String) ->
     runtime.global_ws_connection_id = None;
     runtime.global_ws_message_token = None;
     runtime.live_runtime_status = None;
-    cloud_mcp_snapshot(&runtime)
+    let snapshot = cloud_mcp_snapshot(&runtime);
+    drop(runtime);
+    cloud_mcp_note_sync_connection(false, "blocked");
+    snapshot
 }
 
 async fn cloud_mcp_connect_state(state: &CloudMcpState) -> Result<CloudMcpStatus, String> {
@@ -3280,6 +3433,8 @@ async fn cloud_mcp_set_global_ws_phase(
     runtime.status = status.to_string();
     runtime.global_ws_connected = false;
     runtime.global_ws_status = global_ws_status.to_string();
+    drop(runtime);
+    cloud_mcp_note_sync_connection(false, status);
 }
 
 async fn require_cloud_mcp_connected_state(
@@ -3345,6 +3500,7 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                 "connecting".to_string()
             };
         }
+        cloud_mcp_note_sync_connection(false, "connecting");
 
         match cloud_mcp_open_global_ws(&state, &base_url, &target).await {
             Ok(()) => {}
@@ -3809,6 +3965,7 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
         runtime.live_runtime_status = None;
     }
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
+    cloud_mcp_note_sync_connection(false, "websocket_retrying");
 }
 
 async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &str) {
@@ -3832,6 +3989,7 @@ async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &st
     let _ = state.global_ws_tx.lock().await.take();
     cloud_mcp_fail_pending_ws_requests(state, &message).await;
     state.global_ws_reconnect.notify_waiters();
+    cloud_mcp_note_sync_connection(false, "websocket_retrying");
 }
 
 fn cloud_mcp_registration_blocked_error(message: &Value) -> Option<(String, Value)> {
@@ -3904,6 +4062,7 @@ async fn cloud_mcp_mark_registration_blocked(
     )
     .await;
     state.global_ws_reconnect.notify_waiters();
+    cloud_mcp_note_sync_connection(false, "device_limit_reached");
 }
 
 async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
@@ -3975,6 +4134,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_message_token = Some(message_token.clone());
             runtime.live_runtime_status = initial_live_runtime.clone();
         }
+        // Reconnect means the whole offline backlog is sendable right now;
+        // collapse every queued/retrying backoff so the drain starts immediately.
+        let _ = cloud_mcp_outbox_release_backoff_now();
+        cloud_mcp_note_sync_connection(true, "connected");
         if let Some(initial_live_runtime) = initial_live_runtime {
             cloud_mcp_update_todo_mirror_from_response(
                 state,
@@ -4686,7 +4849,10 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if event_kind == "workspace_catalog_changed" {
-                let _ = app.emit(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, event.clone());
+                // Drop workspaces whose catalog delete is still queued in the
+                // outbox so a stale broadcast cannot resurrect them in the UI.
+                let filtered = cloud_mcp_filter_pending_catalog_deletes(event.clone());
+                let _ = app.emit(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, filtered);
                 continue;
             }
             if cloud_mcp_is_tokenomics_state_event(&event_kind) {
@@ -11690,13 +11856,16 @@ async fn cloud_mcp_register_workspace(
         .await
 }
 
-/// Authoritative workspace create/rename ack from cloud-diffforge. Workspaces
-/// are first-class objects under a device in the cloud catalog; the UI commits
-/// locally first and calls this in the background.
+/// Workspace catalog mutations are Rust-owned and durable: the local scope
+/// store commits synchronously and the cloud mutation rides the sync outbox,
+/// so create/rename/delete survive offline stretches and background mode.
+/// The response carries `queued: true` when the cloud has not confirmed yet.
 #[tauri::command]
 async fn cloud_mcp_workspace_catalog_upsert(
+    app: AppHandle,
     state: State<'_, CloudMcpState>,
     workspace: Value,
+    scope_key: Option<String>,
 ) -> Result<Value, String> {
     let mut workspace = workspace.as_object().cloned().unwrap_or_default();
     if !workspace.contains_key("origin_device_id") && !workspace.contains_key("originDeviceId") {
@@ -11707,18 +11876,43 @@ async fn cloud_mcp_workspace_catalog_upsert(
             workspace.insert("origin_device_id".to_string(), json!(device_id));
         }
     }
-    let payload = json!({ "workspace": Value::Object(workspace) });
-    let response =
-        cloud_mcp_ws_request(state.inner(), "workspace_catalog_upsert", &payload).await?;
-    Ok(cloud_mcp_response_data(&response))
+    let workspace = Value::Object(workspace);
+    let workspace_id =
+        cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])
+            .ok_or_else(|| "Workspace upsert requires a workspace id.".to_string())?;
+    if let Some(scope_key) = scope_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        local_workspace_catalog_apply_upsert(&app, &scope_key, &workspace)?;
+    }
+    let payload = json!({
+        "workspace": workspace,
+        "workspace_id": workspace_id,
+    });
+    cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_upsert", &payload).await
 }
 
 #[tauri::command]
 async fn cloud_mcp_workspace_catalog_delete(
+    app: AppHandle,
     state: State<'_, CloudMcpState>,
     workspace_id: String,
     reason: Option<String>,
+    scope_key: Option<String>,
 ) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Workspace delete requires a workspace id.".to_string());
+    }
+    // Pure local delete: the row leaves the store immediately and never comes
+    // back (workspace ids are unique, the server keeps a deleted-ids ledger).
+    if let Some(scope_key) = scope_key
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let _ = local_workspace_catalog_apply_delete(&app, &scope_key, &workspace_id)?;
+    }
     let payload = json!({
         "workspace_id": workspace_id,
         "reason": reason
@@ -11726,9 +11920,57 @@ async fn cloud_mcp_workspace_catalog_delete(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "workspace_deleted".to_string()),
     });
-    let response =
-        cloud_mcp_ws_request(state.inner(), "workspace_catalog_delete", &payload).await?;
-    Ok(cloud_mcp_response_data(&response))
+    cloud_mcp_post_event_endpoint(state.inner(), "workspace_catalog_delete", &payload).await
+}
+
+// Workspace ids with a catalog delete still queued in the outbox: stale cloud
+// list responses and broadcasts must not show them while the delete drains.
+fn cloud_mcp_outbox_pending_catalog_delete_ids() -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return ids;
+    };
+    let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT payload_json
+         FROM {CLOUD_MCP_OUTBOX_TABLE}
+         WHERE event_kind='workspace_catalog_delete'
+           AND status IN ('queued', 'retrying', 'in_flight')"
+    )) else {
+        return ids;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return ids;
+    };
+    for payload_json in rows.flatten() {
+        if let Ok(payload) = serde_json::from_str::<Value>(&payload_json) {
+            if let Some(workspace_id) =
+                cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
+            {
+                ids.insert(workspace_id);
+            }
+        }
+    }
+    ids
+}
+
+fn cloud_mcp_filter_pending_catalog_deletes(mut data: Value) -> Value {
+    let pending = cloud_mcp_outbox_pending_catalog_delete_ids();
+    if pending.is_empty() {
+        return data;
+    }
+    if let Some(workspaces) = data.get_mut("workspaces").and_then(Value::as_array_mut) {
+        workspaces.retain(|workspace| {
+            cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                .map(|workspace_id| !pending.contains(&workspace_id))
+                .unwrap_or(true)
+        });
+        let count = workspaces.len();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("workspace_count".to_string(), json!(count));
+            object.insert("workspaceCount".to_string(), json!(count));
+        }
+    }
+    data
 }
 
 #[tauri::command]
@@ -11737,7 +11979,9 @@ async fn cloud_mcp_workspace_catalog_list(
 ) -> Result<Value, String> {
     let response =
         cloud_mcp_ws_request(state.inner(), "workspace_catalog_list", &json!({})).await?;
-    Ok(cloud_mcp_response_data(&response))
+    Ok(cloud_mcp_filter_pending_catalog_deletes(
+        cloud_mcp_response_data(&response),
+    ))
 }
 
 #[tauri::command]
