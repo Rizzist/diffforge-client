@@ -477,6 +477,89 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         receipt,
         "remote_intake",
     );
+    // Headless intake: the remote todo is appended into the Rust queue store
+    // (matching the webview's commandId-keyed item id) so the background
+    // dispatcher can submit it and a later webview mount adopts it from the
+    // journal. A mounted TerminalView appends the same id itself and its next
+    // queue sync rewrites the store — both paths converge on one item.
+    {
+        let queue_path = todo_dispatch_data_path("queues", &workspace_id);
+        let already_queued = queue_path
+            .as_deref()
+            .map(|path| {
+                todo_dispatch_queue_read(path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("id").and_then(Value::as_str).map(str::trim)
+                                == Some(command_id.as_str())
+                                || todo_dispatch_queue_item_command_id(item) == command_id
+                        })
+                    })
+            })
+            .unwrap_or(false);
+        if !already_queued && !text.trim().is_empty() {
+            let now_iso = chrono_like_now_iso();
+            let item = json!({
+                "id": command_id,
+                "kind": "todo",
+                "text": text,
+                "todoStatus": "queued",
+                "status": "queued",
+                "createdAt": now_iso,
+                "updatedAt": now_iso,
+                "workspaceId": workspace_id,
+                "targetTerminalId": todo_dispatch_text(
+                    event,
+                    &["target_terminal_id", "targetTerminalId"],
+                ),
+                "targetThreadId": todo_dispatch_text(
+                    event,
+                    &["target_thread_id", "targetThreadId"],
+                ),
+                "targetAgentId": todo_dispatch_text(
+                    event,
+                    &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
+                ),
+                "remoteCommand": {
+                    "commandId": command_id,
+                    "todoId": todo_dispatch_text(event, &["todo_id", "todoId"]),
+                    "originDeviceId": origin_device_id,
+                    "source": "remote_intake_headless",
+                },
+            });
+            if let Some(path) = queue_path.as_deref() {
+                let mut items = todo_dispatch_queue_read(path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                items.push(item.clone());
+                todo_dispatch_queue_write(&workspace_id, &items);
+            }
+            todo_dispatch_journal_append(
+                &workspace_id,
+                json!({
+                    "kind": "remote_todo_created",
+                    "itemId": command_id,
+                    "commandId": command_id,
+                    "item": item,
+                    "at": chrono_like_now_iso(),
+                }),
+            );
+            // Cloud convergence only when the webview cannot own it; a live
+            // webview pushes a fresher snapshot from its own queue state.
+            if !todo_dispatch_webview_dispatcher_active() {
+                todo_dispatch_push_queue_snapshot(
+                    app,
+                    &workspace_id,
+                    Vec::new(),
+                    "remote_todo_intake_headless",
+                );
+            }
+        }
+    }
     let title = if workspace_name.is_empty() {
         "Diff Forge: remote todo arrived".to_string()
     } else {
@@ -809,6 +892,146 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
 
 fn chrono_like_now_iso() -> String {
     crate::coordination::kernel::now_rfc3339()
+}
+
+/// Best-effort headless idle assessment from the activity-hook runtime
+/// registry: a pane that last reported input-not-ready is treated as busy.
+pub(crate) fn todo_dispatch_workspace_has_busy_terminals(workspace_id: &str) -> bool {
+    let registry = TODO_DISPATCH_TERMINAL_RUNTIME.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(map) = registry.lock() else {
+        return false;
+    };
+    let now = todo_dispatch_now_ms();
+    map.values().any(|entry| {
+        entry.get("workspaceId").and_then(Value::as_str) == Some(workspace_id)
+            && entry.get("inputReady").and_then(Value::as_bool) == Some(false)
+            && entry
+                .get("updatedAtMs")
+                .and_then(Value::as_u64)
+                .is_some_and(|at| now.saturating_sub(at) < TODO_DISPATCH_TERMINAL_RUNTIME_TTL_MS)
+    })
+}
+
+pub(crate) fn todo_dispatch_webview_dispatcher_active() -> bool {
+    let heartbeat = TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.load(Ordering::Acquire);
+    heartbeat != 0
+        && todo_dispatch_now_ms().saturating_sub(heartbeat) < TODO_DISPATCH_DISPATCHER_LEASE_MS
+}
+
+/// Headless cloud convergence: push the Rust queue store as the authoritative
+/// todo snapshot (plus explicit removals) after a Rust-side queue mutation.
+/// Rides the durable outbox, so it also works offline.
+fn todo_dispatch_push_queue_snapshot(
+    app: &AppHandle,
+    workspace_id: &str,
+    removed_todo_ids: Vec<String>,
+    reason: &str,
+) {
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return;
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let items = snapshot
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if items.is_empty() && removed_todo_ids.is_empty() {
+        return;
+    }
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let mut payload = json!({ "todos": items });
+        if !removed_todo_ids.is_empty() {
+            payload["removed_todo_ids"] = json!(removed_todo_ids.clone());
+            payload["removedTodoIds"] = json!(removed_todo_ids);
+        }
+        let _ = cloud_mcp_sync_workspace_todos_internal(
+            &state,
+            String::new(),
+            workspace_id,
+            None,
+            payload,
+            Some(reason),
+        )
+        .await;
+    });
+}
+
+/// Headless remote todo delete: applied directly to the Rust queue store so
+/// the lever works with the window closed; the journal entry reconciles the
+/// webview's localStorage mirror on restore. Idempotent next to the webview
+/// path (both remove the same id).
+pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) {
+    let command_kind = todo_dispatch_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_");
+    if !matches!(
+        command_kind.as_str(),
+        "workspace_todo_delete" | "todo_delete" | "delete_todo" | "delete_task"
+            | "remote_todo_delete"
+    ) {
+        return;
+    }
+    let workspace_id = todo_dispatch_text(event, &["workspace_id", "workspaceId"]);
+    let todo_id = todo_dispatch_text(event, &["todo_id", "todoId", "item_id", "itemId"]);
+    if workspace_id.is_empty() || todo_id.is_empty() {
+        return;
+    }
+    let Some(path) = todo_dispatch_data_path("queues", &workspace_id) else {
+        return;
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let items = snapshot
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let before = items.len();
+    let next_items = items
+        .into_iter()
+        .filter(|item| {
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            item_id != todo_id && todo_dispatch_queue_item_command_id(item) != todo_id
+        })
+        .collect::<Vec<_>>();
+    let removed = next_items.len() != before;
+    if removed {
+        todo_dispatch_queue_write(&workspace_id, &next_items);
+    }
+    todo_dispatch_journal_append(
+        &workspace_id,
+        json!({
+            "kind": "remote_todo_deleted",
+            "itemId": todo_id,
+            "commandId": todo_dispatch_text(event, &["command_id", "commandId"]),
+            "at": chrono_like_now_iso(),
+            "removedFromQueueStore": removed,
+        }),
+    );
+    // Cloud convergence only when no webview dispatcher is alive: a mounted
+    // TerminalView handles the same lever itself and pushes a fresher queue;
+    // pushing the (possibly debounce-stale) file copy alongside it could
+    // overwrite the webview's snapshot. Unmounted-workspace deletions converge
+    // on the next mount via the journal entry above.
+    if !todo_dispatch_webview_dispatcher_active() {
+        todo_dispatch_push_queue_snapshot(
+            app,
+            &workspace_id,
+            vec![todo_id],
+            "remote_todo_delete_headless",
+        );
+    }
 }
 
 #[tauri::command]

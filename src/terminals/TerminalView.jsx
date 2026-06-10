@@ -22350,10 +22350,25 @@ function TerminalView({
         });
         const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
         const updatesByItemId = new Map();
+        const removedItemIds = new Set();
+        const createdItems = [];
         entries.forEach((entry) => {
           const itemId = String(entry?.itemId || "").trim();
           const commandId = String(entry?.commandId || "").trim();
+          const entryKind = String(entry?.kind || "").trim();
           if (!itemId) return;
+          if (entryKind === "remote_todo_deleted") {
+            // Applied headless to the Rust queue store; mirror the removal
+            // into the webview queue on restore.
+            removedItemIds.add(itemId);
+            return;
+          }
+          if (entryKind === "remote_todo_created") {
+            if (entry?.item && typeof entry.item === "object") {
+              createdItems.push(entry.item);
+            }
+            return;
+          }
           const receipt = ledgerReceipts[commandId] || todoQueueRemoteCommandReceiptsRef.current[commandId] || null;
           const receiptStatus = receipt
             ? normalizeTodoQueueRemoteCommandReceiptStatus(receipt.status)
@@ -22363,16 +22378,28 @@ function TerminalView({
             status: settledStatuses.has(receiptStatus) ? receiptStatus : "running",
           });
         });
-        if (!updatesByItemId.size) return;
-        updateTodoQueueItems((currentItems) => currentItems.map((item) => {
-          const update = updatesByItemId.get(String(item?.id || "").trim());
-          if (!update) return item;
-          return getTodoQueueItemWithCloudStatus(
-            getTodoQueueItemWithoutPersistedQueueState(item),
-            update.status,
-            { reason: update.reason },
-          );
-        }), {
+        if (!updatesByItemId.size && !removedItemIds.size && !createdItems.length) return;
+        updateTodoQueueItems((currentItems) => {
+          const existingIds = new Set(currentItems.map((item) => String(item?.id || "").trim()));
+          const adoptedItems = createdItems
+            .map((item) => normalizeTodoQueueItems([item])[0])
+            .filter((item) => item && !existingIds.has(String(item.id || "").trim())
+              && !removedItemIds.has(String(item.id || "").trim()));
+          return [
+            ...currentItems
+              .filter((item) => !removedItemIds.has(String(item?.id || "").trim()))
+              .map((item) => {
+                const update = updatesByItemId.get(String(item?.id || "").trim());
+                if (!update) return item;
+                return getTodoQueueItemWithCloudStatus(
+                  getTodoQueueItemWithoutPersistedQueueState(item),
+                  update.status,
+                  { reason: update.reason },
+                );
+              }),
+            ...adoptedItems,
+          ];
+        }, {
           force: true,
           immediate: true,
           reason: "todo_backend_submissions_reconciled",

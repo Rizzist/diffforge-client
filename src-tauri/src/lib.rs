@@ -3544,6 +3544,179 @@ pub(crate) fn local_workspace_catalog_apply_delete(
     Ok(removed)
 }
 
+fn local_workspace_catalog_normalize_cloud_entry(entry: &Value) -> Option<Value> {
+    let id = local_workspace_catalog_text(entry, &["workspace_id", "workspaceId", "id"])?;
+    let name = local_workspace_catalog_text(
+        entry,
+        &["workspace_name", "workspaceName", "name"],
+    )
+    .unwrap_or_else(|| "Workspace".to_string());
+    let created_at =
+        local_workspace_catalog_text(entry, &["created_at", "createdAt"]).unwrap_or_default();
+    let updated_at =
+        local_workspace_catalog_text(entry, &["updated_at", "updatedAt"]).unwrap_or_default();
+    let origin_device_id = local_workspace_catalog_text(
+        entry,
+        &["origin_device_id", "originDeviceId", "device_id", "deviceId"],
+    )
+    .unwrap_or_default();
+    Some(json!({
+        "id": id,
+        "name": name,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "originDeviceId": origin_device_id,
+        "syncState": "synced",
+    }))
+}
+
+/// Headless catalog down-sync: applies a server-authoritative catalog
+/// broadcast to the scope store without the webview. Cloud rows win; local
+/// rows still pending in the sync outbox survive until the cloud confirms;
+/// synced rows the cloud no longer lists were deleted remotely and drop.
+pub(crate) fn local_workspace_catalog_apply_cloud_merge(
+    app: &AppHandle,
+    scope_key: &str,
+    cloud_items: &[Value],
+) -> Result<(), String> {
+    let mut cloud_by_id = std::collections::BTreeMap::new();
+    for entry in cloud_items {
+        if let Some(normalized) = local_workspace_catalog_normalize_cloud_entry(entry) {
+            let id = normalized["id"].as_str().unwrap_or_default().to_string();
+            cloud_by_id.insert(id, normalized);
+        }
+    }
+    let local_items = local_workspace_catalog_read_items(app, scope_key)?;
+    let mut next_items = Vec::new();
+    for item in local_items {
+        let Some(id) =
+            local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"])
+        else {
+            continue;
+        };
+        let sync_state = local_workspace_catalog_text(&item, &["syncState"]).unwrap_or_default();
+        let local_pending = sync_state == "pending" || sync_state == "error";
+        if let Some(cloud_row) = cloud_by_id.remove(&id) {
+            let local_updated =
+                local_workspace_catalog_text(&item, &["updatedAt"]).unwrap_or_default();
+            let cloud_updated = cloud_row["updatedAt"].as_str().unwrap_or_default();
+            if local_pending && local_updated.as_str() > cloud_updated {
+                next_items.push(item);
+            } else {
+                next_items.push(cloud_row);
+            }
+        } else if local_pending {
+            next_items.push(item);
+        }
+    }
+    next_items.extend(cloud_by_id.into_values());
+    local_workspace_catalog_write_items(app, scope_key, &next_items)
+}
+
+/// Rust-owned app-local state files (app-data/app-state/<key>.json). These
+/// replace webview localStorage for state that headless flows must read or
+/// mutate (workspace settings, lifecycle defaults, remote-control intents).
+/// The webview keeps localStorage as a synchronous cache and writes through.
+fn app_local_state_path(app: &AppHandle, key: &str) -> Result<PathBuf, String> {
+    let safe_key = key
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    if safe_key.is_empty() {
+        return Err("App local state key is required.".to_string());
+    }
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
+        .join("app-state");
+    fs::create_dir_all(&store_dir)
+        .map_err(|error| format!("Unable to create app state directory: {error}"))?;
+    Ok(store_dir.join(format!("{safe_key}.json")))
+}
+
+pub(crate) fn app_local_state_read(app: &AppHandle, key: &str) -> Value {
+    let Ok(path) = app_local_state_path(app, key) else {
+        return json!(null);
+    };
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(json!(null))
+}
+
+pub(crate) fn app_local_state_write(app: &AppHandle, key: &str, value: &Value) -> Result<(), String> {
+    let path = app_local_state_path(app, key)?;
+    let serialized = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("Unable to serialize app state: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serialized)
+        .map_err(|error| format!("Unable to write app state: {error}"))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to finalize app state: {error}"))?;
+    Ok(())
+}
+
+/// Merge top-level keys into an app-local state object (creates it if absent).
+pub(crate) fn app_local_state_merge(
+    app: &AppHandle,
+    key: &str,
+    patch: &Value,
+) -> Result<Value, String> {
+    let mut current = match app_local_state_read(app, key) {
+        Value::Object(map) => Value::Object(map),
+        _ => json!({}),
+    };
+    if let (Some(target), Some(source)) = (current.as_object_mut(), patch.as_object()) {
+        for (patch_key, patch_value) in source {
+            if patch_value.is_null() {
+                target.remove(patch_key);
+            } else {
+                target.insert(patch_key.clone(), patch_value.clone());
+            }
+        }
+    }
+    app_local_state_write(app, key, &current)?;
+    Ok(current)
+}
+
+#[tauri::command]
+async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(app_local_state_read(&app, &key)))
+        .await
+        .map_err(|error| format!("App state load worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app_local_state_write(&app, &key, &value)?;
+        Ok(json!({ "ok": true }))
+    })
+    .await
+    .map_err(|error| format!("App state store worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn app_local_state_merge_command(
+    app: AppHandle,
+    key: String,
+    patch: Value,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || app_local_state_merge(&app, &key, &patch))
+        .await
+        .map_err(|error| format!("App state merge worker failed: {error}"))?
+}
+
 #[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -3892,10 +4065,23 @@ pub fn run() {
             cloud_mcp_register_sync_status_app(app.handle());
             cloud_mcp_start_local_device_bridge();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+            let cloud_mcp_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Restore the persisted desktop session before the first
+                // connect so cloud auth comes up without waiting for the
+                // webview (background-capable startup).
+                let _ = cloud_mcp_restore_persisted_desktop_session(
+                    &cloud_mcp_app,
+                    &cloud_mcp_state,
+                )
+                .await;
                 let _ = cloud_mcp_connect_state(&cloud_mcp_state).await;
             });
             cloud_mcp_start_tokenomics_scheduler(
+                app.handle().clone(),
+                app.state::<CloudMcpState>().inner().clone(),
+            );
+            cloud_mcp_start_architecture_headless_watcher(
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
@@ -3961,6 +4147,9 @@ pub fn run() {
             record_desktop_connection_diagnostic,
             local_workspaces_load,
             local_workspaces_store,
+            app_local_state_load,
+            app_local_state_store,
+            app_local_state_merge_command,
             agent_statuses,
             start_agent_login,
             disconnect_agent,

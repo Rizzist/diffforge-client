@@ -5220,14 +5220,22 @@ function readWorkspaceSettings() {
 }
 
 function persistWorkspaceSettings(settings) {
+  const normalized = normalizeWorkspaceSettings(settings);
   try {
     window.localStorage.setItem(
       WORKSPACE_SETTINGS_STORAGE_KEY,
-      JSON.stringify(normalizeWorkspaceSettings(settings)),
+      JSON.stringify(normalized),
     );
   } catch {
     // Workspace root settings are convenience state; the app can still run without persistence.
   }
+  // Write-through to the Rust app-state store so headless flows (background
+  // architecture watcher, remote workspace levers) can read workspace roots
+  // and terminal layouts without the webview.
+  void invoke("app_local_state_store", {
+    key: "workspace-settings",
+    value: normalized,
+  }).catch(() => {});
 }
 
 function normalizeEnabledWorkspaceIds(value) {
@@ -5278,8 +5286,8 @@ function readWorkspaceLifecycleSettings() {
 }
 
 function persistWorkspaceLifecycleSettings(settings) {
+  const normalizedSettings = normalizeWorkspaceLifecycleSettings(settings);
   try {
-    const normalizedSettings = normalizeWorkspaceLifecycleSettings(settings);
     window.localStorage.setItem(
       WORKSPACE_LIFECYCLE_STORAGE_KEY,
       JSON.stringify({
@@ -5290,6 +5298,13 @@ function persistWorkspaceLifecycleSettings(settings) {
   } catch {
     // Runtime activation is session-only; only the explicit startup default is persisted.
   }
+  void invoke("app_local_state_store", {
+    key: "workspace-lifecycle",
+    value: {
+      defaultWorkspaceId: normalizedSettings.defaultWorkspaceId,
+      enabledWorkspaceIds: [],
+    },
+  }).catch(() => {});
 }
 
 function readWorkspaceRailCollapsed() {
@@ -12973,6 +12988,37 @@ export default function App() {
       }
     };
   }, [revalidateOfflineSessionQuietly]);
+
+  useEffect(() => {
+    // Remote workspace activation that arrived while the window was closed:
+    // the Rust remote-command listener records the intent headless; the next
+    // foreground session consumes it here (terminal launch needs the webview).
+    if (authState !== "authenticated" || workspaceState !== "ready") {
+      return undefined;
+    }
+    let cancelled = false;
+    invoke("app_local_state_load", { key: "remote-intents" }).then((intents) => {
+      if (cancelled) {
+        return;
+      }
+      const pendingWorkspaceId = String(intents?.pendingActivationWorkspaceId || "").trim();
+      if (!pendingWorkspaceId) {
+        return;
+      }
+      void invoke("app_local_state_merge_command", {
+        key: "remote-intents",
+        patch: {
+          pendingActivationWorkspaceId: null,
+          pendingActivationReason: null,
+          pendingActivationAtMs: null,
+        },
+      }).catch(() => {});
+      activateWorkspace(pendingWorkspaceId, "remote_control_resume");
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activateWorkspace, authState, workspaceState]);
 
   useEffect(() => {
     const connection = cloudSyncStatus?.connection || "";

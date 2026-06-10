@@ -4852,6 +4852,24 @@ async fn cloud_mcp_start_remote_command_listener(
                 // Drop workspaces whose catalog delete is still queued in the
                 // outbox so a stale broadcast cannot resurrect them in the UI.
                 let filtered = cloud_mcp_filter_pending_catalog_deletes(event.clone());
+                // Headless down-sync: persist the merged catalog into the
+                // scope store so remote create/rename/delete land on this
+                // device even while the window is closed.
+                if let Some(workspaces) = filtered.get("workspaces").and_then(Value::as_array) {
+                    let (scope_type, team_id) = cloud_mcp_process_account_scope();
+                    let scope_key = if scope_type == "team" {
+                        team_id
+                            .map(|team_id| format!("team:{team_id}"))
+                            .unwrap_or_else(|| "personal".to_string())
+                    } else {
+                        "personal".to_string()
+                    };
+                    let _ = local_workspace_catalog_apply_cloud_merge(
+                        &app,
+                        &scope_key,
+                        workspaces,
+                    );
+                }
                 let _ = app.emit(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, filtered);
                 continue;
             }
@@ -4926,6 +4944,8 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             todo_dispatch_record_remote_intake(&app, &event);
+            todo_dispatch_apply_remote_delete(&app, &event);
+            cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")
@@ -4946,6 +4966,190 @@ async fn cloud_mcp_start_remote_command_listener(
         }
     });
     Ok(json!({"ok": true, "started": true}))
+}
+
+/// Headless actuation for remote workspace lifecycle levers. Only runs when
+/// no webview dispatcher is alive (the webview owns actuation when open):
+/// deactivate-if-idle tears the runtime down natively; activate is recorded
+/// as a pending intent the webview consumes on its next foreground launch
+/// (terminal/agent startup is inherently a foreground concern today).
+fn cloud_mcp_apply_remote_workspace_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) {
+    if todo_dispatch_webview_dispatcher_active() {
+        return;
+    }
+    let command_kind = cloud_mcp_payload_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_");
+    let workspace_id = cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"])
+        .unwrap_or_default();
+    if workspace_id.is_empty() {
+        return;
+    }
+    match command_kind.as_str() {
+        "workspace_activate" | "activate_workspace" => {
+            let _ = app_local_state_merge(
+                app,
+                "remote-intents",
+                &json!({
+                    "pendingActivationWorkspaceId": workspace_id,
+                    "pendingActivationReason": "remote_control_headless",
+                    "pendingActivationAtMs": cloud_mcp_now_ms(),
+                }),
+            );
+            let state = state.clone();
+            let event = event.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "queued",
+                    "Workspace activation queued; it completes when the desktop window next opens.",
+                    None,
+                )
+                .await;
+            });
+        }
+        "workspace_deactivate_if_idle" | "deactivate_workspace_if_idle"
+        | "workspace_deactivate" => {
+            let busy = todo_dispatch_workspace_has_busy_terminals(&workspace_id);
+            let app = app.clone();
+            let state = state.clone();
+            let event = event.clone();
+            tauri::async_runtime::spawn(async move {
+                if busy {
+                    let _ = cloud_mcp_send_remote_command_status_event(
+                        &state,
+                        &event,
+                        "blocked",
+                        "Workspace still has busy terminals, so it was not deactivated.",
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+                let result = deactivate_workspace_runtime(
+                    app,
+                    None,
+                    Some("remote_control_headless".to_string()),
+                    Some(workspace_id.clone()),
+                )
+                .await;
+                let (status, message) = match result {
+                    Ok(_) => (
+                        "completed",
+                        "Workspace deactivated headless from the web dashboard.",
+                    ),
+                    Err(_) => (
+                        "failed",
+                        "Workspace runtime could not be deactivated headless.",
+                    ),
+                };
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state, &event, status, message, None,
+                )
+                .await;
+            });
+        }
+        _ => {}
+    }
+}
+
+/// Headless architecture sync: while no webview dispatcher is alive, scan the
+/// known workspace roots for `.agents/architectures/graphs/*.arch` changes
+/// (signature over the listed graphs) and push snapshots through the durable
+/// outbox. The webview owns the same detection when it is open.
+pub(crate) fn cloud_mcp_start_architecture_headless_watcher(app: AppHandle, state: CloudMcpState) {
+    tauri::async_runtime::spawn(async move {
+        let mut signatures: HashMap<String, String> = HashMap::new();
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+                continue;
+            }
+            if todo_dispatch_webview_dispatcher_active() {
+                continue;
+            }
+            // Candidate roots: live registered workspaces first, then the
+            // Rust settings store (covers process restarts straight into
+            // background mode, before any workspace registration).
+            let mut candidates: HashMap<String, (String, String)> = HashMap::new();
+            {
+                let runtime = state.inner.lock().await;
+                for workspace in runtime.registered_workspaces.values() {
+                    if workspace.workspace_id.trim().is_empty() || workspace.root.trim().is_empty()
+                    {
+                        continue;
+                    }
+                    candidates.insert(
+                        workspace.workspace_id.clone(),
+                        (workspace.workspace_name.clone(), workspace.root.clone()),
+                    );
+                }
+            }
+            let settings = app_local_state_read(&app, "workspace-settings");
+            if let Some(entries) = settings.as_object() {
+                for (workspace_id, entry) in entries {
+                    if candidates.contains_key(workspace_id) {
+                        continue;
+                    }
+                    let root = entry
+                        .get("rootDirectory")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if workspace_id.trim().is_empty() || root.is_empty() {
+                        continue;
+                    }
+                    candidates.insert(
+                        workspace_id.clone(),
+                        (String::new(), root.to_string()),
+                    );
+                }
+            }
+            for (workspace_id, (workspace_name, root)) in candidates {
+                if !Path::new(&root).is_dir() {
+                    continue;
+                }
+                let list_root = root.clone();
+                let Ok(Ok(list)) = tauri::async_runtime::spawn_blocking(move || {
+                    architecture_graphs_list_value(list_root)
+                })
+                .await
+                else {
+                    continue;
+                };
+                let graphs = list.get("graphs").cloned().unwrap_or(Value::Null);
+                let graph_count = graphs.as_array().map(Vec::len).unwrap_or(0);
+                if graph_count == 0 {
+                    continue;
+                }
+                let signature = format!("{:x}", Sha256::digest(graphs.to_string().as_bytes()));
+                if signatures.get(&workspace_id) == Some(&signature) {
+                    continue;
+                }
+                signatures.insert(workspace_id.clone(), signature);
+                let _ = cloud_mcp_sync_workspace_architectures_internal(
+                    &state,
+                    root,
+                    workspace_id,
+                    (!workspace_name.is_empty()).then_some(workspace_name),
+                    graphs,
+                    Some("architecture_headless_watcher".to_string()),
+                    None,
+                    None,
+                )
+                .await;
+            }
+        }
+    });
 }
 
 fn cloud_mcp_is_tokenomics_state_event(event_kind: &str) -> bool {
@@ -11694,8 +11898,99 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
     Ok(result)
 }
 
+const CLOUD_MCP_SESSION_STATE_KEY: &str = "desktop-session";
+
+/// Persist the desktop session in Rust app-data so cloud auth restores
+/// process-side on the next launch without waiting for the webview (and so a
+/// background process can re-establish the websocket on its own). Security
+/// posture matches the webview's localStorage copy: plaintext on the user's
+/// own disk, but the file is chmod 0600 on unix.
+fn cloud_mcp_persist_desktop_session(
+    app: &AppHandle,
+    token: Option<&str>,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    plan_name: &str,
+    device_limit: Option<u64>,
+) {
+    let value = match token {
+        Some(token) => json!({
+            "token": token,
+            "billingScopeType": billing_scope_type,
+            "teamId": team_id,
+            "planName": plan_name,
+            "deviceLimit": device_limit,
+            "savedAtMs": cloud_mcp_now_ms(),
+        }),
+        None => json!(null),
+    };
+    let _ = app_local_state_write(app, CLOUD_MCP_SESSION_STATE_KEY, &value);
+    #[cfg(unix)]
+    if token.is_some() {
+        if let Ok(path) = app_local_state_path(app, CLOUD_MCP_SESSION_STATE_KEY) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// Startup restore of the persisted desktop session into the cloud auth
+/// runtime, before any webview exists. The webview's own session validation
+/// still runs later and can replace or clear this.
+pub(crate) async fn cloud_mcp_restore_persisted_desktop_session(
+    app: &AppHandle,
+    state: &CloudMcpState,
+) -> bool {
+    let stored = app_local_state_read(app, CLOUD_MCP_SESSION_STATE_KEY);
+    let Some(token) = stored
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if validate_auth_value("Desktop session", &token).is_err() {
+        return false;
+    }
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope_from_values(
+        stored
+            .get("billingScopeType")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stored.get("teamId").and_then(Value::as_str).map(str::to_string),
+    );
+    let plan_name = cloud_mcp_plan_name_from_value(
+        stored.get("planName").and_then(Value::as_str).map(str::to_string),
+    );
+    let device_limit =
+        cloud_mcp_device_limit_from_value(stored.get("deviceLimit").and_then(Value::as_u64), &plan_name);
+    {
+        let mut auth = state.auth.lock().await;
+        auth.desktop_session_token = Some(token.clone());
+        auth.appwrite_jwt = None;
+        auth.appwrite_jwt_expires_ms = None;
+        auth.billing_scope_type = billing_scope_type.clone();
+        auth.team_id = team_id.clone();
+        auth.plan_name = plan_name.clone();
+        auth.device_limit = device_limit;
+    }
+    cloud_mcp_update_process_auth_cache(
+        Some(token),
+        None,
+        None,
+        Some(billing_scope_type),
+        team_id,
+        Some(plan_name),
+        device_limit,
+    );
+    true
+}
+
 #[tauri::command]
 async fn cloud_mcp_set_desktop_session_token(
+    app: AppHandle,
     state: State<'_, CloudMcpState>,
     token: Option<String>,
     scope_type: Option<String>,
@@ -11717,6 +12012,14 @@ async fn cloud_mcp_set_desktop_session_token(
     let (billing_scope_type, team_id) = cloud_mcp_account_scope_from_values(scope_type, team_id);
     let plan_name = cloud_mcp_plan_name_from_value(plan_name);
     let device_limit = cloud_mcp_device_limit_from_value(device_limit, &plan_name);
+    cloud_mcp_persist_desktop_session(
+        &app,
+        desktop_session_token.as_deref(),
+        &billing_scope_type,
+        team_id.as_deref(),
+        &plan_name,
+        device_limit,
+    );
 
     {
         let mut auth = state.auth.lock().await;
@@ -14523,6 +14826,32 @@ async fn cloud_mcp_sync_workspace_architectures(
     scope_repo_id: Option<String>,
     scope_git_repo_identity_id: Option<String>,
 ) -> Result<Value, String> {
+    cloud_mcp_sync_workspace_architectures_internal(
+        state.inner(),
+        repo_path,
+        workspace_id,
+        workspace_name,
+        graphs,
+        reason,
+        scope_repo_id,
+        scope_git_repo_identity_id,
+    )
+    .await
+}
+
+/// Internal architecture-snapshot push so the headless watcher can converge
+/// the cloud without a tauri command context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn cloud_mcp_sync_workspace_architectures_internal(
+    state: &CloudMcpState,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    graphs: Value,
+    reason: Option<String>,
+    scope_repo_id: Option<String>,
+    scope_git_repo_identity_id: Option<String>,
+) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(
         repo_path,
         Some(workspace_id.clone()),
@@ -14553,7 +14882,7 @@ async fn cloud_mcp_sync_workspace_architectures(
         object.insert("content_transport".to_string(), json!("refs"));
         object.insert("contentTransport".to_string(), json!("refs"));
     }
-    cloud_mcp_post_event_endpoint(state.inner(), "workspace_architecture_snapshot", &payload).await
+    cloud_mcp_post_event_endpoint(state, "workspace_architecture_snapshot", &payload).await
 }
 
 #[tauri::command]
@@ -16443,6 +16772,28 @@ async fn cloud_mcp_sync_workspace_todos(
     todos: Value,
     reason: Option<String>,
 ) -> Result<Value, String> {
+    cloud_mcp_sync_workspace_todos_internal(
+        state.inner(),
+        repo_path,
+        workspace_id,
+        workspace_name,
+        todos,
+        reason,
+    )
+    .await
+}
+
+/// Internal todo-snapshot push, callable without a tauri command context so
+/// headless flows (Rust remote-command actuation, background dispatcher) can
+/// converge the cloud after mutating the Rust queue store.
+pub(crate) async fn cloud_mcp_sync_workspace_todos_internal(
+    state: &CloudMcpState,
+    repo_path: String,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    todos: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
     let workspace_id = workspace_id.trim().to_string();
     if workspace_id.is_empty() {
         return Err("Workspace todo sync requires workspace_id.".to_string());
@@ -16513,7 +16864,7 @@ async fn cloud_mcp_sync_workspace_todos(
         }),
     );
     let result =
-        cloud_mcp_post_event_endpoint(state.inner(), "workspace_todo_snapshot", &payload).await;
+        cloud_mcp_post_event_endpoint(state, "workspace_todo_snapshot", &payload).await;
     match &result {
         Ok(value) => log_terminal_status_event(
             "backend.workspace_todos.sync_result",
