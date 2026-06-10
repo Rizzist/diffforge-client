@@ -368,6 +368,7 @@ import {
   FileFolderTreeIcon,
   FileDocumentIcon
 } from "../app/appStyles";
+import { playNotificationSfx } from "../notifications/notificationSfx";
 
 export const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT = "forge-audio-model-download-progress";
 export const AUDIO_WIDGET_HASH = "#/audio-widget";
@@ -2310,6 +2311,7 @@ export function AudioWidgetWindow() {
       setElapsedMs(0);
       widgetStateRef.current = "recording";
       setWidgetState("recording");
+      playNotificationSfx("voice.on");
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD ? "Deepgram listening" : "Recording");
 
       if (stopAfterStartRef.current || !pushToTalkDownRef.current) {
@@ -2609,6 +2611,7 @@ export function AudioWidgetWindow() {
     stopAfterStartRef.current = false;
     widgetStateRef.current = "transcribing";
     setWidgetState("transcribing");
+    playNotificationSfx("voice.off");
     setMessage("Preparing audio");
     setError("");
 

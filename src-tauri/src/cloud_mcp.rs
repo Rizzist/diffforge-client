@@ -27,6 +27,7 @@ const CLOUD_MCP_CREDIT_WALLET_EVENT: &str = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT: &str = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_TASK_HISTORY_UPDATED_EVENT: &str = "cloud-mcp-task-history-updated";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT: &str = "cloud-mcp-workspace-todos-updated";
+const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT: &str = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_WORKSPACE_ARCHITECTURES_UPDATED_EVENT: &str =
     "cloud-mcp-workspace-architectures-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT: &str = "cloud-mcp-workspace-assets-updated";
@@ -4626,6 +4627,10 @@ async fn cloud_mcp_start_remote_command_listener(
                 }
                 continue;
             }
+            if event_kind == "workspace_catalog_changed" {
+                let _ = app.emit(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, event.clone());
+                continue;
+            }
             if cloud_mcp_is_tokenomics_state_event(&event_kind) {
                 if let Err(error) = tokenomics_record_cloud_account_state(&app, &event) {
                     eprintln!("Unable to cache cloud Tokenomics state: {error}");
@@ -5019,6 +5024,46 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             ],
         )
         .unwrap_or(workspace_index as u64);
+        // Last-known terminal identity (names/colors/agents) rides with the
+        // catalog so every device and the web dashboard can render terminals
+        // even while this device is offline.
+        let last_known_terminals = workspace
+            .get("terminals")
+            .or_else(|| workspace.get("terminal_identities"))
+            .or_else(|| workspace.get("terminalIdentities"))
+            .and_then(Value::as_array)
+            .map(|terminals| {
+                terminals
+                    .iter()
+                    .take(32)
+                    .map(|terminal| {
+                        json!({
+                            "agent_kind": cloud_mcp_payload_text(terminal, &["agent_kind", "agentKind", "agent_id", "agentId"]),
+                            "agent_label": cloud_mcp_payload_text(terminal, &["agent_label", "agentLabel", "label"]),
+                            "color": cloud_mcp_payload_text(terminal, &["color", "accent", "accentColor"]),
+                            "color_slot": terminal
+                                .get("color_slot")
+                                .or_else(|| terminal.get("colorSlot"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "terminal_index": terminal
+                                .get("terminal_index")
+                                .or_else(|| terminal.get("terminalIndex"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "terminal_name": cloud_mcp_payload_text(
+                                terminal,
+                                &["terminal_name", "terminalName", "display_name", "displayName"],
+                            ),
+                            "display_name": cloud_mcp_payload_text(
+                                terminal,
+                                &["terminal_name", "terminalName", "display_name", "displayName"],
+                            ),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut workspace_value = json!({
             "device": device_profile.clone(),
             "device_id": device_profile["device_id"].clone(),
@@ -5048,6 +5093,8 @@ fn cloud_mcp_normalize_workspace_catalog_items(
             "workspaceIndex": workspace_order,
             "terminal_count": terminal_count,
             "mcp_server_count": mcp_server_count,
+            "terminals": last_known_terminals.clone(),
+            "last_known_terminals": last_known_terminals,
         });
         if !repo_path.trim().is_empty() {
             let root = Path::new(&repo_path);
@@ -6893,86 +6940,6 @@ fn cloud_mcp_modified_ms(metadata: &fs::Metadata) -> Option<u64> {
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
-fn cloud_mcp_reference_scan_candidate(path: &Path, size: Option<u64>) -> bool {
-    if size.is_some_and(|size| size > 256 * 1024) {
-        return false;
-    }
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "css" | "html" | "js" | "jsx" | "mjs" | "ts" | "tsx" | "vue" | "svelte"
-    )
-}
-
-fn cloud_mcp_extract_quoted_references(line: &str, needles: &[&str], output: &mut Vec<String>) {
-    let lower = line.to_ascii_lowercase();
-    if !needles.iter().any(|needle| lower.contains(needle)) {
-        return;
-    }
-    let bytes = line.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let quote = bytes[index];
-        if quote != b'"' && quote != b'\'' {
-            index += 1;
-            continue;
-        }
-        let start = index + 1;
-        let mut end = start;
-        while end < bytes.len() && bytes[end] != quote {
-            end += 1;
-        }
-        if end <= bytes.len() {
-            if let Some(value) = line.get(start..end) {
-                let value = value.trim();
-                if cloud_mcp_reference_looks_local(value) {
-                    output.push(value.to_string());
-                }
-            }
-        }
-        index = end.saturating_add(1);
-    }
-}
-
-fn cloud_mcp_reference_looks_local(value: &str) -> bool {
-    !value.is_empty()
-        && !value.starts_with('#')
-        && !value.starts_with("http://")
-        && !value.starts_with("https://")
-        && !value.starts_with("mailto:")
-        && !value.starts_with("data:")
-        && !value.starts_with("javascript:")
-}
-
-fn cloud_mcp_file_references(path: &Path, size: Option<u64>) -> Vec<String> {
-    if !cloud_mcp_reference_scan_candidate(path, size) {
-        return Vec::new();
-    }
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let mut references = Vec::new();
-    for line in text.lines().take(400) {
-        cloud_mcp_extract_quoted_references(
-            line,
-            &[
-                "import", "export", "require(", " from ", "src=", "href=", "@import", "url(",
-            ],
-            &mut references,
-        );
-        if references.len() >= 80 {
-            break;
-        }
-    }
-    references.sort();
-    references.dedup();
-    references
-}
-
 fn cloud_mcp_normalized_git_path(value: &[u8]) -> Option<String> {
     let path = String::from_utf8_lossy(value)
         .replace('\\', "/")
@@ -7346,7 +7313,10 @@ fn cloud_mcp_collect_git_visible_filetree(root: &Path) -> Option<(Vec<CloudMcpFi
             kind: "file".to_string(),
             size,
             modified_ms: cloud_mcp_modified_ms(&metadata),
-            references: cloud_mcp_file_references(&path, size),
+            // Reference extraction used to read every source file here; the
+            // data never left the process (filetree sync is disabled), so the
+            // scan stays metadata-only.
+            references: Vec::new(),
         });
     }
 
@@ -7432,7 +7402,7 @@ fn cloud_mcp_collect_filetree(root: &Path) -> (Vec<CloudMcpFileEntry>, bool) {
                     modified_ms: metadata
                         .as_ref()
                         .and_then(|metadata| cloud_mcp_modified_ms(metadata)),
-                    references: cloud_mcp_file_references(&path, size),
+                    references: Vec::new(),
                 });
             }
         }
@@ -7843,6 +7813,9 @@ fn cloud_mcp_ws_kind_for_endpoint(endpoint: &str) -> Option<&'static str> {
         "/v1/tokenomics/reset-device" => Some("tokenomics_reset_device_cloud"),
         "/v1/cloud/server-reset" => Some("server_reset_cloud_state"),
         "/v1/cloud/repo-catalog" => Some("account_repo_catalog"),
+        "/v1/tools/account" => Some("account_tools_get"),
+        "/v1/tools/skills" => Some("account_tools_set_skills"),
+        "/v1/tools/cli-snapshot" => Some("account_tools_cli_snapshot"),
         "/v1/cloud/sqlite/hard-reset" => Some("hard_reset_cloud_sqlite"),
         _ => None,
     }
@@ -11630,6 +11603,56 @@ async fn cloud_mcp_register_workspace(
         .await
 }
 
+/// Authoritative workspace create/rename ack from cloud-diffforge. Workspaces
+/// are first-class objects under a device in the cloud catalog; the UI commits
+/// locally first and calls this in the background.
+#[tauri::command]
+async fn cloud_mcp_workspace_catalog_upsert(
+    state: State<'_, CloudMcpState>,
+    workspace: Value,
+) -> Result<Value, String> {
+    let mut workspace = workspace.as_object().cloned().unwrap_or_default();
+    if !workspace.contains_key("origin_device_id") && !workspace.contains_key("originDeviceId") {
+        let device_profile = cloud_mcp_desktop_device_profile();
+        if let Some(device_id) =
+            cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        {
+            workspace.insert("origin_device_id".to_string(), json!(device_id));
+        }
+    }
+    let payload = json!({ "workspace": Value::Object(workspace) });
+    let response =
+        cloud_mcp_ws_request(state.inner(), "workspace_catalog_upsert", &payload).await?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_workspace_catalog_delete(
+    state: State<'_, CloudMcpState>,
+    workspace_id: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let payload = json!({
+        "workspace_id": workspace_id,
+        "reason": reason
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "workspace_deleted".to_string()),
+    });
+    let response =
+        cloud_mcp_ws_request(state.inner(), "workspace_catalog_delete", &payload).await?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_workspace_catalog_list(
+    state: State<'_, CloudMcpState>,
+) -> Result<Value, String> {
+    let response =
+        cloud_mcp_ws_request(state.inner(), "workspace_catalog_list", &json!({})).await?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
 #[tauri::command]
 async fn cloud_mcp_sync_workspace(
     state: State<'_, CloudMcpState>,
@@ -13598,6 +13621,111 @@ async fn cloud_mcp_account_repo_catalog(
     });
     let response =
         cloud_mcp_post_json_endpoint(state.inner(), "/v1/cloud/repo-catalog", &payload).await?;
+    Ok(cloud_mcp_response_data(&response))
+}
+
+fn cloud_mcp_account_skills_cache_path() -> Option<PathBuf> {
+    cloud_mcp_local_data_file_path("account-skills.md")
+}
+
+fn cloud_mcp_cache_account_skills(skills_md: &str) {
+    if let Some(path) = cloud_mcp_account_skills_cache_path() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(path, skills_md);
+    }
+}
+
+fn cloud_mcp_cached_account_skills() -> String {
+    cloud_mcp_account_skills_cache_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default()
+}
+
+fn cloud_mcp_tools_base_payload(source: &str) -> Value {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    json!({
+        "source": source,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "ts_ms": cloud_mcp_now_ms(),
+    })
+}
+
+#[tauri::command]
+async fn cloud_mcp_get_account_tools(state: State<'_, CloudMcpState>) -> Result<Value, String> {
+    let payload = cloud_mcp_tools_base_payload("rust-diffforge-account-tools");
+    match cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/account", &payload).await {
+        Ok(response) => {
+            let data = cloud_mcp_response_data(&response);
+            if let Some(skills_md) = data
+                .get("skills")
+                .and_then(|skills| skills.get("skills_md").or_else(|| skills.get("skillsMd")))
+                .and_then(Value::as_str)
+            {
+                cloud_mcp_cache_account_skills(skills_md);
+            }
+            Ok(data)
+        }
+        Err(error) => {
+            // Offline fallback: keep the tools view usable with cached skills.
+            let cached = cloud_mcp_cached_account_skills();
+            Ok(json!({
+                "kind": "account_tools",
+                "offline": true,
+                "error": error,
+                "skills": {
+                    "skills_md": cached.clone(),
+                    "skillsMd": cached,
+                    "revision": Value::Null,
+                },
+                "clis": [],
+                "workspace_mcps": [],
+                "workspaceMcps": [],
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+async fn cloud_mcp_save_account_skills(
+    state: State<'_, CloudMcpState>,
+    skills_md: String,
+    base_revision: Option<i64>,
+) -> Result<Value, String> {
+    let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-account-skills");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("skills_md".to_string(), json!(skills_md.clone()));
+        object.insert("skillsMd".to_string(), json!(skills_md.clone()));
+        if let Some(base_revision) = base_revision {
+            object.insert("base_revision".to_string(), json!(base_revision));
+            object.insert("baseRevision".to_string(), json!(base_revision));
+        }
+    }
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/skills", &payload).await?;
+    cloud_mcp_cache_account_skills(&skills_md);
+    Ok(cloud_mcp_response_data(&response))
+}
+
+#[tauri::command]
+async fn cloud_mcp_report_cli_snapshot(
+    state: State<'_, CloudMcpState>,
+    clis: Value,
+) -> Result<Value, String> {
+    let mut payload = cloud_mcp_tools_base_payload("rust-diffforge-cli-snapshot");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("clis".to_string(), clis);
+    }
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/tools/cli-snapshot", &payload).await?;
     Ok(cloud_mcp_response_data(&response))
 }
 

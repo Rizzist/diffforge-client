@@ -4726,6 +4726,75 @@ fn update_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
     run_agent_npm_install(provider, true)
 }
 
+fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
+    let definition = agent_definition(provider);
+
+    if npm_version().is_none() {
+        return AgentInstallResult {
+            provider: definition.id,
+            label: definition.label,
+            installed: false,
+            updated: false,
+            permission_denied: false,
+            command: definition.install_command,
+            native_install_url: definition.native_install_url,
+            message: format!(
+                "npm was not found on PATH, so the {} npm package cannot be removed.",
+                definition.label
+            ),
+        };
+    }
+
+    let uninstall = run_command_capture(
+        npm_binary(),
+        &["uninstall", "-g", definition.install_package],
+        None,
+        Duration::from_secs(AGENT_INSTALL_TIMEOUT_SECS),
+        None,
+    );
+
+    match uninstall {
+        Ok(capture) if capture.exit_code == Some(0) => AgentInstallResult {
+            provider: definition.id,
+            label: definition.label,
+            installed: false,
+            updated: false,
+            permission_denied: false,
+            command: definition.install_command,
+            native_install_url: definition.native_install_url,
+            message: format!("{} npm package was uninstalled.", definition.label),
+        },
+        Ok(capture) => {
+            let stderr = capture.stderr.trim().to_string();
+            let permission_denied = stderr.contains("EACCES") || stderr.contains("permission");
+            AgentInstallResult {
+                provider: definition.id,
+                label: definition.label,
+                installed: true,
+                updated: false,
+                permission_denied,
+                command: definition.install_command,
+                native_install_url: definition.native_install_url,
+                message: if stderr.is_empty() {
+                    format!("npm could not uninstall {}.", definition.label)
+                } else {
+                    format!("npm could not uninstall {}: {stderr}", definition.label)
+                },
+            }
+        }
+        Err(error) => AgentInstallResult {
+            provider: definition.id,
+            label: definition.label,
+            installed: true,
+            updated: false,
+            permission_denied: false,
+            command: definition.install_command,
+            native_install_url: definition.native_install_url,
+            message: format!("npm uninstall failed: {error}"),
+        },
+    }
+}
+
 fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInstallResult {
     let definition = agent_definition(provider);
 

@@ -12,6 +12,7 @@ import { terminalActivityStatusIsBusy } from "../terminals/terminalActivityState
 import { logBigViewSyncDiagnosticEvent } from "./bigViewSyncDiagnostics";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
+  getWorkspaceThreadAgentLabel,
   getWorkspaceThreadCanArchive,
   getWorkspaceThreadCanPin,
   getWorkspaceThreadIsPinned,
@@ -97,6 +98,9 @@ const OverlayRoot = styled.div`
   --thread-rail-bg: #101820;
   --thread-rail-image: url("/textures/thread-rail-carbon-fiber.png");
   --thread-rail-image-size: 64px 64px;
+  --thread-rail-sheen: rgba(255, 255, 255, 0.045);
+  --thread-rail-tint: rgba(6, 10, 16, 0.28);
+  --thread-rail-edge: rgba(0, 0, 0, 0.5);
   --thread-rail-fg: #e9e9e9;
   --thread-rail-fg-soft: rgba(233, 233, 233, 0.72);
   --thread-rail-icon: rgba(233, 233, 233, 0.78);
@@ -142,6 +146,9 @@ const OverlayRoot = styled.div`
     --thread-red: #b42318;
     --thread-rail-bg: #f1ead2;
     --thread-rail-image: url("/textures/thread-rail-carbon-fiber-light.png");
+    --thread-rail-sheen: rgba(255, 255, 255, 0.55);
+    --thread-rail-tint: rgba(255, 251, 240, 0.4);
+    --thread-rail-edge: rgba(88, 66, 22, 0.16);
     --thread-rail-fg: rgba(45, 38, 24, 0.9);
     --thread-rail-fg-soft: rgba(68, 55, 28, 0.66);
     --thread-rail-icon: rgba(62, 52, 35, 0.68);
@@ -167,7 +174,7 @@ const OverlayPanel = styled.section`
   display: grid;
   min-width: 0;
   min-height: 0;
-  --thread-rail-expanded-width: clamp(136px, calc(9vw + 28px), 220px);
+  --thread-rail-expanded-width: clamp(172px, calc(11vw + 40px), 256px);
   grid-template-columns: var(--thread-rail-expanded-width) minmax(0, 1fr);
   overflow: hidden;
   border: 0;
@@ -199,12 +206,15 @@ const ThreadRail = styled.aside`
   min-width: 0;
   min-height: 0;
   overflow: visible;
-  border-right: 0;
+  border-right: 1px solid var(--thread-border);
   background-color: var(--thread-rail-bg);
-  background-image: var(--thread-rail-image);
-  background-repeat: repeat;
-  background-size: var(--thread-rail-image-size);
-  box-shadow: none;
+  background-image:
+    linear-gradient(180deg, var(--thread-rail-sheen), transparent 150px),
+    linear-gradient(var(--thread-rail-tint), var(--thread-rail-tint)),
+    var(--thread-rail-image);
+  background-repeat: no-repeat, no-repeat, repeat;
+  background-size: 100% 100%, 100% 100%, var(--thread-rail-image-size);
+  box-shadow: inset -16px 0 26px -20px var(--thread-rail-edge);
 `;
 
 const DrawerToggle = styled.button`
@@ -290,6 +300,38 @@ const WorkspaceList = styled.div`
     border-radius: 999px;
     background: rgba(170, 170, 170, 0.16);
   }
+`;
+
+const RailHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 6px 2px;
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--thread-rail-fg);
+    font-size: 12px;
+    font-weight: 660;
+    letter-spacing: 0.02em;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const RailHeaderCount = styled.span`
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--thread-rail-muted);
+  background: var(--thread-rail-search-bg);
+  font-size: 10px;
+  font-weight: 620;
+  line-height: 1.6;
 `;
 
 const RailActionStack = styled.div`
@@ -457,11 +499,11 @@ const WorkspaceTopline = styled.div`
   min-width: 0;
   padding: 0 5px;
   color: var(--thread-rail-muted);
-  font-size: 11px;
-  font-weight: 460;
-  letter-spacing: 0;
+  font-size: 10px;
+  font-weight: 620;
+  letter-spacing: 0.07em;
   line-height: 1.2;
-  text-transform: none;
+  text-transform: uppercase;
 
   span {
     display: block;
@@ -496,10 +538,7 @@ const CollapsedRail = styled.div`
   overflow-x: hidden;
   overflow-y: auto;
   padding: 28px 8px 10px;
-  background-color: var(--thread-rail-bg);
-  background-image: var(--thread-rail-image);
-  background-repeat: repeat;
-  background-size: var(--thread-rail-image-size);
+  background: transparent;
 `;
 
 const CollapsedRailActionStack = styled.div`
@@ -619,11 +658,11 @@ const ThreadRow = styled.div`
   position: relative;
   display: grid;
   min-width: 0;
-  height: 27px;
+  min-height: 40px;
   grid-template-columns: minmax(0, 1fr) 15px;
   align-items: center;
   gap: 3px;
-  padding: 0 4px 0 7px;
+  padding: 4px 4px 4px 8px;
   border: 1px solid transparent;
   border-radius: 8px;
   color: var(--thread-rail-row-fg);
@@ -635,10 +674,28 @@ const ThreadRow = styled.div`
     border-color 130ms ease,
     color 130ms ease;
 
+  &::before {
+    content: "";
+    position: absolute;
+    top: 9px;
+    bottom: 9px;
+    left: 0;
+    width: 2px;
+    border-radius: 999px;
+    background: var(--thread-rail-fg);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 130ms ease;
+  }
+
   &[data-selected="true"] {
     border-color: transparent;
     color: var(--thread-fg);
     background: var(--thread-rail-row-selected);
+  }
+
+  &[data-selected="true"]::before {
+    opacity: 0.75;
   }
 
   &:hover {
@@ -655,7 +712,6 @@ const ThreadRow = styled.div`
 const ThreadSelectButton = styled.button`
   display: flex;
   min-width: 0;
-  height: 100%;
   align-items: center;
   justify-content: flex-start;
   padding: 0;
@@ -665,17 +721,6 @@ const ThreadSelectButton = styled.button`
   font: inherit;
   text-align: left;
 
-  strong {
-    min-width: 0;
-    overflow: hidden;
-    font-size: 11px;
-    font-weight: 480;
-    letter-spacing: 0;
-    line-height: 1.2;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
   &:focus-visible {
     outline: 2px solid rgba(255, 255, 255, 0.22);
     outline-offset: 2px;
@@ -683,11 +728,10 @@ const ThreadSelectButton = styled.button`
 `;
 
 const ThreadRowText = styled.span`
-  display: flex;
+  display: grid;
   min-width: 0;
-  height: 100%;
-  align-items: center;
-  gap: 5px;
+  flex: 1 1 auto;
+  gap: 2px;
   transition: padding-left 130ms ease;
 
   ${ThreadRow}[data-can-pin="true"]:hover &,
@@ -696,14 +740,42 @@ const ThreadRowText = styled.span`
   }
 `;
 
+const ThreadRowMeta = styled.span`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  color: var(--thread-rail-muted-soft);
+  font-size: 9.5px;
+  font-weight: 520;
+  letter-spacing: 0.02em;
+  line-height: 1.2;
+  white-space: nowrap;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  i {
+    flex: 0 0 auto;
+    font-style: normal;
+    opacity: 0.7;
+  }
+`;
+
 const ThreadRowTitle = styled.strong`
   position: relative;
   display: flex;
   min-width: 0;
-  height: 100%;
   flex: 1 1 auto;
   align-items: center;
   overflow: visible;
+  padding-bottom: 2px;
+  font-size: 11px;
+  font-weight: 540;
+  line-height: 1.25;
   text-overflow: clip;
   white-space: normal;
 
@@ -712,7 +784,7 @@ const ThreadRowTitle = styled.strong`
     content: "";
     position: absolute;
     left: 0;
-    bottom: 4px;
+    bottom: 0;
     height: 1px;
     border-radius: 999px;
     opacity: 0;
@@ -982,6 +1054,29 @@ function threadTimestampMs(value) {
 
 function maxThreadTimestampMs(values) {
   return values.reduce((latest, value) => Math.max(latest, threadTimestampMs(value)), 0);
+}
+
+function formatThreadRelativeTime(timestampMs) {
+  if (!timestampMs) {
+    return "";
+  }
+  const deltaMs = Date.now() - timestampMs;
+  if (deltaMs < 60_000) {
+    return "now";
+  }
+  const minutes = Math.floor(deltaMs / 60_000);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days < 7) {
+    return `${days}d`;
+  }
+  return new Date(timestampMs).toLocaleDateString(undefined, { day: "numeric", month: "short" });
 }
 
 function latestCollectionTimestampMs(values, keys) {
@@ -1729,6 +1824,12 @@ function WorkspaceThreadsOverlay({
             </CollapsedRail>
           ) : (
             <WorkspaceList>
+              <RailHeader>
+                <strong>Threads</strong>
+                <RailHeaderCount title={`${totalThreadCount} active threads`}>
+                  {totalThreadCount}
+                </RailHeaderCount>
+              </RailHeader>
               <RailActionStack aria-label="Thread actions">
                 <RailActionButton
                   data-active={newChatActive ? "true" : "false"}
@@ -1826,6 +1927,26 @@ function WorkspaceThreadsOverlay({
                                 <ThreadRowTitle data-working={isWorking ? "true" : "false"}>
                                   <ThreadRowTitleText>{label}</ThreadRowTitleText>
                                 </ThreadRowTitle>
+                                <ThreadRowMeta>
+                                  <span>{getWorkspaceThreadAgentLabel(thread)}</span>
+                                  {(() => {
+                                    const timeLabel = formatThreadRelativeTime(
+                                      getThreadSortFreshnessMs(thread, null, workspaceThreads?.[workspace.id]),
+                                    );
+                                    return timeLabel ? (
+                                      <>
+                                        <i aria-hidden="true">·</i>
+                                        <span>{timeLabel}</span>
+                                      </>
+                                    ) : null;
+                                  })()}
+                                  {isWorking ? (
+                                    <>
+                                      <i aria-hidden="true">·</i>
+                                      <span>working</span>
+                                    </>
+                                  ) : null}
+                                </ThreadRowMeta>
                               </ThreadRowText>
                             </ThreadSelectButton>
                             <ThreadStatusSlot>

@@ -77,6 +77,7 @@ import {
 import { getWorkspaceThreadProviderBinding } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
+import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
@@ -98,6 +99,8 @@ import {
   getTodoQueueComposerTargetAvailability,
 } from "./todoQueueComposerGate.js";
 import { selectTodoQueueDispatchCandidate } from "./todoQueueScheduler.js";
+import { playNotificationSfx } from "../notifications/notificationSfx";
+import { sendNativeNotification } from "../notifications/nativeNotifications";
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
@@ -234,6 +237,7 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
 };
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const VOICE_PLAN_SERVER_RESULT_EVENT = "diffforge-voice-plan-server-result";
@@ -2002,6 +2006,7 @@ const VOICE_PLAN_WAITING_STATUSES = new Set([
 ]);
 const WORKSPACE_TOOL_TABS = [
   { id: "orchestrator", label: "Orchestrator", compactLabel: "Orch" },
+  { id: "tools", label: "Tools" },
   { id: "plans", label: "Plans" },
   { id: "git", label: "Git" },
   { id: "tokenomics", label: "Tokenomics", compactLabel: "Tokens" },
@@ -10943,6 +10948,7 @@ function OrchestratorVoiceCanvasRing({
 const TodoQueuePanel = memo(function TodoQueuePanel({
   accountKey = "",
   activeDragItemId = "",
+  onAddToolTodo,
   billingStatus = null,
   connectedDevices = [],
   defaultWorkingDirectory = "",
@@ -12735,7 +12741,16 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
           workspace={workspace}
         />
       </WorkspaceToolSurface>
-      {activeWorkspaceTool === "git" ? (
+      {activeWorkspaceTool === "tools" ? (
+        <WorkspaceToolSurface data-tool="tools">
+          <WorkspaceToolsDragPanel
+            coordinationTargets={coordinationTargets}
+            onAddToolTodo={onAddToolTodo}
+            rootDirectory={rootDirectory}
+            workspaceId={workspace?.id || ""}
+          />
+        </WorkspaceToolSurface>
+      ) : activeWorkspaceTool === "git" ? (
         <WorkspaceToolSurface data-tool="git">
           <GitWorkspaceView
             onRefreshRepositories={onRefreshGitRepositories}
@@ -15765,6 +15780,19 @@ function TerminalView({
         syncTodoQueueItemsToCloud(nextItems, { reason: `${reason}_removed_from_local_queue` });
         return nextItems;
       });
+      const todoQueueDrained = Object.keys(nextPendingItems).length === 0
+        && todoQueueTerminalInFlightPromptsRef.current.size === 0;
+      if (todoQueueDrained) {
+        playNotificationSfx("todo.queue.drained");
+        sendNativeNotification({
+          body: completedItem?.text
+            ? `Finished: ${String(completedItem.text).slice(0, 160)}`
+            : "The last queued todo finished.",
+          title: terminalWorkspace?.name
+            ? `Diff Forge: all todos done in ${terminalWorkspace.name}`
+            : "Diff Forge: all todos done",
+        });
+      }
       setTodoQueueDispatchRevision((revision) => revision + 1);
       return;
     }
@@ -21204,6 +21232,38 @@ function TerminalView({
     todoQueueItems,
   ]);
 
+  const pendingToolQueueIdRef = useRef("");
+  const addWorkspaceToolTodo = useCallback((text, { send = false } = {}) => {
+    const cleanText = normalizeTodoQueueText(text);
+    if (!cleanText) {
+      return null;
+    }
+    const item = createTodoQueueItem(cleanText, {
+      deviceId: cloudDesktopDeviceId || "",
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    if (send) {
+      // Queue once the item lands in state; queueTodoQueueItem looks the item
+      // up from todoQueueItems, which has not committed yet at this point.
+      pendingToolQueueIdRef.current = item.id;
+    }
+    updateTodoQueueItems((currentItems) => currentItems.concat([item]), {
+      reason: "workspace_tools_drop",
+    });
+    return item;
+  }, [cloudDesktopDeviceId, terminalWorkspace?.id, updateTodoQueueItems]);
+
+  useEffect(() => {
+    const pendingId = pendingToolQueueIdRef.current;
+    if (!pendingId) {
+      return;
+    }
+    if (todoQueueItems.some((item) => item.id === pendingId)) {
+      pendingToolQueueIdRef.current = "";
+      queueTodoQueueItem(pendingId);
+    }
+  }, [queueTodoQueueItem, todoQueueItems]);
+
   const queueAllTodoQueueItems = useCallback(() => {
     const pendingItems = todoQueuePendingItemsRef.current || {};
     const queueableItems = todoQueueItems.filter((item) => {
@@ -21726,12 +21786,34 @@ function TerminalView({
       });
     };
 
+    const handleRemoteTodoDeleteEvent = (event) => {
+      const detail = event?.detail || {};
+      const eventWorkspaceId = String(detail.workspaceId || "").trim();
+      if (!terminalWorkspace?.id || eventWorkspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const todoId = String(detail.todoId || "").trim();
+      if (!todoId) {
+        return;
+      }
+      logTerminalStatus("frontend.todo_queue.remote_delete", {
+        commandId: detail.commandId || todoId,
+        itemId: todoId,
+        source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+        workspaceId: terminalWorkspace.id,
+      });
+      removeTodoQueueItem(todoId);
+    };
+
     window.addEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
+    window.addEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
     return () => {
       window.removeEventListener(REMOTE_TODO_QUEUE_EVENT, handleRemoteTodoQueueEvent);
+      window.removeEventListener(REMOTE_TODO_DELETE_EVENT, handleRemoteTodoDeleteEvent);
     };
   }, [
     recordTodoQueueRemoteCommandReceipt,
+    removeTodoQueueItem,
     resolveTodoQueueTerminalTargetByName,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
@@ -24306,6 +24388,7 @@ function TerminalView({
                           onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
                           onMinimizePane={minimizeTodoQueuePane}
                           onOpenWorkspaceSettings={onOpenWorkspaceSettings}
+                          onAddToolTodo={addWorkspaceToolTodo}
                           onQueueAllItems={queueAllTodoQueueItems}
                           onQueueItem={queueTodoQueueItem}
                           onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}

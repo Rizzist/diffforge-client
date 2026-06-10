@@ -55,6 +55,7 @@ import {
   threadLooksEffectivelyThinking,
 } from "./threadTerminalGroundTruth.js";
 import {
+  getWorkspaceThreadAgentLabel,
   getWorkspaceThreadHasSession,
   getWorkspaceThreadLabel,
   getWorkspaceThreadProviderBinding,
@@ -77,6 +78,10 @@ const DetailRoot = styled.main`
   min-width: 0;
   min-height: 0;
   grid-template-rows: minmax(0, 1fr) auto;
+
+  &[data-has-header="true"] {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
   --thread-bg: #141414;
   --thread-composer-bg: #2d2d2d;
   --thread-bg-soft: #1b1b1b;
@@ -187,6 +192,255 @@ const DetailRoot = styled.main`
     --thread-detail-small-font-size: 12px;
     --thread-detail-mini-font-size: 11px;
     --thread-composer-font-size: 13px;
+  }
+`;
+
+const DetailHeader = styled.header`
+  position: relative;
+  z-index: 3;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--thread-border);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent),
+    var(--thread-bg);
+
+  html[data-forge-theme="light"] & {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.6), transparent),
+      var(--thread-bg);
+  }
+
+  [data-density="compact"] & {
+    gap: 7px;
+    padding: 5px 12px;
+  }
+`;
+
+const HeaderStatusDot = styled.span`
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 99px;
+  background: #7a8493;
+
+  &[data-state="ready"] {
+    background: var(--thread-green);
+    box-shadow: 0 0 10px rgba(60, 203, 127, 0.35);
+  }
+
+  &[data-state="working"] {
+    background: #f2c24e;
+    box-shadow: 0 0 10px rgba(242, 194, 78, 0.4);
+    animation: ${thinkingPulse} 1400ms ease-in-out infinite;
+  }
+
+  &[data-state="error"] {
+    background: #ef6b6b;
+    box-shadow: 0 0 10px rgba(239, 107, 107, 0.4);
+  }
+`;
+
+const HeaderAgentName = styled.strong`
+  flex: 0 0 auto;
+  color: var(--thread-fg);
+  font-size: var(--thread-detail-font-size);
+  font-weight: 640;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  white-space: nowrap;
+`;
+
+const HeaderStateLabel = styled.span`
+  flex: 0 0 auto;
+  color: var(--thread-muted-soft);
+  font-size: var(--thread-detail-mini-font-size);
+  font-weight: 540;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-state="working"] {
+    color: #f2c24e;
+  }
+
+  &[data-state="error"] {
+    color: #ef6b6b;
+  }
+
+  html[data-forge-theme="light"] &[data-state="working"] {
+    color: #9a6700;
+  }
+
+  html[data-forge-theme="light"] &[data-state="error"] {
+    color: #b42318;
+  }
+`;
+
+const HeaderThreadTitle = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--thread-muted);
+  font-size: var(--thread-detail-small-font-size);
+  font-weight: 480;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  [data-density="compact"] & {
+    display: none;
+  }
+
+  @media (max-width: 860px) {
+    display: none;
+  }
+`;
+
+const HeaderDividerDot = styled.span`
+  flex: 0 0 auto;
+  width: 3px;
+  height: 3px;
+  border-radius: 99px;
+  background: var(--thread-muted-soft);
+  opacity: 0.6;
+
+  [data-density="compact"] & {
+    display: none;
+  }
+
+  @media (max-width: 860px) {
+    display: none;
+  }
+`;
+
+const HeaderSpacer = styled.span`
+  flex: 1 1 auto;
+  min-width: 8px;
+`;
+
+const HeaderStat = styled.span`
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--thread-border);
+  border-radius: 999px;
+  color: var(--thread-muted);
+  background: var(--thread-accent);
+  font-size: var(--thread-detail-mini-font-size);
+  font-weight: 560;
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+  white-space: nowrap;
+
+  &[data-tone="diff"] {
+    color: var(--thread-green);
+    border-color: rgba(60, 203, 127, 0.22);
+    background: rgba(60, 203, 127, 0.08);
+  }
+
+  [data-density="compact"] &[data-optional="true"] {
+    display: none;
+  }
+`;
+
+const HeaderChipButton = styled.button`
+  flex: 0 0 auto;
+  display: inline-flex;
+  min-width: 0;
+  max-width: 220px;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--thread-border);
+  border-radius: 999px;
+  color: var(--thread-muted);
+  background: transparent;
+  font: inherit;
+  font-size: var(--thread-detail-mini-font-size);
+  font-weight: 560;
+  letter-spacing: 0.01em;
+  line-height: 1.5;
+  cursor: pointer;
+  transition:
+    border-color 130ms ease,
+    color 130ms ease,
+    background 130ms ease;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 11px;
+    height: 11px;
+    flex: 0 0 auto;
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    border-color: var(--thread-border-strong);
+    background: var(--thread-accent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 1px;
+  }
+
+  &[data-copied="true"] {
+    color: var(--thread-green);
+    border-color: rgba(60, 203, 127, 0.3);
+  }
+
+  [data-density="compact"] & {
+    max-width: 150px;
+  }
+`;
+
+const HeaderIconButton = styled.button`
+  flex: 0 0 auto;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--thread-muted);
+  background: transparent;
+  cursor: pointer;
+  transition:
+    border-color 130ms ease,
+    color 130ms ease,
+    background 130ms ease;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    background: var(--thread-accent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 1px;
+  }
+
+  [data-density="compact"] & {
+    width: 22px;
+    height: 22px;
   }
 `;
 
@@ -1442,18 +1696,26 @@ const ComposerBox = styled.div`
   grid-template-rows: auto minmax(var(--thread-composer-input-min-height, 42px), auto) auto;
   position: relative;
   overflow: visible;
-  border: 1px solid transparent;
+  border: 1px solid var(--thread-border);
   border-radius: var(--thread-composer-box-radius, 22px);
   background: var(--thread-composer-bg);
-  box-shadow: none;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.18);
   transition:
     border-color 160ms ease,
     background 160ms ease,
     box-shadow 160ms ease;
 
   &:focus-within {
-    border-color: transparent;
-    box-shadow: none;
+    border-color: var(--thread-border-strong);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.24);
+  }
+
+  html[data-forge-theme="light"] & {
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.07);
+  }
+
+  html[data-forge-theme="light"] &:focus-within {
+    box-shadow: 0 8px 26px rgba(0, 0, 0, 0.1);
   }
 `;
 
@@ -5153,6 +5415,7 @@ function WorkspaceThreadDetail({
   const [diffSummaryExpandedByTurnId, setDiffSummaryExpandedByTurnId] = useState({});
   const [diffRefreshToken, setDiffRefreshToken] = useState(0);
   const [undoingDiffKey, setUndoingDiffKey] = useState("");
+  const [workspacePathCopied, setWorkspacePathCopied] = useState(false);
   const detailRootRef = useRef(null);
   const composerBoxRef = useRef(null);
   const composerInputRef = useRef(null);
@@ -5529,6 +5792,45 @@ function WorkspaceThreadDetail({
     : "";
   const todoDropOverlayUnsupported = Boolean(todoDropOverlayMessage);
   const detailDensity = density === "compact" ? "compact" : undefined;
+  const headerAgentLabel = getWorkspaceThreadAgentLabel(activeAgentId);
+  const headerTurnState = String(thread?.latestTurn?.state || "").toLowerCase();
+  const headerWorking = Boolean(latestActivity?.live) || headerTurnState === "running";
+  const headerState = headerWorking
+    ? "working"
+    : headerTurnState === "error"
+      ? "error"
+      : canSubmit
+        ? "ready"
+        : "offline";
+  const headerStateLabel = headerState === "working"
+    ? "Working"
+    : headerState === "error"
+      ? "Attention"
+      : headerState === "ready"
+        ? "Ready"
+        : "No session";
+  const headerModelLabel = String(currentTuiModel || "").trim();
+  const headerDiffSummary = visibleFinalDiffSummary || visibleLiveDiffSummary;
+  const headerDiffFileCount = Number(headerDiffSummary?.fileCount || 0);
+  const copyWorkspacePath = async () => {
+    const path = diffRepoPath || workspace?.rootDirectory || "";
+    if (!path) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(path);
+      setWorkspacePathCopied(true);
+      window.setTimeout(() => setWorkspacePathCopied(false), 1400);
+    } catch {
+      // Clipboard access is best effort.
+    }
+  };
+  const scrollTranscriptToLatest = () => {
+    const node = transcriptScrollRef.current;
+    if (node) {
+      node.scrollTo({ behavior: "smooth", top: node.scrollHeight });
+    }
+  };
 
   useEffect(() => {
     const workspaceId = workspace?.id || thread?.workspaceId || "";
@@ -6761,10 +7063,55 @@ function WorkspaceThreadDetail({
     <DetailRoot
       aria-label={getWorkspaceThreadLabel(thread)}
       data-density={detailDensity}
+      data-has-header="true"
       onClick={handleDetailRootClick}
       ref={detailRootRef}
       tabIndex={-1}
     >
+      <DetailHeader aria-label="Thread session details">
+        <HeaderStatusDot aria-hidden="true" data-state={headerState} />
+        <HeaderAgentName title={headerAgentLabel}>{headerAgentLabel}</HeaderAgentName>
+        <HeaderStateLabel data-state={headerState}>{headerStateLabel}</HeaderStateLabel>
+        <HeaderDividerDot aria-hidden="true" />
+        <HeaderThreadTitle title={getWorkspaceThreadLabel(thread)}>
+          {getWorkspaceThreadLabel(thread)}
+        </HeaderThreadTitle>
+        <HeaderSpacer aria-hidden="true" />
+        {headerModelLabel ? (
+          <HeaderStat data-optional="true" title={`Model: ${headerModelLabel}`}>
+            {headerModelLabel}
+          </HeaderStat>
+        ) : null}
+        {messages.length > 0 ? (
+          <HeaderStat data-optional="true" title={`${messages.length} messages in this thread`}>
+            {messages.length} msg
+          </HeaderStat>
+        ) : null}
+        {headerDiffFileCount > 0 ? (
+          <HeaderStat data-tone="diff" title={`${headerDiffFileCount} files changed this turn`}>
+            ±{headerDiffFileCount} files
+          </HeaderStat>
+        ) : null}
+        {(workspace?.name || diffRepoPath) ? (
+          <HeaderChipButton
+            data-copied={workspacePathCopied ? "true" : "false"}
+            onClick={copyWorkspacePath}
+            title={workspacePathCopied ? "Copied workspace path" : `Copy workspace path\n${diffRepoPath || workspace?.rootDirectory || ""}`}
+            type="button"
+          >
+            {workspacePathCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+            <span>{workspacePathCopied ? "Copied" : workspace?.name || "Workspace"}</span>
+          </HeaderChipButton>
+        ) : null}
+        <HeaderIconButton
+          aria-label="Jump to latest message"
+          onClick={scrollTranscriptToLatest}
+          title="Jump to latest"
+          type="button"
+        >
+          <ExpandMore aria-hidden="true" />
+        </HeaderIconButton>
+      </DetailHeader>
       <TranscriptScroll ref={transcriptScrollRef}>
         <TranscriptInner>
           {transcriptItems.map((item) => (

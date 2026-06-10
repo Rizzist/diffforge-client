@@ -1286,37 +1286,6 @@ struct DesktopSigninDiagnosticRequest<'a> {
     details: Value,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateWorkspaceRequest<'a> {
-    name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope_type: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    team_id: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateWorkspaceRequest<'a> {
-    workspace_id: &'a str,
-    name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope_type: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    team_id: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DeleteWorkspaceRequest<'a> {
-    workspace_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    scope_type: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    team_id: Option<&'a str>,
-}
-
 #[derive(Clone, Copy)]
 enum AgentProvider {
     Codex,
@@ -3340,6 +3309,87 @@ async fn delete_workspace_local_metadata(
     .map_err(|error| format!("Unable to delete workspace metadata: {error}"))?
 }
 
+fn local_workspace_scope_file_key(scope_key: &str) -> String {
+    let cleaned = scope_key
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        "personal".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBuf, String> {
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
+        .join("workspace-catalog");
+    fs::create_dir_all(&store_dir)
+        .map_err(|error| format!("Unable to create workspace catalog directory: {error}"))?;
+    Ok(store_dir.join(format!("{}.json", local_workspace_scope_file_key(scope_key))))
+}
+
+/// Workspaces are local-first: the UI commits to this store instantly and the
+/// cloud workspace catalog reconciles in the background.
+#[tauri::command]
+async fn local_workspaces_load(app: AppHandle, scope_key: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = local_workspace_store_path(&app, &scope_key)?;
+        if !path.exists() {
+            return Ok(json!({ "workspaces": [], "loaded": false }));
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
+        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+        let workspaces = value
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({ "workspaces": workspaces, "loaded": true }))
+    })
+    .await
+    .map_err(|error| format!("Unable to load local workspace catalog: {error}"))?
+}
+
+#[tauri::command]
+async fn local_workspaces_store(
+    app: AppHandle,
+    scope_key: String,
+    workspaces: Value,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = local_workspace_store_path(&app, &scope_key)?;
+        let items = workspaces.as_array().cloned().unwrap_or_default();
+        let payload = json!({
+            "version": 1,
+            "workspaces": items,
+        });
+        let serialized = serde_json::to_vec_pretty(&payload)
+            .map_err(|error| format!("Unable to serialize local workspace catalog: {error}"))?;
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, serialized)
+            .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
+        fs::rename(&temp_path, &path)
+            .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
+        Ok(json!({ "ok": true, "count": items.len() }))
+    })
+    .await
+    .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
+}
+
 #[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -3676,6 +3726,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             pty_pool.ensure_warm_async();
@@ -3722,15 +3773,16 @@ pub fn run() {
             logout_desktop_session,
             record_desktop_signin_diagnostic,
             record_desktop_connection_diagnostic,
-            list_workspaces,
-            create_workspace,
-            update_workspace,
-            delete_workspace,
+            local_workspaces_load,
+            local_workspaces_store,
             agent_statuses,
             start_agent_login,
             disconnect_agent,
             install_agent,
             update_agent,
+            uninstall_agent,
+            tools_check_cli_binaries,
+            tools_run_cli_action,
             list_developer_processes,
             terminal_activity_snapshot,
             kill_developer_process,
@@ -3847,9 +3899,15 @@ pub fn run() {
             cloud_mcp_hard_reset_cloud_sqlite,
             cloud_mcp_reset_server_state,
             cloud_mcp_account_repo_catalog,
+            cloud_mcp_get_account_tools,
+            cloud_mcp_save_account_skills,
+            cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
             cloud_mcp_sync_device_workspace_catalog,
+            cloud_mcp_workspace_catalog_upsert,
+            cloud_mcp_workspace_catalog_delete,
+            cloud_mcp_workspace_catalog_list,
             cloud_mcp_sync_device_workspace_snapshot,
             cloud_mcp_record_voice_plan_task_status,
             cloud_mcp_update_voice_plan_steps,
@@ -3876,6 +3934,8 @@ pub fn run() {
             diffforge_list_untracked_assets,
             diffforge_delete_untracked_asset,
             diffforge_rename_untracked_asset,
+            diffforge_save_untracked_data_url_asset,
+            diffforge_save_untracked_text_asset,
             diffforge_copy_asset_to_clipboard,
             diffforge_copy_image_data_url_to_clipboard,
             diffforge_untrack_workspace_asset,

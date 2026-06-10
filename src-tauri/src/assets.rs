@@ -3,6 +3,8 @@ const DIFFFORGE_UNTRACKED_ASSET_DIR: &str = "untracked";
 const DIFFFORGE_UNTRACKED_ASSET_MAX_ROWS: usize = 1000;
 const DIFFFORGE_UNTRACKED_ASSET_MAX_DEPTH: usize = 8;
 const DIFFFORGE_UNTRACKED_ASSET_WATCH_DEBOUNCE_MS: u64 = 180;
+const DIFFFORGE_UNTRACKED_TEXT_ASSET_MAX_BYTES: usize = 16 * 1024 * 1024;
+const DIFFFORGE_UNTRACKED_DATA_URL_ASSET_MAX_BYTES: usize = 96 * 1024 * 1024;
 
 static DIFFFORGE_UNTRACKED_ASSET_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 static DIFFFORGE_UNTRACKED_ASSET_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
@@ -109,6 +111,50 @@ fn diffforge_untracked_asset_name(path: &Path) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("asset")
         .to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffforgeSaveUntrackedTextAssetRequest {
+    group: Option<String>,
+    name: Option<String>,
+    overwrite: Option<bool>,
+    path: Option<String>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffforgeSaveUntrackedDataUrlAssetRequest {
+    data_url: String,
+    group: Option<String>,
+    name: Option<String>,
+}
+
+fn diffforge_untracked_asset_target(
+    root: &Path,
+    group: Option<&str>,
+    name: Option<&str>,
+    fallback_name: &str,
+) -> Result<PathBuf, String> {
+    let group = group
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| cloud_mcp_sanitize_asset_filename(value, "exports"))
+        .unwrap_or_else(|| "exports".to_string());
+    let target_dir = root.join(group);
+    fs::create_dir_all(&target_dir).map_err(|error| {
+        format!(
+            "Unable to create untracked asset directory {}: {error}",
+            target_dir.display()
+        )
+    })?;
+    let filename = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| cloud_mcp_sanitize_asset_filename(value, fallback_name))
+        .unwrap_or_else(|| fallback_name.to_string());
+    Ok(cloud_mcp_available_asset_download_path(&target_dir, &filename))
 }
 
 fn diffforge_untracked_asset_item(root: &Path, path: &Path) -> Result<Value, String> {
@@ -549,6 +595,149 @@ fn diffforge_rename_untracked_asset(
 fn diffforge_copy_asset_to_clipboard(path: String) -> Result<Value, String> {
     let file = diffforge_local_asset_file(&path)?;
     diffforge_copy_image_file_to_clipboard(&file)
+}
+
+#[tauri::command]
+fn diffforge_save_untracked_text_asset(
+    app: AppHandle,
+    request: DiffforgeSaveUntrackedTextAssetRequest,
+) -> Result<Value, String> {
+    if request.text.len() > DIFFFORGE_UNTRACKED_TEXT_ASSET_MAX_BYTES {
+        return Err(format!(
+            "Text asset is too large. Keep exports under {} MB.",
+            DIFFFORGE_UNTRACKED_TEXT_ASSET_MAX_BYTES / 1024 / 1024
+        ));
+    }
+
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let tmp_dir = root.join(".tmp");
+    let overwrite = request.overwrite.unwrap_or(false);
+    let target = if overwrite {
+        if let Some(path) = request
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            diffforge_untracked_asset_file(path)?
+        } else {
+            return Err("An existing untracked asset path is required to overwrite.".to_string());
+        }
+    } else {
+        let fallback_name = "hyperframe.html";
+        let mut filename = request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| cloud_mcp_sanitize_asset_filename(value, fallback_name))
+            .unwrap_or_else(|| fallback_name.to_string());
+        if Path::new(&filename).extension().is_none() {
+            filename.push_str(".html");
+        }
+        diffforge_untracked_asset_target(
+            &root,
+            request.group.as_deref().or(Some("hyperframes")),
+            Some(&filename),
+            fallback_name,
+        )?
+    };
+
+    if !diffforge_path_is_inside_untracked_assets(&target)? {
+        return Err(format!(
+            "Text asset target is outside the scratch folder: {}",
+            target.display()
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create text asset directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let tmp = tmp_dir.join(format!(
+        ".text-asset-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&tmp, request.text.as_bytes())
+        .map_err(|error| format!("Unable to write text asset {}: {error}", tmp.display()))?;
+    fs::rename(&tmp, &target).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "Unable to move text asset {} to {}: {error}",
+            tmp.display(),
+            target.display()
+        )
+    })?;
+
+    let item = diffforge_untracked_asset_item(&root, &target).ok();
+    diffforge_emit_untracked_assets_updated(&app, "text-asset-saved", item.clone());
+    Ok(json!({
+        "kind": "untracked_text_asset_saved",
+        "path": target.display().to_string(),
+        "item": item,
+        "library": diffforge_untracked_asset_library(None)?,
+    }))
+}
+
+#[tauri::command]
+fn diffforge_save_untracked_data_url_asset(
+    app: AppHandle,
+    request: DiffforgeSaveUntrackedDataUrlAssetRequest,
+) -> Result<Value, String> {
+    let encoded = request
+        .data_url
+        .split_once(',')
+        .map(|(_, value)| value)
+        .unwrap_or(request.data_url.as_str());
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("Unable to decode asset data URL: {error}"))?;
+    if bytes.len() > DIFFFORGE_UNTRACKED_DATA_URL_ASSET_MAX_BYTES {
+        return Err(format!(
+            "Asset export is too large. Keep data URL exports under {} MB.",
+            DIFFFORGE_UNTRACKED_DATA_URL_ASSET_MAX_BYTES / 1024 / 1024
+        ));
+    }
+    let root = diffforge_prepare_untracked_asset_root()?;
+    let target = diffforge_untracked_asset_target(
+        &root,
+        request.group.as_deref().or(Some("hyperframes")),
+        request.name.as_deref(),
+        "hyperframe-export.bin",
+    )?;
+    if !diffforge_path_is_inside_untracked_assets(&target)? {
+        return Err(format!(
+            "Asset export target is outside the scratch folder: {}",
+            target.display()
+        ));
+    }
+    let tmp_dir = root.join(".tmp");
+    let tmp = tmp_dir.join(format!(
+        ".data-url-asset-{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&tmp, &bytes)
+        .map_err(|error| format!("Unable to write asset export {}: {error}", tmp.display()))?;
+    fs::rename(&tmp, &target).map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "Unable to move asset export {} to {}: {error}",
+            tmp.display(),
+            target.display()
+        )
+    })?;
+    let item = diffforge_untracked_asset_item(&root, &target).ok();
+    diffforge_emit_untracked_assets_updated(&app, "data-url-asset-saved", item.clone());
+    Ok(json!({
+        "kind": "untracked_data_url_asset_saved",
+        "path": target.display().to_string(),
+        "item": item,
+        "library": diffforge_untracked_asset_library(None)?,
+    }))
 }
 
 #[tauri::command]

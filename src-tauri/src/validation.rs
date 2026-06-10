@@ -41,53 +41,6 @@ unsafe extern "system" {
     fn SetClassLongPtrW(hwnd: WindowsHandle, index: i32, value: isize) -> isize;
 }
 
-fn clean_workspace_name(name: String) -> Result<String, String> {
-    let character_count = name.chars().count();
-
-    if character_count == 0 || character_count > 80 {
-        return Err("Workspace name must be between 1 and 80 characters.".to_string());
-    }
-
-    Ok(name)
-}
-
-#[cfg(test)]
-mod workspace_name_validation_tests {
-    use super::*;
-
-    #[test]
-    fn clean_workspace_name_preserves_user_input() {
-        let name = "  raw workspace_name  ".to_string();
-
-        assert_eq!(clean_workspace_name(name.clone()).unwrap(), name);
-    }
-
-    #[test]
-    fn clean_workspace_name_requires_at_least_one_character() {
-        assert!(clean_workspace_name(String::new()).is_err());
-    }
-
-    #[test]
-    fn clean_workspace_name_counts_unicode_characters() {
-        assert!(clean_workspace_name("é".repeat(80)).is_ok());
-        assert!(clean_workspace_name("a".repeat(81)).is_err());
-    }
-}
-
-fn clean_workspace_id(workspace_id: String) -> Result<String, String> {
-    let workspace_id = workspace_id.trim().to_string();
-    let is_uuid_like = workspace_id.len() == 36
-        && workspace_id
-            .chars()
-            .all(|character| character.is_ascii_hexdigit() || character == '-');
-
-    if is_uuid_like {
-        Ok(workspace_id)
-    } else {
-        Err("Workspace id is invalid.".to_string())
-    }
-}
-
 fn is_safe_terminal_pane_id(value: &str) -> bool {
     let value_length = value.len();
 

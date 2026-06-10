@@ -79,7 +79,12 @@ import {
 } from "../threads/terminalControlPrompts.js";
 import { TERMINAL_IS_WINDOWS_HOST } from "../terminals/terminalScrollStabilityStrategies.jsx";
 import TerminalView from "../terminals/TerminalView.jsx";
-import { createWorkspaceNotificationSfx } from "../notifications/notificationSfx";
+import {
+  disposeSharedNotificationSfx,
+  getSharedNotificationSfx,
+  playNotificationSfx,
+} from "../notifications/notificationSfx";
+import { sendNativeNotification } from "../notifications/nativeNotifications";
 import {
   formatWorkspaceNotificationBadgeCount,
   getWorkspaceNotificationSummaries,
@@ -515,7 +520,7 @@ import {
   FileDocumentIcon,
   VIEW_TRANSITION_MS
 } from "./appStyles";
-import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
+import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView, { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
@@ -1079,9 +1084,11 @@ const TERMINAL_INPUT_HOT_FALLBACK_MS = 2500;
 const WORKSPACE_PROMPT_DELIVERY_TIMEOUT_MS = 31 * 60 * 1000;
 const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const CLOUD_MCP_REMOTE_COMMAND_EVENT = "cloud-mcp-remote-command";
 const CLOUD_MCP_DEVICE_DELETED_EVENT = "cloud-mcp-device-deleted";
+const CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT = "cloud-mcp-workspace-catalog-changed";
 const CLOUD_MCP_CREDIT_WALLET_EVENT = "cloud-mcp-credit-wallet";
 const CLOUD_MCP_TOKENOMICS_REFRESH_EVENT = "cloud-mcp-tokenomics-refresh";
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
@@ -3279,13 +3286,6 @@ function isDesktopSessionExpiredError(error) {
   );
 }
 
-function isWorkspaceAlreadyDeletedError(error) {
-  const message = getErrorMessage(error, "").toLowerCase();
-
-  return message.includes("workspace not found")
-    || message.includes("not found");
-}
-
 function withTimeout(promise, timeoutMs, message) {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -5008,6 +5008,82 @@ function applyForgeThemePreference(theme) {
 
 function findWorkspaceById(workspaces, workspaceId) {
   return workspaces.find((workspace) => workspace.id === workspaceId) || null;
+}
+
+function mintLocalWorkspaceId() {
+  const uuid = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+    ? crypto.randomUUID()
+    : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}-${Math.random().toString(16).slice(2, 10)}`;
+  return `ws-${uuid}`;
+}
+
+function normalizeCatalogWorkspaceEntry(entry) {
+  const id = String(entry?.id || entry?.workspace_id || entry?.workspaceId || "").trim();
+  if (!id) {
+    return null;
+  }
+  const name = String(entry?.name || entry?.workspace_name || entry?.workspaceName || id).trim() || id;
+  const deviceIds = entry?.device_ids || entry?.deviceIds;
+  return {
+    id,
+    name,
+    createdAt: String(entry?.createdAt || entry?.created_at || ""),
+    updatedAt: String(entry?.updatedAt || entry?.updated_at || ""),
+    originDeviceId: String(entry?.originDeviceId || entry?.origin_device_id || entry?.device_id || ""),
+    deviceIds: Array.isArray(deviceIds) ? deviceIds.map((value) => String(value)).filter(Boolean) : [],
+    deletedAt: String(entry?.deletedAt || entry?.deleted_at || ""),
+    pendingDelete: Boolean(entry?.pendingDelete),
+    syncState: entry?.syncState === "pending" || entry?.syncState === "error" ? entry.syncState : "synced",
+  };
+}
+
+// Server-authoritative reconcile: the cloud catalog is the full set of live
+// workspaces. Local rows that the cloud acked before but no longer lists were
+// deleted from another device; local "pending" rows survive offline creation
+// and are re-pushed.
+function reconcileWorkspaceCatalog(localItems, cloudItems) {
+  const cloudById = new Map();
+  cloudItems.forEach((entry) => {
+    if (entry?.id) {
+      cloudById.set(entry.id, entry);
+    }
+  });
+  const workspaces = [];
+  const pendingUpserts = [];
+  const pendingDeletes = [];
+  const seen = new Set();
+  (Array.isArray(localItems) ? localItems : []).forEach((rawLocal) => {
+    const local = normalizeCatalogWorkspaceEntry(rawLocal);
+    if (!local || seen.has(local.id)) {
+      return;
+    }
+    seen.add(local.id);
+    const cloud = cloudById.get(local.id);
+    if (local.pendingDelete) {
+      pendingDeletes.push(local.id);
+      return;
+    }
+    if (!cloud) {
+      if (local.syncState === "pending" || local.syncState === "error") {
+        workspaces.push({ ...local, syncState: "pending" });
+        pendingUpserts.push(local);
+      }
+      return;
+    }
+    cloudById.delete(local.id);
+    const localNewer = local.syncState !== "synced"
+      && String(local.updatedAt || "") > String(cloud.updatedAt || "");
+    if (localNewer) {
+      workspaces.push({ ...local, syncState: "pending" });
+      pendingUpserts.push(local);
+    } else {
+      workspaces.push(cloud);
+    }
+  });
+  cloudById.forEach((cloud) => {
+    workspaces.push(cloud);
+  });
+  return { workspaces, pendingUpserts, pendingDeletes };
 }
 
 function graphText(value, fallback = "") {
@@ -7600,7 +7676,7 @@ export default function App() {
   }, [workspaceNotifications]);
 
   useEffect(() => {
-    const sfx = createWorkspaceNotificationSfx();
+    const sfx = getSharedNotificationSfx();
     workspaceNotificationSfxRef.current = sfx;
     const unlock = () => {
       sfx.unlock();
@@ -7612,7 +7688,7 @@ export default function App() {
     return () => {
       window.removeEventListener("keydown", unlock);
       window.removeEventListener("pointerdown", unlock);
-      sfx.dispose();
+      disposeSharedNotificationSfx();
       if (workspaceNotificationSfxRef.current === sfx) {
         workspaceNotificationSfxRef.current = null;
       }
@@ -7627,6 +7703,16 @@ export default function App() {
       }
       workspaceNotificationCueIdsRef.current.add(cue.id);
       workspaceNotificationSfxRef.current?.play(cue.kind);
+      const cueKind = String(cue.kind || "").trim().toLowerCase().replace(/_/g, ".");
+      if (cueKind === "approval.required" || cueKind === "user.input.required") {
+        const cueWorkspace = findWorkspaceById(workspacesRef.current, cue.workspaceId);
+        sendNativeNotification({
+          body: cueWorkspace?.name
+            ? `A coding agent in ${cueWorkspace.name} is waiting on a tool approval.`
+            : "A coding agent terminal is waiting on a tool approval.",
+          title: "Diff Forge: approval required",
+        });
+      }
       const cueWorkspaceId = String(cue.workspaceId || "").trim();
       if (cueWorkspaceId) {
         const existingTimer = workspaceNotificationHighlightTimersRef.current.get(cueWorkspaceId);
@@ -7663,6 +7749,24 @@ export default function App() {
       window.clearTimeout(timer);
     });
     workspaceNotificationHighlightTimersRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenCaptureSaved = null;
+    listen("forge-snipping-capture-saved", () => {
+      playNotificationSfx("snip.captured");
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unlistenCaptureSaved = unlisten;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      unlistenCaptureSaved?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -8938,14 +9042,6 @@ export default function App() {
       return;
     }
 
-    const token = authStore.getToken();
-    if (!isSafeAuthValue(token)) {
-      expireDesktopSession("Desktop session required to delete workspace.");
-      return;
-    }
-
-    workspaceDeactivationInFlightRef.current = targetWorkspaceId;
-    setWorkspaceSettingsState("deleting");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
@@ -8956,24 +9052,110 @@ export default function App() {
     workspaceAgentBatchInFlightSessionKeysRef.current.clear();
     setWorkspaceAgentBatchSentLaunchKey("");
 
-    try {
+    // Local-first delete: the workspace leaves the UI instantly; cloud
+    // tombstone, runtime teardown, and metadata cleanup drain in background.
+    const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+      .filter((workspace) => workspace.id !== targetWorkspaceId);
+    workspacesRef.current = nextWorkspaces;
+    setWorkspaces(nextWorkspaces);
+
+    const deleteScopeKey = activeAccountScopeKey;
+    const deletedAtIso = new Date().toISOString();
+    const storedWorkspaces = [
+      ...nextWorkspaces,
+      {
+        id: targetWorkspaceId,
+        name: workspaceName,
+        updatedAt: deletedAtIso,
+        pendingDelete: true,
+      },
+    ];
+    void invoke("local_workspaces_store", {
+      scopeKey: deleteScopeKey,
+      workspaces: storedWorkspaces,
+    }).catch(() => {});
+
+    const nextSettings = { ...(workspaceSettingsRef.current || {}) };
+    delete nextSettings[targetWorkspaceId];
+    workspaceSettingsRef.current = nextSettings;
+    persistWorkspaceSettings(nextSettings);
+    setWorkspaceSettings(nextSettings);
+
+    const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+    const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+      previousLifecycleSettings.enabledWorkspaceIds,
+    ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
+    updateWorkspaceLifecycleSettings({
+      defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
+        ? ""
+        : previousLifecycleSettings.defaultWorkspaceId,
+      enabledWorkspaceIds: nextEnabledWorkspaceIds,
+    });
+
+    setWorkspaceThreads((current) => {
+      const next = { ...(current || {}) };
+      delete next[targetWorkspaceId];
+      workspaceThreadsRef.current = next;
+      return next;
+    });
+    setWorkspaceNotifications((current) => {
+      const next = { ...(current || {}) };
+      delete next[targetWorkspaceId];
+      return next;
+    });
+    setWorkspaceTerminalLogicalIndexes((current) => {
+      const next = { ...(current || {}) };
+      delete next[targetWorkspaceId];
+      workspaceTerminalLogicalIndexesRef.current = next;
+      return next;
+    });
+    setWorkspaceTerminalDisplayLayouts((current) => {
+      const next = { ...(current || {}) };
+      delete next[targetWorkspaceId];
+      workspaceTerminalDisplayLayoutsRef.current = next;
+      return next;
+    });
+    setWorkspaceGraphState((current) => Object.fromEntries(
+      Object.entries(current || {}).filter(([key]) => !key.startsWith(`${targetWorkspaceId}::`)),
+    ));
+    purgeWorkspaceTodoQueueLocalStorage(targetWorkspaceId);
+    terminalPresenceSyncKeyRef.current = "";
+    workspaceMcpSyncKeyRef.current = "";
+    workspaceCatalogSyncKeyRef.current = "";
+    workspaceCloudSyncKeyRef.current = "";
+
+    if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
+      const nextActivatedWorkspace = nextEnabledWorkspaceIds
+        .map((enabledWorkspaceId) => findWorkspaceById(nextWorkspaces, enabledWorkspaceId))
+        .find(Boolean)
+        || nextWorkspaces[0]
+        || null;
+      setActivatedWorkspaceId(nextActivatedWorkspace?.id || "");
+    }
+    if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
+      setSelectedWorkspaceId(nextWorkspaces[0]?.id || "");
+    }
+
+    setWorkspaceSettingsModalId("");
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      telemetrySource: "workspace_deleted",
+      telemetryWorkspaceId: targetWorkspaceId,
+    });
+
+    void (async () => {
       const warnings = [];
+      let catalogTombstoned = false;
 
       try {
-        await invoke("delete_workspace", {
-          token,
+        // Authoritative cloud tombstone: broadcasts workspace_catalog_changed
+        // to every device so dashboards drop the workspace instantly.
+        await invoke("cloud_mcp_workspace_catalog_delete", {
           workspaceId: targetWorkspaceId,
-          ...activeWorkspaceScopePayload,
+          reason: "workspace_deleted",
         });
+        catalogTombstoned = true;
       } catch (error) {
-        if (isDesktopSessionExpiredError(error)) {
-          throw error;
-        }
-        if (isWorkspaceAlreadyDeletedError(error)) {
-          warnings.push("Cloud workspace record was already removed.");
-        } else {
-          throw error;
-        }
+        warnings.push(`Cloud catalog cleanup warning: ${getErrorMessage(error, "Unable to tombstone cloud workspace.")}`);
       }
 
       try {
@@ -9013,101 +9195,35 @@ export default function App() {
       } catch (error) {
         warnings.push(`Todo cleanup warning: ${getErrorMessage(error, "Unable to archive workspace todos.")}`);
       }
-      purgeWorkspaceTodoQueueLocalStorage(targetWorkspaceId);
 
-      await invoke("delete_workspace_local_metadata", {
-        repoPath,
-        discardDirtyWorktrees: true,
-      });
-
-      const nextWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-        .filter((workspace) => workspace.id !== targetWorkspaceId);
-      workspacesRef.current = nextWorkspaces;
-      setWorkspaces(nextWorkspaces);
-
-      const nextSettings = { ...(workspaceSettingsRef.current || {}) };
-      delete nextSettings[targetWorkspaceId];
-      workspaceSettingsRef.current = nextSettings;
-      persistWorkspaceSettings(nextSettings);
-      setWorkspaceSettings(nextSettings);
-
-      const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
-      const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
-        previousLifecycleSettings.enabledWorkspaceIds,
-      ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
-      updateWorkspaceLifecycleSettings({
-        defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
-          ? ""
-          : previousLifecycleSettings.defaultWorkspaceId,
-        enabledWorkspaceIds: nextEnabledWorkspaceIds,
-      });
-
-      setWorkspaceThreads((current) => {
-        const next = { ...(current || {}) };
-        delete next[targetWorkspaceId];
-        workspaceThreadsRef.current = next;
-        return next;
-      });
-      setWorkspaceNotifications((current) => {
-        const next = { ...(current || {}) };
-        delete next[targetWorkspaceId];
-        return next;
-      });
-      setWorkspaceTerminalLogicalIndexes((current) => {
-        const next = { ...(current || {}) };
-        delete next[targetWorkspaceId];
-        workspaceTerminalLogicalIndexesRef.current = next;
-        return next;
-      });
-      setWorkspaceTerminalDisplayLayouts((current) => {
-        const next = { ...(current || {}) };
-        delete next[targetWorkspaceId];
-        workspaceTerminalDisplayLayoutsRef.current = next;
-        return next;
-      });
-      setWorkspaceGraphState((current) => Object.fromEntries(
-        Object.entries(current || {}).filter(([key]) => !key.startsWith(`${targetWorkspaceId}::`)),
-      ));
-      terminalPresenceSyncKeyRef.current = "";
-      workspaceMcpSyncKeyRef.current = "";
-      workspaceCatalogSyncKeyRef.current = "";
-      workspaceCloudSyncKeyRef.current = "";
-
-      if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
-        const nextActivatedWorkspace = nextEnabledWorkspaceIds
-          .map((enabledWorkspaceId) => findWorkspaceById(nextWorkspaces, enabledWorkspaceId))
-          .find(Boolean)
-          || nextWorkspaces[0]
-          || null;
-        setActivatedWorkspaceId(nextActivatedWorkspace?.id || "");
-      }
-      if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
-        setSelectedWorkspaceId(nextWorkspaces[0]?.id || "");
+      try {
+        await invoke("delete_workspace_local_metadata", {
+          repoPath,
+          discardDirtyWorktrees: true,
+        });
+      } catch (error) {
+        warnings.push(`Local metadata cleanup warning: ${getErrorMessage(error, "Unable to remove local workspace metadata.")}`);
       }
 
-      setWorkspaceSettingsModalId("");
-      showView(DEFAULT_WORKSPACE_VIEW, {
-        telemetrySource: "workspace_deleted",
-        telemetryWorkspaceId: targetWorkspaceId,
-      });
+      if (catalogTombstoned) {
+        // Drop the local pendingDelete tombstone once the cloud acked.
+        const settledWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+          .filter((workspace) => workspace.id !== targetWorkspaceId);
+        void invoke("local_workspaces_store", {
+          scopeKey: deleteScopeKey,
+          workspaces: settledWorkspaces,
+        }).catch(() => {});
+      }
+
       setWorkspaceError(warnings.length
         ? `Workspace deleted. ${warnings.join(" ")}`
         : "");
-    } catch (error) {
-      if (isDesktopSessionExpiredError(error)) {
-        expireDesktopSession(error);
-        return;
-      }
-      setWorkspaceSettingsError(getErrorMessage(error, "Unable to delete workspace from Diff Forge."));
-    } finally {
-      workspaceDeactivationInFlightRef.current = "";
-      setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
-      setWorkspaceSettingsState("idle");
-    }
+    })();
+
+    setWorkspaceSettingsState("idle");
   }, [
+    activeAccountScopeKey,
     clearPreparedWorkspaceTerminals,
-    activeWorkspaceScopePayload,
-    expireDesktopSession,
     setWorkspaceAgentBatchSentLaunchKey,
     showView,
     updateWorkspaceLifecycleSettings,
@@ -9894,23 +10010,11 @@ export default function App() {
   }, []);
 
   const loadWorkspaces = useCallback(async () => {
-    const token = authStore.getToken();
-
-    if (!isSafeAuthValue(token)) {
-      expireDesktopSession("Desktop session required to load workspaces.");
-      return;
-    }
-
     setWorkspaceSyncState("loading");
     setWorkspaceError("");
 
-    try {
-      const result = await invoke("list_workspaces", {
-        token,
-        ...activeWorkspaceScopePayload,
-      });
-      const nextWorkspaces = Array.isArray(result?.workspaces) ? result.workspaces : [];
-      const currentSelectedId = selectedWorkspaceIdRef.current;
+    const scopeKey = activeAccountScopeKey;
+    const applyLoadedWorkspaces = (nextWorkspaces) => {
       const currentActivatedId = activatedWorkspaceIdRef.current;
       const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
       const configuredDefaultWorkspaceId = currentLifecycleSettings.defaultWorkspaceId;
@@ -9950,6 +10054,7 @@ export default function App() {
         setWorkspaceLifecycleSettings(nextLifecycleSettings);
       }
 
+      workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId((currentSelectedId) => {
         const nextSelected = findWorkspaceById(nextWorkspaces, currentSelectedId)
@@ -9958,21 +10063,74 @@ export default function App() {
         return nextSelected?.id || "";
       });
       setActivatedWorkspaceId(nextActivated?.id || "");
+    };
 
-      setWorkspaceSyncState("idle");
-      setWorkspaceListHydrated(true);
-
-    } catch (error) {
-      if (isDesktopSessionExpiredError(error)) {
-        expireDesktopSession(error);
-        return;
-      }
-
-      setWorkspaceSyncState("error");
-      setWorkspaceListHydrated(true);
-      setWorkspaceError(getErrorMessage(error, "Unable to load workspaces."));
+    // Local-first: the on-disk catalog renders immediately; the cloud catalog
+    // reconciles in the background and pushes any offline edits back up.
+    let localItems = [];
+    try {
+      const local = await invoke("local_workspaces_load", { scopeKey });
+      localItems = Array.isArray(local?.workspaces) ? local.workspaces : [];
+    } catch {
+      localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
     }
-  }, [activeWorkspaceScopePayload, expireDesktopSession]);
+    applyLoadedWorkspaces(
+      localItems
+        .map(normalizeCatalogWorkspaceEntry)
+        .filter((workspace) => workspace && !workspace.pendingDelete),
+    );
+    setWorkspaceSyncState("idle");
+    setWorkspaceListHydrated(true);
+
+    void (async () => {
+      try {
+        const result = await invoke("cloud_mcp_workspace_catalog_list");
+        if (activeAccountScopeKey !== scopeKey) {
+          return;
+        }
+        const cloudItems = (Array.isArray(result?.workspaces) ? result.workspaces : [])
+          .map(normalizeCatalogWorkspaceEntry)
+          .filter(Boolean);
+        const { workspaces: merged, pendingUpserts, pendingDeletes } = reconcileWorkspaceCatalog(
+          localItems,
+          cloudItems,
+        );
+        applyLoadedWorkspaces(merged);
+        try {
+          await invoke("local_workspaces_store", { scopeKey, workspaces: merged });
+        } catch {
+          // Local persistence is best effort; cloud remains authoritative.
+        }
+        for (const pending of pendingUpserts) {
+          try {
+            await invoke("cloud_mcp_workspace_catalog_upsert", {
+              workspace: {
+                workspace_id: pending.id,
+                workspace_name: pending.name,
+                created_at: pending.createdAt,
+                updated_at: pending.updatedAt,
+              },
+            });
+          } catch {
+            // Retried on the next reconcile pass.
+          }
+        }
+        for (const pendingDeleteId of pendingDeletes) {
+          try {
+            await invoke("cloud_mcp_workspace_catalog_delete", {
+              workspaceId: pendingDeleteId,
+              reason: "workspace_deleted_offline",
+            });
+          } catch {
+            // Retried on the next reconcile pass.
+          }
+        }
+      } catch {
+        // Offline or cloud unavailable: the local list stands until the
+        // websocket reconnects and the catalog broadcast refreshes us.
+      }
+    })();
+  }, [activeAccountScopeKey, expireDesktopSession]);
 
   useEffect(() => {
     if (!previousAccountScopeKeyRef.current) {
@@ -9998,6 +10156,56 @@ export default function App() {
     setWorkspaceHydrationReady(false);
     loadWorkspaces();
   }, [activeAccountScopeKey, authState, loadWorkspaces, user]);
+
+  // Cross-device workspace sync: cloud-diffforge broadcasts the full active
+  // catalog whenever any device creates, renames, or deletes a workspace.
+  useEffect(() => {
+    if (authState !== "authenticated" || !isPaidUser(user)) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten = null;
+    const scopeKey = activeAccountScopeKey;
+
+    void listen(CLOUD_MCP_WORKSPACE_CATALOG_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (!Array.isArray(payload.workspaces)) {
+        return;
+      }
+      const cloudItems = payload.workspaces
+        .map(normalizeCatalogWorkspaceEntry)
+        .filter(Boolean);
+      const localItems = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
+      const { workspaces: merged } = reconcileWorkspaceCatalog(localItems, cloudItems);
+      workspacesRef.current = merged;
+      setWorkspaces(merged);
+      if (activatedWorkspaceIdRef.current
+        && !findWorkspaceById(merged, activatedWorkspaceIdRef.current)) {
+        setActivatedWorkspaceId(merged[0]?.id || "");
+      }
+      setSelectedWorkspaceId((currentSelectedId) => (
+        findWorkspaceById(merged, currentSelectedId) ? currentSelectedId : (merged[0]?.id || "")
+      ));
+      void invoke("local_workspaces_store", { scopeKey, workspaces: merged }).catch(() => {});
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, [activeAccountScopeKey, authState, user]);
 
   const openCreateWorkspaceModal = useCallback(() => {
     setWorkspaceName("");
@@ -10066,16 +10274,16 @@ export default function App() {
         throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
       }
 
-      const result = await invoke("create_workspace", {
-        token,
+      // Local-first create: mint the id here, commit the row instantly, and
+      // let the cloud workspace catalog ack + registration run in background.
+      const nowIso = new Date().toISOString();
+      const workspace = {
+        id: mintLocalWorkspaceId(),
         name,
-        ...activeWorkspaceScopePayload,
-      });
-      const workspace = result?.workspace;
-
-      if (!workspace) {
-        throw new Error("Workspace was not returned by the API.");
-      }
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        syncState: "pending",
+      };
 
       const existingWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
       const nextWorkspaces = [
@@ -10095,6 +10303,7 @@ export default function App() {
       workspaceSettingsRef.current = nextWorkspaceSettings;
       persistWorkspaceSettings(nextWorkspaceSettings);
       setWorkspaceSettings(nextWorkspaceSettings);
+      workspacesRef.current = nextWorkspaces;
       setWorkspaces(nextWorkspaces);
       setSelectedWorkspaceId(workspace.id);
       setActivatedWorkspaceId(workspace.id);
@@ -10105,23 +10314,54 @@ export default function App() {
       setWorkspaceName("");
       setNewWorkspaceRootDraft(rootDirectory);
       setWorkspaceCreateModalOpen(false);
+      setWorkspaceSyncState("idle");
 
-      try {
-        await invoke("cloud_mcp_register_workspace", {
-          repoPath: rootDirectory,
-          workspaceId: workspace.id,
-          workspaceName: workspace.name,
-        });
-        setWorkspaceSyncState("idle");
-      } catch (registrationError) {
-        setWorkspaceSyncState("error");
-        setWorkspaceError(
-          `Workspace created, but Cloud MCP registration failed: ${getErrorMessage(
-            registrationError,
-            "Unable to register workspace.",
-          )}`,
-        );
-      }
+      const scopeKey = activeAccountScopeKey;
+      void invoke("local_workspaces_store", { scopeKey, workspaces: nextWorkspaces }).catch(() => {});
+
+      void (async () => {
+        let catalogSynced = false;
+        try {
+          await invoke("cloud_mcp_workspace_catalog_upsert", {
+            workspace: {
+              workspace_id: workspace.id,
+              workspace_name: workspace.name,
+              workspace_root: rootDirectory,
+              created_at: workspace.createdAt,
+              updated_at: workspace.updatedAt,
+            },
+          });
+          catalogSynced = true;
+        } catch (catalogError) {
+          setWorkspaceError(
+            `Workspace created locally; cloud sync is pending: ${getErrorMessage(
+              catalogError,
+              "Unable to sync workspace to cloud.",
+            )}`,
+          );
+        }
+        if (catalogSynced) {
+          const syncedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+            .map((item) => (item.id === workspace.id ? { ...item, syncState: "synced" } : item));
+          workspacesRef.current = syncedWorkspaces;
+          setWorkspaces(syncedWorkspaces);
+          void invoke("local_workspaces_store", { scopeKey, workspaces: syncedWorkspaces }).catch(() => {});
+        }
+        try {
+          await invoke("cloud_mcp_register_workspace", {
+            repoPath: rootDirectory,
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+          });
+        } catch (registrationError) {
+          setWorkspaceError(
+            `Workspace created, but Cloud MCP registration failed: ${getErrorMessage(
+              registrationError,
+              "Unable to register workspace.",
+            )}`,
+          );
+        }
+      })();
     } catch (error) {
       if (isDesktopSessionExpiredError(error)) {
         expireDesktopSession(error);
@@ -10132,8 +10372,8 @@ export default function App() {
       setWorkspaceError(getErrorMessage(error, "Unable to create workspace."));
     }
   }, [
+    activeAccountScopeKey,
     defaultWorkingDirectory,
-    activeWorkspaceScopePayload,
     expireDesktopSession,
     newWorkspaceRootDraft,
     updateWorkspaceLifecycleSettings,
@@ -10373,21 +10613,44 @@ export default function App() {
       }
 
       if (workspaceNameValue !== selectedWorkspace.name) {
-        const result = await invoke("update_workspace", {
-          token,
-          workspaceId: selectedWorkspace.id,
+        // Local-first rename: commit instantly; the cloud catalog upsert acks
+        // in the background and broadcasts the change to other devices.
+        const renamedAtIso = new Date().toISOString();
+        nextWorkspace = {
+          ...selectedWorkspace,
           name: workspaceNameValue,
-          ...activeWorkspaceScopePayload,
+          updatedAt: renamedAtIso,
+          syncState: "pending",
+        };
+        const renamedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+          .map((workspace) => (workspace.id === nextWorkspace.id ? nextWorkspace : workspace));
+        workspacesRef.current = renamedWorkspaces;
+        setWorkspaces(renamedWorkspaces);
+        const renameScopeKey = activeAccountScopeKey;
+        void invoke("local_workspaces_store", {
+          scopeKey: renameScopeKey,
+          workspaces: renamedWorkspaces,
+        }).catch(() => {});
+        void invoke("cloud_mcp_workspace_catalog_upsert", {
+          workspace: {
+            workspace_id: nextWorkspace.id,
+            workspace_name: nextWorkspace.name,
+            updated_at: renamedAtIso,
+          },
+        }).then(() => {
+          const syncedWorkspaces = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+            .map((workspace) => (
+              workspace.id === nextWorkspace.id ? { ...workspace, syncState: "synced" } : workspace
+            ));
+          workspacesRef.current = syncedWorkspaces;
+          setWorkspaces(syncedWorkspaces);
+          void invoke("local_workspaces_store", {
+            scopeKey: renameScopeKey,
+            workspaces: syncedWorkspaces,
+          }).catch(() => {});
+        }).catch(() => {
+          // The next catalog reconcile re-pushes pending renames.
         });
-
-        if (!result?.workspace) {
-          throw new Error("Workspace was not returned by the API.");
-        }
-
-        nextWorkspace = result.workspace;
-        setWorkspaces((items) => items.map((workspace) => (
-          workspace.id === nextWorkspace.id ? nextWorkspace : workspace
-        )));
       }
 
       setWorkspaceSettings((settings) => {
@@ -10446,7 +10709,7 @@ export default function App() {
     }
   }, [
     selectedWorkspace,
-    activeWorkspaceScopePayload,
+    activeAccountScopeKey,
     expireDesktopSession,
     workspaceNameDraft,
     workspaceRootDraft,
@@ -13872,6 +14135,27 @@ export default function App() {
     const targets = [];
     const seen = new Set();
     const activeWorkspaceIds = new Set(enabledRuntimeWorkspaceIds.map((workspaceId) => String(workspaceId || "").trim()));
+    // Stable terminal identity (names/colors/agents — not volatile statuses)
+    // rides along with the catalog so other devices and the web dashboard keep
+    // last-known terminal labels even after this device disconnects.
+    const presenceTerminalsByWorkspaceId = new Map();
+    terminalPresenceWorkspaces.forEach((presenceWorkspace) => {
+      const presenceWorkspaceId = String(presenceWorkspace?.workspaceId || "").trim();
+      if (!presenceWorkspaceId || !Array.isArray(presenceWorkspace?.terminals)) {
+        return;
+      }
+      presenceTerminalsByWorkspaceId.set(
+        presenceWorkspaceId,
+        presenceWorkspace.terminals.slice(0, 32).map((terminal) => ({
+          agentKind: String(terminal?.agentKind || terminal?.agentId || ""),
+          agentLabel: String(terminal?.agentLabel || ""),
+          color: String(terminal?.color || ""),
+          colorSlot: Number(terminal?.colorSlot ?? 0),
+          terminalIndex: Number(terminal?.terminalIndex ?? 0),
+          terminalName: String(terminal?.terminalName || terminal?.displayName || ""),
+        })),
+      );
+    });
     const addTarget = (workspace, activeOverride = null, workspaceIndex = 0) => {
       const workspaceId = String(workspace?.id || "").trim();
       if (!workspaceId) {
@@ -13897,6 +14181,7 @@ export default function App() {
         mountId: "",
         projectName: "",
         repoPath: rootDirectory,
+        terminals: presenceTerminalsByWorkspaceId.get(workspaceId) || [],
         workspaceActive,
         workspaceId,
         workspaceIndex,
@@ -13923,6 +14208,7 @@ export default function App() {
     selectedWorkspace,
     selectedWorkspaceRootDirectory,
     shouldShowWorkspaceSetup,
+    terminalPresenceWorkspaces,
     workspaceSettings,
     workspaces,
   ]);
@@ -13964,6 +14250,7 @@ export default function App() {
         active: Boolean(target.workspaceActive),
         repoPath: getWorkspaceRootIdentity(target.repoPath || ""),
         terminalCount: Number(target.logicalTerminalCount || 0),
+        terminals: Array.isArray(target.terminals) ? target.terminals : [],
         workspaceId: target.workspaceId,
         workspaceName: target.workspaceName || "",
       })),
@@ -17299,6 +17586,45 @@ export default function App() {
         });
         return;
       }
+      if (
+        normalizedKind === "workspace_todo_delete"
+        || normalizedKind === "todo_delete"
+        || normalizedKind === "delete_todo"
+      ) {
+        const todoId = remoteCommandStringField(event, [
+          "todo_id",
+          "todoId",
+          "item_id",
+          "itemId",
+          "target_todo_id",
+          "targetTodoId",
+        ]);
+        if (!todoId) {
+          await recordRemoteCommandStatus(event, "failed", "Todo delete command did not include a todo id.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        // The desktop stays authoritative: the queue panel removes the todo
+        // from its local state, records the deleted receipt, and pushes the
+        // removal to cloud via the normal todo state sync.
+        window.dispatchEvent(new CustomEvent(REMOTE_TODO_DELETE_EVENT, {
+          detail: {
+            commandId,
+            todoId,
+            workspaceId,
+          },
+        }));
+        await recordRemoteCommandStatus(event, "completed", "Todo removed from the desktop queue.", {
+          commandId,
+          commandKind,
+          todoId,
+          workspaceId,
+        });
+        return;
+      }
       await recordRemoteCommandStatus(event, "failed", `Unsupported remote control command: ${commandKind}.`, {
         commandId,
         commandKind,
@@ -17575,6 +17901,13 @@ export default function App() {
               workspaceName: targetWorkspace?.name || "",
             },
           }));
+          playNotificationSfx("todo.arrived");
+          sendNativeNotification({
+            body: text.slice(0, 200),
+            title: targetWorkspace?.name
+              ? `Diff Forge: todo arrived for ${targetWorkspace.name}`
+              : "Diff Forge: remote todo arrived",
+          });
           if (hasResolvedTerminalTarget) {
             terminalStatusEventEmitterRef.current?.({
               activityStatus: "queued",
@@ -22019,14 +22352,14 @@ export default function App() {
                         <span>History</span>
                       </RailActionButton>
                       <RailActionButton
-                        aria-label="MCPs"
+                        aria-label="Tools"
                         data-active={activeView === "mcps"}
                         onClick={() => showView("mcps")}
-                        title="MCPs"
+                        title="Skills, CLIs, and MCPs"
                         type="button"
                       >
                         <ButtonHubIcon aria-hidden="true" />
-                        <span>MCPs</span>
+                        <span>Tools</span>
                       </RailActionButton>
                     </>
                   )}
@@ -23046,15 +23379,15 @@ export default function App() {
                   />
                 </ForgeWorkspace>
               ) : visibleView === "mcps" ? (
-                <ForgeWorkspace aria-label="Workspace MCPs" data-motion={viewMotion}>
+                <ForgeWorkspace aria-label="Workspace tools" data-motion={viewMotion}>
                   {selectedWorkspace ? (
-                    <McpsWorkspaceView
+                    <ToolsWorkspaceView
                       defaultWorkingDirectory={defaultWorkingDirectory}
                       rootDirectory={selectedWorkspaceFileRoot}
                       workspace={selectedWorkspace}
                     />
                   ) : (
-                    <WorkspaceIdleState detail="Select a workspace to inspect MCPs." viewMotion={viewMotion} />
+                    <WorkspaceIdleState detail="Select a workspace to manage its tools." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : (

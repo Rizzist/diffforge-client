@@ -115,53 +115,6 @@ async fn validate_desktop_session(token: String) -> Result<Value, String> {
     read_api_response(response, "Desktop session expired.").await
 }
 
-fn clean_account_scope_type(value: Option<String>) -> String {
-    match value
-        .unwrap_or_default()
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "team" => "team".to_string(),
-        _ => "personal".to_string(),
-    }
-}
-
-fn clean_account_team_id(value: Option<String>) -> Option<String> {
-    let clean = value
-        .unwrap_or_default()
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(64)
-        .collect::<String>();
-
-    if clean.is_empty() {
-        None
-    } else {
-        Some(clean)
-    }
-}
-
-fn clean_account_scope(
-    scope_type: Option<String>,
-    team_id: Option<String>,
-) -> Result<(String, Option<String>), String> {
-    let scope_type = clean_account_scope_type(scope_type);
-    let team_id = clean_account_team_id(team_id);
-
-    if scope_type == "team" && team_id.is_none() {
-        return Err("Team workspace scope requires a team id.".to_string());
-    }
-
-    Ok((scope_type, team_id))
-}
-
 #[tauri::command]
 async fn logout_desktop_session(token: String) -> Result<Value, String> {
     validate_auth_value("Desktop session", &token)?;
@@ -175,33 +128,6 @@ async fn logout_desktop_session(token: String) -> Result<Value, String> {
         .map_err(|error| format!("Unable to sign out desktop session: {error}"))?;
 
     read_api_response(response, "Unable to sign out desktop session.").await
-}
-
-#[tauri::command]
-async fn list_workspaces(
-    token: String,
-    scope_type: Option<String>,
-    team_id: Option<String>,
-) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
-    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
-
-    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let mut request = client
-        .get(format!("{API_BASE_URL}/desktop/workspaces"))
-        .bearer_auth(token)
-        .query(&[("scopeType", scope_type.as_str())]);
-
-    if let Some(team_id) = team_id.as_deref() {
-        request = request.query(&[("teamId", team_id)]);
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Unable to fetch workspaces: {error}"))?;
-
-    read_api_response(response, "Unable to fetch workspaces.").await
 }
 
 fn clean_desktop_signin_diagnostic_text(value: impl AsRef<str>, max_len: usize) -> String {
@@ -345,93 +271,6 @@ async fn record_desktop_connection_diagnostic(
         .map_err(|error| format!("Unable to record desktop connection diagnostic: {error}"))?;
 
     read_api_response(response, "Unable to record desktop connection diagnostic.").await
-}
-
-#[tauri::command]
-async fn create_workspace(
-    token: String,
-    name: String,
-    scope_type: Option<String>,
-    team_id: Option<String>,
-) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
-
-    let workspace_name = clean_workspace_name(name)?;
-    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
-
-    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let response = client
-        .post(format!("{API_BASE_URL}/desktop/workspaces"))
-        .bearer_auth(token)
-        .json(&CreateWorkspaceRequest {
-            name: &workspace_name,
-            scope_type: Some(scope_type.as_str()),
-            team_id: team_id.as_deref(),
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Unable to create workspace: {error}"))?;
-
-    read_api_response(response, "Unable to create workspace.").await
-}
-
-#[tauri::command]
-async fn update_workspace(
-    token: String,
-    workspace_id: String,
-    name: String,
-    scope_type: Option<String>,
-    team_id: Option<String>,
-) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
-
-    let workspace_id = clean_workspace_id(workspace_id)?;
-    let workspace_name = clean_workspace_name(name)?;
-    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
-
-    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let response = client
-        .patch(format!("{API_BASE_URL}/desktop/workspaces"))
-        .bearer_auth(token)
-        .json(&UpdateWorkspaceRequest {
-            workspace_id: &workspace_id,
-            name: &workspace_name,
-            scope_type: Some(scope_type.as_str()),
-            team_id: team_id.as_deref(),
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Unable to update workspace: {error}"))?;
-
-    read_api_response(response, "Unable to update workspace.").await
-}
-
-#[tauri::command]
-async fn delete_workspace(
-    token: String,
-    workspace_id: String,
-    scope_type: Option<String>,
-    team_id: Option<String>,
-) -> Result<Value, String> {
-    validate_auth_value("Desktop session", &token)?;
-
-    let workspace_id = clean_workspace_id(workspace_id)?;
-    let (scope_type, team_id) = clean_account_scope(scope_type, team_id)?;
-
-    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
-    let response = client
-        .delete(format!("{API_BASE_URL}/desktop/workspaces"))
-        .bearer_auth(token)
-        .json(&DeleteWorkspaceRequest {
-            workspace_id: &workspace_id,
-            scope_type: Some(scope_type.as_str()),
-            team_id: team_id.as_deref(),
-        })
-        .send()
-        .await
-        .map_err(|error| format!("Unable to delete workspace: {error}"))?;
-
-    read_api_response(response, "Unable to delete workspace.").await
 }
 
 #[tauri::command]
@@ -584,6 +423,196 @@ async fn update_agent(provider: String) -> Result<AgentInstallResult, String> {
     })
     .await
     .map_err(|error| format!("Unable to update terminal CLI: {error}"))?
+}
+
+#[tauri::command]
+async fn uninstall_agent(provider: String) -> Result<AgentInstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider = parse_agent_provider(&provider)?;
+        let result = uninstall_agent_with_npm(provider);
+
+        if !result.installed {
+            clear_agent_command_candidate_cache(provider);
+        }
+
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("Unable to uninstall terminal CLI: {error}"))?
+}
+
+fn tools_binary_on_path(binary: &str) -> Option<String> {
+    let binary = binary.trim();
+    if binary.is_empty() || binary.contains(['/', '\\']) {
+        return None;
+    }
+    let path_value = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_value) {
+        let candidate = dir.join(binary);
+        #[cfg(windows)]
+        {
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+            for extension in ["exe", "cmd", "bat", "ps1"] {
+                let candidate = candidate.with_extension(extension);
+                if candidate.is_file() {
+                    return Some(candidate.display().to_string());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if candidate.is_file()
+                && fs::metadata(&candidate)
+                    .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+    // GUI apps often miss package-manager locations from the login shell
+    // PATH; probe the common ones per platform.
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut fallback_dirs: Vec<String> = Vec::new();
+        #[cfg(target_os = "macos")]
+        fallback_dirs.extend(["/opt/homebrew/bin".to_string(), "/usr/local/bin".to_string()]);
+        #[cfg(target_os = "linux")]
+        fallback_dirs.extend([
+            "/usr/local/bin".to_string(),
+            "/home/linuxbrew/.linuxbrew/bin".to_string(),
+            format!("{home}/.linuxbrew/bin"),
+            format!("{home}/.local/bin"),
+        ]);
+        fallback_dirs.push(format!("{home}/.cargo/bin"));
+        for prefix in fallback_dirs {
+            if prefix.trim().is_empty() {
+                continue;
+            }
+            let candidate = Path::new(&prefix).join(binary);
+            if candidate.is_file() {
+                return Some(candidate.display().to_string());
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn tools_check_cli_binaries(binaries: Vec<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut results = serde_json::Map::new();
+        for binary in binaries.iter().take(200) {
+            let path = tools_binary_on_path(binary);
+            results.insert(
+                binary.clone(),
+                json!({
+                    "installed": path.is_some(),
+                    "path": path,
+                }),
+            );
+        }
+        Ok(Value::Object(results))
+    })
+    .await
+    .map_err(|error| format!("CLI check worker failed: {error}"))?
+}
+
+const TOOLS_CLI_ACTION_TIMEOUT_SECS: u64 = 15 * 60;
+
+#[tauri::command]
+async fn tools_run_cli_action(
+    manager: String,
+    package: String,
+    action: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = manager.trim().to_ascii_lowercase();
+        let action = action.trim().to_ascii_lowercase();
+        let package = package.trim().to_string();
+        if package.is_empty()
+            || package.len() > 120
+            || !package
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b'@'))
+        {
+            return Err("CLI package name is invalid.".to_string());
+        }
+        if !matches!(action.as_str(), "install" | "uninstall") {
+            return Err("CLI action must be install or uninstall.".to_string());
+        }
+        let (program, args): (String, Vec<String>) = match manager.as_str() {
+            "brew" => {
+                #[cfg(windows)]
+                return Err("Homebrew is not available on Windows; use winget or npm.".to_string());
+                #[cfg(not(windows))]
+                {
+                    let brew = tools_binary_on_path("brew")
+                        .ok_or_else(|| "Homebrew is not installed on this device.".to_string())?;
+                    (brew, vec![action.clone(), package.clone()])
+                }
+            }
+            "winget" => {
+                #[cfg(not(windows))]
+                return Err("winget is only available on Windows.".to_string());
+                #[cfg(windows)]
+                {
+                    let winget = tools_binary_on_path("winget")
+                        .ok_or_else(|| "winget is not installed on this device.".to_string())?;
+                    let mut winget_args = vec![
+                        action.clone(),
+                        "--id".to_string(),
+                        package.clone(),
+                        "--exact".to_string(),
+                    ];
+                    if action == "install" {
+                        winget_args.push("--accept-source-agreements".to_string());
+                        winget_args.push("--accept-package-agreements".to_string());
+                        winget_args.push("--silent".to_string());
+                    }
+                    (winget, winget_args)
+                }
+            }
+            "npm" => (
+                npm_binary().to_string(),
+                vec![action.clone(), "-g".to_string(), package.clone()],
+            ),
+            _ => return Err("CLI manager must be brew, winget, or npm.".to_string()),
+        };
+        let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let capture = run_command_capture(
+            &program,
+            &args_ref,
+            None,
+            Duration::from_secs(TOOLS_CLI_ACTION_TIMEOUT_SECS),
+            None,
+        )
+        .map_err(|error| format!("Unable to run {manager} {action}: {error}"))?;
+        let ok = capture.exit_code == Some(0);
+        Ok(json!({
+            "ok": ok,
+            "manager": manager,
+            "package": package,
+            "action": action,
+            "exit_code": capture.exit_code,
+            "message": if ok {
+                format!("{package} {action} completed.")
+            } else {
+                let stderr = capture.stderr.trim();
+                if stderr.is_empty() {
+                    format!("{manager} {action} failed for {package}.")
+                } else {
+                    format!("{manager} {action} failed: {}", stderr.chars().take(400).collect::<String>())
+                }
+            },
+        }))
+    })
+    .await
+    .map_err(|error| format!("CLI action worker failed: {error}"))?
 }
 
 #[tauri::command]

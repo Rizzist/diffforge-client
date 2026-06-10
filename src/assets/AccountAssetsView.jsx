@@ -19,6 +19,11 @@ import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
 import { Settings } from "@styled-icons/material-rounded/Settings";
+import HyperframeEditor, {
+  assetCanContainHyperframe,
+  assetLooksLikeHyperframe,
+  loadHyperframeAsset,
+} from "./HyperframeEditor.jsx";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
 const DEFAULT_ASSET_CLOUD_ID = "diffforge-ai-cloud";
@@ -347,6 +352,7 @@ function assetPreviewUrl(asset) {
 }
 
 function assetFileTypeLabel(asset) {
+  if (assetLooksLikeHyperframe(asset)) return "HYPER";
   const extension = assetFileExtension(asset);
   if (extension) return shortLabel(extension.toUpperCase(), 8);
   const kind = assetKind(asset);
@@ -427,12 +433,57 @@ export default function AccountAssetsView({
 }) {
   const repoPath = rootDirectory || defaultWorkingDirectory || "";
   const [assetMode, setAssetMode] = useState("tracked");
-  const trackedCount = useMemo(() => assetLibraryItems(library).length, [library]);
-  const untrackedCount = useMemo(() => assetLibraryItems(untrackedLibrary).length, [untrackedLibrary]);
+  const [hyperframeEditor, setHyperframeEditor] = useState(null);
+  const trackedItems = useMemo(() => assetLibraryItems(library), [library]);
+  const untrackedItems = useMemo(() => assetLibraryItems(untrackedLibrary), [untrackedLibrary]);
+  const allAssetItems = useMemo(() => {
+    const byKey = new Map();
+    [...trackedItems, ...untrackedItems].forEach((asset, index) => {
+      const key = assetId(asset) || assetLocalPath(asset) || `${assetName(asset, "asset")}:${index}`;
+      if (key && !byKey.has(key)) byKey.set(key, asset);
+    });
+    return [...byKey.values()];
+  }, [trackedItems, untrackedItems]);
+  const trackedCount = trackedItems.length;
+  const untrackedCount = untrackedItems.length;
+
+  const openHyperframeAsset = useCallback(async (asset) => {
+    if (!assetLocalPath(asset) || !assetCanContainHyperframe(asset)) return false;
+    try {
+      const loaded = await loadHyperframeAsset(asset);
+      if (!loaded.isHyperframe) return false;
+      setHyperframeEditor({
+        ...loaded,
+        asset,
+        assetKey: assetId(asset) || assetLocalPath(asset),
+      });
+      return true;
+    } catch (nextError) {
+      if (!assetLooksLikeHyperframe(asset)) return false;
+      setHyperframeEditor({
+        asset,
+        assetKey: assetId(asset) || assetLocalPath(asset),
+        error: nextError?.message || String(nextError || "Unable to open Hyperframe."),
+        html: "",
+        isHyperframe: true,
+        manifest: null,
+      });
+      return true;
+    }
+  }, []);
 
   return (
     <AssetsSurface aria-label="Account Assets" data-state={loading ? "loading" : "ready"}>
-      {assetMode === "untracked" ? (
+      {hyperframeEditor ? (
+        <HyperframeEditor
+          asset={hyperframeEditor.asset}
+          assets={allAssetItems}
+          initialDocument={hyperframeEditor}
+          onBack={() => setHyperframeEditor(null)}
+          onRefreshTracked={onRefresh}
+          onRefreshUntracked={onUntrackedRefresh}
+        />
+      ) : assetMode === "untracked" ? (
         <UntrackedAssetsPanel
           assetMode={assetMode}
           assetWorkspaces={assetWorkspaces}
@@ -440,6 +491,7 @@ export default function AccountAssetsView({
           library={untrackedLibrary}
           loading={untrackedLoading}
           onAssetModeChange={setAssetMode}
+          onOpenHyperframeAsset={openHyperframeAsset}
           onDelete={onUntrackedDelete}
           onPromote={onUntrackedPromote}
           onRefresh={onUntrackedRefresh}
@@ -459,6 +511,7 @@ export default function AccountAssetsView({
           loading={loading}
           onAssetModeChange={setAssetMode}
           onLoadCached={onLoadCached}
+          onOpenHyperframeAsset={openHyperframeAsset}
           onRefresh={onRefresh}
           repoLabel="Assets"
           repoPath={repoPath}
@@ -510,6 +563,7 @@ function AssetsPanel({
   loading = false,
   onAssetModeChange,
   onLoadCached,
+  onOpenHyperframeAsset,
   onRefresh,
   repoLabel,
   repoPath,
@@ -776,6 +830,9 @@ function AssetsPanel({
       setBusyKey(key);
       setActionError("");
       try {
+        if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
+          return;
+        }
         await openPath(localPath);
       } catch (nextError) {
         setActionError(nextError?.message || String(nextError || "Unable to open asset."));
@@ -866,7 +923,7 @@ function AssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [effectiveCloudId, refresh, repoPath, selectedCloudLabel, workspaceOptionForAsset]);
+  }, [effectiveCloudId, onOpenHyperframeAsset, refresh, repoPath, selectedCloudLabel, workspaceOptionForAsset]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
     const id = assetId(asset);
@@ -1118,6 +1175,7 @@ function AssetsPanel({
             const previewUrl = assetPreviewUrl(asset);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
+            const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
             const rowWorkspaceOption = workspaceOptionForAsset(asset);
             const canRunAssetAction = Boolean(
               (assetRepoPath(asset) || rowWorkspaceOption?.rootDirectory || repoPath)
@@ -1146,10 +1204,10 @@ function AssetsPanel({
             return (
               <AssetCard data-selected={selected ? "true" : "false"} data-status={cardStatus} key={id} title={localPath || assetSha(asset) || name}>
                 <AssetCardPreview
-                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
                   onClick={() => runAssetAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Open big view and annotate" : "Open file"}
+                  title={shouldShowImagePreview ? "Open big view and annotate" : shouldOpenHyperframeEditor ? "Open Hyperframe editor" : "Open file"}
                   type="button"
                 >
                   {shouldShowImagePreview ? (
@@ -1484,6 +1542,7 @@ function UntrackedAssetsPanel({
   loading = false,
   onAssetModeChange,
   onDelete,
+  onOpenHyperframeAsset,
   onPromote,
   onRefresh,
   onRename,
@@ -1554,6 +1613,9 @@ function UntrackedAssetsPanel({
     setActionError("");
     try {
       if (action === "open") {
+        if (typeof onOpenHyperframeAsset === "function" && await onOpenHyperframeAsset(asset)) {
+          return;
+        }
         await openPath(localPath);
       } else if (action === "view") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
@@ -1586,7 +1648,7 @@ function UntrackedAssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [defaultWorkspace, onDelete, onPromote, onRename, repoPath, trackedRefresh]);
+  }, [defaultWorkspace, onDelete, onOpenHyperframeAsset, onPromote, onRename, repoPath, trackedRefresh]);
 
   const runSelectedUntrackedAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
@@ -1705,6 +1767,7 @@ function UntrackedAssetsPanel({
             const previewUrl = assetPreviewUrl(asset);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
+            const shouldOpenHyperframeEditor = !shouldShowImagePreview && assetCanContainHyperframe(asset) && Boolean(localPath);
             const openBusy = busyKey === `open:${id}`;
             const viewBusy = busyKey === `view:${id}`;
             const copyBusy = busyKey === `copy:${id}`;
@@ -1718,10 +1781,10 @@ function UntrackedAssetsPanel({
             return (
               <AssetCard data-selected={selected ? "true" : "false"} data-status="parked" key={id} title={localPath || name}>
                 <AssetCardPreview
-                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : `Open ${name}`}
+                  aria-label={shouldShowImagePreview ? `Open ${name} in image editor` : shouldOpenHyperframeEditor ? `Open ${name} in Hyperframe editor` : `Open ${name}`}
                   disabled={!localPath || Boolean(busyKey)}
                   onClick={() => runUntrackedAction(shouldShowImagePreview ? "view" : "open", asset)}
-                  title={shouldShowImagePreview ? "Open big view and annotate" : "Open file"}
+                  title={shouldShowImagePreview ? "Open big view and annotate" : shouldOpenHyperframeEditor ? "Open Hyperframe editor" : "Open file"}
                   type="button"
                 >
                   {shouldShowImagePreview ? (
