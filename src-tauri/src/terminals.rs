@@ -2699,10 +2699,15 @@ fn terminal_coordination_launch_target_with_mounts(
             TerminalSessionMode::ManagedPatch | TerminalSessionMode::General
         );
     let has_git_or_selected_empty_bootstrap = has_git || selected_workspace_empty_git_bootstrap;
+    let agent_session_mode = terminal_agent_session_mode_for_root(&target_root);
     let git_worktrees_enabled = has_git_or_selected_empty_bootstrap
-        && terminal_agent_worktrees_enabled_for_root(&target_root);
+        && agent_session_mode
+            == crate::coordination::kernel::AGENT_SESSION_MODE_WORKTREE_COORDINATION;
+    let direct_unmanaged_workspace = agent_session_mode
+        == crate::coordination::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED;
     let enforcement_mode = match session_mode {
         TerminalSessionMode::ManagedPatch if git_worktrees_enabled => "worktree_required",
+        TerminalSessionMode::ManagedPatch if direct_unmanaged_workspace => "direct_unmanaged",
         TerminalSessionMode::ManagedPatch if has_git_or_selected_empty_bootstrap => {
             "bounded_direct_edit"
         }
@@ -2713,8 +2718,10 @@ fn terminal_coordination_launch_target_with_mounts(
             );
         }
         TerminalSessionMode::General if git_worktrees_enabled => "worktree_required",
+        TerminalSessionMode::General if direct_unmanaged_workspace => "direct_unmanaged",
         TerminalSessionMode::General => "bounded_direct_edit",
         TerminalSessionMode::DirectEdit if git_worktrees_enabled && has_git => "worktree_required",
+        TerminalSessionMode::DirectEdit if direct_unmanaged_workspace => "direct_unmanaged",
         TerminalSessionMode::DirectEdit => "bounded_direct_edit",
         TerminalSessionMode::Activity => "activity_only",
         TerminalSessionMode::RemoteOps => "remote_unmanaged",
@@ -2731,17 +2738,17 @@ fn terminal_coordination_launch_target_with_mounts(
     })
 }
 
-fn terminal_agent_worktrees_enabled_for_root(root: &Path) -> bool {
+fn terminal_agent_session_mode_for_root(root: &Path) -> &'static str {
     let Ok((kernel, _)) =
         crate::coordination::CoordinationKernel::open_for_terminal_launch(root, None)
     else {
-        return false;
+        return crate::coordination::kernel::AGENT_SESSION_MODE_DIRECT_COORDINATION;
     };
     kernel
         .repo_policy()
         .ok()
-        .and_then(|policy| policy["agent_worktree_required"].as_i64())
-        == Some(1)
+        .map(|policy| crate::coordination::kernel::repo_policy_agent_session_mode(&policy))
+        .unwrap_or(crate::coordination::kernel::AGENT_SESSION_MODE_DIRECT_COORDINATION)
 }
 
 fn terminal_context_requires_isolated_worktree(
@@ -11609,6 +11616,14 @@ mod terminal_tests {
             .unwrap();
     }
 
+    fn terminal_enable_direct_unmanaged_agents(repo: &Path) {
+        let (kernel, _) =
+            crate::coordination::CoordinationKernel::open_for_terminal_launch(repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+    }
+
     fn terminal_test_repo_with_commit(name: &str) -> PathBuf {
         let repo = terminal_test_repo(name);
         fs::write(repo.join("README.md"), "initial\n").unwrap();
@@ -11961,6 +11976,28 @@ mod terminal_tests {
         .unwrap();
 
         assert_eq!(target.enforcement_mode, "worktree_required");
+        assert!(!target.requires_git_bootstrap);
+        assert_eq!(
+            normalized_path_key(&target.root.canonicalize().unwrap()),
+            normalized_path_key(&repo.canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn general_terminal_launch_target_uses_direct_unmanaged_authority_when_policy_enabled() {
+        let repo = terminal_test_repo("general_git_unmanaged_policy_launch_target");
+        terminal_enable_direct_unmanaged_agents(&repo);
+
+        let target = terminal_coordination_launch_target(
+            &repo,
+            None,
+            None,
+            false,
+            TerminalSessionMode::General,
+        )
+        .unwrap();
+
+        assert_eq!(target.enforcement_mode, "direct_unmanaged");
         assert!(!target.requires_git_bootstrap);
         assert_eq!(
             normalized_path_key(&target.root.canonicalize().unwrap()),

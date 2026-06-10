@@ -1006,7 +1006,9 @@ fn apply_claude_coordinated_auto_approval_args(
     let general_worker =
         enforcement_mode.trim() == "general_worker" || file_authority.trim() == "task_scoped";
     let direct_edit_allowed = enforcement_mode.trim() == "bounded_direct_edit"
-        || file_authority.trim() == "bounded_direct_edit";
+        || file_authority.trim() == "bounded_direct_edit"
+        || enforcement_mode.trim() == "direct_unmanaged"
+        || file_authority.trim() == "direct_unmanaged";
     let view_root = terminal_coordination_env_value(coordination, "COORDINATION_VISIBLE_ROOT")
         .or_else(|| terminal_coordination_env_value(coordination, "COORDINATION_PROJECT_ROOT"))
         .filter(|value| !value.trim().is_empty())

@@ -102,6 +102,7 @@ impl TerminalCoordinationContext {
             "general_worker" => "task_scoped",
             "worktree_required" => "git_worktree_patch",
             "bounded_direct_edit" => "bounded_direct_edit",
+            "direct_unmanaged" => "direct_unmanaged",
             "activity_only" => "none",
             "remote_unmanaged" => "remote_unmanaged",
             "coordination_only" => "none",
@@ -123,10 +124,10 @@ impl TerminalCoordinationContext {
     }
 
     pub fn completion_mode(&self) -> &'static str {
-        if self.enforcement_mode == "worktree_required" {
-            "submit_patch"
-        } else {
-            "complete_task"
+        match self.enforcement_mode.as_str() {
+            "worktree_required" => "submit_patch",
+            "direct_unmanaged" => "none",
+            _ => "complete_task",
         }
     }
 

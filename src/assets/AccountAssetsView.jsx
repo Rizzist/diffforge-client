@@ -18,8 +18,10 @@ import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile"
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
+import { Settings } from "@styled-icons/material-rounded/Settings";
 
 const ASSET_IMAGE_EXTENSIONS = new Set(["avif", "bmp", "gif", "jpeg", "jpg", "png", "svg", "webp"]);
+const DEFAULT_ASSET_CLOUD_ID = "diffforge-ai-cloud";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -76,6 +78,49 @@ function assetLibraryAggregate(value) {
   const object = jsonObject(value) || {};
   const data = jsonObject(object.data) || object;
   return jsonObject(data.aggregate) || {};
+}
+
+function assetLibraryClouds(value) {
+  const object = jsonObject(value) || {};
+  const data = jsonObject(object.data) || object;
+  const direct = jsonArray(data.clouds).length
+    ? jsonArray(data.clouds)
+    : jsonArray(data.assetClouds).length
+      ? jsonArray(data.assetClouds)
+      : jsonArray(data.asset_clouds);
+  const byId = new Map();
+  const add = (cloud) => {
+    if (!cloud || typeof cloud !== "object") return;
+    const id = text(cloud.cloudId || cloud.cloud_id || cloud.id);
+    if (!id || byId.has(id)) return;
+    byId.set(id, {
+      ...cloud,
+      cloudId: id,
+      cloud_id: id,
+      label: text(cloud.label || cloud.name, id === DEFAULT_ASSET_CLOUD_ID ? "Diff Forge AI Cloud" : id),
+      providerKind: text(cloud.providerKind || cloud.provider_kind || cloud.provider, id === DEFAULT_ASSET_CLOUD_ID ? "diffforge" : "s3"),
+    });
+  };
+  direct.forEach(add);
+  assetLibraryItems(value).forEach((asset) => {
+    jsonArray(asset?.registeredClouds).forEach(add);
+    jsonArray(asset?.registered_clouds).forEach(add);
+    jsonArray(asset?.clouds).forEach(add);
+  });
+  if (!byId.has(DEFAULT_ASSET_CLOUD_ID)) {
+    add({
+      cloudId: DEFAULT_ASSET_CLOUD_ID,
+      cloud_id: DEFAULT_ASSET_CLOUD_ID,
+      label: "Diff Forge AI Cloud",
+      providerKind: "diffforge",
+      provider_kind: "diffforge",
+      defaultCloud: true,
+      default_cloud: true,
+      builtin: true,
+      status: "active",
+    });
+  }
+  return [...byId.values()];
 }
 
 function assetId(asset, fallback = "") {
@@ -152,11 +197,16 @@ function assetTransferDeviceSummary(transfers) {
   return `${labels.slice(0, 2).join(" · ")} · +${labels.length - 2} more`;
 }
 
-function latestAssetTransfer(transfers, asset) {
+function assetTransferCloudId(transfer) {
+  return text(transfer?.cloudId || transfer?.cloud_id || transfer?.assetCloudId || transfer?.asset_cloud_id, DEFAULT_ASSET_CLOUD_ID);
+}
+
+function latestAssetTransfer(transfers, asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
   const id = assetId(asset);
   if (!id) return null;
+  const selectedCloud = text(cloudId, DEFAULT_ASSET_CLOUD_ID);
   return transfers
-    .filter((transfer) => assetTransferAssetId(transfer) === id)
+    .filter((transfer) => assetTransferAssetId(transfer) === id && assetTransferCloudId(transfer) === selectedCloud)
     .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))[0] || null;
 }
 
@@ -215,7 +265,34 @@ function assetLocalAvailable(asset) {
   return Boolean(assetLocalPath(asset));
 }
 
-function assetCloudAvailable(asset) {
+function assetCloudState(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
+  const selectedCloud = text(cloudId, DEFAULT_ASSET_CLOUD_ID);
+  const maps = [
+    jsonObject(asset?.cloudStatusByCloud),
+    jsonObject(asset?.cloud_status_by_cloud),
+  ].filter(Boolean);
+  for (const map of maps) {
+    if (map[selectedCloud]) return jsonObject(map[selectedCloud]) || map[selectedCloud];
+  }
+  const rows = [
+    ...jsonArray(asset?.clouds),
+    ...jsonArray(asset?.cloudStatuses),
+    ...jsonArray(asset?.cloud_statuses),
+  ];
+  return rows.find((row) => text(row?.cloudId || row?.cloud_id || row?.id) === selectedCloud) || null;
+}
+
+function assetCloudAvailable(asset, cloudId = DEFAULT_ASSET_CLOUD_ID) {
+  const cloudState = assetCloudState(asset, cloudId);
+  if (cloudState) {
+    const explicit = cloudState.cloudAvailable ?? cloudState.cloud_available;
+    if (typeof explicit === "boolean") return explicit;
+    const stateStatus = text(
+      cloudState.cloudStatus || cloudState.cloud_status || cloudState.status,
+    ).toLowerCase().replace(/[_\s]+/gu, "-");
+    if (["complete", "cloud-available", "available", "ready", "synced", "uploaded"].includes(stateStatus)) return true;
+    if (["deleted", "cloud-deleted-local-kept", "local-only", "missing", "not-found", "unavailable"].includes(stateStatus)) return false;
+  }
   const explicit = asset?.cloudAvailable ?? asset?.cloud_available;
   if (typeof explicit === "boolean") return explicit;
   const cloudStatus = text(
@@ -230,11 +307,12 @@ function assetCloudAvailable(asset) {
   return Boolean(asset?.blobId || asset?.blob_id || asset?.objectKey || asset?.object_key);
 }
 
-function assetAvailability(asset) {
+function assetAvailability(asset, cloudId = DEFAULT_ASSET_CLOUD_ID, cloudLabel = "Cloud") {
   const hasLocal = assetLocalAvailable(asset);
-  const hasCloud = assetCloudAvailable(asset);
-  if (hasLocal && hasCloud) return { hasCloud, hasLocal, label: "Local & Cloud", statusKind: "done" };
-  if (hasCloud) return { hasCloud, hasLocal, label: "Cloud only", statusKind: "done" };
+  const hasCloud = assetCloudAvailable(asset, cloudId);
+  const label = shortLabel(cloudLabel || "Cloud", 18);
+  if (hasLocal && hasCloud) return { hasCloud, hasLocal, label: `Local & ${label}`, statusKind: "done" };
+  if (hasCloud) return { hasCloud, hasLocal, label: `${label} only`, statusKind: "done" };
   if (hasLocal) return { hasCloud, hasLocal, label: "Local only", statusKind: "parked" };
   return { hasCloud, hasLocal, label: "Unavailable", statusKind: "failed" };
 }
@@ -442,11 +520,53 @@ function AssetsPanel({
   const items = useMemo(() => assetLibraryItems(library), [library]);
   const transfers = useMemo(() => assetLibraryTransfers(library), [library]);
   const aggregate = useMemo(() => assetLibraryAggregate(library), [library]);
+  const libraryClouds = useMemo(() => assetLibraryClouds(library), [library]);
+  const [cloudsOverride, setCloudsOverride] = useState([]);
+  const clouds = useMemo(() => {
+    const byId = new Map();
+    [...libraryClouds, ...cloudsOverride].forEach((cloud) => {
+      const id = text(cloud?.cloudId || cloud?.cloud_id || cloud?.id);
+      if (!id) return;
+      byId.set(id, {
+        ...cloud,
+        cloudId: id,
+        cloud_id: id,
+        label: text(cloud?.label || cloud?.name, id === DEFAULT_ASSET_CLOUD_ID ? "Diff Forge AI Cloud" : id),
+      });
+    });
+    return [...byId.values()];
+  }, [cloudsOverride, libraryClouds]);
+  const defaultCloudId = useMemo(() => (
+    text(
+      clouds.find((cloud) => cloud?.defaultCloud || cloud?.default_cloud)?.cloudId
+        || clouds.find((cloud) => cloud?.defaultCloud || cloud?.default_cloud)?.cloud_id,
+      DEFAULT_ASSET_CLOUD_ID,
+    )
+  ), [clouds]);
+  const [selectedCloudId, setSelectedCloudId] = useState(DEFAULT_ASSET_CLOUD_ID);
+  const [cloudSettingsOpen, setCloudSettingsOpen] = useState(false);
+  const [cloudSettingsError, setCloudSettingsError] = useState("");
+  const [cloudSettingsBusy, setCloudSettingsBusy] = useState("");
   const [selectedWorkspaceFilterKeys, setSelectedWorkspaceFilterKeys] = useState([]);
   const [busyKey, setBusyKey] = useState("");
   const [actionError, setActionError] = useState("");
   const [failedPreviewKeys, setFailedPreviewKeys] = useState(() => new Set());
   const [selectedAssetIds, setSelectedAssetIds] = useState(() => new Set());
+  const selectedCloud = useMemo(() => (
+    clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === selectedCloudId)
+      || clouds.find((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id) === defaultCloudId)
+      || { cloudId: DEFAULT_ASSET_CLOUD_ID, cloud_id: DEFAULT_ASSET_CLOUD_ID, label: "Diff Forge AI Cloud" }
+  ), [clouds, defaultCloudId, selectedCloudId]);
+  const selectedCloudLabel = text(selectedCloud?.label || selectedCloud?.name, "Cloud");
+  const effectiveCloudId = text(selectedCloud?.cloudId || selectedCloud?.cloud_id || selectedCloudId, DEFAULT_ASSET_CLOUD_ID);
+
+  useEffect(() => {
+    if (!clouds.length) return;
+    const ids = new Set(clouds.map((cloud) => text(cloud.cloudId || cloud.cloud_id || cloud.id)).filter(Boolean));
+    if (!ids.has(selectedCloudId)) {
+      setSelectedCloudId(defaultCloudId);
+    }
+  }, [clouds, defaultCloudId, selectedCloudId]);
 
   const workspaceFilterOptions = useMemo(() => {
     const options = [];
@@ -506,12 +626,13 @@ function AssetsPanel({
     [filteredItems],
   );
   const visibleTransfers = useMemo(() => (
-    selectedWorkspaceFilterOptions.length
+    (selectedWorkspaceFilterOptions.length
       ? transfers.filter((transfer) => visibleAssetIds.has(text(transfer?.assetId || transfer?.asset_id)))
       : transfers
-  ), [selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
-  const cloudCount = filteredItems.filter((item) => assetAvailability(item).hasCloud).length;
-  const localCount = filteredItems.filter((item) => assetAvailability(item).hasLocal).length;
+    ).filter((transfer) => assetTransferCloudId(transfer) === effectiveCloudId)
+  ), [effectiveCloudId, selectedWorkspaceFilterOptions.length, transfers, visibleAssetIds]);
+  const cloudCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasCloud).length;
+  const localCount = filteredItems.filter((item) => assetAvailability(item, effectiveCloudId, selectedCloudLabel).hasLocal).length;
   const activeTransfers = selectedWorkspaceFilterOptions.length
     ? visibleTransfers.filter((transfer) => assetTransferStatusKind(transfer) === "active").length
     : numberValue(aggregate.activeTransfers ?? aggregate.active_transfers, 0)
@@ -540,6 +661,77 @@ function AssetsPanel({
   const refresh = useCallback((options = { silent: true }) => (
     typeof onRefresh === "function" ? onRefresh(options) : Promise.resolve(null)
   ), [onRefresh]);
+
+  const refreshClouds = useCallback(async () => {
+    setCloudSettingsError("");
+    const response = await invoke("cloud_mcp_list_asset_clouds", {
+      repoPath,
+      workspaceId: null,
+      workspaceName: null,
+    });
+    const nextClouds = assetLibraryClouds(response);
+    setCloudsOverride(nextClouds);
+    return nextClouds;
+  }, [repoPath]);
+
+  useEffect(() => {
+    if (!cloudSettingsOpen) return;
+    void refreshClouds().catch((nextError) => {
+      setCloudSettingsError(nextError?.message || String(nextError || "Unable to load asset clouds."));
+    });
+  }, [cloudSettingsOpen, refreshClouds]);
+
+  const runCloudSettingsAction = useCallback(async (action, payload = {}) => {
+    const cloudId = text(payload.cloudId || payload.cloud_id || payload.id);
+    const key = `${action}:${cloudId || "new"}`;
+    setCloudSettingsBusy(key);
+    setCloudSettingsError("");
+    try {
+      let response = null;
+      if (action === "save") {
+        response = await invoke("cloud_mcp_save_asset_cloud", {
+          repoPath,
+          workspaceId: null,
+          workspaceName: null,
+          cloud: payload,
+        });
+      } else if (action === "validate") {
+        response = await invoke("cloud_mcp_validate_asset_cloud", {
+          repoPath,
+          workspaceId: null,
+          workspaceName: null,
+          cloudId,
+        });
+      } else if (action === "default") {
+        response = await invoke("cloud_mcp_set_default_asset_cloud", {
+          repoPath,
+          workspaceId: null,
+          workspaceName: null,
+          cloudId,
+        });
+        if (cloudId) setSelectedCloudId(cloudId);
+      } else if (action === "delete") {
+        response = await invoke("cloud_mcp_delete_asset_cloud", {
+          repoPath,
+          workspaceId: null,
+          workspaceName: null,
+          cloudId,
+        });
+        if (cloudId === effectiveCloudId) setSelectedCloudId(DEFAULT_ASSET_CLOUD_ID);
+      } else if (action === "refresh") {
+        response = { clouds: await refreshClouds() };
+      }
+      const nextClouds = assetLibraryClouds(response);
+      if (nextClouds.length) setCloudsOverride(nextClouds);
+      await refresh({ silent: true, force: true });
+      return response;
+    } catch (nextError) {
+      setCloudSettingsError(nextError?.message || String(nextError || "Cloud settings update failed."));
+      return null;
+    } finally {
+      setCloudSettingsBusy((current) => (current === key ? "" : current));
+    }
+  }, [effectiveCloudId, refresh, refreshClouds, repoPath]);
 
   useEffect(() => {
     if (!busyKey && !activeTransfers) return undefined;
@@ -577,7 +769,7 @@ function AssetsPanel({
     const id = assetId(asset);
     const name = assetName(asset, "asset");
     const localPath = assetLocalPath(asset);
-    const availability = assetAvailability(asset);
+    const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
     if (["copy", "open", "view"].includes(action) && !localPath) return;
     if (action === "open") {
       const key = `${action}:${id || localPath}`;
@@ -638,6 +830,7 @@ function AssetsPanel({
           try {
             await invoke("cloud_mcp_delete_cloud_workspace_asset", {
               assetId: id,
+              cloudId: effectiveCloudId,
               repoPath: actionRepoPath,
               workspaceId: actionWorkspaceId,
               workspaceName: actionWorkspaceName,
@@ -660,6 +853,7 @@ function AssetsPanel({
               : "cloud_mcp_delete_cloud_workspace_asset";
         await invoke(command, {
           assetId: id,
+          cloudId: ["upload", "download", "deleteCloud"].includes(action) ? effectiveCloudId : undefined,
           deleteFile: action === "deleteLocal" ? true : undefined,
           repoPath: actionRepoPath,
           workspaceId: actionWorkspaceId,
@@ -672,7 +866,7 @@ function AssetsPanel({
     } finally {
       setBusyKey((current) => (current === key ? "" : current));
     }
-  }, [refresh, repoPath, workspaceOptionForAsset]);
+  }, [effectiveCloudId, refresh, repoPath, selectedCloudLabel, workspaceOptionForAsset]);
 
   const cancelAssetTransfer = useCallback(async (asset, transfer) => {
     const id = assetId(asset);
@@ -720,7 +914,7 @@ function AssetsPanel({
           const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
           const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
           const actionWorkspaceName = assetWorkspaceName(asset) || actionWorkspace?.name;
-          const availability = assetAvailability(asset);
+          const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
           if (!id || !actionRepoPath || !actionWorkspaceId) {
             continue;
           }
@@ -737,6 +931,7 @@ function AssetsPanel({
           if (availability.hasCloud) {
             await invoke("cloud_mcp_delete_cloud_workspace_asset", {
               assetId: id,
+              cloudId: effectiveCloudId,
               repoPath: actionRepoPath,
               workspaceId: actionWorkspaceId,
               workspaceName: actionWorkspaceName,
@@ -762,6 +957,8 @@ function AssetsPanel({
     repoPath,
     selectedAssets,
     selectedImageAssets,
+    effectiveCloudId,
+    selectedCloudLabel,
     workspaceOptionForAsset,
   ]);
 
@@ -788,7 +985,7 @@ function AssetsPanel({
         </div>
         <AssetHeaderActions>
           <AssetsSummary>
-            {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} cloud
+            {filteredItems.length}{hasWorkspaceFilters ? ` / ${items.length}` : ""} asset{assetCountPluralBase === 1 ? "" : "s"} · {localCount} local · {cloudCount} {shortLabel(selectedCloudLabel, 14)}
             {activeTransfers ? ` · ${activeTransfers} active` : ""}
             {activeTransferSummary ? ` · ${activeTransferSummary}` : ""}
           </AssetsSummary>
@@ -801,8 +998,45 @@ function AssetsPanel({
           >
             <Cached aria-hidden="true" />
           </AssetIconButton>
+          <AssetIconButton
+            aria-label="Asset cloud settings"
+            data-active={cloudSettingsOpen ? "true" : "false"}
+            onClick={() => setCloudSettingsOpen((open) => !open)}
+            title="Asset cloud settings"
+            type="button"
+          >
+            <Settings aria-hidden="true" />
+          </AssetIconButton>
         </AssetHeaderActions>
       </AssetsHeader>
+      <AssetCloudControls aria-label="Asset cloud">
+        {clouds.map((cloud) => {
+          const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
+          const active = cloudId === effectiveCloudId;
+          return (
+            <AssetCloudButton
+              aria-pressed={active}
+              data-active={active}
+              key={cloudId}
+              onClick={() => setSelectedCloudId(cloudId)}
+              title={text(cloud.endpoint || cloud.bucket || cloud.providerKind || cloud.provider_kind, cloud.label)}
+              type="button"
+            >
+              <Cloud aria-hidden="true" />
+              <span>{shortLabel(cloud.label, 22)}</span>
+            </AssetCloudButton>
+          );
+        })}
+      </AssetCloudControls>
+      {cloudSettingsOpen && (
+        <AssetCloudSettingsPanel
+          busyKey={cloudSettingsBusy}
+          clouds={clouds}
+          error={cloudSettingsError}
+          onAction={runCloudSettingsAction}
+          selectedCloudId={effectiveCloudId}
+        />
+      )}
       {workspaceFilterOptions.length > 0 && (
         <AssetWorkspaceFilters aria-label="Asset workspace filters">
           <AssetFilterButton
@@ -870,8 +1104,8 @@ function AssetsPanel({
           {filteredItems.map((asset, index) => {
             const id = assetId(asset, `asset-${index}`);
             const name = assetName(asset, `Asset ${index + 1}`);
-            const availability = assetAvailability(asset);
-            const transfer = latestAssetTransfer(visibleTransfers, asset);
+            const availability = assetAvailability(asset, effectiveCloudId, selectedCloudLabel);
+            const transfer = latestAssetTransfer(visibleTransfers, asset, effectiveCloudId);
             const transferStatus = transfer ? assetTransferStatusKind(transfer) : "";
             const transferActive = transferStatus === "active";
             const transferFailed = transferStatus === "failed";
@@ -943,7 +1177,7 @@ function AssetsPanel({
                     </AssetDocumentPreview>
                   )}
                 </AssetCardPreview>
-                <AssetCardStatus data-status={availability.statusKind} title={`Availability: ${availability.label}`}>
+                <AssetCardStatus data-status={availability.statusKind} title={`${selectedCloudLabel}: ${availability.label}`}>
                   {availability.label}
                 </AssetCardStatus>
                 {transferActive && (
@@ -1081,6 +1315,164 @@ function AssetsPanel({
         </AssetGrid>
       )}
     </AssetsPane>
+  );
+}
+
+function AssetCloudSettingsPanel({
+  busyKey = "",
+  clouds = [],
+  error = "",
+  onAction,
+  selectedCloudId = DEFAULT_ASSET_CLOUD_ID,
+}) {
+  const [form, setForm] = useState({
+    accessKeyId: "",
+    bucket: "",
+    endpoint: "",
+    keyPrefix: "diffforge/assets/blobs",
+    label: "",
+    makeDefault: false,
+    providerKind: "s3",
+    region: "us-east-1",
+    secretAccessKey: "",
+  });
+  const setField = useCallback((key, value) => {
+    setForm((current) => ({ ...current, [key]: value }));
+  }, []);
+  const providerKind = text(form.providerKind, "s3");
+  const canSave = text(form.label)
+    && text(form.bucket)
+    && text(form.endpoint)
+    && text(form.accessKeyId)
+    && text(form.secretAccessKey);
+  const submit = useCallback(async (event) => {
+    event.preventDefault();
+    if (!canSave || typeof onAction !== "function") return;
+    const response = await onAction("save", {
+      bucket: form.bucket,
+      credentials: {
+        accessKeyId: form.accessKeyId,
+        access_key_id: form.accessKeyId,
+        secretAccessKey: form.secretAccessKey,
+        secret_access_key: form.secretAccessKey,
+      },
+      defaultCloud: form.makeDefault,
+      default_cloud: form.makeDefault,
+      endpoint: form.endpoint,
+      keyPrefix: form.keyPrefix,
+      key_prefix: form.keyPrefix,
+      label: form.label,
+      providerKind,
+      provider_kind: providerKind,
+      region: form.region,
+    });
+    if (response) {
+      setForm((current) => ({
+        ...current,
+        accessKeyId: "",
+        bucket: "",
+        endpoint: "",
+        label: "",
+        makeDefault: false,
+        secretAccessKey: "",
+      }));
+    }
+  }, [canSave, form, onAction, providerKind]);
+
+  return (
+    <AssetCloudSettings>
+      <AssetCloudList>
+        {clouds.map((cloud) => {
+          const cloudId = text(cloud.cloudId || cloud.cloud_id || cloud.id, DEFAULT_ASSET_CLOUD_ID);
+          const builtin = cloudId === DEFAULT_ASSET_CLOUD_ID || cloud.builtin;
+          const isDefault = Boolean(cloud.defaultCloud || cloud.default_cloud);
+          return (
+            <AssetCloudRow data-active={cloudId === selectedCloudId} key={cloudId}>
+              <Cloud aria-hidden="true" />
+              <AssetCloudRowText>
+                <strong>{text(cloud.label || cloud.name, cloudId)}</strong>
+                <span>{text(cloud.providerKind || cloud.provider_kind || cloud.provider, "cloud")} {isDefault ? "· default" : ""}</span>
+              </AssetCloudRowText>
+              <AssetCloudRowActions>
+                {!builtin && (
+                  <AssetMiniButton
+                    disabled={Boolean(busyKey)}
+                    onClick={() => onAction?.("validate", { cloudId })}
+                    type="button"
+                  >
+                    Test
+                  </AssetMiniButton>
+                )}
+                {!isDefault && (
+                  <AssetMiniButton
+                    disabled={Boolean(busyKey)}
+                    onClick={() => onAction?.("default", { cloudId })}
+                    type="button"
+                  >
+                    Default
+                  </AssetMiniButton>
+                )}
+                {!builtin && (
+                  <AssetMiniButton
+                    data-danger="true"
+                    disabled={Boolean(busyKey)}
+                    onClick={() => {
+                      if (window.confirm(`Remove ${text(cloud.label || cloudId)}?`)) {
+                        void onAction?.("delete", { cloudId });
+                      }
+                    }}
+                    type="button"
+                  >
+                    Remove
+                  </AssetMiniButton>
+                )}
+              </AssetCloudRowActions>
+            </AssetCloudRow>
+          );
+        })}
+      </AssetCloudList>
+      <AssetCloudForm onSubmit={submit}>
+        <AssetProviderTabs aria-label="Cloud provider">
+          {["s3", "r2", "b2"].map((provider) => (
+            <AssetProviderButton
+              aria-pressed={providerKind === provider}
+              data-active={providerKind === provider}
+              key={provider}
+              onClick={() => {
+                setField("providerKind", provider);
+                if (provider === "r2") setField("region", "auto");
+                if (provider === "s3" && form.region === "auto") setField("region", "us-east-1");
+              }}
+              type="button"
+            >
+              {provider.toUpperCase()}
+            </AssetProviderButton>
+          ))}
+        </AssetProviderTabs>
+        <AssetCloudFields>
+          <AssetCloudInput aria-label="Cloud label" placeholder="Cloud label" value={form.label} onChange={(event) => setField("label", event.target.value)} />
+          <AssetCloudInput aria-label="Bucket" placeholder="Bucket" value={form.bucket} onChange={(event) => setField("bucket", event.target.value)} />
+          <AssetCloudInput aria-label="Endpoint" placeholder="Endpoint URL" value={form.endpoint} onChange={(event) => setField("endpoint", event.target.value)} />
+          <AssetCloudInput aria-label="Region" placeholder="Region" value={form.region} onChange={(event) => setField("region", event.target.value)} />
+          <AssetCloudInput aria-label="Key prefix" placeholder="Key prefix" value={form.keyPrefix} onChange={(event) => setField("keyPrefix", event.target.value)} />
+          <AssetCloudInput aria-label="Access key id" placeholder="Access key id" value={form.accessKeyId} onChange={(event) => setField("accessKeyId", event.target.value)} />
+          <AssetCloudInput aria-label="Secret access key" placeholder="Secret access key" type="password" value={form.secretAccessKey} onChange={(event) => setField("secretAccessKey", event.target.value)} />
+        </AssetCloudFields>
+        <AssetCloudFormFooter>
+          <label>
+            <input checked={form.makeDefault} onChange={(event) => setField("makeDefault", event.target.checked)} type="checkbox" />
+            Default
+          </label>
+          <AssetMiniButton data-primary="true" disabled={!canSave || Boolean(busyKey)} type="submit">
+            Add Cloud
+          </AssetMiniButton>
+          <AssetMiniButton disabled={Boolean(busyKey)} onClick={() => onAction?.("refresh")} type="button">
+            Refresh
+          </AssetMiniButton>
+        </AssetCloudFormFooter>
+        {error && <AssetCloudError>{error}</AssetCloudError>}
+      </AssetCloudForm>
+    </AssetCloudSettings>
   );
 }
 
@@ -1620,6 +2012,277 @@ const AssetHeaderActions = styled.div`
     width: 100%;
     justify-content: space-between;
   }
+`;
+
+const AssetCloudControls = styled.div`
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+`;
+
+const AssetCloudButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  max-width: 190px;
+  padding: 0 9px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 7px;
+  color: rgba(203, 213, 225, 0.78);
+  background: rgba(15, 23, 42, 0.36);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+  cursor: pointer;
+
+  svg {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.14);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(45, 212, 191, 0.34);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.2);
+  }
+`;
+
+const AssetCloudSettings = styled.div`
+  display: grid;
+  grid-template-columns: minmax(180px, 0.85fr) minmax(260px, 1.15fr);
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.36);
+
+  @media (max-width: 820px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const AssetCloudList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  max-height: 220px;
+  overflow: auto;
+`;
+
+const AssetCloudRow = styled.div`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.34);
+
+  > svg {
+    width: 16px;
+    height: 16px;
+    color: rgba(125, 211, 252, 0.78);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(45, 212, 191, 0.26);
+    background: rgba(13, 148, 136, 0.12);
+  }
+`;
+
+const AssetCloudRowText = styled.div`
+  min-width: 0;
+
+  strong,
+  span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.92);
+    font-size: 10px;
+    font-weight: 900;
+  }
+
+  span {
+    margin-top: 2px;
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 9px;
+    font-weight: 720;
+  }
+`;
+
+const AssetCloudRowActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+`;
+
+const AssetCloudForm = styled.form`
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+`;
+
+const AssetProviderTabs = styled.div`
+  display: inline-flex;
+  gap: 4px;
+  width: max-content;
+  padding: 3px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.34);
+`;
+
+const AssetProviderButton = styled.button`
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.76);
+  background: transparent;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 900;
+  cursor: pointer;
+
+  &[data-active="true"],
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(45, 212, 191, 0.26);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.18);
+  }
+`;
+
+const AssetCloudFields = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  min-width: 0;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const AssetCloudInput = styled.input`
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.92);
+  background: rgba(15, 23, 42, 0.5);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 760;
+  outline: none;
+
+  &:focus {
+    border-color: rgba(125, 211, 252, 0.42);
+  }
+
+  &::placeholder {
+    color: rgba(148, 163, 184, 0.64);
+  }
+`;
+
+const AssetCloudFormFooter = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+
+  label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: rgba(203, 213, 225, 0.78);
+    font-size: 10px;
+    font-weight: 820;
+  }
+`;
+
+const AssetMiniButton = styled.button`
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  color: rgba(226, 232, 240, 0.84);
+  background: rgba(15, 23, 42, 0.48);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 850;
+  cursor: pointer;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(125, 211, 252, 0.34);
+    color: rgba(224, 242, 254, 0.94);
+    background: rgba(14, 165, 233, 0.14);
+  }
+
+  &[data-primary="true"] {
+    border-color: rgba(45, 212, 191, 0.26);
+    color: rgba(204, 251, 241, 0.96);
+    background: rgba(13, 148, 136, 0.16);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(251, 113, 133, 0.2);
+    color: rgba(254, 205, 211, 0.9);
+    background: rgba(127, 29, 29, 0.16);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+`;
+
+const AssetCloudError = styled.div`
+  padding: 7px 8px;
+  border: 1px solid rgba(248, 113, 113, 0.22);
+  border-radius: 7px;
+  color: rgba(254, 202, 202, 0.92);
+  background: rgba(127, 29, 29, 0.12);
+  font-size: 10px;
+  font-weight: 760;
+  overflow-wrap: anywhere;
 `;
 
 const AssetWorkspaceFilters = styled.div`

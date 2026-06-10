@@ -10289,17 +10289,21 @@ impl CoordinationKernel {
         if root == self.paths.repo_path.as_path() {
             crate::ensure_architecture_agent_guide(root)?;
         }
-        let managed_terminal = if root == self.paths.repo_path.as_path() {
-            // The visible repo root carries the managed contract only when
-            // managed agents actually edit there with coordination (mode 2).
-            // Worktree mode edits in branch roots, and unmanaged direct mode
-            // must not instruct agents through the coordination lifecycle.
-            repo_policy_agent_session_mode(&self.repo_policy()?)
-                == AGENT_SESSION_MODE_DIRECT_COORDINATION
+        let variant = if root == self.paths.repo_path.as_path() {
+            // The shared visible root carries the coordination contract only
+            // when managed agents actually edit there with coordination
+            // (direct_coordination), and then only behind an explicit env gate
+            // so agents launched outside Diff Forge ignore it. Worktree mode
+            // keeps the contract in private branch roots, and unmanaged direct
+            // mode exposes no coordination knowledge at all.
+            match repo_policy_agent_session_mode(&self.repo_policy()?) {
+                AGENT_SESSION_MODE_DIRECT_COORDINATION => AgentContractVariant::ManagedEnvGated,
+                _ => AgentContractVariant::Plain,
+            }
         } else {
-            true
+            AgentContractVariant::Managed
         };
-        let contract = diffforge_agent_contract_markdown(managed_terminal);
+        let contract = diffforge_agent_contract_markdown(variant);
         let mut generated = Vec::new();
         if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
             generated.push("AGENTS.md");
@@ -24889,7 +24893,7 @@ fn append_codex_managed_permission_profile(
     };
     let write_enabled = matches!(
         enforcement_mode,
-        "worktree_required" | "bounded_direct_edit" | "general_worker"
+        "worktree_required" | "bounded_direct_edit" | "general_worker" | "direct_unmanaged"
     );
     let parent_profile = if enforcement_mode == "general_worker" {
         ":read-only"
@@ -25938,13 +25942,28 @@ enum GeneratedFileCleanup {
     Unchanged,
 }
 
-fn diffforge_agent_contract_markdown(managed_terminal: bool) -> String {
-    if !managed_terminal {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentContractVariant {
+    /// Visible-root note with zero coordination knowledge. Used when managed
+    /// agents do not edit the visible root (worktree mode) or when the
+    /// workspace runs unmanaged direct mode: outside-Diff-Forge agents must
+    /// not learn about worktrees or the coordination lifecycle.
+    Plain,
+    /// Full coordination contract in a Diff Forge-private root (agent
+    /// worktrees under .agents/worktrees).
+    Managed,
+    /// Full coordination contract in the shared visible root (direct
+    /// coordination mode), prefixed with an explicit environment gate so
+    /// agents launched outside Diff Forge ignore it entirely.
+    ManagedEnvGated,
+}
+
+fn diffforge_agent_contract_markdown(variant: AgentContractVariant) -> String {
+    if variant == AgentContractVariant::Plain {
         return format!(
             "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge workspace note\n\n\
-This repository is known to Diff Forge, but ordinary terminals opened outside Diff Forge AI are not managed agent sessions. Work normally from the visible project root unless the user asks otherwise; do not use Diff Forge coordination lifecycle MCP tools from an outside terminal.\n\n\
-Managed Diff Forge AI terminals receive private session-scoped launch config, environment, and file-authority instructions separately. If this file is visible in a regular terminal, it is informational only and does not require task leases, patch submission, or direct-edit routing.\n\n\
+Work normally from the visible project root. This file only documents repo-scoped Diff Forge architecture graph artifacts.\n\n\
 ## Architecture Graphs\n\n\
 - Diff Forge architecture graphs are repo-scoped artifacts under `.agents/architectures`.\n\
 - For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `.agents/architectures/graphs/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
@@ -25953,9 +25972,16 @@ Managed Diff Forge AI terminals receive private session-scoped launch config, en
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
         );
     }
+    let env_gate = if variant == AgentContractVariant::ManagedEnvGated {
+        "## Who this contract applies to\n\n\
+This contract applies only to coding agents launched by the Diff Forge AI desktop app. Those terminals run with `COORDINATION_SESSION_ID` and `COORDINATION_ENFORCEMENT_MODE` set in their environment and with the `coordination-kernel` MCP server mounted. If those environment variables are not present, you were not launched by Diff Forge: ignore everything below except the Architecture Graphs section, work normally from the project root, and do not attempt to call any `coordination-kernel` tools.\n\n"
+    } else {
+        ""
+    };
     format!(
         "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge agent coordination contract\n\n\
+{env_gate}\
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, direct completion, and optional patch submission.\n\n\
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
@@ -28174,10 +28200,13 @@ mod tests {
         assert!(!repo.join(".codex").join("config.toml").exists());
         assert!(!repo.join(".claude").join("settings.local.json").exists());
         let repo_agents = fs::read_to_string(repo.join("AGENTS.md")).unwrap();
-        assert!(repo_agents.contains("ordinary terminals opened outside Diff Forge AI"));
-        assert!(repo_agents.contains("informational only"));
+        assert!(repo_agents.contains("Work normally from the visible project root"));
         assert!(!repo_agents.contains("COORDINATION_AGENT_BRANCH_ROOT"));
         assert!(!repo_agents.contains("coordination-kernel.submit_patch"));
+        assert!(!repo_agents.contains("coordination contract"));
+        assert!(!repo_agents.contains("start_task"));
+        assert!(!repo_agents.contains("worktree"));
+        assert!(!repo_agents.contains("lease"));
         let worktree_agents = fs::read_to_string(worktree.join("AGENTS.md")).unwrap();
         assert!(worktree_agents.contains("coordination-kernel.start_task"));
         let worktree_codex =
@@ -28688,6 +28717,25 @@ command = "diffforge --diff-forge-write-guard"
         assert!(config.contains("\".\" = \"read\""));
         assert!(!config.contains("\".\" = \"write\""));
         assert!(config.contains("\".agents/architectures/graphs\" = \"write\""));
+        assert!(!config.contains(".agents/worktrees/slot1"));
+    }
+
+    #[test]
+    fn managed_codex_home_config_direct_unmanaged_keeps_workspace_writable() {
+        let repo = init_git_repo("managed_codex_direct_unmanaged");
+
+        let config = codex_managed_profile_config(
+            &repo,
+            &repo,
+            "direct_unmanaged",
+            Some("slot1"),
+            "codex",
+            None,
+        )
+        .unwrap();
+
+        assert!(config.contains("extends = \":workspace\""));
+        assert!(config.contains("\".\" = \"write\""));
         assert!(!config.contains(".agents/worktrees/slot1"));
     }
 
@@ -30743,6 +30791,88 @@ Appwrite > Session Store: create session
             Some("direct_unmanaged")
         );
         assert!(session["worktree_id"].as_str().is_none());
+    }
+
+    #[test]
+    fn direct_unmanaged_terminal_context_keeps_mcp_metadata_without_lifecycle_completion() {
+        let repo = init_git_repo("direct_unmanaged_terminal_context");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-direct-unmanaged"),
+                Some("workspace-direct-unmanaged"),
+                Some("Direct Unmanaged Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-direct-unmanaged"),
+                Some("direct_unmanaged"),
+            )
+            .unwrap();
+
+        assert_eq!(context.enforcement_mode, "direct_unmanaged");
+        assert_eq!(context.file_authority(), "direct_unmanaged");
+        assert_eq!(context.completion_mode(), "none");
+        assert!(context.worktree_id.is_none());
+        assert_eq!(
+            PathBuf::from(&context.write_root).canonicalize().unwrap(),
+            repo.canonicalize().unwrap()
+        );
+        let env = context.env_vars();
+        assert!(env.contains(&("COORDINATION_MCP_ALWAYS_ON".to_string(), "1".to_string())));
+        assert!(env.contains(&(
+            "COORDINATION_FILE_AUTHORITY".to_string(),
+            "direct_unmanaged".to_string()
+        )));
+        assert!(env.contains(&(
+            "COORDINATION_COMPLETION_MODE".to_string(),
+            "none".to_string()
+        )));
+    }
+
+    #[test]
+    fn visible_root_contract_exposes_coordination_only_in_direct_coordination_mode() {
+        let repo = init_git_repo("contract_per_mode");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        // Safe mode: managed agents edit in private worktrees, so the shared
+        // visible root must carry no coordination knowledge.
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "worktree_coordination"}))
+            .unwrap();
+        let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert!(root_contract.contains("Work normally from the visible project root"));
+        assert!(!root_contract.contains("start_task"));
+        assert!(!root_contract.contains("lease"));
+        assert!(!root_contract.contains("worktree"));
+        assert!(!root_contract.contains("coordination contract"));
+
+        // Coordinated mode: managed agents edit the visible root, so the
+        // contract lives there but only behind an explicit environment gate.
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_coordination"}))
+            .unwrap();
+        let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert!(root_contract.contains("COORDINATION_SESSION_ID"));
+        assert!(root_contract.contains("you were not launched by Diff Forge"));
+        assert!(root_contract.contains("coordination-kernel.start_task"));
+
+        // Unsafe mode: agents behave like standalone tools; the visible root
+        // must carry no coordination knowledge again.
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+        let root_contract = fs::read_to_string(repo.join("CLAUDE.md")).unwrap();
+        assert!(root_contract.contains("Work normally from the visible project root"));
+        assert!(!root_contract.contains("start_task"));
+        assert!(!root_contract.contains("lease"));
+        assert!(!root_contract.contains("worktree"));
     }
 
     #[test]

@@ -5893,11 +5893,24 @@ mod tests {
         };
         let tools = coordination_tools_for_context(&session_context);
         for tool in TERMINAL_SESSION_TOOL_NAMES {
-            assert!(!tools.contains(tool), "{tool} must be hidden in direct mode");
+            assert!(
+                !tools.contains(tool),
+                "{tool} must be hidden in direct mode"
+            );
         }
-        assert!(tools.contains(&"create_plan"));
-        assert!(tools.contains(&"update_plan"));
-        assert!(tools.contains(&"architecture_context"));
+        for tool in [
+            "create_plan",
+            "update_plan",
+            "architecture_context",
+            "list_assets",
+            "get_asset_root",
+            "upload_asset",
+            "upload_asset_status",
+            "download_asset",
+            "download_asset_status",
+        ] {
+            assert!(tools.contains(&tool), "{tool} must remain available");
+        }
 
         let denied = dispatch_tool(
             &session_context,

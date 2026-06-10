@@ -120,10 +120,12 @@ function dedupeTransferRows(transfers) {
   jsonArray(transfers).forEach((transfer) => {
     if (!transfer || typeof transfer !== "object") return;
     const transferId = text(transfer.transferId || transfer.transfer_id || transfer.id);
+    const cloudId = text(transfer.cloudId || transfer.cloud_id || transfer.assetCloudId || transfer.asset_cloud_id || "diffforge-ai-cloud");
     const key = transferId
-      ? `transfer:${transferId.toLowerCase()}`
+      ? `transfer:${cloudId.toLowerCase()}:${transferId.toLowerCase()}`
       : [
         text(transfer.assetId || transfer.asset_id).toLowerCase(),
+        cloudId.toLowerCase(),
         text(transfer.direction).toLowerCase(),
         text(transfer.status).toLowerCase(),
         text(transfer.updatedAt || transfer.updated_at || transfer.createdAt || transfer.created_at),
@@ -144,10 +146,18 @@ function normalizeAssetsLibrary(library) {
   if (!library || typeof library !== "object") return library;
   const items = dedupeAssetRows(jsonArray(library.items).length ? library.items : library.assets);
   const transfers = dedupeTransferRows(library.transfers);
+  const clouds = jsonArray(library.clouds).length
+    ? jsonArray(library.clouds)
+    : jsonArray(library.assetClouds).length
+      ? jsonArray(library.assetClouds)
+      : jsonArray(library.asset_clouds);
   return {
     ...library,
     items,
     assets: items,
+    clouds,
+    assetClouds: clouds,
+    asset_clouds: clouds,
     transfers,
     count: items.length,
   };
