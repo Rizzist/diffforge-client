@@ -2013,6 +2013,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let force_resync = job.force_resync;
     let force_full = job.force_full;
     let reason_for_worker = job.reason.clone();
+    let limits_only = reason_for_worker == "tokenomics_limits_changed";
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
     let tokenomics_scope = tokenomics_billing_scope_from_parts(
         Some(billing_scope_type.as_str()),
@@ -2031,6 +2032,25 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         } else if force_full {
             tokenomics_scan_usage_for(&app, false, false)?;
             tokenomics_sync_summary_for_scope(&app, &tokenomics_scope)
+        } else if limits_only {
+            let cursor = worker_state_for_summary
+                .background_sync
+                .tokenomics_cursor
+                .blocking_lock()
+                .get(&tokenomics_scope_key_for_summary)
+                .cloned()
+                .unwrap_or_default();
+            let conn = tokenomics_open_db(&app)?;
+            tokenomics_reconcile_current_provider_accounts(&conn)?;
+            tokenomics_sync_delta_from_conn(
+                &conn,
+                if cursor.trim().is_empty() {
+                    None
+                } else {
+                    Some(cursor.as_str())
+                },
+                Some(&tokenomics_scope),
+            )
         } else {
             tokenomics_scan_usage_for(&app, false, false)?;
             let cursor = worker_state_for_summary

@@ -3,14 +3,23 @@ const TOKENOMICS_SCAN_MAX_FILES_PER_PROVIDER: usize = 120;
 const TOKENOMICS_SCAN_MAX_LINE_BYTES: usize = 256 * 1024;
 const TOKENOMICS_SCAN_MAX_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const TOKENOMICS_SYNC_ROLLUP_LIMIT: usize = 5000;
+const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_SYNC_LIMIT: usize = 2048;
+const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_BUCKET_SECS: u64 = 15 * 60;
+const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_5H_RETENTION_SECS: u64 = 48 * 60 * 60;
+const TOKENOMICS_PROVIDER_LIMIT_SAMPLE_WEEKLY_RETENTION_SECS: u64 = 45 * 24 * 60 * 60;
 const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
+const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v5-device-aware";
 const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v3-device-aware";
 const TOKENOMICS_ROLLUP_ID_VERSION: &str = "scope-aware-rollups-v1";
+const TOKENOMICS_PROVIDER_API_PRICING_VERSION: &str = "claude-api-pricing-v1";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
 const TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX: &str = "codex_usage_api_cache:";
-const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 60;
+const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 10;
 const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
+const TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX: &str = "claude_usage_api_cache:";
+const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 180;
+const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
@@ -51,11 +60,18 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let conn = tokenomics_open_db(&app)?;
+        let mut limits = tokenomics_provider_limits(&conn, false, false)?;
+        let sample_count = tokenomics_record_provider_limit_samples(&conn, &limits)?;
+        tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
+        let limit_samples = tokenomics_provider_limit_sample_sync_rows(&conn, None, None)?;
         Ok(json!({
             "known": false,
             "source": "rust_live_provider_limits",
             "updated_at": tokenomics_now_iso_like(),
-            "limits": tokenomics_provider_limits(&conn, true, true)?,
+            "limit_sample_count": sample_count,
+            "limit_samples": limit_samples.clone(),
+            "limitSamples": limit_samples,
+            "limits": limits,
         }))
     })
     .await
@@ -199,6 +215,33 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
            updated_at TEXT NOT NULL,
            received_at TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS tokenomics_provider_limit_samples(
+           id TEXT PRIMARY KEY,
+           device_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           agent_kind TEXT NOT NULL,
+           provider_account_key TEXT NOT NULL,
+           provider_account_label TEXT,
+           billing_scope_type TEXT NOT NULL DEFAULT 'unknown',
+           billing_team_id TEXT,
+           billing_scope_source TEXT NOT NULL DEFAULT 'unknown',
+           window_kind TEXT NOT NULL,
+           sample_bucket_start TEXT NOT NULL,
+           sample_bucket_unix INTEGER NOT NULL DEFAULT 0,
+           sample_at TEXT NOT NULL,
+           sample_at_unix INTEGER NOT NULL DEFAULT 0,
+           used_percent INTEGER,
+           remaining_percent INTEGER,
+           reset_at TEXT,
+           reset_after_seconds INTEGER,
+           limit_window_seconds INTEGER,
+           pace_status TEXT,
+           pace_delta_percent INTEGER,
+           source TEXT NOT NULL DEFAULT 'local',
+           confidence TEXT NOT NULL DEFAULT 'unknown',
+           updated_at TEXT NOT NULL,
+           updated_at_unix INTEGER NOT NULL DEFAULT 0
+         );
          DROP VIEW IF EXISTS tokenomics_display_rollups;
 		         CREATE TABLE IF NOT EXISTS tokenomics_meta(
 		           key TEXT PRIMARY KEY,
@@ -228,7 +271,9 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
            PRIMARY KEY(provider, agent_kind, source_path)
          );
          CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
-         CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);",
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_updated ON tokenomics_provider_limit_samples(updated_at);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_limit_samples_match ON tokenomics_provider_limit_samples(billing_scope_type, billing_team_id, provider, agent_kind, provider_account_key, window_kind, sample_bucket_unix);",
     )
     .map_err(|error| format!("Unable to prepare Tokenomics database: {error}"))?;
     for table in [
@@ -452,6 +497,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     )
     .map_err(|error| format!("Unable to finalize Tokenomics database schema: {error}"))?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
+    tokenomics_repair_provider_api_costs(conn)?;
     Ok(())
 }
 
@@ -1950,6 +1996,10 @@ fn tokenomics_unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn tokenomics_unix_iso_like(seconds: u64) -> String {
+    format!("unix:{seconds}")
+}
+
 fn tokenomics_emit_scan_progress(app: &AppHandle, emit_progress: bool, payload: Value) {
     if !emit_progress {
         return;
@@ -2678,6 +2728,171 @@ fn tokenomics_codex_estimated_api_microusd(
     (credits * 0.04 * 1_000_000.0).round() as i64
 }
 
+#[derive(Clone, Copy)]
+struct TokenomicsApiRatesPerMillion {
+    input: f64,
+    cache_read: f64,
+    cache_write: f64,
+    output: f64,
+}
+
+fn tokenomics_estimated_api_microusd(
+    provider: &str,
+    agent_kind: &str,
+    model: Option<&str>,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    let provider_key = provider.trim().to_ascii_lowercase();
+    let agent_key = agent_kind.trim().to_ascii_lowercase();
+    if provider_key.contains("anthropic")
+        || provider_key.contains("claude")
+        || agent_key.contains("claude")
+    {
+        return tokenomics_claude_estimated_api_microusd(
+            model,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+        );
+    }
+    if provider_key.contains("openai")
+        || provider_key.contains("codex")
+        || agent_key.contains("codex")
+    {
+        return tokenomics_codex_estimated_api_microusd(
+            model,
+            input_tokens,
+            cache_read_tokens,
+            output_tokens,
+        );
+    }
+    0
+}
+
+fn tokenomics_claude_estimated_api_microusd(
+    model: Option<&str>,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    let Some(rates) = tokenomics_claude_api_rates_per_million(model) else {
+        return 0;
+    };
+    tokenomics_api_cost_microusd(
+        rates,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    )
+}
+
+fn tokenomics_api_cost_microusd(
+    rates: TokenomicsApiRatesPerMillion,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+) -> i64 {
+    let input = input_tokens.max(0) as f64;
+    let cache_read = cache_read_tokens.max(0) as f64;
+    let cache_write = cache_write_tokens.max(0) as f64;
+    let output = output_tokens.max(0) as f64;
+    (input * rates.input
+        + cache_read * rates.cache_read
+        + cache_write * rates.cache_write
+        + output * rates.output)
+        .round() as i64
+}
+
+fn tokenomics_claude_api_rates_per_million(
+    model: Option<&str>,
+) -> Option<TokenomicsApiRatesPerMillion> {
+    let normalized = tokenomics_normalized_model_key(model);
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("fable-5") || normalized.contains("mythos-5") {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 10.0,
+            cache_read: 1.0,
+            cache_write: 12.5,
+            output: 50.0,
+        });
+    }
+    if normalized.contains("opus-4-8")
+        || normalized.contains("opus-4-7")
+        || normalized.contains("opus-4-6")
+        || normalized.contains("opus-4-5")
+    {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 5.0,
+            cache_read: 0.5,
+            cache_write: 6.25,
+            output: 25.0,
+        });
+    }
+    if normalized.contains("opus-4-1")
+        || normalized.contains("opus-4.1")
+        || normalized.contains("opus-4")
+    {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 15.0,
+            cache_read: 1.5,
+            cache_write: 18.75,
+            output: 75.0,
+        });
+    }
+    if normalized.contains("sonnet-4-6")
+        || normalized.contains("sonnet-4-5")
+        || normalized.contains("sonnet-4")
+        || normalized.contains("sonnet-3-7")
+        || normalized.contains("sonnet-3.7")
+    {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 3.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+            output: 15.0,
+        });
+    }
+    if normalized.contains("haiku-4-5") {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 1.0,
+            cache_read: 0.1,
+            cache_write: 1.25,
+            output: 5.0,
+        });
+    }
+    if normalized.contains("haiku-3-5") || normalized.contains("haiku-3.5") {
+        return Some(TokenomicsApiRatesPerMillion {
+            input: 0.8,
+            cache_read: 0.08,
+            cache_write: 1.0,
+            output: 4.0,
+        });
+    }
+    None
+}
+
+fn tokenomics_normalized_model_key(model: Option<&str>) -> String {
+    model
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| match character {
+            '_' | '/' | ' ' | ':' => '-',
+            other => other,
+        })
+        .collect()
+}
+
 fn tokenomics_collect_candidate_files(root: &Path, limit: usize) -> Vec<PathBuf> {
     let mut files = Vec::<(u64, PathBuf)>::new();
     tokenomics_collect_candidate_files_inner(root, 0, &mut files);
@@ -3040,6 +3255,15 @@ fn tokenomics_usage_event_from_value(
         .or_else(|| Some(observed_at.clone()));
     let (bucket_day, bucket_hour) =
         tokenomics_buckets(created_at.as_deref().unwrap_or(&observed_at));
+    let estimated_cost_microusd = tokenomics_estimated_api_microusd(
+        provider,
+        agent_kind,
+        model.as_deref(),
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+    );
     Some(TokenomicsUsageEvent {
         id: String::new(),
         device_id,
@@ -3063,7 +3287,7 @@ fn tokenomics_usage_event_from_value(
         cache_read_tokens,
         cache_write_tokens,
         total_tokens,
-        estimated_cost_microusd: 0,
+        estimated_cost_microusd,
         created_at,
         observed_at,
     })
@@ -3114,7 +3338,7 @@ fn tokenomics_now_iso_like() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    format!("unix:{seconds}")
+    tokenomics_unix_iso_like(seconds)
 }
 
 fn tokenomics_hash(value: &str) -> String {
@@ -3351,6 +3575,98 @@ fn tokenomics_rebuild_rollups_for_identity_version(
         rusqlite::params![TOKENOMICS_ROLLUP_ID_VERSION],
     )
     .map_err(|error| format!("Unable to record Tokenomics rollup version: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_repair_provider_api_costs(conn: &rusqlite::Connection) -> Result<(), String> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM tokenomics_meta WHERE key='provider_api_pricing_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    if current.as_deref() == Some(TOKENOMICS_PROVIDER_API_PRICING_VERSION) {
+        return Ok(());
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, provider, agent_kind, model, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens
+             FROM tokenomics_usage_events
+             WHERE estimated_cost_microusd=0",
+        )
+        .map_err(|error| format!("Unable to prepare Tokenomics cost repair: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query Tokenomics cost repair rows: {error}"))?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (
+            id,
+            provider,
+            agent_kind,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        ) = row.map_err(|error| format!("Unable to read Tokenomics cost repair row: {error}"))?;
+        let estimated_cost_microusd = tokenomics_estimated_api_microusd(
+            &provider,
+            &agent_kind,
+            model.as_deref(),
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+        );
+        if estimated_cost_microusd > 0 {
+            updates.push((id, provider, agent_kind, estimated_cost_microusd));
+        }
+    }
+    drop(statement);
+
+    let mut changed_pairs = Vec::<(String, String)>::new();
+    for (id, provider, agent_kind, estimated_cost_microusd) in updates {
+        let changed = conn
+            .execute(
+                "UPDATE tokenomics_usage_events
+                 SET estimated_cost_microusd=?1
+                 WHERE id=?2 AND estimated_cost_microusd=0",
+                rusqlite::params![estimated_cost_microusd, id],
+            )
+            .map_err(|error| format!("Unable to repair Tokenomics event cost: {error}"))?;
+        if changed > 0
+            && !changed_pairs
+                .iter()
+                .any(|(row_provider, row_agent)| row_provider == &provider && row_agent == &agent_kind)
+        {
+            changed_pairs.push((provider, agent_kind));
+        }
+    }
+    for (provider, agent_kind) in changed_pairs {
+        tokenomics_rebuild_provider_rollups_from_events(conn, &provider, &agent_kind)?;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value)
+         VALUES('provider_api_pricing_version', ?1)",
+        rusqlite::params![TOKENOMICS_PROVIDER_API_PRICING_VERSION],
+    )
+    .map_err(|error| format!("Unable to record Tokenomics provider pricing version: {error}"))?;
     Ok(())
 }
 
@@ -3722,7 +4038,10 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
 		            "SELECT device_id, provider, agent_kind, {account_key_sql} AS provider_account_key, {account_label_sql} AS provider_account_label, {scope_select_sql}, COALESCE(NULLIF(model, ''), agent_kind) AS model, bucket_start, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd, COALESCE(SUM(event_count), 0) AS event_count, MAX(updated_at) AS updated_at FROM {hourly_rollup_table} GROUP BY device_id, provider, agent_kind, provider_account_key, billing_scope_key, COALESCE(NULLIF(model, ''), agent_kind), bucket_start ORDER BY bucket_start DESC LIMIT 5000"
 	        ),
 	    )?;
-    let limits = tokenomics_provider_limits(conn, include_cloud, include_cloud)?;
+    let mut limits = tokenomics_provider_limits(conn, include_cloud, include_cloud)?;
+    tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
+    let limit_samples =
+        tokenomics_provider_limit_sample_rows(conn, None, scope_filter, include_cloud)?;
     let sync_hourly = if include_rollups {
         tokenomics_account_hourly_sync_rollups(conn, None, scope_filter)?
     } else {
@@ -3746,6 +4065,8 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     "monthly": monthly,
     "monthly_by_device_provider": monthly_by_device_provider,
     "hourly": sync_hourly,
+    "limit_samples": limit_samples.clone(),
+    "limitSamples": limit_samples,
     "sources": [
         {"provider": "anthropic", "agent_kind": "claude", "label": "Claude Code"},
         {"provider": "openai", "agent_kind": "codex", "label": "Codex"},
@@ -3828,7 +4149,7 @@ fn tokenomics_account_hourly_sync_rollups(
                COALESCE(SUM(output_tokens), 0) AS output_tokens,
                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
                COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
-               COALESCE(SUM(total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(CASE WHEN COALESCE(total_tokens, 0) > 0 THEN total_tokens ELSE COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_write_tokens, 0) END), 0) AS total_tokens,
                COALESCE(SUM(estimated_cost_microusd), 0) AS estimated_cost_microusd,
                COALESCE(SUM(event_count), 0) AS event_count,
                MAX(updated_at) AS updated_at
@@ -3882,6 +4203,786 @@ fn tokenomics_account_hourly_sync_rollups(
     Ok(rollups)
 }
 
+fn tokenomics_provider_limit_sample_bucket_unix(sample_at_unix: u64) -> u64 {
+    sample_at_unix
+        .checked_div(TOKENOMICS_PROVIDER_LIMIT_SAMPLE_BUCKET_SECS)
+        .unwrap_or(0)
+        .saturating_mul(TOKENOMICS_PROVIDER_LIMIT_SAMPLE_BUCKET_SECS)
+}
+
+fn tokenomics_provider_limit_sample_id(
+    provider: &str,
+    agent_kind: &str,
+    provider_account_key: &str,
+    billing_scope: &TokenomicsBillingScope,
+    window_kind: &str,
+    sample_bucket_unix: u64,
+) -> String {
+    let raw = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        billing_scope.scope_type,
+        billing_scope.team_id.as_deref().unwrap_or_default(),
+        provider,
+        agent_kind,
+        provider_account_key,
+        window_kind,
+        sample_bucket_unix
+    );
+    format!("provider-limit-sample-{}", tokenomics_hash(&raw))
+}
+
+fn tokenomics_limit_percent_pair(value: &Value) -> Option<(i64, i64)> {
+    let used = tokenomics_value_i64(
+        value,
+        &[
+            "used_percent",
+            "usedPercent",
+            "limit_used_percent",
+            "limitUsedPercent",
+            "used",
+        ],
+    )
+    .map(|percent| percent.clamp(0, 100));
+    let remaining = tokenomics_value_i64(
+        value,
+        &[
+            "remaining_percent",
+            "remainingPercent",
+            "limit_remaining_percent",
+            "limitRemainingPercent",
+            "remaining",
+        ],
+    )
+    .map(|percent| percent.clamp(0, 100));
+    match (used, remaining) {
+        (Some(used), Some(remaining)) => Some((used, remaining)),
+        (Some(used), None) => Some((used, (100 - used).clamp(0, 100))),
+        (None, Some(remaining)) => Some(((100 - remaining).clamp(0, 100), remaining)),
+        (None, None) => None,
+    }
+}
+
+fn tokenomics_provider_limit_sample_reset_at(value: &Value, sample_at_unix: u64) -> Option<String> {
+    if let Some(reset_at) = tokenomics_value_string(
+        value,
+        &[
+            "reset_at",
+            "resetAt",
+            "limit_resets_at",
+            "limitResetsAt",
+            "pace_reset_at",
+            "paceResetAt",
+        ],
+    )
+    .filter(|text| !text.trim().is_empty())
+    {
+        return Some(reset_at);
+    }
+    tokenomics_value_i64(value, &["reset_after_seconds", "resetAfterSeconds"])
+        .filter(|seconds| *seconds >= 0)
+        .map(|seconds| tokenomics_unix_iso_like(sample_at_unix.saturating_add(seconds as u64)))
+}
+
+fn tokenomics_upsert_provider_limit_sample(
+    conn: &rusqlite::Connection,
+    value: &Value,
+    fallback_scope: &TokenomicsBillingScope,
+    fallback_device_id: &str,
+    source_override: Option<&str>,
+) -> Result<bool, String> {
+    let Some((used_percent, remaining_percent)) = tokenomics_limit_percent_pair(value) else {
+        return Ok(false);
+    };
+    let provider =
+        tokenomics_value_string(value, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+    let agent_kind = tokenomics_value_string(value, &["agent_kind", "agentKind"])
+        .unwrap_or_else(|| provider.clone());
+    if provider == "unknown" || agent_kind == "unknown" {
+        return Ok(false);
+    }
+    let fallback_account = tokenomics_provider_account(&provider, &agent_kind);
+    let provider_account_key = tokenomics_value_string(
+        value,
+        &[
+            "provider_account_key",
+            "providerAccountKey",
+            "subscription_key",
+            "subscriptionKey",
+        ],
+    )
+    .unwrap_or_else(|| fallback_account.key.clone());
+    let provider_account_label =
+        tokenomics_value_string(value, &["provider_account_label", "providerAccountLabel"])
+            .unwrap_or_else(|| fallback_account.label.clone());
+    let billing_scope = tokenomics_billing_scope_from_value(value, fallback_scope);
+    let window_kind = tokenomics_value_string(
+        value,
+        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+    )
+    .unwrap_or_else(|| "5_hour".to_string());
+    let now_unix = tokenomics_unix_now();
+    let sample_at = tokenomics_value_string(
+        value,
+        &[
+            "sample_at",
+            "sampleAt",
+            "updated_at",
+            "updatedAt",
+            "last_known_at",
+            "lastKnownAt",
+        ],
+    )
+    .unwrap_or_else(|| tokenomics_unix_iso_like(now_unix));
+    let sample_at_unix = tokenomics_value_i64(value, &["sample_at_unix", "sampleAtUnix"])
+        .map(tokenomics_normalize_unix_timestamp)
+        .or_else(|| tokenomics_timestamp_unix(&sample_at))
+        .unwrap_or(now_unix);
+    let sample_bucket_unix = tokenomics_value_i64(
+        value,
+        &["sample_bucket_unix", "sampleBucketUnix", "bucket_unix", "bucketUnix"],
+    )
+    .map(tokenomics_normalize_unix_timestamp)
+    .unwrap_or_else(|| tokenomics_provider_limit_sample_bucket_unix(sample_at_unix));
+    let sample_bucket_start = tokenomics_value_string(
+        value,
+        &[
+            "sample_bucket_start",
+            "sampleBucketStart",
+            "bucket_start",
+            "bucketStart",
+        ],
+    )
+    .unwrap_or_else(|| tokenomics_unix_iso_like(sample_bucket_unix));
+    let updated_at_unix = now_unix;
+    let updated_at = tokenomics_unix_iso_like(updated_at_unix);
+    let reset_at = tokenomics_provider_limit_sample_reset_at(value, sample_at_unix);
+    let reset_after_seconds =
+        tokenomics_value_i64(value, &["reset_after_seconds", "resetAfterSeconds"]);
+    let limit_window_seconds = tokenomics_limit_effective_window_seconds(
+        &window_kind,
+        tokenomics_value_i64(value, &["limit_window_seconds", "limitWindowSeconds"]),
+    );
+    let pace_status =
+        tokenomics_value_string(value, &["pace_status", "paceStatus"]).unwrap_or_default();
+    let pace_delta_percent =
+        tokenomics_value_i64(value, &["pace_delta_percent", "paceDeltaPercent"]);
+    let source = source_override
+        .map(ToOwned::to_owned)
+        .or_else(|| tokenomics_value_string(value, &["source", "limit_source", "limitSource"]))
+        .unwrap_or_else(|| "local".to_string());
+    let confidence =
+        tokenomics_value_string(value, &["confidence"]).unwrap_or_else(|| "unknown".to_string());
+    let device_id = tokenomics_value_string(value, &["device_id", "deviceId", "machine_id", "machineId"])
+        .unwrap_or_else(|| fallback_device_id.to_string());
+    let id = tokenomics_provider_limit_sample_id(
+        &provider,
+        &agent_kind,
+        &provider_account_key,
+        &billing_scope,
+        &window_kind,
+        sample_bucket_unix,
+    );
+
+    conn.execute(
+        "INSERT INTO tokenomics_provider_limit_samples(
+           id, device_id, provider, agent_kind, provider_account_key, provider_account_label,
+           billing_scope_type, billing_team_id, billing_scope_source,
+           window_kind, sample_bucket_start, sample_bucket_unix, sample_at, sample_at_unix,
+           used_percent, remaining_percent, reset_at, reset_after_seconds, limit_window_seconds,
+           pace_status, pace_delta_percent, source, confidence, updated_at, updated_at_unix
+         ) VALUES(
+           ?1, ?2, ?3, ?4, ?5, ?6,
+           ?7, ?8, ?9,
+           ?10, ?11, ?12, ?13, ?14,
+           ?15, ?16, ?17, ?18, ?19,
+           ?20, ?21, ?22, ?23, ?24, ?25
+         )
+         ON CONFLICT(id) DO UPDATE SET
+           device_id=excluded.device_id,
+           provider_account_label=excluded.provider_account_label,
+           billing_scope_source=excluded.billing_scope_source,
+           sample_bucket_start=excluded.sample_bucket_start,
+           sample_bucket_unix=excluded.sample_bucket_unix,
+           sample_at=excluded.sample_at,
+           sample_at_unix=excluded.sample_at_unix,
+           used_percent=excluded.used_percent,
+           remaining_percent=excluded.remaining_percent,
+           reset_at=excluded.reset_at,
+           reset_after_seconds=excluded.reset_after_seconds,
+           limit_window_seconds=excluded.limit_window_seconds,
+           pace_status=excluded.pace_status,
+           pace_delta_percent=excluded.pace_delta_percent,
+           source=excluded.source,
+           confidence=excluded.confidence,
+           updated_at=excluded.updated_at,
+           updated_at_unix=excluded.updated_at_unix
+         WHERE excluded.sample_at_unix >= tokenomics_provider_limit_samples.sample_at_unix",
+        rusqlite::params![
+            id,
+            device_id,
+            provider,
+            agent_kind,
+            provider_account_key,
+            provider_account_label,
+            billing_scope.scope_type.as_str(),
+            billing_scope.team_id.as_deref(),
+            billing_scope.source.as_str(),
+            window_kind,
+            sample_bucket_start,
+            sample_bucket_unix as i64,
+            sample_at,
+            sample_at_unix as i64,
+            used_percent,
+            remaining_percent,
+            reset_at.as_deref(),
+            reset_after_seconds,
+            limit_window_seconds,
+            pace_status,
+            pace_delta_percent,
+            source,
+            confidence,
+            updated_at,
+            updated_at_unix as i64,
+        ],
+    )
+    .map_err(|error| format!("Unable to store provider limit sample: {error}"))?;
+    Ok(true)
+}
+
+fn tokenomics_prune_provider_limit_samples(
+    conn: &rusqlite::Connection,
+    now_unix: u64,
+) -> Result<(), String> {
+    let five_hour_cutoff = now_unix.saturating_sub(TOKENOMICS_PROVIDER_LIMIT_SAMPLE_5H_RETENTION_SECS);
+    let weekly_cutoff = now_unix.saturating_sub(TOKENOMICS_PROVIDER_LIMIT_SAMPLE_WEEKLY_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM tokenomics_provider_limit_samples
+         WHERE (window_kind='5_hour' AND sample_at_unix < ?1)
+            OR (window_kind!='5_hour' AND sample_at_unix < ?2)",
+        rusqlite::params![five_hour_cutoff as i64, weekly_cutoff as i64],
+    )
+    .map_err(|error| format!("Unable to prune provider limit samples: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_record_provider_limit_samples(
+    conn: &rusqlite::Connection,
+    limits: &[Value],
+) -> Result<usize, String> {
+    let fallback_scope = tokenomics_current_billing_scope();
+    let device_id = tokenomics_local_device_id();
+    let mut count = 0usize;
+    for limit in limits.iter().take(32) {
+        if tokenomics_provider_limit_is_unknown(limit) {
+            continue;
+        }
+        if tokenomics_upsert_provider_limit_sample(conn, limit, &fallback_scope, &device_id, Some("local"))? {
+            count += 1;
+        }
+    }
+    tokenomics_prune_provider_limit_samples(conn, tokenomics_unix_now())?;
+    Ok(count)
+}
+
+fn tokenomics_provider_limit_sample_sync_rows(
+    conn: &rusqlite::Connection,
+    since_updated_at: Option<&str>,
+    scope_filter: Option<&TokenomicsBillingScope>,
+) -> Result<Vec<Value>, String> {
+    tokenomics_provider_limit_sample_rows(conn, since_updated_at, scope_filter, false)
+}
+
+fn tokenomics_provider_limit_sample_rows(
+    conn: &rusqlite::Connection,
+    since_updated_at: Option<&str>,
+    scope_filter: Option<&TokenomicsBillingScope>,
+    include_cloud: bool,
+) -> Result<Vec<Value>, String> {
+    let clean_since = since_updated_at
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let scope_filter_sql = tokenomics_billing_scope_filter_sql(scope_filter, true);
+    let cloud_filter_sql = if include_cloud {
+        ""
+    } else {
+        " AND source!='cloud'"
+    };
+    let scope_type_sql = "COALESCE(NULLIF(billing_scope_type, ''), 'unknown')";
+    let scope_team_sql = "NULLIF(billing_team_id, '')";
+    let scope_key_sql = "CASE WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='team' AND NULLIF(billing_team_id, '') IS NOT NULL THEN 'team:' || billing_team_id WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='personal' THEN 'personal' ELSE 'unknown' END";
+    let scope_label_sql = "CASE WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='team' THEN 'Team' WHEN COALESCE(NULLIF(billing_scope_type, ''), 'unknown')='personal' THEN 'Personal' ELSE 'Unknown scope' END";
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT
+               id,
+               device_id,
+               provider,
+               agent_kind,
+               provider_account_key AS subscription_key,
+               provider_account_key,
+               provider_account_label,
+               {scope_type_sql} AS billing_scope_type,
+               {scope_team_sql} AS billing_team_id,
+               {scope_key_sql} AS billing_scope_key,
+               {scope_label_sql} AS billing_scope_label,
+               COALESCE(NULLIF(billing_scope_source, ''), 'unknown') AS billing_scope_source,
+               window_kind,
+               sample_bucket_start,
+               sample_bucket_unix,
+               sample_at,
+               sample_at_unix,
+               used_percent,
+               remaining_percent,
+               reset_at,
+               reset_after_seconds,
+               limit_window_seconds,
+               pace_status,
+               pace_delta_percent,
+               source,
+               confidence,
+               updated_at
+             FROM tokenomics_provider_limit_samples
+             WHERE (?1 IS NULL OR updated_at >= ?1)
+               {scope_filter_sql}
+               {cloud_filter_sql}
+             ORDER BY updated_at DESC, sample_bucket_unix DESC
+             LIMIT ?2"
+        ))
+        .map_err(|error| format!("Unable to prepare provider limit sample query: {error}"))?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let mapped = statement
+        .query_map(
+            rusqlite::params![
+                clean_since,
+                TOKENOMICS_PROVIDER_LIMIT_SAMPLE_SYNC_LIMIT as i64
+            ],
+            |row| {
+                let mut object = serde_json::Map::new();
+                for (index, column) in columns.iter().enumerate() {
+                    let value = match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => Value::Null,
+                        rusqlite::types::ValueRef::Integer(value) => json!(value),
+                        rusqlite::types::ValueRef::Real(value) => json!(value),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            Value::String(String::from_utf8_lossy(value).to_string())
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => {
+                            Value::String(tokenomics_hash(&String::from_utf8_lossy(value)))
+                        }
+                    };
+                    object.insert(column.to_string(), value);
+                }
+                Ok(Value::Object(object))
+            },
+        )
+        .map_err(|error| format!("Unable to query provider limit samples: {error}"))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.map_err(|error| format!("Unable to read provider limit sample row: {error}"))?);
+    }
+    Ok(rows)
+}
+
+fn tokenomics_recent_provider_limit_samples_for_limit(
+    conn: &rusqlite::Connection,
+    limit: &Value,
+) -> Result<Vec<Value>, String> {
+    let fallback_scope = tokenomics_current_billing_scope();
+    let billing_scope = tokenomics_billing_scope_from_value(limit, &fallback_scope);
+    let provider =
+        tokenomics_value_string(limit, &["provider"]).unwrap_or_else(|| "unknown".to_string());
+    let agent_kind = tokenomics_value_string(limit, &["agent_kind", "agentKind"])
+        .unwrap_or_else(|| provider.clone());
+    let fallback_account = tokenomics_provider_account(&provider, &agent_kind);
+    let provider_account_key = tokenomics_value_string(
+        limit,
+        &[
+            "provider_account_key",
+            "providerAccountKey",
+            "subscription_key",
+            "subscriptionKey",
+        ],
+    )
+    .unwrap_or_else(|| fallback_account.key);
+    let window_kind = tokenomics_value_string(
+        limit,
+        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+    )
+    .unwrap_or_else(|| "5_hour".to_string());
+    let now_unix = tokenomics_unix_now();
+    let retention = if window_kind == "weekly" {
+        TOKENOMICS_PROVIDER_LIMIT_SAMPLE_WEEKLY_RETENTION_SECS
+    } else {
+        TOKENOMICS_PROVIDER_LIMIT_SAMPLE_5H_RETENTION_SECS
+    };
+    let cutoff = now_unix.saturating_sub(retention);
+    let mut statement = conn
+        .prepare(
+            "SELECT
+               id,
+               device_id,
+               provider,
+               agent_kind,
+               provider_account_key,
+               provider_account_label,
+               billing_scope_type,
+               billing_team_id,
+               billing_scope_source,
+               window_kind,
+               sample_bucket_start,
+               sample_bucket_unix,
+               sample_at,
+               sample_at_unix,
+               used_percent,
+               remaining_percent,
+               reset_at,
+               reset_after_seconds,
+               limit_window_seconds,
+               pace_status,
+               pace_delta_percent,
+               source,
+               confidence,
+               updated_at
+             FROM tokenomics_provider_limit_samples
+             WHERE billing_scope_type=?1
+               AND COALESCE(billing_team_id, '')=?2
+               AND provider=?3
+               AND agent_kind=?4
+               AND provider_account_key=?5
+               AND window_kind=?6
+               AND sample_at_unix >= ?7
+             ORDER BY sample_at_unix ASC
+             LIMIT 384",
+        )
+        .map_err(|error| format!("Unable to prepare provider limit trajectory query: {error}"))?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    let mapped = statement
+        .query_map(
+            rusqlite::params![
+                billing_scope.scope_type.as_str(),
+                billing_scope.team_id.as_deref().unwrap_or_default(),
+                provider,
+                agent_kind,
+                provider_account_key,
+                window_kind,
+                cutoff as i64,
+            ],
+            |row| {
+                let mut object = serde_json::Map::new();
+                for (index, column) in columns.iter().enumerate() {
+                    let value = match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => Value::Null,
+                        rusqlite::types::ValueRef::Integer(value) => json!(value),
+                        rusqlite::types::ValueRef::Real(value) => json!(value),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            Value::String(String::from_utf8_lossy(value).to_string())
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => {
+                            Value::String(tokenomics_hash(&String::from_utf8_lossy(value)))
+                        }
+                    };
+                    object.insert(column.to_string(), value);
+                }
+                Ok(Value::Object(object))
+            },
+        )
+        .map_err(|error| format!("Unable to query provider limit trajectory rows: {error}"))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row.map_err(|error| format!("Unable to read provider limit trajectory row: {error}"))?);
+    }
+    Ok(rows)
+}
+
+fn tokenomics_apply_provider_limit_sample_pacing(
+    conn: &rusqlite::Connection,
+    limits: &mut [Value],
+) -> Result<(), String> {
+    for limit in limits {
+        let samples = tokenomics_recent_provider_limit_samples_for_limit(conn, limit)?;
+        tokenomics_apply_provider_limit_sample_pacing_from_rows(limit, &samples);
+    }
+    Ok(())
+}
+
+fn tokenomics_apply_provider_limit_sample_pacing_from_rows(limit: &mut Value, samples: &[Value]) {
+    if samples.is_empty() {
+        return;
+    }
+    let latest = samples
+        .iter()
+        .rev()
+        .find(|sample| tokenomics_limit_percent_pair(sample).is_some());
+    let Some(latest) = latest else {
+        return;
+    };
+    let Some((latest_used, latest_remaining)) = tokenomics_limit_percent_pair(latest) else {
+        return;
+    };
+    let latest_sample_at_unix = tokenomics_value_i64(latest, &["sample_at_unix", "sampleAtUnix"])
+        .map(tokenomics_normalize_unix_timestamp)
+        .or_else(|| {
+            tokenomics_value_string(latest, &["sample_at", "sampleAt"])
+                .and_then(|value| tokenomics_timestamp_unix(&value))
+        })
+        .unwrap_or_else(tokenomics_unix_now);
+    let window_kind = tokenomics_value_string(
+        limit,
+        &["window_kind", "windowKind", "limit_kind", "limitKind"],
+    )
+    .unwrap_or_else(|| "5_hour".to_string());
+    let window_seconds = tokenomics_limit_effective_window_seconds(
+        &window_kind,
+        tokenomics_value_i64(latest, &["limit_window_seconds", "limitWindowSeconds"])
+            .or_else(|| tokenomics_value_i64(limit, &["limit_window_seconds", "limitWindowSeconds"])),
+    )
+    .max(1) as u64;
+    let reset_at_text = tokenomics_value_string(latest, &["reset_at", "resetAt"])
+        .or_else(|| tokenomics_provider_limit_sample_reset_at(latest, latest_sample_at_unix))
+        .or_else(|| {
+            tokenomics_value_string(limit, &["reset_at", "resetAt"])
+                .or_else(|| tokenomics_provider_limit_sample_reset_at(limit, latest_sample_at_unix))
+        });
+    let reset_at_unix = reset_at_text
+        .as_deref()
+        .and_then(tokenomics_timestamp_unix)
+        .or_else(|| {
+            tokenomics_value_i64(latest, &["reset_after_seconds", "resetAfterSeconds"])
+                .filter(|seconds| *seconds >= 0)
+                .map(|seconds| latest_sample_at_unix.saturating_add(seconds as u64))
+        });
+    let remaining_seconds_at_sample = reset_at_unix
+        .map(|reset_at| reset_at.saturating_sub(latest_sample_at_unix).min(window_seconds))
+        .or_else(|| {
+            tokenomics_value_i64(latest, &["reset_after_seconds", "resetAfterSeconds"])
+                .filter(|seconds| *seconds >= 0)
+                .map(|seconds| (seconds as u64).min(window_seconds))
+        });
+    let now_unix = tokenomics_unix_now();
+    let live_updated_at_unix = tokenomics_value_string(
+        limit,
+        &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"],
+    )
+    .and_then(|value| tokenomics_timestamp_unix(&value))
+    .unwrap_or(latest_sample_at_unix);
+    let live_age_seconds = now_unix.saturating_sub(live_updated_at_unix);
+    let mut status = "unknown".to_string();
+    let mut projected_used_percent = None::<i64>;
+    let mut projected_exhaustion_seconds = None::<i64>;
+    let mut projected_exhaustion_at = None::<String>;
+    let mut pace_delta_percent = None::<i64>;
+    let mut sample_window_seconds = 0_i64;
+    let mut trajectory_sample_count = 1_i64;
+
+    if let Some(remaining_seconds) = remaining_seconds_at_sample {
+        let reset_at_matches = |sample: &Value| {
+            if let Some(latest_reset) = reset_at_text.as_deref().filter(|text| !text.is_empty()) {
+                tokenomics_value_string(sample, &["reset_at", "resetAt"])
+                    .map(|value| value == latest_reset)
+                    .unwrap_or(false)
+            } else {
+                true
+            }
+        };
+        let earliest = samples
+            .iter()
+            .filter(|sample| reset_at_matches(sample))
+            .filter_map(|sample| {
+                let (used, _) = tokenomics_limit_percent_pair(sample)?;
+                let sample_at = tokenomics_value_i64(sample, &["sample_at_unix", "sampleAtUnix"])
+                    .map(tokenomics_normalize_unix_timestamp)
+                    .or_else(|| {
+                        tokenomics_value_string(sample, &["sample_at", "sampleAt"])
+                            .and_then(|value| tokenomics_timestamp_unix(&value))
+                    })?;
+                if sample_at >= latest_sample_at_unix {
+                    return None;
+                }
+                let elapsed = latest_sample_at_unix.saturating_sub(sample_at);
+                if elapsed < 60 || elapsed > window_seconds {
+                    return None;
+                }
+                Some((sample_at, used))
+            })
+            .next();
+        if let Some((earliest_at, earliest_used)) = earliest {
+            let elapsed = latest_sample_at_unix.saturating_sub(earliest_at).max(1);
+            let gained_percent = (latest_used - earliest_used).max(0) as f64;
+            let percent_per_second = gained_percent / elapsed as f64;
+            let projected = latest_used as f64 + percent_per_second * remaining_seconds as f64;
+            let projected = projected.round().clamp(0.0, 999.0) as i64;
+            projected_used_percent = Some(projected);
+            pace_delta_percent = Some(projected - 100);
+            status = if projected >= 100 {
+                "over_pace".to_string()
+            } else {
+                "on_pace".to_string()
+            };
+            sample_window_seconds = elapsed.min(i64::MAX as u64) as i64;
+            trajectory_sample_count = samples
+                .iter()
+                .filter(|sample| reset_at_matches(sample))
+                .filter(|sample| {
+                    tokenomics_value_i64(sample, &["sample_at_unix", "sampleAtUnix"])
+                        .map(tokenomics_normalize_unix_timestamp)
+                        .map(|sample_at| sample_at >= earliest_at && sample_at <= latest_sample_at_unix)
+                        .unwrap_or(false)
+                })
+                .count()
+                .max(2) as i64;
+            if projected >= 100 && percent_per_second > 0.0 && latest_used < 100 {
+                let seconds_to_full = ((100 - latest_used) as f64 / percent_per_second).ceil() as u64;
+                projected_exhaustion_seconds = Some(seconds_to_full.min(i64::MAX as u64) as i64);
+                projected_exhaustion_at = Some(tokenomics_unix_iso_like(
+                    latest_sample_at_unix.saturating_add(seconds_to_full),
+                ));
+            } else if latest_used >= 100 {
+                projected_exhaustion_seconds = Some(0);
+                projected_exhaustion_at = Some(tokenomics_unix_iso_like(latest_sample_at_unix));
+            }
+        }
+    }
+
+    let Some(object) = limit.as_object_mut() else {
+        return;
+    };
+    if tokenomics_limit_percent_pair(&Value::Object(object.clone())).is_none()
+        || tokenomics_provider_limit_is_unknown(&Value::Object(object.clone()))
+    {
+        object.insert("used".to_string(), json!(latest_used));
+        object.insert("allowance".to_string(), json!(100));
+        object.insert("remaining".to_string(), json!(latest_remaining));
+        object.insert("used_percent".to_string(), json!(latest_used));
+        object.insert("usedPercent".to_string(), json!(latest_used));
+        object.insert("limit_used_percent".to_string(), json!(latest_used));
+        object.insert("limitUsedPercent".to_string(), json!(latest_used));
+        object.insert("remaining_percent".to_string(), json!(latest_remaining));
+        object.insert("remainingPercent".to_string(), json!(latest_remaining));
+        object.insert("last_known_at".to_string(), latest["sample_at"].clone());
+        object.insert("lastKnownAt".to_string(), latest["sample_at"].clone());
+        object.insert("confidence".to_string(), json!("sampled_stale"));
+        object.insert("limit_source_kind".to_string(), json!("provider_limit_sample"));
+        if object
+            .get("limit_source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("unavailable")
+        {
+            object.insert("limit_source".to_string(), json!("provider_limit_sample"));
+        }
+        if let Some(reset_at) = reset_at_text.as_deref() {
+            object.insert("reset_at".to_string(), json!(reset_at));
+            object.insert("resetAt".to_string(), json!(reset_at));
+        }
+        if let Some(remaining_seconds) = remaining_seconds_at_sample {
+            object.insert("reset_after_seconds".to_string(), json!(remaining_seconds as i64));
+            object.insert("resetAfterSeconds".to_string(), json!(remaining_seconds as i64));
+        }
+        object.insert(
+            "limit_window_seconds".to_string(),
+            json!(window_seconds.min(i64::MAX as u64) as i64),
+        );
+        object.insert(
+            "limitWindowSeconds".to_string(),
+            json!(window_seconds.min(i64::MAX as u64) as i64),
+        );
+    }
+
+    object.insert("pace_strategy".to_string(), json!("live_10s_with_samples"));
+    object.insert("paceStrategy".to_string(), json!("live_10s_with_samples"));
+    object.insert(
+        "pace_confidence".to_string(),
+        json!(if live_age_seconds <= 30 { "live" } else if live_age_seconds <= 300 { "recent" } else { "stale" }),
+    );
+    object.insert(
+        "paceConfidence".to_string(),
+        object.get("pace_confidence").cloned().unwrap_or_else(|| json!("unknown")),
+    );
+    object.insert("pace_sample_count".to_string(), json!(trajectory_sample_count));
+    object.insert("paceSampleCount".to_string(), json!(trajectory_sample_count));
+    object.insert(
+        "pace_sample_window_seconds".to_string(),
+        json!(sample_window_seconds),
+    );
+    object.insert(
+        "paceSampleWindowSeconds".to_string(),
+        json!(sample_window_seconds),
+    );
+    object.insert("pace_last_sample_at".to_string(), latest["sample_at"].clone());
+    object.insert("paceLastSampleAt".to_string(), latest["sample_at"].clone());
+    object.insert("pace_last_sample_used_percent".to_string(), json!(latest_used));
+    object.insert("paceLastSampleUsedPercent".to_string(), json!(latest_used));
+    if let Some(projected) = projected_used_percent {
+        let delta = pace_delta_percent.unwrap_or(projected - 100);
+        object.insert("pace_trajectory_status".to_string(), json!(status.clone()));
+        object.insert("paceTrajectoryStatus".to_string(), json!(status.clone()));
+        object.insert("pace_trajectory_delta_percent".to_string(), json!(delta));
+        object.insert("paceTrajectoryDeltaPercent".to_string(), json!(delta));
+        object.insert("pace_trajectory_projected_used_percent".to_string(), json!(projected));
+        object.insert("paceTrajectoryProjectedUsedPercent".to_string(), json!(projected));
+        object.insert(
+            "pace_trajectory_projected_exhaustion_seconds".to_string(),
+            json!(projected_exhaustion_seconds),
+        );
+        object.insert(
+            "paceTrajectoryProjectedExhaustionSeconds".to_string(),
+            json!(projected_exhaustion_seconds),
+        );
+        object.insert(
+            "pace_trajectory_projected_exhaustion_at".to_string(),
+            json!(projected_exhaustion_at),
+        );
+        object.insert(
+            "paceTrajectoryProjectedExhaustionAt".to_string(),
+            json!(projected_exhaustion_at),
+        );
+        let current_projected = tokenomics_value_i64(
+            &Value::Object(object.clone()),
+            &["pace_projected_used_percent", "paceProjectedUsedPercent"],
+        )
+        .unwrap_or(-1);
+        let current_status = tokenomics_value_string(
+            &Value::Object(object.clone()),
+            &["pace_status", "paceStatus"],
+        )
+        .unwrap_or_else(|| "unknown".to_string());
+        if live_age_seconds > 30 || status == "over_pace" || projected > current_projected || current_status == "unknown" {
+            object.insert("pace_strategy".to_string(), json!("sample_trajectory"));
+            object.insert("paceStrategy".to_string(), json!("sample_trajectory"));
+            object.insert("pace_status".to_string(), json!(status.clone()));
+            object.insert("paceStatus".to_string(), json!(status.clone()));
+            object.insert("pace_delta_percent".to_string(), json!(delta));
+            object.insert("paceDeltaPercent".to_string(), json!(delta));
+            object.insert("pace_projected_used_percent".to_string(), json!(projected));
+            object.insert("paceProjectedUsedPercent".to_string(), json!(projected));
+            object.insert(
+                "pace_projected_exhaustion_seconds".to_string(),
+                json!(projected_exhaustion_seconds),
+            );
+            object.insert(
+                "paceProjectedExhaustionSeconds".to_string(),
+                json!(projected_exhaustion_seconds),
+            );
+            object.insert(
+                "pace_projected_exhaustion_at".to_string(),
+                json!(projected_exhaustion_at),
+            );
+            object.insert(
+                "paceProjectedExhaustionAt".to_string(),
+                json!(projected_exhaustion_at),
+            );
+        }
+    }
+}
+
 fn tokenomics_sync_delta_from_conn(
     conn: &rusqlite::Connection,
     since_updated_at: Option<&str>,
@@ -3891,21 +4992,30 @@ fn tokenomics_sync_delta_from_conn(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let hourly = tokenomics_account_hourly_sync_rollups(conn, clean_since, scope_filter)?;
+    let mut limits = tokenomics_provider_limits(conn, false, false)?;
+    let _ = tokenomics_record_provider_limit_samples(conn, &limits);
+    tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
+    let limit_samples = tokenomics_provider_limit_sample_sync_rows(conn, clean_since, scope_filter)?;
     let sync_cursor = hourly
         .iter()
+        .chain(limit_samples.iter())
         .filter_map(|row| row.get("updated_at").and_then(Value::as_str))
         .max()
         .map(ToOwned::to_owned)
         .or_else(|| clean_since.map(ToOwned::to_owned));
     let hourly_count = hourly.len();
+    let limit_sample_count = limit_samples.len();
     Ok(json!({
-        "known": hourly_count > 0,
+        "known": hourly_count > 0 || limit_sample_count > 0,
         "source": "rust_local_tokenomics_sqlite_delta",
         "updated_at": tokenomics_now_iso_like(),
         "sync_cursor": sync_cursor,
         "hourly_count": hourly_count,
+        "limit_sample_count": limit_sample_count,
         "hourly": hourly,
-        "limits": tokenomics_provider_limits(conn, false, false)?,
+        "limit_samples": limit_samples.clone(),
+        "limitSamples": limit_samples,
+        "limits": limits,
     }))
 }
 
@@ -3929,6 +5039,12 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
     let summary = tokenomics_cloud_summary_payload(event);
     let stored_limit_count =
         tokenomics_store_cloud_provider_limits(&conn, summary, &inherited_billing_scope)?;
+    let stored_limit_sample_count = tokenomics_store_cloud_provider_limit_samples(
+        &conn,
+        summary,
+        &inherited_billing_scope,
+        inherited_device_id.as_deref().unwrap_or("cloud"),
+    )?;
     let stored_device_identity_count = tokenomics_store_cloud_device_identities(&conn, summary)?;
     let hourly = summary
         .get("hourly")
@@ -3940,6 +5056,7 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
             "ok": true,
             "stored_count": 0,
             "stored_limit_count": stored_limit_count,
+            "stored_limit_sample_count": stored_limit_sample_count,
             "stored_device_identity_count": stored_device_identity_count,
             "event_kind": event_kind,
         }));
@@ -3998,6 +5115,26 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
             .unwrap_or_else(tokenomics_now_iso_like);
         let updated_at = tokenomics_value_string(rollup, &["updated_at", "updatedAt"])
             .unwrap_or_else(|| now.clone());
+        let input_tokens =
+            tokenomics_value_i64(rollup, &["input_tokens", "inputTokens"]).unwrap_or(0).max(0);
+        let output_tokens =
+            tokenomics_value_i64(rollup, &["output_tokens", "outputTokens"]).unwrap_or(0).max(0);
+        let cache_read_tokens = tokenomics_value_i64(rollup, &["cache_read_tokens", "cacheReadTokens"])
+            .unwrap_or(0)
+            .max(0);
+        let cache_write_tokens = tokenomics_value_i64(rollup, &["cache_write_tokens", "cacheWriteTokens"])
+            .unwrap_or(0)
+            .max(0);
+        let reported_total_tokens =
+            tokenomics_value_i64(rollup, &["total_tokens", "totalTokens"]).unwrap_or(0).max(0);
+        let total_tokens = if reported_total_tokens > 0 {
+            reported_total_tokens
+        } else {
+            input_tokens
+                .saturating_add(output_tokens)
+                .saturating_add(cache_read_tokens)
+                .saturating_add(cache_write_tokens)
+        };
         let id = tokenomics_cloud_rollup_id(
             &device_id,
             &provider,
@@ -4033,11 +5170,11 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
 	                billing_scope.source.as_str(),
 	                bucket_width,
                 bucket_start,
-                tokenomics_value_i64(rollup, &["input_tokens", "inputTokens"]).unwrap_or(0).max(0),
-                tokenomics_value_i64(rollup, &["output_tokens", "outputTokens"]).unwrap_or(0).max(0),
-                tokenomics_value_i64(rollup, &["cache_read_tokens", "cacheReadTokens"]).unwrap_or(0).max(0),
-                tokenomics_value_i64(rollup, &["cache_write_tokens", "cacheWriteTokens"]).unwrap_or(0).max(0),
-                tokenomics_value_i64(rollup, &["total_tokens", "totalTokens"]).unwrap_or(0).max(0),
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                total_tokens,
                 tokenomics_value_i64(rollup, &["estimated_cost_microusd", "estimatedCostMicrousd"]).unwrap_or(0).max(0),
                 tokenomics_value_i64(rollup, &["event_count", "eventCount"]).unwrap_or(0).max(0),
                 updated_at,
@@ -4052,6 +5189,7 @@ fn tokenomics_record_cloud_account_state(app: &AppHandle, event: &Value) -> Resu
         "ok": true,
         "stored_count": stored_count,
         "stored_limit_count": stored_limit_count,
+        "stored_limit_sample_count": stored_limit_sample_count,
         "stored_device_identity_count": stored_device_identity_count,
         "event_kind": event_kind,
         "device_count": incoming_devices.len(),
@@ -4107,6 +5245,42 @@ fn tokenomics_store_cloud_provider_limits(
         rusqlite::params![TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY, json!(merged).to_string()],
     )
     .map_err(|error| format!("Unable to store cloud Tokenomics provider limits: {error}"))?;
+    Ok(stored_count)
+}
+
+fn tokenomics_store_cloud_provider_limit_samples(
+    conn: &rusqlite::Connection,
+    summary: &Value,
+    inherited_billing_scope: &TokenomicsBillingScope,
+    fallback_device_id: &str,
+) -> Result<usize, String> {
+    let incoming = summary
+        .get("limit_samples")
+        .or_else(|| summary.get("limitSamples"))
+        .or_else(|| summary.get("provider_limit_samples"))
+        .or_else(|| summary.get("providerLimitSamples"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if incoming.is_empty() {
+        return Ok(0);
+    }
+    let mut stored_count = 0usize;
+    for sample in incoming
+        .iter()
+        .take(TOKENOMICS_PROVIDER_LIMIT_SAMPLE_SYNC_LIMIT)
+    {
+        if tokenomics_upsert_provider_limit_sample(
+            conn,
+            sample,
+            inherited_billing_scope,
+            fallback_device_id,
+            Some("cloud"),
+        )? {
+            stored_count += 1;
+        }
+    }
+    tokenomics_prune_provider_limit_samples(conn, tokenomics_unix_now())?;
     Ok(stored_count)
 }
 
@@ -4233,7 +5407,18 @@ fn tokenomics_provider_limits(
     let claude_plan = tokenomics_claude_plan_state();
     let claude_account = tokenomics_provider_account("anthropic", "claude");
     let _ = tokenomics_ensure_claude_statusline_collector(&claude_plan);
-    if let Some(claude_limits) = tokenomics_claude_statusline_limits(&claude_plan, &claude_account)
+    if let Some(claude_usage) = tokenomics_claude_live_usage(
+        conn,
+        &claude_account,
+        include_stale_provider_cache,
+    ) {
+        limits.extend(tokenomics_claude_live_limit_snapshots(
+            &claude_plan,
+            &claude_usage,
+            &claude_account,
+        ));
+    } else if let Some(claude_limits) =
+        tokenomics_claude_statusline_limits(&claude_plan, &claude_account)
     {
         limits.extend(claude_limits);
     } else {
@@ -4406,16 +5591,18 @@ fn tokenomics_cached_codex_usage(
     let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix", "fetchedAtUnix"])
         .unwrap_or(0)
         .max(0) as u64;
-    if fetched_at == 0 || now_unix.saturating_sub(fetched_at) > max_age_secs {
+    if fetched_at == 0 || now_unix.saturating_sub(fetched_at) >= max_age_secs {
         return Ok(None);
     }
     let Some(usage) = cached.get("usage").filter(|value| value.is_object()) else {
         return Ok(None);
     };
-    Ok(Some(tokenomics_adjust_cached_codex_usage(
+    let mut usage = tokenomics_adjust_cached_codex_usage(
         usage,
         now_unix.saturating_sub(fetched_at),
-    )))
+    );
+    tokenomics_mark_usage_updated_at(&mut usage, tokenomics_unix_iso_like(fetched_at));
+    Ok(Some(usage))
 }
 
 fn tokenomics_store_codex_usage_cache(
@@ -4473,6 +5660,16 @@ fn tokenomics_adjust_cached_codex_usage(usage: &Value, elapsed_seconds: u64) -> 
     usage
 }
 
+fn tokenomics_mark_usage_updated_at(usage: &mut Value, updated_at: String) {
+    let Some(object) = usage.as_object_mut() else {
+        return;
+    };
+    object.insert("updated_at".to_string(), json!(updated_at.clone()));
+    object.insert("updatedAt".to_string(), json!(updated_at.clone()));
+    object.insert("last_known_at".to_string(), json!(updated_at.clone()));
+    object.insert("lastKnownAt".to_string(), json!(updated_at));
+}
+
 fn tokenomics_codex_live_usage(
     conn: &rusqlite::Connection,
     plan: &Value,
@@ -4495,7 +5692,8 @@ fn tokenomics_codex_live_usage(
         return Some(cached);
     }
     let fetched = tokenomics_fetch_codex_live_usage(access_token);
-    if let Some(usage) = fetched {
+    if let Some(mut usage) = fetched {
+        tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
         let _ = tokenomics_store_codex_usage_cache(conn, &cache_key, &usage);
         return Some(usage);
     }
@@ -4529,6 +5727,154 @@ fn tokenomics_fetch_codex_live_usage(access_token: &str) -> Option<Value> {
     response.json::<Value>().ok()
 }
 
+fn tokenomics_claude_usage_cache_key(provider_account: &TokenomicsProviderAccount) -> String {
+    format!(
+        "{TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX}{}",
+        provider_account.key
+    )
+}
+
+fn tokenomics_cached_claude_usage(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    now_unix: u64,
+    max_age_secs: u64,
+) -> Result<Option<Value>, String> {
+    let text: String = match conn.query_row(
+        "SELECT value FROM tokenomics_meta WHERE key=?1",
+        rusqlite::params![cache_key],
+        |row| row.get(0),
+    ) {
+        Ok(text) => text,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+        Err(error) => return Err(format!("Unable to read Claude usage cache: {error}")),
+    };
+    let cached = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("Unable to parse Claude usage cache: {error}"))?;
+    let fetched_at = tokenomics_value_i64(&cached, &["fetched_at_unix", "fetchedAtUnix"])
+        .unwrap_or(0)
+        .max(0) as u64;
+    if fetched_at == 0 || now_unix.saturating_sub(fetched_at) >= max_age_secs {
+        return Ok(None);
+    }
+    let Some(usage) = cached.get("usage").filter(|value| value.is_object()) else {
+        return Ok(None);
+    };
+    let mut usage = usage.clone();
+    tokenomics_mark_usage_updated_at(&mut usage, tokenomics_unix_iso_like(fetched_at));
+    Ok(Some(usage))
+}
+
+fn tokenomics_store_claude_usage_cache(
+    conn: &rusqlite::Connection,
+    cache_key: &str,
+    usage: &Value,
+) -> Result<(), String> {
+    let payload = json!({
+        "fetched_at_unix": tokenomics_unix_now(),
+        "usage": usage,
+    });
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![cache_key, payload.to_string()],
+    )
+    .map_err(|error| format!("Unable to write Claude usage cache: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_claude_live_usage(
+    conn: &rusqlite::Connection,
+    provider_account: &TokenomicsProviderAccount,
+    allow_stale_cache: bool,
+) -> Option<Value> {
+    let access_token = tokenomics_claude_access_token()?;
+    let cache_key = tokenomics_claude_usage_cache_key(provider_account);
+    let now_unix = tokenomics_unix_now();
+    if let Ok(Some(cached)) = tokenomics_cached_claude_usage(
+        conn,
+        &cache_key,
+        now_unix,
+        TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS,
+    ) {
+        return Some(cached);
+    }
+    let fetched = tokenomics_fetch_claude_live_usage(access_token.as_str());
+    if let Some(mut usage) = fetched {
+        tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
+        let _ = tokenomics_store_claude_usage_cache(conn, &cache_key, &usage);
+        return Some(usage);
+    }
+    if !allow_stale_cache {
+        return None;
+    }
+    tokenomics_cached_claude_usage(
+        conn,
+        &cache_key,
+        now_unix,
+        TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS,
+    )
+    .ok()
+    .flatten()
+}
+
+fn tokenomics_fetch_claude_live_usage(access_token: &str) -> Option<Value> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+    let response = client
+        .get(TOKENOMICS_CLAUDE_USAGE_URL)
+        .bearer_auth(access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", tokenomics_claude_code_user_agent())
+        .header("Content-Type", "application/json")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<Value>().ok()
+}
+
+fn tokenomics_claude_code_user_agent() -> String {
+    let version = Command::new("claude")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tokenomics_first_semver(stdout.as_ref())
+                .or_else(|| tokenomics_first_semver(stderr.as_ref()))
+        })
+        .unwrap_or_else(|| "2.1.170".to_string());
+    format!("claude-code/{version}")
+}
+
+fn tokenomics_first_semver(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|part| {
+        let clean = part.trim_matches(|character: char| {
+            !(character.is_ascii_digit() || character == '.')
+        });
+        let mut pieces = clean.split('.');
+        let major = pieces.next()?;
+        let minor = pieces.next()?;
+        let patch = pieces.next()?;
+        if pieces.next().is_some()
+            || major.is_empty()
+            || minor.is_empty()
+            || patch.is_empty()
+            || !major.chars().all(|character| character.is_ascii_digit())
+            || !minor.chars().all(|character| character.is_ascii_digit())
+            || !patch.chars().all(|character| character.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(format!("{major}.{minor}.{patch}"))
+    })
+}
+
 fn tokenomics_codex_live_limit_snapshots(
     plan: &Value,
     usage: &Value,
@@ -4544,8 +5890,13 @@ fn tokenomics_codex_live_limit_snapshots(
                 .and_then(Value::as_str)
                 .unwrap_or("ChatGPT plan")
                 .to_string()
-        });
+    });
     let credits = usage.get("credits").cloned().unwrap_or_else(|| json!({}));
+    let updated_at = tokenomics_value_string(
+        usage,
+        &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"],
+    )
+    .unwrap_or_else(tokenomics_now_iso_like);
     if let Some(rate_limit) = usage.get("rate_limit") {
         if let Some(primary) = rate_limit.get("primary_window") {
             limits.push(tokenomics_codex_window_snapshot(
@@ -4556,6 +5907,7 @@ fn tokenomics_codex_live_limit_snapshots(
                 primary,
                 rate_limit,
                 &credits,
+                updated_at.as_str(),
                 provider_account,
             ));
         }
@@ -4568,6 +5920,7 @@ fn tokenomics_codex_live_limit_snapshots(
                 secondary,
                 rate_limit,
                 &credits,
+                updated_at.as_str(),
                 provider_account,
             ));
         }
@@ -4620,6 +5973,137 @@ fn tokenomics_title_case(value: &str) -> String {
     }
 }
 
+fn tokenomics_limit_default_window_seconds(window_kind: &str) -> i64 {
+    if window_kind == "weekly" {
+        7 * 24 * 60 * 60
+    } else {
+        5 * 60 * 60
+    }
+}
+
+fn tokenomics_limit_effective_window_seconds(window_kind: &str, seconds: Option<i64>) -> i64 {
+    seconds
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| tokenomics_limit_default_window_seconds(window_kind))
+}
+
+fn tokenomics_limit_pace_snapshot(
+    used_percent: i64,
+    limit_window_seconds: i64,
+    reset_after_seconds: Option<i64>,
+    reset_at_unix: Option<u64>,
+    updated_at: &str,
+) -> Value {
+    let window_seconds = limit_window_seconds.max(0) as u64;
+    if window_seconds == 0 {
+        return tokenomics_unknown_pace_snapshot();
+    }
+
+    let updated_at_unix = tokenomics_timestamp_unix(updated_at).unwrap_or_else(tokenomics_unix_now);
+    let remaining_seconds = reset_after_seconds
+        .map(|value| value.max(0) as u64)
+        .or_else(|| reset_at_unix.map(|reset_at| reset_at.saturating_sub(updated_at_unix)));
+    let Some(remaining_seconds) = remaining_seconds else {
+        return tokenomics_unknown_pace_snapshot();
+    };
+
+    let remaining_seconds = remaining_seconds.min(window_seconds);
+    let elapsed_seconds = window_seconds.saturating_sub(remaining_seconds);
+    let elapsed_for_rate = elapsed_seconds.max(1) as f64;
+    let used_percent = used_percent.clamp(0, 100) as f64;
+    let projected_used_percent = if used_percent <= 0.0 {
+        0.0
+    } else {
+        (used_percent / elapsed_for_rate) * window_seconds as f64
+    };
+    let projected_used_percent = projected_used_percent.round().clamp(0.0, 999.0) as i64;
+    let pace_delta_percent = projected_used_percent - 100;
+    let expected_used_percent = ((elapsed_seconds as f64 / window_seconds as f64) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as i64;
+    let exhausts_before_reset = if used_percent >= 100.0 {
+        true
+    } else if used_percent <= 0.0 {
+        false
+    } else {
+        let seconds_to_full = (elapsed_for_rate * (100.0 / used_percent)).ceil();
+        seconds_to_full <= window_seconds as f64
+    };
+    let projected_exhaustion_seconds = if used_percent >= 100.0 {
+        Some(0_i64)
+    } else if exhausts_before_reset {
+        let seconds_to_full = (elapsed_for_rate * (100.0 / used_percent)).ceil() as i64;
+        Some((seconds_to_full - elapsed_seconds as i64).max(0))
+    } else {
+        None
+    };
+    let projected_exhaustion_at = projected_exhaustion_seconds
+        .map(|seconds| tokenomics_unix_iso_like(updated_at_unix.saturating_add(seconds as u64)));
+    let reset_at = tokenomics_unix_iso_like(updated_at_unix.saturating_add(remaining_seconds));
+    let pace_status = if exhausts_before_reset {
+        "over_pace"
+    } else {
+        "on_pace"
+    };
+
+    json!({
+        "pace_delta_percent": pace_delta_percent,
+        "paceDeltaPercent": pace_delta_percent,
+        "pace_status": pace_status,
+        "paceStatus": pace_status,
+        "pace_exhausts_before_reset": exhausts_before_reset,
+        "paceExhaustsBeforeReset": exhausts_before_reset,
+        "pace_expected_used_percent": expected_used_percent,
+        "paceExpectedUsedPercent": expected_used_percent,
+        "pace_window_elapsed_percent": expected_used_percent,
+        "paceWindowElapsedPercent": expected_used_percent,
+        "pace_projected_used_percent": projected_used_percent,
+        "paceProjectedUsedPercent": projected_used_percent,
+        "pace_projected_exhaustion_seconds": projected_exhaustion_seconds,
+        "paceProjectedExhaustionSeconds": projected_exhaustion_seconds,
+        "pace_projected_exhaustion_at": projected_exhaustion_at,
+        "paceProjectedExhaustionAt": projected_exhaustion_at,
+        "pace_reset_at": reset_at,
+        "paceResetAt": reset_at,
+    })
+}
+
+fn tokenomics_unknown_pace_snapshot() -> Value {
+    json!({
+        "pace_delta_percent": 0,
+        "paceDeltaPercent": 0,
+        "pace_status": "unknown",
+        "paceStatus": "unknown",
+        "pace_exhausts_before_reset": false,
+        "paceExhaustsBeforeReset": false,
+        "pace_expected_used_percent": Value::Null,
+        "paceExpectedUsedPercent": Value::Null,
+        "pace_window_elapsed_percent": Value::Null,
+        "paceWindowElapsedPercent": Value::Null,
+        "pace_projected_used_percent": Value::Null,
+        "paceProjectedUsedPercent": Value::Null,
+        "pace_projected_exhaustion_seconds": Value::Null,
+        "paceProjectedExhaustionSeconds": Value::Null,
+        "pace_projected_exhaustion_at": Value::Null,
+        "paceProjectedExhaustionAt": Value::Null,
+        "pace_reset_at": Value::Null,
+        "paceResetAt": Value::Null,
+    })
+}
+
+fn tokenomics_with_pace_fields(mut snapshot: Value, pace: Value) -> Value {
+    let Some(snapshot_object) = snapshot.as_object_mut() else {
+        return snapshot;
+    };
+    let Some(pace_object) = pace.as_object() else {
+        return snapshot;
+    };
+    for (key, value) in pace_object {
+        snapshot_object.insert(key.clone(), value.clone());
+    }
+    snapshot
+}
+
 fn tokenomics_codex_window_snapshot(
     window_kind: &str,
     label: &str,
@@ -4628,17 +6112,28 @@ fn tokenomics_codex_window_snapshot(
     window: &Value,
     rate_limit: &Value,
     credits: &Value,
+    updated_at: &str,
     provider_account: &TokenomicsProviderAccount,
 ) -> Value {
     let used_percent = tokenomics_value_i64(window, &["used_percent", "usedPercent"])
         .unwrap_or(0)
         .clamp(0, 100);
     let remaining_percent = (100 - used_percent).clamp(0, 100);
-    let reset_after_seconds =
-        tokenomics_value_i64(window, &["reset_after_seconds", "resetAfterSeconds"]).unwrap_or(0);
+    let reset_after_seconds_value =
+        tokenomics_value_i64(window, &["reset_after_seconds", "resetAfterSeconds"]);
+    let reset_after_seconds = reset_after_seconds_value.unwrap_or(0);
     let reset_at = tokenomics_value_i64(window, &["reset_at", "resetAt"]);
-    let limit_window_seconds =
+    let limit_window_seconds_value =
         tokenomics_value_i64(window, &["limit_window_seconds", "limitWindowSeconds"]);
+    let limit_window_seconds =
+        tokenomics_limit_effective_window_seconds(window_kind, limit_window_seconds_value);
+    let pace = tokenomics_limit_pace_snapshot(
+        used_percent,
+        limit_window_seconds,
+        reset_after_seconds_value,
+        reset_at.map(tokenomics_normalize_unix_timestamp),
+        updated_at,
+    );
     let limit_reached = rate_limit
         .get("limit_reached")
         .or_else(|| rate_limit.get("limitReached"))
@@ -4648,7 +6143,7 @@ fn tokenomics_codex_window_snapshot(
         .get("allowed")
         .and_then(Value::as_bool)
         .unwrap_or(!limit_reached);
-    json!({
+    tokenomics_with_pace_fields(json!({
         "provider": "openai",
         "agent_kind": "codex",
         "provider_account_key": provider_account.key.as_str(),
@@ -4667,12 +6162,13 @@ fn tokenomics_codex_window_snapshot(
         "remaining": remaining_percent,
         "used_percent": used_percent,
         "remaining_percent": remaining_percent,
-        "pace_delta_percent": 0,
         "status_label": tokenomics_codex_status_label(remaining_percent, limit_reached, allowed),
         "reset_label": tokenomics_reset_label(reset_at, reset_after_seconds),
         "reset_after_seconds": reset_after_seconds,
         "reset_at": reset_at,
         "limit_window_seconds": limit_window_seconds,
+        "updated_at": updated_at,
+        "last_known_at": updated_at,
         "credits": {
             "has_credits": credits.get("has_credits").or_else(|| credits.get("hasCredits")).and_then(Value::as_bool).unwrap_or(false),
             "unlimited": credits.get("unlimited").and_then(Value::as_bool).unwrap_or(false),
@@ -4682,7 +6178,7 @@ fn tokenomics_codex_window_snapshot(
             "approx_cloud_messages": credits.get("approx_cloud_messages").or_else(|| credits.get("approxCloudMessages")).cloned().unwrap_or(Value::Null),
         },
         "rate_points": [],
-    })
+    }), pace)
 }
 
 fn tokenomics_ensure_claude_statusline_collector(plan: &Value) -> Result<(), String> {
@@ -4711,6 +6207,10 @@ process.stdin.on("end", () => {{
     if (payload && payload.rate_limits) {{
       const out = {{
         updated_at: new Date().toISOString(),
+        session_id: payload.session_id || payload.sessionId || null,
+        transcript_path: payload.transcript_path || payload.transcriptPath || null,
+        cwd: payload.cwd || null,
+        version: payload.version || null,
         model: payload.model || null,
         rate_limits: payload.rate_limits
       }};
@@ -4762,12 +6262,65 @@ process.stdin.on("end", () => {{
     Ok(())
 }
 
+fn tokenomics_claude_live_limit_snapshots(
+    plan: &Value,
+    usage: &Value,
+    provider_account: &TokenomicsProviderAccount,
+) -> Vec<Value> {
+    let plan_name = plan
+        .get("plan_name")
+        .and_then(Value::as_str)
+        .unwrap_or("Claude account signed in");
+    let updated_at = tokenomics_value_string(
+        usage,
+        &["updated_at", "updatedAt", "last_known_at", "lastKnownAt"],
+    )
+    .unwrap_or_else(tokenomics_now_iso_like);
+    let mut limits = Vec::new();
+    if let Some(five_hour) = usage
+        .get("five_hour")
+        .or_else(|| usage.get("fiveHour"))
+        .filter(|value| value.is_object())
+    {
+        limits.push(tokenomics_claude_window_snapshot(
+            "5_hour",
+            "5-Hour Session",
+            plan_name,
+            "claude_oauth_usage_api",
+            five_hour,
+            updated_at.as_str(),
+            provider_account,
+        ));
+    }
+    if let Some(seven_day) = usage
+        .get("seven_day")
+        .or_else(|| usage.get("sevenDay"))
+        .filter(|value| value.is_object())
+    {
+        limits.push(tokenomics_claude_window_snapshot(
+            "weekly",
+            "Weekly Limit",
+            plan_name,
+            "claude_oauth_usage_api",
+            seven_day,
+            updated_at.as_str(),
+            provider_account,
+        ));
+    }
+    limits
+}
+
 fn tokenomics_claude_statusline_limits(
     plan: &Value,
     provider_account: &TokenomicsProviderAccount,
 ) -> Option<Vec<Value>> {
     let home = env::var("HOME").ok().map(PathBuf::from)?;
     let cache_path = home.join(".claude").join("diffforge-rate-limits.json");
+    let cache_modified = fs::metadata(&cache_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| tokenomics_unix_iso_like(duration.as_secs()));
     let text = fs::read_to_string(cache_path).ok()?;
     let cache = serde_json::from_str::<Value>(&text).ok()?;
     let rate_limits = cache.get("rate_limits")?;
@@ -4775,6 +6328,13 @@ fn tokenomics_claude_statusline_limits(
         .get("plan_name")
         .and_then(Value::as_str)
         .unwrap_or("Claude account signed in");
+    let updated_at = cache
+        .get("updated_at")
+        .or_else(|| cache.get("updatedAt"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or(cache_modified)
+        .unwrap_or_else(tokenomics_now_iso_like);
     let mut limits = Vec::new();
     if let Some(five_hour) = rate_limits
         .get("five_hour")
@@ -4784,8 +6344,9 @@ fn tokenomics_claude_statusline_limits(
             "5_hour",
             "5-Hour Session",
             plan_name,
+            "claude_statusline",
             five_hour,
-            cache.get("updated_at").and_then(Value::as_str),
+            updated_at.as_str(),
             provider_account,
         ));
     }
@@ -4797,8 +6358,9 @@ fn tokenomics_claude_statusline_limits(
             "weekly",
             "Weekly Limit",
             plan_name,
+            "claude_statusline",
             seven_day,
-            cache.get("updated_at").and_then(Value::as_str),
+            updated_at.as_str(),
             provider_account,
         ));
     }
@@ -4813,32 +6375,58 @@ fn tokenomics_claude_window_snapshot(
     window_kind: &str,
     label: &str,
     plan_name: &str,
+    limit_source: &str,
     window: &Value,
-    updated_at: Option<&str>,
+    updated_at: &str,
     provider_account: &TokenomicsProviderAccount,
 ) -> Value {
-    let used_percent = tokenomics_value_i64(
+    let provider_reported_percent = tokenomics_value_i64(
         window,
         &[
             "used_percentage",
             "usedPercentage",
+            "utilization",
             "used_percent",
             "usedPercent",
         ],
     )
     .unwrap_or(0)
     .clamp(0, 100);
+    let used_percent = (100 - provider_reported_percent).clamp(0, 100);
     let remaining_percent = (100 - used_percent).clamp(0, 100);
-    let reset_at_text = window
-        .get("resets_at")
-        .or_else(|| window.get("resetsAt"))
-        .and_then(Value::as_str);
+    let reset_at = tokenomics_value_string(
+        window,
+        &[
+            "resets_at",
+            "resetsAt",
+            "reset_at",
+            "resetAt",
+            "limit_resets_at",
+            "limitResetsAt",
+        ],
+    );
     let limit_window_seconds = if window_kind == "5_hour" {
         5 * 60 * 60
     } else {
         7 * 24 * 60 * 60
     };
-    json!({
+    let reset_at_unix = reset_at.as_deref().and_then(tokenomics_timestamp_unix);
+    let reset_after_seconds = reset_at_unix.map(|reset_at| {
+        let updated_at_unix = tokenomics_timestamp_unix(updated_at).unwrap_or_else(tokenomics_unix_now);
+        reset_at.saturating_sub(updated_at_unix).min(i64::MAX as u64) as i64
+    });
+    let reset_label = tokenomics_reset_label(
+        reset_at_unix.map(|value| value.min(i64::MAX as u64) as i64),
+        reset_after_seconds.unwrap_or(0),
+    );
+    let pace = tokenomics_limit_pace_snapshot(
+        used_percent,
+        limit_window_seconds,
+        reset_after_seconds,
+        reset_at_unix,
+        updated_at,
+    );
+    tokenomics_with_pace_fields(json!({
         "provider": "anthropic",
         "agent_kind": "claude",
         "provider_account_key": provider_account.key.as_str(),
@@ -4849,7 +6437,7 @@ fn tokenomics_claude_window_snapshot(
         "plan_detected": true,
         "plan_name": plan_name,
         "plan_source": "claude_credentials_file",
-        "limit_source": "claude_statusline",
+        "limit_source": limit_source,
         "confidence": "live",
         "allowance_unit": "percent",
         "used": used_percent,
@@ -4857,14 +6445,19 @@ fn tokenomics_claude_window_snapshot(
         "remaining": remaining_percent,
         "used_percent": used_percent,
         "remaining_percent": remaining_percent,
-        "pace_delta_percent": 0,
+        "provider_reported_percent": provider_reported_percent,
+        "provider_reported_direction": "remaining",
         "status_label": tokenomics_claude_status_label(remaining_percent),
-        "reset_label": tokenomics_claude_reset_label(reset_at_text),
-        "reset_at": reset_at_text,
+        "reset_label": reset_label,
+        "reset_after_seconds": reset_after_seconds,
+        "reset_at": reset_at.clone(),
+        "resetAt": reset_at.clone(),
+        "limit_resets_at": reset_at,
         "limit_window_seconds": limit_window_seconds,
         "updated_at": updated_at,
+        "last_known_at": updated_at,
         "rate_points": [],
-    })
+    }), pace)
 }
 
 fn tokenomics_claude_status_label(remaining_percent: i64) -> &'static str {
@@ -4877,12 +6470,6 @@ fn tokenomics_claude_status_label(remaining_percent: i64) -> &'static str {
     } else {
         "Available"
     }
-}
-
-fn tokenomics_claude_reset_label(reset_at: Option<&str>) -> String {
-    reset_at
-        .map(|value| format!("Resets {}", value))
-        .unwrap_or_else(|| "Reset time unavailable".to_string())
 }
 
 fn tokenomics_unknown_limit_snapshot(
@@ -4913,7 +6500,7 @@ fn tokenomics_unknown_limit_snapshot(
     } else {
         "Provider schedule unavailable"
     };
-    json!({
+    tokenomics_with_pace_fields(json!({
         "provider": provider,
         "agent_kind": agent_kind,
         "provider_account_key": provider_account.key.as_str(),
@@ -4932,11 +6519,10 @@ fn tokenomics_unknown_limit_snapshot(
         "remaining": Value::Null,
         "used_percent": Value::Null,
         "remaining_percent": Value::Null,
-        "pace_delta_percent": 0,
         "status_label": status_label,
         "reset_label": reset_label,
         "rate_points": [],
-    })
+    }), tokenomics_unknown_pace_snapshot())
 }
 
 fn tokenomics_codex_status_label(
@@ -5064,6 +6650,16 @@ fn tokenomics_claude_plan_state() -> Value {
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     tokenomics_claude_plan_state_from_credentials(credentials.as_ref())
+}
+
+fn tokenomics_claude_access_token() -> Option<String> {
+    let home = tokenomics_home_dir()?;
+    let credentials = tokenomics_read_json_file(home.join(".claude").join(".credentials.json"))?;
+    credentials
+        .get("claudeAiOauth")
+        .and_then(|oauth| tokenomics_value_string(oauth, &["accessToken", "access_token"]))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn tokenomics_claude_plan_state_from_credentials(credentials: Option<&Value>) -> Value {
@@ -5329,7 +6925,7 @@ mod tokenomics_tests {
         let cached = tokenomics_cached_codex_usage(
             &conn,
             "codex-usage-cache-test",
-            1_030,
+            1_005,
             TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
         )
         .unwrap()
@@ -5337,12 +6933,13 @@ mod tokenomics_tests {
 
         assert_eq!(
             cached["rate_limit"]["primary_window"]["reset_after_seconds"],
-            json!(270)
+            json!(295)
         );
         assert_eq!(
             cached["rate_limit"]["secondary_window"]["reset_after_seconds"],
-            json!(604_770)
+            json!(604_795)
         );
+        assert_eq!(cached["updated_at"], json!("unix:1000"));
     }
 
     #[test]
@@ -5431,6 +7028,34 @@ mod tokenomics_tests {
         assert_eq!(rollups[0]["total_tokens"], json!(12));
         assert_eq!(rollups[0]["event_count"], json!(2));
         assert_eq!(rollups[0]["model"], json!("codex"));
+    }
+
+    #[test]
+    fn tokenomics_account_sync_rollups_fall_back_to_component_totals() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key,
+               bucket_width, bucket_start, input_tokens, output_tokens, cache_read_tokens,
+               cache_write_tokens, total_tokens, estimated_cost_microusd, event_count, updated_at
+             ) VALUES(
+               'rollup-component-total', 'anthropic', 'claude', 'fable-5', 'anthropic:claude',
+               'hour', 'unix-hour-component-total', 2, 3, 5,
+               7, 0, 0, 1, '2026-05-30T05:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let rollups = tokenomics_account_hourly_sync_rollups(&conn, None, None).unwrap();
+
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0]["total_tokens"], json!(17));
+        assert_eq!(rollups[0]["input_tokens"], json!(2));
+        assert_eq!(rollups[0]["output_tokens"], json!(3));
+        assert_eq!(rollups[0]["cache_read_tokens"], json!(5));
+        assert_eq!(rollups[0]["cache_write_tokens"], json!(7));
     }
 
     #[test]
@@ -6321,6 +7946,138 @@ mod tokenomics_tests {
     }
 
     #[test]
+    fn tokenomics_claude_fable_5_estimated_api_cost_uses_current_rates() {
+        assert_eq!(
+            tokenomics_estimated_api_microusd(
+                "anthropic",
+                "claude",
+                Some("claude-fable-5"),
+                1_000_000,
+                100_000,
+                100_000,
+                2_000_000,
+            ),
+            111_350_000
+        );
+    }
+
+    #[test]
+    fn tokenomics_record_usage_value_prices_claude_fable_5() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        let inserted = tokenomics_record_usage_value(
+            &conn,
+            &json!({
+                "provider": "anthropic",
+                "agent_kind": "claude",
+                "provider_account_key": "anthropic:claude:fable-test",
+                "provider_account_label": "Claude Fable Test",
+                "model": "claude-fable-5",
+                "created_at": "2026-06-10T10:00:00Z",
+                "input_tokens": 1_000_000,
+                "cache_read_tokens": 100_000,
+                "cache_write_tokens": 100_000,
+                "output_tokens": 2_000_000,
+            }),
+            "test",
+        )
+        .unwrap();
+
+        assert_eq!(inserted, 1);
+        let event_cost: i64 = conn
+            .query_row(
+                "SELECT estimated_cost_microusd FROM tokenomics_usage_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_cost: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(estimated_cost_microusd), 0)
+                 FROM tokenomics_rollups WHERE bucket_width='hour'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(event_cost, 111_350_000);
+        assert_eq!(rollup_cost, 111_350_000);
+    }
+
+    #[test]
+    fn tokenomics_repair_provider_api_costs_rebuilds_claude_rollups() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM tokenomics_meta WHERE key='provider_api_pricing_version'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_usage_events(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, source_kind, source_path, bucket_day, bucket_hour,
+               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+               total_tokens, estimated_cost_microusd, created_at, observed_at
+             ) VALUES(
+               'fable-event-zero-cost', 'anthropic', 'claude', 'claude-fable-5',
+               'anthropic:claude:fable-test', 'anthropic:claude:fable-test',
+               'Claude Fable Test', 'jsonl', '/tmp/claude.jsonl', '2026-06-10',
+               '2026-06-10T10', 1000000, 2000000, 100000, 100000,
+               3200000, 0, '2026-06-10T10:00:00Z', '2026-06-10T10:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tokenomics_rollups(
+               id, provider, agent_kind, model, subscription_key, provider_account_key,
+               provider_account_label, bucket_width, bucket_start, input_tokens, output_tokens,
+               cache_read_tokens, cache_write_tokens, total_tokens, estimated_cost_microusd,
+               event_count, updated_at
+             ) VALUES(
+               'fable-rollup-zero-cost', 'anthropic', 'claude', 'claude-fable-5',
+               'anthropic:claude:fable-test', 'anthropic:claude:fable-test',
+               'Claude Fable Test', 'hour', '2026-06-10T10', 1000000, 2000000,
+               100000, 100000, 3200000, 0, 1, '2026-06-10T10:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        tokenomics_repair_provider_api_costs(&conn).unwrap();
+
+        let event_cost: i64 = conn
+            .query_row(
+                "SELECT estimated_cost_microusd
+                 FROM tokenomics_usage_events WHERE id='fable-event-zero-cost'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_cost: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(estimated_cost_microusd), 0)
+                 FROM tokenomics_rollups WHERE provider='anthropic' AND agent_kind='claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let meta_value: String = conn
+            .query_row(
+                "SELECT value FROM tokenomics_meta WHERE key='provider_api_pricing_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(event_cost, 111_350_000);
+        assert_eq!(rollup_cost, 222_700_000);
+        assert_eq!(meta_value, TOKENOMICS_PROVIDER_API_PRICING_VERSION);
+    }
+
+    #[test]
     fn tokenomics_claude_plan_state_distinguishes_auth_from_subscription() {
         let signed_in = tokenomics_claude_plan_state_from_credentials(Some(&json!({
             "claudeAiOauth": {
@@ -6344,6 +8101,71 @@ mod tokenomics_tests {
         assert_eq!(pro["plan_name"], json!("Claude Pro"));
         assert_eq!(pro["subscription_type"], json!("pro"));
         assert_eq!(pro["rate_limit_tier"], json!("standard"));
+        assert!(pro["access_token"].is_null());
+    }
+
+    #[test]
+    fn tokenomics_claude_limit_snapshot_accepts_numeric_reset_timestamp() {
+        let account = TokenomicsProviderAccount {
+            key: "anthropic:claude:test".to_string(),
+            label: "Claude account test".to_string(),
+        };
+        let snapshot = tokenomics_claude_window_snapshot(
+            "5_hour",
+            "5-Hour Session",
+            "Claude Pro",
+            "claude_statusline",
+            &json!({
+                "used_percentage": 95,
+                "resets_at": 1781061600i64,
+            }),
+            "unix:1781058000",
+            &account,
+        );
+
+        assert_eq!(snapshot["used_percent"], json!(5));
+        assert_eq!(snapshot["remaining_percent"], json!(95));
+        assert_eq!(snapshot["provider_reported_percent"], json!(95));
+        assert_eq!(snapshot["provider_reported_direction"], json!("remaining"));
+        assert_eq!(snapshot["reset_after_seconds"], json!(3600));
+        assert_eq!(snapshot["reset_at"], json!("1781061600"));
+        assert_eq!(snapshot["limit_resets_at"], json!("1781061600"));
+        assert_eq!(snapshot["reset_label"], json!("Resets in 1h 0m"));
+    }
+
+    #[test]
+    fn tokenomics_claude_oauth_usage_snapshot_uses_utilization_and_iso_reset() {
+        let account = TokenomicsProviderAccount {
+            key: "anthropic:claude:test".to_string(),
+            label: "Claude account test".to_string(),
+        };
+        let limits = tokenomics_claude_live_limit_snapshots(
+            &json!({
+                "plan_name": "Claude Pro",
+            }),
+            &json!({
+                "updated_at": "2026-06-10T12:00:00Z",
+                "five_hour": {
+                    "utilization": 95,
+                    "resets_at": "2026-06-10T13:00:00.528743+00:00"
+                },
+                "seven_day": {
+                    "utilization": 20,
+                    "resets_at": "2026-06-14T02:00:00.951713+00:00"
+                }
+            }),
+            &account,
+        );
+
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0]["limit_source"], json!("claude_oauth_usage_api"));
+        assert_eq!(limits[0]["used_percent"], json!(5));
+        assert_eq!(limits[0]["remaining_percent"], json!(95));
+        assert_eq!(limits[0]["provider_reported_percent"], json!(95));
+        assert_eq!(limits[0]["reset_after_seconds"], json!(3600));
+        assert_eq!(limits[1]["window_kind"], json!("weekly"));
+        assert_eq!(limits[1]["used_percent"], json!(80));
+        assert_eq!(limits[1]["remaining_percent"], json!(20));
     }
 
     #[test]
@@ -6409,5 +8231,99 @@ mod tokenomics_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["used_percent"], json!(42));
         assert_eq!(merged[0]["remaining_percent"], json!(58));
+    }
+
+    #[test]
+    fn tokenomics_provider_limit_merge_prefers_fresher_local_live_snapshot() {
+        let cloud_known = json!({
+            "provider": "anthropic",
+            "agent_kind": "claude",
+            "provider_account_key": "anthropic:claude:personal",
+            "window_kind": "5_hour",
+            "limit_source": "claude_statusline",
+            "confidence": "live",
+            "used_percent": 95,
+            "remaining_percent": 5,
+            "updated_at": "unix:2000"
+        });
+        let local_live = json!({
+            "provider": "anthropic",
+            "agent_kind": "claude",
+            "provider_account_key": "anthropic:claude:personal",
+            "window_kind": "5_hour",
+            "limit_source": "claude_statusline",
+            "confidence": "live",
+            "used_percent": 98,
+            "remaining_percent": 2,
+            "updated_at": "unix:2010"
+        });
+
+        let merged = tokenomics_merge_provider_limits(vec![cloud_known], vec![local_live]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["used_percent"], json!(98));
+        assert_eq!(merged[0]["remaining_percent"], json!(2));
+    }
+
+    #[test]
+    fn tokenomics_limit_pace_marks_projected_early_exhaustion() {
+        let pace = tokenomics_limit_pace_snapshot(
+            50,
+            5 * 60 * 60,
+            Some(4 * 60 * 60),
+            None,
+            "unix:1000",
+        );
+
+        assert_eq!(pace["pace_status"], json!("over_pace"));
+        assert_eq!(pace["pace_exhausts_before_reset"], json!(true));
+        assert_eq!(pace["pace_projected_used_percent"], json!(250));
+        assert_eq!(pace["pace_delta_percent"], json!(150));
+        assert_eq!(pace["pace_projected_exhaustion_seconds"], json!(3600));
+    }
+
+    #[test]
+    fn tokenomics_limit_pace_keeps_safe_weekly_projection_on_pace() {
+        let pace = tokenomics_limit_pace_snapshot(
+            10,
+            7 * 24 * 60 * 60,
+            Some(3 * 24 * 60 * 60 + 12 * 60 * 60),
+            None,
+            "unix:1000",
+        );
+
+        assert_eq!(pace["pace_status"], json!("on_pace"));
+        assert_eq!(pace["pace_exhausts_before_reset"], json!(false));
+        assert_eq!(pace["pace_projected_used_percent"], json!(20));
+        assert_eq!(pace["pace_delta_percent"], json!(-80));
+    }
+
+    #[test]
+    fn tokenomics_codex_limit_snapshot_carries_live_timestamp() {
+        let account = TokenomicsProviderAccount {
+            key: "openai:codex:test".to_string(),
+            label: "Codex account test".to_string(),
+        };
+        let snapshot = tokenomics_codex_window_snapshot(
+            "5_hour",
+            "5-Hour Session",
+            "ChatGPT Pro",
+            "codex_usage_api",
+            &json!({
+                "used_percent": 98,
+                "reset_after_seconds": 60,
+            }),
+            &json!({
+                "allowed": true,
+                "limit_reached": false,
+            }),
+            &json!({}),
+            "unix:2010",
+            &account,
+        );
+
+        assert_eq!(snapshot["remaining_percent"], json!(2));
+        assert_eq!(snapshot["updated_at"], json!("unix:2010"));
+        assert_eq!(snapshot["last_known_at"], json!("unix:2010"));
     }
 }

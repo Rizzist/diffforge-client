@@ -25,6 +25,10 @@ const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 10_000;
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = 7;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
+const TOKENOMICS_USAGE_RATE_WINDOWS = [
+  { key: "5_hour", label: "5h" },
+  { key: "weekly", label: "Weekly" },
+];
 
 const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
@@ -42,7 +46,7 @@ const PROVIDER_LABELS = {
 
 const PROVIDER_MODELS = {
   codex: ["gpt-5.5", "gpt-5.4", "gpt-5"],
-  claude: ["opus-4-6", "sonnet-4-6", "haiku-4-5"],
+  claude: ["fable-5", "opus-4-8", "sonnet-4-6", "haiku-4-5"],
   all: ["codex", "claude", "opencode"],
 };
 
@@ -441,6 +445,16 @@ function limitNumberOrNull(...values) {
 
 function parseLimitTimestamp(value) {
   if (value == null || value === "") return null;
+  const text = String(value).trim();
+  if (/^resets\s+/i.test(text) && !/^resets\s+in\b/i.test(text)) {
+    return parseLimitTimestamp(text.replace(/^resets\s+/i, ""));
+  }
+  if (text.startsWith("unix:")) {
+    const unixSeconds = Number(text.slice(5));
+    if (Number.isFinite(unixSeconds) && unixSeconds > 0) {
+      return new Date(unixSeconds * 1000);
+    }
+  }
   const number = Number(value);
   if (Number.isFinite(number) && number > 0) {
     return new Date(number < 1_000_000_000_000 ? number * 1000 : number);
@@ -518,6 +532,8 @@ function mergeLimits(limits, windowKind) {
       remainingPercent: null,
       usedPercent: null,
       paceDelta: 0,
+      paceStatus: "unknown",
+      overPace: false,
       statusLabel: "Plan limit not exposed",
       resetLabel: windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule",
       ratePoints: [],
@@ -535,6 +551,8 @@ function mergeLimits(limits, windowKind) {
   const limitSource = rows.find((row) => row?.limit_source || row?.limitSource)?.limit_source || rows.find((row) => row?.limitSource)?.limitSource || "";
   const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
+  const paceStatus = limitPaceStatus(rows);
+  const overPace = paceStatus === "over_pace" || paceDelta > 0;
   return {
     windowKind,
     label: rows[0]?.label || (windowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
@@ -546,7 +564,9 @@ function mergeLimits(limits, windowKind) {
     remainingPercent,
     usedPercent,
     paceDelta,
-    statusLabel: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable),
+    paceStatus,
+    overPace,
+    statusLabel: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
     resetLabel: limitResetLabel(rows, windowKind, claudeUnavailable),
     ratePoints,
     limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),
@@ -569,6 +589,24 @@ function isClaudeLimitUnavailable(rows) {
   });
 }
 
+function truthyLimitValue(value) {
+  return value === true || value === 1 || value === "1" || String(value).toLowerCase() === "true";
+}
+
+function limitPaceStatus(rows) {
+  if (!Array.isArray(rows) || !rows.length) return "unknown";
+  if (rows.some((row) => {
+    const status = String(row?.pace_status || row?.paceStatus || "").toLowerCase();
+    return status === "over_pace" || truthyLimitValue(row?.pace_exhausts_before_reset ?? row?.paceExhaustsBeforeReset);
+  })) {
+    return "over_pace";
+  }
+  if (rows.some((row) => String(row?.pace_status || row?.paceStatus || "").toLowerCase() === "on_pace")) {
+    return "on_pace";
+  }
+  return "unknown";
+}
+
 function limitResetLabel(rows, windowKind, claudeUnavailable) {
   const current = rows[0]?.reset_label || rows[0]?.resetLabel || "";
   if (!claudeUnavailable) {
@@ -583,13 +621,14 @@ function limitResetLabel(rows, windowKind, claudeUnavailable) {
   return current;
 }
 
-function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable = false) {
+function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable = false, paceStatus = "unknown") {
   if (remainingPercent == null) {
     if (claudeUnavailable) return "Live limits unavailable";
     return rows.find((row) => row?.status_label || row?.statusLabel)?.status_label || "Plan limit not exposed";
   }
   if (remainingPercent <= 0) return "Limit exhausted";
-  if (remainingPercent < 18 || paceDelta > 25) return "Pace is running hot";
+  if (paceStatus === "over_pace" || paceDelta > 0) return "Pace will exhaust before reset";
+  if (remainingPercent < 18) return "Pace is running hot";
   if (remainingPercent < 38 || paceDelta > 8) return "Watch current pace";
   return "Safe at current pace";
 }
@@ -604,7 +643,7 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
       const index = numeric(row?.window_index, row?.windowIndex);
       const previous = byIndex.get(index) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
       byIndex.set(index, {
-        total: previous.total + rowTotal(row),
+        total: previous.total + rowActivityTokens(row),
         input: previous.input + rowInput(row),
         output: previous.output + rowOutput(row),
         cache: previous.cache + rowCache(row),
@@ -628,7 +667,7 @@ function usageRateRowsFromLimit(limit, hourlyRows, selectedProvider, selectedAcc
     const key = hourKey(date);
     const previous = byHour.get(key) || { total: 0, input: 0, output: 0, cache: 0, cost: 0 };
     byHour.set(key, {
-      total: previous.total + rowTotal(row),
+      total: previous.total + rowActivityTokens(row),
       input: previous.input + rowInput(row),
       output: previous.output + rowOutput(row),
       cache: previous.cache + rowCache(row),
@@ -682,17 +721,37 @@ function usageRatePath(points, width, height) {
     .join(" ");
 }
 
-function sessionWindowSeconds(limit) {
-  return numeric(limit?.limitWindowSeconds, limit?.limit_window_seconds) || 5 * 60 * 60;
+function usageRateBarWidth(pointCount) {
+  if (pointCount <= 1) return 8;
+  const step = 340 / Math.max(1, pointCount - 1);
+  return Math.max(1.1, Math.min(8, step * 0.58));
 }
 
-function windowDurationLabel(limit) {
-  const seconds = sessionWindowSeconds(limit);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
-  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
-  if (hours > 0) return `${hours}h`;
-  return `${minutes}m`;
+function usageRateAxisLabel(remainingHours) {
+  if (remainingHours <= 0) return "now";
+  if (remainingHours >= 24) return `-${Math.ceil(remainingHours / 24)}d`;
+  return `-${remainingHours}h`;
+}
+
+function usageRateAxisLabels(rows, windowKind) {
+  if (!rows.length) return [];
+  if (rows.length <= 12) {
+    return rows.map((row) => ({ key: row.key, label: row.label }));
+  }
+  const lastIndex = rows.length - 1;
+  return rows
+    .map((row, index) => {
+      const remaining = lastIndex - index;
+      const show = index === 0
+        || index === lastIndex
+        || (windowKind === "weekly" ? remaining % 24 === 0 : remaining % 6 === 0);
+      return show ? { key: row.key, label: usageRateAxisLabel(remaining) } : null;
+    })
+    .filter(Boolean);
+}
+
+function sessionWindowSeconds(limit) {
+  return numeric(limit?.limitWindowSeconds, limit?.limit_window_seconds) || 5 * 60 * 60;
 }
 
 function limitSourceText(limit) {
@@ -728,9 +787,9 @@ function codexCreditBalance(limits) {
   return match?.credits || null;
 }
 
-function statusTone(remainingPercent, paceDelta = 0) {
+function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
   if (remainingPercent == null) return "unknown";
-  if (remainingPercent <= 15 || paceDelta > 25) return "danger";
+  if (remainingPercent <= 15 || paceStatus === "over_pace" || paceDelta > 0) return "danger";
   if (remainingPercent <= 38 || paceDelta > 8) return "warn";
   return "good";
 }
@@ -779,11 +838,16 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKey, selecte
 function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all", selectedScopeKey = "all") {
   if (selectedProvider === "all") return [];
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
+  const usageRows = Array.isArray(summary?.by_device_account) ? summary.by_device_account : [];
+  const limitRows = Array.isArray(summary?.limits) ? summary.limits : [];
   const rows = [
-    ...(Array.isArray(summary?.by_device_account) ? summary.by_device_account : []),
+    ...usageRows,
+    ...limitRows,
   ].filter((row) => (
     provider.match(row)
-      && (selectedDeviceId === "all" || rowDeviceId(row) === selectedDeviceId)
+      && ((row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind)
+        || selectedDeviceId === "all"
+        || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
   const byKey = new Map();
@@ -803,12 +867,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   }
   const accounts = [...byKey.values()].sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
   if (!accounts.length) return [];
-  const providerLabelText = selectedProvider === "codex"
-    ? "All Codex"
-    : selectedProvider === "claude"
-      ? "All Claude"
-      : `All ${provider.label}`;
-  return [{ key: "all", label: providerLabelText }, ...accounts];
+  return [{ key: "all", label: "All accounts" }, ...accounts];
 }
 
 function deviceOptions(summary, selectedScopeKey = "all") {
@@ -896,6 +955,16 @@ function providerLimitKey(row = {}) {
   ].join("::");
 }
 
+function providerLimitSampleKey(row = {}) {
+  return [
+    rowScopeKey(row),
+    providerKey(row),
+    rowProviderAccountKey(row),
+    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
+    String(row?.sample_bucket_start || row?.sampleBucketStart || row?.bucket_start || row?.bucketStart || ""),
+  ].join("::");
+}
+
 function providerLimitIsUnknown(row = {}) {
   const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
   const confidence = String(row?.confidence || "").toLowerCase();
@@ -928,6 +997,56 @@ function mergeProviderLimits(previousLimits, nextLimits) {
   return [...merged.values()];
 }
 
+function mergeProviderLimitSamples(previousSamples, nextSamples) {
+  const previousRows = Array.isArray(previousSamples) ? previousSamples : [];
+  if (!Array.isArray(nextSamples)) return previousRows;
+  if (!nextSamples.length && previousRows.length) return previousRows;
+
+  const merged = new Map();
+  previousRows.forEach((row) => merged.set(providerLimitSampleKey(row), row));
+  nextSamples.forEach((row) => merged.set(providerLimitSampleKey(row), row));
+  return [...merged.values()];
+}
+
+function providerLimitDisplayedRemainingPercent(row = {}) {
+  const remaining = limitNumberOrNull(row?.remaining_percent, row?.remainingPercent);
+  if (remaining != null) return Math.max(0, Math.min(100, Math.round(remaining)));
+  const used = limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent);
+  if (used != null) return Math.max(0, Math.min(100, Math.round(100 - used)));
+  const allowance = limitNumberOrNull(row?.allowance);
+  const usedAmount = limitNumberOrNull(row?.used);
+  if (allowance && usedAmount != null) {
+    return Math.max(0, Math.min(100, Math.round(100 - ((usedAmount / allowance) * 100))));
+  }
+  return null;
+}
+
+function tokenomicsLimitPercentSignature(summary = {}) {
+  const limits = Array.isArray(summary?.limits) ? summary.limits : [];
+  const limitSignature = mergeProviderLimits([], limits)
+    .map((row) => {
+      const remaining = providerLimitDisplayedRemainingPercent(row);
+      if (remaining == null) return "";
+      return `${providerLimitKey(row)}=${remaining}`;
+    })
+    .filter(Boolean)
+    .sort()
+    .join("|");
+  const samples = Array.isArray(summary?.limit_samples)
+    ? summary.limit_samples
+    : (Array.isArray(summary?.limitSamples) ? summary.limitSamples : []);
+  const sampleSignature = mergeProviderLimitSamples([], samples)
+    .map((row) => {
+      const used = limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent);
+      if (used == null) return "";
+      return `${providerLimitSampleKey(row)}=${Math.round(used)}`;
+    })
+    .filter(Boolean)
+    .sort()
+    .join("|");
+  return [limitSignature, sampleSignature].filter(Boolean).join("|");
+}
+
 function mergeTokenomicsSummary(previous, next) {
   if (!previous) return stripLegacyTokenomicsSummaryFields(next || {});
   if (!next) return previous;
@@ -944,6 +1063,8 @@ function mergeTokenomicsSummary(previous, next) {
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
     limits: mergeProviderLimits(previous.limits, next.limits),
+    limit_samples: mergeProviderLimitSamples(previous.limit_samples || previous.limitSamples, next.limit_samples || next.limitSamples),
+    limitSamples: mergeProviderLimitSamples(previous.limitSamples || previous.limit_samples, next.limitSamples || next.limit_samples),
     device_identities: next.device_identities || previous.device_identities,
     deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
     credits: next.credits || previous.credits,
@@ -977,8 +1098,12 @@ const tokenomicsStore = {
   state: createTokenomicsStoreState(),
   loadedOnce: false,
   loadPromise: null,
+  liveLimitsPromise: null,
   pollInterval: null,
   pollSubscriberCount: 0,
+  limitPercentSignature: "",
+  limitSyncInFlight: false,
+  limitSyncPending: false,
   progressListenerPromise: null,
   progressUnlisten: null,
   subscribers: new Set(),
@@ -1014,10 +1139,53 @@ function tokenomicsErrorMessage(caught) {
   return caught?.message || String(caught || "Unable to load Tokenomics.");
 }
 
-function mergeSummaryIntoTokenomicsStore(next) {
+function rememberTokenomicsLimitSignature(summary) {
+  const signature = tokenomicsLimitPercentSignature(summary);
+  if (signature) {
+    tokenomicsStore.limitPercentSignature = signature;
+  }
+  return signature;
+}
+
+function scheduleTokenomicsLimitCloudSync() {
+  if (tokenomicsStore.limitSyncInFlight) {
+    tokenomicsStore.limitSyncPending = true;
+    return;
+  }
+  tokenomicsStore.limitSyncInFlight = true;
+  invoke("cloud_mcp_schedule_tokenomics_sync", {
+    reason: "tokenomics_limits_changed",
+    full: false,
+    resyncLast30Days: false,
+  })
+    .catch(() => {})
+    .finally(() => {
+      tokenomicsStore.limitSyncInFlight = false;
+      if (tokenomicsStore.limitSyncPending) {
+        tokenomicsStore.limitSyncPending = false;
+        scheduleTokenomicsLimitCloudSync();
+      }
+    });
+}
+
+function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}) {
+  let nextSignature = "";
+  let shouldSyncLimits = false;
   updateTokenomicsStore((previous) => ({
-    summary: mergeTokenomicsSummary(previous.summary, next || {}),
+    summary: (() => {
+      const merged = mergeTokenomicsSummary(previous.summary, next || {});
+      const previousSignature = tokenomicsStore.limitPercentSignature || tokenomicsLimitPercentSignature(previous.summary);
+      nextSignature = tokenomicsLimitPercentSignature(merged);
+      shouldSyncLimits = Boolean(syncLimitChanges && previousSignature && nextSignature && previousSignature !== nextSignature);
+      return merged;
+    })(),
   }));
+  if (nextSignature) {
+    tokenomicsStore.limitPercentSignature = nextSignature;
+  }
+  if (shouldSyncLimits) {
+    scheduleTokenomicsLimitCloudSync();
+  }
 }
 
 function resetTokenomicsStoreForAccount(accountKey) {
@@ -1030,6 +1198,9 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.requestEpoch += 1;
   tokenomicsStore.loadedOnce = false;
   tokenomicsStore.loadPromise = null;
+  tokenomicsStore.liveLimitsPromise = null;
+  tokenomicsStore.limitPercentSignature = "";
+  tokenomicsStore.limitSyncPending = false;
   tokenomicsStore.state = createTokenomicsStoreState();
   notifyTokenomicsSubscribers();
 }
@@ -1055,6 +1226,27 @@ function ensureTokenomicsProgressListener() {
     });
 }
 
+function refreshTokenomicsLiveLimits({ syncLimitChanges = false } = {}) {
+  const requestEpoch = tokenomicsStore.requestEpoch;
+  if (tokenomicsStore.liveLimitsPromise) {
+    return tokenomicsStore.liveLimitsPromise;
+  }
+  tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits")
+    .then((limitsSummary) => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        mergeSummaryIntoTokenomicsStore(limitsSummary || {}, { syncLimitChanges });
+      }
+      return tokenomicsStore.state.summary;
+    })
+    .catch(() => tokenomicsStore.state.summary)
+    .finally(() => {
+      if (tokenomicsStore.requestEpoch === requestEpoch) {
+        tokenomicsStore.liveLimitsPromise = null;
+      }
+    });
+  return tokenomicsStore.liveLimitsPromise;
+}
+
 function loadTokenomicsStore({ scan = false, force = false } = {}) {
   const hasSummary = Boolean(tokenomicsStore.state.summary);
   const shouldScan = Boolean(scan || !tokenomicsStore.loadedOnce);
@@ -1076,13 +1268,7 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
   tokenomicsStore.loadPromise = (async () => {
     try {
       if (shouldScan) {
-        invoke("tokenomics_get_live_limits")
-          .then((limitsSummary) => {
-            if (tokenomicsStore.requestEpoch === requestEpoch) {
-              mergeSummaryIntoTokenomicsStore(limitsSummary || {});
-            }
-          })
-          .catch(() => {});
+        void refreshTokenomicsLiveLimits();
       }
 
       const next = shouldScan
@@ -1097,6 +1283,7 @@ function loadTokenomicsStore({ scan = false, force = false } = {}) {
         status: "ready",
         summary: mergeTokenomicsSummary(previous.summary, next || {}),
       }));
+      rememberTokenomicsLimitSignature(tokenomicsStore.state.summary);
       return tokenomicsStore.state.summary;
     } catch (caught) {
       if (tokenomicsStore.requestEpoch !== requestEpoch) {
@@ -1128,10 +1315,13 @@ export function startAccountTokenomicsStartupScan(accountKey = "") {
 function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   tokenomicsStore.pollSubscriberCount += 1;
-  void loadTokenomicsStore();
+  void loadTokenomicsStore().finally(() => {
+    void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
+  });
 
   if (!tokenomicsStore.pollInterval) {
     tokenomicsStore.pollInterval = window.setInterval(() => {
+      void refreshTokenomicsLiveLimits({ syncLimitChanges: true });
       void loadTokenomicsStore({ force: true });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
@@ -1177,19 +1367,19 @@ function CostCell({ value }) {
 
 function LimitMetricCard({ icon: Icon, limit, title }) {
   return (
-    <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta)}>
+    <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta, limit.paceStatus)}>
       <MetricHeading>
         <MetricName>
           <Icon aria-hidden="true" />
           <span>{title}</span>
         </MetricName>
         <MetricScore>
-          <strong>{limit.remainingPercent == null ? "—" : `${limit.remainingPercent}%`}</strong>
+          <strong>{limit.usedPercent == null ? "—" : `${limit.usedPercent}%`}</strong>
           <span>{limit.paceDelta > 0 ? "▲" : "▼"}{Math.abs(limit.paceDelta)}%</span>
         </MetricScore>
       </MetricHeading>
-      <ProgressTrack>
-        <ProgressFill style={{ width: `${limit.remainingPercent ?? 0}%` }} />
+      <ProgressTrack aria-label={`${title} used`}>
+        <ProgressFill style={{ width: `${limit.usedPercent ?? 0}%` }} />
       </ProgressTrack>
       <MetricFoot>
         <span>{limit.resetLabel}</span>
@@ -1227,6 +1417,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     scanProgress,
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
+  const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
 
   const refresh = useCallback(async ({ scan = false } = {}) => {
     await loadTokenomicsStore({ scan, force: true });
@@ -1330,10 +1521,13 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   );
   const fiveHour = useMemo(() => mergeLimits(limits, "5_hour"), [limits]);
   const weekly = useMemo(() => mergeLimits(limits, "weekly"), [limits]);
+  const usageRateLimit = usageRateWindowKind === "weekly" ? weekly : fiveHour;
   const sessionUsageRows = useMemo(
-    () => usageRateRowsFromLimit(fiveHour, hourlyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
-    [fiveHour, hourlyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey],
+    () => usageRateRowsFromLimit(usageRateLimit, hourlyRaw, selectedProvider, selectedAccountKey, selectedDeviceId, selectedScopeKey),
+    [hourlyRaw, selectedAccountKey, selectedDeviceId, selectedProvider, selectedScopeKey, usageRateLimit],
   );
+  const sessionUsageBarWidth = usageRateBarWidth(sessionUsageRows.length);
+  const sessionUsageLabels = usageRateAxisLabels(sessionUsageRows, usageRateWindowKind);
   const maxSessionUsage = Math.max(1, ...sessionUsageRows.map((row) => row.total));
   const activeSessionRows = sessionUsageRows.filter((row) => row.total > 0);
   const averageSessionUsage = activeSessionRows.reduce((sum, row) => sum + row.total, 0) / Math.max(1, activeSessionRows.length);
@@ -1394,7 +1588,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             ))}
           </AccountTabs>
         ) : null}
-        {accountOptions.length > 1 ? (
+        {accountOptions.length > 0 ? (
           <AccountTabs role="tablist" aria-label="Provider account filter">
             {accountOptions.map((account) => (
               <AccountTab
@@ -1469,79 +1663,93 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           </>
         )}
 
-        <ChartCard>
-          <PanelTitle>
-            <span>
-              <RateIcon aria-hidden="true" />
-              Usage Rate
-            </span>
-            <small>{windowDurationLabel(fiveHour)}</small>
-          </PanelTitle>
-          <RateGraph viewBox="0 0 360 104" preserveAspectRatio="none" aria-hidden="true">
-            <line x1="0" y1="18" x2="360" y2="18" />
-            <line x1="0" y1="52" x2="360" y2="52" />
-            <line x1="0" y1="86" x2="360" y2="86" />
-            {[90, 180, 270].map((x) => <line key={x} x1={x} y1="10" x2={x} y2="94" className="v" />)}
-            {sessionUsageRows.map((row, index) => {
-              const step = sessionUsageRows.length > 1 ? 340 / (sessionUsageRows.length - 1) : 0;
-              const x = 10 + index * step;
-              const height = Math.max(row.total > 0 ? 5 : 3, (row.total / maxSessionUsage) * 70);
-              const y = 90 - height;
-              const isHot = averageSessionUsage > 0 && row.total > averageSessionUsage * 1.35;
-              return (
-                <rect
-                  key={row.key}
-                  x={x - 4}
-                  y={y}
-                  width="8"
-                  height={height}
-                  rx="2"
-                  className={isHot ? "hot" : "cool"}
-                />
-              );
-            })}
-            <path d={usageRatePath(sessionUsageRows, 360, 96)} />
-          </RateGraph>
-          <SessionRateLabels>
-            {sessionUsageRows.map((row) => (
-              <span key={row.key}>{row.label}</span>
-            ))}
-          </SessionRateLabels>
-        </ChartCard>
-
-        <ChartCard>
-          <PanelTitle>
-            <span>
-              <BarsIcon aria-hidden="true" />
-              Daily Usage
-            </span>
-            <RangeToggle aria-label="Daily usage range" role="group">
-              {TOKENOMICS_DAILY_RANGE_OPTIONS.map((days) => (
-                <RangeToggleButton
-                  key={days}
-                  $active={dailyWindowDays === days}
-                  aria-pressed={dailyWindowDays === days}
-                  onClick={() => setDailyWindowDays(days)}
-                  type="button"
-                >
-                  {days}d
-                </RangeToggleButton>
+        <ChartGrid>
+          <ChartCard>
+            <PanelTitle>
+              <span>
+                <RateIcon aria-hidden="true" />
+                Usage Rate
+              </span>
+              <RangeToggle aria-label="Usage rate window" role="group">
+                {TOKENOMICS_USAGE_RATE_WINDOWS.map((window) => (
+                  <RangeToggleButton
+                    key={window.key}
+                    $active={usageRateWindowKind === window.key}
+                    aria-pressed={usageRateWindowKind === window.key}
+                    onClick={() => setUsageRateWindowKind(window.key)}
+                    type="button"
+                  >
+                    {window.label}
+                  </RangeToggleButton>
+                ))}
+              </RangeToggle>
+            </PanelTitle>
+            <RateGraph viewBox="0 0 360 104" preserveAspectRatio="none" aria-hidden="true">
+              <line x1="0" y1="18" x2="360" y2="18" />
+              <line x1="0" y1="52" x2="360" y2="52" />
+              <line x1="0" y1="86" x2="360" y2="86" />
+              {[90, 180, 270].map((x) => <line key={x} x1={x} y1="10" x2={x} y2="94" className="v" />)}
+              {sessionUsageRows.map((row, index) => {
+                const step = sessionUsageRows.length > 1 ? 340 / (sessionUsageRows.length - 1) : 0;
+                const x = 10 + index * step;
+                const height = Math.max(row.total > 0 ? 5 : 3, (row.total / maxSessionUsage) * 70);
+                const y = 90 - height;
+                const isHot = averageSessionUsage > 0 && row.total > averageSessionUsage * 1.35;
+                return (
+                  <rect
+                    key={row.key}
+                    x={x - (sessionUsageBarWidth / 2)}
+                    y={y}
+                    width={sessionUsageBarWidth}
+                    height={height}
+                    rx={sessionUsageBarWidth > 3 ? "2" : "1"}
+                    className={isHot ? "hot" : "cool"}
+                  />
+                );
+              })}
+              <path d={usageRatePath(sessionUsageRows, 360, 96)} />
+            </RateGraph>
+            <SessionRateLabels>
+              {sessionUsageLabels.map((row) => (
+                <span key={row.key}>{row.label}</span>
               ))}
-            </RangeToggle>
-          </PanelTitle>
-          <DailyChart $days={dailyRows.length}>
-            {dailyRows.map((row) => (
-              <DailyColumn key={row.key}>
-                <DailyBar
-                  $tone={dailyTone(dailyUsageValue(row), dailyAverage)}
-                  style={{ height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
-                  title={dailyUsageTitle({ ...row, label: row.titleLabel || row.label })}
-                />
-                <small>{row.label}</small>
-              </DailyColumn>
-            ))}
-          </DailyChart>
-        </ChartCard>
+            </SessionRateLabels>
+          </ChartCard>
+
+          <ChartCard>
+            <PanelTitle>
+              <span>
+                <BarsIcon aria-hidden="true" />
+                Daily Usage
+              </span>
+              <RangeToggle aria-label="Daily usage range" role="group">
+                {TOKENOMICS_DAILY_RANGE_OPTIONS.map((days) => (
+                  <RangeToggleButton
+                    key={days}
+                    $active={dailyWindowDays === days}
+                    aria-pressed={dailyWindowDays === days}
+                    onClick={() => setDailyWindowDays(days)}
+                    type="button"
+                  >
+                    {days}d
+                  </RangeToggleButton>
+                ))}
+              </RangeToggle>
+            </PanelTitle>
+            <DailyChart $days={dailyRows.length}>
+              {dailyRows.map((row) => (
+                <DailyColumn key={row.key}>
+                  <DailyBar
+                    $tone={dailyTone(dailyUsageValue(row), dailyAverage)}
+                    style={{ height: `${dailyBarHeight(dailyUsageValue(row), maxDaily)}%` }}
+                    title={dailyUsageTitle({ ...row, label: row.titleLabel || row.label })}
+                  />
+                  <small>{row.label}</small>
+                </DailyColumn>
+              ))}
+            </DailyChart>
+          </ChartCard>
+        </ChartGrid>
 
         <UsageCard>
           <PanelTitle>
@@ -2114,6 +2322,18 @@ const ChartCard = styled.div`
   html[data-forge-theme="light"] & {
     border-color: rgba(15, 23, 42, 0.08);
     background: #f8fafc;
+  }
+`;
+
+const ChartGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  min-width: 0;
+  align-items: stretch;
+
+  @media (max-width: 900px) {
+    grid-template-columns: 1fr;
   }
 `;
 

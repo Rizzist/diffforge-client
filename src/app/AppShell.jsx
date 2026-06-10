@@ -526,9 +526,9 @@ import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EV
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
-  SnippingPinnedWindow,
+  SnippingDetachedPreviewWindow,
+  SNIPPING_DETACHED_HASH,
   SNIPPING_EDITOR_HASH,
-  SNIPPING_PIN_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import ProcessesView from "../processes/ProcessesView.jsx";
@@ -5740,8 +5740,8 @@ export default function App() {
     return <SnippingOverlayWindow />;
   }
 
-  if (window.location.hash.startsWith(SNIPPING_PIN_HASH)) {
-    return <SnippingPinnedWindow />;
+  if (window.location.hash.startsWith(SNIPPING_DETACHED_HASH)) {
+    return <SnippingDetachedPreviewWindow />;
   }
 
   if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {

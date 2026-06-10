@@ -3,12 +3,12 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Delete } from "@styled-icons/material-rounded/Delete";
+import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { Gesture } from "@styled-icons/material-rounded/Gesture";
-import { LibraryAddCheck } from "@styled-icons/material-rounded/LibraryAddCheck";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
-import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
 import { Save } from "@styled-icons/material-rounded/Save";
@@ -21,9 +21,10 @@ import styled, { createGlobalStyle } from "styled-components";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const SNIP_TOAST_LIMIT = 6;
+const SNIP_DETACH_DRAG_THRESHOLD_PX = 8;
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
-export const SNIPPING_PIN_HASH = "#/snipping-pin";
+export const SNIPPING_DETACHED_HASH = "#/snipping-detached";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 
 const TOOL_OPTIONS = [
@@ -208,6 +209,8 @@ export default function SnippingQuickAccess() {
   const [snips, setSnips] = useState([]);
   const [busyIds, setBusyIds] = useState(() => new Set());
   const hadSnipsRef = useRef(false);
+  const dragDetachRef = useRef(null);
+  const detachingIdsRef = useRef(new Set());
 
   useFloatingWindowBody("quick-access");
 
@@ -285,6 +288,94 @@ export default function SnippingQuickAccess() {
     }
   }, []);
 
+  const detachSnip = useCallback(async (snip, pointer = {}) => {
+    if (!snip?.id || !assetLocalPath(snip)) return;
+    if (detachingIdsRef.current.has(snip.id)) return;
+
+    detachingIdsRef.current.add(snip.id);
+    setBusyIds((current) => {
+      const next = new Set(current);
+      next.add(snip.id);
+      return next;
+    });
+
+    const request = {
+      path: snip.localPath,
+    };
+    if (Number.isFinite(pointer.screenX)) {
+      request.screenX = pointer.screenX;
+    }
+    if (Number.isFinite(pointer.screenY)) {
+      request.screenY = pointer.screenY;
+    }
+
+    try {
+      await invoke("snipping_open_detached_preview_window", { request });
+      dismissSnip(snip);
+    } catch (error) {
+      setTransientStatus(setSnips, snip.id, error?.message || String(error || "Unable to detach snip"));
+    } finally {
+      detachingIdsRef.current.delete(snip.id);
+      setBusyIds((current) => {
+        const next = new Set(current);
+        next.delete(snip.id);
+        return next;
+      });
+    }
+  }, [dismissSnip]);
+
+  const beginDetachDrag = useCallback((event, snip) => {
+    if (event.button !== 0 || busyIds.has(snip.id)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDetachRef.current = {
+      detached: false,
+      pointerId: event.pointerId,
+      snip,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+    };
+  }, [busyIds]);
+
+  const detachFromKeyboard = useCallback((event, snip) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    detachSnip(snip, {
+      screenX: window.screenX + window.innerWidth - 56,
+      screenY: window.screenY + window.innerHeight - 56,
+    });
+  }, [detachSnip]);
+
+  useEffect(() => {
+    const onPointerMove = (event) => {
+      const drag = dragDetachRef.current;
+      if (!drag || drag.pointerId !== event.pointerId || drag.detached) return;
+      const distance = Math.hypot(
+        event.clientX - drag.startClientX,
+        event.clientY - drag.startClientY,
+      );
+      if (distance < SNIP_DETACH_DRAG_THRESHOLD_PX) return;
+      drag.detached = true;
+      detachSnip(drag.snip, {
+        screenX: event.screenX,
+        screenY: event.screenY,
+      });
+    };
+    const onPointerEnd = (event) => {
+      const drag = dragDetachRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) return;
+      dragDetachRef.current = null;
+    };
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("pointerup", onPointerEnd, true);
+    window.addEventListener("pointercancel", onPointerEnd, true);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", onPointerEnd, true);
+      window.removeEventListener("pointercancel", onPointerEnd, true);
+    };
+  }, [detachSnip]);
+
   const runSnipAction = useCallback(async (snip, action) => {
     if (!snip?.id) return;
     setBusyIds((current) => {
@@ -306,9 +397,6 @@ export default function SnippingQuickAccess() {
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: snip.localPath });
         setTransientStatus(setSnips, snip.id, "Editor opened");
-      } else if (action === "pin") {
-        await invoke("snipping_open_pinned_window", { path: snip.localPath });
-        setTransientStatus(setSnips, snip.id, "Pinned");
       } else if (action === "upload") {
         await invoke("snipping_upload_untracked_asset", {
           request: {
@@ -343,6 +431,27 @@ export default function SnippingQuickAccess() {
 
           return (
             <QuickAccessCard data-busy={busy ? "true" : "false"} key={snip.id}>
+              <QuickAccessDragButton
+                aria-label={`Drag ${snip.name} out`}
+                disabled={busy}
+                onKeyDown={(event) => detachFromKeyboard(event, snip)}
+                onPointerDown={(event) => beginDetachDrag(event, snip)}
+                title="Drag preview out"
+                type="button"
+              >
+                <DragIndicator aria-hidden="true" />
+              </QuickAccessDragButton>
+              <QuickAccessUploadButton
+                aria-label={`Upload ${snip.name}`}
+                disabled={busy}
+                onClick={() => runSnipAction(snip, "upload")}
+                title="Upload snip"
+                type="button"
+              >
+                <CloudUpload aria-hidden="true" />
+                <span>Upload</span>
+              </QuickAccessUploadButton>
+
               <QuickAccessPreview>
                 {snip.previewUrl ? (
                   <img alt={snip.name} draggable={false} src={snip.previewUrl} />
@@ -357,12 +466,6 @@ export default function SnippingQuickAccess() {
                 </QuickAccessButton>
                 <QuickAccessButton aria-label={`Edit ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "edit")} title="Annotate copy" type="button">
                   <ModeEdit aria-hidden="true" />
-                </QuickAccessButton>
-                <QuickAccessButton aria-label={`Pin ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "pin")} title="Float screenshot" type="button">
-                  <PushPin aria-hidden="true" />
-                </QuickAccessButton>
-                <QuickAccessButton aria-label={`Upload ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "upload")} title="Track and upload" type="button">
-                  <LibraryAddCheck aria-hidden="true" />
                 </QuickAccessButton>
                 <QuickAccessButton aria-label={`Delete ${snip.name}`} data-danger="true" disabled={busy} onClick={() => runSnipAction(snip, "delete")} title="Delete file" type="button">
                   <Delete aria-hidden="true" />
@@ -383,52 +486,81 @@ export default function SnippingQuickAccess() {
   );
 }
 
-export function SnippingPinnedWindow() {
-  const localPath = useMemo(() => pathFromHash(SNIPPING_PIN_HASH), []);
+export function SnippingDetachedPreviewWindow() {
+  const localPath = useMemo(() => pathFromHash(SNIPPING_DETACHED_HASH), []);
   const previewUrl = useMemo(() => assetPreviewUrl({ localPath }), [localPath]);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  useFloatingWindowBody("pinned");
+  useFloatingWindowBody("detached");
 
   const runAction = useCallback(async (action) => {
+    if (busy) return;
+    setBusy(true);
     try {
       if (action === "copy") {
         setStatus(await copySnipToClipboard({ localPath, name, previewUrl }));
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
         setStatus("Editor opened");
+      } else if (action === "upload") {
+        await invoke("snipping_upload_untracked_asset", {
+          request: {
+            group: "snips",
+            name,
+            path: localPath,
+          },
+        });
+        setStatus("Uploaded");
+      } else if (action === "delete") {
+        await invoke("diffforge_delete_untracked_asset", { path: localPath });
+        await getCurrentWindow().close();
       } else if (action === "close") {
         await getCurrentWindow().close();
       }
     } catch (error) {
       setStatus(error?.message || String(error || "Action failed"));
+    } finally {
+      setBusy(false);
     }
-  }, [localPath, name, previewUrl]);
+  }, [busy, localPath, name, previewUrl]);
 
   return (
     <>
       <SnipFloatingGlobalStyle />
-      <PinnedWindowRoot>
-        <PinnedDragBar data-tauri-drag-region>
-          <strong>{name}</strong>
-          {status && <span>{status}</span>}
-        </PinnedDragBar>
-        <PinnedImageFrame>
+      <DetachedWindowRoot>
+        <DetachedTitleBar>
+          <DetachedDragButton aria-label="Drag preview window" data-tauri-drag-region title="Drag preview" type="button">
+            <DragIndicator aria-hidden="true" />
+          </DetachedDragButton>
+          <DetachedTitle>
+            <strong>{name}</strong>
+            {status && <span>{status}</span>}
+          </DetachedTitle>
+          <DetachedUploadButton disabled={busy} onClick={() => runAction("upload")} title="Upload snip" type="button">
+            <CloudUpload aria-hidden="true" />
+            <span>{busy ? "Working" : "Upload"}</span>
+          </DetachedUploadButton>
+        </DetachedTitleBar>
+        <DetachedImageFrame>
           {previewUrl ? <img alt={name} draggable={false} src={previewUrl} /> : <span>No snip selected</span>}
-        </PinnedImageFrame>
-        <FloatingToolbar>
-          <FloatingButton aria-label="Copy pinned snip" onClick={() => runAction("copy")} title="Copy" type="button">
+        </DetachedImageFrame>
+        <DetachedToolbar>
+          <FloatingButton aria-label="Copy detached snip" disabled={busy} onClick={() => runAction("copy")} title="Copy" type="button">
             <ContentCopy aria-hidden="true" />
           </FloatingButton>
-          <FloatingButton aria-label="Edit pinned snip" onClick={() => runAction("edit")} title="Edit" type="button">
+          <FloatingButton aria-label="Edit detached snip" disabled={busy} onClick={() => runAction("edit")} title="Edit" type="button">
             <ModeEdit aria-hidden="true" />
           </FloatingButton>
-          <FloatingButton aria-label="Close pinned snip" onClick={() => runAction("close")} title="Close" type="button">
+          <FloatingButton aria-label="Delete detached snip" data-danger="true" disabled={busy} onClick={() => runAction("delete")} title="Delete file" type="button">
+            <Delete aria-hidden="true" />
+          </FloatingButton>
+          <FloatingButton aria-label="Close detached snip" disabled={busy} onClick={() => runAction("close")} title="Close" type="button">
             <Close aria-hidden="true" />
           </FloatingButton>
-        </FloatingToolbar>
-      </PinnedWindowRoot>
+        </DetachedToolbar>
+      </DetachedWindowRoot>
     </>
   );
 }
@@ -850,7 +982,7 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
     user-select: none;
   }
 
-  body[data-snipping-floating="pinned"] {
+  body[data-snipping-floating="detached"] {
     background: #070a10 !important;
   }
 `;
@@ -861,7 +993,7 @@ const QuickAccessRoot = styled.aside`
   z-index: 12000;
   display: flex;
   flex-direction: column-reverse;
-  align-items: flex-start;
+  align-items: flex-end;
   justify-content: flex-start;
   gap: 10px;
   padding: 10px;
@@ -885,7 +1017,56 @@ const QuickAccessCard = styled.article`
 
   &:hover,
   &:focus-within {
-    transform: translateX(2px);
+    transform: translateX(-2px);
+  }
+`;
+
+const QuickAccessUploadButton = styled.button`
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  max-width: calc(100% - 54px);
+  padding: 0 9px;
+  border: 1px solid rgba(147, 197, 253, 0.36);
+  border-radius: 999px;
+  color: #eff6ff;
+  background: rgba(21, 38, 68, 0.84);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
+  cursor: pointer;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+
+  svg {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 10px;
+    font-weight: 850;
+    line-height: 1;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(191, 219, 254, 0.72);
+    background: rgba(37, 99, 235, 0.8);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.54;
   }
 `;
 
@@ -988,9 +1169,39 @@ const QuickAccessButton = styled.button`
   }
 `;
 
-const QuickAccessStatusPill = styled.span`
+const QuickAccessDragButton = styled(QuickAccessButton)`
   position: absolute;
   top: 8px;
+  left: 8px;
+  z-index: 4;
+  width: 28px;
+  height: 28px;
+  color: rgba(248, 250, 252, 0.9);
+  background: rgba(7, 10, 16, 0.76);
+  cursor: grab;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(255, 255, 255, 0.38);
+    background: rgba(15, 23, 36, 0.92);
+  }
+`;
+
+const QuickAccessStatusPill = styled.span`
+  position: absolute;
+  top: 42px;
   left: 50%;
   z-index: 3;
   max-width: calc(100% - 24px);
@@ -1032,20 +1243,6 @@ const QuickAccessDismissButton = styled(QuickAccessButton)`
   }
 `;
 
-const FloatingToolbar = styled.div`
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  z-index: 5;
-  display: inline-flex;
-  gap: 6px;
-  opacity: 0;
-  transform: translateY(-3px);
-  transition:
-    opacity 140ms ease,
-    transform 140ms ease;
-`;
-
 const FloatingButton = styled.button`
   display: inline-grid;
   width: 30px;
@@ -1067,41 +1264,76 @@ const FloatingButton = styled.button`
     background: rgba(15, 23, 36, 0.94);
   }
 
+  &[data-danger="true"] {
+    color: #ffd4d4;
+  }
+
+  &[data-danger="true"]:hover:not(:disabled) {
+    border-color: rgba(239, 107, 107, 0.48);
+    background: rgba(76, 22, 26, 0.94);
+  }
+
   &:disabled {
     cursor: default;
     opacity: 0.45;
   }
 `;
 
-const PinnedWindowRoot = styled.main`
+const DetachedWindowRoot = styled.main`
   position: relative;
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   width: 100vw;
   height: 100vh;
   overflow: hidden;
   background: rgba(7, 10, 16, 0.94);
   color: #f8fafc;
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+`;
 
-  &:hover ${FloatingToolbar},
-  &:focus-within ${FloatingToolbar} {
-    opacity: 1;
-    transform: translateY(0);
+const DetachedTitleBar = styled.header`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 12, 18, 0.92);
+`;
+
+const DetachedDragButton = styled.button`
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.92);
+  background: rgba(255, 255, 255, 0.07);
+  cursor: grab;
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  &:active {
+    cursor: grabbing;
   }
 `;
 
-const PinnedDragBar = styled.div`
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 4;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 42px;
-  padding: 8px 112px 8px 12px;
-  background: linear-gradient(180deg, rgba(7, 10, 16, 0.72), rgba(7, 10, 16, 0));
-  cursor: move;
+const DetachedTitle = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 2px;
 
   strong,
   span {
@@ -1123,12 +1355,54 @@ const PinnedDragBar = styled.div`
   }
 `;
 
-const PinnedImageFrame = styled.div`
+const DetachedUploadButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  max-width: 108px;
+  padding: 0 10px;
+  border: 1px solid rgba(147, 197, 253, 0.38);
+  border-radius: 999px;
+  color: #eff6ff;
+  background: rgba(21, 38, 68, 0.86);
+  cursor: pointer;
+
+  svg {
+    flex: 0 0 auto;
+    width: 15px;
+    height: 15px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 10px;
+    font-weight: 850;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(191, 219, 254, 0.72);
+    background: rgba(37, 99, 235, 0.82);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.58;
+  }
+`;
+
+const DetachedImageFrame = styled.div`
   display: grid;
+  min-height: 0;
   width: 100%;
   height: 100%;
   place-items: center;
   overflow: hidden;
+  padding: 10px;
 
   img {
     display: block;
@@ -1142,6 +1416,15 @@ const PinnedImageFrame = styled.div`
     font-size: 13px;
     font-weight: 800;
   }
+`;
+
+const DetachedToolbar = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 12, 18, 0.78);
 `;
 
 const EditorWindowRoot = styled.main`

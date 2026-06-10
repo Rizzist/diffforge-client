@@ -3803,7 +3803,7 @@ pub fn run() {
             snipping_set_asset_target,
             snipping_upload_untracked_asset,
             snipping_save_edited_untracked_asset,
-            snipping_open_pinned_window,
+            snipping_open_detached_preview_window,
             snipping_open_annotation_editor,
             snipping_read_asset_data_url,
             snipping_open_annotation_editor_batch,
