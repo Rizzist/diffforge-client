@@ -14248,6 +14248,7 @@ function TerminalView({
   const todoQueuePendingTimersRef = useRef(new Map());
   const todoQueueComposerIdleTimersRef = useRef(new Map());
   const todoQueueRemoteCommandReceiptsRef = useRef({});
+  const todoQueueBackendReconcileRef = useRef(null);
   const todoQueueRemoteCommandReceiptStorageKeyRef = useRef("");
   const todoQueueTerminalInFlightPromptsRef = useRef(new Map());
   const todoQueueLiveTerminalsRef = useRef(new Map());
@@ -14407,6 +14408,13 @@ function TerminalView({
     const send = () => {
       todoQueueCloudSyncTimerRef.current = 0;
       todoQueueCloudSyncSignatureRef.current = signature;
+      // Mirror the queue snapshot into the Rust ledger so the background
+      // dispatcher can submit queued todos when no webview is alive.
+      void invoke("todo_dispatch_queue_sync", {
+        items: payload.todos,
+        reason: payload.reason,
+        workspaceId,
+      }).catch(() => {});
       void invoke("cloud_mcp_sync_workspace_todos", {
         reason: payload.reason,
         repoPath,
@@ -14526,6 +14534,9 @@ function TerminalView({
       const merged = mergeTodoQueueReceiptsNewest(todoQueueRemoteCommandReceiptsRef.current, ledger);
       todoQueueRemoteCommandReceiptsRef.current = merged;
       writeTodoQueueRemoteCommandReceipts(todoQueueRemoteCommandReceiptStorageKeyRef.current, merged);
+      // Backend-dispatched items settle through the Rust ledger; mirror the
+      // final receipt status onto the local queue item.
+      todoQueueBackendReconcileRef.current?.(merged);
     })
       .then((unlisten) => {
         if (cancelled) {
@@ -22230,6 +22241,111 @@ function TerminalView({
     updateTodoQueueItems,
   ]);
 
+  useEffect(() => {
+    // Late-bound reconcile used by the receipts listener (which mounts before
+    // updateTodoQueueItems is declared): settle backend-dispatched items from
+    // their final receipt statuses.
+    todoQueueBackendReconcileRef.current = (ledgerReceipts) => {
+      const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
+      updateTodoQueueItems((currentItems) => {
+        let changed = false;
+        const nextItems = currentItems.map((item) => {
+          if (String(item?.todoStatusReason || item?.todo_status_reason || "").trim() !== "todo_queue_backend_submit") {
+            return item;
+          }
+          if (normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status) !== "running") {
+            return item;
+          }
+          const commandId = String(
+            item?.remoteCommand?.commandId
+              || item?.remoteCommand?.command_id
+              || item?.id
+              || "",
+          ).trim();
+          const receipt = (ledgerReceipts && ledgerReceipts[commandId]) || null;
+          const receiptStatus = receipt
+            ? normalizeTodoQueueRemoteCommandReceiptStatus(receipt.status)
+            : "";
+          if (!settledStatuses.has(receiptStatus)) {
+            return item;
+          }
+          changed = true;
+          return getTodoQueueItemWithCloudStatus(item, receiptStatus, {
+            reason: String(receipt?.statusReason || "todo_queue_backend_settled"),
+          });
+        });
+        return changed ? nextItems : currentItems;
+      }, {
+        force: true,
+        immediate: true,
+        reason: "todo_backend_receipt_reconcile",
+      });
+    };
+    return () => {
+      todoQueueBackendReconcileRef.current = null;
+    };
+  }, [updateTodoQueueItems]);
+
+  // Reconcile prompts the Rust background dispatcher submitted while no
+  // webview was alive: drain the submission journal and apply final statuses
+  // from the Rust receipts ledger onto the local queue items.
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    Promise.all([
+      invoke("todo_dispatch_backend_submissions_drain", { workspaceId }),
+      invoke("todo_dispatch_receipts_get", { workspaceId }).catch(() => null),
+    ])
+      .then(([drainResult, receiptsResult]) => {
+        if (cancelled) return;
+        const entries = Array.isArray(drainResult?.entries) ? drainResult.entries : [];
+        if (!entries.length) return;
+        const ledgerReceipts = receiptsResult?.receipts && typeof receiptsResult.receipts === "object"
+          ? receiptsResult.receipts
+          : {};
+        logTerminalStatus("frontend.todo_queue.backend_submissions_drained", {
+          entryCount: entries.length,
+          workspaceId,
+        });
+        const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
+        const updatesByItemId = new Map();
+        entries.forEach((entry) => {
+          const itemId = String(entry?.itemId || "").trim();
+          const commandId = String(entry?.commandId || "").trim();
+          if (!itemId) return;
+          const receipt = ledgerReceipts[commandId] || todoQueueRemoteCommandReceiptsRef.current[commandId] || null;
+          const receiptStatus = receipt
+            ? normalizeTodoQueueRemoteCommandReceiptStatus(receipt.status)
+            : "";
+          updatesByItemId.set(itemId, {
+            reason: String(receipt?.statusReason || "todo_queue_backend_submit"),
+            status: settledStatuses.has(receiptStatus) ? receiptStatus : "running",
+          });
+        });
+        if (!updatesByItemId.size) return;
+        updateTodoQueueItems((currentItems) => currentItems.map((item) => {
+          const update = updatesByItemId.get(String(item?.id || "").trim());
+          if (!update) return item;
+          return getTodoQueueItemWithCloudStatus(
+            getTodoQueueItemWithoutPersistedQueueState(item),
+            update.status,
+            { reason: update.reason },
+          );
+        }), {
+          force: true,
+          immediate: true,
+          reason: "todo_backend_submissions_reconciled",
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [terminalWorkspace?.id, updateTodoQueueItems]);
+
   // Crash/shutdown recovery: todos that were running when the app went away
   // get labelled interrupted, and the workspace shows a resume modal for them.
   const [crashResumeCandidates, setCrashResumeCandidates] = useState([]);
@@ -22254,9 +22370,12 @@ function TerminalView({
         const hasInFlight = Array.from(todoQueueTerminalInFlightPromptsRef.current.values())
           .some((prompt) => String(prompt?.itemId || "").trim() === itemId);
         const pendingItem = todoQueuePendingItemsRef.current[itemId] || null;
-        if (status === "running" && !hasInFlight && !pendingItem) {
+        const backendDispatched = String(item.todoStatusReason || item.todo_status_reason || "").trim()
+          === "todo_queue_backend_submit";
+        if (status === "running" && !hasInFlight && !pendingItem && !backendDispatched) {
           // Running with no live dispatch state only happens after the app
-          // process went away mid-turn; label it interrupted.
+          // process went away mid-turn; label it interrupted. Backend-
+          // dispatched items are excluded: the Rust ledger settles those.
           interruptIds.add(itemId);
           if (!dismissed.has(itemId)) {
             candidates.push({

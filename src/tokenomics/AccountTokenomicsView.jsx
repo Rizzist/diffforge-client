@@ -794,6 +794,22 @@ function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
   return "good";
 }
 
+function usagePercentTone(usedPercent) {
+  if (usedPercent == null) return "unknown";
+  const used = Number(usedPercent);
+  if (!Number.isFinite(used)) return "unknown";
+  if (used >= 85) return "danger";
+  if (used >= 62) return "warn";
+  return "good";
+}
+
+function toneColor(tone) {
+  if (tone === "danger") return "#ff5a5f";
+  if (tone === "warn") return "#fb923c";
+  if (tone === "unknown") return "#94a3b8";
+  return "#60a5fa";
+}
+
 function dailyTone(value, average) {
   if (value <= 0) return "quiet";
   if (!average || value <= average * 1.15) return "good";
@@ -1379,7 +1395,7 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
         </MetricScore>
       </MetricHeading>
       <ProgressTrack aria-label={`${title} used`}>
-        <ProgressFill style={{ width: `${limit.usedPercent ?? 0}%` }} />
+        <ProgressFill $tone={usagePercentTone(limit.usedPercent)} style={{ width: `${limit.usedPercent ?? 0}%` }} />
       </ProgressTrack>
       <MetricFoot>
         <span>{limit.resetLabel}</span>
@@ -2193,12 +2209,7 @@ const LimitCard = styled.div`
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.72);
 
-  --tone: ${({ tone }) => {
-    if (tone === "danger") return "#ff5a5f";
-    if (tone === "warn") return "#fb923c";
-    if (tone === "unknown") return "#94a3b8";
-    return "#60a5fa";
-  }};
+  --tone: ${({ tone }) => toneColor(tone)};
 
   html[data-forge-theme="light"] & {
     border-color: rgba(15, 23, 42, 0.08);
@@ -2274,8 +2285,9 @@ const ProgressFill = styled.div`
   height: 100%;
   min-width: 7px;
   border-radius: inherit;
-  background: var(--tone);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--tone) 72%, transparent);
+  --bar-tone: ${({ $tone }) => toneColor($tone)};
+  background: var(--bar-tone);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--bar-tone) 72%, transparent);
 `;
 
 const MetricFoot = styled.div`

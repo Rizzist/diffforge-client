@@ -3777,6 +3777,9 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
+            // Background dispatcher: dormant while the webview heartbeats;
+            // takes over queued-todo submission when the window goes away.
+            todo_dispatch_start_background_dispatcher(app.handle().clone());
             {
                 // Crash recovery: anything still marked in-flight in the todo
                 // ledger is a leftover from a previous process and gets
@@ -4010,6 +4013,9 @@ pub fn run() {
             todo_dispatch_receipt_record,
             todo_dispatch_receipts_import,
             todo_dispatch_notify_queue_drained,
+            todo_dispatch_queue_sync,
+            todo_dispatch_dispatcher_heartbeat,
+            todo_dispatch_backend_submissions_drain,
             hyperframe_transcribe_audio,
             hyperframe_save_media_transcript,
             hyperframe_media_transcript_status,

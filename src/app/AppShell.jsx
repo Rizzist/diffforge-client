@@ -7633,6 +7633,22 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Dispatcher ownership lease: while the webview heartbeats it owns todo
+    // dispatch; when the heartbeat stops (hidden/destroyed window in
+    // background mode), the Rust background dispatcher takes over.
+    const beat = () => {
+      void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
+    };
+    beat();
+    const intervalId = window.setInterval(beat, 5000);
+    document.addEventListener("visibilitychange", beat);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", beat);
+    };
+  }, []);
+
+  useEffect(() => {
     const targets = workspaceThreadStoreTargets;
     const storeKey = workspaceThreadStoreKey;
 

@@ -21,5 +21,6 @@ export function terminalPromptSubmittedPayloadIsAuthoritative(payload = {}) {
   return (
     promptSource === "parked_resume_backend_submit"
     || promptSource === "crash_todo_resume_backend_submit"
+    || promptSource === "todo_queue_backend_submit"
   );
 }

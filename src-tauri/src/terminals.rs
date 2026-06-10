@@ -9345,7 +9345,9 @@ fn terminal_prompt_submitted_source_is_authoritative(
         "observed_input_gate" => observed_prompt
             .map(str::trim)
             .is_some_and(|value| !value.is_empty()),
-        "parked_resume_backend_submit" | "crash_todo_resume_backend_submit" => true,
+        "parked_resume_backend_submit"
+        | "crash_todo_resume_backend_submit"
+        | "todo_queue_backend_submit" => true,
         _ => false,
     }
 }
