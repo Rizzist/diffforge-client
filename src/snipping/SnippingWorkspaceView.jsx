@@ -37,6 +37,7 @@ export const SNIPPING_OVERLAY_HASH = "#/snipping-overlay";
 const SNIPPING_SHORTCUTS_CHANGED_EVENT = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT = "forge-snipping-area-overlay-started";
+const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_ACTION_FULL = "full-screenshot";
 const SNIPPING_ACTION_AREA = "area-snip";
 const SNIPPING_MODIFIER_CODES = new Set([
@@ -723,6 +724,7 @@ export function SnippingOverlayWindow() {
   useEffect(() => {
     let cancelled = false;
     let unlistenOverlayStarted = null;
+    let unlistenOverlaySnapshot = null;
 
     listen(SNIPPING_AREA_OVERLAY_STARTED_EVENT, (event) => {
       if (!cancelled) {
@@ -736,9 +738,27 @@ export function SnippingOverlayWindow() {
       }
     }).catch(() => {});
 
+    // The frozen-frame preview is written after the overlay opens; merge it in
+    // without resetting an in-progress selection.
+    listen(SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT, (event) => {
+      if (cancelled) return;
+      const snapshotPath = text(event.payload?.snapshotPath || event.payload?.snapshot_path);
+      if (!snapshotPath) return;
+      setOverlayMonitor((current) => (
+        current ? { ...current, snapshotPath, snapshot_path: snapshotPath } : current
+      ));
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+      } else {
+        unlistenOverlaySnapshot = unlisten;
+      }
+    }).catch(() => {});
+
     return () => {
       cancelled = true;
       unlistenOverlayStarted?.();
+      unlistenOverlaySnapshot?.();
     };
   }, [applyOverlayMonitor]);
 
@@ -837,6 +857,12 @@ export function SnippingOverlayWindow() {
         onMouseUp={finishDrag}
         style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}
       >
+        {!selection && <SnippingOverlayDim aria-hidden="true" />}
+        {!selection && !capturing && (
+          <SnippingOverlayHint aria-hidden="true">
+            Drag to snip · Esc to cancel
+          </SnippingOverlayHint>
+        )}
         {selection && (
           <SnippingSelectionBox
             aria-hidden="true"
@@ -847,7 +873,7 @@ export function SnippingOverlayWindow() {
               height: `${selection.height}px`,
             }}
           >
-            <span>{Math.round(selection.width)} x {Math.round(selection.height)}</span>
+            <span>{Math.round(selection.width)} × {Math.round(selection.height)}</span>
           </SnippingSelectionBox>
         )}
         {error && <SnippingOverlayError>{error}</SnippingOverlayError>}
@@ -1068,31 +1094,61 @@ const SnippingOverlayRoot = styled.main`
     sans-serif;
 `;
 
+const SnippingOverlayDim = styled.div`
+  position: absolute;
+  inset: 0;
+  background: rgba(8, 10, 14, 0.28);
+  pointer-events: none;
+`;
+
+const SnippingOverlayHint = styled.div`
+  position: absolute;
+  top: 28px;
+  left: 50%;
+  padding: 7px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  color: rgba(244, 247, 250, 0.92);
+  background: rgba(10, 12, 16, 0.78);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+`;
+
 const SnippingSelectionBox = styled.div`
   position: absolute;
-  border: 1px solid rgba(255, 255, 255, 0.96);
-  border-radius: 1px;
-  background: rgba(225, 229, 236, 0.18);
+  border: 1.5px solid rgba(125, 176, 255, 0.95);
+  border-radius: 2px;
+  /* Spotlight: everything outside the selection is dimmed by the shadow. */
   box-shadow:
-    0 0 0 1px rgba(11, 14, 19, 0.16),
-    0 2px 8px rgba(11, 14, 19, 0.16);
+    0 0 0 1px rgba(8, 10, 14, 0.4),
+    0 0 0 100000px rgba(8, 10, 14, 0.42);
   pointer-events: none;
 
   span {
     position: absolute;
-    left: 0;
-    top: calc(100% + 5px);
-    padding: 2px 5px;
-    border: 1px solid rgba(255, 255, 255, 0.62);
-    border-radius: 4px;
-    background: rgba(244, 246, 249, 0.86);
-    box-shadow: 0 1px 4px rgba(11, 14, 19, 0.18);
-    color: rgba(18, 22, 28, 0.78);
-    font-size: 10px;
+    left: 50%;
+    top: calc(100% + 8px);
+    padding: 4px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    background: rgba(10, 12, 16, 0.88);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    color: rgba(244, 247, 250, 0.92);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
     font-weight: 650;
-    letter-spacing: 0.01em;
-    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+    line-height: 1;
     white-space: nowrap;
+    transform: translateX(-50%);
   }
 `;
 

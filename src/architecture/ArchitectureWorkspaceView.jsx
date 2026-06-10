@@ -4897,51 +4897,6 @@ function planStepDetail(step) {
   );
 }
 
-function buildTimelineItems(tasks) {
-  const normalized = jsonArray(tasks)
-    .map((task, index) => {
-      const startMs = taskStartMs(task);
-      const endMs = taskEndMs(task);
-      const active = taskIsActive(task);
-      return {
-        active,
-        endMs,
-        index,
-        label: taskDisplayTitle(task),
-        startMs,
-        statusKind: taskStatusKind(task),
-        statusLabel: taskTimelineStatusLabel(task),
-        rawStatusLabel: taskStatusLabel(task),
-        task,
-        taskId: text(task?.task_id || task?.id, `task-${index}`),
-        updatedMs: taskUpdatedMs(task),
-      };
-    })
-    .filter((item) => item.taskId);
-
-  const ascending = [...normalized].sort((left, right) => (
-    (left.startMs || left.updatedMs || 0) - (right.startMs || right.updatedMs || 0)
-      || left.index - right.index
-  ));
-  const laneEnds = [];
-  ascending.forEach((item) => {
-    const startMs = item.startMs || item.updatedMs || 0;
-    const endMs = item.endMs || (item.active ? Date.now() : item.updatedMs || startMs);
-    let lane = laneEnds.findIndex((laneEnd) => startMs >= laneEnd);
-    if (lane === -1) lane = laneEnds.length;
-    laneEnds[lane] = Math.max(laneEnds[lane] || 0, endMs || startMs);
-    item.lane = lane;
-  });
-
-  return {
-    laneCount: Math.max(1, laneEnds.length),
-    rows: normalized.sort((left, right) => (
-      (right.startMs || right.updatedMs || 0) - (left.startMs || left.updatedMs || 0)
-        || right.index - left.index
-    )),
-  };
-}
-
 function scannedResultParentPath(relativePath) {
   const parts = text(relativePath).split("/").filter(Boolean);
   if (parts.length <= 1) return "";
@@ -5285,11 +5240,9 @@ export default function ArchitectureWorkspaceView({
     [activeWorkspaceId, visibleTasks, workspaceTodos],
   );
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
-  const toolbarMeta = viewMode === "todoHistory"
-    ? `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`
-    : viewMode === "scannedResult"
-      ? `Scanned Result · architecture scan · ${repoLabel}`
-      : `Task History · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · repo: ${repoLabel} · live`;
+  const toolbarMeta = viewMode === "scannedResult"
+    ? `Scanned Result · architecture scan · ${repoLabel}`
+    : `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`;
   const visibleArchitectureError = architectureCloudMcpNoiseError(architectureError) ? "" : architectureError;
 
   useEffect(() => {
@@ -5362,9 +5315,9 @@ export default function ArchitectureWorkspaceView({
     });
   }, [repoPath, activeWorkspaceId, activeWorkspaceName]);
 
-	  const finishTerminalTodoPlan = useCallback((item) => {
-	    const task = item?.task || null;
-	    const terminalPlan = taskTerminalPlan(task);
+	  const finishTerminalTodoPlan = useCallback((entry) => {
+	    const task = entry?.task || null;
+	    const terminalPlan = jsonObject(entry?.plan) || taskTerminalPlan(task);
 	    const planRef = terminalPlanIdentity(terminalPlan);
 	    if (!planRef || !repoPath) return;
 
@@ -5419,13 +5372,6 @@ export default function ArchitectureWorkspaceView({
             Todos History
           </ViewToggleButton>
           <ViewToggleButton
-            data-active={viewMode === "taskHistory" ? "true" : "false"}
-            onClick={() => setViewMode("taskHistory")}
-            type="button"
-          >
-            Task History
-          </ViewToggleButton>
-          <ViewToggleButton
             data-active={viewMode === "scannedResult" ? "true" : "false"}
             onClick={() => setViewMode("scannedResult")}
             type="button"
@@ -5436,23 +5382,19 @@ export default function ArchitectureWorkspaceView({
         <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
       </ArchitectureToolbar>
 
-      {viewMode === "todoHistory" ? (
-        <TodosHistoryPanel
-          items={todoHistoryItems}
-          repoLabel={repoLabel}
-        />
-      ) : viewMode === "scannedResult" ? (
+      {viewMode === "scannedResult" ? (
         <ScannedResultPanel
           error={architectureRepositoryScanError}
           scan={architectureRepositoryScanSnapshot}
           state={architectureRepositoryScanState}
         />
       ) : (
-	        <HistoryTimeline
-	          finishPlanError={finishPlanState.error}
-	          finishingPlanTaskId={finishPlanState.planRef}
+        <TodosHistoryPanel
+          finishPlanError={finishPlanState.error}
+          finishedPlanRefs={finishedPlanRefs}
+          finishingPlanRef={finishPlanState.planRef}
+          items={todoHistoryItems}
           onFinishPlan={finishTerminalTodoPlan}
-          tasks={visibleTasks}
           repoLabel={repoLabel}
         />
       )}
@@ -9000,102 +8942,14 @@ function ArchitectureCanvasEdge({
   );
 }
 
-function HistoryTimeline({
+function TodosHistoryPanel({
   finishPlanError = "",
-  finishingPlanTaskId = "",
-  onFinishPlan,
+  finishedPlanRefs = null,
+  finishingPlanRef = "",
+  items = [],
+  onFinishPlan = null,
   repoLabel,
-  tasks,
 }) {
-  const timeline = useMemo(() => buildTimelineItems(tasks), [tasks]);
-  const [selectedTaskId, setSelectedTaskId] = useState("");
-
-  useEffect(() => {
-    if (!timeline.rows.length) {
-      if (selectedTaskId) setSelectedTaskId("");
-      return;
-    }
-    if (!timeline.rows.some((item) => item.taskId === selectedTaskId)) {
-      setSelectedTaskId(timeline.rows[0].taskId);
-    }
-  }, [selectedTaskId, timeline.rows]);
-
-  const selectedItem = timeline.rows.find((item) => item.taskId === selectedTaskId)
-    || timeline.rows[0]
-    || null;
-
-  if (!tasks.length) {
-    return (
-      <HistoryPane>
-        <EmptyState>No task history recorded yet.</EmptyState>
-      </HistoryPane>
-    );
-  }
-
-  return (
-    <HistoryPane>
-      <TimelineHeader>
-        <div>
-          <TimelineKicker>Repo timeline</TimelineKicker>
-          <TimelineTitle>{repoLabel}</TimelineTitle>
-        </div>
-        <TimelineSummary>{timeline.rows.length} task{timeline.rows.length === 1 ? "" : "s"} · newest first</TimelineSummary>
-      </TimelineHeader>
-      <HistorySplit>
-        <TimelineList aria-label="Task history timeline" style={{ "--timeline-lanes": timeline.laneCount }}>
-          {timeline.rows.map((item) => {
-            const startLabel = formatTime(item.startMs) || "unknown";
-            const finishLabel = item.endMs
-              ? formatTime(item.endMs)
-              : item.active ? "now" : "not finished";
-            const duration = formatTimelineDuration(item.startMs, item.endMs, item.active);
-            const relativeStamp = taskRelativeStamp(item);
-
-            return (
-              <TimelineRow
-                aria-pressed={selectedItem?.taskId === item.taskId}
-                data-selected={selectedItem?.taskId === item.taskId ? "true" : "false"}
-                data-status={item.statusKind}
-                key={item.taskId}
-                onClick={() => setSelectedTaskId(item.taskId)}
-                title={`${item.label}\n${startLabel} -> ${finishLabel}`}
-                type="button"
-              >
-                <TimelineTrack aria-hidden="true" style={{ "--timeline-lane": item.lane }}>
-                  <span data-part="trunk" />
-                  <span data-part="lane" />
-                  <span data-part="connector" />
-                  <span data-part="dot" />
-                </TimelineTrack>
-                <TimelineTask>
-                  <TimelineTaskLine>
-                    <TimelineTaskName>{item.label}</TimelineTaskName>
-                    <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
-                      {item.statusLabel}
-                    </StatusPill>
-                  </TimelineTaskLine>
-                </TimelineTask>
-                <TimelineTimes>
-                  <strong>{relativeStamp}</strong>
-                  {duration && <em>{duration}</em>}
-                </TimelineTimes>
-              </TimelineRow>
-            );
-          })}
-        </TimelineList>
-        <TaskDetailPanel
-          finishPlanError={finishPlanError}
-          finishingPlanTaskId={finishingPlanTaskId}
-          item={selectedItem}
-          onFinishPlan={onFinishPlan}
-          repoLabel={repoLabel}
-        />
-      </HistorySplit>
-    </HistoryPane>
-  );
-}
-
-function TodosHistoryPanel({ items = [], repoLabel }) {
   const [selectedTodoId, setSelectedTodoId] = useState("");
 
   useEffect(() => {
@@ -9130,55 +8984,44 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
         <TimelineSummary>{items.length} todo{items.length === 1 ? "" : "s"} · newest first</TimelineSummary>
       </TimelineHeader>
       <HistorySplit>
-        <TimelineList aria-label="Todos history timeline" style={{ "--timeline-lanes": 1 }}>
+        <TodoHistoryRail aria-label="Todos history list">
           {items.map((item) => {
-            const startLabel = formatTime(item.startMs || item.createdMs) || "unknown";
-            const finishLabel = item.endMs
-              ? formatTime(item.endMs)
-              : item.statusKind === "active" ? "now" : "not finished";
+            const selected = selectedItem?.id === item.id;
             const relativeStamp = item.statusKind === "active"
               ? "live now"
               : formatRelativeTimeMs(item.updatedMs || item.endMs || item.createdMs) || "unknown";
-            const duration = item.duration || formatTimelineDuration(
-              item.startMs || item.createdMs,
-              item.endMs,
-              item.statusKind === "active",
-            );
-            const selected = selectedItem?.id === item.id;
+            const preview = text(item.body, item.title);
             return (
-              <TimelineRow
+              <TodoHistoryRow
                 aria-pressed={selected}
                 data-selected={selected ? "true" : "false"}
                 data-status={item.statusKind}
                 key={item.id}
                 onClick={() => setSelectedTodoId(item.id)}
-                title={`${item.title}\n${startLabel} -> ${finishLabel}`}
                 type="button"
               >
-                <TimelineTrack aria-hidden="true" style={{ "--timeline-lane": 0 }}>
-                  <span data-part="trunk" />
-                  <span data-part="lane" />
-                  <span data-part="connector" />
-                  <span data-part="dot" />
-                </TimelineTrack>
-                <TimelineTask>
-                  <TimelineTaskLine>
-                    <TimelineTaskName>{item.title}</TimelineTaskName>
-                    <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
-                      {item.statusLabel}
-                    </StatusPill>
-                  </TimelineTaskLine>
-                </TimelineTask>
-                <TimelineTimes>
-                  <strong>{relativeStamp}</strong>
-                  {duration && <em>{duration}</em>}
-                </TimelineTimes>
-              </TimelineRow>
+                <TodoHistoryRowTop>
+                  <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatus}`}>
+                    {item.statusLabel}
+                  </StatusPill>
+                  <time>{relativeStamp}</time>
+                </TodoHistoryRowTop>
+                <TodoHistoryRowPreview>{preview}</TodoHistoryRowPreview>
+                <TodoHistoryRowMeta>
+                  <span>{item.target || item.source || "unassigned"}</span>
+                  {item.taskCount > 0 && <em>{item.taskCount} task{item.taskCount === 1 ? "" : "s"}</em>}
+                  {item.planCount > 0 && <em>{item.planCount} plan{item.planCount === 1 ? "" : "s"}</em>}
+                </TodoHistoryRowMeta>
+              </TodoHistoryRow>
             );
           })}
-        </TimelineList>
+        </TodoHistoryRail>
         <TodoDetailPanel
+          finishPlanError={finishPlanError}
+          finishedPlanRefs={finishedPlanRefs}
+          finishingPlanRef={finishingPlanRef}
           item={selectedItem}
+          onFinishPlan={onFinishPlan}
           repoLabel={repoLabel}
         />
       </HistorySplit>
@@ -9187,8 +9030,11 @@ function TodosHistoryPanel({ items = [], repoLabel }) {
 }
 
 function TaskPlanPreviewCard({
+  action = null,
   label = "Terminal todo plan",
   plan,
+  statusKind = "",
+  statusLabel = "",
   title = "",
 }) {
   if (!plan) return null;
@@ -9201,6 +9047,10 @@ function TaskPlanPreviewCard({
       <TaskPlanHeader>
         <span>{label}</span>
         <strong>{text(plan.title, title)}</strong>
+        {statusLabel && (
+          <StatusPill data-status={statusKind}>{statusLabel}</StatusPill>
+        )}
+        {action}
       </TaskPlanHeader>
       {planDetail && <TaskPlanDescription>{planDetail}</TaskPlanDescription>}
       {planSteps.length > 0 && (
@@ -9229,7 +9079,71 @@ function TaskPlanPreviewCard({
   );
 }
 
-function TodoDetailPanel({ item, repoLabel }) {
+const TODO_PLAN_STATUS_LABELS = {
+  active: "Active",
+  blocked: "Blocked",
+  completed: "Completed",
+  interrupted: "Interrupted",
+  unknown: "Unknown",
+};
+
+function TodoTaskAccordionItem({ task, taskId }) {
+  const [expanded, setExpanded] = useState(false);
+  const startMs = taskStartMs(task);
+  const endMs = taskEndMs(task);
+  const active = taskIsActive(task);
+  const updated = formatRelativeTimeMs(taskUpdatedMs(task) || endMs || startMs) || "unknown";
+  const taskDuration = formatTimelineDuration(startMs, endMs, active);
+  const agent = taskAgentLabel(task);
+  const inputBlocks = taskInputBlocks(task);
+  const body = taskBody(task);
+
+  return (
+    <TodoTaskAccordion data-expanded={expanded ? "true" : "false"}>
+      <TodoTaskAccordionHeader
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        type="button"
+      >
+        <TodoTaskAccordionChevron aria-hidden="true" data-expanded={expanded ? "true" : "false"} />
+        <div>
+          <strong>{taskDisplayTitle(task)}</strong>
+          <span>{taskId}</span>
+        </div>
+        <TodoTaskMeta>
+          <StatusPill data-status={taskStatusKind(task)} title={`Actual status: ${taskStatusLabel(task)}`}>
+            {taskTimelineStatusLabel(task)}
+          </StatusPill>
+          {agent && <em>{agent}</em>}
+          {taskDuration && <em>{taskDuration}</em>}
+          <em>{updated}</em>
+        </TodoTaskMeta>
+      </TodoTaskAccordionHeader>
+      {expanded && (
+        <TodoTaskAccordionBody>
+          <TaskInputPanel>
+            {(inputBlocks.length ? inputBlocks : [{ content: body || "No agent input recorded.", label: "Input" }])
+              .map((block, index) => (
+                <TaskInputBlock key={`${block.label}-${index}-${block.content.slice(0, 24)}`}>
+                  <span>{block.label}</span>
+                  <p>{block.content}</p>
+                </TaskInputBlock>
+              ))}
+          </TaskInputPanel>
+        </TodoTaskAccordionBody>
+      )}
+    </TodoTaskAccordion>
+  );
+}
+
+function TodoDetailPanel({
+  finishPlanError = "",
+  finishedPlanRefs = null,
+  finishingPlanRef = "",
+  item,
+  onFinishPlan = null,
+  repoLabel,
+}) {
   if (!item) {
     return (
       <TaskDetails>
@@ -9324,26 +9238,12 @@ function TodoDetailPanel({ item, repoLabel }) {
           <TodoTaskList>
             {item.relatedTasks.map((task, index) => {
               const taskId = taskPlanTaskId(task, `task-${index}`);
-              const startMs = taskStartMs(task);
-              const endMs = taskEndMs(task);
-              const active = taskIsActive(task);
-              const updated = formatRelativeTimeMs(taskUpdatedMs(task) || endMs || startMs) || "unknown";
-              const taskDuration = formatTimelineDuration(startMs, endMs, active);
               return (
-                <TodoTaskRow key={taskId}>
-                  <div>
-                    <strong>{taskDisplayTitle(task)}</strong>
-                    <span>{taskId}</span>
-                  </div>
-                  <TodoTaskMeta>
-                    <StatusPill data-status={taskStatusKind(task)} title={`Actual status: ${taskStatusLabel(task)}`}>
-                      {taskTimelineStatusLabel(task)}
-                    </StatusPill>
-                    {taskAgentLabel(task) && <em>{taskAgentLabel(task)}</em>}
-                    {taskDuration && <em>{taskDuration}</em>}
-                    <em>{updated}</em>
-                  </TodoTaskMeta>
-                </TodoTaskRow>
+                <TodoTaskAccordionItem
+                  key={`${item.id}-${taskId}`}
+                  task={task}
+                  taskId={taskId}
+                />
               );
             })}
           </TodoTaskList>
@@ -9356,99 +9256,47 @@ function TodoDetailPanel({ item, repoLabel }) {
           <span>Plans under this todo</span>
           <strong>{item.relatedPlans.length}</strong>
         </TodoDetailSectionHeader>
-	        {item.relatedPlans.length ? item.relatedPlans.map((entry) => (
-	          <TaskPlanPreviewCard
-	            key={entry.key}
-	            plan={entry.plan}
-	            title={entry.title}
-	          />
-	        )) : (
-	          <TodoEmptyInline>No matching plans recorded yet.</TodoEmptyInline>
-	        )}
+        {item.relatedPlans.length ? item.relatedPlans.map((entry) => {
+          const basePlan = entry.plan;
+          const planRef = terminalPlanIdentity(basePlan, entry.key);
+          const finishedOverride = Boolean(finishedPlanRefs?.has?.(planRef));
+          const plan = finishedOverride
+            ? completedTerminalTodoPlan(basePlan) || basePlan
+            : basePlan;
+          const statusKind = finishedOverride ? "completed" : terminalPlanStatusKind(plan);
+          const statusLabel = TODO_PLAN_STATUS_LABELS[statusKind] || TODO_PLAN_STATUS_LABELS.unknown;
+          const canFinish = Boolean(
+            typeof onFinishPlan === "function"
+              && planRef
+              && statusKind !== "completed",
+          );
+          const finishing = finishingPlanRef === planRef;
+          return (
+            <TaskPlanPreviewCard
+              action={canFinish ? (
+                <FinishPlanButton
+                  data-loading={finishing ? "true" : undefined}
+                  disabled={finishing}
+                  onClick={() => onFinishPlan({ plan: basePlan, task: entry.task })}
+                  type="button"
+                >
+                  {finishing && <FinishPlanButtonSpinner aria-hidden="true" />}
+                  <span>{finishing ? "Finishing..." : "Finish plan"}</span>
+                </FinishPlanButton>
+              ) : null}
+              key={entry.key}
+              label={entry.sourceLabel === "Task" ? "Task plan" : "Todo plan"}
+              plan={plan}
+              statusKind={statusKind}
+              statusLabel={statusLabel}
+              title={entry.title}
+            />
+          );
+        }) : (
+          <TodoEmptyInline>No matching plans recorded yet.</TodoEmptyInline>
+        )}
+        {finishPlanError && <TaskActionError>{finishPlanError}</TaskActionError>}
       </TodoDetailSection>
-    </TaskDetails>
-  );
-}
-
-function TaskDetailPanel({
-  finishPlanError = "",
-  finishingPlanTaskId = "",
-  item,
-  onFinishPlan,
-  repoLabel,
-}) {
-  if (!item) {
-    return (
-      <TaskDetails>
-        <EmptyState>Select a task to inspect it.</EmptyState>
-      </TaskDetails>
-    );
-  }
-
-  const task = item.task;
-  const terminalPlan = taskTerminalPlan(task);
-  const duration = formatTimelineDuration(item.startMs, item.endMs, item.active) || "unknown";
-  const agent = taskAgentLabel(task) || "unknown";
-  const body = taskBody(task);
-  const title = item.label;
-  const relativeStamp = taskRelativeStamp(item);
-  const updatedRelative = formatRelativeTimeMs(item.updatedMs || item.endMs || item.startMs) || relativeStamp;
-  const planRef = terminalPlanIdentity(terminalPlan);
-  const inputBlocks = taskInputBlocks(task);
-  const canFinishPlan = Boolean(
-    terminalPlan
-      && planRef
-      && terminalPlanStatusKind(terminalPlan) !== "completed"
-      && typeof onFinishPlan === "function",
-  );
-  const finishingPlan = finishingPlanTaskId === planRef;
-
-  return (
-    <TaskDetails aria-label="Selected task details">
-      <TaskDetailsHeader>
-        <div>
-          <TimelineKicker>{repoLabel}</TimelineKicker>
-          <TaskDetailsTitle>{title}</TaskDetailsTitle>
-        </div>
-        <TaskDetailsHeaderActions>
-          <TaskDetailsUpdated>Updated {updatedRelative}</TaskDetailsUpdated>
-          <StatusPill data-status={item.statusKind} title={`Actual status: ${item.rawStatusLabel}`}>
-            {item.statusLabel}
-          </StatusPill>
-          {canFinishPlan && (
-            <FinishPlanButton
-              disabled={finishingPlan}
-              data-loading={finishingPlan ? "true" : undefined}
-              onClick={() => onFinishPlan(item)}
-              type="button"
-            >
-              {finishingPlan && <FinishPlanButtonSpinner aria-hidden="true" />}
-              <span>{finishingPlan ? "Finishing..." : "Finish plan"}</span>
-            </FinishPlanButton>
-          )}
-        </TaskDetailsHeaderActions>
-      </TaskDetailsHeader>
-      <TaskMetaStrip>
-        <TaskMetaChip>
-          <span>Agent</span>
-          <strong>{agent}</strong>
-        </TaskMetaChip>
-        <TaskMetaChip>
-          <span>Duration</span>
-          <strong>{duration}</strong>
-        </TaskMetaChip>
-      </TaskMetaStrip>
-      <TaskInputPanel>
-        {(inputBlocks.length ? inputBlocks : [{ content: body || "No agent input recorded.", label: "Input" }])
-          .map((block, index) => (
-            <TaskInputBlock key={`${block.label}-${index}-${block.content.slice(0, 24)}`}>
-              <span>{block.label}</span>
-              <p>{block.content}</p>
-            </TaskInputBlock>
-          ))}
-      </TaskInputPanel>
-      {terminalPlan && <TaskPlanPreviewCard plan={terminalPlan} title={title} />}
-      {finishPlanError && <TaskActionError>{finishPlanError}</TaskActionError>}
     </TaskDetails>
   );
 }
@@ -12945,6 +12793,176 @@ const TodoTaskMeta = styled.div`
   @media (max-width: 700px) {
     justify-content: flex-start;
   }
+`;
+
+const TodoHistoryRail = styled.div`
+  display: flex;
+  flex-direction: column;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+`;
+
+const TodoHistoryRow = styled.button`
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 10px;
+  color: inherit;
+  background: rgba(2, 6, 23, 0.24);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  flex-shrink: 0;
+
+  &:hover {
+    border-color: rgba(96, 165, 250, 0.3);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(96, 165, 250, 0.45);
+    background: rgba(30, 64, 175, 0.14);
+  }
+`;
+
+const TodoHistoryRowTop = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+
+  time {
+    color: rgba(148, 163, 184, 0.8);
+    font-size: 9px;
+    font-weight: 760;
+    white-space: nowrap;
+  }
+`;
+
+const TodoHistoryRowPreview = styled.p`
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: rgba(226, 232, 240, 0.92);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+`;
+
+const TodoHistoryRowMeta = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+
+  span,
+  em {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9px;
+    font-style: normal;
+    font-weight: 720;
+  }
+
+  span {
+    min-width: 0;
+    color: rgba(148, 163, 184, 0.78);
+  }
+
+  em {
+    flex-shrink: 0;
+    color: rgba(125, 211, 252, 0.78);
+  }
+`;
+
+const TodoTaskAccordion = styled.div`
+  display: grid;
+  min-width: 0;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.2);
+  overflow: hidden;
+
+  &[data-expanded="true"] {
+    border-color: rgba(96, 165, 250, 0.28);
+  }
+`;
+
+const TodoTaskAccordionHeader = styled.button`
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  > div {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  strong,
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: rgba(241, 245, 249, 0.94);
+    font-size: 11px;
+    font-weight: 820;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.76);
+    font-size: 9px;
+    font-weight: 720;
+  }
+
+  @media (max-width: 700px) {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+`;
+
+const TodoTaskAccordionChevron = styled.span`
+  width: 0;
+  height: 0;
+  border-left: 5px solid rgba(148, 163, 184, 0.85);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 140ms ease;
+
+  &[data-expanded="true"] {
+    transform: rotate(90deg);
+  }
+`;
+
+const TodoTaskAccordionBody = styled.div`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 9px 9px;
+  border-top: 1px solid rgba(148, 163, 184, 0.08);
 `;
 
 const TaskActionError = styled.div`

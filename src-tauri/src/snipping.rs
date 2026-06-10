@@ -12,6 +12,7 @@ use xcap::{image::ImageFormat as XcapImageFormat, Monitor as XcapMonitor};
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
+const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
 const SNIPPING_TOAST_WINDOW_LABEL: &str = "snipping-toasts";
 const SNIPPING_PIN_WINDOW_PREFIX: &str = "snipping-pin";
@@ -100,7 +101,7 @@ extern "C" {
 struct SnippingState {
     shortcut_manager: SnippingShortcutManager,
     active_area_monitor: Arc<StdMutex<Option<SnippingAreaMonitor>>>,
-    active_area_snapshot: Arc<StdMutex<Option<xcap::image::RgbaImage>>>,
+    active_area_snapshot: Arc<StdMutex<Option<Arc<xcap::image::RgbaImage>>>>,
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
     asset_target: Arc<StdMutex<SnippingAssetTarget>>,
 }
@@ -683,7 +684,12 @@ fn register_snipping_shortcut_handler(
                     });
                 }
                 SnippingShortcutAction::AreaSnip => {
-                    let _ = snipping_begin_area_snip_for(&app_handle, "shortcut", shortcut_text);
+                    // Capture + overlay prep must never block the shortcut
+                    // dispatch thread, or the overlay appears with a visible lag.
+                    thread::spawn(move || {
+                        let _ =
+                            snipping_begin_area_snip_for(&app_handle, "shortcut", shortcut_text);
+                    });
                 }
             }
         })
@@ -1191,30 +1197,6 @@ fn snipping_remove_snapshot_file(path: Option<&str>) {
     let _ = fs::remove_file(path);
 }
 
-fn snipping_prepare_area_snapshot(
-    mut area_monitor: SnippingAreaMonitor,
-) -> Result<(SnippingAreaMonitor, xcap::image::RgbaImage), String> {
-    let monitor = xcap_monitor_for_area(&area_monitor)?;
-    let image = monitor
-        .capture_image()
-        .map_err(|error| format!("Unable to capture screen for area snip: {error}"))?;
-    let snapshot_path = snipping_overlay_snapshot_path()?;
-    xcap::image::DynamicImage::ImageRgba8(image.clone())
-        .to_rgb8()
-        .save_with_format(&snapshot_path, XcapImageFormat::Jpeg)
-        .map_err(|error| {
-            format!(
-                "Unable to write snipping overlay preview {}: {error}",
-                snapshot_path.display()
-            )
-        })?;
-
-    area_monitor.snapshot_width = image.width();
-    area_monitor.snapshot_height = image.height();
-    area_monitor.snapshot_path = Some(snapshot_path.display().to_string());
-    Ok((area_monitor, image))
-}
-
 fn snipping_crop_snapshot_image(
     image: &xcap::image::RgbaImage,
     x: u32,
@@ -1681,6 +1663,32 @@ fn snipping_emit_untracked_image_saved(
     Ok(payload)
 }
 
+/// Writes a capture as PNG with fast compression. Default PNG settings spend
+/// seconds compressing a retina-sized frame, which is the difference between
+/// the capture toast appearing instantly and appearing after a long pause.
+fn snipping_write_png_fast(
+    image: &xcap::image::RgbaImage,
+    path: &Path,
+) -> Result<(), String> {
+    use xcap::image::ImageEncoder;
+    let file = fs::File::create(path)
+        .map_err(|error| format!("Unable to create snip image {}: {error}", path.display()))?;
+    let writer = std::io::BufWriter::new(file);
+    let encoder = xcap::image::codecs::png::PngEncoder::new_with_quality(
+        writer,
+        xcap::image::codecs::png::CompressionType::Fast,
+        xcap::image::codecs::png::FilterType::Adaptive,
+    );
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            xcap::image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| format!("Unable to encode snip image {}: {error}", path.display()))
+}
+
 fn snipping_save_image(
     app: &AppHandle,
     image: xcap::image::RgbaImage,
@@ -1691,9 +1699,7 @@ fn snipping_save_image(
     let (target, tmp) = snipping_prepare_capture_path(mode)?;
     let width = image.width();
     let height = image.height();
-    image
-        .save_with_format(&tmp, XcapImageFormat::Png)
-        .map_err(|error| format!("Unable to write snip image {}: {error}", tmp.display()))?;
+    snipping_write_png_fast(&image, &tmp)?;
     fs::rename(&tmp, &target).map_err(|error| {
         let _ = fs::remove_file(&tmp);
         format!(
@@ -1942,14 +1948,28 @@ fn snipping_save_edited_untracked_asset_for(
             tmp_dir.display()
         )
     })?;
-    let filename = cloud_mcp_sanitize_asset_filename(
-        &format!("{source_name}-edited-{}.png", cloud_mcp_now_ms()),
-        "snip-edited.png",
-    );
-    let target = cloud_mcp_available_asset_download_path(&edits_dir, &filename);
+    // Annotating an original creates exactly one edited copy. Re-annotating
+    // that copy must update it in place instead of multiplying
+    // "-edited-edited-…" files.
+    let source_is_edited_copy = source
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(edits_dir.canonicalize().ok())
+        .is_some_and(|(parent, edits)| parent == edits);
+    let (target, original_path) = if source_is_edited_copy {
+        (source.clone(), None)
+    } else {
+        let filename = cloud_mcp_sanitize_asset_filename(
+            &format!("{source_name}-edited.png"),
+            "snip-edited.png",
+        );
+        (
+            cloud_mcp_available_asset_download_path(&edits_dir, &filename),
+            Some(source.display().to_string()),
+        )
+    };
     let tmp = tmp_dir.join(format!(
-        ".{}-{}.tmp",
-        filename.trim_end_matches(".png"),
+        ".snip-edited-{}.tmp",
         uuid::Uuid::new_v4()
     ));
     fs::write(&tmp, &bytes)
@@ -1970,7 +1990,7 @@ fn snipping_save_edited_untracked_asset_for(
         "edited",
         "annotation-editor",
         String::new(),
-        Some(source.display().to_string()),
+        original_path,
     )
 }
 
@@ -2082,7 +2102,7 @@ fn snipping_set_active_area_monitor(
 
 fn snipping_set_active_area_snapshot(
     app: &AppHandle,
-    snapshot: Option<xcap::image::RgbaImage>,
+    snapshot: Option<Arc<xcap::image::RgbaImage>>,
 ) -> Result<(), String> {
     let state = app.state::<SnippingState>();
     let mut guard = state
@@ -2108,7 +2128,7 @@ fn snipping_crop_active_area_snapshot(
     let image = guard
         .as_ref()
         .ok_or_else(|| "No frozen snip snapshot is available.".to_string())?;
-    snipping_crop_snapshot_image(image, x, y, width, height)
+    snipping_crop_snapshot_image(image.as_ref(), x, y, width, height)
 }
 
 fn snipping_active_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
@@ -2128,8 +2148,17 @@ fn snipping_begin_area_snip_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
-    let (monitor, snapshot) = snipping_prepare_area_snapshot(snipping_current_area_monitor(app)?)?;
-    snipping_set_active_area_snapshot(app, Some(snapshot))?;
+    let mut monitor = snipping_current_area_monitor(app)?;
+    let xcap_monitor = xcap_monitor_for_area(&monitor)?;
+    let image = Arc::new(
+        xcap_monitor
+            .capture_image()
+            .map_err(|error| format!("Unable to capture screen for area snip: {error}"))?,
+    );
+    monitor.snapshot_width = image.width();
+    monitor.snapshot_height = image.height();
+    monitor.snapshot_path = None;
+    snipping_set_active_area_snapshot(app, Some(Arc::clone(&image)))?;
     snipping_set_active_area_monitor(app, Some(monitor.clone()))?;
     let window = ensure_snipping_overlay_window(app, &monitor)?;
     let _ = window.emit(SNIPPING_AREA_OVERLAY_STARTED_EVENT, json!({
@@ -2139,6 +2168,51 @@ fn snipping_begin_area_snip_for(
     window
         .show()
         .map_err(|error| format!("Unable to show snipping overlay: {error}"))?;
+    let _ = window.set_focus();
+
+    // The frozen-frame JPEG is only a visual backdrop; write it off the hot
+    // path so the selection overlay appears instantly, then announce it.
+    let app_for_snapshot = app.clone();
+    thread::spawn(move || {
+        let Ok(snapshot_path) = snipping_overlay_snapshot_path() else {
+            return;
+        };
+        // Pixel copy + JPEG encode both happen on this background thread.
+        if xcap::image::DynamicImage::ImageRgba8(image.as_ref().clone())
+            .to_rgb8()
+            .save_with_format(&snapshot_path, XcapImageFormat::Jpeg)
+            .is_err()
+        {
+            return;
+        }
+        let path_text = snapshot_path.display().to_string();
+        let state = app_for_snapshot.state::<SnippingState>();
+        let mut still_active = false;
+        if let Ok(mut guard) = state.active_area_monitor.lock() {
+            if let Some(active_monitor) = guard.as_mut() {
+                if active_monitor.snapshot_path.is_none() {
+                    active_monitor.snapshot_path = Some(path_text.clone());
+                    still_active = true;
+                }
+            }
+        }
+        if !still_active {
+            snipping_remove_snapshot_file(Some(&path_text));
+            return;
+        }
+        if let Some(overlay) =
+            app_for_snapshot.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL)
+        {
+            let _ = overlay.emit(
+                SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT,
+                json!({
+                    "kind": "snipping_area_overlay_snapshot",
+                    "snapshotPath": path_text.clone(),
+                    "snapshot_path": path_text,
+                }),
+            );
+        }
+    });
 
     Ok(json!({
         "kind": "snipping_area_started",
@@ -2197,23 +2271,27 @@ fn snipping_finish_area_snip_for(
     }
 
     let image_result = (|| -> Result<xcap::image::RgbaImage, String> {
+        // The in-memory frozen frame is what the user actually saw while
+        // selecting; always prefer it over re-capturing the live screen.
+        if let Ok(image) = snipping_crop_active_area_snapshot(
+            app,
+            selection_x,
+            selection_y,
+            selection_width,
+            selection_height,
+        ) {
+            return Ok(image);
+        }
         if area_monitor.snapshot_path.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
-            return snipping_crop_active_area_snapshot(
-                app,
+            if let Ok(image) = snipping_crop_area_preview_snapshot(
+                &area_monitor,
                 selection_x,
                 selection_y,
                 selection_width,
                 selection_height,
-            )
-            .or_else(|_| {
-                snipping_crop_area_preview_snapshot(
-                    &area_monitor,
-                    selection_x,
-                    selection_y,
-                    selection_width,
-                    selection_height,
-                )
-            });
+            ) {
+                return Ok(image);
+            }
         }
 
         let monitor = xcap_monitor_for_area(&area_monitor)?;

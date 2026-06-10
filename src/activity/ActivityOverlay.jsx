@@ -11,8 +11,7 @@ const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-upd
 
 const REFRESH_INTERVAL_MS = 4500;
 const REFRESH_DEBOUNCE_MS = 180;
-const CARD_LIMIT = 6;
-const VISIBLE_CARD_LIMIT = 4;
+const CARD_LIMIT = 30;
 const RECENT_FINISHED_MS = 5 * 60 * 1000;
 const WORKSPACE_TODOS_CACHE_KEY = "diffforge.activityOverlay.workspaceTodos";
 
@@ -806,13 +805,16 @@ function useActivityOverlayData() {
         errors.push("assets");
       }
       const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
-      const cachedWorkspaceTodos = refreshedWorkspaceTodos || current.cachedWorkspaceTodos;
       const cloudWorkspaceTodos = cloudStatusResult.status === "fulfilled"
         ? workspaceTodosFromStatus(cloudStatus)
         : {};
-      const nextWorkspaceTodos = Object.keys(cloudWorkspaceTodos).length
-        ? cloudWorkspaceTodos
-        : cachedWorkspaceTodos;
+      // The reconciled Rust mirror is the source of truth, even when it is
+      // empty: falling back to older snapshots here used to resurrect todos
+      // that no longer exist anywhere else.
+      const nextWorkspaceTodos = refreshedWorkspaceTodos
+        || (Object.keys(cloudWorkspaceTodos).length
+          ? cloudWorkspaceTodos
+          : current.cachedWorkspaceTodos);
       writeCachedWorkspaceTodos(nextWorkspaceTodos);
       return {
         ...current,
@@ -976,7 +978,7 @@ export default function ActivityOverlayWindow() {
     () => selectActivityCards(todoCards, transferCards),
     [todoCards, transferCards],
   );
-  const visibleCards = activityCards.slice(0, VISIBLE_CARD_LIMIT);
+  const visibleCards = activityCards;
   const totalCount = todoCards.length + transferCards.length;
   const hiddenCount = Math.max(0, totalCount - visibleCards.length);
   const hasWork = totalCount > 0;
@@ -1214,9 +1216,26 @@ const OverlayBody = styled.div`
   min-height: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
   cursor: grab;
   -webkit-app-region: drag;
+
+  &::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.35);
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
 
   &:active {
     cursor: grabbing;

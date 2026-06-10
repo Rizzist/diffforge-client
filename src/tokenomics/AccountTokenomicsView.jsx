@@ -263,10 +263,11 @@ function rowScopeLabel(row, key = rowScopeKey(row)) {
 }
 
 function tokenomicsDeviceIdentityRows(summary = {}) {
+  const value = summary && typeof summary === "object" ? summary : {};
   return [
-    ...(Array.isArray(summary.device_identities) ? summary.device_identities : []),
-    ...(Array.isArray(summary.deviceIdentities) ? summary.deviceIdentities : []),
-    ...(Array.isArray(summary.devices) ? summary.devices : []),
+    ...(Array.isArray(value.device_identities) ? value.device_identities : []),
+    ...(Array.isArray(value.deviceIdentities) ? value.deviceIdentities : []),
+    ...(Array.isArray(value.devices) ? value.devices : []),
   ];
 }
 

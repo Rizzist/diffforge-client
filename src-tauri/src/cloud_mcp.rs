@@ -18446,6 +18446,9 @@ fn cloud_mcp_update_todo_mirror_conn(
     // Deletions win over any row carried in the same payload: a deleted todo id
     // must never survive in the mirror, or it re-imports as a ghost later.
     cloud_mcp_todo_mirror_apply_removed_todo_ids(conn, &removed_todo_ids)?;
+    // Reconcile id aliases after every write so a terminal status arriving
+    // under a command/dispatch alias retires the original todo row too.
+    let _ = cloud_mcp_todo_mirror_reconcile_conn(conn);
     Ok(true)
 }
 
@@ -20003,7 +20006,163 @@ fn cloud_mcp_todo_mirror_workspace_todos_from_conn(
 
 fn cloud_mcp_todo_mirror_workspace_todos_from_store() -> Option<Value> {
     let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    let _ = cloud_mcp_todo_mirror_reconcile_conn(&conn);
     cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, None, None)
+}
+
+/// DiffForge generates aliased ids for one logical todo: the todo id, its
+/// dispatch id, and its command id share a recognizable family. Status events
+/// sometimes arrive identified by an alias, which used to leave the original
+/// row stuck in `queued` forever. This maps any alias to its family token.
+fn cloud_mcp_todo_mirror_family_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    for prefix in [
+        "direct-prompt-todo-",
+        "direct-prompt-command-",
+        "direct-prompt-dispatch-",
+    ] {
+        if let Some(suffix) = value.strip_prefix(prefix) {
+            if !suffix.is_empty() {
+                return Some(format!("family::direct-prompt::{suffix}"));
+            }
+        }
+    }
+    if let Some(rest) = value.strip_prefix("local-plan-") {
+        if let Some((plan, ordinal)) = rest.rsplit_once("-todo-") {
+            if !plan.is_empty() && !ordinal.is_empty() {
+                return Some(format!("family::local-plan::{plan}::{ordinal}"));
+            }
+        }
+        if let Some((plan, tail)) = rest.rsplit_once("-dispatch-") {
+            let ordinal = tail.strip_suffix("-command").unwrap_or(tail);
+            if !plan.is_empty() && !ordinal.is_empty() {
+                return Some(format!("family::local-plan::{plan}::{ordinal}"));
+            }
+        }
+    }
+    None
+}
+
+fn cloud_mcp_todo_mirror_identity_tokens(
+    todo_id: &str,
+    command_id: &str,
+    dispatch_id: &str,
+) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for value in [todo_id, command_id, dispatch_id] {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let token = format!("id::{value}");
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+        if let Some(family) = cloud_mcp_todo_mirror_family_token(value) {
+            if !tokens.contains(&family) {
+                tokens.push(family);
+            }
+        }
+    }
+    tokens
+}
+
+/// Removes ghost rows from the todo mirror:
+/// 1. Rows written under retired key schemes (their keys embedded a repo id),
+///    which later status updates can never reach.
+/// 2. Non-terminal rows whose terminal state arrived under an aliased id
+///    (command/dispatch id instead of todo id, or a plan dispatch alias).
+/// Runs on every mirror write batch and before every read, so stale todos
+/// can never accumulate again.
+fn cloud_mcp_todo_mirror_reconcile_conn(conn: &rusqlite::Connection) -> Result<usize, String> {
+    let mut removed = conn
+        .execute(
+            "DELETE FROM workspace_todo_mirror_rows
+             WHERE key LIKE '%::repo-%' OR key LIKE '%::unresolved-repo::%'",
+            [],
+        )
+        .map_err(|error| format!("Unable to drop legacy todo mirror rows: {error}"))?;
+    // Dispatch rows track transient executions; one stuck in an active status
+    // for a day was abandoned (crashed terminal, lost event) and would
+    // otherwise linger forever. Todos are exempt: queued work may legitimately
+    // wait for days.
+    let stale_dispatch_cutoff_ms =
+        cloud_mcp_now_ms() as i64 - 24 * 60 * 60 * 1000;
+    removed += conn
+        .execute(
+            "DELETE FROM workspace_todo_mirror_rows
+             WHERE row_kind='dispatch'
+               AND status NOT IN ('completed', 'complete', 'done', 'failed', 'cancelled',
+                                  'canceled', 'timed_out', 'timeout', 'deleted', 'removed',
+                                  'rejected', 'skipped', 'duplicate_ignored')
+               AND mirror_updated_at_ms > 0
+               AND mirror_updated_at_ms < ?1",
+            rusqlite::params![stale_dispatch_cutoff_ms],
+        )
+        .map_err(|error| format!("Unable to drop stale dispatch mirror rows: {error}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT key, todo_id, command_id, dispatch_id, status, mirror_updated_at_ms
+             FROM workspace_todo_mirror_rows",
+        )
+        .map_err(|error| format!("Unable to read todo mirror rows for reconcile: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to scan todo mirror rows for reconcile: {error}"))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    let mut terminal_seen_ms: HashMap<String, i64> = HashMap::new();
+    for (_, todo_id, command_id, dispatch_id, status, updated_ms) in &rows {
+        if !cloud_mcp_todo_mirror_dispatch_status_is_terminal(status) {
+            continue;
+        }
+        for token in cloud_mcp_todo_mirror_identity_tokens(todo_id, command_id, dispatch_id) {
+            let entry = terminal_seen_ms.entry(token).or_insert(*updated_ms);
+            if *entry < *updated_ms {
+                *entry = *updated_ms;
+            }
+        }
+    }
+    if terminal_seen_ms.is_empty() {
+        return Ok(removed);
+    }
+    for (key, todo_id, command_id, dispatch_id, status, updated_ms) in &rows {
+        if cloud_mcp_todo_mirror_dispatch_status_is_terminal(status) {
+            continue;
+        }
+        let superseded = cloud_mcp_todo_mirror_identity_tokens(todo_id, command_id, dispatch_id)
+            .iter()
+            .any(|token| {
+                terminal_seen_ms
+                    .get(token)
+                    .is_some_and(|terminal_ms| *terminal_ms >= *updated_ms)
+            });
+        if !superseded {
+            continue;
+        }
+        removed += conn
+            .execute(
+                "DELETE FROM workspace_todo_mirror_rows WHERE key=?1",
+                rusqlite::params![key],
+            )
+            .map_err(|error| format!("Unable to drop superseded todo mirror row: {error}"))?;
+    }
+    Ok(removed)
 }
 
 fn cloud_mcp_todo_body_cache_key(value: &Value) -> Option<String> {

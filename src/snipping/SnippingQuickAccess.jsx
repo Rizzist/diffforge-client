@@ -383,6 +383,9 @@ export default function SnippingQuickAccess() {
               <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip)} title="Dismiss" type="button">
                 <Close aria-hidden="true" />
               </QuickAccessDismissButton>
+              {snip.status ? (
+                <QuickAccessStatusPill aria-live="polite">{snip.status}</QuickAccessStatusPill>
+              ) : null}
             </QuickAccessCard>
           );
         })}
@@ -626,7 +629,7 @@ export function SnippingAnnotationEditorWindow() {
   const saveCopy = useCallback(async () => {
     const canvas = canvasRef.current;
     if (!canvas || !activePath) return;
-    setStatus("Saving edited copy...");
+    setStatus("Saving...");
     try {
       const imageDataUrl = canvas.toDataURL("image/png");
       await invoke("snipping_save_edited_untracked_asset", {
@@ -635,9 +638,9 @@ export function SnippingAnnotationEditorWindow() {
           sourcePath: activePath,
         },
       });
-      setStatus("Saved edited copy");
+      setStatus("Saved");
     } catch (error) {
-      setStatus(error?.message || String(error || "Unable to save edited copy."));
+      setStatus(error?.message || String(error || "Unable to save annotated image."));
     }
   }, [activePath]);
 
@@ -751,9 +754,9 @@ export function SnippingAnnotationEditorWindow() {
             <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
               <ContentCopy aria-hidden="true" />
             </EditorToolButton>
-            <EditorSaveButton onClick={saveCopy} type="button">
+            <EditorSaveButton onClick={saveCopy} title="Originals get one edited copy; edited copies save in place" type="button">
               <Save aria-hidden="true" />
-              <span>Save copy</span>
+              <span>Save</span>
             </EditorSaveButton>
           </EditorToolbar>
         </EditorControlsStack>
@@ -1000,6 +1003,29 @@ const QuickAccessButton = styled.button`
     cursor: default;
     opacity: 0.48;
   }
+`;
+
+const QuickAccessStatusPill = styled.span`
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  z-index: 3;
+  max-width: calc(100% - 24px);
+  overflow: hidden;
+  padding: 4px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 999px;
+  color: rgba(244, 247, 250, 0.94);
+  background: rgba(10, 12, 16, 0.85);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
+  backdrop-filter: blur(10px);
 `;
 
 const QuickAccessDismissButton = styled(QuickAccessButton)`
