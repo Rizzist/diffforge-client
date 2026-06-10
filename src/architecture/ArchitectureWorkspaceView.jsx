@@ -5955,6 +5955,10 @@ function ArchitecturesPanel({
   const isLoading = repoState === "loading" || graphState === "loading";
   const singleRepository = repositories.length <= 1;
   const treeRows = useMemo(() => architectureGraphTreeRows(graphs, singleRepository ? 0 : 1), [graphs, singleRepository]);
+  const showEmptyGraphList = !graphs.length && (
+    graphState === "ready"
+    || (graphState === "loading" && Boolean(selectedGraphListCacheEntry))
+  );
   const folderSuggestions = useMemo(() => (
     [...new Set(graphs.map((graph) => architectureFolderPathText(graph.groupPath)).filter(Boolean))]
       .sort((left, right) => left.localeCompare(right))
@@ -6187,18 +6191,18 @@ function ArchitecturesPanel({
           </ArchitectureTreeRow>
         );
       })}
-      {graphState === "ready" && !graphs.length && (
+      {showEmptyGraphList && (
         <ArchitectureTreeEmpty style={{ "--tree-depth": emptyDepth }}>No graphs yet</ArchitectureTreeEmpty>
       )}
     </>
   ), [
     beginCreateGraph,
     creatingGraph,
-    graphState,
     graphs.length,
     onCopyGraph,
     selectedGraphId,
     selectedRepoPath,
+    showEmptyGraphList,
     treeRows,
     visibleAgentEditMarkers,
   ]);
@@ -6251,13 +6255,15 @@ function ArchitecturesPanel({
     const glyphKind = scopeKind === "global"
       ? "folder"
       : repoKind === "git" ? "repo" : "folder";
+    const repoActive = architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath);
     return (
       <ArchitectureTreeRepoGroup key={repo.id}>
         <ArchitectureTreeRow
-          data-active={architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) ? "true" : "false"}
+          data-active={repoActive ? "true" : "false"}
           data-drop-enabled={dropEnabled ? "true" : undefined}
           data-kind={glyphKind}
           onClick={() => {
+            if (repoActive) return;
             setSelectedRepoPath(architectureRepoPath);
             setSelectedGraphId("");
             setSelectedGraph(null);
@@ -6278,7 +6284,7 @@ function ArchitecturesPanel({
           <em>{scopeKind === "global" ? "global" : scopeKind === "orphan" ? "synced" : scannedResultEntryKindLabel(repo)}</em>
           <em>{repo.graphCount}</em>
         </ArchitectureTreeRow>
-        {architectureRepoPathKey(architectureRepoPath) === architectureRepoPathKey(selectedRepoPath) && (
+        {repoActive && (
           <ArchitectureTreeBranch>
             {renderTreeRows(1)}
           </ArchitectureTreeBranch>

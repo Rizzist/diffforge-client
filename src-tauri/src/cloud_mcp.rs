@@ -15033,7 +15033,8 @@ async fn cloud_mcp_list_workspace_assets(
     local_only: Option<bool>,
 ) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(repo_path, workspace_id.clone(), workspace_name.clone());
-    let include_all_workspaces = include_all_workspaces.unwrap_or(false);
+    // Assets are account-global; per-workspace filtering is opt-in.
+    let include_all_workspaces = include_all_workspaces.unwrap_or(true);
     let effective_limit = limit
         .unwrap_or(100)
         .clamp(1, CLOUD_MCP_ASSET_LIBRARY_MAX_ROWS as u64);
@@ -15157,6 +15158,8 @@ async fn cloud_mcp_upload_workspace_asset(
         Some(workspace_id.clone()),
         workspace_name.clone(),
     );
+    // A cancel from a previous attempt must not kill this retry.
+    cloud_mcp_clear_asset_transfer_cancel(&[&asset_id]);
     let row = cloud_mcp_asset_row_from_file(&asset_id)?;
     let local_path = cloud_mcp_payload_text(&row, &["local_path", "localPath", "path"])
         .ok_or_else(|| "Asset has no local path to upload.".to_string())?;
@@ -15232,6 +15235,7 @@ async fn cloud_mcp_upload_workspace_asset(
     let repo_id_for_upload = req.repo_id.clone();
     let workspace_id_for_upload = workspace_id.clone();
     let asset_id_for_upload = asset_id.clone();
+    let transfer_id_for_upload = transfer_id.clone();
     let upload_result = tauri::async_runtime::spawn_blocking(move || {
         cloud_mcp_upload_asset_streaming_blocking(
             upload_url,
@@ -15240,12 +15244,46 @@ async fn cloud_mcp_upload_workspace_asset(
             repo_id_for_upload,
             workspace_id_for_upload,
             asset_id_for_upload,
-            transfer_id,
+            transfer_id_for_upload,
             bytes_total,
         )
     })
     .await
-    .map_err(|error| format!("Asset upload worker failed: {error}"))??;
+    .map_err(|error| format!("Asset upload worker failed: {error}"))?;
+    let upload_result = match upload_result {
+        Ok(result) => {
+            cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id]);
+            result
+        }
+        Err(error) => {
+            cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id]);
+            // Tag the failed upload in the cloud too, so the transfer session
+            // does not linger as "uploading" until the websocket drops.
+            let status = if error.contains("cancelled by user") {
+                "interrupted"
+            } else {
+                "failed"
+            };
+            let failure_report = cloud_mcp_asset_transfer_progress_row(
+                &req.repo_id,
+                &workspace_id,
+                &asset_id,
+                &transfer_id,
+                "upload",
+                status,
+                bytes_total,
+                0,
+                Some(&error),
+            );
+            let _ = cloud_mcp_post_json_endpoint(
+                state.inner(),
+                "/v1/workspace/assets/report-transfer-progress",
+                &failure_report,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     cloud_mcp_update_asset_library_from_response(
         "asset_upload_http",
         Some("/v1/assets/upload"),
@@ -15269,6 +15307,8 @@ async fn cloud_mcp_download_workspace_asset(
         Some(workspace_id.clone()),
         workspace_name.clone(),
     );
+    // A cancel from a previous attempt must not kill this retry.
+    cloud_mcp_clear_asset_transfer_cancel(&[&asset_id]);
     let payload = {
         let mut payload = cloud_mcp_asset_payload_base(
             &req,
@@ -15339,7 +15379,8 @@ async fn cloud_mcp_download_workspace_asset(
             .await;
         }
     });
-    tauri::async_runtime::spawn_blocking(move || {
+    let transfer_id_for_cleanup = transfer_id.clone();
+    let download_result = tauri::async_runtime::spawn_blocking(move || {
         cloud_mcp_download_asset_streaming_blocking(
             download_url,
             headers,
@@ -15354,7 +15395,9 @@ async fn cloud_mcp_download_workspace_asset(
         )
     })
     .await
-    .map_err(|error| format!("Asset download worker failed: {error}"))??;
+    .map_err(|error| format!("Asset download worker failed: {error}"))?;
+    cloud_mcp_clear_asset_transfer_cancel(&[&asset_id, &transfer_id_for_cleanup]);
+    download_result?;
     let mut local_asset = asset;
     if let Some(object) = local_asset.as_object_mut() {
         object.insert(
@@ -15378,6 +15421,27 @@ async fn cloud_mcp_download_workspace_asset(
         "assetId": asset_id,
         "local_path": target_path.display().to_string(),
         "localPath": target_path.display().to_string(),
+    }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_cancel_asset_transfer(
+    asset_id: Option<String>,
+    transfer_id: Option<String>,
+) -> Result<Value, String> {
+    let asset_id = asset_id.unwrap_or_default();
+    let transfer_id = transfer_id.unwrap_or_default();
+    if asset_id.trim().is_empty() && transfer_id.trim().is_empty() {
+        return Err("Cancel requires an asset id or transfer id.".to_string());
+    }
+    cloud_mcp_request_asset_transfer_cancel(&[&asset_id, &transfer_id]);
+    Ok(json!({
+        "ok": true,
+        "asset_id": asset_id,
+        "assetId": asset_id,
+        "transfer_id": transfer_id,
+        "transferId": transfer_id,
+        "status": "cancel_requested",
     }))
 }
 
@@ -15419,14 +15483,43 @@ async fn cloud_mcp_delete_cloud_workspace_asset(
 
 #[tauri::command]
 async fn cloud_mcp_delete_local_workspace_asset(
+    state: State<'_, CloudMcpState>,
     repo_path: String,
     workspace_id: String,
     workspace_name: Option<String>,
     asset_id: String,
     delete_file: Option<bool>,
 ) -> Result<Value, String> {
-    let _ = (repo_path, workspace_id, workspace_name);
-    cloud_mcp_delete_local_asset_copy(&asset_id, delete_file.unwrap_or(true))
+    let row = cloud_mcp_asset_row_from_file(&asset_id).ok();
+    let result = cloud_mcp_delete_local_asset_copy(&asset_id, delete_file.unwrap_or(true))?;
+    // Tell the cloud this device no longer holds a local copy so per-device
+    // sync metadata stays accurate everywhere. Best-effort: a failure here
+    // never blocks the local delete.
+    if let Some(row) = row {
+        let req = cloud_mcp_repo_request(
+            repo_path,
+            Some(workspace_id.clone()),
+            workspace_name.clone(),
+        );
+        let mut payload = cloud_mcp_asset_registration_payload_from_row(
+            &req,
+            &workspace_id,
+            workspace_name.as_deref(),
+            "asset_local_deleted",
+            &row,
+        );
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("local_status".to_string(), json!("local_deleted"));
+            object.insert("localStatus".to_string(), json!("local_deleted"));
+        }
+        let _ = cloud_mcp_post_json_endpoint(
+            state.inner(),
+            "/v1/workspace/assets/register",
+            &payload,
+        )
+        .await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -16093,6 +16186,43 @@ fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::R
     )
 }
 
+const CLOUD_MCP_ASSET_TRANSFER_STALE_ACTIVE_MS: i64 = 60 * 60 * 1000;
+const CLOUD_MCP_ASSET_TRANSFER_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const CLOUD_MCP_ASSET_TRANSFER_MAX_ROWS: i64 = 500;
+
+/// Keeps the local transfer mirror from accumulating stray rows: active
+/// transfers that stopped progressing are tagged interrupted, terminal rows
+/// age out after a retention window, and the table is capped to the newest
+/// rows. The cloud transfer sessions remain the durable history.
+fn cloud_mcp_asset_library_prune_transfers(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let now_ms = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        "UPDATE workspace_asset_transfers
+         SET status='interrupted', mirror_updated_at_ms=?1
+         WHERE status IN ('queued', 'preparing', 'prepared', 'uploading',
+                          'downloading', 'verifying', 'committing', 'warming_cache')
+           AND mirror_updated_at_ms > 0
+           AND mirror_updated_at_ms < ?2",
+        rusqlite::params![now_ms, now_ms - CLOUD_MCP_ASSET_TRANSFER_STALE_ACTIVE_MS],
+    )?;
+    conn.execute(
+        "DELETE FROM workspace_asset_transfers
+         WHERE status IN ('completed', 'failed', 'interrupted', 'cancelled')
+           AND mirror_updated_at_ms < ?1",
+        rusqlite::params![now_ms - CLOUD_MCP_ASSET_TRANSFER_TERMINAL_RETENTION_MS],
+    )?;
+    conn.execute(
+        "DELETE FROM workspace_asset_transfers
+         WHERE transfer_id IN (
+           SELECT transfer_id FROM workspace_asset_transfers
+           ORDER BY mirror_updated_at_ms DESC
+           LIMIT -1 OFFSET ?1
+         )",
+        rusqlite::params![CLOUD_MCP_ASSET_TRANSFER_MAX_ROWS],
+    )?;
+    Ok(())
+}
+
 fn cloud_mcp_open_asset_library_conn() -> Result<rusqlite::Connection, String> {
     let path = cloud_mcp_asset_library_db_path()
         .ok_or_else(|| "Asset library cache path is unavailable.".to_string())?;
@@ -16106,6 +16236,7 @@ fn cloud_mcp_open_asset_library_conn() -> Result<rusqlite::Connection, String> {
         .map_err(|error| format!("Unable to configure asset library SQLite cache: {error}"))?;
     cloud_mcp_asset_library_init_conn(&conn)
         .map_err(|error| format!("Unable to initialize asset library SQLite cache: {error}"))?;
+    let _ = cloud_mcp_asset_library_prune_transfers(&conn);
     Ok(conn)
 }
 
@@ -22609,6 +22740,45 @@ impl CloudMcpAssetTransferProgress {
     }
 }
 
+static CLOUD_MCP_ASSET_TRANSFER_CANCEL_REQUESTS: OnceLock<std::sync::Mutex<HashSet<String>>> =
+    OnceLock::new();
+
+fn cloud_mcp_asset_cancel_requests() -> &'static std::sync::Mutex<HashSet<String>> {
+    CLOUD_MCP_ASSET_TRANSFER_CANCEL_REQUESTS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn cloud_mcp_asset_cancel_key(value: &str) -> Option<String> {
+    let key = value.trim().to_ascii_lowercase();
+    (!key.is_empty()).then_some(key)
+}
+
+fn cloud_mcp_request_asset_transfer_cancel(keys: &[&str]) {
+    if let Ok(mut requests) = cloud_mcp_asset_cancel_requests().lock() {
+        for key in keys.iter().filter_map(|value| cloud_mcp_asset_cancel_key(value)) {
+            requests.insert(key);
+        }
+    }
+}
+
+fn cloud_mcp_clear_asset_transfer_cancel(keys: &[&str]) {
+    if let Ok(mut requests) = cloud_mcp_asset_cancel_requests().lock() {
+        for key in keys.iter().filter_map(|value| cloud_mcp_asset_cancel_key(value)) {
+            requests.remove(&key);
+        }
+    }
+}
+
+fn cloud_mcp_asset_transfer_cancelled(keys: &[&str]) -> bool {
+    cloud_mcp_asset_cancel_requests()
+        .lock()
+        .map(|requests| {
+            keys.iter()
+                .filter_map(|value| cloud_mcp_asset_cancel_key(value))
+                .any(|key| requests.contains(&key))
+        })
+        .unwrap_or(false)
+}
+
 struct CloudMcpAssetProgressReader {
     file: fs::File,
     progress: CloudMcpAssetTransferProgress,
@@ -22616,6 +22786,15 @@ struct CloudMcpAssetProgressReader {
 
 impl Read for CloudMcpAssetProgressReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if cloud_mcp_asset_transfer_cancelled(&[
+            &self.progress.asset_id,
+            &self.progress.transfer_id,
+        ]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Asset upload cancelled by user.",
+            ));
+        }
         let read = self.file.read(buf)?;
         if read > 0 {
             let done = self.progress.bytes_done.saturating_add(read as i64);
@@ -22698,18 +22877,25 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     let response = match send_result {
         Ok(response) => response,
         Err(error) => {
+            let cancelled =
+                cloud_mcp_asset_transfer_cancelled(&[&fail_asset_id, &fail_transfer_id]);
+            let (status, message) = if cancelled {
+                ("interrupted", "Asset upload cancelled by user.".to_string())
+            } else {
+                ("failed", format!("Asset upload failed: {error}"))
+            };
             let _ = cloud_mcp_asset_store_local_transfer_progress(
                 &fail_repo_id,
                 &fail_workspace_id,
                 &fail_asset_id,
                 &fail_transfer_id,
                 "upload",
-                "failed",
+                status,
                 bytes_total,
                 0,
-                Some(&format!("Asset upload failed: {error}")),
+                Some(&message),
             );
-            return Err(format!("Asset upload failed: {error}"));
+            return Err(message);
         }
     };
     let status = response.status();
@@ -22932,6 +23118,17 @@ fn cloud_mcp_write_download_response_to_file(
     let mut bytes_done = 0_i64;
     progress.report("downloading", 0, true, None);
     loop {
+        let cancel_keys = [progress.asset_id.clone(), progress.transfer_id.clone()];
+        if cloud_mcp_asset_transfer_cancelled(&[&cancel_keys[0], &cancel_keys[1]]) {
+            let _ = fs::remove_file(&staging);
+            progress.report(
+                "interrupted",
+                bytes_done,
+                true,
+                Some("Asset download cancelled by user."),
+            );
+            return Err("Asset download cancelled by user.".to_string());
+        }
         let read = match response.read(&mut buffer) {
             Ok(read) => read,
             Err(error) => {

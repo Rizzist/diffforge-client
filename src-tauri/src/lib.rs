@@ -3863,6 +3863,7 @@ pub fn run() {
             cloud_mcp_register_workspace_asset,
             cloud_mcp_upload_workspace_asset,
             cloud_mcp_download_workspace_asset,
+            cloud_mcp_cancel_asset_transfer,
             cloud_mcp_delete_cloud_workspace_asset,
             cloud_mcp_delete_local_workspace_asset,
             cloud_mcp_get_workspace_asset_status,

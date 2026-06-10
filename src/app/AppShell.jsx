@@ -344,6 +344,8 @@ import {
   McpEditorPanel,
   McpEditorHeader,
   McpSwitchButton,
+  AgentSafetyModeGroup,
+  AgentSafetyModeButton,
   McpFieldGrid,
   McpWideField,
   McpInput,
@@ -4806,7 +4808,11 @@ function normalizeWorkspaceSettings(value) {
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
         const rootWasEmptyAtSelection = Boolean(settings?.rootWasEmptyAtSelection);
-        const gitWorktreesEnabled = Boolean(settings?.gitWorktreesEnabled);
+        const agentSessionMode = normalizeAgentSessionMode(
+          settings?.agentSessionMode,
+          Boolean(settings?.gitWorktreesEnabled),
+        );
+        const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
 
         if (
           !workspaceId
@@ -4814,7 +4820,7 @@ function normalizeWorkspaceSettings(value) {
             !rootDirectory
             && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
-            && !gitWorktreesEnabled
+            && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
           )
         ) {
           return null;
@@ -4825,6 +4831,7 @@ function normalizeWorkspaceSettings(value) {
           {
             rootDirectory: rootDirectory.slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH),
             rootWasEmptyAtSelection: rootDirectory ? rootWasEmptyAtSelection : false,
+            agentSessionMode,
             gitWorktreesEnabled,
             terminalCount,
             terminalRoles,
@@ -5361,8 +5368,49 @@ function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
   return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
 }
 
+const AGENT_SESSION_MODE_WORKTREE = "worktree_coordination";
+const AGENT_SESSION_MODE_COORDINATED = "direct_coordination";
+const AGENT_SESSION_MODE_DIRECT = "direct_unmanaged";
+const AGENT_SESSION_MODE_OPTIONS = [
+  {
+    description: "Isolated worktrees + coordination",
+    label: "Safe",
+    tone: "safe",
+    value: AGENT_SESSION_MODE_WORKTREE,
+  },
+  {
+    description: "Direct edits with locking + pause/resume",
+    label: "Coordinated",
+    tone: "balanced",
+    value: AGENT_SESSION_MODE_COORDINATED,
+  },
+  {
+    description: "Direct edits, no safety rails",
+    label: "Direct",
+    tone: "unsafe",
+    value: AGENT_SESSION_MODE_DIRECT,
+  },
+];
+
+function normalizeAgentSessionMode(value, gitWorktreesEnabled = false) {
+  const mode = String(value || "").trim().toLowerCase();
+  if (
+    mode === AGENT_SESSION_MODE_WORKTREE
+    || mode === AGENT_SESSION_MODE_COORDINATED
+    || mode === AGENT_SESSION_MODE_DIRECT
+  ) {
+    return mode;
+  }
+  return gitWorktreesEnabled ? AGENT_SESSION_MODE_WORKTREE : AGENT_SESSION_MODE_COORDINATED;
+}
+
+function getWorkspaceAgentSessionMode(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId] || {};
+  return normalizeAgentSessionMode(settings.agentSessionMode, settings.gitWorktreesEnabled);
+}
+
 function getWorkspaceGitWorktreesEnabled(workspaceSettings, workspaceId) {
-  return Boolean(workspaceSettings?.[workspaceId]?.gitWorktreesEnabled);
+  return getWorkspaceAgentSessionMode(workspaceSettings, workspaceId) === AGENT_SESSION_MODE_WORKTREE;
 }
 
 function workspaceRuntimeActivationKey(workspaceId, repoPath) {
@@ -5628,6 +5676,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasRootDirectory = Object.prototype.hasOwnProperty.call(nextValues, "rootDirectory");
   const hasRootWasEmptyAtSelection = Object.prototype.hasOwnProperty.call(nextValues, "rootWasEmptyAtSelection");
   const hasGitWorktreesEnabled = Object.prototype.hasOwnProperty.call(nextValues, "gitWorktreesEnabled");
+  const hasAgentSessionMode = Object.prototype.hasOwnProperty.call(nextValues, "agentSessionMode");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
@@ -5651,17 +5700,24 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     fallbackRole,
   );
   const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
-  const gitWorktreesEnabled = Boolean(
-    hasGitWorktreesEnabled
-      ? nextValues.gitWorktreesEnabled
-      : currentSettings.gitWorktreesEnabled,
-  );
+  const agentSessionMode = hasAgentSessionMode
+    ? normalizeAgentSessionMode(
+      nextValues.agentSessionMode,
+      Boolean(currentSettings.gitWorktreesEnabled),
+    )
+    : hasGitWorktreesEnabled
+      ? normalizeAgentSessionMode("", Boolean(nextValues.gitWorktreesEnabled))
+      : normalizeAgentSessionMode(
+        currentSettings.agentSessionMode,
+        Boolean(currentSettings.gitWorktreesEnabled),
+      );
+  const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
 
   if (
     !rootDirectory
     && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
-    && !gitWorktreesEnabled
+    && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
   ) {
     delete nextSettings[workspaceId];
     return nextSettings;
@@ -5670,6 +5726,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   nextSettings[workspaceId] = {
     rootDirectory,
     rootWasEmptyAtSelection,
+    agentSessionMode,
     gitWorktreesEnabled,
     terminalCount,
     terminalRoles,
@@ -5746,7 +5803,8 @@ export default function App() {
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
-  const [workspaceGitWorktreesEnabledDraft, setWorkspaceGitWorktreesEnabledDraft] = useState(false);
+  const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
+  const [workspaceUnsafeModeArmed, setWorkspaceUnsafeModeArmed] = useState(false);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
@@ -7929,7 +7987,8 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
-    setWorkspaceGitWorktreesEnabledDraft(false);
+    setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
+    setWorkspaceUnsafeModeArmed(false);
     setWorkspaceRootDraft("");
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
@@ -8005,7 +8064,8 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
-    setWorkspaceGitWorktreesEnabledDraft(false);
+    setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
+    setWorkspaceUnsafeModeArmed(false);
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -10125,8 +10185,9 @@ export default function App() {
     );
     const cleanedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft);
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
-    const currentGitWorktreesEnabled = getWorkspaceGitWorktreesEnabled(workspaceSettings, selectedWorkspace.id);
-    const gitWorktreesEnabled = Boolean(workspaceGitWorktreesEnabledDraft);
+    const currentAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id);
+    const agentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft);
+    const gitWorktreesEnabled = agentSessionMode === AGENT_SESSION_MODE_WORKTREE;
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
       workspaceSettings,
@@ -10196,7 +10257,7 @@ export default function App() {
         [terminalIndex, terminalRoles[index]]
       )));
       const rootChanged = rootDirectory !== currentRootDirectory;
-      const gitWorktreesChanged = gitWorktreesEnabled !== currentGitWorktreesEnabled;
+      const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
         ? rootChanged
           ? Boolean(normalizedRoot?.emptyDirectory)
@@ -10309,7 +10370,7 @@ export default function App() {
         await invoke("coordination_update_repo_policy", {
           repoPath: nextMcpRepoPath,
           input: {
-            agent_worktree_required: gitWorktreesEnabled,
+            agent_session_mode: agentSessionMode,
           },
         });
       }
@@ -10336,6 +10397,7 @@ export default function App() {
         const nextSettings = updateWorkspaceLocalSettings(settings, selectedWorkspace.id, {
           rootDirectory,
           rootWasEmptyAtSelection,
+          agentSessionMode,
           gitWorktreesEnabled,
           terminalCount,
           terminalRoles,
@@ -10371,7 +10433,8 @@ export default function App() {
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
-      setWorkspaceGitWorktreesEnabledDraft(gitWorktreesEnabled);
+      setWorkspaceAgentSessionModeDraft(agentSessionMode);
+      setWorkspaceUnsafeModeArmed(false);
       setWorkspaceSettingsState("idle");
       setWorkspaceSettingsMessage("Workspace settings saved.");
       closeWorkspaceSettings();
@@ -10390,7 +10453,7 @@ export default function App() {
     expireDesktopSession,
     workspaceNameDraft,
     workspaceRootDraft,
-    workspaceGitWorktreesEnabledDraft,
+    workspaceAgentSessionModeDraft,
     workspaceTerminalCountDraft,
     workspaceTerminalRolesDraft,
     workspaceSettings,
@@ -12592,9 +12655,9 @@ export default function App() {
       workspaceSettings,
     ],
   );
-  const selectedWorkspaceGitWorktreesEnabled = selectedWorkspace && !shouldShowWorkspaceSetup
-    ? getWorkspaceGitWorktreesEnabled(workspaceSettings, selectedWorkspace.id)
-    : false;
+  const selectedWorkspaceAgentSessionMode = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id)
+    : AGENT_SESSION_MODE_COORDINATED;
   const activatedWorkspaceTerminalRoles = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
@@ -21445,7 +21508,8 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     ));
-    setWorkspaceGitWorktreesEnabledDraft(Boolean(selectedWorkspaceGitWorktreesEnabled));
+    setWorkspaceAgentSessionModeDraft(normalizeAgentSessionMode(selectedWorkspaceAgentSessionMode));
+    setWorkspaceUnsafeModeArmed(false);
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
@@ -21454,7 +21518,7 @@ export default function App() {
     selectedWorkspace?.id,
     selectedWorkspace?.name,
     selectedWorkspaceRootDirectory,
-    selectedWorkspaceGitWorktreesEnabled,
+    selectedWorkspaceAgentSessionMode,
     selectedWorkspaceTerminalCount,
     selectedWorkspaceTerminalRoles,
     workspaceTerminalFallbackRole,
@@ -23267,24 +23331,52 @@ export default function App() {
 
                       <WorkspaceSettingsSection>
                         <div>
-                          <PanelKicker>Git agent edits</PanelKicker>
-                          <SettingsHint>Direct mode is the default. Isolated worktrees remain available when a workspace needs patch-style submission.</SettingsHint>
+                          <PanelKicker>Agent safety mode</PanelKicker>
+                          <SettingsHint>
+                            Coordinated is the default: agents edit the repo directly with file locking and terminal pause/resume.
+                            Safe adds isolated worktrees with patch submission. Direct removes every rail: agents edit immediately,
+                            can conflict, and cannot pause or resume.
+                          </SettingsHint>
                         </div>
                         <div>
-                          <SettingsLabel>File authority</SettingsLabel>
-                          <McpSwitchButton
-                            aria-pressed={workspaceGitWorktreesEnabledDraft}
-                            disabled={isWorkspaceSettingsBusy}
-                            onClick={() => {
-                              setWorkspaceGitWorktreesEnabledDraft((value) => !value);
-                              setWorkspaceSettingsError("");
-                              setWorkspaceSettingsMessage("");
-                            }}
-                            type="button"
-                          >
-                            <span aria-hidden="true" />
-                            {workspaceGitWorktreesEnabledDraft ? "Isolated worktrees" : "Direct repo edits"}
-                          </McpSwitchButton>
+                          <SettingsLabel>Mode</SettingsLabel>
+                          <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
+                            {AGENT_SESSION_MODE_OPTIONS.map((option) => {
+                              const active = workspaceAgentSessionModeDraft === option.value;
+                              const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
+                              return (
+                                <AgentSafetyModeButton
+                                  aria-checked={active}
+                                  data-active={active ? "true" : "false"}
+                                  data-tone={option.tone}
+                                  disabled={isWorkspaceSettingsBusy}
+                                  key={option.value}
+                                  onClick={() => {
+                                    setWorkspaceSettingsError("");
+                                    setWorkspaceSettingsMessage("");
+                                    if (needsConfirm && !workspaceUnsafeModeArmed) {
+                                      setWorkspaceUnsafeModeArmed(true);
+                                      setWorkspaceSettingsMessage(
+                                        "Direct mode disables worktrees, locking, and pause/resume. Click Direct again to confirm.",
+                                      );
+                                      return;
+                                    }
+                                    setWorkspaceUnsafeModeArmed(false);
+                                    setWorkspaceAgentSessionModeDraft(option.value);
+                                  }}
+                                  role="radio"
+                                  type="button"
+                                >
+                                  <strong>
+                                    {option.value === AGENT_SESSION_MODE_DIRECT && workspaceUnsafeModeArmed && !active
+                                      ? "Confirm Direct"
+                                      : option.label}
+                                  </strong>
+                                  <em>{option.description}</em>
+                                </AgentSafetyModeButton>
+                              );
+                            })}
+                          </AgentSafetyModeGroup>
                         </div>
                       </WorkspaceSettingsSection>
 

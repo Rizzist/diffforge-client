@@ -8894,6 +8894,68 @@ export const McpSwitchButton = styled.button`
   }
 `;
 
+export const AgentSafetyModeGroup = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+`;
+
+export const AgentSafetyModeButton = styled.button`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: rgba(21, 27, 35, 0.72);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+
+  strong {
+    font-size: 12px;
+    font-weight: 780;
+  }
+
+  em {
+    font-size: 10.5px;
+    font-style: normal;
+    font-weight: 600;
+    color: var(--forge-text-muted);
+  }
+
+  &[data-active="true"][data-tone="safe"] {
+    border-color: rgba(34, 197, 94, 0.42);
+    color: rgba(134, 239, 172, 0.95);
+    background: rgba(34, 197, 94, 0.1);
+  }
+
+  &[data-active="true"][data-tone="balanced"] {
+    border-color: rgba(245, 158, 11, 0.42);
+    color: rgba(252, 211, 77, 0.95);
+    background: rgba(245, 158, 11, 0.1);
+  }
+
+  &[data-active="true"][data-tone="unsafe"] {
+    border-color: rgba(239, 68, 68, 0.46);
+    color: rgba(252, 165, 165, 0.95);
+    background: rgba(239, 68, 68, 0.1);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
+
+  &:disabled {
+    opacity: 0.76;
+    cursor: default;
+  }
+`;
+
 export const McpFieldGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

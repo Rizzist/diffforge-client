@@ -9,6 +9,7 @@ import { CheckBoxOutlineBlank } from "@styled-icons/material-rounded/CheckBoxOut
 import { Cloud } from "@styled-icons/material-rounded/Cloud";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
@@ -157,6 +158,41 @@ function latestAssetTransfer(transfers, asset) {
   return transfers
     .filter((transfer) => assetTransferAssetId(transfer) === id)
     .sort((left, right) => assetTransferUpdatedAt(right) - assetTransferUpdatedAt(left))[0] || null;
+}
+
+function assetTransferId(transfer) {
+  return text(transfer?.transferId || transfer?.transfer_id || transfer?.id);
+}
+
+function assetTransferPercent(transfer) {
+  const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
+  const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
+  if (total <= 0) return done > 0 ? 100 : 0;
+  return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+}
+
+function assetTransferDirectionLabel(transfer) {
+  const direction = text(transfer?.direction).toLowerCase();
+  if (direction.includes("upload")) return "Uploading";
+  if (direction.includes("download")) return "Downloading";
+  return "Syncing";
+}
+
+function assetSyncedDeviceNames(asset) {
+  const seen = new Set();
+  const names = [];
+  jsonArray(asset?.devices).forEach((device) => {
+    const status = text(device?.localStatus || device?.local_status).toLowerCase();
+    if (status !== "local_available") return;
+    const name = text(device?.deviceName || device?.device_name)
+      || text(device?.deviceId || device?.device_id);
+    const key = name.toLowerCase();
+    if (name && !seen.has(key)) {
+      seen.add(key);
+      names.push(name);
+    }
+  });
+  return names;
 }
 
 function assetLocalPath(asset) {
@@ -638,6 +674,26 @@ function AssetsPanel({
     }
   }, [refresh, repoPath, workspaceOptionForAsset]);
 
+  const cancelAssetTransfer = useCallback(async (asset, transfer) => {
+    const id = assetId(asset);
+    const transferId = assetTransferId(transfer);
+    if (!id && !transferId) return;
+    const key = `cancel:${id || transferId}`;
+    setBusyKey(key);
+    setActionError("");
+    try {
+      await invoke("cloud_mcp_cancel_asset_transfer", {
+        assetId: id || null,
+        transferId: transferId || null,
+      });
+      await refresh({ silent: true, force: true });
+    } catch (nextError) {
+      setActionError(nextError?.message || String(nextError || "Unable to cancel transfer."));
+    } finally {
+      setBusyKey((current) => (current === key ? "" : current));
+    }
+  }, [refresh]);
+
   const runSelectedAssetAction = useCallback(async (action) => {
     if (!selectedAssets.length) return;
     const key = `batch:${action}`;
@@ -819,6 +875,10 @@ function AssetsPanel({
             const transferStatus = transfer ? assetTransferStatusKind(transfer) : "";
             const transferActive = transferStatus === "active";
             const transferFailed = transferStatus === "failed";
+            const transferPercent = transfer ? assetTransferPercent(transfer) : 0;
+            const transferLabel = transfer ? assetTransferDirectionLabel(transfer) : "";
+            const transferError = text(transfer?.error);
+            const syncedDeviceNames = assetSyncedDeviceNames(asset);
             const cardStatus = transferActive || transferFailed ? transferStatus : availability.statusKind;
             const localPath = assetLocalPath(asset);
             const previewUrl = assetPreviewUrl(asset);
@@ -886,6 +946,27 @@ function AssetsPanel({
                 <AssetCardStatus data-status={availability.statusKind} title={`Availability: ${availability.label}`}>
                   {availability.label}
                 </AssetCardStatus>
+                {transferActive && (
+                  <AssetTransferOverlay>
+                    <AssetTransferInfo>
+                      <AssetTransferLabel>
+                        {`${transferLabel} ${transferPercent}%`}
+                      </AssetTransferLabel>
+                      <AssetTransferTrack aria-hidden="true">
+                        <AssetTransferFill style={{ width: `${transferPercent}%` }} />
+                      </AssetTransferTrack>
+                    </AssetTransferInfo>
+                    <AssetTransferCancel
+                      aria-label={`Cancel ${transferLabel.toLowerCase()} of ${name}`}
+                      disabled={busyKey === `cancel:${id}`}
+                      onClick={() => cancelAssetTransfer(asset, transfer)}
+                      title="Cancel transfer"
+                      type="button"
+                    >
+                      <Close aria-hidden="true" />
+                    </AssetTransferCancel>
+                  </AssetTransferOverlay>
+                )}
                 <AssetSelectButton
                   aria-label={`${selected ? "Deselect" : "Select"} ${name}`}
                   aria-pressed={selected}
@@ -981,6 +1062,18 @@ function AssetsPanel({
                 </AssetCardActions>
                 <AssetCardCaption>
                   <AssetCardName>{name}</AssetCardName>
+                  {syncedDeviceNames.length > 0 && (
+                    <AssetCardMetaLine title={`Synced to: ${syncedDeviceNames.join(", ")}`}>
+                      {syncedDeviceNames.length === 1
+                        ? `On ${syncedDeviceNames[0]}`
+                        : `On ${syncedDeviceNames.length} devices`}
+                    </AssetCardMetaLine>
+                  )}
+                  {transferFailed && !transferActive && (
+                    <AssetCardMetaLine data-failed="true" title={transferError || "Transfer failed."}>
+                      {`${transferLabel || "Transfer"} failed — retry available`}
+                    </AssetCardMetaLine>
+                  )}
                 </AssetCardCaption>
               </AssetCard>
             );
@@ -1939,6 +2032,101 @@ const AssetCardName = styled.strong`
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+`;
+
+const AssetCardMetaLine = styled.span`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  margin-top: 2px;
+  color: rgba(148, 163, 184, 0.82);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-failed="true"] {
+    color: rgba(254, 205, 211, 0.9);
+  }
+`;
+
+const AssetTransferOverlay = styled.div`
+  position: absolute;
+  top: 32px;
+  right: 7px;
+  left: 7px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  border-radius: 7px;
+  background: rgba(2, 6, 23, 0.88);
+  backdrop-filter: blur(8px);
+`;
+
+const AssetTransferInfo = styled.div`
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+`;
+
+const AssetTransferLabel = styled.span`
+  overflow: hidden;
+  color: rgba(191, 219, 254, 0.9);
+  font-size: 8px;
+  font-weight: 850;
+  line-height: 1;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+const AssetTransferTrack = styled.div`
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.18);
+`;
+
+const AssetTransferFill = styled.div`
+  height: 100%;
+  min-width: 4%;
+  border-radius: inherit;
+  background: rgba(96, 165, 250, 0.92);
+  transition: width 200ms ease;
+`;
+
+const AssetTransferCancel = styled.button`
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(251, 113, 133, 0.28);
+  border-radius: 999px;
+  color: rgba(254, 205, 211, 0.92);
+  background: rgba(2, 6, 23, 0.85);
+  cursor: pointer;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(251, 113, 133, 0.5);
+    background: rgba(159, 18, 57, 0.28);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
 `;
 
 const AssetIconButton = styled.button`

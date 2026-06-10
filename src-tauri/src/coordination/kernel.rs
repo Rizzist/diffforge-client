@@ -374,8 +374,45 @@ fn bool_i64(value: bool) -> i64 {
     }
 }
 
+pub(crate) const AGENT_SESSION_MODE_WORKTREE_COORDINATION: &str = "worktree_coordination";
+pub(crate) const AGENT_SESSION_MODE_DIRECT_COORDINATION: &str = "direct_coordination";
+pub(crate) const AGENT_SESSION_MODE_DIRECT_UNMANAGED: &str = "direct_unmanaged";
+
+pub(crate) fn normalize_agent_session_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "worktree_coordination" | "isolated" | "safe" => {
+            Some(AGENT_SESSION_MODE_WORKTREE_COORDINATION)
+        }
+        "direct_coordination" | "coordinated" => Some(AGENT_SESSION_MODE_DIRECT_COORDINATION),
+        "direct_unmanaged" | "direct" | "unmanaged" => Some(AGENT_SESSION_MODE_DIRECT_UNMANAGED),
+        _ => None,
+    }
+}
+
+pub(crate) fn repo_policy_agent_session_mode(policy: &Value) -> &'static str {
+    policy["agent_session_mode"]
+        .as_str()
+        .and_then(normalize_agent_session_mode)
+        .unwrap_or_else(|| {
+            if policy["agent_worktree_required"].as_i64().unwrap_or(0) == 1 {
+                AGENT_SESSION_MODE_WORKTREE_COORDINATION
+            } else {
+                AGENT_SESSION_MODE_DIRECT_COORDINATION
+            }
+        })
+}
+
 fn repo_policy_requires_agent_worktree(policy: &Value) -> bool {
-    policy["agent_worktree_required"].as_i64().unwrap_or(0) == 1
+    repo_policy_agent_session_mode(policy) == AGENT_SESSION_MODE_WORKTREE_COORDINATION
+}
+
+fn write_enforcement_safety_rank(mode: &str) -> Option<u8> {
+    match mode {
+        "worktree_required" => Some(3),
+        "bounded_direct_edit" => Some(2),
+        "direct_unmanaged" => Some(1),
+        _ => None,
+    }
 }
 
 fn required_trimmed<'a>(value: &'a str, key: &str) -> Result<&'a str, String> {
@@ -6397,6 +6434,7 @@ impl CoordinationKernel {
                 "worktree_required"
                     | "general_worker"
                     | "bounded_direct_edit"
+                    | "direct_unmanaged"
                     | "activity_only"
                     | "remote_unmanaged"
                     | "coordination_only"
@@ -6407,15 +6445,30 @@ impl CoordinationKernel {
                 ));
             }
         }
+        let policy_session_mode = repo_policy_agent_session_mode(&self.repo_policy()?);
         let default_enforcement_mode = if write_enabled {
-            if repo_policy_requires_agent_worktree(&self.repo_policy()?) {
-                "worktree_required"
-            } else {
-                "bounded_direct_edit"
+            match policy_session_mode {
+                AGENT_SESSION_MODE_WORKTREE_COORDINATION => "worktree_required",
+                AGENT_SESSION_MODE_DIRECT_UNMANAGED => "direct_unmanaged",
+                _ => "bounded_direct_edit",
             }
         } else {
             "read_only"
         };
+        if let (Some(requested_rank), Some(default_rank)) = (
+            requested_enforcement_mode.and_then(write_enforcement_safety_rank),
+            write_enforcement_safety_rank(default_enforcement_mode),
+        ) {
+            // Sessions may opt into a safer mode than the workspace policy,
+            // never a less safe one; only the human settings path changes the
+            // workspace agent session mode.
+            if requested_rank < default_rank {
+                return Err(format!(
+                    "Session enforcement mode {} is less safe than the workspace agent session policy {policy_session_mode}.",
+                    requested_enforcement_mode.unwrap_or_default()
+                ));
+            }
+        }
         let mut enforcement_mode = requested_enforcement_mode
             .unwrap_or(default_enforcement_mode)
             .to_string();
@@ -10236,8 +10289,16 @@ impl CoordinationKernel {
         if root == self.paths.repo_path.as_path() {
             crate::ensure_architecture_agent_guide(root)?;
         }
-        let managed_terminal = root != self.paths.repo_path.as_path()
-            || !repo_policy_requires_agent_worktree(&self.repo_policy()?);
+        let managed_terminal = if root == self.paths.repo_path.as_path() {
+            // The visible repo root carries the managed contract only when
+            // managed agents actually edit there with coordination (mode 2).
+            // Worktree mode edits in branch roots, and unmanaged direct mode
+            // must not instruct agents through the coordination lifecycle.
+            repo_policy_agent_session_mode(&self.repo_policy()?)
+                == AGENT_SESSION_MODE_DIRECT_COORDINATION
+        } else {
+            true
+        };
         let contract = diffforge_agent_contract_markdown(managed_terminal);
         let mut generated = Vec::new();
         if write_or_update_generated_agent_contract(&root.join("AGENTS.md"), &contract)? {
@@ -21794,11 +21855,43 @@ impl CoordinationKernel {
     }
 
     pub fn update_repo_policy(&self, patch: &Value) -> Result<Value, String> {
+        let mut patch = patch.clone();
+        if let Some(raw_mode) = patch["agent_session_mode"].as_str() {
+            let mode = normalize_agent_session_mode(raw_mode).ok_or_else(|| {
+                "agent_session_mode must be worktree_coordination, direct_coordination, or direct_unmanaged.".to_string()
+            })?;
+            if let Some(object) = patch.as_object_mut() {
+                object.insert("agent_session_mode".to_string(), json!(mode));
+                // Keep the legacy boolean derived from the mode enum.
+                object.insert(
+                    "agent_worktree_required".to_string(),
+                    json!(mode == AGENT_SESSION_MODE_WORKTREE_COORDINATION),
+                );
+            }
+        } else if patch.get("agent_worktree_required").is_some() {
+            let required = patch["agent_worktree_required"].as_bool().unwrap_or(false)
+                || patch["agent_worktree_required"].as_i64().unwrap_or(0) != 0;
+            let current_mode = repo_policy_agent_session_mode(&self.repo_policy()?);
+            let next_mode = if required {
+                AGENT_SESSION_MODE_WORKTREE_COORDINATION
+            } else if current_mode == AGENT_SESSION_MODE_DIRECT_UNMANAGED {
+                // Legacy worktree toggles never silently change the unmanaged
+                // mode; only an explicit agent_session_mode patch does.
+                AGENT_SESSION_MODE_DIRECT_UNMANAGED
+            } else {
+                AGENT_SESSION_MODE_DIRECT_COORDINATION
+            };
+            if let Some(object) = patch.as_object_mut() {
+                object.insert("agent_session_mode".to_string(), json!(next_mode));
+            }
+        }
+        let patch = &patch;
         let allowed = [
             "sql_mcp_default",
             "repo_has_sql",
             "sql_engine",
             "agent_worktree_required",
+            "agent_session_mode",
             "patch_lease_validation_required",
             "merge_gate_required",
             "unleased_write_policy",
@@ -21885,7 +21978,9 @@ impl CoordinationKernel {
                 }
             }
         }
-        if patch.get("agent_worktree_required").is_some() {
+        if patch.get("agent_worktree_required").is_some()
+            || patch.get("agent_session_mode").is_some()
+        {
             self.write_agent_contract_files(&self.paths.repo_path)?;
         }
         self.emit_event(
@@ -22963,6 +23058,7 @@ impl CoordinationKernel {
             let file_authority = match enforcement_mode {
                 "worktree_required" => "git_worktree_patch",
                 "bounded_direct_edit" => "bounded_direct_edit",
+                "direct_unmanaged" => "direct_unmanaged",
                 "remote_unmanaged" => "remote_unmanaged",
                 _ => "none",
             };
@@ -22976,8 +23072,8 @@ impl CoordinationKernel {
         }
 
         let repo_is_git = repo_has_git(&self.paths.repo_path);
-        let worktrees_required = repo_policy_requires_agent_worktree(&self.repo_policy()?);
-        if repo_is_git && worktrees_required {
+        let policy_session_mode = repo_policy_agent_session_mode(&self.repo_policy()?);
+        if repo_is_git && policy_session_mode == AGENT_SESSION_MODE_WORKTREE_COORDINATION {
             let worktree = self.create_worktree_for_session(agent_id, session_id, task_id)?;
             return Ok(json!({
                 "changed": true,
@@ -22990,6 +23086,50 @@ impl CoordinationKernel {
                 "worktree_path": worktree["path"].clone(),
                 "agent_branch_root": worktree["path"].clone(),
                 "branch_name": worktree["branchName"].clone(),
+            }));
+        }
+        if policy_session_mode == AGENT_SESSION_MODE_DIRECT_UNMANAGED {
+            let now = now_rfc3339();
+            let write_root = self.paths.repo_path.display().to_string();
+            self.conn
+                .execute(
+                    "UPDATE agent_sessions
+                     SET worktree_id=NULL,
+                         write_root=?1,
+                         base_git_sha=NULL,
+                         current_git_sha=NULL,
+                         enforcement_mode='direct_unmanaged',
+                         updated_at=?2
+                     WHERE id=?3 AND agent_id=?4",
+                    params![&write_root, &now, session_id, agent_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to assign unmanaged direct file authority: {error}")
+                })?;
+            self.emit_event(
+                "session_file_authority_resolved",
+                "kernel",
+                REPO_ID,
+                EventRefs {
+                    agent_id: Some(agent_id.to_string()),
+                    session_id: Some(session_id.to_string()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "enforcement_mode": "direct_unmanaged",
+                    "file_authority": "direct_unmanaged",
+                    "write_root": write_root,
+                    "reason": "workspace_direct_unmanaged_policy",
+                }),
+            )?;
+            return Ok(json!({
+                "changed": true,
+                "enforcement_mode": "direct_unmanaged",
+                "file_authority": "direct_unmanaged",
+                "completion_mode": "none",
+                "session_mode": "unmanaged_direct",
+                "write_root": write_root,
+                "reason": "workspace_direct_unmanaged_policy",
             }));
         }
 
@@ -30544,6 +30684,92 @@ Appwrite > Session Store: create session
             Some("worktree_required")
         );
         assert!(session["worktree_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn direct_unmanaged_policy_resolves_unmanaged_direct_authority() {
+        let repo = init_git_repo("general_worker_direct_unmanaged");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        let updated = kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+        assert_eq!(
+            updated["data"]["agent_session_mode"].as_str(),
+            Some("direct_unmanaged")
+        );
+        assert_eq!(updated["data"]["agent_worktree_required"].as_i64(), Some(0));
+
+        let context = kernel
+            .prepare_terminal_context_for_slot(
+                "Codex",
+                "codex",
+                "1",
+                Some("pane-direct-unmanaged"),
+                Some("workspace-direct-unmanaged"),
+                Some("Direct Unmanaged Workspace"),
+                None,
+                None,
+                None,
+                Some("epoch-direct-unmanaged"),
+                Some("general_worker"),
+            )
+            .unwrap();
+        let authority = kernel
+            .resolve_general_worker_file_authority(
+                context.agent_id.as_str(),
+                context.session_id.as_str(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            authority["enforcement_mode"].as_str(),
+            Some("direct_unmanaged")
+        );
+        assert_eq!(
+            authority["file_authority"].as_str(),
+            Some("direct_unmanaged")
+        );
+        assert_eq!(authority["completion_mode"].as_str(), Some("none"));
+        assert!(authority["worktree_id"].as_str().is_none());
+        let session = kernel
+            .query_one(
+                "SELECT enforcement_mode, worktree_id FROM agent_sessions WHERE id=?1",
+                &[&context.session_id],
+                "missing",
+            )
+            .unwrap();
+        assert_eq!(
+            session["enforcement_mode"].as_str(),
+            Some("direct_unmanaged")
+        );
+        assert!(session["worktree_id"].as_str().is_none());
+    }
+
+    #[test]
+    fn legacy_worktree_toggle_keeps_direct_unmanaged_mode() {
+        let repo = init_git_repo("legacy_toggle_direct_unmanaged");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+        let updated = kernel
+            .update_repo_policy(&json!({"agent_worktree_required": false}))
+            .unwrap();
+        assert_eq!(
+            updated["data"]["agent_session_mode"].as_str(),
+            Some("direct_unmanaged")
+        );
+        let promoted = kernel
+            .update_repo_policy(&json!({"agent_worktree_required": true}))
+            .unwrap();
+        assert_eq!(
+            promoted["data"]["agent_session_mode"].as_str(),
+            Some("worktree_coordination")
+        );
+        assert_eq!(
+            promoted["data"]["agent_worktree_required"].as_i64(),
+            Some(1)
+        );
     }
 
     #[test]

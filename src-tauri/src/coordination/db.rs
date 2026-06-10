@@ -9,6 +9,7 @@ use rusqlite::{Connection, Error as SqliteError, ErrorCode};
 use serde_json::{json, Value};
 
 use super::schema::{
+    AGENT_SESSION_MODE_MIGRATION_NAME, AGENT_SESSION_MODE_MIGRATION_VERSION,
     APPROVAL_SQL_ORCHESTRATION_MIGRATION_NAME, APPROVAL_SQL_ORCHESTRATION_MIGRATION_VERSION,
     CRASH_TODO_RESUME_MIGRATION_NAME, CRASH_TODO_RESUME_MIGRATION_VERSION, CREATE_SCHEMA_SQL,
     DEPENDENCY_GRAPH_MIGRATION_NAME, DEPENDENCY_GRAPH_MIGRATION_VERSION,
@@ -638,8 +639,51 @@ fn run_migrations(connection: &Connection) -> Result<Vec<SchemaMigrationDiagnost
     diagnostics.push(apply_workspace_mcp_exposure_mode_migration(connection)?);
     diagnostics.push(apply_crash_todo_resume_migration(connection)?);
     diagnostics.push(apply_optional_git_worktrees_policy_migration(connection)?);
+    diagnostics.push(apply_agent_session_mode_migration(connection)?);
 
     Ok(diagnostics)
+}
+
+fn apply_agent_session_mode_migration(
+    connection: &Connection,
+) -> Result<SchemaMigrationDiagnostics, String> {
+    if migration_applied(connection, AGENT_SESSION_MODE_MIGRATION_VERSION)? {
+        return Ok(SchemaMigrationDiagnostics::new(
+            AGENT_SESSION_MODE_MIGRATION_VERSION,
+            AGENT_SESSION_MODE_MIGRATION_NAME,
+            "already_applied",
+            vec!["schema_migrations row already exists".to_string()],
+        ));
+    }
+
+    let added = ensure_column(
+        connection,
+        "repo_policies",
+        "agent_session_mode",
+        "TEXT NOT NULL DEFAULT 'direct_coordination'",
+    )?;
+    let now = super::kernel::now_rfc3339();
+    let backfilled = with_sqlite_lock_retry("Unable to backfill agent session mode", || {
+        connection.execute(
+            "UPDATE repo_policies
+             SET agent_session_mode='worktree_coordination', updated_at=?1
+             WHERE agent_worktree_required<>0
+               AND agent_session_mode<>'worktree_coordination'",
+            [&now],
+        )
+    })?;
+    let mut migration = record_migration_if_missing(
+        connection,
+        AGENT_SESSION_MODE_MIGRATION_VERSION,
+        AGENT_SESSION_MODE_MIGRATION_NAME,
+    )?;
+    migration.details.splice(
+        0..0,
+        [format!(
+            "repo_policies.agent_session_mode column_added={added} worktree_backfill_rows={backfilled}"
+        )],
+    );
+    Ok(migration)
 }
 
 fn ensure_bootstrap_compatibility_columns(connection: &Connection) -> Result<Vec<String>, String> {

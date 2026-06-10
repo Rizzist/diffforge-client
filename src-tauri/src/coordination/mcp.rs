@@ -3178,7 +3178,43 @@ fn coordination_context_has_terminal_session(context: &McpContext) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn coordination_context_repo_session_mode(context: &McpContext) -> Option<&'static str> {
+    if context
+        .enforcement_mode
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("direct_unmanaged"))
+    {
+        return Some(super::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED);
+    }
+    let repo_path = context
+        .repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let db_path = context
+        .db_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let kernel = CoordinationKernel::open(PathBuf::from(repo_path), db_path).ok()?;
+    let policy = kernel.repo_policy().ok()?;
+    Some(super::kernel::repo_policy_agent_session_mode(&policy))
+}
+
 fn coordination_tools_for_context(context: &McpContext) -> Vec<&'static str> {
+    // Unsafe direct workspaces never expose the coordination lifecycle:
+    // agents physically cannot start tasks, take leases, or submit patches.
+    if coordination_context_repo_session_mode(context)
+        == Some(super::kernel::AGENT_SESSION_MODE_DIRECT_UNMANAGED)
+    {
+        return TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|tool| !TERMINAL_SESSION_TOOL_NAMES.contains(tool))
+            .collect();
+    }
     if coordination_context_has_terminal_session(context) {
         return TOOL_NAMES.to_vec();
     }
@@ -5832,6 +5868,50 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("todo_id"));
+    }
+
+    #[test]
+    fn lifecycle_tools_are_hidden_for_direct_unmanaged_policy() {
+        let repo = std::env::temp_dir().join(format!(
+            "diffforge-mcp-direct-unmanaged-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_unmanaged"}))
+            .unwrap();
+
+        let session_context = McpContext {
+            repo_path: Some(repo.display().to_string()),
+            db_path: Some(kernel.paths.db_path.display().to_string()),
+            session_id: Some("session-direct".to_string()),
+            ..McpContext::default()
+        };
+        let tools = coordination_tools_for_context(&session_context);
+        for tool in TERMINAL_SESSION_TOOL_NAMES {
+            assert!(!tools.contains(tool), "{tool} must be hidden in direct mode");
+        }
+        assert!(tools.contains(&"create_plan"));
+        assert!(tools.contains(&"update_plan"));
+        assert!(tools.contains(&"architecture_context"));
+
+        let denied = dispatch_tool(
+            &session_context,
+            "start_task",
+            json!({"plan": "Patch code"}),
+        );
+        assert_eq!(denied["ok"].as_bool(), Some(false));
+        assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
+
+        kernel
+            .update_repo_policy(&json!({"agent_session_mode": "direct_coordination"}))
+            .unwrap();
+        let restored = coordination_tools_for_context(&session_context);
+        assert!(restored.contains(&"start_task"));
     }
 
     #[test]

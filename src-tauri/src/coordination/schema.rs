@@ -47,6 +47,8 @@ pub const CRASH_TODO_RESUME_MIGRATION_NAME: &str = "coordination_kernel_crash_to
 pub const OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_VERSION: i64 = 21;
 pub const OPTIONAL_GIT_WORKTREES_POLICY_MIGRATION_NAME: &str =
     "coordination_kernel_optional_git_worktrees_policy";
+pub const AGENT_SESSION_MODE_MIGRATION_VERSION: i64 = 22;
+pub const AGENT_SESSION_MODE_MIGRATION_NAME: &str = "coordination_kernel_agent_session_mode";
 
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -602,6 +604,7 @@ CREATE TABLE IF NOT EXISTS repo_policies(
   shadow_validation_required INTEGER NOT NULL DEFAULT 1,
   prod_requires_human INTEGER NOT NULL DEFAULT 1,
   agent_worktree_required INTEGER NOT NULL DEFAULT 0,
+  agent_session_mode TEXT NOT NULL DEFAULT 'direct_coordination',
   patch_lease_validation_required INTEGER NOT NULL DEFAULT 1,
   merge_gate_required INTEGER NOT NULL DEFAULT 1,
   root_repo_write_policy TEXT NOT NULL DEFAULT 'detect_and_reject_patch',
