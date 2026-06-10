@@ -4491,6 +4491,12 @@ const TodoQueueItemText = styled.p`
   color: #edf5ff;
   font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 
+  /* Cloud-generated titles read as headlines; the raw todo text stays on hover. */
+  &[data-llm-title="true"] {
+    font-weight: 720;
+    white-space: normal;
+  }
+
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
   }
@@ -11195,6 +11201,7 @@ function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, de
         item.todoText || item.todo_text || item.text || item.title || "Untitled todo",
         900,
       ) || "Untitled todo";
+      const llmTitle = String(item.llmTitle || item.llm_title || "").trim();
       const mappedDevice = deviceMap.get(normalizeWorkspaceTodoDeviceId(deviceId)) || null;
       const deviceName = String(
         item.deviceName
@@ -11219,6 +11226,7 @@ function normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, workspaceId, de
         deviceName,
         deviceTag: deviceName,
         id: `peer-${key}`,
+        llmTitle,
         platformLabel: mappedDevice?.platformLabel || "",
         repoName: String(item.gitRepoDisplayName || item.git_repo_display_name || item.repoName || item.repo_name || "").trim(),
         sourceWorkspaceId,
@@ -11449,6 +11457,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   onToggleTerminalBreakout,
   onToggleWindowBreakout,
   windowBreakoutActive = false,
+  todoLlmTitles = null,
   onToggleFullscreenPane,
   onUpdateItem,
   onVoiceAgentToolCall,
@@ -13153,6 +13162,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     [connectedDevices],
   );
   const workspaceTodoPeerItems = Array.isArray(peerItems) ? peerItems : [];
+  const todoLlmTitleFor = useCallback((item) => {
+    if (!todoLlmTitles || typeof todoLlmTitles.get !== "function") {
+      return "";
+    }
+    const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
+    return todoId ? (todoLlmTitles.get(todoId) || "") : "";
+  }, [todoLlmTitles]);
   const workspaceTodoDispatchTargets = Array.isArray(dispatchTargets)
     ? dispatchTargets.filter((target) => target?.canQueue !== false)
     : [];
@@ -13513,6 +13529,10 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                 spellCheck="true"
                                 value={editingDraft}
                               />
+                            ) : todoLlmTitleFor(item) ? (
+                              <TodoQueueItemText data-llm-title="true" title={item.text}>
+                                {todoLlmTitleFor(item)}
+                              </TodoQueueItemText>
                             ) : (
                               <TodoQueueItemText>{item.text}</TodoQueueItemText>
                             )}
@@ -13607,7 +13627,12 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             {item.deviceTag}
                           </TodoQueuePeerDeviceTag>
                           <TodoQueuePeerBody>
-                            <TodoQueueItemText>{item.text}</TodoQueueItemText>
+                            <TodoQueueItemText
+                              data-llm-title={item.llmTitle ? "true" : undefined}
+                              title={item.llmTitle ? item.text : undefined}
+                            >
+                              {item.llmTitle || item.text}
+                            </TodoQueueItemText>
                             <TodoQueuePeerMeta>
                               <TodoQueuePeerPill data-peer-status={item.status}>
                                 {item.statusLabel}
@@ -14308,6 +14333,19 @@ function TerminalView({
     () => normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, terminalWorkspace?.id, workspaceTodoDeviceMap),
     [terminalWorkspace?.id, workspaceTodoDeviceMap, workspaceTodos],
   );
+  // Cloud-generated todo titles (cheap LLM, created once a todo is sent to a
+  // coding agent) keyed by todo id; synced back through the todo mirror.
+  const workspaceTodoLlmTitles = useMemo(() => {
+    const titles = new Map();
+    workspaceTodoItemsForWorkspace(workspaceTodos, terminalWorkspace?.id || "").forEach((item) => {
+      const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
+      const title = String(item?.llmTitle || item?.llm_title || "").trim();
+      if (todoId && title) {
+        titles.set(todoId, title);
+      }
+    });
+    return titles;
+  }, [terminalWorkspace?.id, workspaceTodos]);
   const workspaceTodoDispatchTargets = useMemo(
     () => normalizeWorkspaceTodoDispatchTargets(workspaceTodos, terminalWorkspace?.id),
     [terminalWorkspace?.id, workspaceTodos],
@@ -25820,6 +25858,7 @@ function TerminalView({
                           selectedTerminalPlanTarget={selectedTerminalPlanTarget}
                           storageUsage={storageUsage}
                           terminalBreakoutActive={terminalBreakoutVisible}
+                          todoLlmTitles={workspaceTodoLlmTitles}
                           workspace={terminalWorkspace}
                           workspaceError={workspaceError}
                           workspaceId={terminalWorkspace.id}

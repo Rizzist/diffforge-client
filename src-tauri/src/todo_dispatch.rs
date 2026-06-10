@@ -867,6 +867,103 @@ async fn todo_dispatch_backend_submissions_drain(workspace_id: String) -> Result
     .map_err(|error| format!("Todo dispatch journal drain worker failed: {error}"))?
 }
 
+/// Aggregated view of every workspace queue snapshot for the background
+/// monitor window: items grouped by lifecycle bucket with workspace labels
+/// resolved best-effort from the terminal runtime registry.
+#[tauri::command]
+async fn todo_dispatch_overview() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let workspace_names = TODO_DISPATCH_TERMINAL_RUNTIME
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .map(|map| {
+                map.values()
+                    .filter_map(|entry| {
+                        let workspace_id = entry.get("workspaceId").and_then(Value::as_str)?;
+                        let workspace_name = entry
+                            .get("workspaceName")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())?;
+                        Some((workspace_id.to_string(), workspace_name.to_string()))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut workspaces = Vec::new();
+        let mut running = 0usize;
+        let mut queued = 0usize;
+        let mut listed = 0usize;
+        for path in todo_dispatch_data_workspace_files("queues") {
+            let snapshot = todo_dispatch_queue_read(&path);
+            let workspace_id = snapshot
+                .get("workspaceId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if workspace_id.is_empty() {
+                continue;
+            }
+            let items = snapshot
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|item| {
+                    let status = item
+                        .get("todoStatus")
+                        .or_else(|| item.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("listed")
+                        .to_string();
+                    let bucket = match status.as_str() {
+                        "running" | "sending" | "submitted" | "paused" => "running",
+                        "queued" => "queued",
+                        "listed" | "" => "listed",
+                        _ => "finished",
+                    };
+                    match bucket {
+                        "running" => running += 1,
+                        "queued" => queued += 1,
+                        "listed" => listed += 1,
+                        _ => {}
+                    }
+                    json!({
+                        "bucket": bucket,
+                        "id": item.get("id").cloned().unwrap_or(Value::Null),
+                        "status": status,
+                        "targetTerminalIndex": item.get("targetTerminalIndex").cloned().unwrap_or(Value::Null),
+                        "text": item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(180)
+                            .collect::<String>(),
+                        "updatedAt": item.get("updatedAt").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                continue;
+            }
+            workspaces.push(json!({
+                "items": items,
+                "workspaceId": workspace_id.clone(),
+                "workspaceName": workspace_names.get(&workspace_id).cloned().unwrap_or_default(),
+            }));
+        }
+        Ok(json!({
+            "counts": { "listed": listed, "queued": queued, "running": running },
+            "updatedAtMs": todo_dispatch_now_ms(),
+            "workspaces": workspaces,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo dispatch overview worker failed: {error}"))?
+}
+
 fn todo_dispatch_backend_item_text(item: &Value) -> String {
     let text = item
         .get("text")

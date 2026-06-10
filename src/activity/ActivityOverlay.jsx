@@ -413,6 +413,8 @@ function todoTitle(item, fallback = "todo") {
   return shortText(
     displayText(
       firstText(
+        item?.llmTitle,
+        item?.llm_title,
         item?.title,
         item?.summary,
         item?.body,

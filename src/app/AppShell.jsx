@@ -477,6 +477,7 @@ import {
   FormMessage,
   buttonIconSize,
   titleIconSize,
+  TitleBackgroundIcon,
   TitleMinimizeIcon,
   TitleMaximizeIcon,
   TitleRestoreIcon,
@@ -536,6 +537,7 @@ import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
+import BackgroundMonitorWindow from "../background/BackgroundMonitorWindow.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
 import ActivityOverlayWindow, {
@@ -6138,6 +6140,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 }
 
 export default function App() {
+  if (window.location.hash === "#/background-monitor") {
+    return <BackgroundMonitorWindow />;
+  }
+
   if (window.location.hash === SNIPPING_OVERLAY_HASH) {
     return <SnippingOverlayWindow />;
   }
@@ -12246,6 +12252,11 @@ export default function App() {
     event.stopPropagation();
     toggleWindowSize();
   }, [toggleWindowSize]);
+
+  const enterBackgroundMode = useCallback((event) => {
+    event?.stopPropagation?.();
+    void invoke("app_enter_background").catch(() => {});
+  }, []);
 
   const buildAppCloseActiveTerminalSnapshot = useCallback((livePayload, source = "app_close") => {
     const liveSnapshot = normalizeTerminalLiveSessionsPayload(livePayload);
@@ -22400,6 +22411,17 @@ export default function App() {
             <span>{BRAND_NAME}</span>
           </WindowTitle>
           <WindowControls aria-label="Window controls" data-platform={windowControlPlatform}>
+            <WindowControlButton
+              aria-label="Run in background"
+              data-action="background"
+              data-platform={windowControlPlatform}
+              data-window-control
+              onClick={enterBackgroundMode}
+              title="Run Diff Forge in the background (terminals, sync, and hotkeys keep working)"
+              type="button"
+            >
+              <TitleBackgroundIcon aria-hidden="true" />
+            </WindowControlButton>
             <WindowControlButton
               aria-label="Minimize"
               data-action="minimize"

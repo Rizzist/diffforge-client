@@ -9,6 +9,7 @@ import { CloudDone } from "@styled-icons/material-rounded/CloudDone";
 import { Code } from "@styled-icons/material-rounded/Code";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
+import { KeyboardDoubleArrowDown as TitleBackgroundGlyph } from "@styled-icons/material-rounded/KeyboardDoubleArrowDown";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
 import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
@@ -12684,6 +12685,10 @@ export const titleIconSize = `
   width: 15px;
   height: 15px;
   flex: 0 0 auto;
+`;
+
+export const TitleBackgroundIcon = styled(TitleBackgroundGlyph)`
+  ${titleIconSize}
 `;
 
 export const TitleMinimizeIcon = styled(Remove)`

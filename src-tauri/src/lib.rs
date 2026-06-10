@@ -2123,6 +2123,7 @@ include!("terminals.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
+include!("background_mode.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
@@ -3721,6 +3722,10 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if app_is_in_background_mode() {
+                app_exit_background_internal(app);
+                return;
+            }
             #[cfg(target_os = "macos")]
             restore_main_window_after_reopen(app.clone(), false);
             #[cfg(not(target_os = "macos"))]
@@ -3780,6 +3785,7 @@ pub fn run() {
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
             todo_dispatch_start_background_dispatcher(app.handle().clone());
+            setup_background_tray(app);
             {
                 // Crash recovery: anything still marked in-flight in the todo
                 // ledger is a leftover from a previous process and gets
@@ -4016,6 +4022,10 @@ pub fn run() {
             todo_dispatch_queue_sync,
             todo_dispatch_dispatcher_heartbeat,
             todo_dispatch_backend_submissions_drain,
+            todo_dispatch_overview,
+            app_enter_background,
+            app_exit_background,
+            app_background_mode_state,
             hyperframe_transcribe_audio,
             hyperframe_save_media_transcript,
             hyperframe_media_transcript_status,
@@ -4204,7 +4214,11 @@ pub fn run() {
                 ..
             } = event
             {
-                restore_main_window_after_reopen(app.clone(), has_visible_windows);
+                if app_is_in_background_mode() {
+                    app_exit_background_internal(app);
+                } else {
+                    restore_main_window_after_reopen(app.clone(), has_visible_windows);
+                }
             }
         });
 }
