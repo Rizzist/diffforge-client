@@ -414,6 +414,92 @@ fn collect_codex_rollout_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Scans the tail of a provider session transcript for the last model the
+/// session actually used. Both Claude Code and Codex write compact JSONL
+/// where assistant/turn entries carry a `"model":"..."` field, so the last
+/// occurrence is the model that was active when the session closed.
+fn jsonl_tail_last_model(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(192 * 1024);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let needle = "\"model\":\"";
+    let mut last = None;
+    let mut cursor = 0usize;
+    while let Some(position) = text[cursor..].find(needle) {
+        let value_start = cursor + position + needle.len();
+        let Some(value_length) = text[value_start..].find('"') else {
+            break;
+        };
+        let value = text[value_start..value_start + value_length].trim();
+        if !value.is_empty()
+            && value.len() <= 120
+            && value != "<synthetic>"
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/'))
+        {
+            last = Some(value.to_string());
+        }
+        cursor = value_start + value_length;
+    }
+    last
+}
+
+fn claude_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let projects_dir = claude_home_dir()?.join("projects");
+    for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
+        let path = entry.path().join(format!("{session_id}.jsonl"));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn codex_session_transcript_path(session_id: &str) -> Option<PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let sessions_dir = codex_home_dir()?.join("sessions");
+    let mut files = Vec::new();
+    collect_codex_rollout_files(&sessions_dir, &mut files);
+    let mut matches = files
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        })
+        .collect::<Vec<_>>();
+    sort_rollouts_newest_first(&mut matches);
+    matches.into_iter().next()
+}
+
+/// Resolves the model a provider session was last using, straight from the
+/// provider's own transcript. This is more current than any stored binding
+/// because it reflects in-session model switches (e.g. `/model`).
+pub(crate) fn agent_session_last_model(
+    provider: AgentProvider,
+    session_id: &str,
+) -> Option<String> {
+    let transcript = match provider {
+        AgentProvider::Claude => claude_session_transcript_path(session_id)?,
+        AgentProvider::Codex => codex_session_transcript_path(session_id)?,
+        AgentProvider::OpenCode => return None,
+    };
+    jsonl_tail_last_model(&transcript)
+}
+
 fn sort_rollouts_newest_first(files: &mut [PathBuf]) {
     files.sort_by(|left, right| {
         let left_modified = fs::metadata(left).and_then(|metadata| metadata.modified()).ok();

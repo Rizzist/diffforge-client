@@ -103,11 +103,12 @@ fn terminal_launch(
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
     let mut args = Vec::new();
-    if let Some(session_id) = provider_session_id
+    let resume_session_id = provider_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
+        .map(str::to_string);
+    if let Some(session_id) = resume_session_id.as_deref() {
         match provider {
             AgentProvider::Codex => {
                 args.push("resume".to_string());
@@ -124,7 +125,19 @@ fn terminal_launch(
         }
     }
 
-    if let Some(model) = normalize_forge_model(model)? {
+    // When resuming, the session transcript knows the exact model that was
+    // active when the session closed — including in-session `/model`
+    // switches the stored binding never saw. Prefer it over the caller's
+    // default so a reopened terminal continues on the same model.
+    let session_model = resume_session_id
+        .as_deref()
+        .and_then(|session_id| agent_session_last_model(provider, session_id))
+        .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
+    let launch_model = match session_model {
+        Some(model) => Some(model),
+        None => normalize_forge_model(model)?,
+    };
+    if let Some(model) = launch_model {
         args.push("--model".to_string());
         args.push(model);
     }
@@ -5027,12 +5040,13 @@ async fn start_terminal_agent_in_prepared_pty(
     };
     let definition = agent_definition(provider);
     let mut args = Vec::new();
-    if let Some(session_id) = request
+    let resume_session_id = request
         .provider_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
+        .map(str::to_string);
+    if let Some(session_id) = resume_session_id.as_deref() {
         match provider {
             AgentProvider::Codex => {
                 args.push("resume".to_string());
@@ -5049,7 +5063,18 @@ async fn start_terminal_agent_in_prepared_pty(
         }
     }
 
-    match normalize_forge_model(request.model) {
+    // Resumed sessions continue on the exact model they last used; the
+    // transcript outranks the caller's default (it sees `/model` switches).
+    let session_model = resume_session_id
+        .as_deref()
+        .and_then(|session_id| agent_session_last_model(provider, session_id))
+        .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
+    let request_model = if session_model.is_some() {
+        Ok(session_model)
+    } else {
+        normalize_forge_model(request.model)
+    };
+    match request_model {
         Ok(Some(model)) => {
             args.push("--model".to_string());
             args.push(model);

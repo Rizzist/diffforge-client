@@ -10910,6 +10910,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   queueItems = items,
   rootDirectory = "",
   selectedTerminalPlanTarget = null,
+  storageUsage = null,
   terminalBreakoutActive = false,
   workspace,
   workspaceError = "",
@@ -24091,6 +24092,7 @@ function TerminalView({
                           queueItems={todoQueueItems}
                           rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
                           selectedTerminalPlanTarget={selectedTerminalPlanTarget}
+                          storageUsage={storageUsage}
                           terminalBreakoutActive={terminalBreakoutVisible}
                           workspace={terminalWorkspace}
                           workspaceError={workspaceError}
