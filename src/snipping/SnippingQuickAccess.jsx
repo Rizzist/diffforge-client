@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
@@ -21,10 +21,17 @@ import styled, { createGlobalStyle } from "styled-components";
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
 const SNIP_TOAST_LIMIT = 6;
-const SNIP_DETACH_DRAG_THRESHOLD_PX = 8;
+const SNIP_DRAG_THRESHOLD_PX = 6;
+const SNIP_TOAST_WINDOW_WIDTH = 316;
+const SNIP_TOAST_WINDOW_HEIGHT = 560;
+const SNIP_TOAST_WINDOW_MARGIN = 18;
+const SNIP_QUEUE_DROP_WIDTH = 260;
+const SNIP_QUEUE_DROP_HEIGHT = 560;
+const SNIP_CARD_WIDTH = 208;
+const SNIP_CARD_HEIGHT = 132;
+const SNIP_CARD_GAP = 10;
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
-export const SNIPPING_DETACHED_HASH = "#/snipping-detached";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 
 const TOOL_OPTIONS = [
@@ -194,23 +201,101 @@ function useFloatingWindowBody(kind) {
   }, [kind]);
 }
 
-function setTransientStatus(setSnips, snipId, status) {
+function setSnipStatus(setSnips, setFloatingSnips, snipId, status) {
   setSnips((current) => current.map((snip) => (
     snip.id === snipId ? { ...snip, status } : snip
   )));
+  setFloatingSnips((current) => current.map((item) => (
+    item.snip.id === snipId ? { ...item, snip: { ...item.snip, status } } : item
+  )));
+}
+
+function setTransientStatus(setSnips, setFloatingSnips, snipId, status) {
+  setSnipStatus(setSnips, setFloatingSnips, snipId, status);
   window.setTimeout(() => {
     setSnips((current) => current.map((snip) => (
       snip.id === snipId && snip.status === status ? { ...snip, status: "" } : snip
     )));
+    setFloatingSnips((current) => current.map((item) => (
+      item.snip.id === snipId && item.snip.status === status
+        ? { ...item, snip: { ...item.snip, status: "" } }
+        : item
+    )));
   }, 1700);
+}
+
+function clampNumber(value, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return min;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function moveSnipToIndex(snips, snipId, targetIndex) {
+  const currentIndex = snips.findIndex((snip) => snip.id === snipId);
+  if (currentIndex < 0) return snips;
+  const next = [...snips];
+  const [snip] = next.splice(currentIndex, 1);
+  next.splice(clampNumber(targetIndex, 0, next.length), 0, snip);
+  return next;
+}
+
+function queueIndexFromDropPoint(point, queuedCount, viewportHeight) {
+  const bottom = viewportHeight - SNIP_TOAST_WINDOW_MARGIN;
+  const cardCenterY = point.y + (SNIP_CARD_HEIGHT / 2);
+  const bottomDistance = bottom - cardCenterY;
+  return clampNumber(Math.round(bottomDistance / (SNIP_CARD_HEIGHT + SNIP_CARD_GAP)), 0, queuedCount);
+}
+
+function isPointInQueueDropZone(point, viewportHeight) {
+  return point.x <= SNIP_QUEUE_DROP_WIDTH
+    && point.y >= Math.max(0, viewportHeight - SNIP_QUEUE_DROP_HEIGHT);
+}
+
+async function setQuickAccessSurfaceMode(expanded) {
+  try {
+    const windowHandle = getCurrentWindow();
+    const monitor = await currentMonitor();
+    if (!monitor?.workArea) return null;
+
+    const scaleFactor = Math.max(0.1, Number(monitor.scaleFactor || window.devicePixelRatio || 1));
+    const workArea = monitor.workArea;
+    if (expanded) {
+      await windowHandle.setPosition(new PhysicalPosition(workArea.position.x, workArea.position.y));
+      await windowHandle.setSize(new LogicalSize(
+        Math.max(SNIP_TOAST_WINDOW_WIDTH, workArea.size.width / scaleFactor),
+        Math.max(SNIP_TOAST_WINDOW_HEIGHT, workArea.size.height / scaleFactor),
+      ));
+      return {
+        expanded: true,
+        height: workArea.size.height / scaleFactor,
+        width: workArea.size.width / scaleFactor,
+      };
+    }
+
+    await windowHandle.setSize(new LogicalSize(SNIP_TOAST_WINDOW_WIDTH, SNIP_TOAST_WINDOW_HEIGHT));
+    await windowHandle.setPosition(new PhysicalPosition(
+      workArea.position.x + SNIP_TOAST_WINDOW_MARGIN,
+      workArea.position.y + workArea.size.height - Math.round(SNIP_TOAST_WINDOW_HEIGHT * scaleFactor) - SNIP_TOAST_WINDOW_MARGIN,
+    ));
+    return {
+      expanded: false,
+      height: SNIP_TOAST_WINDOW_HEIGHT,
+      width: SNIP_TOAST_WINDOW_WIDTH,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export default function SnippingQuickAccess() {
   const [snips, setSnips] = useState([]);
+  const [floatingSnips, setFloatingSnips] = useState([]);
+  const [dragState, setDragState] = useState(null);
   const [busyIds, setBusyIds] = useState(() => new Set());
   const hadSnipsRef = useRef(false);
-  const dragDetachRef = useRef(null);
-  const detachingIdsRef = useRef(new Set());
+  const dragRef = useRef(null);
+  const surfaceExpandedRef = useRef(false);
+  const surfaceTransitionRef = useRef(null);
 
   useFloatingWindowBody("quick-access");
 
@@ -237,6 +322,7 @@ export default function SnippingQuickAccess() {
       if (disposed) return;
       const snip = snipToastFromPayload(event?.payload);
       if (!snip) return;
+      setFloatingSnips((current) => current.filter((item) => item.snip.localPath !== snip.localPath));
       setSnips((current) => [
         snip,
         ...current.filter((item) => item.localPath !== snip.localPath),
@@ -277,6 +363,12 @@ export default function SnippingQuickAccess() {
     setSnips((current) => current.filter((snip) => (
       snip.id !== snipId && snip.localPath !== localPath
     )));
+    setFloatingSnips((current) => current.filter((item) => (
+      item.snip.id !== snipId && item.snip.localPath !== localPath
+    )));
+    setDragState((current) => (
+      current && (current.snip.id === snipId || current.snip.localPath === localPath) ? null : current
+    ));
 
     if (localPath) {
       invoke("snipping_dismiss_capture_toast", {
@@ -288,84 +380,144 @@ export default function SnippingQuickAccess() {
     }
   }, []);
 
-  const detachSnip = useCallback(async (snip, pointer = {}) => {
-    if (!snip?.id || !assetLocalPath(snip)) return;
-    if (detachingIdsRef.current.has(snip.id)) return;
-
-    detachingIdsRef.current.add(snip.id);
-    setBusyIds((current) => {
-      const next = new Set(current);
-      next.add(snip.id);
-      return next;
+  const expandDragSurface = useCallback(() => {
+    if (surfaceExpandedRef.current) {
+      return surfaceTransitionRef.current || Promise.resolve(null);
+    }
+    const transition = setQuickAccessSurfaceMode(true).then((metrics) => {
+      surfaceExpandedRef.current = Boolean(metrics?.expanded);
+      return metrics;
     });
+    const trackedTransition = transition.finally(() => {
+      if (surfaceTransitionRef.current === trackedTransition) {
+        surfaceTransitionRef.current = null;
+      }
+    });
+    surfaceTransitionRef.current = trackedTransition;
+    return trackedTransition;
+  }, []);
 
-    const request = {
-      path: snip.localPath,
+  const restoreStackSurface = useCallback(() => {
+    const restore = async () => {
+      if (!surfaceExpandedRef.current || floatingSnips.length || dragRef.current) return null;
+      const metrics = await setQuickAccessSurfaceMode(false);
+      surfaceExpandedRef.current = Boolean(metrics?.expanded);
+      return metrics;
     };
-    if (Number.isFinite(pointer.screenX)) {
-      request.screenX = pointer.screenX;
-    }
-    if (Number.isFinite(pointer.screenY)) {
-      request.screenY = pointer.screenY;
-    }
+    return surfaceTransitionRef.current ? surfaceTransitionRef.current.finally(restore) : restore();
+  }, [floatingSnips.length]);
 
-    try {
-      await invoke("snipping_open_detached_preview_window", { request });
-      dismissSnip(snip);
-    } catch (error) {
-      setTransientStatus(setSnips, snip.id, error?.message || String(error || "Unable to detach snip"));
-    } finally {
-      detachingIdsRef.current.delete(snip.id);
-      setBusyIds((current) => {
-        const next = new Set(current);
-        next.delete(snip.id);
-        return next;
-      });
+  useEffect(() => {
+    if (floatingSnips.length || dragState) {
+      expandDragSurface();
+    } else {
+      restoreStackSurface();
     }
-  }, [dismissSnip]);
+  }, [dragState, expandDragSurface, floatingSnips.length, restoreStackSurface]);
 
-  const beginDetachDrag = useCallback((event, snip) => {
+  const beginSnipDrag = useCallback((event, snip, origin = "queue") => {
     if (event.button !== 0 || busyIds.has(snip.id)) return;
     event.preventDefault();
     event.stopPropagation();
-    dragDetachRef.current = {
-      detached: false,
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is best effort; the expanded surface still handles normal move events.
+    }
+    const card = event.currentTarget.closest("[data-snip-card]");
+    const rect = card?.getBoundingClientRect();
+    const floatingMatch = floatingSnips.find((item) => item.snip.id === snip.id);
+    const startX = origin === "floating" && floatingMatch ? floatingMatch.x : rect?.left || event.clientX;
+    const startY = origin === "floating" && floatingMatch ? floatingMatch.y : rect?.top || event.clientY;
+    const offsetX = rect ? event.clientX - rect.left : SNIP_CARD_WIDTH / 2;
+    const offsetY = rect ? event.clientY - rect.top : 16;
+
+    dragRef.current = {
+      active: true,
+      dragging: false,
+      origin,
       pointerId: event.pointerId,
       snip,
       startClientX: event.clientX,
       startClientY: event.clientY,
+      startX,
+      startY,
+      x: startX,
+      y: startY,
+      offsetX,
+      offsetY,
     };
-  }, [busyIds]);
 
-  const detachFromKeyboard = useCallback((event, snip) => {
+    expandDragSurface();
+  }, [busyIds, expandDragSurface, floatingSnips]);
+
+  const floatSnipFromKeyboard = useCallback((event, snip) => {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    detachSnip(snip, {
-      screenX: window.screenX + window.innerWidth - 56,
-      screenY: window.screenY + window.innerHeight - 56,
+    expandDragSurface();
+    setFloatingSnips((current) => {
+      if (current.some((item) => item.snip.id === snip.id)) return current;
+      const x = Math.min(Math.max(SNIP_TOAST_WINDOW_MARGIN, window.innerWidth - SNIP_CARD_WIDTH - 40), window.innerWidth - SNIP_CARD_WIDTH - SNIP_TOAST_WINDOW_MARGIN);
+      const y = Math.min(Math.max(SNIP_TOAST_WINDOW_MARGIN, window.innerHeight - SNIP_CARD_HEIGHT - 40), window.innerHeight - SNIP_CARD_HEIGHT - SNIP_TOAST_WINDOW_MARGIN);
+      return [...current, { snip, x, y }];
     });
-  }, [detachSnip]);
+  }, [expandDragSurface]);
 
   useEffect(() => {
     const onPointerMove = (event) => {
-      const drag = dragDetachRef.current;
-      if (!drag || drag.pointerId !== event.pointerId || drag.detached) return;
+      const drag = dragRef.current;
+      if (!drag || drag.pointerId !== event.pointerId) return;
       const distance = Math.hypot(
         event.clientX - drag.startClientX,
         event.clientY - drag.startClientY,
       );
-      if (distance < SNIP_DETACH_DRAG_THRESHOLD_PX) return;
-      drag.detached = true;
-      detachSnip(drag.snip, {
-        screenX: event.screenX,
-        screenY: event.screenY,
-      });
+      if (!drag.dragging && distance < SNIP_DRAG_THRESHOLD_PX) return;
+
+      if (!drag.dragging && drag.origin === "floating") {
+        setFloatingSnips((current) => current.filter((item) => item.snip.id !== drag.snip.id));
+      }
+
+      const nextX = clampNumber(event.clientX - drag.offsetX, 0, Math.max(0, window.innerWidth - SNIP_CARD_WIDTH));
+      const nextY = clampNumber(event.clientY - drag.offsetY, 0, Math.max(0, window.innerHeight - SNIP_CARD_HEIGHT));
+      const nextDrag = {
+        ...drag,
+        dragging: true,
+        x: nextX,
+        y: nextY,
+      };
+      dragRef.current = nextDrag;
+      setDragState(nextDrag);
     };
+
     const onPointerEnd = (event) => {
-      const drag = dragDetachRef.current;
+      const drag = dragRef.current;
       if (!drag || drag.pointerId !== event.pointerId) return;
-      dragDetachRef.current = null;
+      dragRef.current = null;
+      setDragState(null);
+
+      if (!drag.dragging) {
+        restoreStackSurface();
+        return;
+      }
+
+      const dropPoint = {
+        x: drag.x + (SNIP_CARD_WIDTH / 2),
+        y: drag.y + (SNIP_CARD_HEIGHT / 2),
+      };
+      if (isPointInQueueDropZone(dropPoint, window.innerHeight)) {
+        const floatingIds = new Set(floatingSnips.map((item) => item.snip.id));
+        const queuedCount = snips.filter((item) => item.id !== drag.snip.id && !floatingIds.has(item.id)).length;
+        const targetIndex = queueIndexFromDropPoint(drag, queuedCount, window.innerHeight);
+        setFloatingSnips((current) => current.filter((item) => item.snip.id !== drag.snip.id));
+        setSnips((current) => moveSnipToIndex(current, drag.snip.id, targetIndex));
+      } else {
+        setFloatingSnips((current) => [
+          ...current.filter((item) => item.snip.id !== drag.snip.id),
+          { snip: drag.snip, x: drag.x, y: drag.y },
+        ]);
+      }
     };
+
     window.addEventListener("pointermove", onPointerMove, true);
     window.addEventListener("pointerup", onPointerEnd, true);
     window.addEventListener("pointercancel", onPointerEnd, true);
@@ -374,7 +526,7 @@ export default function SnippingQuickAccess() {
       window.removeEventListener("pointerup", onPointerEnd, true);
       window.removeEventListener("pointercancel", onPointerEnd, true);
     };
-  }, [detachSnip]);
+  }, [floatingSnips, restoreStackSurface, snips]);
 
   const runSnipAction = useCallback(async (snip, action) => {
     if (!snip?.id) return;
@@ -386,6 +538,9 @@ export default function SnippingQuickAccess() {
     setSnips((current) => current.map((item) => (
       item.id === snip.id ? { ...item, status: "" } : item
     )));
+    setFloatingSnips((current) => current.map((item) => (
+      item.snip.id === snip.id ? { ...item, snip: { ...item.snip, status: "" } } : item
+    )));
 
     try {
       if (action === "delete") {
@@ -393,10 +548,10 @@ export default function SnippingQuickAccess() {
         dismissSnip(snip);
       } else if (action === "copy") {
         const status = await copySnipToClipboard(snip);
-        setTransientStatus(setSnips, snip.id, status);
+        setTransientStatus(setSnips, setFloatingSnips, snip.id, status);
       } else if (action === "edit") {
         await invoke("snipping_open_annotation_editor", { path: snip.localPath });
-        setTransientStatus(setSnips, snip.id, "Editor opened");
+        setTransientStatus(setSnips, setFloatingSnips, snip.id, "Editor opened");
       } else if (action === "upload") {
         await invoke("snipping_upload_untracked_asset", {
           request: {
@@ -405,10 +560,10 @@ export default function SnippingQuickAccess() {
             path: snip.localPath,
           },
         });
-        setTransientStatus(setSnips, snip.id, "Tracked for upload");
+        setTransientStatus(setSnips, setFloatingSnips, snip.id, "Tracked for upload");
       }
     } catch (error) {
-      setTransientStatus(setSnips, snip.id, error?.message || String(error || "Action failed"));
+      setTransientStatus(setSnips, setFloatingSnips, snip.id, error?.message || String(error || "Action failed"));
     } finally {
       setBusyIds((current) => {
         const next = new Set(current);
@@ -418,6 +573,73 @@ export default function SnippingQuickAccess() {
     }
   }, [dismissSnip]);
 
+  const floatingIds = useMemo(() => new Set(floatingSnips.map((item) => item.snip.id)), [floatingSnips]);
+  const activeDragId = dragState?.snip?.id || "";
+  const queuedSnips = useMemo(() => snips.filter((snip) => (
+    snip.id !== activeDragId && !floatingIds.has(snip.id)
+  )), [activeDragId, floatingIds, snips]);
+
+  const renderSnipCard = useCallback((snip, { dragOrigin = "queue", floating = false, style = null } = {}) => {
+    const busy = busyIds.has(snip.id);
+    return (
+      <QuickAccessCard
+        data-busy={busy ? "true" : "false"}
+        data-floating={floating ? "true" : "false"}
+        data-snip-card
+        key={snip.id}
+        style={style || undefined}
+      >
+        <QuickAccessDragButton
+          aria-label={`Drag ${snip.name}`}
+          disabled={busy}
+          onKeyDown={(event) => floatSnipFromKeyboard(event, snip)}
+          onPointerDown={(event) => beginSnipDrag(event, snip, dragOrigin)}
+          title="Drag preview"
+          type="button"
+        >
+          <DragIndicator aria-hidden="true" />
+        </QuickAccessDragButton>
+        <QuickAccessUploadButton
+          aria-label={`Upload ${snip.name}`}
+          disabled={busy}
+          onClick={() => runSnipAction(snip, "upload")}
+          title="Upload snip"
+          type="button"
+        >
+          <CloudUpload aria-hidden="true" />
+          <span>Upload</span>
+        </QuickAccessUploadButton>
+
+        <QuickAccessPreview>
+          {snip.previewUrl ? (
+            <img alt={snip.name} draggable={false} src={snip.previewUrl} />
+          ) : (
+            <span>Preview unavailable</span>
+          )}
+        </QuickAccessPreview>
+
+        <QuickAccessActions>
+          <QuickAccessButton aria-label={`Copy ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "copy")} title="Copy image" type="button">
+            <ContentCopy aria-hidden="true" />
+          </QuickAccessButton>
+          <QuickAccessButton aria-label={`Edit ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "edit")} title="Annotate copy" type="button">
+            <ModeEdit aria-hidden="true" />
+          </QuickAccessButton>
+          <QuickAccessButton aria-label={`Delete ${snip.name}`} data-danger="true" disabled={busy} onClick={() => runSnipAction(snip, "delete")} title="Delete file" type="button">
+            <Delete aria-hidden="true" />
+          </QuickAccessButton>
+        </QuickAccessActions>
+
+        <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip)} title="Dismiss" type="button">
+          <Close aria-hidden="true" />
+        </QuickAccessDismissButton>
+        {snip.status ? (
+          <QuickAccessStatusPill aria-live="polite">{snip.status}</QuickAccessStatusPill>
+        ) : null}
+      </QuickAccessCard>
+    );
+  }, [beginSnipDrag, busyIds, dismissSnip, floatSnipFromKeyboard, runSnipAction]);
+
   if (!snips.length) {
     return <SnipFloatingGlobalStyle />;
   }
@@ -425,142 +647,32 @@ export default function SnippingQuickAccess() {
   return (
     <>
       <SnipFloatingGlobalStyle />
-      <QuickAccessRoot aria-label="Snip quick access" aria-live="polite">
-        {snips.map((snip) => {
-          const busy = busyIds.has(snip.id);
-
-          return (
-            <QuickAccessCard data-busy={busy ? "true" : "false"} key={snip.id}>
-              <QuickAccessDragButton
-                aria-label={`Drag ${snip.name} out`}
-                disabled={busy}
-                onKeyDown={(event) => detachFromKeyboard(event, snip)}
-                onPointerDown={(event) => beginDetachDrag(event, snip)}
-                title="Drag preview out"
-                type="button"
-              >
-                <DragIndicator aria-hidden="true" />
-              </QuickAccessDragButton>
-              <QuickAccessUploadButton
-                aria-label={`Upload ${snip.name}`}
-                disabled={busy}
-                onClick={() => runSnipAction(snip, "upload")}
-                title="Upload snip"
-                type="button"
-              >
-                <CloudUpload aria-hidden="true" />
-                <span>Upload</span>
-              </QuickAccessUploadButton>
-
-              <QuickAccessPreview>
-                {snip.previewUrl ? (
-                  <img alt={snip.name} draggable={false} src={snip.previewUrl} />
-                ) : (
-                  <span>Preview unavailable</span>
-                )}
-              </QuickAccessPreview>
-
-              <QuickAccessActions>
-                <QuickAccessButton aria-label={`Copy ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "copy")} title="Copy image" type="button">
-                  <ContentCopy aria-hidden="true" />
-                </QuickAccessButton>
-                <QuickAccessButton aria-label={`Edit ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "edit")} title="Annotate copy" type="button">
-                  <ModeEdit aria-hidden="true" />
-                </QuickAccessButton>
-                <QuickAccessButton aria-label={`Delete ${snip.name}`} data-danger="true" disabled={busy} onClick={() => runSnipAction(snip, "delete")} title="Delete file" type="button">
-                  <Delete aria-hidden="true" />
-                </QuickAccessButton>
-              </QuickAccessActions>
-
-              <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip)} title="Dismiss" type="button">
-                <Close aria-hidden="true" />
-              </QuickAccessDismissButton>
-              {snip.status ? (
-                <QuickAccessStatusPill aria-live="polite">{snip.status}</QuickAccessStatusPill>
-              ) : null}
-            </QuickAccessCard>
-          );
-        })}
+      <QuickAccessRoot aria-label="Snip quick access" aria-live="polite" data-expanded={floatingSnips.length || dragState ? "true" : "false"}>
+        <QueueDropZone aria-hidden="true" data-active={dragState ? "true" : "false"} />
+        <QueuedSnipStack>
+          {queuedSnips.map((snip) => renderSnipCard(snip))}
+        </QueuedSnipStack>
+        <FloatingSnipLayer>
+          {floatingSnips
+            .filter((item) => item.snip.id !== activeDragId)
+            .map((item) => renderSnipCard(item.snip, {
+              dragOrigin: "floating",
+              floating: true,
+              style: {
+                left: `${item.x}px`,
+                top: `${item.y}px`,
+              },
+            }))}
+          {dragState ? renderSnipCard(dragState.snip, {
+            dragOrigin: dragState.origin,
+            floating: true,
+            style: {
+              left: `${dragState.x}px`,
+              top: `${dragState.y}px`,
+            },
+          }) : null}
+        </FloatingSnipLayer>
       </QuickAccessRoot>
-    </>
-  );
-}
-
-export function SnippingDetachedPreviewWindow() {
-  const localPath = useMemo(() => pathFromHash(SNIPPING_DETACHED_HASH), []);
-  const previewUrl = useMemo(() => assetPreviewUrl({ localPath }), [localPath]);
-  const name = useMemo(() => assetName({ localPath }), [localPath]);
-  const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  useFloatingWindowBody("detached");
-
-  const runAction = useCallback(async (action) => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      if (action === "copy") {
-        setStatus(await copySnipToClipboard({ localPath, name, previewUrl }));
-      } else if (action === "edit") {
-        await invoke("snipping_open_annotation_editor", { path: localPath });
-        setStatus("Editor opened");
-      } else if (action === "upload") {
-        await invoke("snipping_upload_untracked_asset", {
-          request: {
-            group: "snips",
-            name,
-            path: localPath,
-          },
-        });
-        setStatus("Uploaded");
-      } else if (action === "delete") {
-        await invoke("diffforge_delete_untracked_asset", { path: localPath });
-        await getCurrentWindow().close();
-      } else if (action === "close") {
-        await getCurrentWindow().close();
-      }
-    } catch (error) {
-      setStatus(error?.message || String(error || "Action failed"));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, localPath, name, previewUrl]);
-
-  return (
-    <>
-      <SnipFloatingGlobalStyle />
-      <DetachedWindowRoot>
-        <DetachedTitleBar>
-          <DetachedDragButton aria-label="Drag preview window" data-tauri-drag-region title="Drag preview" type="button">
-            <DragIndicator aria-hidden="true" />
-          </DetachedDragButton>
-          <DetachedTitle>
-            <strong>{name}</strong>
-            {status && <span>{status}</span>}
-          </DetachedTitle>
-          <DetachedUploadButton disabled={busy} onClick={() => runAction("upload")} title="Upload snip" type="button">
-            <CloudUpload aria-hidden="true" />
-            <span>{busy ? "Working" : "Upload"}</span>
-          </DetachedUploadButton>
-        </DetachedTitleBar>
-        <DetachedImageFrame>
-          {previewUrl ? <img alt={name} draggable={false} src={previewUrl} /> : <span>No snip selected</span>}
-        </DetachedImageFrame>
-        <DetachedToolbar>
-          <FloatingButton aria-label="Copy detached snip" disabled={busy} onClick={() => runAction("copy")} title="Copy" type="button">
-            <ContentCopy aria-hidden="true" />
-          </FloatingButton>
-          <FloatingButton aria-label="Edit detached snip" disabled={busy} onClick={() => runAction("edit")} title="Edit" type="button">
-            <ModeEdit aria-hidden="true" />
-          </FloatingButton>
-          <FloatingButton aria-label="Delete detached snip" data-danger="true" disabled={busy} onClick={() => runAction("delete")} title="Delete file" type="button">
-            <Delete aria-hidden="true" />
-          </FloatingButton>
-          <FloatingButton aria-label="Close detached snip" disabled={busy} onClick={() => runAction("close")} title="Close" type="button">
-            <Close aria-hidden="true" />
-          </FloatingButton>
-        </DetachedToolbar>
-      </DetachedWindowRoot>
     </>
   );
 }
@@ -982,23 +1094,58 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
     user-select: none;
   }
 
-  body[data-snipping-floating="detached"] {
-    background: #070a10 !important;
-  }
 `;
 
 const QuickAccessRoot = styled.aside`
   position: fixed;
   inset: 0;
   z-index: 12000;
-  display: flex;
-  flex-direction: column-reverse;
-  align-items: flex-end;
-  justify-content: flex-start;
-  gap: 10px;
-  padding: 10px;
   overflow: hidden;
   pointer-events: none;
+`;
+
+const QueuedSnipStack = styled.div`
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+  gap: ${SNIP_CARD_GAP}px;
+  max-height: calc(100vh - 20px);
+  overflow: hidden;
+  pointer-events: none;
+`;
+
+const FloatingSnipLayer = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+`;
+
+const QueueDropZone = styled.div`
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  z-index: 1;
+  width: ${SNIP_QUEUE_DROP_WIDTH}px;
+  height: min(${SNIP_QUEUE_DROP_HEIGHT}px, 100vh);
+  border: 1px solid transparent;
+  border-radius: 16px;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease;
+
+  &[data-active="true"] {
+    border-color: rgba(147, 197, 253, 0.24);
+    background: rgba(37, 99, 235, 0.08);
+    opacity: 1;
+  }
 `;
 
 const QuickAccessCard = styled.article`
@@ -1017,7 +1164,18 @@ const QuickAccessCard = styled.article`
 
   &:hover,
   &:focus-within {
-    transform: translateX(-2px);
+    transform: translateX(2px);
+  }
+
+  &[data-floating="true"] {
+    position: absolute;
+    z-index: 4;
+    transform: none;
+  }
+
+  &[data-floating="true"]:hover,
+  &[data-floating="true"]:focus-within {
+    transform: none;
   }
 `;
 
@@ -1277,154 +1435,6 @@ const FloatingButton = styled.button`
     cursor: default;
     opacity: 0.45;
   }
-`;
-
-const DetachedWindowRoot = styled.main`
-  position: relative;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  width: 100vw;
-  height: 100vh;
-  overflow: hidden;
-  background: rgba(7, 10, 16, 0.94);
-  color: #f8fafc;
-  font-family:
-    Inter,
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-`;
-
-const DetachedTitleBar = styled.header`
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  min-height: 46px;
-  padding: 8px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.92);
-`;
-
-const DetachedDragButton = styled.button`
-  display: inline-grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 999px;
-  color: rgba(248, 250, 252, 0.92);
-  background: rgba(255, 255, 255, 0.07);
-  cursor: grab;
-
-  svg {
-    width: 17px;
-    height: 17px;
-  }
-
-  &:active {
-    cursor: grabbing;
-  }
-`;
-
-const DetachedTitle = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-
-  strong,
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  strong {
-    font-size: 12px;
-    font-weight: 850;
-  }
-
-  span {
-    color: rgba(248, 250, 252, 0.62);
-    font-size: 11px;
-    font-weight: 700;
-  }
-`;
-
-const DetachedUploadButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 30px;
-  max-width: 108px;
-  padding: 0 10px;
-  border: 1px solid rgba(147, 197, 253, 0.38);
-  border-radius: 999px;
-  color: #eff6ff;
-  background: rgba(21, 38, 68, 0.86);
-  cursor: pointer;
-
-  svg {
-    flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    font-size: 10px;
-    font-weight: 850;
-    text-overflow: ellipsis;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: rgba(191, 219, 254, 0.72);
-    background: rgba(37, 99, 235, 0.82);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.58;
-  }
-`;
-
-const DetachedImageFrame = styled.div`
-  display: grid;
-  min-height: 0;
-  width: 100%;
-  height: 100%;
-  place-items: center;
-  overflow: hidden;
-  padding: 10px;
-
-  img {
-    display: block;
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-  }
-
-  span {
-    color: rgba(248, 250, 252, 0.62);
-    font-size: 13px;
-    font-weight: 800;
-  }
-`;
-
-const DetachedToolbar = styled.div`
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-  padding: 8px 10px 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.78);
 `;
 
 const EditorWindowRoot = styled.main`

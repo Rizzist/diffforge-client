@@ -6362,7 +6362,21 @@ function normalizeTodoQueueLifecycleStatus(value) {
   if (["deleted", "removed"].includes(status)) {
     return "deleted";
   }
-  if (["listed", "list", "in_list", "ready"].includes(status)) {
+  if ([
+    "listed",
+    "list",
+    "in_list",
+    "ready",
+    "released",
+    "unqueued",
+    "unqueue",
+    "terminal_closed",
+    "terminal_unavailable",
+    "target_terminal_closed",
+    "target_terminal_unavailable",
+    "terminal_instance_changed",
+    "terminal_thread_changed",
+  ].includes(status)) {
     return "listed";
   }
   return "";
@@ -9032,6 +9046,44 @@ function getTodoQueueItemWithoutPersistedQueueState(item) {
   return rest;
 }
 
+function getTodoQueueItemWithoutTerminalAssignment(item) {
+  if (!item || typeof item !== "object") {
+    return item;
+  }
+  const {
+    targetAgentId: _targetAgentId,
+    target_agent_id: _targetAgentIdSnake,
+    targetAgentLabel: _targetAgentLabel,
+    target_agent_label: _targetAgentLabelSnake,
+    targetColorSlot: _targetColorSlot,
+    target_color_slot: _targetColorSlotSnake,
+    targetTerminalColor: _targetTerminalColor,
+    target_terminal_color: _targetTerminalColorSnake,
+    targetTerminalId: _targetTerminalId,
+    target_terminal_id: _targetTerminalIdSnake,
+    targetTerminalIndex: _targetTerminalIndex,
+    target_terminal_index: _targetTerminalIndexSnake,
+    targetTerminalName: _targetTerminalName,
+    target_terminal_name: _targetTerminalNameSnake,
+    targetThreadId: _targetThreadId,
+    target_thread_id: _targetThreadIdSnake,
+    ...rest
+  } = item;
+  return rest;
+}
+
+function getTodoQueueItemReleasedToListed(item, reason = "released", fields = {}) {
+  const updatedAt = String(fields.updatedAt || new Date().toISOString());
+  return getTodoQueueItemWithCloudStatus(
+    getTodoQueueItemWithoutTerminalAssignment(getTodoQueueItemWithoutPersistedQueueState(item)),
+    "listed",
+    {
+      reason,
+      updatedAt,
+    },
+  );
+}
+
 function getTodoQueueItemStorageRehydrated(item) {
   const queueState = normalizeTodoQueuePersistedQueueState(item);
   if (!queueState) {
@@ -9565,6 +9617,7 @@ function createTodoQueueItem(text, options = {}) {
   const source = normalizeTodoQueueSource(options.source);
   const planTask = normalizeTodoQueuePlanTask(options.planTask);
   const workspaceId = String(options.workspaceId || "").trim();
+  const deviceId = normalizeWorkspaceTodoDeviceId(options.deviceId || options.device_id);
   const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
@@ -9627,6 +9680,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     text: normalizeTodoQueueText(text),
+    ...(deviceId ? { deviceId } : {}),
     ...(workspaceId ? { workspaceId } : {}),
   };
 }
@@ -9644,6 +9698,7 @@ function normalizeTodoQueueItem(item) {
   const source = normalizeTodoQueueSource(item.source);
   const planTask = getTodoQueueItemPlanTask(item);
   const workspaceId = String(item.workspaceId || item.workspace_id || "").trim();
+  const deviceId = normalizeWorkspaceTodoDeviceId(item.deviceId || item.device_id);
   const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
@@ -9713,6 +9768,7 @@ function normalizeTodoQueueItem(item) {
     ...(targetTerminalColor ? { targetTerminalColor } : {}),
     ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
     text,
+    ...(deviceId ? { deviceId } : {}),
     ...(workspaceId ? { workspaceId } : {}),
   };
 }
@@ -9732,6 +9788,25 @@ function normalizeTodoQueueItems(items) {
       keyed.set(key, preferTodoQueueStorageItem(keyed.get(key), item));
     });
   return [...keyed.values(), ...unkeyed].slice(0, TODO_QUEUE_MAX_ITEMS);
+}
+
+function normalizeTodoQueueItemsForWorkspace(items, workspaceId = "", deviceId = "") {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const safeDeviceId = normalizeWorkspaceTodoDeviceId(deviceId);
+  return normalizeTodoQueueItems(items)
+    .map((item) => {
+      const itemWorkspaceId = String(item?.workspaceId || item?.workspace_id || "").trim();
+      if (safeWorkspaceId && itemWorkspaceId && itemWorkspaceId !== safeWorkspaceId) {
+        return null;
+      }
+      const itemDeviceId = normalizeWorkspaceTodoDeviceId(item?.deviceId || item?.device_id);
+      return {
+        ...item,
+        ...(safeDeviceId && !itemDeviceId ? { deviceId: safeDeviceId } : {}),
+        ...(safeWorkspaceId && !itemWorkspaceId ? { workspaceId: safeWorkspaceId } : {}),
+      };
+    })
+    .filter(Boolean);
 }
 
 function readTodoQueueItems(storageKey) {
@@ -9787,11 +9862,17 @@ function collectWorkspaceTodoSyncRemovedIds(result) {
 }
 
 function buildTodoQueueCloudSyncItem(item, {
+  deviceId = "",
   status = "",
   workspaceId = "",
 } = {}) {
   const normalizedItem = normalizeTodoQueueItem(item);
   if (!normalizedItem) {
+    return null;
+  }
+  const effectiveDeviceId = normalizeWorkspaceTodoDeviceId(normalizedItem.deviceId || deviceId);
+  const effectiveWorkspaceId = String(normalizedItem.workspaceId || workspaceId || "").trim();
+  if (!effectiveDeviceId || !effectiveWorkspaceId) {
     return null;
   }
   const images = getTodoQueueItemImages(normalizedItem);
@@ -9817,8 +9898,9 @@ function buildTodoQueueCloudSyncItem(item, {
     ...(normalizedItem.todoDeletedAt ? { deletedAt: normalizedItem.todoDeletedAt } : {}),
     ...(normalizedItem.todoStatusReason ? { reason: normalizedItem.todoStatusReason } : {}),
     kind: normalizeTodoQueueKind(normalizedItem.kind),
+    deviceId: effectiveDeviceId,
     ...(normalizedItem.source ? { source: normalizedItem.source } : {}),
-    ...(workspaceId || normalizedItem.workspaceId ? { workspaceId: normalizedItem.workspaceId || workspaceId } : {}),
+    workspaceId: effectiveWorkspaceId,
     ...(note ? {
       note: {
         title: note.title || "",
@@ -9871,6 +9953,7 @@ function normalizeTodoQueueRemoteCommandReceiptStatus(value) {
     "timed_out",
     "timeout",
     "duplicate_ignored",
+    "released",
   ].includes(status)
     ? status === "canceled"
       ? "cancelled"
@@ -10452,13 +10535,6 @@ function createTodoQueueItemFromWorkspaceTodo(item, workspaceId, hydratedText = 
     todoStatus: "listed",
     todoStatusReason: item?.todoStatusReason || item?.todo_status_reason || item?.statusReason || item?.status_reason || "",
     workspaceId,
-    targetAgentId: item?.targetAgentId || item?.target_agent_id || "",
-    targetTerminalId: item?.targetTerminalId || item?.target_terminal_id || "",
-    targetTerminalIndex: item?.targetTerminalIndex ?? item?.target_terminal_index,
-    targetTerminalName: item?.targetTerminalName || item?.target_terminal_name || "",
-    targetThreadId: item?.targetThreadId || item?.target_thread_id || "",
-    targetColorSlot: item?.targetColorSlot ?? item?.target_color_slot,
-    targetTerminalColor: item?.targetTerminalColor || item?.target_terminal_color || "",
   });
 }
 
@@ -13757,9 +13833,10 @@ function TerminalView({
   const buildTodoQueueCloudSyncPayload = useCallback((items, options = {}) => {
     const pendingItems = options.pendingItems || todoQueuePendingItemsRef.current || {};
     const workspaceId = terminalWorkspace?.id || "";
-    const normalizedItems = normalizeTodoQueueItems(items);
+    const normalizedItems = normalizeTodoQueueItemsForWorkspace(items, workspaceId, cloudDesktopDeviceId);
     const cloudItems = normalizedItems
       .map((item) => buildTodoQueueCloudSyncItem(item, {
+        deviceId: cloudDesktopDeviceId,
         status: getTodoQueueItemCloudStatus(item, pendingItems[item.id] || null),
         workspaceId,
       }))
@@ -13777,6 +13854,7 @@ function TerminalView({
       todos: cloudItems,
     };
   }, [
+    cloudDesktopDeviceId,
     terminalWorkspace?.id,
   ]);
 
@@ -13831,9 +13909,13 @@ function TerminalView({
         );
         const removedSet = new Set(removedIds);
         setTodoQueueItems((currentItems) => {
-          const nextItems = currentItems.filter((item) => (
-            !removedSet.has(String(item?.id || "").trim())
-          ));
+          const nextItems = normalizeTodoQueueItemsForWorkspace(
+            currentItems.filter((item) => (
+              !removedSet.has(String(item?.id || "").trim())
+            )),
+            workspaceId,
+            cloudDesktopDeviceId,
+          );
           if (nextItems.length === currentItems.length) {
             return currentItems;
           }
@@ -13866,6 +13948,7 @@ function TerminalView({
     todoQueueCloudSyncTimerRef.current = window.setTimeout(send, TODO_QUEUE_CLOUD_SYNC_DEBOUNCE_MS);
   }, [
     buildTodoQueueCloudSyncPayload,
+    cloudDesktopDeviceId,
     defaultWorkingDirectory,
     terminalWorkspace?.id,
     terminalWorkspace?.name,
@@ -15666,8 +15749,10 @@ function TerminalView({
         reason,
       });
       setTodoQueueItems((currentItems) => {
-        const nextItems = normalizeTodoQueueItems(
+        const nextItems = normalizeTodoQueueItemsForWorkspace(
           currentItems.filter((item) => item.id !== itemId),
+          terminalWorkspace?.id || "",
+          cloudDesktopDeviceId,
         );
         logTerminalStatus("frontend.todo_queue.items_state", {
           nextItemCount: nextItems.length,
@@ -15729,25 +15814,29 @@ function TerminalView({
       replaceTodoQueuePendingItems(nextPendingItems);
       const settledAt = new Date().toISOString();
       setTodoQueueItems((currentItems) => {
-        const nextItems = normalizeTodoQueueItems(currentItems.map((item) => (
-          item.id === itemId
-            ? getTodoQueueItemWithCloudStatus(
-              getTodoQueueItemWithTerminalAssignment(
-                getTodoQueueItemWithoutPersistedQueueState(item),
-                terminalAssignmentFields,
-              ),
-              recoverableSettleStatus,
-              {
-                failedAt: settledAt,
-                interruptedAt: settledAt,
-                pausedAt: settledAt,
-                reason,
-                timedOutAt: settledAt,
-                updatedAt: settledAt,
-              },
-            )
-            : item
-        )));
+        const nextItems = normalizeTodoQueueItemsForWorkspace(
+          currentItems.map((item) => (
+            item.id === itemId
+              ? getTodoQueueItemWithCloudStatus(
+                getTodoQueueItemWithTerminalAssignment(
+                  getTodoQueueItemWithoutPersistedQueueState(item),
+                  terminalAssignmentFields,
+                ),
+                recoverableSettleStatus,
+                {
+                  failedAt: settledAt,
+                  interruptedAt: settledAt,
+                  pausedAt: settledAt,
+                  reason,
+                  timedOutAt: settledAt,
+                  updatedAt: settledAt,
+                },
+              )
+              : item
+          )),
+          terminalWorkspace?.id || "",
+          cloudDesktopDeviceId,
+        );
         writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
         syncTodoQueueItemsToCloud(nextItems, {
           force: true,
@@ -15755,6 +15844,70 @@ function TerminalView({
           reason,
         });
         return nextItems;
+      });
+      setTodoQueueDispatchRevision((revision) => revision + 1);
+      return;
+    }
+
+    if ([
+      "terminal_closed",
+      "terminal_unavailable",
+      "terminal_instance_changed",
+      "terminal_thread_changed",
+    ].includes(normalizedSettleReason)) {
+      const releasedItem = todoQueueItemsRef.current.find((item) => item.id === itemId) || null;
+      const workspaceId = String(pendingItem?.workspaceId || fields.workspaceId || terminalWorkspace?.id || "");
+      if (releasedItem) {
+        recordTodoQueueRemoteCommandReceipt(releasedItem, "released", {
+          commandId: pendingItem?.commandId || "",
+          dispatchId: pendingItem?.dispatchId || pendingItem?.todoDispatchId || "",
+          reason,
+          workspaceId,
+        });
+      }
+      if (pendingItem) {
+        logTerminalStatus("frontend.todo_queue.pending_clear", {
+          elapsedMs: Date.now() - Number(pendingItem.startedAtMs || Date.now()),
+          itemId,
+          phase: pendingItem.phase || pendingItem.state || "sending",
+          promptEventId,
+          reason,
+          targetRole: pendingItem.targetRole || "",
+          targetTerminalIndex: safeTerminalIndex,
+          workspaceId,
+          ...fields,
+        });
+      }
+      const nextPendingItems = { ...todoQueuePendingItemsRef.current };
+      delete nextPendingItems[itemId];
+      replaceTodoQueuePendingItems(nextPendingItems);
+      const releasedAt = new Date().toISOString();
+      setTodoQueueItems((currentItems) => {
+        const nextItems = normalizeTodoQueueItemsForWorkspace(
+          currentItems.map((item) => (
+            item.id === itemId
+              ? getTodoQueueItemReleasedToListed(item, reason, { updatedAt: releasedAt })
+              : item
+          )),
+          terminalWorkspace?.id || "",
+          cloudDesktopDeviceId,
+        );
+        writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
+        syncTodoQueueItemsToCloud(nextItems, {
+          force: true,
+          immediate: true,
+          reason,
+        });
+        return nextItems;
+      });
+      logTerminalStatus("frontend.todo_queue.in_flight_prompt_released", {
+        itemId,
+        promptEventId,
+        reason,
+        targetTerminalIndex: safeTerminalIndex,
+        threadId: inFlightPrompt?.threadId || "",
+        workspaceId,
+        ...fields,
       });
       setTodoQueueDispatchRevision((revision) => revision + 1);
       return;
@@ -15806,21 +15959,25 @@ function TerminalView({
       [itemId]: requeuedPendingItem,
     });
     setTodoQueueItems((currentItems) => {
-      const nextItems = normalizeTodoQueueItems(currentItems.map((item) => (
-        item.id === itemId
-          ? getTodoQueueItemWithPersistedQueueState(item, "queued", {
-            reason,
-            source: requeuedPendingItem.source,
-            targetAgentId: requeuedPendingItem.targetRole,
-            targetColorSlot: requeuedPendingItem.targetColorSlot,
-            targetTerminalColor: requeuedPendingItem.targetTerminalColor,
-            targetTerminalId: requeuedPendingItem.targetTerminalId,
-            targetTerminalIndex: requeuedPendingItem.targetTerminalIndex,
-            targetThreadId: requeuedPendingItem.targetThreadId,
-            targetExplicit: requeuedHasExplicitTerminalTarget,
-          })
-          : item
-      )));
+      const nextItems = normalizeTodoQueueItemsForWorkspace(
+        currentItems.map((item) => (
+          item.id === itemId
+            ? getTodoQueueItemWithPersistedQueueState(item, "queued", {
+              reason,
+              source: requeuedPendingItem.source,
+              targetAgentId: requeuedPendingItem.targetRole,
+              targetColorSlot: requeuedPendingItem.targetColorSlot,
+              targetTerminalColor: requeuedPendingItem.targetTerminalColor,
+              targetTerminalId: requeuedPendingItem.targetTerminalId,
+              targetTerminalIndex: requeuedPendingItem.targetTerminalIndex,
+              targetThreadId: requeuedPendingItem.targetThreadId,
+              targetExplicit: requeuedHasExplicitTerminalTarget,
+            })
+            : item
+        )),
+        terminalWorkspace?.id || "",
+        cloudDesktopDeviceId,
+      );
       writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
       syncTodoQueueItemsToCloud(nextItems, { reason: "todo_queue_requeued" });
       return nextItems;
@@ -15837,6 +15994,7 @@ function TerminalView({
     setTodoQueueDispatchRevision((revision) => revision + 1);
   }, [
     recordTodoQueueRemoteCommandReceipt,
+    cloudDesktopDeviceId,
     replaceTodoQueuePendingItems,
     syncTodoQueueItemsToCloud,
     terminalWorkspace?.id,
@@ -16502,7 +16660,11 @@ function TerminalView({
 	      }
 	    });
 	    todoQueueComposerIdleTimersRef.current.clear();
-	    const persistedItems = readTodoQueueItems(todoQueueStorageKey);
+    const persistedItems = normalizeTodoQueueItemsForWorkspace(
+      readTodoQueueItems(todoQueueStorageKey),
+      terminalWorkspace?.id || "",
+      cloudDesktopDeviceId,
+    );
     const queuedPersistedItems = persistedItems.filter((item) => normalizeTodoQueuePersistedQueueState(item));
     const rehydratedAtMs = Date.now();
     todoQueueRehydratedAtMsRef.current = queuedPersistedItems.length ? rehydratedAtMs : 0;
@@ -16530,6 +16692,7 @@ function TerminalView({
     }
   }, [
     replaceTodoQueuePendingItems,
+    cloudDesktopDeviceId,
     syncTodoQueueItemsToCloud,
     terminalWorkspace?.id,
     todoQueueStorageKey,
@@ -17771,8 +17934,10 @@ function TerminalView({
 
   const updateTodoQueueItems = useCallback((updater, options = {}) => {
     setTodoQueueItems((currentItems) => {
-      const nextItems = normalizeTodoQueueItems(
+      const nextItems = normalizeTodoQueueItemsForWorkspace(
         typeof updater === "function" ? updater(currentItems) : updater,
+        terminalWorkspace?.id || "",
+        cloudDesktopDeviceId,
       );
       const previousImageCount = currentItems.filter((item) => getTodoQueueItemImage(item)).length;
       const nextImageCount = nextItems.filter((item) => getTodoQueueItemImage(item)).length;
@@ -17803,7 +17968,17 @@ function TerminalView({
       }
       return nextItems;
     });
-  }, [syncTodoQueueItemsToCloud, terminalWorkspace?.id]);
+  }, [cloudDesktopDeviceId, syncTodoQueueItemsToCloud, terminalWorkspace?.id]);
+
+  useEffect(() => {
+    if (!terminalWorkspace?.id || !cloudDesktopDeviceId) {
+      return;
+    }
+    updateTodoQueueItems((currentItems) => currentItems, {
+      reason: "todo_queue_identity_normalized",
+      skipCloudSync: true,
+    });
+  }, [cloudDesktopDeviceId, terminalWorkspace?.id, updateTodoQueueItems]);
 
   useEffect(() => {
     const workspaceId = terminalWorkspace?.id || "";
@@ -17938,10 +18113,22 @@ function TerminalView({
         : ["interrupted", "provider_turn_interrupted"].includes(normalizedReason)
           ? "interrupted"
           : ["timed_out", "timeout", "expired"].includes(normalizedReason)
-            ? "timed_out"
-            : ["error", "failed", "provider_turn_error"].includes(normalizedReason)
-              ? "failed"
-              : "";
+          ? "timed_out"
+          : ["error", "failed", "provider_turn_error"].includes(normalizedReason)
+            ? "failed"
+            : "";
+    const releaseReceiptStatus = [
+      "terminal_closed",
+      "terminal_unavailable",
+      "target_terminal_closed",
+      "target_terminal_not_found",
+      "target_terminal_unavailable",
+      "target_agent_mismatch",
+      "terminal_instance_changed",
+      "terminal_thread_changed",
+    ].includes(normalizedReason)
+      ? "released"
+      : "";
     const terminalAssignmentFields = {
       targetAgentId: fields.targetAgentId || pendingItem.targetAgentId || pendingItem.targetRole || "",
       targetColorSlot: fields.targetColorSlot ?? pendingItem.targetColorSlot,
@@ -17950,10 +18137,10 @@ function TerminalView({
       targetTerminalIndex: fields.targetTerminalIndex ?? pendingItem.targetTerminalIndex,
       targetThreadId: fields.targetThreadId || pendingItem.targetThreadId || "",
     };
-    if (remoteReceiptStatus) {
+    if (remoteReceiptStatus || releaseReceiptStatus) {
       const item = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
       if (item) {
-        recordTodoQueueRemoteCommandReceipt(item, remoteReceiptStatus, {
+        recordTodoQueueRemoteCommandReceipt(item, remoteReceiptStatus || releaseReceiptStatus, {
           commandId: pendingItem.commandId || fields.commandId || fields.command_id || "",
           dispatchId: pendingItem.dispatchId || pendingItem.todoDispatchId || fields.dispatchId || fields.dispatch_id || fields.todoDispatchId || fields.todo_dispatch_id || "",
           dispatchSource: pendingItem.dispatchSource || fields.dispatchSource || fields.dispatch_source,
@@ -18013,19 +18200,16 @@ function TerminalView({
                 updatedAt: settledAt,
               },
             )
-            : getTodoQueueItemWithCloudStatus(
-              getTodoQueueItemWithoutPersistedQueueState(item),
-              "listed",
-              {
-                reason,
+            : releaseReceiptStatus
+              ? getTodoQueueItemReleasedToListed(item, reason, {
                 updatedAt: settledAt,
-              },
-            )
+              })
+              : getTodoQueueItemWithoutPersistedQueueState(item)
           : item
       ))
     ), {
-      force: Boolean(remoteReceiptStatus),
-      immediate: Boolean(remoteReceiptStatus),
+      force: Boolean(remoteReceiptStatus || releaseReceiptStatus),
+      immediate: Boolean(remoteReceiptStatus || releaseReceiptStatus),
       reason: `todo_queue_pending_${reason}`,
     });
   }, [
@@ -20908,6 +21092,8 @@ function TerminalView({
     const text = normalizeTodoQueueText(todoQueueDraft);
     const images = dedupeTodoQueueImages(Array.isArray(options.images) ? options.images : [options.image]);
     const note = normalizeTodoQueueNote(options.note);
+    const workspaceId = terminalWorkspace?.id || "";
+    const deviceId = cloudDesktopDeviceId || "";
 
     if (!text && !images.length && !note) {
       return [];
@@ -20915,10 +21101,16 @@ function TerminalView({
 
     const nextItems = images.length
       ? [createTodoQueueItem(text, {
+        deviceId,
         images,
         ...(note ? { note } : {}),
+        workspaceId,
       })]
-      : [createTodoQueueItem(text, note ? { note } : {})];
+      : [createTodoQueueItem(text, {
+        deviceId,
+        ...(note ? { note } : {}),
+        workspaceId,
+      })];
 
     if (images.length) {
       logBigViewSyncDiagnosticEvent("tui.image.queue_add", {
@@ -20938,7 +21130,7 @@ function TerminalView({
     setTodoDropError("");
     setTodoQueueDraft("");
     return nextItems;
-  }, [todoQueueDraft, updateTodoQueueItems]);
+  }, [cloudDesktopDeviceId, terminalWorkspace?.id, todoQueueDraft, updateTodoQueueItems]);
 
   const removeTodoQueueItem = useCallback((itemId) => {
     const item = todoQueueItemsRef.current.find((candidate) => candidate.id === itemId) || null;
@@ -21777,9 +21969,50 @@ function TerminalView({
     );
 
     if (!queuedItem || !target) {
+      const dispatchWaitReason = dispatchSelection.reason || selectionTargetInfo.reason || "no_available_terminal";
+      if (queuedItem && queuedItemHasExplicitTerminalTarget && [
+        "target_terminal_not_found",
+        "terminal_unavailable",
+        "terminal_closed",
+        "target_agent_mismatch",
+      ].includes(String(dispatchWaitReason || "").trim().toLowerCase().replace(/[-\s]+/g, "_"))) {
+        const releasedAt = new Date().toISOString();
+        const pendingItems = { ...todoQueuePendingItemsRef.current };
+        delete pendingItems[queuedItem.id];
+        replaceTodoQueuePendingItems(pendingItems);
+        recordTodoQueueRemoteCommandReceipt(queuedItem, "released", {
+          reason: dispatchWaitReason,
+          workspaceId: queuedItem.workspaceId || terminalWorkspace?.id || "",
+        });
+        updateTodoQueueItems((currentItems) => (
+          currentItems.map((item) => (
+            item.id === queuedItem.id
+              ? getTodoQueueItemReleasedToListed(item, dispatchWaitReason, {
+                updatedAt: releasedAt,
+              })
+              : item
+          ))
+        ), {
+          force: true,
+          immediate: true,
+          reason: `todo_queue_${dispatchWaitReason}`,
+        });
+        logTerminalStatus("frontend.todo_queue.target_released_to_listed", {
+          item: getTodoQueueItemLogSummary([queuedItem])[0] || null,
+          reason: dispatchWaitReason,
+          requestedTargetAgentId,
+          requestedTargetTerminalId,
+          requestedTargetTerminalIndex: Number.isInteger(requestedTargetTerminalIndex) ? requestedTargetTerminalIndex : "",
+          requestedTargetTerminalName,
+          requestedTargetThreadId,
+          workspaceId: terminalWorkspace?.id || "",
+        });
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+        return;
+      }
       logTerminalStatus("frontend.todo_queue.dispatch_wait", {
         item: getTodoQueueItemLogSummary(queuedItem ? [queuedItem] : [])[0] || null,
-        reason: dispatchSelection.reason || selectionTargetInfo.reason || "no_available_terminal",
+        reason: dispatchWaitReason,
         requestedTargetAgentId,
         requestedTargetTerminalId,
         requestedTargetTerminalIndex: Number.isInteger(requestedTargetTerminalIndex) ? requestedTargetTerminalIndex : "",
@@ -22102,6 +22335,7 @@ function TerminalView({
     logicalTerminalIndexes,
     recordTodoQueueRemoteCommandReceipt,
     recordVoicePlanTaskStatus,
+    replaceTodoQueuePendingItems,
     resolveTodoQueueTerminalTargetByName,
     sendTodoQueueItemToTerminal,
     setTodoQueueItemPending,

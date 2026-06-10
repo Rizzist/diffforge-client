@@ -521,13 +521,14 @@ import ArchitectureWorkspaceView, { ArchitectureHubView } from "../architecture/
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
-import ActivityOverlayWindow, { ACTIVITY_OVERLAY_HASH } from "../activity/ActivityOverlay.jsx";
+import ActivityOverlayWindow, {
+  ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY,
+  ACTIVITY_OVERLAY_HASH,
+} from "../activity/ActivityOverlay.jsx";
 import AudioWorkspaceView, { AudioWidgetWindow, AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, AUDIO_WIDGET_HASH, AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT } from "../audio/AudioWorkspaceView.jsx";
 import SnippingWorkspaceView, { SnippingOverlayWindow, SNIPPING_OVERLAY_HASH } from "../snipping/SnippingWorkspaceView.jsx";
 import SnippingQuickAccess, {
   SnippingAnnotationEditorWindow,
-  SnippingDetachedPreviewWindow,
-  SNIPPING_DETACHED_HASH,
   SNIPPING_EDITOR_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
@@ -5738,10 +5739,6 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 export default function App() {
   if (window.location.hash === SNIPPING_OVERLAY_HASH) {
     return <SnippingOverlayWindow />;
-  }
-
-  if (window.location.hash.startsWith(SNIPPING_DETACHED_HASH)) {
-    return <SnippingDetachedPreviewWindow />;
   }
 
   if (window.location.hash.startsWith(SNIPPING_EDITOR_HASH)) {
@@ -14939,6 +14936,32 @@ export default function App() {
   const selectedWorkspaceFileRoot = selectedWorkspace
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
     : "";
+  const activityOverlayContext = useMemo(() => ({
+    repoPath: selectedWorkspaceFileRoot || "",
+    workspaceId: selectedWorkspace?.id || "",
+    workspaceName: selectedWorkspace?.name || "",
+  }), [
+    selectedWorkspace?.id,
+    selectedWorkspace?.name,
+    selectedWorkspaceFileRoot,
+  ]);
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      window.localStorage.setItem(ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY, JSON.stringify({
+        ...activityOverlayContext,
+        updatedAt: Date.now(),
+      }));
+    } catch {
+      // The activity overlay falls back to account-level assets if context cannot be shared.
+    }
+  }, [
+    activityOverlayContext.repoPath,
+    activityOverlayContext.workspaceId,
+    activityOverlayContext.workspaceName,
+  ]);
   const assetWorkspaceOptions = useMemo(() => (
     workspaces.map((workspace) => {
       const workspaceId = String(workspace?.id || "").trim();

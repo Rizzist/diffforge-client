@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { createGlobalStyle, keyframes } from "styled-components";
 
 export const ACTIVITY_OVERLAY_HASH = "#/activity-overlay";
+export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.context";
 
 const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
@@ -52,24 +53,58 @@ function dataValue(value) {
   return data || object || {};
 }
 
-function readCachedWorkspaceTodos() {
+function normalizeActivityOverlayContext(value) {
+  const object = jsonObject(value) || {};
+  return {
+    repoPath: text(object.repoPath || object.repo_path),
+    workspaceId: text(object.workspaceId || object.workspace_id),
+    workspaceName: text(object.workspaceName || object.workspace_name),
+  };
+}
+
+function readActivityOverlayContext() {
+  if (typeof window === "undefined") {
+    return normalizeActivityOverlayContext(null);
+  }
+  try {
+    return normalizeActivityOverlayContext(window.localStorage.getItem(ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY));
+  } catch {
+    return normalizeActivityOverlayContext(null);
+  }
+}
+
+function storageKeyPart(value) {
+  return text(value, "none")
+    .replace(/[^\w.-]/gu, "_")
+    .slice(0, 120) || "none";
+}
+
+function workspaceTodosCacheKey(context = {}) {
+  return `${WORKSPACE_TODOS_CACHE_KEY}.${storageKeyPart(context.repoPath)}.${storageKeyPart(context.workspaceId)}`;
+}
+
+function activityOverlayContextKey(context = {}) {
+  return `${text(context.repoPath)}\n${text(context.workspaceId)}`;
+}
+
+function readCachedWorkspaceTodos(context = {}) {
   if (typeof window === "undefined") {
     return {};
   }
   try {
-    return jsonObject(window.localStorage.getItem(WORKSPACE_TODOS_CACHE_KEY)) || {};
+    return jsonObject(window.localStorage.getItem(workspaceTodosCacheKey(context))) || {};
   } catch {
     return {};
   }
 }
 
-function writeCachedWorkspaceTodos(value) {
+function writeCachedWorkspaceTodos(value, context = {}) {
   const workspaceTodos = jsonObject(value);
   if (typeof window === "undefined" || !workspaceTodos) {
     return;
   }
   try {
-    window.localStorage.setItem(WORKSPACE_TODOS_CACHE_KEY, JSON.stringify(workspaceTodos));
+    window.localStorage.setItem(workspaceTodosCacheKey(context), JSON.stringify(workspaceTodos));
   } catch {
     // Cache hydration is best-effort; the Rust mirror remains the source of truth.
   }
@@ -284,21 +319,78 @@ function collectionItems(collection) {
   return [];
 }
 
-function collectionsByWorkspace(collection) {
+function collectionWorkspaceId(entry) {
+  return firstText(
+    entry?.workspaceId,
+    entry?.workspace_id,
+    entry?.observerWorkspaceId,
+    entry?.observer_workspace_id,
+    entry?.targetWorkspaceId,
+    entry?.target_workspace_id,
+  );
+}
+
+function collectionsByWorkspace(collection, workspaceId = "") {
+  const safeWorkspaceId = text(workspaceId);
   if (Array.isArray(collection)) {
-    return collection.flatMap((entry) => collectionItems(entry));
+    return collection
+      .filter((entry) => !safeWorkspaceId || collectionWorkspaceId(entry) === safeWorkspaceId)
+      .flatMap((entry) => collectionItems(entry));
   }
   const object = jsonObject(collection);
   if (!object) {
     return [];
   }
+  if (safeWorkspaceId) {
+    const direct = object[safeWorkspaceId] || object[safeWorkspaceId.toLowerCase()];
+    if (direct) {
+      return collectionItems(direct);
+    }
+    return Object.values(object)
+      .filter((entry) => collectionWorkspaceId(entry) === safeWorkspaceId)
+      .flatMap((entry) => collectionItems(entry));
+  }
   return Object.values(object).flatMap((entry) => collectionItems(entry));
 }
 
-function workspaceTodoCollection(workspaceTodos, directKeys, byWorkspaceKeys) {
+function workspaceIdsForTodoItem(item, kind = "todo") {
+  const common = [
+    item?.workspaceId,
+    item?.workspace_id,
+    item?.observerWorkspaceId,
+    item?.observer_workspace_id,
+    item?.todoWorkspaceId,
+    item?.todo_workspace_id,
+    item?.originWorkspaceId,
+    item?.origin_workspace_id,
+  ];
+  if (kind === "dispatch") {
+    return [
+      item?.targetWorkspaceId,
+      item?.target_workspace_id,
+      ...common,
+    ].map(text).filter(Boolean);
+  }
+  return common.map(text).filter(Boolean);
+}
+
+function todoItemMatchesWorkspace(item, workspaceId, kind = "todo") {
+  const safeWorkspaceId = text(workspaceId);
+  if (!safeWorkspaceId) {
+    return false;
+  }
+  return workspaceIdsForTodoItem(item, kind).some((candidate) => candidate === safeWorkspaceId);
+}
+
+function workspaceTodoCollection(workspaceTodos, directKeys, byWorkspaceKeys, workspaceId = "", kind = "todo") {
+  const safeWorkspaceId = text(workspaceId);
+  if (!safeWorkspaceId) {
+    return [];
+  }
   const direct = directKeys.flatMap((key) => collectionItems(workspaceTodos?.[key]));
-  const byWorkspace = byWorkspaceKeys.flatMap((key) => collectionsByWorkspace(workspaceTodos?.[key]));
-  return [...direct, ...byWorkspace];
+  const byWorkspace = byWorkspaceKeys.flatMap((key) => collectionsByWorkspace(workspaceTodos?.[key], safeWorkspaceId));
+  const items = byWorkspace.length ? byWorkspace : direct;
+  return items.filter((item) => todoItemMatchesWorkspace(jsonObject(item) || {}, safeWorkspaceId, kind));
 }
 
 function todoIdentity(item, fallback) {
@@ -368,15 +460,17 @@ function todoUpdatedAt(item) {
   );
 }
 
-function todoDisplayStatus(item) {
+function todoDisplayStatus(item, fallback = "listed") {
   const status = statusKey(
-    item?.todoStatus
+    item?.dispatchStatus
+      || item?.dispatch_status
+      || item?.todoStatus
       || item?.todo_status
       || item?.cloudStatus
       || item?.cloud_status
       || item?.status
       || item?.state,
-    "listed",
+    fallback,
   );
   if (status === "queued") {
     return "queued";
@@ -430,33 +524,64 @@ function uniqueCards(cards, limit = CARD_LIMIT) {
     .slice(0, limit);
 }
 
-function normalizeTodoCards(status) {
+function todoCardFromItem(item, index, status, options = {}) {
+  const object = jsonObject(item) || {};
+  const workspace = todoWorkspaceLabel(object);
+  const lane = options.lane || "todos";
+  return {
+    id: `${lane}-${todoIdentity(object, index)}`,
+    detail: workspace,
+    eyebrow: status,
+    lane: "todos",
+    meta: workspace,
+    progress: status === "queued" ? 20 : 0,
+    status,
+    title: todoTitle(object, options.fallbackTitle || "Todo"),
+    tone: status === "queued" ? "warn" : "good",
+    updatedAt: todoUpdatedAt(object),
+  };
+}
+
+function normalizeTodoCards(status, workspaceId = "") {
   const workspaceTodos = workspaceTodosFromStatus(status);
+  const listedCards = workspaceTodoCollection(
+    workspaceTodos,
+    ["items", "todos"],
+    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
+    workspaceId,
+    "todo",
+  ).map((item, index) => {
+    const object = jsonObject(item) || {};
+    const status = todoDisplayStatus(object, "listed");
+    if (status !== "listed") {
+      return null;
+    }
+    return todoCardFromItem(object, index, status, {
+      fallbackTitle: "Listed todo",
+      lane: "todo",
+    });
+  });
+
+  const queuedCards = workspaceTodoCollection(
+    workspaceTodos,
+    ["dispatches", "todoDispatches", "todo_dispatches"],
+    ["dispatchesByWorkspace", "dispatches_by_workspace", "todoDispatchesByWorkspace", "todo_dispatches_by_workspace"],
+    workspaceId,
+    "dispatch",
+  ).map((item, index) => {
+    const object = jsonObject(item) || {};
+    const status = todoDisplayStatus(object, "queued");
+    if (status !== "queued") {
+      return null;
+    }
+    return todoCardFromItem(object, index, status, {
+      fallbackTitle: "Queued todo",
+      lane: "todo-dispatch",
+    });
+  });
+
   return uniqueCards(
-    workspaceTodoCollection(
-      workspaceTodos,
-      ["items", "todos"],
-      ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
-    ).map((item, index) => {
-      const object = jsonObject(item) || {};
-      const status = todoDisplayStatus(object);
-      if (!status || !isLocalTodo(object)) {
-        return null;
-      }
-      const workspace = todoWorkspaceLabel(object);
-      return {
-        id: `todo-${todoIdentity(object, index)}`,
-        detail: workspace,
-        eyebrow: status,
-        lane: "todos",
-        meta: workspace,
-        progress: status === "queued" ? 20 : 0,
-        status,
-        title: todoTitle(object, "Queued todo"),
-        tone: status === "queued" ? "warn" : "good",
-        updatedAt: todoUpdatedAt(object),
-      };
-    }).filter(Boolean),
+    [...queuedCards, ...listedCards].filter(Boolean),
   );
 }
 
@@ -746,26 +871,72 @@ function selectActivityCards(todoCards, transferCards) {
     .slice(0, CARD_LIMIT);
 }
 
-function useActivityOverlayData() {
-  const [state, setState] = useState({
-    cachedWorkspaceTodos: readCachedWorkspaceTodos(),
+function useActivityOverlayContext() {
+  const [context, setContext] = useState(() => readActivityOverlayContext());
+
+  useEffect(() => {
+    const syncContext = () => {
+      setContext(readActivityOverlayContext());
+    };
+    window.addEventListener("storage", syncContext);
+    window.addEventListener("focus", syncContext);
+    syncContext();
+    return () => {
+      window.removeEventListener("storage", syncContext);
+      window.removeEventListener("focus", syncContext);
+    };
+  }, []);
+
+  return context;
+}
+
+function useActivityOverlayData(context) {
+  const [state, setState] = useState(() => ({
+    cachedWorkspaceTodos: readCachedWorkspaceTodos(context),
     cloudStatus: null,
     errors: [],
     library: null,
     updatedAt: 0,
-  });
+  }));
+  const contextRef = useRef(context);
+  const contextKeyRef = useRef(activityOverlayContextKey(context));
   const refreshTimerRef = useRef(0);
   const refreshInFlightRef = useRef(false);
+  const refreshPendingOptionsRef = useRef(null);
+
+  useEffect(() => {
+    contextRef.current = context;
+    contextKeyRef.current = activityOverlayContextKey(context);
+    setState((current) => ({
+      ...current,
+      cachedWorkspaceTodos: readCachedWorkspaceTodos(context),
+      updatedAt: Date.now(),
+    }));
+  }, [context.repoPath, context.workspaceId]);
 
   const refresh = useCallback(async ({ localOnly = true } = {}) => {
     if (refreshInFlightRef.current) {
+      refreshPendingOptionsRef.current = { localOnly: localOnly && refreshPendingOptionsRef.current?.localOnly !== false };
       return;
     }
     refreshInFlightRef.current = true;
-    const cachedTodosPromise = invoke("cloud_mcp_get_cached_workspace_todos")
+    const refreshContext = contextRef.current || {};
+    const refreshContextKey = activityOverlayContextKey(refreshContext);
+    const todoRequest = refreshContext.workspaceId
+      ? {
+        repoPath: refreshContext.repoPath || "",
+        workspaceId: refreshContext.workspaceId,
+      }
+      : null;
+    const cachedTodosPromise = (todoRequest
+      ? invoke("cloud_mcp_get_cached_workspace_todos", todoRequest)
+      : Promise.resolve({}))
       .then((value) => {
+        if (contextKeyRef.current !== refreshContextKey) {
+          return null;
+        }
         const cachedWorkspaceTodos = jsonObject(value) || {};
-        writeCachedWorkspaceTodos(cachedWorkspaceTodos);
+        writeCachedWorkspaceTodos(cachedWorkspaceTodos, refreshContext);
         setState((current) => ({
           ...current,
           cachedWorkspaceTodos,
@@ -775,6 +946,9 @@ function useActivityOverlayData() {
         return cachedWorkspaceTodos;
       })
       .catch(() => {
+        if (contextKeyRef.current !== refreshContextKey) {
+          return null;
+        }
         setState((current) => ({
           ...current,
           errors: Array.from(new Set([...current.errors, "todos"])),
@@ -782,49 +956,59 @@ function useActivityOverlayData() {
         }));
         return null;
       });
-    const [cloudStatusResult, libraryResult] = await Promise.allSettled([
-      invoke("cloud_mcp_get_status"),
-      invoke("cloud_mcp_list_workspace_assets", {
-        includeAllWorkspaces: true,
-        limit: 120,
-        localOnly,
-        repoPath: "",
-      }),
-    ]);
-    const refreshedWorkspaceTodos = await cachedTodosPromise;
-    refreshInFlightRef.current = false;
-    setState((current) => {
-      const errors = [];
-      if (!refreshedWorkspaceTodos) {
-        errors.push("todos");
+    try {
+      const [cloudStatusResult, libraryResult] = await Promise.allSettled([
+        invoke("cloud_mcp_get_status"),
+        invoke("cloud_mcp_list_workspace_assets", {
+          includeAllWorkspaces: true,
+          limit: 120,
+          localOnly,
+          repoPath: "",
+        }),
+      ]);
+      const refreshedWorkspaceTodos = await cachedTodosPromise;
+      if (contextKeyRef.current !== refreshContextKey) {
+        return;
       }
-      if (cloudStatusResult.status === "rejected") {
-        errors.push("cloud");
+      setState((current) => {
+        const errors = [];
+        if (!refreshedWorkspaceTodos) {
+          errors.push("todos");
+        }
+        if (cloudStatusResult.status === "rejected") {
+          errors.push("cloud");
+        }
+        if (libraryResult.status === "rejected") {
+          errors.push("assets");
+        }
+        const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
+        const cloudWorkspaceTodos = cloudStatusResult.status === "fulfilled"
+          ? workspaceTodosFromStatus(cloudStatus)
+          : {};
+        const nextWorkspaceTodos = refreshedWorkspaceTodos
+          || (Object.keys(cloudWorkspaceTodos).length
+            ? cloudWorkspaceTodos
+            : current.cachedWorkspaceTodos);
+        writeCachedWorkspaceTodos(nextWorkspaceTodos, refreshContext);
+        return {
+          ...current,
+          cachedWorkspaceTodos: nextWorkspaceTodos,
+          cloudStatus,
+          errors,
+          library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
+          updatedAt: Date.now(),
+        };
+      });
+    } finally {
+      refreshInFlightRef.current = false;
+      const pendingOptions = refreshPendingOptionsRef.current;
+      refreshPendingOptionsRef.current = null;
+      if (pendingOptions) {
+        window.setTimeout(() => {
+          void refresh(pendingOptions);
+        }, 0);
       }
-      if (libraryResult.status === "rejected") {
-        errors.push("assets");
-      }
-      const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
-      const cloudWorkspaceTodos = cloudStatusResult.status === "fulfilled"
-        ? workspaceTodosFromStatus(cloudStatus)
-        : {};
-      // The reconciled Rust mirror is the source of truth, even when it is
-      // empty: falling back to older snapshots here used to resurrect todos
-      // that no longer exist anywhere else.
-      const nextWorkspaceTodos = refreshedWorkspaceTodos
-        || (Object.keys(cloudWorkspaceTodos).length
-          ? cloudWorkspaceTodos
-          : current.cachedWorkspaceTodos);
-      writeCachedWorkspaceTodos(nextWorkspaceTodos);
-      return {
-        ...current,
-        cachedWorkspaceTodos: nextWorkspaceTodos,
-        cloudStatus,
-        errors,
-        library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
-        updatedAt: Date.now(),
-      };
-    });
+    }
   }, []);
 
   const scheduleRefresh = useCallback((options) => {
@@ -859,13 +1043,12 @@ function useActivityOverlayData() {
       }
     };
 
-    void refresh({ localOnly: true });
     intervalId = window.setInterval(() => {
       void refresh({ localOnly: true });
     }, REFRESH_INTERVAL_MS);
 
     void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT);
-    void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: true } });
+    void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
 
     return () => {
       cancelled = true;
@@ -885,6 +1068,10 @@ function useActivityOverlayData() {
       });
     };
   }, [refresh, scheduleRefresh]);
+
+  useEffect(() => {
+    void refresh({ localOnly: false });
+  }, [context.repoPath, context.workspaceId, refresh]);
 
   return state;
 }
@@ -961,10 +1148,11 @@ function RowGlyph({ kind, status, tone }) {
 }
 
 export default function ActivityOverlayWindow() {
-  const data = useActivityOverlayData();
+  const context = useActivityOverlayContext();
+  const data = useActivityOverlayData(context);
   const todoCards = useMemo(
-    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }),
-    [data.cachedWorkspaceTodos],
+    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, context.workspaceId),
+    [context.workspaceId, data.cachedWorkspaceTodos],
   );
   const transferCards = useMemo(
     () => normalizeTransferCards(data.library),

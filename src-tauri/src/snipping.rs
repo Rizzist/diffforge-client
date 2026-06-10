@@ -15,7 +15,6 @@ const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-s
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
 const SNIPPING_TOAST_WINDOW_LABEL: &str = "snipping-toasts";
-const SNIPPING_DETACHED_WINDOW_PREFIX: &str = "snipping-detached";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
@@ -391,14 +390,6 @@ struct SnippingEditedAssetRequest {
 #[serde(rename_all = "camelCase")]
 struct SnippingAnnotationEditorRequest {
     paths: Vec<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnippingDetachedPreviewRequest {
-    path: String,
-    screen_x: Option<f64>,
-    screen_y: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1386,9 +1377,8 @@ fn position_snipping_toast_window(app: &AppHandle, window: &tauri::WebviewWindow
 
     let work_area = monitor.work_area();
     let scale_factor = monitor.scale_factor().max(0.1);
-    let width = (SNIPPING_TOAST_WINDOW_WIDTH * scale_factor).round() as i32;
     let height = (SNIPPING_TOAST_WINDOW_HEIGHT * scale_factor).round() as i32;
-    let x = work_area.position.x + work_area.size.width as i32 - width - SNIPPING_TOAST_WINDOW_MARGIN;
+    let x = work_area.position.x + SNIPPING_TOAST_WINDOW_MARGIN;
     let y = work_area.position.y + work_area.size.height as i32 - height - SNIPPING_TOAST_WINDOW_MARGIN;
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
@@ -1757,104 +1747,6 @@ fn snipping_center_floating_window(app: &AppHandle, window: &tauri::WebviewWindo
     let y = work_area.position.y
         + ((work_area.size.height as i32 - size.height as i32) / 2).max(0);
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-}
-
-fn snipping_position_detached_preview_window(
-    app: &AppHandle,
-    window: &tauri::WebviewWindow,
-    screen_x: Option<f64>,
-    screen_y: Option<f64>,
-) {
-    let (Some(screen_x), Some(screen_y)) = (screen_x, screen_y) else {
-        snipping_center_floating_window(app, window);
-        return;
-    };
-    if !screen_x.is_finite() || !screen_y.is_finite() {
-        snipping_center_floating_window(app, window);
-        return;
-    }
-
-    let Ok(size) = window.outer_size() else {
-        snipping_center_floating_window(app, window);
-        return;
-    };
-    let monitor = app
-        .get_webview_window("main")
-        .and_then(|main_window| main_window.current_monitor().ok().flatten())
-        .or_else(|| window.current_monitor().ok().flatten());
-
-    let mut x = screen_x.round() as i32 - 18;
-    let mut y = screen_y.round() as i32 - 18;
-    if let Some(monitor) = monitor {
-        let work_area = monitor.work_area();
-        let min_x = work_area.position.x;
-        let min_y = work_area.position.y;
-        let max_x = work_area.position.x + work_area.size.width as i32 - size.width as i32;
-        let max_y = work_area.position.y + work_area.size.height as i32 - size.height as i32;
-        x = x.clamp(min_x, max_x.max(min_x));
-        y = y.clamp(min_y, max_y.max(min_y));
-    }
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-}
-
-fn snipping_detached_preview_window_label(path: &Path) -> String {
-    format!(
-        "{}-{}",
-        SNIPPING_DETACHED_WINDOW_PREFIX,
-        cloud_mcp_short_hash(&path.display().to_string())
-    )
-}
-
-fn snipping_open_detached_preview_window_for(
-    app: &AppHandle,
-    request: SnippingDetachedPreviewRequest,
-) -> Result<Value, String> {
-    let file = diffforge_local_asset_file(&request.path)?;
-    let label = snipping_detached_preview_window_label(&file);
-    if let Some(window) = app.get_webview_window(&label) {
-        snipping_position_detached_preview_window(app, &window, request.screen_x, request.screen_y);
-        window
-            .show()
-            .map_err(|error| format!("Unable to show detached snip preview: {error}"))?;
-        let _ = window.set_focus();
-        return Ok(json!({
-            "kind": "snipping_detached_preview_window_opened",
-            "label": label,
-            "path": file.display().to_string(),
-            "reused": true,
-        }));
-    }
-
-    let encoded_path = snipping_url_token(&file.display().to_string());
-    let window = WebviewWindowBuilder::new(
-        app,
-        label.clone(),
-        WebviewUrl::App(format!("index.html#/snipping-detached/{encoded_path}").into()),
-    )
-    .title("Snip Preview")
-    .inner_size(460.0, 340.0)
-    .min_inner_size(260.0, 180.0)
-    .resizable(true)
-    .decorations(false)
-    .always_on_top(true)
-    .focused(true)
-    .accept_first_mouse(true)
-    .transparent(false)
-    .visible(false)
-    .shadow(true)
-    .build()
-    .map_err(|error| format!("Unable to create detached snip preview: {error}"))?;
-    snipping_position_detached_preview_window(app, &window, request.screen_x, request.screen_y);
-    window
-        .show()
-        .map_err(|error| format!("Unable to show detached snip preview: {error}"))?;
-    let _ = window.set_focus();
-    Ok(json!({
-        "kind": "snipping_detached_preview_window_opened",
-        "label": label,
-        "path": file.display().to_string(),
-        "reused": false,
-    }))
 }
 
 fn snipping_open_floating_asset_window(
@@ -2728,14 +2620,6 @@ fn snipping_read_asset_data_url(path: String) -> Result<String, String> {
         "data:{mime};base64,{}",
         general_purpose::STANDARD.encode(bytes)
     ))
-}
-
-#[tauri::command]
-fn snipping_open_detached_preview_window(
-    app: AppHandle,
-    request: SnippingDetachedPreviewRequest,
-) -> Result<Value, String> {
-    snipping_open_detached_preview_window_for(&app, request)
 }
 
 #[tauri::command]

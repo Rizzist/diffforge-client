@@ -3133,7 +3133,7 @@ async fn cloud_mcp_status_snapshot(state: &CloudMcpState) -> CloudMcpStatus {
     let mut snapshot = cloud_mcp_snapshot(&runtime);
     drop(runtime);
     if snapshot.workspace_todos.is_none() {
-        snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos_from_store();
+        snapshot.workspace_todos = cloud_mcp_todo_mirror_workspace_todos_from_store(None, None);
     }
     snapshot
 }
@@ -7864,6 +7864,9 @@ async fn cloud_mcp_post_event_endpoint(
             &payload,
         )
         .await;
+        let _ = state
+            .global_ws_events
+            .send(cloud_mcp_event_envelope(event_kind, &payload));
     }
     cloud_mcp_background_sync_ensure_started(state);
     let row = cloud_mcp_outbox_enqueue_event(
@@ -11538,8 +11541,30 @@ async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMc
 }
 
 #[tauri::command]
-async fn cloud_mcp_get_cached_workspace_todos() -> Result<Value, String> {
-    Ok(cloud_mcp_todo_mirror_workspace_todos_from_store().unwrap_or_else(|| json!({})))
+async fn cloud_mcp_get_cached_workspace_todos(
+    repo_path: Option<String>,
+    workspace_id: Option<String>,
+) -> Result<Value, String> {
+    let safe_workspace_id = workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let repo_id = repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|path| cloud_mcp_repo_request(path.to_string(), safe_workspace_id.clone(), None).repo_id);
+    let scoped = cloud_mcp_todo_mirror_workspace_todos_from_store(
+        repo_id.as_deref(),
+        safe_workspace_id.as_deref(),
+    );
+    let fallback = if scoped.is_none() && repo_id.is_some() && safe_workspace_id.is_some() {
+        cloud_mcp_todo_mirror_workspace_todos_from_store(None, safe_workspace_id.as_deref())
+    } else {
+        None
+    };
+    Ok(scoped.or(fallback).unwrap_or_else(|| json!({})))
 }
 
 async fn cloud_mcp_refresh_live_runtime_status_if_connected(
@@ -15887,6 +15912,10 @@ async fn cloud_mcp_sync_workspace_todos(
     todos: Value,
     reason: Option<String>,
 ) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Workspace todo sync requires workspace_id.".to_string());
+    }
     let req = cloud_mcp_repo_request(
         repo_path.clone(),
         Some(workspace_id.clone()),
@@ -16075,6 +16104,10 @@ async fn cloud_mcp_request_workspace_todo_dispatch(
     reason: Option<String>,
     mode: Option<String>,
 ) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Workspace todo dispatch requires workspace_id.".to_string());
+    }
     let send_mode = cloud_mcp_proxy_normalize_todo_send_mode(mode.as_deref().unwrap_or("queued"))?;
     let queued_mode = send_mode == "queued";
     let event_kind = if queued_mode {
@@ -17577,7 +17610,23 @@ fn cloud_mcp_todo_mirror_row_workspace_matches(row: &Value, workspace_id: Option
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return true;
+        return [
+            "todo_workspace_id",
+            "todoWorkspaceId",
+            "requested_by_workspace_id",
+            "requestedByWorkspaceId",
+            "target_workspace_id",
+            "targetWorkspaceId",
+            "workspace_id",
+            "workspaceId",
+        ]
+        .iter()
+        .any(|key| {
+            row.get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty())
+        });
     };
     [
         "todo_workspace_id",
@@ -17720,7 +17769,13 @@ fn cloud_mcp_todo_mirror_dispatch_status_is_terminal(status: &str) -> bool {
             | "rejected"
             | "skipped"
             | "duplicate_ignored"
+            | "released"
     )
+}
+
+fn cloud_mcp_todo_mirror_dispatch_status_supersedes_todo(status: &str) -> bool {
+    cloud_mcp_todo_mirror_dispatch_status_is_terminal(status)
+        && status.trim().to_ascii_lowercase() != "released"
 }
 
 fn cloud_mcp_todo_mirror_dispatch_status_is_quiescent(status: &str) -> bool {
@@ -17823,6 +17878,18 @@ fn cloud_mcp_todo_mirror_row_kind(row: &Value) -> String {
     } else {
         "todo".to_string()
     }
+}
+
+fn cloud_mcp_todo_mirror_row_active_in_workspace_view(row: &Value) -> bool {
+    let row_kind = cloud_mcp_todo_mirror_row_kind(row);
+    let status = if row_kind == "dispatch" {
+        cloud_mcp_payload_text(row, &["status", "dispatch_status", "dispatchStatus"])
+            .unwrap_or_else(|| "queued".to_string())
+    } else {
+        cloud_mcp_payload_text(row, &["status", "todo_status", "todoStatus"])
+            .unwrap_or_else(|| "listed".to_string())
+    };
+    !cloud_mcp_todo_mirror_dispatch_status_is_terminal(&status)
 }
 
 fn cloud_mcp_todo_mirror_status_row_key(row: &Value) -> Option<String> {
@@ -18221,12 +18288,6 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
         } else {
             origin_workspace_id.clone()
         };
-        let key = format!(
-            "{}::{}::{}",
-            cloud_mcp_todo_mirror_entry_key(Some(base_url), None, Some(&effective_workspace_id)),
-            row_kind,
-            status_row_key
-        );
         let todo_batch_id = cloud_mcp_todo_mirror_row_column(
             row,
             &["todo_batch_id", "todoBatchId", "batch_id", "batchId"],
@@ -18254,6 +18315,27 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
                 "device_id",
                 "deviceId",
             ],
+        );
+        if effective_workspace_id.is_empty()
+            || (row_kind == "todo"
+                && (todo_id.is_empty()
+                    || origin_device_id.is_empty()
+                    || origin_workspace_id.is_empty()))
+            || (row_kind == "dispatch"
+                && (dispatch_id.is_empty()
+                    || todo_id.is_empty()
+                    || origin_device_id.is_empty()
+                    || origin_workspace_id.is_empty()
+                    || target_device_id.is_empty()
+                    || target_workspace_id.is_empty()))
+        {
+            continue;
+        }
+        let key = format!(
+            "{}::{}::{}",
+            cloud_mcp_todo_mirror_entry_key(Some(base_url), None, Some(&effective_workspace_id)),
+            row_kind,
+            status_row_key
         );
         let status = if row_kind == "dispatch" {
             cloud_mcp_todo_mirror_row_column(row, &["status", "dispatch_status", "dispatchStatus"])
@@ -19856,6 +19938,13 @@ fn cloud_mcp_todo_mirror_snapshot_rows(
 ) -> Vec<(Value, String)> {
     let mut clauses = vec!["row_kind=?".to_string()];
     let mut params = vec![row_kind.to_string()];
+    clauses.push("workspace_id<>''".to_string());
+    clauses.push(
+        "status NOT IN ('completed', 'complete', 'done', 'failed', 'cancelled', 'canceled',
+                        'timed_out', 'timeout', 'deleted', 'removed', 'rejected',
+                        'skipped', 'duplicate_ignored', 'released')"
+            .to_string(),
+    );
     if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
         clauses.push("repo_id=?".to_string());
         params.push(repo_id.to_string());
@@ -19910,6 +19999,13 @@ fn cloud_mcp_todo_mirror_count_rows(
 ) -> usize {
     let mut clauses = vec!["row_kind=?".to_string()];
     let mut params = vec![row_kind.to_string()];
+    clauses.push("workspace_id<>''".to_string());
+    clauses.push(
+        "status NOT IN ('completed', 'complete', 'done', 'failed', 'cancelled', 'canceled',
+                        'timed_out', 'timeout', 'deleted', 'removed', 'rejected',
+                        'skipped', 'duplicate_ignored', 'released')"
+            .to_string(),
+    );
     if let Some(repo_id) = repo_id.map(str::trim).filter(|value| !value.is_empty()) {
         clauses.push("repo_id=?".to_string());
         params.push(repo_id.to_string());
@@ -19944,6 +20040,10 @@ fn cloud_mcp_todo_mirror_count_rows(
 fn cloud_mcp_todo_mirror_group_rows_by_workspace(rows: &[(Value, String)]) -> Vec<Value> {
     let mut grouped = HashMap::<String, Vec<Value>>::new();
     for (row, workspace_id) in rows {
+        if workspace_id.trim().is_empty() || !cloud_mcp_todo_mirror_row_active_in_workspace_view(row)
+        {
+            continue;
+        }
         grouped
             .entry(workspace_id.trim().to_string())
             .or_default()
@@ -20091,10 +20191,13 @@ fn cloud_mcp_todo_mirror_workspace_todos_from_conn(
     Some(workspace_todos)
 }
 
-fn cloud_mcp_todo_mirror_workspace_todos_from_store() -> Option<Value> {
+fn cloud_mcp_todo_mirror_workspace_todos_from_store(
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+) -> Option<Value> {
     let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
     let _ = cloud_mcp_todo_mirror_reconcile_conn(&conn);
-    cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, None, None)
+    cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, repo_id, workspace_id)
 }
 
 /// DiffForge generates aliased ids for one logical todo: the todo id, its
@@ -20215,7 +20318,7 @@ fn cloud_mcp_todo_mirror_reconcile_conn(conn: &rusqlite::Connection) -> Result<u
 
     let mut terminal_seen_ms: HashMap<String, i64> = HashMap::new();
     for (_, todo_id, command_id, dispatch_id, status, updated_ms) in &rows {
-        if !cloud_mcp_todo_mirror_dispatch_status_is_terminal(status) {
+        if !cloud_mcp_todo_mirror_dispatch_status_supersedes_todo(status) {
             continue;
         }
         for token in cloud_mcp_todo_mirror_identity_tokens(todo_id, command_id, dispatch_id) {
@@ -20229,7 +20332,7 @@ fn cloud_mcp_todo_mirror_reconcile_conn(conn: &rusqlite::Connection) -> Result<u
         return Ok(removed);
     }
     for (key, todo_id, command_id, dispatch_id, status, updated_ms) in &rows {
-        if cloud_mcp_todo_mirror_dispatch_status_is_terminal(status) {
+        if cloud_mcp_todo_mirror_dispatch_status_supersedes_todo(status) {
             continue;
         }
         let superseded = cloud_mcp_todo_mirror_identity_tokens(todo_id, command_id, dispatch_id)
@@ -21210,6 +21313,7 @@ mod cloud_mcp_tests {
                         "dispatchId": "dispatch-1",
                         "commandId": "command-1",
                         "todoId": "todo-1",
+                        "todoDeviceId": "device-a",
                         "todoWorkspaceId": "workspace-a",
                         "targetWorkspaceId": "workspace-b",
                         "targetDeviceId": "device-b",
@@ -21254,6 +21358,7 @@ mod cloud_mcp_tests {
                 "dispatchId": "dispatch-1",
                 "commandId": "command-1",
                 "todoId": "todo-1",
+                "todoDeviceId": "device-a",
                 "todoWorkspaceId": "workspace-a",
                 "targetWorkspaceId": "workspace-a",
                 "targetDeviceId": "device-a",
@@ -21277,6 +21382,7 @@ mod cloud_mcp_tests {
                 "dispatchId": "dispatch-1",
                 "commandId": "command-1",
                 "todoId": "todo-1",
+                "todoDeviceId": "device-a",
                 "todoWorkspaceId": "workspace-a",
                 "targetWorkspaceId": "workspace-a",
                 "targetDeviceId": "device-a",
@@ -21324,7 +21430,11 @@ mod cloud_mcp_tests {
             "items": [{
                 "dispatchId": "dispatch-row-workspace",
                 "commandId": "command-row-workspace",
+                "todoId": "todo-row-workspace",
+                "todoWorkspaceId": "workspace-row",
+                "todoDeviceId": "device-row",
                 "targetWorkspaceId": "workspace-row",
+                "targetDeviceId": "device-row",
                 "dispatchStatus": "queued",
                 "updatedAt": "2026-06-07T00:00:00Z"
             }]
@@ -21367,6 +21477,109 @@ mod cloud_mcp_tests {
         )
         .expect("workspace-scoped status");
         assert_eq!(status["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn todo_mirror_rejects_rows_without_required_identity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "workspace_todos": {
+                "items": [{
+                    "todoId": "todo-orphan",
+                    "todoStatus": "listed",
+                    "text": "missing device/workspace"
+                }],
+                "dispatches": [{
+                    "dispatchId": "dispatch-orphan",
+                    "commandId": "command-orphan",
+                    "todoId": "todo-orphan",
+                    "targetWorkspaceId": "workspace-a",
+                    "dispatchStatus": "queued"
+                }]
+            }
+        });
+
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &response,
+        )
+        .unwrap());
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_todo_mirror_rows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        if let Some(workspace_todos) = cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, None, None)
+        {
+            assert_eq!(workspace_todos["items"]["items"].as_array().unwrap().len(), 0);
+            assert_eq!(workspace_todos["dispatches"]["items"].as_array().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn todo_mirror_workspace_todos_excludes_terminal_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let response = json!({
+            "workspace_todos": {
+                "items": [
+                    {
+                        "todoId": "todo-active",
+                        "todoStatus": "listed",
+                        "todoWorkspaceId": "workspace-a",
+                        "todoDeviceId": "device-a",
+                        "workspaceId": "workspace-a",
+                        "deviceId": "device-a",
+                        "text": "active",
+                        "updatedAt": "2026-06-09T00:00:00Z"
+                    },
+                    {
+                        "todoId": "todo-completed",
+                        "todoStatus": "completed",
+                        "todoWorkspaceId": "workspace-a",
+                        "todoDeviceId": "device-a",
+                        "workspaceId": "workspace-a",
+                        "deviceId": "device-a",
+                        "text": "done",
+                        "updatedAt": "2026-06-09T00:01:00Z"
+                    }
+                ],
+                "dispatches": [{
+                    "dispatchId": "dispatch-released",
+                    "commandId": "command-released",
+                    "todoId": "todo-active",
+                    "todoWorkspaceId": "workspace-a",
+                    "todoDeviceId": "device-a",
+                    "targetWorkspaceId": "workspace-a",
+                    "targetDeviceId": "device-a",
+                    "dispatchStatus": "released",
+                    "updatedAt": "2026-06-09T00:02:00Z"
+                }]
+            }
+        });
+
+        assert!(cloud_mcp_update_todo_mirror_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            None,
+            Some("workspace-a"),
+            &response,
+        )
+        .unwrap());
+
+        let workspace_todos =
+            cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, None, Some("workspace-a"))
+                .expect("active workspace todos");
+        let items = workspace_todos["items"]["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["todoId"].as_str(), Some("todo-active"));
+        assert_eq!(workspace_todos["dispatches"]["items"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -21625,6 +21838,7 @@ mod cloud_mcp_tests {
                 "dispatchId": "dispatch-1",
                 "commandId": "command-1",
                 "todoId": "todo-1",
+                "todoDeviceId": "device-a",
                 "todoWorkspaceId": "workspace-a",
                 "targetWorkspaceId": "workspace-b",
                 "targetDeviceId": "device-b",
