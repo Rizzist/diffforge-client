@@ -11,19 +11,16 @@ use xcap::{image::ImageFormat as XcapImageFormat, Monitor as XcapMonitor};
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
+const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
 const SNIPPING_AREA_OVERLAY_WINDOW_LABEL: &str = "snipping-overlay";
-const SNIPPING_TOAST_WINDOW_LABEL: &str = "snipping-toasts";
 const SNIPPING_EDITOR_WINDOW_PREFIX: &str = "snipping-editor";
 const SNIPPING_SHORTCUT_SETTINGS_FILE: &str = "snipping-shortcuts.json";
 const SNIPPING_DISMISSED_TOASTS_FILE: &str = "snipping-dismissed-toasts.json";
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
-const SNIPPING_TOAST_WINDOW_WIDTH: f64 = 316.0;
-const SNIPPING_TOAST_WINDOW_HEIGHT: f64 = 560.0;
-const SNIPPING_TOAST_WINDOW_MARGIN: i32 = 18;
 #[cfg(target_os = "macos")]
 const MACOS_SCREEN_CAPTURE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
@@ -1361,91 +1358,6 @@ fn snipping_capture_area_image(
         .map_err(|error| format!("Unable to capture selected area: {error}"))
 }
 
-fn size_snipping_toast_window(window: &tauri::WebviewWindow) {
-    let _ = window.set_size(tauri::LogicalSize::new(
-        SNIPPING_TOAST_WINDOW_WIDTH,
-        SNIPPING_TOAST_WINDOW_HEIGHT,
-    ));
-}
-
-fn position_snipping_toast_window(app: &AppHandle, window: &tauri::WebviewWindow) {
-    let monitor = app
-        .get_webview_window("main")
-        .and_then(|main_window| main_window.current_monitor().ok().flatten())
-        .or_else(|| window.current_monitor().ok().flatten());
-    let Some(monitor) = monitor else {
-        return;
-    };
-
-    let work_area = monitor.work_area();
-    let scale_factor = monitor.scale_factor().max(0.1);
-    let height = (SNIPPING_TOAST_WINDOW_HEIGHT * scale_factor).round() as i32;
-    let x = work_area.position.x + SNIPPING_TOAST_WINDOW_MARGIN;
-    let y = work_area.position.y + work_area.size.height as i32 - height - SNIPPING_TOAST_WINDOW_MARGIN;
-    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
-}
-
-fn ensure_snipping_toast_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-    if let Some(window) = app.get_webview_window(SNIPPING_TOAST_WINDOW_LABEL) {
-        size_snipping_toast_window(&window);
-        position_snipping_toast_window(app, &window);
-        return Ok(window);
-    }
-
-    let window = WebviewWindowBuilder::new(
-        app,
-        SNIPPING_TOAST_WINDOW_LABEL,
-        WebviewUrl::App("index.html#/snipping-toasts".into()),
-    )
-    .title("Snip Quick Access")
-    .inner_size(SNIPPING_TOAST_WINDOW_WIDTH, SNIPPING_TOAST_WINDOW_HEIGHT)
-    .resizable(false)
-    .decorations(false)
-    .always_on_top(true)
-    .focused(false)
-    .accept_first_mouse(true)
-    .transparent(true)
-    .background_color(Color(0, 0, 0, 0))
-    .visible(false)
-    .shadow(false)
-    .visible_on_all_workspaces(true)
-    .build()
-    .map_err(|error| format!("Unable to create snipping preview window: {error}"))?;
-
-    position_snipping_toast_window(app, &window);
-    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
-    // The preview dock must stay visible over full-screen Spaces too (e.g.
-    // a full-screen browser the user swipes to).
-    #[cfg(target_os = "macos")]
-    if let Ok(ns_window) = window.ns_window() {
-        if !ns_window.is_null() {
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
-            );
-        }
-    }
-    Ok(window)
-}
-
-fn show_snipping_toast_window_for(app: &AppHandle) -> Result<(), String> {
-    let window = ensure_snipping_toast_window(app)?;
-    window
-        .show()
-        .map_err(|error| format!("Unable to show snipping preview window: {error}"))?;
-    position_snipping_toast_window(app, &window);
-    Ok(())
-}
-
-fn show_snipping_toast_window(app: &AppHandle) {
-    let app_for_task = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        let _ = show_snipping_toast_window_for(&app_for_task);
-    });
-}
-
 fn snipping_capture_toast_path(value: &Value) -> Option<String> {
     value
         .get("path")
@@ -1678,7 +1590,13 @@ fn snipping_emit_untracked_image_saved_with_toast(
     diffforge_emit_untracked_assets_updated(app, "snip-saved", payload.get("item").cloned());
     snipping_push_recent_capture_toast(app, payload.clone());
     if show_toast {
-        show_snipping_toast_window(app);
+        // Every snip preview is its own draggable native window from the
+        // start; new captures stack in the bottom-left column.
+        let app_for_preview = app.clone();
+        let preview_path = target.display().to_string();
+        let _ = app.run_on_main_thread(move || {
+            let _ = snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
+        });
     }
     let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
     Ok(payload)
@@ -2030,9 +1948,10 @@ fn snipping_save_edited_untracked_asset_for(
             target.display()
         )
     })?;
-    // Autosaved in-place updates refresh the dock card quietly; only the
-    // first save of a new edited copy raises the dock window.
-    snipping_emit_untracked_image_saved_with_toast(
+    // Edits never spawn a second preview window. The original's preview
+    // retargets itself to the edited copy (or refreshes in place for
+    // re-edits) through the source-updated event below.
+    let saved = snipping_emit_untracked_image_saved_with_toast(
         app,
         &target,
         width,
@@ -2040,9 +1959,50 @@ fn snipping_save_edited_untracked_asset_for(
         "edited",
         "annotation-editor",
         String::new(),
-        original_path,
-        !source_is_edited_copy,
-    )
+        original_path.clone(),
+        false,
+    )?;
+
+    let target_path = target.display().to_string();
+    let original_for_event = original_path
+        .clone()
+        .unwrap_or_else(|| target_path.clone());
+    let _ = app.emit(
+        SNIPPING_SOURCE_UPDATED_EVENT,
+        json!({
+            "kind": "snip_source_updated",
+            "original_path": original_for_event,
+            "originalPath": original_for_event,
+            "edited_path": target_path,
+            "editedPath": target_path,
+            "path": target_path,
+            "in_place": source_is_edited_copy,
+            "inPlace": source_is_edited_copy,
+        }),
+    );
+
+    if !source_is_edited_copy {
+        // No preview is showing the original (already dismissed): give the
+        // fresh edited copy its own preview window instead.
+        let original_label = format!(
+            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+            snipping_window_token(&source)
+        );
+        if app.get_webview_window(&original_label).is_none() {
+            let app_for_preview = app.clone();
+            let preview_path = target_path.clone();
+            let _ = app.run_on_main_thread(move || {
+                let _ = snipping_open_snip_preview_window_for(
+                    &app_for_preview,
+                    &preview_path,
+                    None,
+                    false,
+                );
+            });
+        }
+    }
+
+    Ok(saved)
 }
 
 fn ensure_snipping_enabled(app: &AppHandle) -> Result<(), String> {
@@ -2655,33 +2615,68 @@ fn snipping_save_edited_untracked_asset(
 }
 
 const SNIPPING_FLOAT_WINDOW_PREFIX: &str = "snip-float";
-const SNIPPING_FLOAT_RETURNED_EVENT: &str = "forge-snip-float-returned";
 const SNIPPING_FLOAT_LOGICAL_WIDTH: f64 = 240.0;
+const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
+const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
 
-fn snipping_windows_intersect(
-    left: (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>),
-    right: (tauri::PhysicalPosition<i32>, tauri::PhysicalSize<u32>),
-) -> bool {
-    let (left_pos, left_size) = left;
-    let (right_pos, right_size) = right;
-    let left_x2 = left_pos.x.saturating_add(left_size.width as i32);
-    let left_y2 = left_pos.y.saturating_add(left_size.height as i32);
-    let right_x2 = right_pos.x.saturating_add(right_size.width as i32);
-    let right_y2 = right_pos.y.saturating_add(right_size.height as i32);
-    left_pos.x < right_x2 && right_pos.x < left_x2 && left_pos.y < right_y2 && right_pos.y < left_y2
+/// Bottom-left stacking slot for a new preview window: directly above the
+/// highest preview still sitting in the left column, or the bottom corner of
+/// the work area when none are there.
+fn snipping_preview_stack_position(
+    app: &AppHandle,
+    width: f64,
+    height: f64,
+) -> Option<tauri::PhysicalPosition<i32>> {
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|main_window| main_window.current_monitor().ok().flatten())?;
+    let work_area = monitor.work_area();
+    let scale = monitor.scale_factor().max(0.1);
+    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
+    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
+    let width_physical = (width * scale).round() as i32;
+    let height_physical = (height * scale).round() as i32;
+    let x = work_area.position.x + margin;
+    let bottom_y =
+        work_area.position.y + work_area.size.height as i32 - height_physical - margin;
+
+    let mut highest_top: Option<i32> = None;
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+            continue;
+        }
+        if !window.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let Ok(position) = window.outer_position() else {
+            continue;
+        };
+        // Only stack against previews still parked in the left column; ones
+        // the user dragged away stop reserving a slot.
+        if (position.x - x).abs() > width_physical {
+            continue;
+        }
+        highest_top = Some(highest_top.map_or(position.y, |current| current.min(position.y)));
+    }
+
+    let y = match highest_top {
+        Some(top) => (top - gap - height_physical).max(work_area.position.y + margin),
+        None => bottom_y,
+    };
+    Some(tauri::PhysicalPosition::new(x, y))
 }
 
-/// Opens one snip preview as its own small native window at the given
-/// logical screen position. Dragging it over the queue dock sends it back:
-/// the dock is notified and the float closes itself.
-#[tauri::command]
-fn snipping_open_snip_float(
-    app: AppHandle,
-    path: String,
-    x: f64,
-    y: f64,
+/// Opens one snip preview as its own draggable native window. Every preview is
+/// a standalone window from the moment it is captured: new previews stack in
+/// the bottom-left column and can be dragged anywhere (over any Space) without
+/// ever changing identity.
+fn snipping_open_snip_preview_window_for(
+    app: &AppHandle,
+    path: &str,
+    explicit_position: Option<(f64, f64)>,
+    focused: bool,
 ) -> Result<Value, String> {
-    let file = diffforge_local_asset_file(&path)?;
+    let file = diffforge_local_asset_file(path)?;
     let (image_width, image_height) = xcap::image::image_dimensions(&file)
         .map_err(|error| format!("Unable to read snip dimensions: {error}"))?;
     let aspect = if image_width > 0 {
@@ -2692,27 +2687,43 @@ fn snipping_open_snip_float(
     let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
     let height = (width * aspect).clamp(60.0, 420.0);
     let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
+
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.show();
+        if focused {
+            let _ = existing.set_focus();
+        }
+        return Ok(json!({
+            "kind": "snip_float_opened",
+            "label": label,
+            "path": file.display().to_string(),
+            "already_open": true,
+            "width": width,
+            "height": height,
+        }));
+    }
+
     let encoded_path = snipping_url_token(&file.display().to_string());
     let window = WebviewWindowBuilder::new(
-        &app,
+        app,
         label.clone(),
         WebviewUrl::App(format!("index.html#/snipping-float/{encoded_path}").into()),
     )
     .title("Snip")
     .inner_size(width, height)
-    .position(x.max(0.0), y.max(0.0))
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
-    .focused(true)
+    .focused(focused)
     .accept_first_mouse(true)
     .skip_taskbar(true)
     .visible_on_all_workspaces(true)
     .transparent(true)
     .background_color(Color(0, 0, 0, 0))
+    .visible(false)
     .shadow(true)
     .build()
-    .map_err(|error| format!("Unable to create snip float window: {error}"))?;
+    .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
     #[cfg(target_os = "macos")]
     if let Ok(ns_window) = window.ns_window() {
         if !ns_window.is_null() {
@@ -2725,55 +2736,17 @@ fn snipping_open_snip_float(
         }
     }
 
-    // Drag-back-to-queue: once the float has been away from the dock at
-    // least once, moving it over the dock returns the snip to the queue.
-    let has_left_dock = Arc::new(AtomicBool::new(false));
-    let app_for_events = app.clone();
-    let float_label = label.clone();
-    let float_path = file.display().to_string();
-    window.on_window_event(move |event| {
-        if !matches!(event, tauri::WindowEvent::Moved(_)) {
-            return;
+    match explicit_position {
+        Some((x, y)) => {
+            let _ = window.set_position(tauri::LogicalPosition::new(x.max(0.0), y.max(0.0)));
         }
-        let Some(float_window) = app_for_events.get_webview_window(&float_label) else {
-            return;
-        };
-        let Some(dock_window) = app_for_events.get_webview_window(SNIPPING_TOAST_WINDOW_LABEL)
-        else {
-            return;
-        };
-        if !dock_window.is_visible().unwrap_or(false) {
-            return;
+        None => {
+            if let Some(position) = snipping_preview_stack_position(app, width, height) {
+                let _ = window.set_position(position);
+            }
         }
-        let (Ok(float_pos), Ok(float_size), Ok(dock_pos), Ok(dock_size)) = (
-            float_window.outer_position(),
-            float_window.outer_size(),
-            dock_window.outer_position(),
-            dock_window.outer_size(),
-        ) else {
-            return;
-        };
-        let overlapping =
-            snipping_windows_intersect((float_pos, float_size), (dock_pos, dock_size));
-        if !overlapping {
-            has_left_dock.store(true, Ordering::SeqCst);
-            return;
-        }
-        if !has_left_dock.load(Ordering::SeqCst) {
-            return;
-        }
-        let _ = app_for_events.emit_to(
-            SNIPPING_TOAST_WINDOW_LABEL,
-            SNIPPING_FLOAT_RETURNED_EVENT,
-            json!({
-                "kind": "snip_float_returned",
-                "path": float_path.clone(),
-                "local_path": float_path.clone(),
-                "localPath": float_path.clone(),
-            }),
-        );
-        let _ = float_window.close();
-    });
+    }
+    let _ = window.show();
 
     Ok(json!({
         "kind": "snip_float_opened",
@@ -2782,6 +2755,20 @@ fn snipping_open_snip_float(
         "width": width,
         "height": height,
     }))
+}
+
+#[tauri::command]
+fn snipping_open_snip_float(
+    app: AppHandle,
+    path: String,
+    x: Option<f64>,
+    y: Option<f64>,
+) -> Result<Value, String> {
+    let explicit_position = match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    };
+    snipping_open_snip_preview_window_for(&app, &path, explicit_position, true)
 }
 
 #[tauri::command]

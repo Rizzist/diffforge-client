@@ -22384,6 +22384,23 @@ function TerminalView({
     };
   }, [terminalWorkspace?.id, updateTodoQueueItems]);
 
+  useEffect(() => {
+    // Account-level cloud cleanup re-pushes the local queue as the
+    // authoritative copy: drop the dedupe signature and sync immediately.
+    const handleCloudResync = () => {
+      todoQueueCloudSyncSignatureRef.current = "";
+      syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
+        force: true,
+        immediate: true,
+        reason: "cloud_account_reset_resync",
+      });
+    };
+    window.addEventListener("diffforge:cloud-resync-requested", handleCloudResync);
+    return () => {
+      window.removeEventListener("diffforge:cloud-resync-requested", handleCloudResync);
+    };
+  }, [syncTodoQueueItemsToCloud]);
+
   // Crash/shutdown recovery: todos that were running when the app went away
   // get labelled interrupted, and the workspace shows a resume modal for them.
   const [crashResumeCandidates, setCrashResumeCandidates] = useState([]);

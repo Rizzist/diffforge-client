@@ -199,7 +199,7 @@ export default function BackgroundMonitorWindow() {
   return (
     <MonitorShell>
       <MonitorGlobalStyle />
-      <MonitorHeader data-tauri-drag-region="true">
+      <MonitorHeader>
         <div>
           <strong>Diff Forge</strong>
           <span>Running in background</span>
@@ -305,17 +305,22 @@ const MonitorGlobalStyle = createGlobalStyle`
   #app {
     height: 100%;
     margin: 0;
-    background: #07090d;
+    background: transparent;
   }
 `;
 
 const MonitorShell = styled.div`
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  height: 100vh;
+  box-sizing: border-box;
+  height: calc(100vh - 12px);
+  margin: 6px;
   overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 14px;
   color: #f4f7fa;
-  background: #07090d;
+  background: rgba(9, 12, 17, 0.98);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 `;
 

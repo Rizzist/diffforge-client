@@ -21,6 +21,25 @@ static AUDIO_FN_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
 static AUDIO_FN_KEY_IS_DOWN: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static AUDIO_FN_MONITOR_APP: OnceLock<StdMutex<Option<AppHandle>>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static AUDIO_OPTION_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_OPTION_KEY_IS_DOWN: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static AUDIO_OPTION_PTT_BINDING: OnceLock<StdMutex<Option<AudioOptionPushToTalkBinding>>> =
+    OnceLock::new();
+
+/// macOS 15 broke RegisterEventHotKey for combos whose only modifiers are
+/// Option or Option+Shift (FB15168205): the Carbon hot key never fires, or
+/// fires without a matching release. Those bindings get a parallel NSEvent
+/// keyboard monitor; `handle_audio_push_to_talk_state` dedupes the two paths.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct AudioOptionPushToTalkBinding {
+    shortcut: String,
+    key_code: u16,
+    require_shift: bool,
+}
 #[cfg(windows)]
 static AUDIO_CONTEXT_MENU_HOOK_HANDLE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(windows)]
@@ -849,6 +868,11 @@ fn register_audio_shortcut_registration(
         return deferred_audio_cancel_registration(shortcut);
     }
 
+    #[cfg(target_os = "macos")]
+    if action == AudioShortcutAction::PushToTalk {
+        sync_macos_option_push_to_talk_binding(app, &shortcut);
+    }
+
     if audio_shortcut_is_fn_key(&shortcut) {
         return register_audio_fn_key_registration(app, action, shortcut);
     }
@@ -1071,6 +1095,285 @@ fn register_audio_fn_key_monitors(app: &AppHandle) {
 
         log_audio_diagnostic_event("audio.ptt.fn_monitor.installed", json!({}));
     });
+}
+
+#[cfg(target_os = "macos")]
+fn macos_virtual_key_code_for_shortcut_key(token: &str) -> Option<u16> {
+    let compact = token.trim().replace([' ', '-', '_'], "").to_ascii_uppercase();
+
+    let key_code = match compact.as_str() {
+        "KEYA" | "A" => 0,
+        "KEYS" | "S" => 1,
+        "KEYD" | "D" => 2,
+        "KEYF" | "F" => 3,
+        "KEYH" | "H" => 4,
+        "KEYG" | "G" => 5,
+        "KEYZ" | "Z" => 6,
+        "KEYX" | "X" => 7,
+        "KEYC" | "C" => 8,
+        "KEYV" | "V" => 9,
+        "KEYB" | "B" => 11,
+        "KEYQ" | "Q" => 12,
+        "KEYW" | "W" => 13,
+        "KEYE" | "E" => 14,
+        "KEYR" | "R" => 15,
+        "KEYY" | "Y" => 16,
+        "KEYT" | "T" => 17,
+        "DIGIT1" | "1" => 18,
+        "DIGIT2" | "2" => 19,
+        "DIGIT3" | "3" => 20,
+        "DIGIT4" | "4" => 21,
+        "DIGIT6" | "6" => 22,
+        "DIGIT5" | "5" => 23,
+        "EQUAL" => 24,
+        "DIGIT9" | "9" => 25,
+        "DIGIT7" | "7" => 26,
+        "MINUS" => 27,
+        "DIGIT8" | "8" => 28,
+        "DIGIT0" | "0" => 29,
+        "BRACKETRIGHT" | "RIGHTBRACKET" => 30,
+        "KEYO" | "O" => 31,
+        "KEYU" | "U" => 32,
+        "BRACKETLEFT" | "LEFTBRACKET" => 33,
+        "KEYI" | "I" => 34,
+        "KEYP" | "P" => 35,
+        "ENTER" | "RETURN" => 36,
+        "KEYL" | "L" => 37,
+        "KEYJ" | "J" => 38,
+        "QUOTE" => 39,
+        "KEYK" | "K" => 40,
+        "SEMICOLON" => 41,
+        "BACKSLASH" => 42,
+        "COMMA" => 43,
+        "SLASH" => 44,
+        "KEYN" | "N" => 45,
+        "KEYM" | "M" => 46,
+        "PERIOD" | "DOT" => 47,
+        "TAB" => 48,
+        "SPACE" => 49,
+        "BACKQUOTE" | "GRAVE" => 50,
+        "BACKSPACE" => 51,
+        "F1" => 122,
+        "F2" => 120,
+        "F3" => 99,
+        "F4" => 118,
+        "F5" => 96,
+        "F6" => 97,
+        "F7" => 98,
+        "F8" => 100,
+        "F9" => 101,
+        "F10" => 109,
+        "F11" => 103,
+        "F12" => 111,
+        "ARROWLEFT" | "LEFT" => 123,
+        "ARROWRIGHT" | "RIGHT" => 124,
+        "ARROWDOWN" | "DOWN" => 125,
+        "ARROWUP" | "UP" => 126,
+        _ => return None,
+    };
+
+    Some(key_code)
+}
+
+/// Builds the NSEvent-monitor binding for a push-to-talk shortcut whose
+/// modifier set hits the macOS 15 Option/Option+Shift hot key regression.
+/// Returns None for combos Carbon still handles reliably.
+#[cfg(target_os = "macos")]
+fn macos_option_push_to_talk_binding(shortcut: &str) -> Option<AudioOptionPushToTalkBinding> {
+    let mut has_option = false;
+    let mut has_shift = false;
+    let mut key_token: Option<String> = None;
+
+    for token in shortcut.split('+') {
+        let compact = token.trim().replace([' ', '-', '_'], "").to_ascii_uppercase();
+        match compact.as_str() {
+            "" => continue,
+            "ALT" | "OPTION" => has_option = true,
+            "SHIFT" => has_shift = true,
+            "CONTROL" | "CTRL" | "COMMAND" | "CMD" | "SUPER" | "META" | "COMMANDORCONTROL"
+            | "COMMANDORCTRL" | "CMDORCTRL" | "CMDORCONTROL" => return None,
+            _ => {
+                if key_token.replace(compact).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if !has_option {
+        return None;
+    }
+
+    Some(AudioOptionPushToTalkBinding {
+        shortcut: shortcut.to_string(),
+        key_code: macos_virtual_key_code_for_shortcut_key(&key_token?)?,
+        require_shift: has_shift,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_option_active_binding() -> Option<AudioOptionPushToTalkBinding> {
+    AUDIO_OPTION_PTT_BINDING
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()))
+}
+
+/// Returns true when the event matched the active Option binding and became a
+/// push-to-talk gesture, so the local monitor can swallow the keystroke
+/// instead of letting it type into the focused field.
+#[cfg(target_os = "macos")]
+fn audio_option_handle_monitor_event(event: &objc2_app_kit::NSEvent) -> bool {
+    let Some(binding) = audio_option_active_binding() else {
+        return false;
+    };
+
+    let Some(app) = audio_fn_monitor_app_handle() else {
+        return false;
+    };
+
+    use objc2_app_kit::{NSEventModifierFlags, NSEventType};
+
+    let event_type = event.r#type();
+
+    if event_type == NSEventType::KeyDown {
+        if event.keyCode() != binding.key_code {
+            return false;
+        }
+
+        let flags = event.modifierFlags();
+        let modifiers_match = flags.contains(NSEventModifierFlags::Option)
+            && !flags.contains(NSEventModifierFlags::Command)
+            && !flags.contains(NSEventModifierFlags::Control)
+            && flags.contains(NSEventModifierFlags::Shift) == binding.require_shift;
+        if !modifiers_match {
+            return false;
+        }
+
+        if AUDIO_OPTION_KEY_IS_DOWN.swap(true, Ordering::AcqRel) {
+            // Key auto-repeat while held.
+            return true;
+        }
+
+        log_audio_diagnostic_event(
+            "audio.ptt.option_monitor.key_down",
+            json!({
+                "shortcut": binding.shortcut,
+            }),
+        );
+        let _ = handle_audio_push_to_talk_state(app, ShortcutState::Pressed, binding.shortcut);
+        return true;
+    }
+
+    if event_type == NSEventType::KeyUp {
+        if event.keyCode() != binding.key_code
+            || !AUDIO_OPTION_KEY_IS_DOWN.swap(false, Ordering::AcqRel)
+        {
+            return false;
+        }
+
+        log_audio_diagnostic_event(
+            "audio.ptt.option_monitor.key_up",
+            json!({
+                "shortcut": binding.shortcut,
+            }),
+        );
+        let _ = handle_audio_push_to_talk_state(app, ShortcutState::Released, binding.shortcut);
+        return true;
+    }
+
+    if event_type == NSEventType::FlagsChanged
+        && AUDIO_OPTION_KEY_IS_DOWN.load(Ordering::Acquire)
+        && !event
+            .modifierFlags()
+            .contains(NSEventModifierFlags::Option)
+    {
+        // Option released before the key: end the hold gesture now.
+        AUDIO_OPTION_KEY_IS_DOWN.store(false, Ordering::Release);
+        log_audio_diagnostic_event(
+            "audio.ptt.option_monitor.option_released",
+            json!({
+                "shortcut": binding.shortcut,
+            }),
+        );
+        let _ = handle_audio_push_to_talk_state(app, ShortcutState::Released, binding.shortcut);
+    }
+
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn register_audio_option_key_monitors(app: &AppHandle) {
+    let app_slot = AUDIO_FN_MONITOR_APP.get_or_init(|| StdMutex::new(None));
+    if let Ok(mut slot) = app_slot.lock() {
+        *slot = Some(app.clone());
+    }
+
+    if AUDIO_OPTION_MONITORS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let _ = app.run_on_main_thread(move || {
+        use objc2_app_kit::{NSEvent, NSEventMask};
+
+        let mask = NSEventMask::KeyDown | NSEventMask::KeyUp | NSEventMask::FlagsChanged;
+
+        let global_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| {
+                let _ = audio_option_handle_monitor_event(unsafe { event.as_ref() });
+            },
+        );
+        if let Some(token) =
+            NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &global_block)
+        {
+            // The monitors live for the app's lifetime.
+            std::mem::forget(token);
+        }
+
+        let local_block = block2::RcBlock::new(
+            move |event: std::ptr::NonNull<objc2_app_kit::NSEvent>| -> *mut objc2_app_kit::NSEvent {
+                if audio_option_handle_monitor_event(unsafe { event.as_ref() }) {
+                    // Swallow the matched gesture inside our own app.
+                    return std::ptr::null_mut();
+                }
+                event.as_ptr()
+            },
+        );
+        let local_token = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(mask, &local_block)
+        };
+        if let Some(token) = local_token {
+            std::mem::forget(token);
+        }
+
+        log_audio_diagnostic_event("audio.ptt.option_monitor.installed", json!({}));
+    });
+}
+
+/// Activates or clears the NSEvent fallback for the current push-to-talk
+/// binding. Safe to call on every (re)registration; non-Option combos clear
+/// the binding so the monitor goes inert.
+#[cfg(target_os = "macos")]
+fn sync_macos_option_push_to_talk_binding(app: &AppHandle, shortcut: &str) {
+    let binding = macos_option_push_to_talk_binding(shortcut);
+    let active = binding.is_some();
+
+    let slot = AUDIO_OPTION_PTT_BINDING.get_or_init(|| StdMutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = binding;
+    }
+    AUDIO_OPTION_KEY_IS_DOWN.store(false, Ordering::Release);
+
+    log_audio_diagnostic_event(
+        "audio.ptt.option_monitor.sync",
+        json!({
+            "shortcut": shortcut,
+            "active": active,
+        }),
+    );
+
+    if active {
+        register_audio_option_key_monitors(app);
+    }
 }
 
 fn register_audio_shortcuts(app: &AppHandle) {

@@ -13,6 +13,7 @@ import {
   AUDIO_RECORDER_MODE_TOGGLE_TO_TALK,
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
   AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
+  AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT,
   AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
   AUDIO_TRANSCRIPTION_STATUS_CANCELLED,
   AUDIO_TRANSCRIPTION_STATUS_INSERTED,
@@ -55,6 +56,14 @@ import {
   writeDeepgramLanguage,
   writeSelectedAudioInputDeviceId,
 } from "./audioCapture";
+import {
+  cloudVoiceAgentEventKind,
+  createCloudVoiceAgentTtsPlayer,
+  finishCloudVoiceAgentInput,
+  startCloudVoiceAgentStream,
+  stopCloudVoiceAgentStream,
+  subscribeCloudVoiceAgentEvents,
+} from "./cloudVoiceAgentClient.js";
 import { applyVoiceTextPipeline } from "./voicePipeline.js";
 import {
   loadVoiceTextRules,
@@ -944,6 +953,9 @@ function formatAudioProviderLabel(provider) {
   if (provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
     return "Deepgram";
   }
+  if (provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+    return "Forge Voice";
+  }
   if (provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
     return "Forge";
   }
@@ -1114,6 +1126,7 @@ export default function AudioWorkspaceView({
   const copiedAudioHistoryTimerRef = useRef(0);
   const isCloudMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const isForgeMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+  const isForgeAgentMode = audioMode === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
   const deepgramReady = Boolean(deepgramApiKey.trim());
   const installed = Boolean(audioModelStatus?.installed);
   const forgeCreditsExhausted = forgeBilling.state === "ready"
@@ -1121,12 +1134,12 @@ export default function AudioWorkspaceView({
     && forgeBilling.remaining <= 0;
   const forgeReady = forgeBilling.state !== "error" && !forgeCreditsExhausted;
   const recorderOpen = Boolean(audioWidgetVisible);
-  const recorderReady = isForgeMode ? forgeReady : isCloudMode ? deepgramReady : installed;
+  const recorderReady = (isForgeMode || isForgeAgentMode) ? forgeReady : isCloudMode ? deepgramReady : installed;
   const isBusy = audioActionState === "downloading"
     || audioActionState === "closing"
     || audioActionState === "opening"
     || audioActionState === "uninstalling"
-    || (!isCloudMode && !isForgeMode && audioStatusState === "checking");
+    || (!isCloudMode && !isForgeMode && !isForgeAgentMode && audioStatusState === "checking");
   const RecorderOpenButton = recorderOpen ? SecondaryButton : PrimaryButton;
   const recorderButtonLabel = recorderOpen
     ? audioActionState === "closing"
@@ -1137,7 +1150,7 @@ export default function AudioWorkspaceView({
       : "Open recorder";
   const recorderActionDisabled = recorderOpen
     ? isBusy
-    : isBusy || (isForgeMode ? !forgeReady : isCloudMode ? !deepgramReady : !installed);
+    : isBusy || ((isForgeMode || isForgeAgentMode) ? !forgeReady : isCloudMode ? !deepgramReady : !installed);
   const recorderAction = recorderOpen ? onCloseWidget : onOpenWidget;
   const isToggleRecorderMode = recorderMode === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK;
   const isManualOrchestratorMode = orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL;
@@ -1163,6 +1176,14 @@ export default function AudioWorkspaceView({
         : forgeCreditsExhausted
           ? "No credits"
           : "Forge ready")
+    : isForgeAgentMode
+      ? (forgeBilling.state === "loading"
+        ? "Checking credits"
+        : forgeBilling.state === "error"
+          ? "Sign in needed"
+          : forgeCreditsExhausted
+            ? "No credits"
+            : "Voice ready")
     : isCloudMode
       ? (deepgramReady ? "Cloud ready" : "API key needed")
       : (installed ? "Local ready" : audioActionState === "downloading" ? "Downloading" : missingLabel);
@@ -1501,10 +1522,10 @@ export default function AudioWorkspaceView({
   }, []);
 
   useEffect(() => {
-    if (isForgeMode) {
+    if (isForgeMode || isForgeAgentMode) {
       refreshForgeBilling();
     }
-  }, [isForgeMode, refreshForgeBilling]);
+  }, [isForgeAgentMode, isForgeMode, refreshForgeBilling]);
 
   const toggleForgeLlmCleanup = useCallback(() => {
     setForgeLlmCleanup((currentValue) => {
@@ -1813,7 +1834,13 @@ export default function AudioWorkspaceView({
           <div>
             <PanelKicker>Audio</PanelKicker>
             <PanelHeading>{workspace?.name || "Workspace"} dictation</PanelHeading>
-            <PageSubline>{isCloudMode ? "Deepgram Nova-3 realtime dictation." : "Local Whisper dictation setup."}</PageSubline>
+            <PageSubline>{isForgeAgentMode
+              ? "Diff Forge Cloud voice agent with streamed speech."
+              : isForgeMode
+                ? "Diff Forge Cloud Nova-3 dictation with cleanup."
+                : isCloudMode
+                  ? "Deepgram Nova-3 realtime dictation."
+                  : "Local Whisper dictation setup."}</PageSubline>
           </div>
           <AudioStatePill data-installed={recorderReady}>
             {audioModeStatusLabel}
@@ -1833,9 +1860,11 @@ export default function AudioWorkspaceView({
                 <SettingsLabel>Provider</SettingsLabel>
                 <SettingsHint>{isForgeMode
                   ? "Diff Forge AI cloud"
-                  : isCloudMode
-                    ? "Deepgram Nova-3"
-                    : "Local Whisper"}</SettingsHint>
+                  : isForgeAgentMode
+                    ? "Diff Forge AI voice"
+                    : isCloudMode
+                      ? "Deepgram Nova-3"
+                      : "Local Whisper"}</SettingsHint>
               </div>
               <AudioStatePill data-installed={recorderReady}>
                 {audioModeStatusLabel}
@@ -1843,7 +1872,7 @@ export default function AudioWorkspaceView({
             </AudioDeviceHeader>
             <AudioModeGrid role="group" aria-label="Transcription mode">
               <AudioModeButton
-                aria-pressed={!isCloudMode}
+                aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
                 onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
                 type="button"
               >
@@ -1875,8 +1904,19 @@ export default function AudioWorkspaceView({
                   <span>Nova-3 + LLM cleanup</span>
                 </span>
               </AudioModeButton>
+              <AudioModeButton
+                aria-pressed={isForgeAgentMode}
+                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT)}
+                type="button"
+              >
+                <ButtonHubIcon aria-hidden="true" />
+                <span>
+                  <strong>Forge Voice</strong>
+                  <span>LLM + streamed speech</span>
+                </span>
+              </AudioModeButton>
             </AudioModeGrid>
-            {isForgeMode && (
+            {(isForgeMode || isForgeAgentMode) && (
               <>
                 <AudioRecorderOptionRow>
                   <SettingsHint>
@@ -1885,15 +1925,18 @@ export default function AudioWorkspaceView({
                       : forgeBilling.state === "error"
                         ? forgeBilling.error
                         : forgeCreditsExhausted
-                          ? "No Diff Forge AI credits remaining. Top up to use cloud dictation."
-                          : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
+                          ? "No Diff Forge AI credits remaining. Top up to use cloud audio."
+                          : isForgeAgentMode
+                            ? "Streams mic audio to Diff Forge Cloud, runs the voice agent, and plays the response back here."
+                            : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
                   </SettingsHint>
                   <SecondaryButton onClick={refreshForgeBilling} type="button">
                     <ButtonRefreshIcon aria-hidden="true" />
                     <span>{forgeBilling.state === "loading" ? "Checking..." : "Recheck credits"}</span>
                   </SecondaryButton>
                 </AudioRecorderOptionRow>
-                <AudioRecorderOptionRow>
+                {isForgeMode && (
+                  <AudioRecorderOptionRow>
                   <SettingsHint>
                     {forgeLlmCleanup
                       ? "A cheap LLM polishes the final transcript (punctuation, fillers, false starts)."
@@ -1907,7 +1950,8 @@ export default function AudioWorkspaceView({
                     <span aria-hidden="true" />
                     LLM cleanup
                   </McpSwitchButton>
-                </AudioRecorderOptionRow>
+                  </AudioRecorderOptionRow>
+                )}
               </>
             )}
           </AudioProviderPanel>
@@ -2693,6 +2737,8 @@ export function AudioWidgetWindow() {
   const barSavedPlacementRef = useRef(null);
   const widgetFrameModeRef = useRef(widgetFrameMode);
   const widgetStateRef = useRef(widgetState);
+  const forgeVoiceEventsActiveRef = useRef(false);
+  const forgeVoiceTtsPlayerRef = useRef(null);
 
   useEffect(() => {
     widgetStateRef.current = widgetState;
@@ -2755,6 +2801,15 @@ export function AudioWidgetWindow() {
       setWidgetState(nextState);
       setModelStatus(null);
       setMessage(hasSetup ? "Forge cloud ready" : "Audio setup needed");
+      return;
+    }
+
+    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+      const nextState = hasSetup ? "ready" : "setup";
+      widgetStateRef.current = nextState;
+      setWidgetState(nextState);
+      setModelStatus(null);
+      setMessage(hasSetup ? "Forge voice ready" : "Audio setup needed");
       return;
     }
 
@@ -2835,6 +2890,22 @@ export function AudioWidgetWindow() {
     return audioBuffer;
   }, [startWarmBuffer]);
 
+  const resetForgeVoiceTtsPlayer = useCallback(async () => {
+    const previousPlayer = forgeVoiceTtsPlayerRef.current;
+    const nextPlayer = createCloudVoiceAgentTtsPlayer({
+      onError: (playbackError) => {
+        if (!forgeVoiceEventsActiveRef.current) {
+          return;
+        }
+        setError(getAudioInputErrorMessage(playbackError, "Unable to play the Diff Forge Cloud voice response."));
+      },
+    });
+    forgeVoiceTtsPlayerRef.current = nextPlayer;
+    await previousPlayer?.close?.().catch(() => {});
+    await nextPlayer.prime?.();
+    return nextPlayer;
+  }, []);
+
   const startRecording = useCallback(async ({ skipPrerollWait = false } = {}) => {
     const currentState = widgetStateRef.current;
     const currentProvider = readAudioTranscriptionProvider();
@@ -2855,6 +2926,7 @@ export function AudioWidgetWindow() {
       }
     } else if (
       currentProvider !== AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+      && currentProvider !== AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
       && !modelStatus?.installed
     ) {
       setError("Install Whisper from the Audio tab before recording.");
@@ -2898,6 +2970,23 @@ export function AudioWidgetWindow() {
         }
         return;
       }
+      setRecordingStartedAt(Date.now());
+      setElapsedMs(0);
+      const waitsForCloudStart = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+        || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+        || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
+      if (!waitsForCloudStart) {
+        widgetStateRef.current = "recording";
+        setWidgetState("recording");
+      }
+      playNotificationSfx("voice.on");
+      setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+        ? "Opening Deepgram stream"
+        : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+          ? "Connecting Diff Forge Cloud"
+          : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+            ? "Connecting Forge voice"
+            : "Recording");
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         setMessage("Opening Deepgram stream");
         await invoke("start_deepgram_realtime_transcription", {
@@ -2914,12 +3003,21 @@ export function AudioWidgetWindow() {
             language: readDeepgramLanguage(),
           },
         });
+      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        await resetForgeVoiceTtsPlayer();
+        forgeVoiceEventsActiveRef.current = true;
+        await startCloudVoiceAgentStream({
+          submissionMode: readOrchestratorVoiceSubmissionMode(),
+        });
       }
       if (recordingRunRef.current !== recordingRunId) {
         if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
           await invoke("stop_deepgram_realtime_transcription").catch(() => {});
         } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
           await invoke("stop_forge_dictation_transcription", { request: { cancel: true } }).catch(() => {});
+        } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+          forgeVoiceEventsActiveRef.current = false;
+          await stopCloudVoiceAgentStream().catch(() => {});
         }
         await audioBuffer.finishCapture().catch(() => null);
         if (audioBufferRef.current === audioBuffer) {
@@ -2929,15 +3027,14 @@ export function AudioWidgetWindow() {
         }
         return;
       }
-      setRecordingStartedAt(Date.now());
-      setElapsedMs(0);
       widgetStateRef.current = "recording";
       setWidgetState("recording");
-      playNotificationSfx("voice.on");
       setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "Deepgram listening"
         : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
           ? "Forge cloud listening"
+          : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+            ? "Forge voice listening"
           : "Recording");
 
       if (stopAfterStartRef.current || !pushToTalkDownRef.current) {
@@ -2949,10 +3046,14 @@ export function AudioWidgetWindow() {
         await invoke("stop_deepgram_realtime_transcription").catch(() => {});
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
         await invoke("stop_forge_dictation_transcription", { request: { cancel: true } }).catch(() => {});
+      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        forgeVoiceEventsActiveRef.current = false;
+        await stopCloudVoiceAgentStream().catch(() => {});
       }
       const failedAudioBuffer = audioBufferRef.current || audioBuffer;
       if (captureBegan) {
         await failedAudioBuffer?.finishCapture?.().catch(() => null);
+        playNotificationSfx("voice.off");
       }
       if (failedAudioBuffer && audioBufferRef.current === failedAudioBuffer) {
         await closeWarmBuffer();
@@ -2969,7 +3070,7 @@ export function AudioWidgetWindow() {
       setWidgetState("error");
       setError(getAudioInputErrorMessage(recordingError, "Choose and enable a microphone in the Audio tab before recording."));
     }
-  }, [closeWarmBuffer, modelStatus?.installed, startWarmBuffer, waitForWarmPrerollBuffer]);
+  }, [closeWarmBuffer, modelStatus?.installed, resetForgeVoiceTtsPlayer, startWarmBuffer, waitForWarmPrerollBuffer]);
 
   const refreshStatus = useCallback(async () => {
     const currentProvider = readAudioTranscriptionProvider();
@@ -3007,6 +3108,16 @@ export function AudioWidgetWindow() {
       setWidgetState(nextState);
       setModelStatus(null);
       setMessage(hasSetup ? "Forge cloud ready" : "Audio setup needed");
+      return;
+    }
+
+    if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+      const hasSetup = hasAudioInputSetup();
+      const nextState = hasSetup ? "ready" : "setup";
+      widgetStateRef.current = nextState;
+      setWidgetState(nextState);
+      setModelStatus(null);
+      setMessage(hasSetup ? "Forge voice ready" : "Audio setup needed");
       return;
     }
 
@@ -3420,6 +3531,8 @@ export function AudioWidgetWindow() {
       provider,
       source: provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         ? "deepgram-nova-3-live"
+        : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+          ? "forge-voice-agent"
         : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
           ? "forge-nova3-dictation"
           : "whisper-local",
@@ -3505,6 +3618,22 @@ export function AudioWidgetWindow() {
 
     try {
       const currentProvider = readAudioTranscriptionProvider();
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        setMessage("Capturing final audio");
+        await waitForAudioPostBuffer(DEEPGRAM_RELEASE_POST_BUFFER_MS);
+        if (recordingRunRef.current !== recordingRunId) {
+          throw new Error("Diff Forge Cloud voice canceled.");
+        }
+        setMessage("Finishing voice input");
+        await finishCloudVoiceAgentInput();
+        await audioBuffer.finishCapture().catch(() => null);
+        if (recordingRunRef.current !== recordingRunId) {
+          return;
+        }
+        setMessage("Forge voice responding");
+        return;
+      }
+
     const result = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
       ? await (async () => {
           setMessage("Capturing final audio");
@@ -3594,6 +3723,8 @@ export function AudioWidgetWindow() {
         provider: currentProvider,
         source: currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
           ? "deepgram-nova-3-live"
+          : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+            ? "forge-voice-agent"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
             ? (result?.llmCleaned ? "forge-nova3-llm-cleaned" : "forge-nova3-dictation")
             : "whisper-local",
@@ -3628,6 +3759,10 @@ export function AudioWidgetWindow() {
       widgetStateRef.current = "ready";
       setWidgetState("ready");
     } catch (recordingError) {
+      if (readAudioTranscriptionProvider() === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        forgeVoiceEventsActiveRef.current = false;
+        await stopCloudVoiceAgentStream().catch(() => {});
+      }
       if (audioBufferRef.current === audioBuffer) {
         await closeWarmBuffer();
       } else {
@@ -3702,6 +3837,16 @@ export function AudioWidgetWindow() {
     }
 
     if (currentState === "transcribing") {
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        forgeVoiceEventsActiveRef.current = false;
+        await stopCloudVoiceAgentStream().catch(() => {});
+        await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+        forgeVoiceTtsPlayerRef.current = null;
+        resetWidgetToStartState();
+        setMessage("Cancelled");
+        return;
+      }
+
       if (salvage) {
         // Let the in-flight transcription finish detached; the invalidated
         // stopRecording run publishes it as cancelled instead of inserting.
@@ -3745,6 +3890,12 @@ export function AudioWidgetWindow() {
           },
           AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
         );
+      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+        forgeVoiceEventsActiveRef.current = false;
+        await stopCloudVoiceAgentStream().catch(() => {});
+        await audioBuffer.finishCapture().catch(() => null);
+        await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+        forgeVoiceTtsPlayerRef.current = null;
       } else {
         const captureResult = await audioBuffer.finishCapture().catch(() => null);
         salvageLocalCancelledCapture(captureResult, captureStats);
@@ -3752,7 +3903,9 @@ export function AudioWidgetWindow() {
 
       await closeWarmBuffer();
       resetWidgetToStartState();
-      setMessage("Cancelled, saved to history");
+      setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+        ? "Cancelled"
+        : "Cancelled, saved to history");
       return;
     }
 
@@ -3760,6 +3913,11 @@ export function AudioWidgetWindow() {
       await invoke("stop_deepgram_realtime_transcription").catch(() => {});
     } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
       await invoke("stop_forge_dictation_transcription", { request: { cancel: true } }).catch(() => {});
+    } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+      forgeVoiceEventsActiveRef.current = false;
+      await stopCloudVoiceAgentStream().catch(() => {});
+      await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+      forgeVoiceTtsPlayerRef.current = null;
     } else {
       await invoke("cancel_whisper_transcription").catch(() => {});
     }
@@ -3810,6 +3968,13 @@ export function AudioWidgetWindow() {
     refreshShortcutStatus();
 
     return () => {
+      const hadForgeVoice = forgeVoiceEventsActiveRef.current;
+      forgeVoiceEventsActiveRef.current = false;
+      if (hadForgeVoice) {
+        stopCloudVoiceAgentStream().catch(() => {});
+        forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+        forgeVoiceTtsPlayerRef.current = null;
+      }
       closeWarmBuffer();
     };
   }, [closeWarmBuffer, refreshShortcutStatus, refreshStatus]);
@@ -3821,6 +3986,8 @@ export function AudioWidgetWindow() {
 
     const providerReady = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
       ? Boolean(deepgramApiKey.trim())
+      : transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+        ? true
       : transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? true
         : Boolean(modelStatus?.installed);
@@ -3972,6 +4139,99 @@ export function AudioWidgetWindow() {
           return;
         }
 
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    subscribeCloudVoiceAgentEvents((event) => {
+      if (disposed || !forgeVoiceEventsActiveRef.current) {
+        return;
+      }
+
+      const kind = cloudVoiceAgentEventKind(event);
+      if (kind === "voice_agent_stream_started") {
+        setError("");
+        setMessage("Forge voice listening");
+        return;
+      }
+
+      if (kind === "voice_agent_transcript") {
+        const transcript = String(event?.transcript || event?.text || "").trim();
+        if (transcript) {
+          setRealtimeTranscript(transcript);
+          setMessage(event?.final ? "Forge voice heard" : "Forge voice live");
+        }
+        return;
+      }
+
+      if (
+        kind === "voice_agent_llm_feedback"
+        || kind === "voice_agent_fast_llm_feedback"
+        || kind === "voice_agent_initial_llm_feedback"
+      ) {
+        const feedback = String(event?.feedback || event?.text || "").trim();
+        setMessage(feedback ? "Forge voice responding" : "Forge voice thinking");
+        return;
+      }
+
+      if (
+        kind === "voice_agent_tts_start"
+        || kind === "voice_agent_tts_audio"
+        || kind === "voice_agent_tts_end"
+      ) {
+        if (kind === "voice_agent_tts_start") {
+          setMessage("Forge voice speaking");
+        }
+        void forgeVoiceTtsPlayerRef.current?.handleEvent?.(event);
+        return;
+      }
+
+      if (kind === "voice_agent_tts_error") {
+        setError(String(event?.error?.message || event?.message || "Diff Forge Cloud could not play the voice response."));
+        return;
+      }
+
+      if (kind === "voice_agent_error") {
+        const messageText = String(event?.error?.message || event?.message || "Diff Forge Cloud voice stopped.");
+        forgeVoiceEventsActiveRef.current = false;
+        widgetStateRef.current = "error";
+        setWidgetState("error");
+        setMessage("Forge voice error");
+        setError(messageText);
+        void stopCloudVoiceAgentStream().catch(() => {});
+        void forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+        forgeVoiceTtsPlayerRef.current = null;
+        return;
+      }
+
+      if (kind === "voice_agent_finished") {
+        forgeVoiceEventsActiveRef.current = false;
+        void (async () => {
+          await stopCloudVoiceAgentStream().catch(() => {});
+          await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+          forgeVoiceTtsPlayerRef.current = null;
+        })();
+        widgetStateRef.current = "ready";
+        setWidgetState("ready");
+        setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
+        setMessage("Forge voice ready");
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten?.();
+          return;
+        }
         unlisten = nextUnlisten;
       })
       .catch(() => {});
@@ -4208,9 +4468,10 @@ export function AudioWidgetWindow() {
 
   const isCloudWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD;
   const isForgeWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+  const isForgeVoiceWidget = transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
   const installed = isCloudWidget
     ? Boolean(deepgramApiKey.trim())
-    : isForgeWidget
+    : (isForgeWidget || isForgeVoiceWidget)
       ? true
       : Boolean(modelStatus?.installed);
   const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000));

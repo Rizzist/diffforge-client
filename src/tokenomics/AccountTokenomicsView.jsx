@@ -794,12 +794,12 @@ function statusTone(remainingPercent, paceDelta = 0, paceStatus = "unknown") {
   return "good";
 }
 
-function usagePercentTone(usedPercent) {
-  if (usedPercent == null) return "unknown";
-  const used = Number(usedPercent);
-  if (!Number.isFinite(used)) return "unknown";
-  if (used >= 85) return "danger";
-  if (used >= 62) return "warn";
+function limitPercentTone(percent) {
+  if (percent == null) return "unknown";
+  const value = Number(percent);
+  if (!Number.isFinite(value)) return "unknown";
+  if (value < 25) return "danger";
+  if (value < 40) return "warn";
   return "good";
 }
 
@@ -1395,7 +1395,7 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
         </MetricScore>
       </MetricHeading>
       <ProgressTrack aria-label={`${title} used`}>
-        <ProgressFill $tone={usagePercentTone(limit.usedPercent)} style={{ width: `${limit.usedPercent ?? 0}%` }} />
+        <ProgressFill $tone={limitPercentTone(limit.usedPercent)} style={{ width: `${limit.usedPercent ?? 0}%` }} />
       </ProgressTrack>
       <MetricFoot>
         <span>{limit.resetLabel}</span>

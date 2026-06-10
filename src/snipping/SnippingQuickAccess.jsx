@@ -6,7 +6,6 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Delete } from "@styled-icons/material-rounded/Delete";
-import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { Gesture } from "@styled-icons/material-rounded/Gesture";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
@@ -18,21 +17,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { createGlobalStyle } from "styled-components";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
+const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
+const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
+const SNIPPING_LIVE_PREVIEW_THROTTLE_MS = 120;
+const SNIPPING_LIVE_PREVIEW_MAX_WIDTH = 512;
 const SNIPPING_ANNOTATION_TODO_EVENT = "diffforge:snipping-annotation-todo";
-const SNIP_TOAST_LIMIT = 6;
-const SNIP_DRAG_THRESHOLD_PX = 6;
-const SNIP_TOAST_WINDOW_WIDTH = 316;
-const SNIP_TOAST_WINDOW_HEIGHT = 560;
-const SNIP_TOAST_WINDOW_MARGIN = 18;
-const SNIP_CARD_WIDTH = 208;
-const SNIP_CARD_HEIGHT = 132;
-const SNIP_CARD_GAP = 10;
 
 export const SNIPPING_TOAST_HASH = "#/snipping-toasts";
 export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 export const SNIPPING_FLOAT_HASH = "#/snipping-float";
 
-const SNIPPING_FLOAT_RETURNED_EVENT = "forge-snip-float-returned";
 
 const TOOL_OPTIONS = [
   { id: "pen", label: "Pen", Icon: Gesture },
@@ -133,28 +127,6 @@ async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
   return canvas.toDataURL("image/png");
 }
 
-function snipToastFromPayload(payload) {
-  const source = payload && typeof payload === "object" ? payload : {};
-  const item = source.item && typeof source.item === "object" ? source.item : source;
-  const localPath = assetLocalPath(item) || assetLocalPath(source);
-  if (!localPath) return null;
-
-  const name = assetName(item);
-  const savedAtMs = Number(source.savedAtMs || source.saved_at_ms || Date.now());
-  const id = text(item.id || item.untrackedId || item.untracked_id, `snip-${savedAtMs}-${localPath}`);
-  return {
-    id,
-    localPath,
-    name,
-    originalPath: text(source.originalPath || source.original_path),
-    previewUrl: assetPreviewUrl({ ...item, localPath }),
-    savedAtMs,
-    status: "",
-    width: Number(source.width || item.width || 0),
-    height: Number(source.height || item.height || 0),
-  };
-}
-
 async function copySnipToClipboard(snip) {
   try {
     await invoke("diffforge_copy_asset_to_clipboard", {
@@ -201,340 +173,191 @@ function useFloatingWindowBody(kind) {
   }, [kind]);
 }
 
-function setSnipStatus(setSnips, snipId, status) {
-  setSnips((current) => current.map((snip) => (
-    snip.id === snipId ? { ...snip, status } : snip
-  )));
-}
-
-function setTransientStatus(setSnips, snipId, status) {
-  setSnipStatus(setSnips, snipId, status);
-  window.setTimeout(() => {
-    setSnips((current) => current.map((snip) => (
-      snip.id === snipId && snip.status === status ? { ...snip, status: "" } : snip
-    )));
-  }, 2400);
-}
-
+// Legacy dock route: snip previews are standalone draggable windows
+// (#/snipping-float) from the moment they are captured, so a leftover dock
+// window from an older session simply closes itself.
 export default function SnippingQuickAccess() {
-  const [snips, setSnips] = useState([]);
-  const [floatedSnips, setFloatedSnips] = useState([]);
-  const [busyIds, setBusyIds] = useState(() => new Set());
-  const hadSnipsRef = useRef(false);
-
-  useFloatingWindowBody("quick-access");
-
   useEffect(() => {
-    invoke("snipping_recent_capture_toasts")
-      .then((result) => {
-        const items = Array.isArray(result?.items) ? result.items : [];
-        const nextSnips = items
-          .map(snipToastFromPayload)
-          .filter(Boolean)
-          .slice(0, SNIP_TOAST_LIMIT);
-        if (nextSnips.length) {
-          setSnips(nextSnips);
-        }
-      })
-      .catch(() => {});
+    getCurrentWindow().close().catch(() => {});
   }, []);
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = null;
-
-    listen(SNIPPING_CAPTURE_SAVED_EVENT, (event) => {
-      if (disposed) return;
-      const snip = snipToastFromPayload(event?.payload);
-      if (!snip) return;
-      setSnips((current) => [
-        snip,
-        ...current.filter((item) => item.localPath !== snip.localPath),
-      ].slice(0, SNIP_TOAST_LIMIT));
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = null;
-    listen(SNIPPING_FLOAT_RETURNED_EVENT, (event) => {
-      if (disposed) return;
-      const path = text(event?.payload?.localPath || event?.payload?.local_path || event?.payload?.path);
-      if (!path) return;
-      setFloatedSnips((current) => current.filter((item) => item.localPath !== path));
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (snips.length || floatedSnips.length) {
-      hadSnipsRef.current = true;
-      return;
-    }
-    if (hadSnipsRef.current) {
-      getCurrentWindow().close().catch(() => {});
-    }
-  }, [floatedSnips.length, snips.length]);
-
-  const dismissSnip = useCallback((snipOrId) => {
-    const snipId = typeof snipOrId === "string" ? snipOrId : text(snipOrId?.id);
-    const localPath = typeof snipOrId === "string" ? "" : assetLocalPath(snipOrId);
-    if (!snipId && !localPath) return;
-
-    setSnips((current) => current.filter((snip) => (
-      snip.id !== snipId && snip.localPath !== localPath
-    )));
-    setFloatedSnips((current) => current.filter((item) => (
-      item.id !== snipId && item.localPath !== localPath
-    )));
-
-    if (localPath) {
-      invoke("snipping_dismiss_capture_toast", {
-        request: {
-          id: snipId,
-          path: localPath,
-        },
-      }).catch(() => {});
-    }
-  }, []);
-
-  const floatOutSnip = useCallback((snip, x, y) => {
-    if (!snip?.localPath) return;
-    invoke("snipping_open_snip_float", {
-      path: snip.localPath,
-      x: Math.max(0, Math.round(x)),
-      y: Math.max(0, Math.round(y)),
-    })
-      .then(() => {
-        setFloatedSnips((current) => [
-          ...current.filter((item) => item.localPath !== snip.localPath),
-          snip,
-        ]);
-      })
-      .catch(() => {});
-  }, []);
-
-  // Pulling a card past the drag threshold detaches it into its own native
-  // window at the cursor, so it can live anywhere on screen (and over any
-  // Space). Dragging that window back over this dock returns it here.
-  const beginSnipDrag = useCallback((event, snip) => {
-    if (event.button !== 0 || busyIds.has(snip.id)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const card = event.currentTarget.closest("[data-snip-card]");
-    const rect = card?.getBoundingClientRect();
-    const offsetX = rect ? event.clientX - rect.left : SNIP_CARD_WIDTH / 2;
-    const offsetY = rect ? event.clientY - rect.top : 16;
-    const startScreenX = event.screenX;
-    const startScreenY = event.screenY;
-    const pointerId = event.pointerId;
-    let finished = false;
-    const cleanup = () => {
-      window.removeEventListener("pointermove", onMove, true);
-      window.removeEventListener("pointerup", onEnd, true);
-      window.removeEventListener("pointercancel", onEnd, true);
-    };
-    const onMove = (moveEvent) => {
-      if (finished || moveEvent.pointerId !== pointerId) return;
-      const distance = Math.hypot(
-        moveEvent.screenX - startScreenX,
-        moveEvent.screenY - startScreenY,
-      );
-      if (distance < SNIP_DRAG_THRESHOLD_PX) return;
-      finished = true;
-      cleanup();
-      floatOutSnip(snip, moveEvent.screenX - offsetX, moveEvent.screenY - offsetY);
-    };
-    const onEnd = (endEvent) => {
-      if (endEvent.pointerId !== pointerId) return;
-      finished = true;
-      cleanup();
-    };
-    window.addEventListener("pointermove", onMove, true);
-    window.addEventListener("pointerup", onEnd, true);
-    window.addEventListener("pointercancel", onEnd, true);
-  }, [busyIds, floatOutSnip]);
-
-  const floatSnipFromKeyboard = useCallback((event, snip) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    floatOutSnip(snip, SNIP_TOAST_WINDOW_WIDTH + 60, Math.max(40, window.screenY || 80));
-  }, [floatOutSnip]);
-
-  const runSnipAction = useCallback(async (snip, action) => {
-    if (!snip?.id) return;
-    setBusyIds((current) => {
-      const next = new Set(current);
-      next.add(snip.id);
-      return next;
-    });
-    setSnips((current) => current.map((item) => (
-      item.id === snip.id ? { ...item, status: "" } : item
-    )));
-
-    try {
-      if (action === "delete") {
-        await invoke("diffforge_delete_untracked_asset", { path: snip.localPath });
-        dismissSnip(snip);
-      } else if (action === "copy") {
-        const status = await copySnipToClipboard(snip);
-        setTransientStatus(setSnips, snip.id, status);
-      } else if (action === "edit") {
-        await invoke("snipping_open_annotation_editor", { path: snip.localPath });
-        setTransientStatus(setSnips, snip.id, "Editor opened");
-      } else if (action === "upload") {
-        await invoke("snipping_upload_untracked_asset", {
-          request: {
-            group: "snips",
-            name: snip.name,
-            path: snip.localPath,
-          },
-        });
-        setTransientStatus(setSnips, snip.id, "Tracked for upload");
-      }
-    } catch (error) {
-      setTransientStatus(setSnips, snip.id, error?.message || String(error || "Action failed"));
-    } finally {
-      setBusyIds((current) => {
-        const next = new Set(current);
-        next.delete(snip.id);
-        return next;
-      });
-    }
-  }, [dismissSnip]);
-
-  const floatedPaths = useMemo(
-    () => new Set(floatedSnips.map((item) => item.localPath)),
-    [floatedSnips],
-  );
-  const queuedSnips = useMemo(
-    () => snips.filter((snip) => !floatedPaths.has(snip.localPath)),
-    [floatedPaths, snips],
-  );
-
-  const renderSnipCard = useCallback((snip) => {
-    const busy = busyIds.has(snip.id);
-    return (
-      <QuickAccessCard
-        data-busy={busy ? "true" : "false"}
-        data-snip-card
-        key={snip.id}
-      >
-        <QuickAccessDragButton
-          aria-label={`Drag ${snip.name} out as its own window`}
-          disabled={busy}
-          onKeyDown={(event) => floatSnipFromKeyboard(event, snip)}
-          onPointerDown={(event) => beginSnipDrag(event, snip)}
-          title="Drag out as a floating preview"
-          type="button"
-        >
-          <DragIndicator aria-hidden="true" />
-        </QuickAccessDragButton>
-        <QuickAccessUploadButton
-          aria-label={`Upload ${snip.name}`}
-          disabled={busy}
-          onClick={() => runSnipAction(snip, "upload")}
-          title="Upload snip"
-          type="button"
-        >
-          <CloudUpload aria-hidden="true" />
-          <span>Upload</span>
-        </QuickAccessUploadButton>
-
-        <QuickAccessPreview>
-          {snip.previewUrl ? (
-            <img alt={snip.name} draggable={false} src={snip.previewUrl} />
-          ) : (
-            <span>Preview unavailable</span>
-          )}
-        </QuickAccessPreview>
-
-        <QuickAccessActions>
-          <QuickAccessButton aria-label={`Copy ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "copy")} title="Copy image" type="button">
-            <ContentCopy aria-hidden="true" />
-          </QuickAccessButton>
-          <QuickAccessButton aria-label={`Edit ${snip.name}`} disabled={busy} onClick={() => runSnipAction(snip, "edit")} title="Annotate copy" type="button">
-            <ModeEdit aria-hidden="true" />
-          </QuickAccessButton>
-          <QuickAccessButton aria-label={`Delete ${snip.name}`} data-danger="true" disabled={busy} onClick={() => runSnipAction(snip, "delete")} title="Delete file" type="button">
-            <Delete aria-hidden="true" />
-          </QuickAccessButton>
-        </QuickAccessActions>
-
-        <QuickAccessDismissButton aria-label={`Dismiss ${snip.name}`} disabled={busy} onClick={() => dismissSnip(snip)} title="Dismiss" type="button">
-          <Close aria-hidden="true" />
-        </QuickAccessDismissButton>
-        {snip.status ? (
-          <QuickAccessStatusPill aria-live="polite">{snip.status}</QuickAccessStatusPill>
-        ) : null}
-      </QuickAccessCard>
-    );
-  }, [beginSnipDrag, busyIds, dismissSnip, floatSnipFromKeyboard, runSnipAction]);
-
-  if (!snips.length && !floatedSnips.length) {
-    return <SnipFloatingGlobalStyle />;
-  }
-
-  return (
-    <>
-      <SnipFloatingGlobalStyle />
-      <QuickAccessRoot aria-label="Snip quick access" aria-live="polite">
-        <QueuedSnipStack>
-          {queuedSnips.map((snip) => renderSnipCard(snip))}
-        </QueuedSnipStack>
-      </QuickAccessRoot>
-    </>
-  );
+  return <SnipFloatingGlobalStyle />;
 }
 
+/**
+ * One snip preview = one draggable native window, from the moment it is
+ * captured. Grab it anywhere to move it (no drag handle, no morphing into a
+ * different surface); hovering reveals the actions.
+ */
 export function SnippingFloatWindow() {
-  const localPath = useMemo(() => pathFromHash(SNIPPING_FLOAT_HASH), []);
-  const previewUrl = useMemo(() => assetPreviewUrl({ localPath }), [localPath]);
+  const initialPath = useMemo(() => pathFromHash(SNIPPING_FLOAT_HASH), []);
+  // Annotating an original retargets this same window to the edited copy
+  // (originals get copied exactly once; edited copies always save in place),
+  // so the preview keeps showing the latest annotated view.
+  const [localPath, setLocalPath] = useState(initialPath);
+  const [imageVersion, setImageVersion] = useState(0);
+  // While the annotation editor is open, it streams composited frames here so
+  // edits are visible live; the autosaved file takes back over on each save.
+  const [liveFrameUrl, setLiveFrameUrl] = useState("");
+  const localPathRef = useRef(initialPath);
+  const previewUrl = useMemo(() => {
+    if (liveFrameUrl) return liveFrameUrl;
+    const url = assetPreviewUrl({ localPath });
+    if (!url || !imageVersion) return url;
+    return `${url}${url.includes("?") ? "&" : "?"}v=${imageVersion}`;
+  }, [imageVersion, liveFrameUrl, localPath]);
   const name = useMemo(() => assetName({ localPath }), [localPath]);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
 
-  const beginDrag = useCallback((event) => {
-    if (event.button !== 0 || event.target.closest("button")) return;
-    getCurrentWindow().startDragging().catch(() => {});
+  useEffect(() => {
+    localPathRef.current = localPath;
+  }, [localPath]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(SNIPPING_SOURCE_UPDATED_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const original = text(payload.originalPath || payload.original_path);
+      const edited = text(payload.editedPath || payload.edited_path || payload.path);
+      if (!edited) return;
+      const current = localPathRef.current;
+      if (current !== original && current !== edited) return;
+      setLocalPath(edited);
+      setImageVersion((version) => version + 1);
+      // The saved file now contains everything the live frames showed.
+      setLiveFrameUrl("");
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(SNIPPING_LIVE_PREVIEW_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      const sourcePath = text(payload.sourcePath || payload.source_path);
+      const targetPath = text(payload.targetPath || payload.target_path);
+      const dataUrl = text(payload.dataUrl || payload.data_url);
+      if (!dataUrl) return;
+      const current = localPathRef.current;
+      if (current !== sourcePath && (!targetPath || current !== targetPath)) return;
+      setLiveFrameUrl(dataUrl);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  const showStatus = useCallback((nextStatus) => {
+    setStatus(nextStatus);
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
+    statusTimerRef.current = window.setTimeout(() => {
+      statusTimerRef.current = 0;
+      setStatus("");
+    }, 2400);
+  }, []);
+
+  useEffect(() => () => {
+    if (statusTimerRef.current) {
+      window.clearTimeout(statusTimerRef.current);
+    }
   }, []);
 
   const closeFloat = useCallback(() => {
     getCurrentWindow().close().catch(() => {});
   }, []);
 
-  const openEditor = useCallback(() => {
-    if (!localPath) return;
-    invoke("snipping_open_annotation_editor", { path: localPath }).catch(() => {});
-  }, [localPath]);
+  const dismissFloat = useCallback(() => {
+    if (localPath) {
+      invoke("snipping_dismiss_capture_toast", {
+        request: { path: localPath },
+      }).catch(() => {});
+    }
+    closeFloat();
+  }, [closeFloat, localPath]);
+
+  const runAction = useCallback(async (action) => {
+    if (!localPath || busy) return;
+    setBusy(true);
+
+    try {
+      if (action === "delete") {
+        await invoke("diffforge_delete_untracked_asset", { path: localPath });
+        dismissFloat();
+      } else if (action === "copy") {
+        const copyStatus = await copySnipToClipboard({ localPath, name, previewUrl });
+        showStatus(copyStatus);
+      } else if (action === "edit") {
+        await invoke("snipping_open_annotation_editor", { path: localPath });
+        showStatus("Editor opened");
+      } else if (action === "upload") {
+        await invoke("snipping_upload_untracked_asset", {
+          request: {
+            group: "snips",
+            name,
+            path: localPath,
+          },
+        });
+        showStatus("Tracked for upload");
+      }
+    } catch (error) {
+      showStatus(error?.message || String(error || "Action failed"));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, dismissFloat, localPath, name, previewUrl, showStatus]);
+
+  // Manual double-press detection: the native window drag begins on the
+  // first press, so a synthetic dblclick event is not reliable here.
+  const lastPressAtRef = useRef(0);
+  const beginDrag = useCallback((event) => {
+    if (event.button !== 0 || event.target.closest("button")) return;
+    // Stop WebKit from starting a selection highlight while the native
+    // window drag takes over.
+    event.preventDefault();
+
+    const now = Date.now();
+    if (now - lastPressAtRef.current < 360) {
+      lastPressAtRef.current = 0;
+      void runAction("edit");
+      return;
+    }
+    lastPressAtRef.current = now;
+    getCurrentWindow().startDragging().catch(() => {});
+  }, [runAction]);
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -551,18 +374,65 @@ export function SnippingFloatWindow() {
     <>
       <SnipFloatingGlobalStyle />
       <FloatWindowRoot
-        onDoubleClick={openEditor}
+        data-busy={busy ? "true" : "false"}
+        onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
-        title={`${name} — drag anywhere, drag onto the queue to return, double-click to annotate`}
+        title={`${name} — drag anywhere, double-click to annotate`}
       >
         {previewUrl ? (
           <img alt={name} draggable={false} src={previewUrl} />
         ) : (
-          <span>Preview unavailable</span>
+          <span data-empty="true">Preview unavailable</span>
         )}
-        <FloatCloseButton aria-label={`Close ${name}`} onClick={closeFloat} title="Close" type="button">
+        <FloatCloseButton
+          aria-label={`Dismiss ${name}`}
+          onClick={dismissFloat}
+          title="Dismiss"
+          type="button"
+        >
           <Close aria-hidden="true" />
         </FloatCloseButton>
+        <FloatUploadButton
+          aria-label={`Upload ${name}`}
+          disabled={busy}
+          onClick={() => runAction("upload")}
+          title="Upload snip"
+          type="button"
+        >
+          <CloudUpload aria-hidden="true" />
+          <span>Upload</span>
+        </FloatUploadButton>
+        <FloatActionBar>
+          <FloatActionButton
+            aria-label={`Copy ${name}`}
+            disabled={busy}
+            onClick={() => runAction("copy")}
+            title="Copy image"
+            type="button"
+          >
+            <ContentCopy aria-hidden="true" />
+          </FloatActionButton>
+          <FloatActionButton
+            aria-label={`Annotate ${name}`}
+            disabled={busy}
+            onClick={() => runAction("edit")}
+            title="Annotate copy"
+            type="button"
+          >
+            <ModeEdit aria-hidden="true" />
+          </FloatActionButton>
+          <FloatActionButton
+            aria-label={`Delete ${name}`}
+            data-danger="true"
+            disabled={busy}
+            onClick={() => runAction("delete")}
+            title="Delete file"
+            type="button"
+          >
+            <Delete aria-hidden="true" />
+          </FloatActionButton>
+        </FloatActionBar>
+        {status ? <FloatStatusPill aria-live="polite">{status}</FloatStatusPill> : null}
       </FloatWindowRoot>
     </>
   );
@@ -580,6 +450,7 @@ const FloatWindowRoot = styled.main`
   clip-path: inset(0 round 12px);
   cursor: grab;
   user-select: none;
+  -webkit-user-select: none;
 
   &:active {
     cursor: grabbing;
@@ -590,28 +461,37 @@ const FloatWindowRoot = styled.main`
     height: 100%;
     object-fit: contain;
     pointer-events: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
   }
 
-  span {
+  > span[data-empty="true"] {
     color: rgba(248, 250, 252, 0.6);
     font-size: 11px;
     font-weight: 700;
   }
 
-  button {
+  /* All chrome (close, upload, action pill, status) stays invisible until
+     the preview is hovered; the bare image is the whole resting surface. */
+  > button,
+  > div {
     opacity: 0;
-    transition: opacity 130ms ease;
+    pointer-events: none;
+    transition: opacity 140ms ease;
   }
 
-  &:hover button {
+  &:hover > button,
+  &:hover > div {
     opacity: 1;
+    pointer-events: auto;
   }
 `;
 
 const FloatCloseButton = styled.button`
   position: absolute;
   top: 6px;
-  right: 6px;
+  left: 6px;
   display: grid;
   width: 22px;
   height: 22px;
@@ -632,6 +512,105 @@ const FloatCloseButton = styled.button`
     border-color: rgba(239, 107, 107, 0.5);
     background: rgba(76, 22, 26, 0.9);
   }
+`;
+
+const FloatUploadButton = styled.button`
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 9px;
+  border: 1px solid rgba(125, 176, 255, 0.34);
+  border-radius: 999px;
+  color: #cfe3ff;
+  background: rgba(7, 10, 16, 0.85);
+  font-size: 10px;
+  font-weight: 760;
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled) {
+    color: #06121f;
+    background: #7db0ff;
+    border-color: transparent;
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+`;
+
+const FloatActionBar = styled.div`
+  position: absolute;
+  bottom: 6px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  background: rgba(7, 10, 16, 0.88);
+  transform: translateX(-50%);
+`;
+
+const FloatActionButton = styled.button`
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.82);
+  background: transparent;
+  cursor: pointer;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled) {
+    color: #fff;
+    background: rgba(125, 176, 255, 0.22);
+  }
+
+  &[data-danger="true"]:hover:not(:disabled) {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.85);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+`;
+
+const FloatStatusPill = styled.span`
+  position: absolute;
+  top: 7px;
+  left: 50%;
+  max-width: calc(100% - 132px);
+  overflow: hidden;
+  padding: 3px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.92);
+  background: rgba(7, 10, 16, 0.88);
+  font-size: 10px;
+  font-weight: 740;
+  text-overflow: ellipsis;
+  transform: translateX(-50%);
+  white-space: nowrap;
 `;
 
 export function SnippingAnnotationEditorWindow() {
@@ -852,6 +831,65 @@ export function SnippingAnnotationEditorWindow() {
   // version. Edited copies always update in place.
   const autosaveTargetsRef = useRef({});
   const autosaveTimerRef = useRef(0);
+  const livePreviewTimerRef = useRef(0);
+  const livePreviewLastSentRef = useRef(0);
+
+  // Streams the composited canvas to the snip preview window while drawing,
+  // so edits are visible there live (downscaled JPEG frames, throttled).
+  const emitLivePreviewFrame = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !activePath || !canvas.width || !canvas.height) return;
+
+    let dataUrl = "";
+    try {
+      const scale = Math.min(1, SNIPPING_LIVE_PREVIEW_MAX_WIDTH / canvas.width);
+      if (scale < 1) {
+        const frame = document.createElement("canvas");
+        frame.width = Math.max(1, Math.round(canvas.width * scale));
+        frame.height = Math.max(1, Math.round(canvas.height * scale));
+        frame.getContext("2d").drawImage(canvas, 0, 0, frame.width, frame.height);
+        dataUrl = frame.toDataURL("image/jpeg", 0.72);
+      } else {
+        dataUrl = canvas.toDataURL("image/jpeg", 0.72);
+      }
+    } catch {
+      return;
+    }
+    if (!dataUrl) return;
+
+    emit(SNIPPING_LIVE_PREVIEW_EVENT, {
+      kind: "snip_live_preview",
+      sourcePath: activePath,
+      targetPath: autosaveTargetsRef.current[activePath] || "",
+      dataUrl,
+    }).catch(() => {});
+  }, [activePath]);
+
+  useEffect(() => {
+    if (!canvasSize.width || !canvasSize.height) return undefined;
+    if (!draft && !(annotationsByPath[activePath] || []).length) return undefined;
+
+    const elapsed = Date.now() - livePreviewLastSentRef.current;
+    const delay = Math.max(16, SNIPPING_LIVE_PREVIEW_THROTTLE_MS - elapsed);
+    if (livePreviewTimerRef.current) {
+      window.clearTimeout(livePreviewTimerRef.current);
+    }
+    livePreviewTimerRef.current = window.setTimeout(() => {
+      livePreviewTimerRef.current = 0;
+      livePreviewLastSentRef.current = Date.now();
+      emitLivePreviewFrame();
+    }, delay);
+
+    // Intentionally no cleanup on dependency change: the trailing frame must
+    // still fire after the last stroke update settles.
+    return undefined;
+  }, [activePath, annotationsByPath, canvasSize.height, canvasSize.width, draft, emitLivePreviewFrame]);
+
+  useEffect(() => () => {
+    if (livePreviewTimerRef.current) {
+      window.clearTimeout(livePreviewTimerRef.current);
+    }
+  }, []);
   const persistAnnotatedImage = useCallback(async () => {
     const canvas = canvasRef.current;
     if (!canvas || !activePath || !canvas.width || !canvas.height) return;
@@ -951,32 +989,33 @@ export function SnippingAnnotationEditorWindow() {
           </FloatingButton>
         </EditorTitleBar>
 
-        <EditorControlsStack>
-          {multiImage && (
-            <EditorBatchStrip aria-label="Selected images">
-              {localPaths.map((path, index) => {
-                const itemName = assetName({ localPath: path });
-                const itemPreviewUrl = assetPreviewUrl({ localPath: path });
-                const annotationCount = (annotationsByPath[path] || []).length;
-                const active = path === activePath;
-                return (
-                  <EditorThumbButton
-                    aria-label={`Edit ${itemName}`}
-                    data-active={active ? "true" : "false"}
-                    key={path}
-                    onClick={() => setActivePath(path)}
-                    title={itemName}
-                    type="button"
-                  >
-                    {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
-                    <strong>{index + 1}</strong>
-                    {annotationCount > 0 && <small>{annotationCount}</small>}
-                  </EditorThumbButton>
-                );
-              })}
-            </EditorBatchStrip>
-          )}
-          <EditorToolbar>
+        {multiImage && (
+          <EditorBatchStrip aria-label="Selected images">
+            {localPaths.map((path, index) => {
+              const itemName = assetName({ localPath: path });
+              const itemPreviewUrl = assetPreviewUrl({ localPath: path });
+              const annotationCount = (annotationsByPath[path] || []).length;
+              const active = path === activePath;
+              return (
+                <EditorThumbButton
+                  aria-label={`Edit ${itemName}`}
+                  data-active={active ? "true" : "false"}
+                  key={path}
+                  onClick={() => setActivePath(path)}
+                  title={itemName}
+                  type="button"
+                >
+                  {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
+                  <strong>{index + 1}</strong>
+                  {annotationCount > 0 && <small>{annotationCount}</small>}
+                </EditorThumbButton>
+              );
+            })}
+          </EditorBatchStrip>
+        )}
+
+        <EditorBody>
+          <EditorToolRail aria-label="Annotation tools">
             <EditorToolGroup>
               {TOOL_OPTIONS.map(({ id, label, Icon }) => (
                 <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
@@ -984,15 +1023,24 @@ export function SnippingAnnotationEditorWindow() {
                 </EditorToolButton>
               ))}
             </EditorToolGroup>
+            <EditorRailDivider aria-hidden="true" />
             <EditorToolGroup>
               {COLOR_OPTIONS.map((option) => (
                 <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
               ))}
             </EditorToolGroup>
-            <StrokeControl>
-              <span>Stroke</span>
-              <input max="14" min="2" onChange={(event) => setStrokeWidth(Number(event.target.value) || 5)} type="range" value={strokeWidth} />
+            <EditorRailDivider aria-hidden="true" />
+            <StrokeControl title={`Stroke ${strokeWidth}`}>
+              <input
+                aria-label="Stroke width"
+                max="14"
+                min="2"
+                onChange={(event) => setStrokeWidth(Number(event.target.value) || 5)}
+                type="range"
+                value={strokeWidth}
+              />
             </StrokeControl>
+            <EditorRailDivider aria-hidden="true" />
             <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
               <Undo aria-hidden="true" />
             </EditorToolButton>
@@ -1002,19 +1050,18 @@ export function SnippingAnnotationEditorWindow() {
             <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
               <ContentCopy aria-hidden="true" />
             </EditorToolButton>
-          </EditorToolbar>
-        </EditorControlsStack>
-
-        <EditorCanvasStage>
-          <canvas
-            aria-label="Snip annotation canvas"
-            onMouseDown={beginDraw}
-            onMouseLeave={finishDraw}
-            onMouseMove={updateDraw}
-            onMouseUp={finishDraw}
-            ref={canvasRef}
-          />
-        </EditorCanvasStage>
+          </EditorToolRail>
+          <EditorCanvasStage>
+            <canvas
+              aria-label="Snip annotation canvas"
+              onMouseDown={beginDraw}
+              onMouseLeave={finishDraw}
+              onMouseMove={updateDraw}
+              onMouseUp={finishDraw}
+              ref={canvasRef}
+            />
+          </EditorCanvasStage>
+        </EditorBody>
         <EditorTodoComposer onSubmit={queueTodo}>
           <EditorTargetSelect
             aria-label="Target workspace"
@@ -1155,281 +1202,6 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
 
 `;
 
-const QuickAccessRoot = styled.aside`
-  position: fixed;
-  inset: 0;
-  z-index: 12000;
-  overflow: hidden;
-  pointer-events: none;
-`;
-
-const QueuedSnipStack = styled.div`
-  position: absolute;
-  left: 10px;
-  bottom: 10px;
-  z-index: 2;
-  display: flex;
-  flex-direction: column-reverse;
-  align-items: flex-start;
-  gap: ${SNIP_CARD_GAP}px;
-  max-height: calc(100vh - 20px);
-  overflow: hidden;
-  pointer-events: none;
-`;
-
-const QuickAccessCard = styled.article`
-  position: relative;
-  display: inline-grid;
-  width: fit-content;
-  max-width: calc(100vw - 24px);
-  padding: 0;
-  border: 0;
-  border-radius: 18px;
-  background: transparent;
-  pointer-events: auto;
-  transform: translateX(0);
-  transition:
-    transform 150ms ease;
-
-  &:hover,
-  &:focus-within {
-    transform: translateX(2px);
-  }
-
-  &[data-floating="true"] {
-    position: absolute;
-    z-index: 4;
-    transform: none;
-  }
-
-  &[data-floating="true"]:hover,
-  &[data-floating="true"]:focus-within {
-    transform: none;
-  }
-`;
-
-const QuickAccessUploadButton = styled.button`
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  z-index: 4;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 28px;
-  max-width: calc(100% - 54px);
-  padding: 0 9px;
-  border: 1px solid rgba(147, 197, 253, 0.36);
-  border-radius: 999px;
-  color: #eff6ff;
-  background: rgba(21, 38, 68, 0.84);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
-  cursor: pointer;
-  transition:
-    background 140ms ease,
-    border-color 140ms ease;
-
-  svg {
-    flex: 0 0 auto;
-    width: 14px;
-    height: 14px;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    font-size: 10px;
-    font-weight: 850;
-    line-height: 1;
-    text-overflow: ellipsis;
-    text-transform: uppercase;
-    white-space: nowrap;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: rgba(191, 219, 254, 0.72);
-    background: rgba(37, 99, 235, 0.8);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.54;
-  }
-`;
-
-const QuickAccessPreview = styled.div`
-  /* Fixed rectangular card: thin or extreme aspect snips letterbox inside it
-     instead of collapsing, and the hover action pill always has room. */
-  display: grid;
-  width: min(208px, calc(100vw - 24px));
-  height: 132px;
-  place-items: center;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-radius: 14px;
-  background: rgba(9, 12, 18, 0.82);
-  box-shadow:
-    0 14px 34px rgba(0, 0, 0, 0.34),
-    0 0 0 1px rgba(0, 0, 0, 0.18);
-
-  img {
-    display: block;
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-    user-select: none;
-  }
-
-  span {
-    display: grid;
-    place-items: center;
-    padding: 16px;
-    color: rgba(248, 250, 252, 0.62);
-    font-size: 11px;
-    font-weight: 800;
-    text-align: center;
-  }
-`;
-
-const QuickAccessActions = styled.div`
-  position: absolute;
-  left: 50%;
-  bottom: 8px;
-  z-index: 2;
-  display: inline-flex;
-  gap: 5px;
-  padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 999px;
-  background: rgba(7, 10, 16, 0.72);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
-  backdrop-filter: blur(14px);
-  opacity: 0;
-  pointer-events: none;
-  transform: translate(-50%, 6px);
-  transition:
-    opacity 140ms ease,
-    transform 140ms ease;
-
-  ${QuickAccessCard}:hover &,
-  ${QuickAccessCard}:focus-within &,
-  ${QuickAccessCard}[data-busy="true"] & {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translate(-50%, 0);
-  }
-`;
-
-const QuickAccessButton = styled.button`
-  display: inline-grid;
-  width: 25px;
-  height: 25px;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 999px;
-  color: #f8fafc;
-  background: rgba(255, 255, 255, 0.07);
-  cursor: pointer;
-
-  svg {
-    width: 14px;
-    height: 14px;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: rgba(255, 255, 255, 0.38);
-    background: rgba(15, 23, 36, 0.92);
-  }
-
-  &[data-danger="true"] {
-    color: #ffd4d4;
-  }
-
-  &[data-danger="true"]:hover:not(:disabled) {
-    border-color: rgba(239, 107, 107, 0.46);
-    background: rgba(76, 22, 26, 0.92);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.48;
-  }
-`;
-
-const QuickAccessDragButton = styled(QuickAccessButton)`
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  z-index: 4;
-  width: 28px;
-  height: 28px;
-  color: rgba(248, 250, 252, 0.9);
-  background: rgba(7, 10, 16, 0.76);
-  cursor: grab;
-  transition:
-    background 140ms ease,
-    border-color 140ms ease;
-
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  &:active {
-    cursor: grabbing;
-  }
-
-  &:hover:not(:disabled),
-  &:focus-visible {
-    border-color: rgba(255, 255, 255, 0.38);
-    background: rgba(15, 23, 36, 0.92);
-  }
-`;
-
-const QuickAccessStatusPill = styled.span`
-  position: absolute;
-  top: 42px;
-  left: 50%;
-  z-index: 3;
-  max-width: calc(100% - 24px);
-  overflow: hidden;
-  padding: 4px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 999px;
-  color: rgba(244, 247, 250, 0.94);
-  background: rgba(10, 12, 16, 0.85);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
-  font-size: 10px;
-  font-weight: 650;
-  line-height: 1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  transform: translateX(-50%);
-  pointer-events: none;
-  backdrop-filter: blur(10px);
-`;
-
-const QuickAccessDismissButton = styled(QuickAccessButton)`
-  position: absolute;
-  top: 50%;
-  left: 8px;
-  z-index: 3;
-  opacity: 0;
-  pointer-events: none;
-  transform: translate(-6px, -50%);
-  transition:
-    opacity 140ms ease,
-    transform 140ms ease;
-
-  ${QuickAccessCard}:hover &,
-  ${QuickAccessCard}:focus-within &,
-  ${QuickAccessCard}[data-busy="true"] & {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translate(0, -50%);
-  }
-`;
-
 const FloatingButton = styled.button`
   display: inline-grid;
   width: 30px;
@@ -1467,8 +1239,8 @@ const FloatingButton = styled.button`
 `;
 
 const EditorWindowRoot = styled.main`
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   width: 100vw;
   height: 100vh;
   overflow: hidden;
@@ -1534,32 +1306,29 @@ const EditorStatus = styled.span`
   font-weight: 750;
 `;
 
-const EditorControlsStack = styled.div`
-  display: grid;
-  min-width: 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.92);
-`;
-
+// Thin, horizontally scrollable strip of the other selected images.
 const EditorBatchStrip = styled.div`
   display: flex;
+  flex: none;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   overflow-x: auto;
-  padding: 9px 12px 0;
+  padding: 5px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 12, 18, 0.92);
   scrollbar-width: thin;
 `;
 
 const EditorThumbButton = styled.button`
   position: relative;
   flex: 0 0 auto;
-  width: 72px;
-  height: 52px;
+  width: 54px;
+  height: 32px;
   overflow: hidden;
   padding: 0;
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 10px;
+  border-radius: 7px;
   color: #f8fafc;
   background: rgba(255, 255, 255, 0.055);
   cursor: pointer;
@@ -1577,7 +1346,7 @@ const EditorThumbButton = styled.button`
     height: 100%;
     place-items: center;
     color: rgba(248, 250, 252, 0.62);
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 850;
   }
 
@@ -1585,25 +1354,25 @@ const EditorThumbButton = styled.button`
   small {
     position: absolute;
     display: inline-grid;
-    min-width: 18px;
-    height: 18px;
+    min-width: 14px;
+    height: 14px;
     place-items: center;
     border-radius: 999px;
-    font-size: 9px;
+    font-size: 8px;
     font-weight: 900;
     line-height: 1;
   }
 
   strong {
-    left: 5px;
-    bottom: 5px;
+    left: 3px;
+    bottom: 3px;
     color: rgba(248, 250, 252, 0.92);
     background: rgba(7, 10, 16, 0.78);
   }
 
   small {
-    top: 5px;
-    right: 5px;
+    top: 3px;
+    right: 3px;
     color: rgba(204, 251, 241, 0.96);
     background: rgba(13, 148, 136, 0.76);
   }
@@ -1616,18 +1385,40 @@ const EditorThumbButton = styled.button`
   }
 `;
 
-const EditorToolbar = styled.nav`
+const EditorBody = styled.div`
   display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+`;
+
+// Slim vertical tool rail hugging the left edge; the canvas owns the rest.
+const EditorToolRail = styled.nav`
+  display: flex;
+  flex: none;
+  flex-direction: column;
   align-items: center;
-  gap: 10px;
-  min-height: 48px;
-  padding: 8px 12px;
-  overflow-x: auto;
+  gap: 8px;
+  width: 46px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(9, 12, 18, 0.92);
   scrollbar-width: thin;
 `;
 
+const EditorRailDivider = styled.span`
+  width: 22px;
+  height: 1px;
+  flex: none;
+  background: rgba(255, 255, 255, 0.1);
+`;
+
 const EditorToolGroup = styled.div`
-  display: inline-flex;
+  display: flex;
+  flex: none;
+  flex-direction: column;
   align-items: center;
   gap: 6px;
 `;
@@ -1675,25 +1466,28 @@ const ColorButton = styled.button`
 `;
 
 const StrokeControl = styled.label`
-  display: inline-flex;
+  display: flex;
+  flex: none;
   align-items: center;
-  gap: 7px;
-  color: rgba(248, 250, 252, 0.62);
-  font-size: 11px;
-  font-weight: 750;
+  justify-content: center;
 
   input {
-    width: 96px;
+    width: 20px;
+    height: 72px;
+    -webkit-appearance: slider-vertical;
+    writing-mode: vertical-lr;
+    direction: rtl;
   }
 `;
 
-
 const EditorCanvasStage = styled.section`
   display: grid;
+  flex: 1;
+  min-width: 0;
   min-height: 0;
   place-items: center;
   overflow: auto;
-  padding: 18px;
+  padding: 8px;
   background:
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.12), transparent 40%),
     #05070b;

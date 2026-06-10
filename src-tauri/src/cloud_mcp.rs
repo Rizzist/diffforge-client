@@ -13569,13 +13569,12 @@ async fn cloud_mcp_hard_reset_cloud_sqlite(
         .filter(|scope| !scope.is_empty())
         .unwrap_or("repo")
         .to_ascii_lowercase();
-    if requested_reset_scope == "account" {
-        return Err(
-            "Account cloud SQLite reset has been removed; select a repository to reset."
-                .to_string(),
-        );
-    }
     let reset_scope = match requested_reset_scope.as_str() {
+        // Account scope is the "clean up the server" path: cloud-diffforge
+        // wipes every per-client SQLite scope, the hot state, the workspace
+        // mirror, and the deleted-ids ledger for the account, after which
+        // this client resyncs everything as the authoritative copy.
+        "account" | "account_full" | "account-full" => "account",
         "repo" | "repository" | "git_repo" | "git-repo" => "repo",
         "client" | "current" | "workspace" => "repo",
         _ => "repo",

@@ -6575,7 +6575,7 @@ export const AudioRecorderActions = styled.div`
 
 export const AudioModeGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   gap: 6px;
   min-width: 0;
 
@@ -8293,13 +8293,13 @@ export const AudioPillShell = styled.div`
 export const AudioPillTooltip = styled.span`
   display: inline-flex;
   align-items: center;
-  padding: 5px 13px;
+  padding: 4px 10px;
   border: 1px solid rgba(230, 236, 245, 0.14);
   border-radius: 999px;
   color: rgba(230, 236, 245, 0.92);
   background: linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.97));
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 740;
   white-space: nowrap;
   opacity: 0;
@@ -8324,8 +8324,8 @@ export const AudioPillTooltip = styled.span`
 // the same element into a round microphone button (Wispr-style).
 export const AudioPillMicButton = styled.button`
   display: inline-flex;
-  width: 56px;
-  height: 8px;
+  width: 44px;
+  height: 7px;
   flex: none;
   align-items: center;
   justify-content: center;
@@ -8343,15 +8343,15 @@ export const AudioPillMicButton = styled.button`
     border-color 160ms ease;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 15px;
+    height: 15px;
     opacity: 0;
     transition: opacity 120ms ease 60ms;
   }
 
   ${AudioPillShell}:hover & {
-    width: 40px;
-    height: 40px;
+    width: 34px;
+    height: 34px;
     border-color: rgba(230, 236, 245, 0.18);
     background:
       radial-gradient(circle at 30% 18%, rgba(125, 176, 255, 0.2), transparent 55%),
@@ -12688,7 +12688,52 @@ export const titleIconSize = `
 `;
 
 export const TitleBackgroundIcon = styled(TitleBackgroundGlyph)`
-  ${titleIconSize}
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+`;
+
+export const WindowBackgroundPill = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: center;
+  padding: 3px 10px;
+  border: 1px solid rgba(125, 176, 255, 0.32);
+  border-radius: 999px;
+  color: rgba(200, 222, 255, 0.92);
+  background: rgba(59, 130, 246, 0.12);
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &:hover {
+    color: #ffffff;
+    background: rgba(59, 130, 246, 0.28);
+  }
+
+  &[data-platform="macos"] {
+    order: 4;
+    margin-left: 10px;
+  }
+
+  &[data-platform="windows"],
+  &[data-platform="linux"] {
+    margin-right: 8px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(37, 99, 235, 0.35);
+    color: rgba(29, 78, 216, 0.9);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: rgba(29, 78, 216, 1);
+    background: rgba(59, 130, 246, 0.2);
+  }
 `;
 
 export const TitleMinimizeIcon = styled(Remove)`

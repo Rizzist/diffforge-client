@@ -15,6 +15,7 @@ const AUDIO_DEEPGRAM_LANGUAGE_STORAGE_KEY = "diffforge.audio.deepgramLanguage";
 export const AUDIO_TRANSCRIPTION_PROVIDER_LOCAL = "local";
 export const AUDIO_TRANSCRIPTION_PROVIDER_CLOUD = "cloud";
 export const AUDIO_TRANSCRIPTION_PROVIDER_FORGE = "forge";
+export const AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT = "forge-agent";
 const AUDIO_FORGE_LLM_CLEANUP_STORAGE_KEY = "diffforge.audio.forgeLlmCleanup";
 export const AUDIO_RECORDER_MODE_PUSH_TO_TALK = "push-to-talk";
 export const AUDIO_RECORDER_MODE_TOGGLE_TO_TALK = "toggle-to-talk";
@@ -51,6 +52,7 @@ function normalizeAudioTranscriptionProvider(value) {
   if (
     value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
     || value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+    || value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
   ) {
     return value;
   }
@@ -108,11 +110,15 @@ function inferAudioTranscriptionProvider(value) {
   if (
     provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
     || provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+    || provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
   ) {
     return provider;
   }
 
   const source = String(value?.source || "").toLowerCase();
+  if (source.includes("voice-agent") || source.includes("voice agent")) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT;
+  }
   if (source.includes("forge")) {
     return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
   }
@@ -340,6 +346,8 @@ function normalizeTranscriptionResult(value) {
     ? value.source.trim()
     : provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
       ? "deepgram-nova-3-live"
+      : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+        ? "forge-voice-agent"
       : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? "forge-nova3-dictation"
         : "whisper-local";

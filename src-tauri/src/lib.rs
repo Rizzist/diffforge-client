@@ -3784,8 +3784,8 @@ pub fn run() {
             );
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
+            // (The tray icon is created only when background mode is entered.)
             todo_dispatch_start_background_dispatcher(app.handle().clone());
-            setup_background_tray(app);
             {
                 // Crash recovery: anything still marked in-flight in the todo
                 // ledger is a leftover from a previous process and gets
