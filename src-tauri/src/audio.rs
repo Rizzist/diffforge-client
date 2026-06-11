@@ -22,6 +22,55 @@ const CLOUD_DICTATION_WARM_READY_TIMEOUT_SECS: u64 = 10;
 const CLOUD_DICTATION_WARM_CLAIM_TIMEOUT_MS: u64 = 800;
 const CLOUD_DICTATION_WARM_RETRY_MIN_MS: u64 = 1_000;
 const CLOUD_DICTATION_WARM_RETRY_MAX_MS: u64 = 30_000;
+// Raw-first finalization: the cloud sends `voice_dictation_final` with the
+// raw transcript as soon as Deepgram flushes, then a `voice_dictation_cleaned`
+// follow-up frame once the LLM pass lands. The client waits at most this long
+// for the cleaned frame (server cleanup budget is 4s) before returning raw.
+const CLOUD_DICTATION_CLEANED_WAIT_SECS: u64 = 6;
+// Cold-connect route cache, keyed by websocket path: every successful voice
+// route resolve (mostly the dictation warm keeper's) is remembered briefly so
+// a cold press-to-talk skips the serial auth + heartbeat + balancer round
+// trips it would otherwise pay.
+const CLOUD_VOICE_ROUTE_CACHE_TTL_SECS: u64 = 90;
+
+struct ForgeVoiceCachedRoute {
+    ws_target: CloudMcpWsTarget,
+    auth_bearer: Option<String>,
+    resolved_at: Instant,
+}
+
+static FORGE_VOICE_ROUTE_CACHE: OnceLock<StdMutex<HashMap<String, ForgeVoiceCachedRoute>>> =
+    OnceLock::new();
+
+fn forge_voice_route_cache() -> &'static StdMutex<HashMap<String, ForgeVoiceCachedRoute>> {
+    FORGE_VOICE_ROUTE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn forge_voice_route_cache_store(
+    ws_path: &str,
+    ws_target: &CloudMcpWsTarget,
+    auth_bearer: &Option<String>,
+) {
+    if let Ok(mut cache) = forge_voice_route_cache().lock() {
+        cache.insert(
+            ws_path.to_string(),
+            ForgeVoiceCachedRoute {
+                ws_target: ws_target.clone(),
+                auth_bearer: auth_bearer.clone(),
+                resolved_at: Instant::now(),
+            },
+        );
+    }
+}
+
+fn forge_voice_route_cache_fresh(ws_path: &str) -> Option<(CloudMcpWsTarget, Option<String>)> {
+    let cache = forge_voice_route_cache().lock().ok()?;
+    let cached = cache.get(ws_path)?;
+    if cached.resolved_at.elapsed() > Duration::from_secs(CLOUD_VOICE_ROUTE_CACHE_TTL_SECS) {
+        return None;
+    }
+    Some((cached.ws_target.clone(), cached.auth_bearer.clone()))
+}
 
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
@@ -40,7 +89,10 @@ fn write_whisper_local_audio_log(entry: Value) {
     if !WHISPER_LOCAL_AUDIO_LOGGING_ENABLED {
         return;
     }
+    write_whisper_local_audio_log_entry(entry);
+}
 
+fn write_whisper_local_audio_log_entry(entry: Value) {
     let log_path = whisper_local_audio_log_path();
     let Some(log_dir) = log_path.parent() else {
         return;
@@ -83,15 +135,23 @@ fn audio_debug_thread_label() -> String {
 }
 
 fn log_audio_diagnostic_event(phase: &str, fields: Value) {
-    log_whisper_local_audio_event(
-        phase,
-        None,
-        json!({
+    // Cloud dictation breadcrumbs stay on even in production builds: they are
+    // a handful of one-line events per session and the only field telemetry
+    // for press-to-talk latency. Everything else honors the debug flag.
+    let forced = phase.starts_with("audio.forge_dictation.");
+    if !WHISPER_LOCAL_AUDIO_LOGGING_ENABLED && !forced {
+        return;
+    }
+    write_whisper_local_audio_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_whisper_local_audio_log_text(phase),
+        "elapsed_ms": Value::Null,
+        "fields": {
             "app_pid": std::process::id(),
             "thread": audio_debug_thread_label(),
             "fields": fields,
-        }),
-    );
+        },
+    }));
 }
 
 struct WhisperCliWarmCacheState {
@@ -4410,85 +4470,114 @@ async fn start_cloud_voice_agent_stream(
             "workspace_root": workspace_root.clone(),
         }),
     );
-    match ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await {
-        Ok(()) => {
-            spawn_cloud_voice_agent_desktop_log(
-                cloud_mcp_state.inner(),
-                "app_ws_auth_ready",
-                "ok",
-                "Rust desktop confirmed authenticated app websocket readiness before voice streaming.",
-                &voice_session_id,
-                &workspace_id,
-                &repo_id,
-                json!({}),
-            );
-        }
-        Err(error) => {
-            spawn_cloud_voice_agent_desktop_log(
-                cloud_mcp_state.inner(),
-                "app_ws_auth_not_ready",
-                "error",
-                &error,
-                &voice_session_id,
-                &workspace_id,
-                &repo_id,
-                json!({}),
-            );
-            return Err(error);
-        }
-    }
-    let auth_bearer = match cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await {
-        Ok(token) => token,
-        Err(error) => {
-            spawn_cloud_voice_agent_desktop_log(
-                cloud_mcp_state.inner(),
-                "voice_media_auth_failed",
-                "error",
-                &error,
-                &voice_session_id,
-                &workspace_id,
-                &repo_id,
-                json!({}),
-            );
-            return Err(error);
-        }
-    };
-    let ws_target = match cloud_mcp_resolve_ws_target(
-        cloud_mcp_state.inner(),
-        &cloud_mcp_base_url(),
-        CLOUD_VOICE_AGENT_WS_PATH,
-    )
-    .await
-    {
-        Ok(target) => target,
-        Err(error) => {
-            let message = format!("Cloud voice route unavailable: {error}");
-            spawn_cloud_voice_agent_desktop_log(
-                cloud_mcp_state.inner(),
-                "voice_media_route_resolved",
-                "error",
-                &message,
-                &voice_session_id,
-                &workspace_id,
-                &repo_id,
-                json!({}),
-            );
-            return Err(message);
-        }
-    };
-    spawn_cloud_voice_agent_desktop_log(
-        cloud_mcp_state.inner(),
-        "voice_media_route_resolved",
-        "ok",
-        "Rust desktop resolved the dedicated cloud voice media websocket route.",
-        &voice_session_id,
-        &workspace_id,
-        &repo_id,
-        json!({
-            "direct": ws_target.route_token.is_some(),
-            "transport": ws_target.transport.clone(),
-        }),
-    );
+    // A freshly cached voice route (under the cache TTL) skips the serial
+    // app-ws auth wait, bearer prep, device heartbeat, and balancer round
+    // trip; a failed connect surfaces normally and the retry resolves fresh.
+    let (ws_target, auth_bearer) =
+        match forge_voice_route_cache_fresh(CLOUD_VOICE_AGENT_WS_PATH) {
+            Some((ws_target, auth_bearer)) => {
+                spawn_cloud_voice_agent_desktop_log(
+                    cloud_mcp_state.inner(),
+                    "voice_media_route_resolved",
+                    "ok",
+                    "Rust desktop reused the freshly cached cloud voice media websocket route.",
+                    &voice_session_id,
+                    &workspace_id,
+                    &repo_id,
+                    json!({
+                        "direct": ws_target.route_token.is_some(),
+                        "transport": ws_target.transport.clone(),
+                        "cached": true,
+                    }),
+                );
+                (ws_target, auth_bearer)
+            }
+            None => {
+                match ensure_cloud_voice_agent_app_ws_ready(cloud_mcp_state.inner()).await {
+                    Ok(()) => {
+                        spawn_cloud_voice_agent_desktop_log(
+                            cloud_mcp_state.inner(),
+                            "app_ws_auth_ready",
+                            "ok",
+                            "Rust desktop confirmed authenticated app websocket readiness before voice streaming.",
+                            &voice_session_id,
+                            &workspace_id,
+                            &repo_id,
+                            json!({}),
+                        );
+                    }
+                    Err(error) => {
+                        spawn_cloud_voice_agent_desktop_log(
+                            cloud_mcp_state.inner(),
+                            "app_ws_auth_not_ready",
+                            "error",
+                            &error,
+                            &voice_session_id,
+                            &workspace_id,
+                            &repo_id,
+                            json!({}),
+                        );
+                        return Err(error);
+                    }
+                }
+                let auth_bearer = match cloud_mcp_authorization_bearer(cloud_mcp_state.inner())
+                    .await
+                {
+                    Ok(token) => token,
+                    Err(error) => {
+                        spawn_cloud_voice_agent_desktop_log(
+                            cloud_mcp_state.inner(),
+                            "voice_media_auth_failed",
+                            "error",
+                            &error,
+                            &voice_session_id,
+                            &workspace_id,
+                            &repo_id,
+                            json!({}),
+                        );
+                        return Err(error);
+                    }
+                };
+                let ws_target = match cloud_mcp_resolve_ws_target(
+                    cloud_mcp_state.inner(),
+                    &cloud_mcp_base_url(),
+                    CLOUD_VOICE_AGENT_WS_PATH,
+                )
+                .await
+                {
+                    Ok(target) => target,
+                    Err(error) => {
+                        let message = format!("Cloud voice route unavailable: {error}");
+                        spawn_cloud_voice_agent_desktop_log(
+                            cloud_mcp_state.inner(),
+                            "voice_media_route_resolved",
+                            "error",
+                            &message,
+                            &voice_session_id,
+                            &workspace_id,
+                            &repo_id,
+                            json!({}),
+                        );
+                        return Err(message);
+                    }
+                };
+                forge_voice_route_cache_store(CLOUD_VOICE_AGENT_WS_PATH, &ws_target, &auth_bearer);
+                spawn_cloud_voice_agent_desktop_log(
+                    cloud_mcp_state.inner(),
+                    "voice_media_route_resolved",
+                    "ok",
+                    "Rust desktop resolved the dedicated cloud voice media websocket route.",
+                    &voice_session_id,
+                    &workspace_id,
+                    &repo_id,
+                    json!({
+                        "direct": ws_target.route_token.is_some(),
+                        "transport": ws_target.transport.clone(),
+                    }),
+                );
+                (ws_target, auth_bearer)
+            }
+        };
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -5312,6 +5401,7 @@ async fn resolve_forge_dictation_cloud_route(
     )
     .await
     .map_err(|error| format!("Cloud dictation route unavailable: {error}"))?;
+    forge_voice_route_cache_store(CLOUD_DICTATION_WS_PATH, &ws_target, &auth_bearer);
     Ok((ws_target, auth_bearer))
 }
 
@@ -5473,7 +5563,80 @@ async fn run_forge_dictation_stream(
                                 }
                             }
                             "voice_dictation_final" => {
-                                break forge_dictation_result_from_payload(&payload, cancel_requested);
+                                log_audio_diagnostic_event(
+                                    "audio.forge_dictation.final_received",
+                                    json!({
+                                        "cleanup_pending": payload.get("cleanup_pending"),
+                                        "server_timings": payload.get("timings"),
+                                    }),
+                                );
+                                let parsed =
+                                    forge_dictation_result_from_payload(&payload, cancel_requested);
+                                let cleanup_pending = payload
+                                    .get("cleanup_pending")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                match parsed {
+                                    Ok(mut result) if cleanup_pending => {
+                                        // Raw transcript is in hand; give the
+                                        // cleaned follow-up frame a bounded
+                                        // window, then return raw as-is.
+                                        let cleaned_wait_started = Instant::now();
+                                        let deadline = tokio::time::Instant::now()
+                                            + Duration::from_secs(CLOUD_DICTATION_CLEANED_WAIT_SECS);
+                                        loop {
+                                            let remaining = deadline
+                                                .saturating_duration_since(tokio::time::Instant::now());
+                                            if remaining.is_zero() {
+                                                break;
+                                            }
+                                            match timeout(remaining, read.next()).await {
+                                                Ok(Some(Ok(Message::Text(text)))) => {
+                                                    let Ok(frame) =
+                                                        serde_json::from_str::<Value>(text.as_str())
+                                                    else {
+                                                        continue;
+                                                    };
+                                                    if frame
+                                                        .get("kind")
+                                                        .and_then(Value::as_str)
+                                                        != Some("voice_dictation_cleaned")
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let cleaned_text = frame
+                                                        .get("text")
+                                                        .and_then(Value::as_str)
+                                                        .unwrap_or_default()
+                                                        .trim()
+                                                        .to_string();
+                                                    if !cleaned_text.is_empty() {
+                                                        result.text = cleaned_text;
+                                                    }
+                                                    result.llm_cleaned = frame
+                                                        .get("llm_cleaned")
+                                                        .and_then(Value::as_bool)
+                                                        .unwrap_or(false);
+                                                    log_audio_diagnostic_event(
+                                                        "audio.forge_dictation.cleaned_received",
+                                                        json!({
+                                                            "wait_ms": cleaned_wait_started
+                                                                .elapsed()
+                                                                .as_millis() as u64,
+                                                            "llm_cleaned": result.llm_cleaned,
+                                                            "cleanup_ms": frame.get("cleanup_ms"),
+                                                        }),
+                                                    );
+                                                    break;
+                                                }
+                                                Ok(Some(Ok(_))) => {}
+                                                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+                                            }
+                                        }
+                                        break Ok(result);
+                                    }
+                                    other => break other,
+                                }
                             }
                             "voice_dictation_error" => {
                                 let message = payload
@@ -5751,6 +5914,7 @@ async fn start_forge_dictation_transcription(
     cloud_mcp_state: State<'_, CloudMcpState>,
     request: ForgeDictationStartRequest,
 ) -> Result<ForgeDictationStartStatus, String> {
+    let command_started_at = Instant::now();
     let llm_cleanup = request.llm_cleanup.unwrap_or(true);
     let language = clean_deepgram_language(request.language)?;
     log_audio_diagnostic_event(
@@ -5783,17 +5947,28 @@ async fn start_forge_dictation_transcription(
     // the cloud side); fall back to a cold connect when none is available.
     let warm_stream = claim_forge_dictation_warm_stream(&audio_state).await;
     let used_warm_socket = warm_stream.is_some();
+    // Cold path: a freshly cached route (usually the warm keeper's, seconds
+    // old) skips the serial auth + heartbeat + balancer round trips.
     let connection = match warm_stream {
         Some(stream) => ForgeDictationConnection::Warm(stream),
-        None => match resolve_forge_dictation_cloud_route(cloud_mcp_state.inner()).await {
-            Ok((ws_target, auth_bearer)) => ForgeDictationConnection::Cold {
-                ws_target,
-                auth_bearer,
-            },
-            Err(error) => {
-                let _ = audio_state.input_worker.detach_realtime_stream();
-                return Err(error);
+        None => match forge_voice_route_cache_fresh(CLOUD_DICTATION_WS_PATH) {
+            Some((ws_target, auth_bearer)) => {
+                log_audio_diagnostic_event("audio.forge_dictation.route.cached", json!({}));
+                ForgeDictationConnection::Cold {
+                    ws_target,
+                    auth_bearer,
+                }
             }
+            None => match resolve_forge_dictation_cloud_route(cloud_mcp_state.inner()).await {
+                Ok((ws_target, auth_bearer)) => ForgeDictationConnection::Cold {
+                    ws_target,
+                    auth_bearer,
+                },
+                Err(error) => {
+                    let _ = audio_state.input_worker.detach_realtime_stream();
+                    return Err(error);
+                }
+            },
         },
     };
 
@@ -5808,6 +5983,9 @@ async fn start_forge_dictation_transcription(
         "sample_rate": status.sample_rate,
         "language": language.clone(),
         "llm_cleanup": llm_cleanup,
+        // Raw-first finalization: final raw transcript immediately after the
+        // Deepgram flush, cleaned text as a follow-up frame.
+        "raw_first": true,
     });
 
     tauri::async_runtime::spawn(run_forge_dictation_stream(
@@ -5848,6 +6026,7 @@ async fn start_forge_dictation_transcription(
             "sample_rate": status.sample_rate,
             "llm_cleanup": llm_cleanup,
             "warm_socket": used_warm_socket,
+            "elapsed_ms": command_started_at.elapsed().as_millis() as u64,
         }),
     );
 
@@ -5865,6 +6044,7 @@ async fn stop_forge_dictation_transcription(
     audio_state: State<'_, AudioState>,
     request: Option<ForgeDictationStopRequest>,
 ) -> Result<ForgeDictationResult, String> {
+    let stop_started_at = Instant::now();
     let cancel = request.map(|request| request.cancel).unwrap_or(false);
     log_audio_diagnostic_event(
         "audio.forge_dictation.stop.command",
@@ -5909,6 +6089,7 @@ async fn stop_forge_dictation_transcription(
             "text_chars": result.text.chars().count(),
             "cancelled": result.cancelled,
             "llm_cleaned": result.llm_cleaned,
+            "elapsed_ms": stop_started_at.elapsed().as_millis() as u64,
         }),
     );
     Ok(result)

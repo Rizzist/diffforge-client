@@ -3063,7 +3063,7 @@ const OrchestratorHistoryView = styled.div`
   height: 100%;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   color: #7f8da1;
   background: rgba(2, 4, 8, 0.76);
   font-size: 12px;
@@ -3073,6 +3073,137 @@ const OrchestratorHistoryView = styled.div`
   html[data-forge-theme="light"] & {
     color: #7a7a7a;
     background: #ffffff;
+  }
+`;
+
+const OrchestratorHistoryToolbar = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px 7px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  background: rgba(7, 11, 18, 0.6);
+
+  strong {
+    color: rgba(226, 232, 240, 0.9);
+    font-size: 10.5px;
+    font-weight: 850;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  span {
+    overflow: hidden;
+    min-width: 0;
+    color: rgba(127, 141, 161, 0.85);
+    font-size: 10.5px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(15, 23, 42, 0.08);
+    background: rgba(248, 250, 252, 0.9);
+
+    strong {
+      color: rgba(30, 41, 59, 0.9);
+    }
+  }
+`;
+
+const OrchestratorHistoryClearButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  padding: 2px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.8);
+  background: transparent;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 760;
+  cursor: pointer;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(251, 113, 133, 0.45);
+    color: rgba(254, 205, 211, 0.95);
+    background: rgba(127, 29, 29, 0.18);
+  }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(71, 85, 105, 0.9);
+  }
+`;
+
+const OrchestratorHistoryTurnHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: rgba(127, 141, 161, 0.8);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+
+  > span:first-child {
+    overflow: hidden;
+    min-width: 0;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const OrchestratorHistoryEngineChip = styled.span`
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+
+  &[data-engine="realtime"] {
+    color: rgba(187, 247, 208, 0.92);
+    background: rgba(34, 197, 94, 0.14);
+  }
+
+  &[data-engine="pipeline"] {
+    color: rgba(191, 219, 254, 0.92);
+    background: rgba(59, 130, 246, 0.14);
+  }
+`;
+
+const OrchestratorHistoryTurnStatusChip = styled.span`
+  flex: none;
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+
+  &[data-tone="good"] {
+    color: rgba(187, 247, 208, 0.92);
+    background: rgba(34, 197, 94, 0.12);
+  }
+
+  &[data-tone="busy"] {
+    color: rgba(253, 230, 138, 0.92);
+    background: rgba(217, 119, 6, 0.14);
+  }
+
+  &[data-tone="bad"] {
+    color: rgba(254, 205, 211, 0.92);
+    background: rgba(225, 29, 72, 0.16);
   }
 `;
 
@@ -3145,11 +3276,14 @@ const OrchestratorHistoryList = styled.div`
 const OrchestratorHistoryTurn = styled.article`
   display: grid;
   min-width: 0;
-  gap: 9px;
-  background: transparent;
+  gap: 8px;
+  padding: 9px 11px 11px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 12px;
+  background: rgba(10, 15, 24, 0.55);
 
   &[data-pending="true"] {
-    background: transparent;
+    border-color: rgba(96, 165, 250, 0.2);
   }
 
   &[data-cancelled="true"] {
@@ -3157,11 +3291,12 @@ const OrchestratorHistoryTurn = styled.article`
   }
 
   html[data-forge-theme="light"] & {
-    background: transparent;
+    border-color: rgba(15, 23, 42, 0.08);
+    background: rgba(248, 250, 252, 0.85);
   }
 
   html[data-forge-theme="light"] &[data-pending="true"] {
-    background: transparent;
+    border-color: rgba(37, 99, 235, 0.18);
   }
 `;
 
@@ -3261,15 +3396,6 @@ const OrchestratorHistoryCopiedIcon = styled(Check)`
   display: block;
   width: 16px;
   height: 16px;
-`;
-
-const OrchestratorHistoryTurnHeader = styled.div`
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 9px 14px 6px;
 `;
 
 const OrchestratorHistoryTurnLabel = styled.div`
@@ -7659,6 +7785,7 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
     queued: Boolean(item.queued),
     queuedText,
     source: String(item.source || "").trim().slice(0, 32),
+    engine: String(item.engine || "").trim().slice(0, 24),
     transcript,
     transcriptFinal: Boolean(item.transcriptFinal),
     turnIndex: Number.isFinite(turnIndex) ? turnIndex : 0,
@@ -11871,6 +11998,18 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     orchestratorVoiceTurnTimeoutsRef.current.set(safeTurnKey, timeoutId);
   }, [markVoiceHistoryTurnTerminal, orchestratorPanelWorkspaceId]);
 
+  // Display-only clear: the conversation cards go away (and the empty list
+  // persists through the debounced agents-store write), but anything the
+  // turns CREATED — queued todos, plans, subtasks, dispatches — lives in the
+  // todo queue / plan state and is deliberately untouched.
+  const clearOrchestratorVoiceHistory = useCallback(() => {
+    clearAllVoiceHistoryTurnTimeouts();
+    setOrchestratorVoiceHistoryItems([]);
+    logTerminalStatus("frontend.voice_history.cleared", {
+      workspaceId: orchestratorPanelWorkspaceId,
+    });
+  }, [clearAllVoiceHistoryTurnTimeouts, orchestratorPanelWorkspaceId]);
+
   useEffect(() => {
     let disposed = false;
     clearAllVoiceHistoryTurnTimeouts();
@@ -11999,13 +12138,20 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
   const recordVoiceHistoryTranscript = useCallback((event) => {
     const sessionId = orchestratorVoiceSessionRef.current;
     const turnKey = getVoiceHistoryTurnKey(event, sessionId);
-    const transcript = normalizeVoiceHistoryText(event?.transcript);
-    const isFinal = Boolean(event?.final);
+    const provider = String(event?.provider || "").trim();
+    const isRealtime = provider === "openai_realtime";
+    const marker = String(event?.event || "").trim();
+    // GPT-Realtime marks end-of-turn through the event marker rather than a
+    // `final` flag; both engines must resolve to the same finality here.
+    const isFinal = Boolean(event?.final) || marker === "EndOfTurn";
+    const rawTranscript = String(event?.transcript || "");
+    const transcript = normalizeVoiceHistoryText(rawTranscript);
     if (!transcript && !isFinal) {
       return;
     }
 
     logTerminalStatus("frontend.voice_history.transcript_arrived", {
+      engine: isRealtime ? "gpt_realtime" : "pipeline",
       final: isFinal,
       textLength: transcript.length,
       turnIndex: getVoiceHistoryTurnIndex(event),
@@ -12014,7 +12160,17 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     });
     updateVoiceHistoryTurn(turnKey, (currentItem) => ({
       source: event?.provider === "desktop_text" ? "chat" : currentItem.source || "voice",
-      transcript: transcript || currentItem.transcript,
+      engine: isRealtime ? "gpt_realtime" : currentItem.engine || "pipeline",
+      // Pipeline interims (Deepgram) are cumulative phrases — replace.
+      // GPT-Realtime interims are token DELTAS — append to the live draft,
+      // and the completed transcript replaces the whole draft at end of turn.
+      transcript: isFinal
+        ? (transcript || currentItem.transcript)
+        : isRealtime
+          ? normalizeVoiceHistoryText(
+            `${currentItem.transcriptFinal ? "" : (currentItem.transcript || "")}${rawTranscript}`,
+          )
+          : (transcript || currentItem.transcript),
       transcriptFinal: currentItem.transcriptFinal || isFinal,
       turnIndex: getVoiceHistoryTurnIndex(event),
     }));
@@ -13859,6 +14015,27 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
               </TodoQueueBoard>
             ) : (
               <OrchestratorHistoryView aria-label="Voice history">
+                <OrchestratorHistoryToolbar>
+                  <strong>Voice history</strong>
+                  <span>
+                    {orchestratorVoiceHistoryItems.length > 0
+                      ? `${orchestratorVoiceHistoryItems.length} turn${orchestratorVoiceHistoryItems.length === 1 ? "" : "s"}`
+                      : "No turns yet"}
+                  </span>
+                  <OrchestratorHistoryClearButton
+                    aria-label="Clear voice history"
+                    disabled={!orchestratorVoiceHistoryItems.length}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      clearOrchestratorVoiceHistory();
+                    }}
+                    title="Clear the conversation log (queued todos, plans and subtasks stay)"
+                    type="button"
+                  >
+                    Clear
+                  </OrchestratorHistoryClearButton>
+                </OrchestratorHistoryToolbar>
                 <OrchestratorHistoryScroll ref={orchestratorHistoryScrollRef}>
                   {orchestratorVoiceError && (
                     <OrchestratorHistoryError role="alert">
@@ -13892,6 +14069,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             data-pending={pending ? "true" : undefined}
                             key={item.id}
                           >
+                            <OrchestratorHistoryTurnHeader>
+                              <span>{getVoiceHistoryTurnLabel(item)}</span>
+                              <OrchestratorHistoryEngineChip
+                                data-engine={item.engine === "gpt_realtime" ? "realtime" : "pipeline"}
+                              >
+                                {item.engine === "gpt_realtime" ? "GPT-Realtime" : "Pipeline"}
+                              </OrchestratorHistoryEngineChip>
+                              <OrchestratorHistoryTurnStatusChip
+                                data-tone={cancelled || status === "Failed" || status === "Timed out"
+                                  ? "bad"
+                                  : status === "Done" || status === "Planned"
+                                    ? "good"
+                                    : "busy"}
+                              >
+                                {status}
+                              </OrchestratorHistoryTurnStatusChip>
+                            </OrchestratorHistoryTurnHeader>
                             {item.transcript && (
                               <OrchestratorHistoryUserMessage>
                                 <OrchestratorHistoryTranscript

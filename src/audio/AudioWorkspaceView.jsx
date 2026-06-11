@@ -288,6 +288,8 @@ import {
   AudioBarSurface,
   AudioBarCancelButton,
   AudioBarMeter,
+  AudioBarSpinner,
+  AudioBarStopButton,
   AudioBarStatusText,
   AudioBarUndoButton,
   AudioBarNoticeProgress,
@@ -447,14 +449,19 @@ const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
 // worker, so only a short tail is needed to flush in-flight chunks before
 // the finish frame; this keeps release-to-transcript latency low.
 const FORGE_RELEASE_POST_BUFFER_MS = 350;
+// Last successful billing snapshot, module-wide: provider switches and
+// remounts render the known state instantly (stale-while-revalidate) instead
+// of flashing "Checking credits" while the network refresh runs.
+let lastKnownForgeBilling = null;
 const AUDIO_WIDGET_PREROLL_READY_MS = 500;
 const AUDIO_INPUT_METER_BARS = 32;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
-// Recording: a slim Wispr-style line bottom-center (X to cancel + waveform).
-const AUDIO_WIDGET_BAR_SIZE = { width: 264, height: 40 };
-const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 10;
+// Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
+// stop/spinner on the right), hovering just above the Dock/taskbar edge.
+const AUDIO_WIDGET_BAR_SIZE = { width: 248, height: 34 };
+const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 6;
 // Idle: a thin line hugging the bottom; the window stays this small dock
 // zone so hovering it can reveal the round record button + shortcut hint.
 const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
@@ -1118,7 +1125,9 @@ export default function AudioWorkspaceView({
   const [copiedAudioHistoryId, setCopiedAudioHistoryId] = useState("");
   const [voiceRules, setVoiceRules] = useState(peekVoiceTextRules);
   const [forgeLlmCleanup, setForgeLlmCleanup] = useState(readForgeLlmCleanup);
-  const [forgeBilling, setForgeBilling] = useState({ state: "idle", remaining: null, error: "" });
+  const [forgeBilling, setForgeBilling] = useState(
+    () => lastKnownForgeBilling || { state: "idle", remaining: null, error: "" },
+  );
   const [audioWidgetStyleSetting, setAudioWidgetStyleSetting] = useState(readAudioWidgetStyle);
   const [voiceRulesTab, setVoiceRulesTab] = useState("dictionary");
   const [voiceRulesPreviewInput, setVoiceRulesPreviewInput] = useState("");
@@ -1517,16 +1526,25 @@ export default function AudioWorkspaceView({
   }, []);
 
   const refreshForgeBilling = useCallback(async () => {
-    setForgeBilling({ state: "loading", remaining: null, error: "" });
+    // Stale-while-revalidate: keep showing the last known billing state while
+    // the refresh runs; "Checking credits" only appears on the first load.
+    setForgeBilling((current) => (
+      current.state === "ready"
+        ? current
+        : lastKnownForgeBilling || { state: "loading", remaining: null, error: "" }
+    ));
 
     try {
       const billing = await invoke("cloud_mcp_get_billing_status");
-      setForgeBilling({
+      const nextBilling = {
         state: "ready",
         remaining: extractRemainingForgeCredits(billing),
         error: "",
-      });
+      };
+      lastKnownForgeBilling = nextBilling;
+      setForgeBilling(nextBilling);
     } catch (billingError) {
+      lastKnownForgeBilling = null;
       setForgeBilling({
         state: "error",
         remaining: null,
@@ -2790,6 +2808,9 @@ export function AudioWidgetWindow() {
   const widgetStateRef = useRef(widgetState);
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceTtsPlayerRef = useRef(null);
+  // GPT-Realtime interim transcripts are token deltas, not cumulative
+  // phrases; the live line accumulates them here between turn boundaries.
+  const forgeVoiceRealtimeDraftRef = useRef("");
 
   useEffect(() => {
     widgetStateRef.current = widgetState;
@@ -4282,10 +4303,23 @@ export function AudioWidgetWindow() {
       }
 
       if (kind === "voice_agent_transcript") {
-        const transcript = String(event?.transcript || event?.text || "").trim();
+        const isRealtimeEngine = String(event?.provider || "").trim() === "openai_realtime";
+        const isFinal = Boolean(event?.final) || String(event?.event || "").trim() === "EndOfTurn";
+        const rawTranscript = String(event?.transcript || event?.text || "");
+        if (isRealtimeEngine && !isFinal) {
+          forgeVoiceRealtimeDraftRef.current += rawTranscript;
+          const draft = forgeVoiceRealtimeDraftRef.current.trim();
+          if (draft) {
+            setRealtimeTranscript(draft);
+            setMessage("Forge voice live");
+          }
+          return;
+        }
+        forgeVoiceRealtimeDraftRef.current = "";
+        const transcript = rawTranscript.trim();
         if (transcript) {
           setRealtimeTranscript(transcript);
-          setMessage(event?.final ? "Forge voice heard" : "Forge voice live");
+          setMessage(isFinal ? "Forge voice heard" : "Forge voice live");
         }
         return;
       }
@@ -4707,6 +4741,19 @@ export function AudioWidgetWindow() {
                     />
                   ))}
                 </AudioBarMeter>
+              )}
+              {isProcessingFocus ? (
+                <AudioBarSpinner aria-label="Transcribing" role="status" />
+              ) : (isRecordingFocus || widgetState === "arming") && (
+                <AudioBarStopButton
+                  aria-label="Finish and paste"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    finishFromBar();
+                  }}
+                  title="Finish recording and paste the transcript"
+                  type="button"
+                />
               )}
             </AudioBarSurface>
           )}

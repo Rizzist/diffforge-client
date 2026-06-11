@@ -8133,7 +8133,7 @@ export const AudioBarShell = styled.div`
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 4px;
+  padding: 3px;
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
@@ -8179,7 +8179,7 @@ export const AudioBarMeter = styled.div`
   display: flex;
   flex: 1;
   min-width: 0;
-  height: 20px;
+  height: 14px;
   align-items: center;
   justify-content: center;
   gap: 2.5px;
@@ -8201,6 +8201,58 @@ export const AudioBarMeter = styled.div`
 
   ${AudioBarShell}[data-theme="light"] & span {
     background: hsl(var(--bar-hue, 210), 80%, 46%);
+  }
+`;
+
+/* Right-side finish control while recording: a small red round stop button,
+   like Wispr Flow. While transcribing it is replaced by the spinner below —
+   finishing is automatic, nothing to confirm. */
+export const AudioBarStopButton = styled.button`
+  position: relative;
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #ef5350;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.12) inset;
+  cursor: pointer;
+  transition: transform 120ms ease, background 120ms ease;
+
+  &::after {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.96);
+  }
+
+  &:hover {
+    transform: scale(1.08);
+    background: #f26461;
+  }
+`;
+
+export const AudioBarSpinner = styled.span`
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 2px solid rgba(230, 236, 245, 0.22);
+  border-top-color: var(--forge-orange, #ff9f43);
+  border-radius: 50%;
+  animation: audioBarSpin 760ms linear infinite;
+
+  @keyframes audioBarSpin {
+    to { transform: rotate(360deg); }
+  }
+
+  ${AudioBarShell}[data-theme="light"] & {
+    border-color: rgba(29, 29, 31, 0.16);
+    border-top-color: var(--forge-orange, #ff9f43);
   }
 `;
 
