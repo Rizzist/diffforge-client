@@ -716,7 +716,11 @@ fn coordination_workspace_mcp_server(status: &Value) -> Value {
     })
 }
 
-fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value) -> Value {
+fn workspace_mcp_secrets_server(
+    secrets: &[Value],
+    client_mount_summary: &Value,
+    enabled: bool,
+) -> Value {
     json!({
         "id": "secrets",
         "server_key": "secrets",
@@ -724,7 +728,9 @@ fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value)
         "description": "Built-in local workspace secrets for coding agents.",
         "built_in": true,
         "secrets_builtin": true,
-        "toggleable": false,
+        // Agent exposure is opt-in per workspace (disabled until the user
+        // flips it on); the vault itself stays available either way.
+        "toggleable": true,
         "source_kind": "built_in",
         "source_label": "Diff Forge",
         "package_ref": "local-only",
@@ -738,18 +744,22 @@ fn workspace_mcp_secrets_server(secrets: &[Value], client_mount_summary: &Value)
         "missing_required_config": [],
         "tools_json": WORKSPACE_MCP_SECRETS_TOOLS,
         "install_state": "installed",
-        "workspace_enabled": true,
+        "workspace_enabled": enabled,
         "approval_policy": WORKSPACE_MCP_APPROVAL_ALWAYS_ALLOW,
         "exposure_mode": WORKSPACE_MCP_EXPOSURE_PINNED,
         "agent_config_access_enabled": true,
         "agent_secret_config_access_enabled": true,
         "agent_env_file_write_enabled": true,
-        "status": "healthy",
-        "badge_state": "enabled",
+        "status": if enabled { "healthy" } else { "disabled" },
+        "badge_state": if enabled { "enabled" } else { "planned" },
         "config_status": "configured",
-        "last_probe_status": "healthy",
-        "last_probe_message": "Local-only workspace secrets are available through the gateway.",
-        "agent_visibility": workspace_mcp_visibility(true, true, client_mount_summary, true),
+        "last_probe_status": if enabled { "healthy" } else { "not_connected" },
+        "last_probe_message": if enabled {
+            "Local-only workspace secrets are available through the gateway."
+        } else {
+            "Secrets tools are hidden from coding agents until this MCP is enabled."
+        },
+        "agent_visibility": workspace_mcp_visibility(enabled, true, client_mount_summary, enabled),
         "runtime_note": "Local-only built-in secrets vault. Values are not synced to Cloud.",
         "secret_count": secrets.len(),
         "secrets": secrets,
@@ -8412,6 +8422,7 @@ impl CoordinationKernel {
         servers.push(workspace_mcp_secrets_server(
             &secret_rows,
             &client_mount_summary,
+            self.workspace_mcp_secrets_enabled(workspace_id)?,
         ));
         for row in installed_rows {
             servers.push(workspace_mcp_public_server(row, &client_mount_summary));
@@ -9870,6 +9881,38 @@ impl CoordinationKernel {
         self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str())
     }
 
+    /// Agent exposure for the built-in Secrets MCP, per workspace. No stored
+    /// row means disabled: agents only get the secrets tools after the user
+    /// explicitly enables the Secrets MCP in the MCPs tab.
+    pub fn workspace_mcp_secrets_enabled(&self, workspace_id: &str) -> Result<bool, String> {
+        let workspace_id = required_trimmed(workspace_id, "workspace_id")?;
+        let rows = self.query_json(
+            "SELECT enabled FROM workspace_mcp_secrets_state WHERE workspace_id=?1",
+            &[&workspace_id],
+        )?;
+        Ok(rows
+            .first()
+            .map(|row| row["enabled"].as_i64().unwrap_or_default() != 0)
+            .unwrap_or(false))
+    }
+
+    fn set_workspace_mcp_secrets_enabled(
+        &self,
+        workspace_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO workspace_mcp_secrets_state(workspace_id, enabled, updated_at)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(workspace_id) DO UPDATE SET enabled=?2, updated_at=?3",
+                params![workspace_id, bool_i64(enabled), now],
+            )
+            .map_err(|error| format!("Unable to record Secrets MCP state: {error}"))?;
+        Ok(())
+    }
+
     pub fn update_workspace_mcp_server(
         &self,
         workspace_id: &str,
@@ -9880,6 +9923,28 @@ impl CoordinationKernel {
         let server_id = required_trimmed(server_id, "server_id")?;
         if server_id == "coordination-kernel" {
             return Err("The Coordination Kernel MCP is built in and always enabled.".to_string());
+        }
+        if server_id == "secrets" {
+            let enabled = input["workspace_enabled"]
+                .as_bool()
+                .or_else(|| input["workspace_enabled"].as_i64().map(|value| value != 0))
+                .ok_or_else(|| {
+                    "The Secrets MCP only supports enabling or disabling agent access."
+                        .to_string()
+                })?;
+            self.set_workspace_mcp_secrets_enabled(workspace_id, enabled)?;
+            self.emit_event(
+                "workspace_mcp_server_updated",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "workspace_id": workspace_id,
+                    "server_id": "secrets",
+                    "workspace_enabled": enabled,
+                }),
+            )?;
+            return self.workspace_mcp_registry(workspace_id, input["workspace_name"].as_str());
         }
         let current = self.query_one(
             "SELECT * FROM workspace_mcp_servers WHERE workspace_id=?1 AND id=?2",

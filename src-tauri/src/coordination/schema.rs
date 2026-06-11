@@ -62,6 +62,22 @@ CREATE TABLE IF NOT EXISTS workspace_mcp_seed_state(
 );
 "#;
 
+pub const WORKSPACE_MCP_SECRETS_STATE_MIGRATION_VERSION: i64 = 24;
+pub const WORKSPACE_MCP_SECRETS_STATE_MIGRATION_NAME: &str =
+    "coordination_kernel_workspace_mcp_secrets_state";
+
+// Stores whether the built-in Secrets MCP is exposed to coding agents for a
+// workspace. No row means disabled: the vault and its data stay available in
+// the MCPs tab, but agents only see the secrets tools after an explicit
+// opt-in (the "auto disabled on first open" default).
+pub const WORKSPACE_MCP_SECRETS_STATE_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workspace_mcp_secrets_state(
+  workspace_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"#;
+
 pub const CREATE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations(
   version INTEGER PRIMARY KEY,

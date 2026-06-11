@@ -4985,6 +4985,7 @@ async fn cloud_mcp_start_remote_command_listener(
             todo_dispatch_record_remote_intake(&app, &event);
             todo_dispatch_apply_remote_delete(&app, &event);
             cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
+            cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
@@ -5052,6 +5053,24 @@ fn cloud_mcp_apply_remote_workspace_lever(
                     &event,
                     "queued",
                     "Workspace activation queued; it completes when the desktop window next opens.",
+                    None,
+                )
+                .await;
+            });
+        }
+        "terminal_relaunch_agent" | "relaunch_terminal_agent" | "relaunch_terminal"
+        | "terminal_relaunch" | "terminal_switch_agent" | "switch_terminal_agent" => {
+            // Terminal slots and agent threads live in webview state, so a
+            // relaunch cannot actuate headless; tell the dashboard instead of
+            // leaving the command pending forever.
+            let state = state.clone();
+            let event = event.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "blocked",
+                    "The Diff Forge window is closed on this desktop; open it to relaunch terminals.",
                     None,
                 )
                 .await;
@@ -5269,9 +5288,6 @@ pub(crate) fn cloud_mcp_start_agent_inventory_watcher(app: AppHandle, state: Clo
 /// state. Replies with running → completed/failed and re-probes the
 /// inventory afterwards so cloud and any later webview converge.
 fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
-    if todo_dispatch_webview_dispatcher_active() {
-        return;
-    }
     let command_kind = cloud_mcp_payload_text(
         event,
         &["command_kind", "commandKind", "action", "command"],
@@ -5285,6 +5301,11 @@ fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, ev
         "agent_uninstall" | "uninstall_agent" | "cli_uninstall" => "uninstall",
         _ => return,
     };
+    // Install/update are lease-gated: an open webview runs them itself with
+    // richer UI state. Uninstall has no webview path, so Rust always owns it.
+    if action != "uninstall" && todo_dispatch_webview_dispatcher_active() {
+        return;
+    }
     let provider = cloud_mcp_payload_text(
         event,
         &[
@@ -5368,6 +5389,263 @@ fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, ev
             true,
         )
         .await;
+    });
+}
+
+fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value) {
+    let current = app_local_state_read(app, "remote-intents");
+    let mut pending = current
+        .get("pendingRemoteCommands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    pending.push(event.clone());
+    if pending.len() > 8 {
+        let overflow = pending.len() - 8;
+        pending.drain(0..overflow);
+    }
+    let _ = app_local_state_merge(
+        app,
+        "remote-intents",
+        &json!({ "pendingRemoteCommands": pending }),
+    );
+}
+
+/// Conservative headless idle assessment for one presence-snapshot terminal:
+/// hook registry wins when fresh; otherwise the snapshot's own input-ready /
+/// status fields decide. Unknown leans busy only for explicit busy markers.
+fn cloud_mcp_presence_terminal_is_idle(terminal: &Value) -> bool {
+    let pane_id = cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]).unwrap_or_default();
+    if !pane_id.is_empty() {
+        if let Some(input_ready) = todo_dispatch_pane_input_ready(&pane_id) {
+            return input_ready;
+        }
+    }
+    if let Some(input_ready) = terminal
+        .get("input_ready")
+        .or_else(|| terminal.get("inputReady"))
+        .and_then(Value::as_bool)
+    {
+        return input_ready;
+    }
+    let status = cloud_mcp_payload_text(terminal, &["status", "state"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        status.as_str(),
+        "busy" | "running" | "working" | "sending" | "submitted" | "starting"
+    )
+}
+
+/// Headless actuation for remote terminal levers. Close-idle commands run
+/// natively against the live PTY sessions (resolved from the cached presence
+/// snapshot by pane id, friendly name, or index); relaunch is deferred as a
+/// replayed remote command for the next foreground session, because agent
+/// relaunch orchestration lives in the webview. Lease-gated: an open webview
+/// owns all of these itself.
+fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+    if todo_dispatch_webview_dispatcher_active() {
+        return;
+    }
+    let command_kind = cloud_mcp_payload_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_");
+    let action = match command_kind.as_str() {
+        "terminal_close_idle" | "close_idle_terminal" => "close_one",
+        "workspace_close_idle_terminals" | "close_idle_terminals" => "close_workspace",
+        "terminal_relaunch_agent" | "relaunch_terminal_agent" | "relaunch_terminal"
+        | "terminal_relaunch" | "terminal_switch_agent" | "switch_terminal_agent" => "relaunch",
+        _ => return,
+    };
+    let workspace_id =
+        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let target_terminal_id = cloud_mcp_payload_text(
+        event,
+        &["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId"],
+    )
+    .unwrap_or_default();
+    let target_terminal_name = cloud_mcp_payload_text(
+        event,
+        &["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let target_terminal_index = event
+        .get("target_terminal_index")
+        .or_else(|| event.get("targetTerminalIndex"))
+        .and_then(Value::as_i64);
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    let action = action.to_string();
+    tauri::async_runtime::spawn(async move {
+        if action == "relaunch" {
+            cloud_mcp_defer_remote_command_for_foreground(&app, &event);
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "queued",
+                "Terminal relaunch queued; it completes when the desktop window next opens.",
+                None,
+            )
+            .await;
+            return;
+        }
+        if workspace_id.is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Terminal command did not include a workspace id.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let snapshot = {
+            let snapshots = state.runtime_snapshots.lock().await;
+            snapshots.terminal_presence.clone()
+        };
+        let workspace_terminals = snapshot
+            .as_ref()
+            .and_then(|payload| payload.get("workspaces"))
+            .and_then(Value::as_array)
+            .map(|workspaces| {
+                workspaces
+                    .iter()
+                    .filter(|workspace| {
+                        cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                            .as_deref()
+                            == Some(workspace_id.as_str())
+                    })
+                    .flat_map(|workspace| {
+                        workspace
+                            .get("terminals")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if workspace_terminals.is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "blocked",
+                "No live terminals are known for that workspace on this desktop.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let matches_target = |terminal: &Value| -> bool {
+            let pane_id =
+                cloud_mcp_payload_text(terminal, &["pane_id", "paneId"]).unwrap_or_default();
+            if !target_terminal_id.is_empty() {
+                return pane_id == target_terminal_id
+                    || cloud_mcp_payload_text(terminal, &["terminal_id", "terminalId"])
+                        .as_deref()
+                        == Some(target_terminal_id.as_str());
+            }
+            if !target_terminal_name.is_empty() {
+                return cloud_mcp_payload_text(
+                    terminal,
+                    &["terminal_nickname", "terminalNickname", "terminal_name", "terminalName"],
+                )
+                .map(|name| name.to_ascii_lowercase() == target_terminal_name)
+                .unwrap_or(false);
+            }
+            if let Some(index) = target_terminal_index {
+                return terminal
+                    .get("terminal_index")
+                    .or_else(|| terminal.get("terminalIndex"))
+                    .and_then(Value::as_i64)
+                    == Some(index);
+            }
+            false
+        };
+        let candidates = if action == "close_one" {
+            let matched = workspace_terminals
+                .iter()
+                .find(|terminal| matches_target(terminal))
+                .cloned();
+            match matched {
+                Some(terminal) => vec![terminal],
+                None => {
+                    let _ = cloud_mcp_send_remote_command_status_event(
+                        &state,
+                        &event,
+                        "failed",
+                        "No terminal matched the requested name, index, or id.",
+                        None,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            workspace_terminals
+        };
+        let mut closed = 0usize;
+        let mut skipped_busy = 0usize;
+        let mut failed = 0usize;
+        let terminal_state = app.state::<TerminalState>();
+        for terminal in candidates {
+            if !cloud_mcp_presence_terminal_is_idle(&terminal) {
+                skipped_busy += 1;
+                continue;
+            }
+            let pane_id =
+                cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]).unwrap_or_default();
+            if pane_id.is_empty() {
+                failed += 1;
+                continue;
+            }
+            match close_terminal_session(
+                terminal_state.inner(),
+                Some(&state),
+                &pane_id,
+                None,
+                false,
+                false,
+            )
+            .await
+            {
+                Ok(_) => closed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        let (status, message) = if action == "close_one" {
+            if closed > 0 {
+                ("completed", "Terminal closed headless.".to_string())
+            } else if skipped_busy > 0 {
+                ("blocked", "Terminal is busy, so it was not closed.".to_string())
+            } else {
+                ("failed", "Terminal could not be closed.".to_string())
+            }
+        } else {
+            (
+                "completed",
+                format!(
+                    "Closed {closed} idle terminal(s) headless; {skipped_busy} busy skipped{}.",
+                    if failed > 0 {
+                        format!(", {failed} failed")
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+        };
+        let _ = cloud_mcp_send_remote_command_status_event(&state, &event, status, &message, None)
+            .await;
+        // Presence convergence: push a fresh snapshot composed from what
+        // remains cached, so dashboards drop the closed terminals quickly.
+        cloud_mcp_emit_sync_status(None);
     });
 }
 

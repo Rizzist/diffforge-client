@@ -912,6 +912,19 @@ pub(crate) fn todo_dispatch_workspace_has_busy_terminals(workspace_id: &str) -> 
     })
 }
 
+/// Last hook-reported input-ready state for one pane (None when the pane has
+/// no fresh registry entry — for example a plain shell with no agent hooks).
+pub(crate) fn todo_dispatch_pane_input_ready(pane_id: &str) -> Option<bool> {
+    let registry = TODO_DISPATCH_TERMINAL_RUNTIME.get_or_init(|| StdMutex::new(HashMap::new()));
+    let map = registry.lock().ok()?;
+    let entry = map.get(pane_id)?;
+    let updated_at = entry.get("updatedAtMs").and_then(Value::as_u64)?;
+    if todo_dispatch_now_ms().saturating_sub(updated_at) >= TODO_DISPATCH_TERMINAL_RUNTIME_TTL_MS {
+        return None;
+    }
+    entry.get("inputReady").and_then(Value::as_bool)
+}
+
 pub(crate) fn todo_dispatch_webview_dispatcher_active() -> bool {
     let heartbeat = TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.load(Ordering::Acquire);
     heartbeat != 0
@@ -1035,9 +1048,43 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
 }
 
 #[tauri::command]
-fn todo_dispatch_dispatcher_heartbeat() -> Result<(), String> {
-    TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.store(todo_dispatch_now_ms(), Ordering::Release);
+fn todo_dispatch_dispatcher_heartbeat(app: AppHandle) -> Result<(), String> {
+    let now = todo_dispatch_now_ms();
+    let previous = TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.swap(now, Ordering::AcqRel);
+    // Webview just came (back) alive: replay remote commands that were
+    // deferred while no webview could actuate them (for example terminal
+    // relaunches requested via voice/dashboard in background mode).
+    let was_stale =
+        previous == 0 || now.saturating_sub(previous) >= TODO_DISPATCH_DISPATCHER_LEASE_MS;
+    if was_stale {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // Give the webview's remote-command listener time to subscribe.
+            sleep(Duration::from_secs(3)).await;
+            todo_dispatch_flush_deferred_remote_commands(&app);
+        });
+    }
     Ok(())
+}
+
+pub(crate) fn todo_dispatch_flush_deferred_remote_commands(app: &AppHandle) {
+    let intents = app_local_state_read(app, "remote-intents");
+    let pending = intents
+        .get("pendingRemoteCommands")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if pending.is_empty() {
+        return;
+    }
+    let _ = app_local_state_merge(
+        app,
+        "remote-intents",
+        &json!({ "pendingRemoteCommands": Value::Null }),
+    );
+    for event in pending {
+        let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event);
+    }
 }
 
 #[tauri::command]

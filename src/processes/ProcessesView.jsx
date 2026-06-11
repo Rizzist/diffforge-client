@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
+import { Article } from "@styled-icons/material-rounded/Article";
+import { Pause } from "@styled-icons/material-rounded/Pause";
+import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
+import { Stop } from "@styled-icons/material-rounded/Stop";
 
 import {
   ButtonBotIcon,
@@ -771,6 +775,154 @@ function ProcessBucket({
   );
 }
 
+function formatContainerPorts(ports) {
+  const entries = String(ports || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && !entry.startsWith("[::]") && !entry.startsWith(":::"));
+  return entries.join(", ");
+}
+
+function containerDisplayImage(image) {
+  const value = String(image || "");
+  if (value.startsWith("sha256:")) {
+    return value.slice(0, 19);
+  }
+  return value;
+}
+
+function containerActionTitle(action) {
+  switch (action) {
+    case "start": return "Start container";
+    case "stop": return "Stop container";
+    case "restart": return "Restart container";
+    case "pause": return "Pause container";
+    case "unpause": return "Unpause container";
+    case "remove": return "Remove container";
+    default: return "Docker action";
+  }
+}
+
+function DockerContainerRow({
+  busyAction,
+  container,
+  disabled,
+  logsOpen,
+  onAction,
+  onToggleLogs,
+}) {
+  const state = String(container.state || "");
+  const running = state === "running";
+  const paused = state === "paused";
+  const restarting = state === "restarting";
+  const stopped = !running && !paused && !restarting;
+  const ports = formatContainerPorts(container.ports);
+  const rowDisabled = disabled || Boolean(busyAction);
+
+  return (
+    <ProcessContainerRow data-state={state} role="listitem">
+      <ProcessRowIcon data-kind="docker">
+        {busyAction ? (
+          <ProcessBusySpinner />
+        ) : (
+          <ProcessContainerDot
+            data-health={container.health || undefined}
+            data-state={state}
+            title={container.status || state}
+          />
+        )}
+      </ProcessRowIcon>
+      <ProcessContainerMain>
+        <strong title={container.name || container.id}>{container.name || container.id}</strong>
+        <span title={container.image}>
+          {containerDisplayImage(container.image)}
+          {container.composeService ? ` / ${container.composeService}` : ""}
+        </span>
+      </ProcessContainerMain>
+      <ProcessContainerStatus>
+        <span title={container.status}>{container.status || state || "unknown"}</span>
+        {ports && <em title={ports}>{ports}</em>}
+      </ProcessContainerStatus>
+      <ProcessRowUsage>
+        <span>{container.memUsage ? String(container.memUsage).split(" / ")[0] : ""}</span>
+        <strong>
+          {Number.isFinite(Number(container.cpuPercent)) && container.cpuPercent !== null
+            ? formatCpu(container.cpuPercent)
+            : ""}
+        </strong>
+      </ProcessRowUsage>
+      <ProcessRowActions>
+        {(stopped || paused) && (
+          <ProcessDockerActionButton
+            aria-label={containerActionTitle(paused ? "unpause" : "start")}
+            disabled={rowDisabled}
+            onClick={() => onAction(container, paused ? "unpause" : "start")}
+            title={containerActionTitle(paused ? "unpause" : "start")}
+            type="button"
+          >
+            <PlayArrow aria-hidden="true" />
+          </ProcessDockerActionButton>
+        )}
+        {running && (
+          <ProcessDockerActionButton
+            aria-label={containerActionTitle("pause")}
+            disabled={rowDisabled}
+            onClick={() => onAction(container, "pause")}
+            title={containerActionTitle("pause")}
+            type="button"
+          >
+            <Pause aria-hidden="true" />
+          </ProcessDockerActionButton>
+        )}
+        {(running || restarting) && (
+          <ProcessDockerActionButton
+            aria-label={containerActionTitle("restart")}
+            disabled={rowDisabled}
+            onClick={() => onAction(container, "restart")}
+            title={containerActionTitle("restart")}
+            type="button"
+          >
+            <ButtonRefreshIcon aria-hidden="true" />
+          </ProcessDockerActionButton>
+        )}
+        {(running || paused || restarting) && (
+          <ProcessDockerActionButton
+            aria-label={containerActionTitle("stop")}
+            data-danger="true"
+            disabled={rowDisabled}
+            onClick={() => onAction(container, "stop")}
+            title={containerActionTitle("stop")}
+            type="button"
+          >
+            <Stop aria-hidden="true" />
+          </ProcessDockerActionButton>
+        )}
+        <ProcessDockerActionButton
+          aria-label="Show container logs"
+          data-active={logsOpen ? "true" : undefined}
+          disabled={disabled}
+          onClick={() => onToggleLogs(container)}
+          title="Show container logs"
+          type="button"
+        >
+          <Article aria-hidden="true" />
+        </ProcessDockerActionButton>
+        {stopped && (
+          <ProcessRowStopButton
+            aria-label={containerActionTitle("remove")}
+            disabled={rowDisabled}
+            onClick={() => onAction(container, "remove")}
+            title={containerActionTitle("remove")}
+            type="button"
+          >
+            <ButtonDeleteIcon aria-hidden="true" />
+          </ProcessRowStopButton>
+        )}
+      </ProcessRowActions>
+    </ProcessContainerRow>
+  );
+}
+
 export default function ProcessesView({
   onCloseTrackedTerminal,
   workspaceRoots = [],
@@ -787,7 +939,14 @@ export default function ProcessesView({
     targetProcessKey: "",
   });
   const [killState, setKillState] = useState({ state: "idle", message: "" });
+  const [containersSnapshot, setContainersSnapshot] = useState(null);
+  const [containersError, setContainersError] = useState("");
+  const [containerBusy, setContainerBusy] = useState({});
+  const [containerFeedback, setContainerFeedback] = useState(null);
+  const [containerConfirm, setContainerConfirm] = useState(null);
+  const [containerLogs, setContainerLogs] = useState(null);
   const mountedRef = useRef(false);
+  const containersStateRef = useRef("");
   const processOrderCounterRef = useRef(0);
   const processOrderRef = useRef(new Map());
 
@@ -827,13 +986,40 @@ export default function ProcessesView({
     }
   }, [workspaceRootsKey]);
 
+  // Containers are listed through the Rust docker CLI bridge, so the panel
+  // keeps working in background/headless mode.
+  const loadContainers = useCallback(async ({ silent = false } = {}) => {
+    try {
+      const result = await invoke("docker_containers_snapshot", { includeStats: true });
+      if (!mountedRef.current) {
+        return;
+      }
+      containersStateRef.current = String(result?.state || "");
+      setContainersSnapshot(result);
+      setContainersError("");
+    } catch (loadError) {
+      if (!mountedRef.current) {
+        return;
+      }
+      if (!silent) {
+        setContainersError(errorMessage(loadError, "Unable to load Docker containers."));
+      }
+    }
+  }, []);
+
   useEffect(() => {
     mountedRef.current = true;
     loadProcesses();
+    loadContainers({ silent: true });
 
     const intervalId = window.setInterval(() => {
       if (document.visibilityState !== "hidden") {
         loadProcesses({ silent: true });
+        // A missing CLI never recovers on its own; skip the auto-poll and let
+        // the manual Refresh button retry it.
+        if (containersStateRef.current !== "cli_missing") {
+          loadContainers({ silent: true });
+        }
       }
     }, PROCESS_REFRESH_MS);
 
@@ -841,7 +1027,127 @@ export default function ProcessesView({
       mountedRef.current = false;
       window.clearInterval(intervalId);
     };
-  }, [loadProcesses]);
+  }, [loadContainers, loadProcesses]);
+
+  const fetchContainerLogs = useCallback(async (container) => {
+    setContainerLogs({
+      error: "",
+      id: container.id,
+      loading: true,
+      name: container.name || container.id,
+      output: "",
+      truncated: false,
+    });
+    try {
+      const result = await invoke("docker_container_logs", {
+        containerRef: container.id,
+        tail: 200,
+      });
+      setContainerLogs((current) => (
+        current?.id === container.id
+          ? {
+            ...current,
+            loading: false,
+            output: String(result?.output || ""),
+            truncated: Boolean(result?.truncated),
+          }
+          : current
+      ));
+    } catch (logsError) {
+      setContainerLogs((current) => (
+        current?.id === container.id
+          ? { ...current, error: errorMessage(logsError, "Unable to read container logs."), loading: false }
+          : current
+      ));
+    }
+  }, []);
+
+  const toggleContainerLogs = useCallback((container) => {
+    if (containerLogs?.id === container.id) {
+      setContainerLogs(null);
+      return;
+    }
+    void fetchContainerLogs(container);
+  }, [containerLogs?.id, fetchContainerLogs]);
+
+  const runContainerAction = useCallback(async (container, action) => {
+    const containerId = String(container?.id || "");
+    if (!containerId) {
+      return;
+    }
+    setContainerBusy((current) => ({ ...current, [containerId]: action }));
+    setContainerFeedback(null);
+    try {
+      const result = await invoke("docker_container_action", {
+        action,
+        containerRef: containerId,
+      });
+      setContainerFeedback({
+        id: containerId,
+        message: `${container.name || containerId}: ${result?.message || "Docker action completed."}${
+          Number(result?.durationMs || 0) > 0 ? ` (${Math.round(result.durationMs)}ms)` : ""
+        }`,
+        state: result?.ok ? "done" : "error",
+      });
+    } catch (actionError) {
+      setContainerFeedback({
+        id: containerId,
+        message: errorMessage(actionError, "Unable to run the Docker container action."),
+        state: "error",
+      });
+    } finally {
+      setContainerBusy((current) => {
+        const next = { ...current };
+        delete next[containerId];
+        return next;
+      });
+      await loadContainers({ silent: true });
+      await loadProcesses({ silent: true });
+    }
+  }, [loadContainers, loadProcesses]);
+
+  const beginContainerAction = useCallback((container, action) => {
+    if (action === "remove") {
+      setContainerConfirm({ action, container });
+      return;
+    }
+    void runContainerAction(container, action);
+  }, [runContainerAction]);
+
+  const confirmContainerAction = useCallback(async () => {
+    if (!containerConfirm) {
+      return;
+    }
+    const { action, container } = containerConfirm;
+    setContainerConfirm(null);
+    await runContainerAction(container, action);
+  }, [containerConfirm, runContainerAction]);
+
+  const containerGroups = useMemo(() => {
+    const containers = Array.isArray(containersSnapshot?.containers)
+      ? containersSnapshot.containers
+      : [];
+    const byProject = new Map();
+    for (const container of containers) {
+      const key = String(container.composeProject || "");
+      if (!byProject.has(key)) {
+        byProject.set(key, []);
+      }
+      byProject.get(key).push(container);
+    }
+    const groups = [...byProject.entries()]
+      .filter(([key]) => key)
+      .map(([key, items]) => ({ containers: items, id: `compose:${key}`, label: key }));
+    const standalone = byProject.get("") || [];
+    if (standalone.length) {
+      groups.push({
+        containers: standalone,
+        id: "standalone",
+        label: groups.length ? "Standalone" : "",
+      });
+    }
+    return groups;
+  }, [containersSnapshot]);
 
   const allProcesses = Array.isArray(snapshot?.processes) ? snapshot.processes : [];
   const buckets = useMemo(() => {
@@ -1099,7 +1405,14 @@ export default function ProcessesView({
             <ButtonCodeIcon aria-hidden="true" />
             <span>Rebuild</span>
           </SecondaryButton>
-          <SecondaryButton disabled={refreshState === "loading"} onClick={() => loadProcesses()} type="button">
+          <SecondaryButton
+            disabled={refreshState === "loading"}
+            onClick={() => {
+              loadProcesses();
+              loadContainers();
+            }}
+            type="button"
+          >
             <ButtonRefreshIcon aria-hidden="true" />
             <span>{refreshState === "loading" ? "Refreshing..." : "Refresh"}</span>
           </SecondaryButton>
@@ -1119,6 +1432,96 @@ export default function ProcessesView({
       )}
       {dockerActionState.result && (
         <ProcessDockerActionLog result={dockerActionState.result} />
+      )}
+
+      {containersSnapshot && containersSnapshot.state !== "cli_missing" && (
+        <ProcessContainersPanel aria-label="Docker containers">
+          <ProcessContainersHeader>
+            <strong>Containers</strong>
+            <span data-tone={containersSnapshot.daemonRunning ? "ok" : "warn"}>
+              {containersSnapshot.daemonRunning
+                ? `${(containersSnapshot.containers || []).length} total / ${(containersSnapshot.containers || []).filter((container) => container.state === "running").length} running`
+                : "Docker daemon offline"}
+            </span>
+          </ProcessContainersHeader>
+          {containersError && <FormMessage $state="error">{containersError}</FormMessage>}
+          {containerFeedback?.message && (
+            <ProcessInlineMessage data-state={containerFeedback.state}>
+              {containerFeedback.message}
+            </ProcessInlineMessage>
+          )}
+          {!containersSnapshot.daemonRunning ? (
+            <ProcessContainersNotice>
+              The docker CLI is installed but the daemon is not reachable.
+              {containersSnapshot.message ? ` ${containersSnapshot.message}` : ""}
+            </ProcessContainersNotice>
+          ) : containerGroups.length === 0 ? (
+            <ProcessContainersNotice>No containers yet.</ProcessContainersNotice>
+          ) : (
+            <ProcessContainersList role="list">
+              {containerGroups.map((group) => (
+                <Fragment key={group.id}>
+                  {group.label && (
+                    <ProcessContainersGroupLabel>{group.label}</ProcessContainersGroupLabel>
+                  )}
+                  {group.containers.map((container) => (
+                    <DockerContainerRow
+                      busyAction={containerBusy[container.id] || ""}
+                      container={container}
+                      disabled={false}
+                      key={container.id}
+                      logsOpen={containerLogs?.id === container.id}
+                      onAction={beginContainerAction}
+                      onToggleLogs={toggleContainerLogs}
+                    />
+                  ))}
+                </Fragment>
+              ))}
+            </ProcessContainersList>
+          )}
+          {containerLogs && (
+            <ProcessContainerLogsPanel>
+              <ProcessContainerLogsHeader>
+                <strong>{containerLogs.name}</strong>
+                <span>
+                  {containerLogs.loading
+                    ? "Loading logs..."
+                    : `last 200 lines${containerLogs.truncated ? " (truncated)" : ""}`}
+                </span>
+                <ProcessDockerActionButton
+                  aria-label="Refresh logs"
+                  disabled={containerLogs.loading}
+                  onClick={() => {
+                    const container = (containersSnapshot.containers || [])
+                      .find((candidate) => candidate.id === containerLogs.id);
+                    void fetchContainerLogs(container || { id: containerLogs.id, name: containerLogs.name });
+                  }}
+                  title="Refresh logs"
+                  type="button"
+                >
+                  <ButtonRefreshIcon aria-hidden="true" />
+                </ProcessDockerActionButton>
+                <ProcessDockerActionButton
+                  aria-label="Close logs"
+                  onClick={() => setContainerLogs(null)}
+                  title="Close logs"
+                  type="button"
+                >
+                  <ButtonDeleteIcon aria-hidden="true" />
+                </ProcessDockerActionButton>
+              </ProcessContainerLogsHeader>
+              {containerLogs.error ? (
+                <FormMessage $state="error">{containerLogs.error}</FormMessage>
+              ) : (
+                <ProcessDockerOutput>
+                  {containerLogs.loading
+                    ? "..."
+                    : containerLogs.output || "No log output."}
+                </ProcessDockerOutput>
+              )}
+            </ProcessContainerLogsPanel>
+          )}
+        </ProcessContainersPanel>
       )}
 
       <ProcessBucketsGrid>
@@ -1196,6 +1599,34 @@ export default function ProcessesView({
                     ? dockerConfirmAction.pendingLabel
                     : dockerConfirmAction.buttonLabel}
                 </span>
+              </PrimaryDangerButton>
+            </ProcessConfirmActions>
+          </ProcessConfirmDialog>
+        </ProcessConfirmOverlay>
+      )}
+
+      {containerConfirm && (
+        <ProcessConfirmOverlay role="presentation">
+          <ProcessConfirmDialog aria-labelledby="container-confirm-title" aria-modal="true" role="dialog">
+            <PanelKicker>Docker container</PanelKicker>
+            <PanelHeading id="container-confirm-title">
+              {containerActionTitle(containerConfirm.action)}?
+            </PanelHeading>
+            <SettingsHint>
+              {containerConfirm.container?.name || containerConfirm.container?.id}
+              {" / "}
+              {containerDisplayImage(containerConfirm.container?.image)}
+              {containerConfirm.action === "remove"
+                ? " — the container and its writable layer are deleted. Volumes are kept."
+                : ""}
+            </SettingsHint>
+            <ProcessConfirmActions>
+              <SecondaryButton onClick={() => setContainerConfirm(null)} type="button">
+                <span>Cancel</span>
+              </SecondaryButton>
+              <PrimaryDangerButton onClick={confirmContainerAction} type="button">
+                <ButtonDeleteIcon aria-hidden="true" />
+                <span>Remove</span>
               </PrimaryDangerButton>
             </ProcessConfirmActions>
           </ProcessConfirmDialog>
@@ -1800,6 +2231,12 @@ const ProcessDockerActionButton = styled.button`
     background: rgba(239, 107, 107, 0.1);
   }
 
+  &[data-active="true"] {
+    border-color: rgba(125, 176, 255, 0.45);
+    color: #9cc4ff;
+    background: rgba(125, 176, 255, 0.12);
+  }
+
   &:disabled {
     opacity: 0.28;
     cursor: default;
@@ -1895,5 +2332,261 @@ const ProcessConfirmActions = styled.div`
 
   button {
     min-height: 38px;
+  }
+`;
+
+const ProcessContainersPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  max-height: 42vh;
+  align-content: start;
+  gap: 6px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 10px;
+  background: rgba(230, 236, 245, 0.02);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface);
+  }
+`;
+
+const ProcessContainersHeader = styled.header`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+
+  strong {
+    color: rgba(230, 236, 245, 0.92);
+    font-size: 12px;
+    font-weight: 760;
+    letter-spacing: 0.02em;
+  }
+
+  > span {
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.5);
+    font-size: 11px;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > span[data-tone="warn"] {
+    color: #ffb454;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & > span {
+    color: var(--forge-text-muted);
+  }
+`;
+
+const ProcessContainersNotice = styled.p`
+  margin: 0;
+  color: rgba(230, 236, 245, 0.55);
+  font-size: 11.5px;
+  font-weight: 600;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+`;
+
+const ProcessContainersList = styled.div`
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 2px;
+`;
+
+const ProcessContainersGroupLabel = styled.div`
+  margin-top: 4px;
+  overflow: hidden;
+  color: rgba(230, 236, 245, 0.42);
+  font-size: 10px;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: var(--forge-text-muted);
+  }
+`;
+
+const ProcessContainerRow = styled.div`
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 30px;
+  grid-template-columns: 18px minmax(140px, 1.2fr) minmax(0, 1fr) max-content max-content;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  padding: 2px 3px;
+  border-radius: 6px;
+
+  &:hover,
+  &:focus-within {
+    background: rgba(230, 236, 245, 0.045);
+  }
+
+  html[data-forge-theme="light"] &:hover,
+  html[data-forge-theme="light"] &:focus-within {
+    background: rgba(0, 102, 204, 0.06);
+  }
+`;
+
+const ProcessContainerDot = styled.span`
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: rgba(230, 236, 245, 0.28);
+
+  &[data-state="running"] {
+    background: #4bd4aa;
+    box-shadow: 0 0 6px rgba(75, 212, 170, 0.5);
+  }
+
+  &[data-state="running"][data-health="unhealthy"] {
+    background: #ff6b6b;
+    box-shadow: 0 0 6px rgba(255, 107, 107, 0.5);
+  }
+
+  &[data-state="restarting"],
+  &[data-state="running"][data-health="starting"] {
+    background: #ffb454;
+  }
+
+  &[data-state="paused"] {
+    background: #ffd08a;
+  }
+
+  &[data-state="dead"] {
+    background: #ff6b6b;
+  }
+`;
+
+const ProcessContainerMain = styled.div`
+  display: grid;
+  min-width: 0;
+  align-content: center;
+
+  strong {
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.9);
+    font-size: 11.5px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.45);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--forge-text-muted);
+  }
+`;
+
+const ProcessContainerStatus = styled.div`
+  display: grid;
+  min-width: 0;
+  align-content: center;
+  justify-items: end;
+  text-align: right;
+
+  span {
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.58);
+    font-size: 10.5px;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  em {
+    overflow: hidden;
+    color: rgba(125, 176, 255, 0.78);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 650;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: var(--forge-text-muted);
+  }
+
+  html[data-forge-theme="light"] & em {
+    color: var(--forge-blue);
+  }
+`;
+
+const ProcessContainerLogsPanel = styled.section`
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.08);
+  border-radius: 8px;
+  background: rgba(2, 3, 4, 0.5);
+
+  html[data-forge-theme="light"] & {
+    border-color: var(--forge-border);
+    background: var(--forge-surface-control);
+  }
+`;
+
+const ProcessContainerLogsHeader = styled.header`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+
+  strong {
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.88);
+    font-size: 11.5px;
+    font-weight: 720;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  > span {
+    flex: 1;
+    overflow: hidden;
+    color: rgba(230, 236, 245, 0.42);
+    font-size: 10.5px;
+    font-weight: 620;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: var(--forge-text);
+  }
+
+  html[data-forge-theme="light"] & > span {
+    color: var(--forge-text-muted);
   }
 `;

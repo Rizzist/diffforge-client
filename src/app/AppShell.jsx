@@ -18311,6 +18311,7 @@ export default function App() {
       }
     };
     const handleRemoteLifecycleControl = async ({
+      agentId,
       commandId,
       commandKind,
       event,
@@ -18436,6 +18437,100 @@ export default function App() {
           commandId,
           commandKind,
           terminalCount: terminals.length,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "terminal_relaunch_agent",
+        "relaunch_terminal_agent",
+        "relaunch_terminal",
+        "terminal_relaunch",
+        "terminal_switch_agent",
+        "switch_terminal_agent",
+      ].includes(normalizedKind)) {
+        const nextAgentId = normalizeManagedAgentProviderId(
+          agentId
+            || remoteCommandStringField(event, [
+              "target_agent_id",
+              "targetAgentId",
+              "agent_id",
+              "agentId",
+              "provider",
+            ]),
+        );
+        if (!nextAgentId) {
+          await recordRemoteCommandStatus(event, "failed", "Relaunch command did not include a supported agent (claude, codex, or opencode).", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const { terminal } = findRemoteControlTerminal(workspaceId, target);
+        const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"])
+          ?? (Number.isInteger(targetTerminalIndex) ? targetTerminalIndex : null);
+        if (!Number.isInteger(terminalIndex)) {
+          await recordRemoteCommandStatus(event, "failed", "Target terminal was not found on this desktop.", {
+            commandId,
+            commandKind,
+            target,
+            workspaceId,
+          });
+          return;
+        }
+        const assessment = assessRemoteControlTerminalIdle(terminal);
+        const terminalBusy = Boolean(terminal)
+          && !assessment.idle
+          && !["already_closed", "unknown", "error", "failed", "timeout"].includes(assessment.reason);
+        if (terminalBusy) {
+          await recordRemoteCommandStatus(event, "blocked", "Terminal is busy; relaunch it after the current turn finishes.", {
+            assessment,
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminal, { reason: assessment.reason, ...target }),
+            workspaceId,
+          });
+          return;
+        }
+        const previousAgentId = remoteControlTerminalText(terminal, ["agentId", "agent_id", "agentKind", "agent_kind"]);
+        const terminalLooksOpen = Boolean(terminal) && !remoteControlTerminalLooksClosed(terminal);
+        if (previousAgentId && previousAgentId === nextAgentId && terminalLooksOpen) {
+          await recordRemoteCommandStatus(event, "completed", `Terminal is already running ${getManagedAgentLabel(nextAgentId)}.`, {
+            agentId: nextAgentId,
+            commandId,
+            commandKind,
+            terminalIndex,
+            workspaceId,
+          });
+          return;
+        }
+        const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || targetThreadId;
+        await recordRemoteCommandStatus(event, "running", `Relaunching terminal as ${getManagedAgentLabel(nextAgentId)}.`, {
+          agentId: nextAgentId,
+          commandId,
+          commandKind,
+          previousAgentId,
+          terminalIndex,
+          workspaceId,
+        });
+        // Same path as the desktop's own agent switcher: the role change
+        // closes the pane and the runtime relaunches it with the new CLI.
+        changeWorkspaceTerminalRole({
+          role: nextAgentId,
+          source: "remote_control_relaunch",
+          terminalIndex,
+          threadId,
+          workspaceId,
+        });
+        await syncRemoteControlState("remote_terminal_relaunch_agent");
+        await recordRemoteCommandStatus(event, "completed", `Terminal relaunched as ${getManagedAgentLabel(nextAgentId)} from the web dashboard.`, {
+          agentId: nextAgentId,
+          commandId,
+          commandKind,
+          previousAgentId,
+          terminal: remoteControlTerminalSummary(terminal, target),
+          terminalIndex,
           workspaceId,
         });
         return;
@@ -18643,6 +18738,12 @@ export default function App() {
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
           const agentPackageAction = remoteCommandIsAgentPackageAction(commandKind);
+          // Agent uninstall has no webview UI path; the Rust lever always
+          // owns it (and replies), so the webview stays silent here.
+          if (["agent_uninstall", "uninstall_agent", "cli_uninstall"]
+            .includes(String(commandKind || "").trim().toLowerCase().replace(/[.\s-]+/g, "_"))) {
+            return;
+          }
           const receiptWorkspaceId = workspaceId || (agentPackageAction ? "device" : "");
           if (!workspaceId && !agentPackageAction) {
             await recordRemoteCommandStatus(
@@ -18687,6 +18788,7 @@ export default function App() {
           if (!remoteCommandIsCreateTask(commandKind)) {
             try {
               await handleRemoteLifecycleControl({
+                agentId,
                 commandId,
                 commandKind,
                 event,
@@ -18820,7 +18922,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, agentStatuses, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, refreshAgentStatuses, syncAgentInstallationsToCloud, workspaces]);
 
   const openSelectedWorkspaceSettings = useCallback(() => {
     if (selectedWorkspace) {

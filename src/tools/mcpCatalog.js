@@ -1,49 +1,251 @@
-import { Amazonaws } from "@styled-icons/simple-icons/Amazonaws";
 import { Cloudflare } from "@styled-icons/simple-icons/Cloudflare";
+import { Figma } from "@styled-icons/simple-icons/Figma";
 import { Github } from "@styled-icons/simple-icons/Github";
 import { Gitlab } from "@styled-icons/simple-icons/Gitlab";
-import { Googlecloud } from "@styled-icons/simple-icons/Googlecloud";
+import { Googlemaps } from "@styled-icons/simple-icons/Googlemaps";
 import { Notion } from "@styled-icons/simple-icons/Notion";
-import { Postgresql } from "@styled-icons/simple-icons/Postgresql";
-import { Redis } from "@styled-icons/simple-icons/Redis";
 import { Sentry } from "@styled-icons/simple-icons/Sentry";
 import { Slack } from "@styled-icons/simple-icons/Slack";
-import { Sqlite } from "@styled-icons/simple-icons/Sqlite";
 import { Stripe } from "@styled-icons/simple-icons/Stripe";
 import { Supabase } from "@styled-icons/simple-icons/Supabase";
 
+function env(key, label, { required = true, secret = true, description = "" } = {}) {
+  return { key, label, description, required, secret, source: "catalog" };
+}
+
 /**
- * Curated catalog of popular MCP servers. `command` is what the marketplace
- * box in the MCPs manager parses (npx-style stdio launch), so "Copy command"
- * → paste → add is the whole flow.
+ * Curated catalog of popular MCP servers, installable in one click from the
+ * MCPs tab. Every entry launches over stdio through the workspace gateway
+ * (which serves both Claude Code and Codex); `args` is the full npx argv and
+ * `env` describes the config the server needs before it can be enabled.
+ * Entries without `env` work immediately after install.
  */
 export const MCP_CATALOG = [
-  { id: "filesystem", label: "Filesystem", command: "npx -y @modelcontextprotocol/server-filesystem", icon: null },
-  { id: "memory", label: "Memory", command: "npx -y @modelcontextprotocol/server-memory", icon: null },
-  { id: "fetch", label: "Fetch", command: "npx -y @modelcontextprotocol/server-fetch", icon: null },
-  { id: "sequential-thinking", label: "Sequential Thinking", command: "npx -y @modelcontextprotocol/server-sequential-thinking", icon: null },
-  { id: "github", label: "GitHub", command: "npx -y @modelcontextprotocol/server-github", icon: Github },
-  { id: "gitlab", label: "GitLab", command: "npx -y @modelcontextprotocol/server-gitlab", icon: Gitlab },
-  { id: "postgres", label: "PostgreSQL", command: "npx -y @modelcontextprotocol/server-postgres", icon: Postgresql },
-  { id: "sqlite", label: "SQLite", command: "npx -y mcp-server-sqlite-npx", icon: Sqlite },
-  { id: "redis", label: "Redis", command: "npx -y @modelcontextprotocol/server-redis", icon: Redis },
-  { id: "slack", label: "Slack", command: "npx -y @modelcontextprotocol/server-slack", icon: Slack },
-  { id: "puppeteer", label: "Puppeteer", command: "npx -y @modelcontextprotocol/server-puppeteer", icon: null },
-  { id: "playwright", label: "Playwright", command: "npx -y @playwright/mcp", icon: null },
-  { id: "stripe", label: "Stripe", command: "npx -y @stripe/mcp", icon: Stripe },
-  { id: "supabase", label: "Supabase", command: "npx -y @supabase/mcp-server-supabase", icon: Supabase },
-  { id: "notion", label: "Notion", command: "npx -y @notionhq/notion-mcp-server", icon: Notion },
-  { id: "sentry", label: "Sentry", command: "npx -y @sentry/mcp-server", icon: Sentry },
-  { id: "cloudflare", label: "Cloudflare", command: "npx -y @cloudflare/mcp-server-cloudflare", icon: Cloudflare },
-  { id: "aws", label: "AWS", command: "npx -y @aws/mcp-server-aws", icon: Amazonaws },
-  { id: "gcloud", label: "Google Cloud", command: "npx -y @google-cloud/mcp", icon: Googlecloud },
-  { id: "brave-search", label: "Brave Search", command: "npx -y @modelcontextprotocol/server-brave-search", icon: null },
-  { id: "exa", label: "Exa Search", command: "npx -y exa-mcp-server", icon: null },
-  { id: "firecrawl", label: "Firecrawl", command: "npx -y firecrawl-mcp", icon: null },
-  { id: "context7", label: "Context7 Docs", command: "npx -y @upstash/context7-mcp", icon: null },
-  { id: "linear", label: "Linear", command: "npx -y mcp-remote https://mcp.linear.app/sse", icon: null },
-  { id: "figma", label: "Figma", command: "npx -y figma-developer-mcp", icon: null },
-  { id: "everart", label: "EverArt", command: "npx -y @modelcontextprotocol/server-everart", icon: null },
-  { id: "gdrive", label: "Google Drive", command: "npx -y @modelcontextprotocol/server-gdrive", icon: null },
-  { id: "google-maps", label: "Google Maps", command: "npx -y @modelcontextprotocol/server-google-maps", icon: null },
+  {
+    id: "filesystem",
+    label: "Filesystem",
+    description: "Read, write, and search files in the workspace directory.",
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."],
+    packageRef: "@modelcontextprotocol/server-filesystem",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "memory",
+    label: "Memory",
+    description: "Persistent knowledge-graph memory across agent sessions.",
+    args: ["-y", "@modelcontextprotocol/server-memory"],
+    packageRef: "@modelcontextprotocol/server-memory",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "fetch",
+    label: "Fetch",
+    description: "Fetch web pages and convert them to agent-friendly markdown.",
+    args: ["-y", "@modelcontextprotocol/server-fetch"],
+    packageRef: "@modelcontextprotocol/server-fetch",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "sequential-thinking",
+    label: "Sequential Thinking",
+    description: "Structured step-by-step reasoning scratchpad for hard problems.",
+    args: ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+    packageRef: "@modelcontextprotocol/server-sequential-thinking",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "playwright",
+    label: "Playwright",
+    description: "Drive a real browser: navigate, click, screenshot, and scrape.",
+    args: ["-y", "@playwright/mcp"],
+    packageRef: "@playwright/mcp",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "puppeteer",
+    label: "Puppeteer",
+    description: "Headless Chrome automation and page capture.",
+    args: ["-y", "@modelcontextprotocol/server-puppeteer"],
+    packageRef: "@modelcontextprotocol/server-puppeteer",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "context7",
+    label: "Context7 Docs",
+    description: "Up-to-date library documentation injected into agent context.",
+    args: ["-y", "@upstash/context7-mcp"],
+    packageRef: "@upstash/context7-mcp",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "github",
+    label: "GitHub",
+    description: "Issues, pull requests, repos, and code search on GitHub.",
+    args: ["-y", "@modelcontextprotocol/server-github"],
+    packageRef: "@modelcontextprotocol/server-github",
+    icon: Github,
+    env: [env("GITHUB_PERSONAL_ACCESS_TOKEN", "Personal access token")],
+  },
+  {
+    id: "gitlab",
+    label: "GitLab",
+    description: "Projects, merge requests, and issues on GitLab.",
+    args: ["-y", "@modelcontextprotocol/server-gitlab"],
+    packageRef: "@modelcontextprotocol/server-gitlab",
+    icon: Gitlab,
+    env: [
+      env("GITLAB_PERSONAL_ACCESS_TOKEN", "Personal access token"),
+      env("GITLAB_API_URL", "API URL", { required: false, secret: false }),
+    ],
+  },
+  {
+    id: "slack",
+    label: "Slack",
+    description: "Read channels and post messages in your Slack workspace.",
+    args: ["-y", "@modelcontextprotocol/server-slack"],
+    packageRef: "@modelcontextprotocol/server-slack",
+    icon: Slack,
+    env: [
+      env("SLACK_BOT_TOKEN", "Bot token"),
+      env("SLACK_TEAM_ID", "Team ID", { secret: false }),
+    ],
+  },
+  {
+    id: "linear",
+    label: "Linear",
+    description: "Linear issues, projects, and cycles (OAuth on first use).",
+    args: ["-y", "mcp-remote", "https://mcp.linear.app/sse"],
+    packageRef: "mcp-remote",
+    icon: null,
+    env: [],
+  },
+  {
+    id: "notion",
+    label: "Notion",
+    description: "Search and edit Notion pages and databases.",
+    args: ["-y", "@notionhq/notion-mcp-server"],
+    packageRef: "@notionhq/notion-mcp-server",
+    icon: Notion,
+    env: [env("NOTION_TOKEN", "Internal integration token")],
+  },
+  {
+    id: "stripe",
+    label: "Stripe",
+    description: "Inspect customers, payments, and products in Stripe.",
+    args: ["-y", "@stripe/mcp", "--tools=all"],
+    packageRef: "@stripe/mcp",
+    icon: Stripe,
+    env: [env("STRIPE_SECRET_KEY", "Secret key")],
+  },
+  {
+    id: "supabase",
+    label: "Supabase",
+    description: "Manage Supabase projects, database, and edge functions.",
+    args: ["-y", "@supabase/mcp-server-supabase"],
+    packageRef: "@supabase/mcp-server-supabase",
+    icon: Supabase,
+    env: [env("SUPABASE_ACCESS_TOKEN", "Access token")],
+  },
+  {
+    id: "sentry",
+    label: "Sentry",
+    description: "Query Sentry issues, events, and releases.",
+    args: ["-y", "@sentry/mcp-server"],
+    packageRef: "@sentry/mcp-server",
+    icon: Sentry,
+    env: [env("SENTRY_AUTH_TOKEN", "Auth token")],
+  },
+  {
+    id: "cloudflare",
+    label: "Cloudflare",
+    description: "Workers, KV, R2, and DNS through Cloudflare's MCP.",
+    args: ["-y", "@cloudflare/mcp-server-cloudflare"],
+    packageRef: "@cloudflare/mcp-server-cloudflare",
+    icon: Cloudflare,
+    env: [
+      env("CLOUDFLARE_API_TOKEN", "API token"),
+      env("CLOUDFLARE_ACCOUNT_ID", "Account ID", { secret: false }),
+    ],
+  },
+  {
+    id: "figma",
+    label: "Figma",
+    description: "Read Figma files and design tokens for implementation.",
+    args: ["-y", "figma-developer-mcp", "--stdio"],
+    packageRef: "figma-developer-mcp",
+    icon: Figma,
+    env: [env("FIGMA_API_KEY", "Personal access token")],
+  },
+  {
+    id: "brave-search",
+    label: "Brave Search",
+    description: "Web search with the Brave Search API.",
+    args: ["-y", "@modelcontextprotocol/server-brave-search"],
+    packageRef: "@modelcontextprotocol/server-brave-search",
+    icon: null,
+    env: [env("BRAVE_API_KEY", "API key")],
+  },
+  {
+    id: "exa",
+    label: "Exa Search",
+    description: "Semantic web search and research with Exa.",
+    args: ["-y", "exa-mcp-server"],
+    packageRef: "exa-mcp-server",
+    icon: null,
+    env: [env("EXA_API_KEY", "API key")],
+  },
+  {
+    id: "firecrawl",
+    label: "Firecrawl",
+    description: "Crawl and scrape websites into clean markdown.",
+    args: ["-y", "firecrawl-mcp"],
+    packageRef: "firecrawl-mcp",
+    icon: null,
+    env: [env("FIRECRAWL_API_KEY", "API key")],
+  },
+  {
+    id: "google-maps",
+    label: "Google Maps",
+    description: "Geocoding, places, and directions via Google Maps.",
+    args: ["-y", "@modelcontextprotocol/server-google-maps"],
+    packageRef: "@modelcontextprotocol/server-google-maps",
+    icon: Googlemaps,
+    env: [env("GOOGLE_MAPS_API_KEY", "API key")],
+  },
 ];
+
+/** Builds the install input for coordination_install_workspace_mcp_server. */
+export function mcpCatalogInstallInput(entry, workspaceName) {
+  const envSchema = Array.isArray(entry?.env) ? entry.env : [];
+  const requiresConfig = envSchema.some((item) => item?.required);
+  return {
+    workspace_name: workspaceName,
+    name: entry.label,
+    server_key: entry.id,
+    source_kind: "catalog",
+    source_label: "Popular",
+    package_ref: entry.packageRef || "",
+    version: "",
+    transport: "stdio",
+    command: "npx",
+    args: entry.args || [],
+    url: "",
+    env_schema: envSchema,
+    tools: [],
+    // No-config servers are usable the moment they are installed; servers
+    // that need keys stay disabled until the user fills in the config.
+    workspace_enabled: !requiresConfig,
+    approval_policy: "always_allow",
+    exposure_mode: "lazy",
+    agent_config_access_enabled: true,
+    agent_secret_config_access_enabled: false,
+    agent_env_file_write_enabled: true,
+  };
+}

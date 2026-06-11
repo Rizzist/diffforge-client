@@ -1512,6 +1512,376 @@ async fn docker_developer_action(
     .map_err(|error| format!("Unable to join Docker action worker: {error}"))?
 }
 
+const DOCKER_CONTAINER_LIST_LIMIT: usize = 200;
+const DOCKER_CONTAINER_SNAPSHOT_OUTPUT_LIMIT: usize = 512 * 1024;
+const DOCKER_CONTAINER_LOGS_DEFAULT_TAIL: u32 = 200;
+const DOCKER_CONTAINER_LOGS_MAX_TAIL: u32 = 2000;
+const DOCKER_CONTAINER_LOGS_OUTPUT_LIMIT: usize = 24 * 1024;
+const DOCKER_CONTAINER_ACTIONS: &[&str] =
+    &["start", "stop", "restart", "pause", "unpause", "remove"];
+
+fn validate_docker_container_ref(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return Err("A Docker container id or name is required.".to_string());
+    }
+    let valid = value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+        && value
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric());
+    if !valid {
+        return Err("Docker container reference contains unsupported characters.".to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn docker_ps_labels_value(labels: &str, key: &str) -> String {
+    labels
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(label_key, _)| label_key.trim() == key)
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn docker_container_from_ps_line(line: &Value) -> Option<Value> {
+    let id = line["ID"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let name = line["Names"]
+        .as_str()
+        .unwrap_or_default()
+        .split(',')
+        .map(|value| value.trim().trim_start_matches('/'))
+        .find(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string();
+    let labels = line["Labels"].as_str().unwrap_or_default();
+    let status = line["Status"].as_str().unwrap_or_default().to_string();
+    let health = if status.contains("(healthy)") {
+        "healthy"
+    } else if status.contains("(unhealthy)") {
+        "unhealthy"
+    } else if status.contains("(health: starting)") {
+        "starting"
+    } else {
+        ""
+    };
+
+    Some(json!({
+        "id": id,
+        "name": name,
+        "image": line["Image"].as_str().unwrap_or_default(),
+        "state": line["State"].as_str().unwrap_or_default().to_ascii_lowercase(),
+        "status": status,
+        "health": health,
+        "ports": line["Ports"].as_str().unwrap_or_default(),
+        "command": line["Command"].as_str().unwrap_or_default().trim_matches('"'),
+        "createdAt": line["CreatedAt"].as_str().unwrap_or_default(),
+        "runningFor": line["RunningFor"].as_str().unwrap_or_default(),
+        "networks": line["Networks"].as_str().unwrap_or_default(),
+        "composeProject": docker_ps_labels_value(labels, "com.docker.compose.project"),
+        "composeService": docker_ps_labels_value(labels, "com.docker.compose.service"),
+    }))
+}
+
+fn docker_container_state_rank(state: &str) -> u8 {
+    match state {
+        "running" => 0,
+        "restarting" => 1,
+        "paused" => 2,
+        "created" => 3,
+        "exited" => 4,
+        "dead" => 5,
+        _ => 6,
+    }
+}
+
+fn docker_stats_percent(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches('%').parse::<f64>().ok()
+}
+
+fn docker_cli_is_missing(result: &DockerDeveloperCommandResult) -> bool {
+    if result.exit_code.is_some() {
+        return false;
+    }
+    let stderr = result.stderr.to_ascii_lowercase();
+    stderr.contains("no such file")
+        || stderr.contains("not found")
+        || stderr.contains("cannot find")
+        || stderr.contains("os error 2")
+}
+
+/// Containers panel snapshot: lists every Docker container (not just
+/// workspace-linked ones) with identity, state, ports, and optional live
+/// stats. Runs entirely through the Rust CLI bridge so the panel keeps
+/// working in background/headless mode.
+#[tauri::command]
+async fn docker_containers_snapshot(include_stats: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        docker_containers_snapshot_blocking(include_stats.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("Unable to join Docker snapshot worker: {error}"))?
+}
+
+fn docker_containers_snapshot_blocking(include_stats: bool) -> Result<Value, String> {
+    let ps = run_developer_docker_command_with_limit(
+        "docker",
+        &[
+            String::from("ps"),
+            String::from("--all"),
+            String::from("--no-trunc"),
+            String::from("--format"),
+            String::from("{{json .}}"),
+        ],
+        None,
+        DOCKER_CONTAINER_SNAPSHOT_OUTPUT_LIMIT,
+    );
+
+    if !ps.success {
+        if docker_cli_is_missing(&ps) {
+            return Ok(json!({
+                "available": false,
+                "daemonRunning": false,
+                "state": "cli_missing",
+                "message": "The docker CLI is not installed.",
+                "containers": [],
+            }));
+        }
+        let stderr = ps.stderr.to_ascii_lowercase();
+        if stderr.contains("cannot connect to the docker daemon")
+            || stderr.contains("docker daemon")
+            || stderr.contains("dockerdesktoplinuxengine")
+            || stderr.contains("error during connect")
+            || stderr.contains("is the docker daemon running")
+        {
+            return Ok(json!({
+                "available": true,
+                "daemonRunning": false,
+                "state": "daemon_unreachable",
+                "message": ps.stderr.lines().next().unwrap_or("The Docker daemon is not running."),
+                "containers": [],
+            }));
+        }
+        return Err(docker_command_error_message(
+            "Unable to list Docker containers.",
+            &ps,
+        ));
+    }
+
+    let mut containers = ps
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|line| docker_container_from_ps_line(&line))
+        .take(DOCKER_CONTAINER_LIST_LIMIT)
+        .collect::<Vec<_>>();
+
+    let any_running = containers
+        .iter()
+        .any(|container| container["state"].as_str() == Some("running"));
+    let mut stats_sampled = false;
+    if include_stats && any_running {
+        let stats = run_developer_docker_command_with_limit(
+            "docker",
+            &[
+                String::from("stats"),
+                String::from("--no-stream"),
+                String::from("--format"),
+                String::from("{{json .}}"),
+            ],
+            None,
+            DOCKER_CONTAINER_SNAPSHOT_OUTPUT_LIMIT,
+        );
+        if stats.success {
+            stats_sampled = true;
+            let mut stats_by_id = HashMap::new();
+            for line in stats.stdout.lines() {
+                let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let id = entry["ID"]
+                    .as_str()
+                    .or_else(|| entry["Container"].as_str())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(12)
+                    .collect::<String>();
+                if !id.is_empty() {
+                    stats_by_id.insert(id, entry);
+                }
+            }
+            for container in containers.iter_mut() {
+                let id = container["id"].as_str().unwrap_or_default().to_string();
+                if let Some(entry) = stats_by_id.get(&id) {
+                    container["cpuPercent"] = json!(docker_stats_percent(
+                        entry["CPUPerc"].as_str().unwrap_or_default()
+                    ));
+                    container["memPercent"] = json!(docker_stats_percent(
+                        entry["MemPerc"].as_str().unwrap_or_default()
+                    ));
+                    container["memUsage"] = json!(entry["MemUsage"].as_str().unwrap_or_default());
+                    container["pids"] = entry["PIDs"]
+                        .as_str()
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .map(|value| json!(value))
+                        .unwrap_or(Value::Null);
+                }
+            }
+        }
+    }
+
+    containers.sort_by(|left, right| {
+        let left_rank = docker_container_state_rank(left["state"].as_str().unwrap_or_default());
+        let right_rank = docker_container_state_rank(right["state"].as_str().unwrap_or_default());
+        left_rank.cmp(&right_rank).then_with(|| {
+            left["name"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["name"].as_str().unwrap_or_default())
+        })
+    });
+
+    Ok(json!({
+        "available": true,
+        "daemonRunning": true,
+        "state": "ok",
+        "containers": containers,
+        "statsSampled": stats_sampled,
+        "fetchedAtMs": current_time_ms(),
+    }))
+}
+
+/// Per-container control (start/stop/restart/pause/unpause/remove) with a
+/// feedback payload the Processes tab renders inline.
+#[tauri::command]
+async fn docker_container_action(container_ref: String, action: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        docker_container_action_blocking(&container_ref, &action)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Docker container action worker: {error}"))?
+}
+
+fn docker_container_action_blocking(container_ref: &str, action: &str) -> Result<Value, String> {
+    let container_ref = validate_docker_container_ref(container_ref)?;
+    let action = action.trim().to_ascii_lowercase();
+    if !DOCKER_CONTAINER_ACTIONS.contains(&action.as_str()) {
+        return Err(format!(
+            "Unsupported Docker container action: {action}. Use one of {}.",
+            DOCKER_CONTAINER_ACTIONS.join(", ")
+        ));
+    }
+    let cli_verb = if action == "remove" { "rm" } else { action.as_str() };
+    let result = run_developer_docker_command(
+        "docker",
+        &[cli_verb.to_string(), container_ref.clone()],
+        None,
+    );
+
+    let message = if result.success {
+        match action.as_str() {
+            "start" => "Container started.",
+            "stop" => "Container stopped.",
+            "restart" => "Container restarted.",
+            "pause" => "Container paused.",
+            "unpause" => "Container unpaused.",
+            "remove" => "Container removed.",
+            _ => "Docker action completed.",
+        }
+        .to_string()
+    } else {
+        result
+            .stderr
+            .lines()
+            .next()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or("The Docker command failed.")
+            .to_string()
+    };
+
+    Ok(json!({
+        "ok": result.success,
+        "action": action,
+        "containerRef": container_ref,
+        "exitCode": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "durationMs": result.duration_ms,
+        "message": message,
+    }))
+}
+
+/// Tail of a container's logs for the Processes tab detail view.
+#[tauri::command]
+async fn docker_container_logs(container_ref: String, tail: Option<u32>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        docker_container_logs_blocking(&container_ref, tail)
+    })
+    .await
+    .map_err(|error| format!("Unable to join Docker logs worker: {error}"))?
+}
+
+fn docker_container_logs_blocking(container_ref: &str, tail: Option<u32>) -> Result<Value, String> {
+    let container_ref = validate_docker_container_ref(container_ref)?;
+    let tail = tail
+        .unwrap_or(DOCKER_CONTAINER_LOGS_DEFAULT_TAIL)
+        .clamp(1, DOCKER_CONTAINER_LOGS_MAX_TAIL);
+    let result = run_developer_docker_command_with_limit(
+        "docker",
+        &[
+            String::from("logs"),
+            String::from("--tail"),
+            tail.to_string(),
+            container_ref.clone(),
+        ],
+        None,
+        DOCKER_CONTAINER_LOGS_OUTPUT_LIMIT,
+    );
+    if !result.success {
+        return Err(docker_command_error_message(
+            "Unable to read container logs.",
+            &result,
+        ));
+    }
+
+    // Container logs commonly land on stderr; merge both streams.
+    let mut output = String::new();
+    if !result.stdout.trim().is_empty() {
+        output.push_str(&result.stdout);
+    }
+    if !result.stderr.trim().is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&result.stderr);
+    }
+    let truncated = output.chars().count() > DOCKER_CONTAINER_LOGS_OUTPUT_LIMIT;
+    let output = output
+        .chars()
+        .take(DOCKER_CONTAINER_LOGS_OUTPUT_LIMIT)
+        .collect::<String>();
+
+    Ok(json!({
+        "ok": true,
+        "containerRef": container_ref,
+        "tail": tail,
+        "output": output,
+        "truncated": truncated,
+        "durationMs": result.duration_ms,
+    }))
+}
+
 fn docker_developer_action_blocking(
     action: &str,
     workspace_roots: Vec<String>,
@@ -2649,6 +3019,15 @@ fn run_developer_docker_command(
     args: &[String],
     cwd: Option<&Path>,
 ) -> DockerDeveloperCommandResult {
+    run_developer_docker_command_with_limit(program, args, cwd, DOCKER_DEVELOPER_OUTPUT_LIMIT)
+}
+
+fn run_developer_docker_command_with_limit(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    output_limit: usize,
+) -> DockerDeveloperCommandResult {
     let started_at = Instant::now();
     let mut command = Command::new(program);
     command.args(args);
@@ -2666,8 +3045,14 @@ fn run_developer_docker_command(
                 .map(process_path_display)
                 .unwrap_or_else(String::new),
             exit_code: output.status.code(),
-            stdout: limit_docker_developer_output(&String::from_utf8_lossy(&output.stdout)),
-            stderr: limit_docker_developer_output(&String::from_utf8_lossy(&output.stderr)),
+            stdout: limit_docker_developer_output_with(
+                &String::from_utf8_lossy(&output.stdout),
+                output_limit,
+            ),
+            stderr: limit_docker_developer_output_with(
+                &String::from_utf8_lossy(&output.stderr),
+                output_limit,
+            ),
             success: output.status.success(),
             duration_ms: docker_command_duration_ms(started_at),
             target_label: String::new(),
@@ -2712,6 +3097,10 @@ fn docker_command_duration_ms(started_at: Instant) -> u64 {
 }
 
 fn limit_docker_developer_output(value: &str) -> String {
+    limit_docker_developer_output_with(value, DOCKER_DEVELOPER_OUTPUT_LIMIT)
+}
+
+fn limit_docker_developer_output_with(value: &str, limit: usize) -> String {
     let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
     let mut output = normalized
         .chars()
@@ -2719,8 +3108,12 @@ fn limit_docker_developer_output(value: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string();
-    if output.len() > DOCKER_DEVELOPER_OUTPUT_LIMIT {
-        output.truncate(DOCKER_DEVELOPER_OUTPUT_LIMIT);
+    if output.len() > limit {
+        let mut end = limit;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.truncate(end);
         output.push_str("\n...");
     }
     output
@@ -3492,6 +3885,84 @@ fn process_name_matches(name: &str, candidates: &[&str]) -> bool {
 #[cfg(test)]
 mod developer_process_docker_tests {
     use super::*;
+
+    #[test]
+    fn docker_container_from_ps_line_parses_identity_and_compose_labels() {
+        let line = json!({
+            "ID": "0123456789abcdef0123",
+            "Names": "/web-1",
+            "Image": "nginx:1.27",
+            "State": "Running",
+            "Status": "Up 3 hours (healthy)",
+            "Ports": "0.0.0.0:8080->80/tcp",
+            "Command": "\"nginx -g daemon off\"",
+            "CreatedAt": "2026-06-10 10:00:00 +0000 UTC",
+            "RunningFor": "3 hours ago",
+            "Networks": "app_default",
+            "Labels": "com.docker.compose.project=shop,com.docker.compose.service=web,other=1",
+        });
+        let container = docker_container_from_ps_line(&line).unwrap();
+        assert_eq!(container["id"], "0123456789ab");
+        assert_eq!(container["name"], "web-1");
+        assert_eq!(container["state"], "running");
+        assert_eq!(container["health"], "healthy");
+        assert_eq!(container["composeProject"], "shop");
+        assert_eq!(container["composeService"], "web");
+        assert_eq!(container["ports"], "0.0.0.0:8080->80/tcp");
+    }
+
+    #[test]
+    fn docker_container_action_rejects_bad_refs_and_actions() {
+        assert!(validate_docker_container_ref("web-1").is_ok());
+        assert!(validate_docker_container_ref("0123456789ab").is_ok());
+        assert!(validate_docker_container_ref("").is_err());
+        assert!(validate_docker_container_ref("-flag").is_err());
+        assert!(validate_docker_container_ref("a;rm -rf /").is_err());
+        assert!(validate_docker_container_ref("a b").is_err());
+
+        let unsupported = docker_container_action_blocking("web-1", "explode");
+        assert!(unsupported.unwrap_err().contains("Unsupported"));
+    }
+
+    #[test]
+    fn docker_container_state_rank_orders_running_first() {
+        assert!(docker_container_state_rank("running") < docker_container_state_rank("paused"));
+        assert!(docker_container_state_rank("paused") < docker_container_state_rank("exited"));
+        assert!(docker_container_state_rank("exited") < docker_container_state_rank("unknown"));
+    }
+
+    #[test]
+    fn docker_cli_missing_detection_matches_spawn_errors() {
+        let missing = DockerDeveloperCommandResult {
+            program: "docker".to_string(),
+            args: Vec::new(),
+            cwd: String::new(),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: "No such file or directory (os error 2)".to_string(),
+            success: false,
+            duration_ms: 1,
+            target_label: String::new(),
+            target_container_id: String::new(),
+            target_container_name: String::new(),
+            target_container_image: String::new(),
+            target_compose_project: String::new(),
+            target_compose_service: String::new(),
+            target_compose_working_dir: String::new(),
+            target_compose_config_files: Vec::new(),
+            target_workspace_links: Vec::new(),
+        };
+        assert!(docker_cli_is_missing(&missing));
+
+        let daemon_down = DockerDeveloperCommandResult {
+            exit_code: Some(1),
+            stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+                .to_string(),
+            ..missing
+        };
+        assert!(!docker_cli_is_missing(&daemon_down));
+    }
+
 
     fn test_developer_process_info(name: &str, command: &str) -> DeveloperProcessInfo {
         DeveloperProcessInfo {

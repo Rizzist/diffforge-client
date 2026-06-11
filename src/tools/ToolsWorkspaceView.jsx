@@ -6,7 +6,6 @@ import styled, { keyframes } from "styled-components";
 import { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
-import { MCP_CATALOG } from "./mcpCatalog.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
 import {
   parseSkillsLibrary,
@@ -83,7 +82,6 @@ export default function ToolsWorkspaceView({
 
   // ---- MCP scope (global defaults vs per-workspace) ----
   const [mcpScope, setMcpScope] = useState(GLOBAL_MCP_DEFAULTS_SCOPE);
-  const [mcpCatalogOpen, setMcpCatalogOpen] = useState(false);
   const [globalMcpDefaults, setGlobalMcpDefaults] = useState({
     error: "",
     rootDirectory: "",
@@ -605,54 +603,8 @@ export default function ToolsWorkspaceView({
                   <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
                 ))}
               </ToolsScopeSelect>
-              <ToolsGhostButton
-                onClick={() => setMcpCatalogOpen((open) => !open)}
-                type="button"
-              >
-                {mcpCatalogOpen ? "Hide popular servers" : "Popular servers"}
-              </ToolsGhostButton>
             </ToolsScopeControls>
           </ToolsScopeBar>
-          {mcpCatalogOpen && (
-            <ToolsPanel aria-label="Popular MCP servers">
-              <ToolsPanelTopline>
-                <div>
-                  <ToolsPanelTitle>Popular MCP servers</ToolsPanelTitle>
-                  <ToolsPanelHint>
-                    Copy a launch command, then paste it into the marketplace box below to add it
-                    to the selected scope.
-                  </ToolsPanelHint>
-                </div>
-              </ToolsPanelTopline>
-              <ToolsCatalogGrid>
-                {MCP_CATALOG.map((entry) => {
-                  const Icon = entry.icon;
-                  return (
-                    <ToolsCatalogCard key={entry.id}>
-                      <ToolsCatalogIcon aria-hidden="true">
-                        {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
-                      </ToolsCatalogIcon>
-                      <ToolsCatalogCopy>
-                        <strong>{entry.label}</strong>
-                        <span title={entry.command}>{entry.command}</span>
-                      </ToolsCatalogCopy>
-                      <ToolsCatalogButton
-                        onClick={() => {
-                          navigator?.clipboard?.writeText?.(entry.command);
-                          setCliMessage(`Copied ${entry.label} command`);
-                          window.setTimeout(() => setCliMessage(""), 2000);
-                        }}
-                        type="button"
-                      >
-                        Copy
-                      </ToolsCatalogButton>
-                    </ToolsCatalogCard>
-                  );
-                })}
-              </ToolsCatalogGrid>
-              {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
-            </ToolsPanel>
-          )}
           {globalMcpDefaults.error && activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE && (
             <ToolsError role="alert">{globalMcpDefaults.error}</ToolsError>
           )}
@@ -1348,91 +1300,10 @@ const ToolsSearchInput = styled.input`
   }
 `;
 
-const ToolsCatalogGrid = styled.div`
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 8px;
-`;
 
-const ToolsCatalogCard = styled.article`
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 9px;
-  padding: 9px 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
-  border-radius: 9px;
-  background: rgba(7, 9, 13, 0.4);
 
-  &[data-installed="true"] {
-    border-color: rgba(60, 203, 127, 0.16);
-  }
-`;
 
-const ToolsCatalogIcon = styled.span`
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  border-radius: 7px;
-  color: var(--forge-text-soft, #b6c0cc);
-  background: rgba(230, 236, 245, 0.06);
 
-  svg {
-    width: 15px;
-    height: 15px;
-  }
-
-  span {
-    font-size: 12px;
-    font-weight: 800;
-  }
-`;
-
-const ToolsCatalogCopy = styled.div`
-  display: grid;
-  min-width: 0;
-  gap: 1px;
-
-  strong {
-    overflow: hidden;
-    font-size: 12px;
-    font-weight: 750;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  span {
-    color: var(--forge-text-muted, #7a8493);
-    font-size: 10px;
-    font-weight: 650;
-  }
-`;
-
-const ToolsCatalogButton = styled.button`
-  padding: 5px 10px;
-  border: 1px solid rgba(125, 176, 255, 0.3);
-  border-radius: 7px;
-  color: rgba(200, 222, 255, 0.95);
-  background: rgba(59, 130, 246, 0.12);
-  font-size: 11px;
-  font-weight: 750;
-  cursor: pointer;
-
-  &:hover {
-    background: rgba(59, 130, 246, 0.24);
-  }
-
-  &[data-danger="true"] {
-    border-color: rgba(239, 107, 107, 0.3);
-    color: rgba(250, 180, 180, 0.92);
-    background: transparent;
-  }
-
-  &[data-danger="true"]:hover {
-    background: rgba(127, 29, 29, 0.2);
-  }
-`;
 
 // --- Minimalist CLI list (installed-programs style) ------------------------
 

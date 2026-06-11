@@ -976,8 +976,10 @@ fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Va
 }
 
 fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
+    let secrets_enabled = workspace_gateway_secrets_enabled(context);
     let mut tools = WORKSPACE_GATEWAY_BUILTIN_TOOLS
         .iter()
+        .filter(|name| secrets_enabled || !name.starts_with("secrets__"))
         .map(|name| {
             json!({
                 "name": name,
@@ -1057,7 +1059,24 @@ pub(crate) fn workspace_gateway_dispatch_tool(
     result
 }
 
+/// The built-in Secrets MCP is opt-in per workspace; its tools disappear
+/// from the gateway until the user enables it in the MCPs tab.
+fn workspace_gateway_secrets_enabled(context: &McpContext) -> bool {
+    workspace_gateway_kernel(context)
+        .ok()
+        .and_then(|(kernel, workspace_id)| {
+            kernel.workspace_mcp_secrets_enabled(&workspace_id).ok()
+        })
+        .unwrap_or(false)
+}
+
 fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+    if tool.starts_with("secrets__") && !workspace_gateway_secrets_enabled(context) {
+        return workspace_gateway_error_content(
+            "The Secrets MCP is disabled for this workspace. Enable it in the Diff Forge MCPs tab before using secrets tools."
+                .to_string(),
+        );
+    }
     match tool {
         "workspace_mcp__sync_manifest" => match workspace_gateway_manifest(context) {
             Ok(manifest) => {
