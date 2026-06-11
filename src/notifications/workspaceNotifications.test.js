@@ -121,7 +121,7 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
   );
 });
 
-test("todo completion always cues and stays unread for unwatched workspaces", () => {
+test("todo completion cues with causer tags and stays unread for unwatched workspaces", () => {
   const completed = reduceTodoCompletedNotificationEvent({}, {
     itemId: "todo-1",
     paneId: "pane-1",
@@ -135,25 +135,62 @@ test("todo completion always cues and stays unread for unwatched workspaces", ()
 
   assert.equal(completed.cues.length, 1);
   assert.equal(completed.cues[0].kind, "todo.completed");
+  assert.equal(completed.cues[0].workspaceId, "workspace-1");
+  assert.equal(completed.cues[0].paneId, "pane-1");
+  assert.equal(completed.cues[0].terminalIndex, 2);
   const notification = completed.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-1"];
   assert.equal(notification.kind, "todo.completed");
   assert.equal(notification.status, "unread");
   assert.equal(notification.terminalIndex, 2);
 });
 
-test("todo completion that drains the queue cues the drained tone and reads on arrival when watching", () => {
+test("todo completion stays silent and read while watching the causing workspace's terminals tab", () => {
+  const completed = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "todo-3",
+    paneId: "pane-1",
+    queueDrained: false,
+    terminalIndex: 1,
+    workspaceId: "workspace-1",
+  }, {
+    workspaceVisibleAndFocused: true,
+  });
+
+  assert.equal(completed.cues.length, 0);
+  assert.equal(
+    completed.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-3"].status,
+    "read",
+  );
+});
+
+test("todo completion that drains the queue cues the drained tone when not watching", () => {
   const drained = reduceTodoCompletedNotificationEvent({}, {
     itemId: "todo-2",
     queueDrained: true,
     workspaceId: "workspace-1",
   }, {
-    workspaceVisibleAndFocused: true,
+    workspaceVisibleAndFocused: false,
   });
 
   assert.equal(drained.cues.length, 1);
   assert.equal(drained.cues[0].kind, "todo.queue.drained");
   assert.equal(
     drained.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-2"].status,
+    "unread",
+  );
+});
+
+test("queue drain while watching the causing workspace stays silent", () => {
+  const drained = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "todo-4",
+    queueDrained: true,
+    workspaceId: "workspace-1",
+  }, {
+    workspaceVisibleAndFocused: true,
+  });
+
+  assert.equal(drained.cues.length, 0);
+  assert.equal(
+    drained.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-4"].status,
     "read",
   );
 });

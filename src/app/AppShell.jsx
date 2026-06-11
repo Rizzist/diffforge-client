@@ -8624,9 +8624,11 @@ export default function App() {
   }, [workspaceNotificationReducerOptions]);
 
   useEffect(() => {
-    // TerminalView dispatches this only when a todo finished on a terminal the
-    // user is not watching; the cue plays the SFX and flashes the workspace
-    // rail row, and the unread notification keeps the rail badge lit.
+    // TerminalView dispatches this for every finished todo, tagged with the
+    // causing workspace + terminal. The reducer decides feedback from what
+    // the user is looking at: watching that workspace's Terminals tab in a
+    // focused window stays silent (border flash only); otherwise the cue
+    // rings and the unread notification lights that workspace's rail badge.
     const handleTodoCompleted = (event) => {
       const detail = event?.detail || {};
       const workspaceId = String(detail.workspaceId || "").trim();

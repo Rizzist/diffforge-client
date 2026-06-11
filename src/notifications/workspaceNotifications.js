@@ -501,7 +501,7 @@ function setWorkspaceBucket(state, workspaceId, bucket) {
   };
 }
 
-function appendCue(state, bucket, workspaceId, kind, options = {}) {
+function appendCue(state, bucket, workspaceId, kind, options = {}, source = {}) {
   if (options.suppressCue) {
     return { bucket, state };
   }
@@ -522,6 +522,7 @@ function appendCue(state, bucket, workspaceId, kind, options = {}) {
     return { bucket, state };
   }
 
+  const sourceTerminalIndex = Number(source.terminalIndex);
   return {
     bucket: {
       ...bucket,
@@ -538,6 +539,10 @@ function appendCue(state, bucket, workspaceId, kind, options = {}) {
           createdAt: new Date(nowMs).toISOString(),
           id: `${kind}:${workspaceId}:${nowMs}:${Math.random().toString(16).slice(2)}`,
           kind,
+          // Causer attribution: which terminal produced this cue, so cue
+          // consumers can reason about the source, not just the workspace.
+          paneId: cleanText(source.paneId),
+          terminalIndex: Number.isInteger(sourceTerminalIndex) ? sourceTerminalIndex : null,
           workspaceId,
         },
       ].slice(-MAX_CUES),
@@ -590,7 +595,10 @@ function appendNotificationCue(state, bucket, workspaceId, notification, existin
   if (!shouldCueNotification(notification, existing, options)) {
     return { bucket, state };
   }
-  return appendCue(state, bucket, workspaceId, notification.kind || "workspace.notification", options);
+  return appendCue(state, bucket, workspaceId, notification.kind || "workspace.notification", options, {
+    paneId: notification.paneId,
+    terminalIndex: notification.terminalIndex,
+  });
 }
 
 function eventRefs(event) {
@@ -1388,17 +1396,27 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
     },
   };
   const nextState = setWorkspaceBucket(currentState, workspaceId, nextBucket);
-  // The terminal view only reports completions the user is not watching (the
-  // watched terminal gets a border flash instead), so this cue bypasses the
-  // manual-acceptance gate and always rings. When the completion also drained
-  // the queue, ring the drained tone instead of the per-todo tone.
-  const cueResult = appendCue(
-    nextState,
-    nextBucket,
-    workspaceId,
-    completionEvent?.queueDrained ? "todo.queue.drained" : "todo.completed",
-    options,
-  );
+  // Completion cues bypass the manual-acceptance gate but respect what the
+  // user is looking at: when the causing workspace's Terminals tab is visible
+  // and the window is focused (`seenOnArrival`), the watched terminal's
+  // border flash is the only feedback — no SFX, and the notification arrives
+  // already read so the workspace tab badge stays dark. Unfocused window,
+  // background mode, a non-terminal tab, or another selected workspace all
+  // ring and leave the unread badge on the causing workspace's tab. When the
+  // completion also drained the queue, ring the drained tone instead.
+  const cueResult = seenOnArrival
+    ? { bucket: nextBucket, state: nextState }
+    : appendCue(
+      nextState,
+      nextBucket,
+      workspaceId,
+      completionEvent?.queueDrained ? "todo.queue.drained" : "todo.completed",
+      options,
+      {
+        paneId: completionEvent?.paneId || completionEvent?.pane_id,
+        terminalIndex: completionEvent?.terminalIndex ?? completionEvent?.terminal_index,
+      },
+    );
   nextBucket = cueResult.bucket;
   return trimWorkspaceNotifications(setWorkspaceBucket(cueResult.state, workspaceId, nextBucket), workspaceId);
 }

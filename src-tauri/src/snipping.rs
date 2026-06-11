@@ -1431,6 +1431,11 @@ fn snipping_capture_monitor_image_keeping_session(
         .map_err(|error| format!("Unable to capture screen for snip re-freeze: {error}"));
     if let Some(overlay) = overlay.as_ref() {
         let _ = overlay.show();
+        // Space-change re-freezes can run while Diff Forge is not the active
+        // app (the user just swiped into another app's fullscreen Space);
+        // makeKeyAndOrderFront alone would leave the overlay hidden there.
+        #[cfg(target_os = "macos")]
+        snipping_order_overlay_front_regardless(overlay);
     }
     captured
 }
@@ -2196,21 +2201,59 @@ fn ensure_snipping_overlay_window(
     .map_err(|error| format!("Unable to create snipping overlay: {error}"))?;
 
     size_snipping_overlay_window(&window, monitor);
-    // CanJoinAllSpaces alone does not join full-screen Spaces on macOS; the
-    // overlay needs FullScreenAuxiliary or it vanishes when the user swipes
-    // to a full-screen window mid-snip.
     #[cfg(target_os = "macos")]
-    if let Ok(ns_window) = window.ns_window() {
-        if !ns_window.is_null() {
-            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.setCollectionBehavior(
-                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
-            );
-        }
-    }
+    snipping_apply_overlay_fullscreen_window_style(&window);
     Ok(window)
+}
+
+/// Window style that lets the selection overlay appear over OTHER apps'
+/// fullscreen Spaces (a fullscreen Chrome window, for example) the way the
+/// system screenshot UI does. Two things are required beyond what tao sets:
+/// CanJoinAllSpaces alone does not join full-screen Spaces — the overlay
+/// needs FullScreenAuxiliary — and tao's always-on-top floating level (3) is
+/// not reliably above a fullscreen Space's window, so the overlay runs at
+/// screen-saver level for the duration of the snip. Applied on the AppKit
+/// main thread, and re-asserted on every snip start since both values are
+/// plain NSWindow state that other window calls may rewrite.
+#[cfg(target_os = "macos")]
+fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.setCollectionBehavior(
+            objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    });
+}
+
+/// Orders the overlay to the front even while Diff Forge is NOT the active
+/// app. tao's show()/set_focus() rely on makeKeyAndOrderFront, which does
+/// nothing visible when another app's fullscreen Space is active; AppKit's
+/// orderFrontRegardless is the documented way to surface a window from an
+/// inactive application.
+#[cfg(target_os = "macos")]
+fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        let Ok(ns_window) = window_for_main.ns_window() else {
+            return;
+        };
+        if ns_window.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+        ns_window.orderFrontRegardless();
+    });
 }
 
 fn prewarm_snipping_overlay_window(app: &AppHandle) {
@@ -2314,9 +2357,19 @@ fn snipping_begin_area_snip_for(
         "kind": "snipping_area_overlay_started",
         "monitor": monitor.clone(),
     }));
+    // The reused (prewarmed) window must re-assert the fullscreen-capable
+    // style before every presentation, not only at creation.
+    #[cfg(target_os = "macos")]
+    snipping_apply_overlay_fullscreen_window_style(&window);
     window
         .show()
         .map_err(|error| format!("Unable to show snipping overlay: {error}"))?;
+    // Surface the overlay even when Diff Forge is inactive and the user is
+    // on another app's fullscreen Space; only then activate for keyboard and
+    // hover tracking — activating with the overlay already key on the
+    // current Space keeps macOS from switching Spaces.
+    #[cfg(target_os = "macos")]
+    snipping_order_overlay_front_regardless(&window);
     let _ = window.set_focus();
     snipping_register_escape_cancel(app);
 

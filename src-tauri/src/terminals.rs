@@ -8298,9 +8298,10 @@ fn emit_terminal_prompt_submitted(
         && todo_dispatch_id.is_none()
         && todo_command_id.is_none()
         && !todo_resume_requested;
+    let mut direct_todo_item_id: Option<String> = None;
     if direct_capture_candidate {
         if terminal_direct_prompt_should_capture(&metadata.pane_id, prompt) {
-            todo_dispatch_capture_direct_prompt_todo(
+            direct_todo_item_id = todo_dispatch_capture_direct_prompt_todo(
                 app,
                 &metadata.workspace_id,
                 &metadata.workspace_name,
@@ -8312,6 +8313,7 @@ fn emit_terminal_prompt_submitted(
                     .unwrap_or(metadata.thread_id.as_str()),
                 &metadata.agent_kind,
                 prompt,
+                prompt_event_id,
             );
         }
     } else {
@@ -8362,6 +8364,7 @@ fn emit_terminal_prompt_submitted(
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
             todo_resume_requested,
+            direct_todo_item_id,
             expected_prompt: expected_prompt
                 .map(str::trim)
                 .filter(|value| !value.is_empty())

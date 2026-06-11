@@ -1205,13 +1205,46 @@ fn cloud_mcp_merge_diffforge_credit_ledger(mut billing: Value, ledger: Value) ->
 }
 
 fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // Retention: acked/superseded rows are inert history and only slow the
+    // status-count scans; anything older than two days is dropped, and the
+    // permanently-rejected pile is capped to the most recent 200 rows.
+    let retention_cutoff_ms = cloud_mcp_now_ms().saturating_sub(48 * 60 * 60 * 1000) as i64;
+    let prune_sql = format!(
+        "DELETE FROM {CLOUD_MCP_OUTBOX_TABLE}
+         WHERE status IN ('acked', 'superseded')
+           AND updated_at_ms < {retention_cutoff_ms};
+         DELETE FROM {CLOUD_MCP_OUTBOX_TABLE}
+         WHERE status='rejected'
+           AND outbox_id NOT IN (
+             SELECT outbox_id FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE status='rejected'
+             ORDER BY updated_at_ms DESC
+             LIMIT 200
+           );"
+    );
     let reset_inflight_sql = format!(
         "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
          SET status='retrying', next_attempt_at_ms=0
          WHERE status='in_flight';
          UPDATE {CLOUD_MCP_OUTBOX_TABLE}
          SET status='retrying', next_attempt_at_ms=0
-         WHERE status='dead_letter';"
+         WHERE status='dead_letter';
+         -- Legacy heartbeat/lane rows used stable identity-based idempotency
+         -- keys (coalesce_key='') with mutable payloads; the server rejects
+         -- every retry as an idempotency conflict and each new heartbeat used
+         -- to resurrect the row, pinning the pending count above zero forever
+         -- (the Syncing/Connecting pill loop). New rows carry a coalesce key
+         -- and a hash-suffixed idempotency key; the stranded legacy rows are
+         -- superseded once here.
+         UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+         SET status='superseded'
+         WHERE coalesce_key=''
+           AND status IN ('queued', 'retrying')
+           AND event_kind IN (
+             'agent_heartbeat', 'lane_claim', 'lane_claimed',
+             'lane_release', 'lane_released'
+           );
+         {prune_sql}"
     );
     conn.execute_batch(&format!(
         "
@@ -1288,6 +1321,67 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             return None;
         }
         return Some(format!("catalog:workspace:{workspace_id}"));
+    }
+    // Todo dispatch status is reported by two writers (the webview settle
+    // path and the Rust ledger); coalescing per dispatch+status collapses the
+    // duplicate rows to one latest-wins event instead of shipping both.
+    if matches!(
+        normalized_kind.as_str(),
+        "workspace_todo_dispatch_status" | "todo_dispatch_status" | "todo_dispatch_update"
+    ) {
+        let dispatch_id = cloud_mcp_payload_text(
+            payload,
+            &[
+                "todo_dispatch_id",
+                "todoDispatchId",
+                "dispatch_id",
+                "dispatchId",
+                "command_id",
+                "commandId",
+                "todo_id",
+                "todoId",
+            ],
+        )
+        .unwrap_or_default();
+        let status = cloud_mcp_payload_text(
+            payload,
+            &["status", "dispatch_status", "dispatchStatus"],
+        )
+        .unwrap_or_default();
+        if dispatch_id.is_empty() || status.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "event:{normalized_kind}:{dispatch_id}:{status}"
+        ));
+    }
+    // Heartbeat / lane lifecycle events are latest-wins per identity. They
+    // previously derived a STABLE idempotency key from identity parts while
+    // the payload kept changing (timestamps, task ids), which the server
+    // permanently rejects as "idempotency key reused with a different
+    // payload" — and each new heartbeat resurrected the rejected row through
+    // the enqueue upsert, so the outbox never drained and the sync pill
+    // looped Syncing/Connecting forever. A coalesce key here makes the
+    // idempotency key hash-suffixed (unique per payload, so the server never
+    // sees a key reuse) and supersedes older queued rows locally.
+    if matches!(
+        normalized_kind.as_str(),
+        "agent_heartbeat" | "lane_claim" | "lane_claimed" | "lane_release" | "lane_released"
+    ) {
+        let mut parts = Vec::new();
+        for keys in [
+            &["lane", "lane_id", "laneId"][..],
+            &["agent_id", "agentId", "self_agent_id", "selfAgentId"][..],
+            &["task_id", "taskId"][..],
+            &["session_id", "sessionId"][..],
+            &["workspace_id", "workspaceId"][..],
+            &["repo_id", "repoId"][..],
+        ] {
+            if let Some(value) = cloud_mcp_payload_text(payload, keys) {
+                parts.push(value);
+            }
+        }
+        return Some(format!("event:{normalized_kind}:{}", parts.join(":")));
     }
     let is_snapshot = matches!(
         normalized_kind.as_str(),
@@ -1481,15 +1575,18 @@ fn cloud_mcp_outbox_enqueue_event(
                 payload_hash=excluded.payload_hash,
                 payload_json=excluded.payload_json,
                 status=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN 'acked'
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                        THEN {CLOUD_MCP_OUTBOX_TABLE}.status
                     ELSE 'queued'
                 END,
                 next_attempt_at_ms=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN {CLOUD_MCP_OUTBOX_TABLE}.next_attempt_at_ms
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                        THEN {CLOUD_MCP_OUTBOX_TABLE}.next_attempt_at_ms
                     ELSE 0
                 END,
                 last_error=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status='acked' THEN {CLOUD_MCP_OUTBOX_TABLE}.last_error
+                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                        THEN {CLOUD_MCP_OUTBOX_TABLE}.last_error
                     ELSE ''
                 END,
                 updated_at_ms=excluded.updated_at_ms"
@@ -1599,8 +1696,25 @@ fn cloud_mcp_sync_connection_for_runtime(connected: bool, status: &str) -> &'sta
 
 fn cloud_mcp_note_sync_connection(connected: bool, status: &str) {
     let connection = cloud_mcp_sync_connection_for_runtime(connected, status);
-    if let Ok(mut current) = CLOUD_MCP_SYNC_STATUS_CONNECTION.lock() {
-        *current = Some(connection);
+    let previous = CLOUD_MCP_SYNC_STATUS_CONNECTION
+        .lock()
+        .ok()
+        .and_then(|mut current| current.replace(connection));
+    if previous != Some(connection) {
+        let (pending, retrying, dead_letter, oldest_pending_ms) = cloud_mcp_outbox_status_counts();
+        log_cloud_sync_event(
+            "sync.connection_note",
+            json!({
+                "connected": connected,
+                "status": status,
+                "connection": connection,
+                "previous_connection": previous,
+                "outbox_pending": pending,
+                "outbox_retrying": retrying,
+                "outbox_dead_letter": dead_letter,
+                "outbox_oldest_pending_ms": oldest_pending_ms,
+            }),
+        );
     }
     cloud_mcp_emit_sync_status(None);
 }
@@ -1791,6 +1905,10 @@ fn cloud_mcp_outbox_error_is_permanent_rejection(error: &str) -> bool {
         "idempotency key was reused with a different payload",
         "workspace delete requires a workspace_id",
         "voice plan task was not found",
+        // Orphan-entity rejections: the parent record is gone server-side and
+        // no retry can bring it back.
+        "was not found",
+        "no longer exists",
     ]
     .iter()
     .any(|needle| error.contains(needle))
@@ -3006,76 +3124,12 @@ fn cloud_mcp_short_hash(value: &str) -> String {
     format!("{digest:x}").chars().take(12).collect()
 }
 
-fn cloud_mcp_prompt_source_has_existing_todo(source: Option<&str>) -> bool {
-    matches!(
-        source
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase().replace(['_', ' '], "-"))
-            .as_deref(),
-        Some(
-            "todo-auto-queue"
-                | "terminal-direct-input"
-                | "voice-agent-queue"
-                | "voice-plan-queue"
-                | "remote-control"
-                | "terminal-view-drop"
-                | "tui-todo-auto-queue"
-                | "tui-terminal-direct-input"
-                | "tui-voice-agent-queue"
-                | "tui-voice-plan-queue"
-                | "next-remote-control"
-        )
-    )
-}
-
 fn cloud_mcp_clean_optional_text(value: &Option<String>) -> Option<String> {
     value
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-}
-
-fn cloud_mcp_direct_prompt_todo_refs(
-    workspace_id: &str,
-    pane_id: &str,
-    instance_id: u64,
-    terminal_index: Option<u16>,
-    prompt: &str,
-    prompt_metadata: &CloudMcpTerminalPromptMetadata,
-) -> Option<CloudMcpDirectPromptTodoRefs> {
-    let workspace_id = workspace_id.trim();
-    let prompt = prompt.trim();
-    if workspace_id.is_empty()
-        || prompt.is_empty()
-        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_id).is_some()
-        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id).is_some()
-        || cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id).is_some()
-        || cloud_mcp_prompt_source_has_existing_todo(prompt_metadata.prompt_event_source.as_deref())
-    {
-        return None;
-    }
-    let seed = prompt_metadata
-        .prompt_event_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("prompt-event:{workspace_id}:{value}"))
-        .unwrap_or_else(|| {
-            format!(
-                "direct-prompt:{workspace_id}:{pane_id}:{instance_id}:{}:{prompt}",
-                terminal_index
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "terminal".to_string())
-            )
-        });
-    let hash = cloud_mcp_short_hash(&seed);
-    Some(CloudMcpDirectPromptTodoRefs {
-        todo_id: format!("direct-prompt-todo-{hash}"),
-        dispatch_id: format!("direct-prompt-dispatch-{hash}"),
-        command_id: format!("direct-prompt-command-{hash}"),
-    })
 }
 
 fn cloud_mcp_direct_prompt_dispatch_status_for_turn(turn_status: &str) -> Option<&'static str> {
@@ -3488,11 +3542,19 @@ async fn cloud_mcp_set_global_ws_phase(
     global_ws_status: &str,
 ) {
     let mut runtime = state.inner.lock().await;
+    let previous_status = std::mem::replace(&mut runtime.status, status.to_string());
     runtime.connected = false;
-    runtime.status = status.to_string();
     runtime.global_ws_connected = false;
     runtime.global_ws_status = global_ws_status.to_string();
     drop(runtime);
+    log_cloud_sync_event(
+        "ws.phase",
+        json!({
+            "status": status,
+            "global_ws_status": global_ws_status,
+            "previous_status": previous_status,
+        }),
+    );
     cloud_mcp_note_sync_connection(false, status);
 }
 
@@ -3534,22 +3596,54 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
         "Rust started the single shared app websocket manager.",
         json!({}),
     );
+    let mut loop_iteration: u64 = 0;
     loop {
+        loop_iteration += 1;
+        let iteration_started = Instant::now();
         if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
             state.global_ws_started.store(false, Ordering::SeqCst);
+            log_cloud_sync_event(
+                "ws.loop_exit",
+                json!({ "iteration": loop_iteration, "reason": "registration_blocked" }),
+            );
             return;
         }
         let base_url = {
             let runtime = state.inner.lock().await;
             runtime.base_url.clone()
         };
+        log_cloud_sync_event(
+            "ws.loop_iteration",
+            json!({ "iteration": loop_iteration, "base_url": base_url }),
+        );
         cloud_mcp_set_global_ws_phase(&state, "resolving_route", "resolving_route").await;
         // Direct-only policy: the balancer is a route directory, never a
         // websocket proxy. If no direct route resolves, stay in retrying and
         // resolve again on the next loop pass instead of proxying traffic.
+        let resolve_started = Instant::now();
         let target = match cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await {
-            Ok(target) => target,
+            Ok(target) => {
+                log_cloud_sync_event(
+                    "ws.route_resolved",
+                    json!({
+                        "iteration": loop_iteration,
+                        "elapsed_ms": resolve_started.elapsed().as_millis() as u64,
+                        "ws_url": target.ws_url,
+                        "transport": target.transport,
+                        "has_route_token": target.route_token.is_some(),
+                    }),
+                );
+                target
+            }
             Err(error) => {
+                log_cloud_sync_event(
+                    "ws.route_resolve_failed",
+                    json!({
+                        "iteration": loop_iteration,
+                        "elapsed_ms": resolve_started.elapsed().as_millis() as u64,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
                 if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
                     state.global_ws_started.store(false, Ordering::SeqCst);
                     return;
@@ -3590,9 +3684,27 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
         }
         cloud_mcp_note_sync_connection(false, "connecting");
 
+        let open_started = Instant::now();
         match cloud_mcp_open_global_ws(&state, &base_url, &target).await {
-            Ok(()) => {}
+            Ok(()) => {
+                log_cloud_sync_event(
+                    "ws.session_ended_ok",
+                    json!({
+                        "iteration": loop_iteration,
+                        "session_ms": open_started.elapsed().as_millis() as u64,
+                    }),
+                );
+            }
             Err(error) => {
+                log_cloud_sync_event(
+                    "ws.session_ended_error",
+                    json!({
+                        "iteration": loop_iteration,
+                        "session_ms": open_started.elapsed().as_millis() as u64,
+                        "iteration_ms": iteration_started.elapsed().as_millis() as u64,
+                        "error": clean_terminal_telemetry_text(&error),
+                    }),
+                );
                 if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
                     state.global_ws_started.store(false, Ordering::SeqCst);
                     return;
@@ -4120,6 +4232,7 @@ async fn cloud_mcp_mark_global_ws_disconnected(state: &CloudMcpState, error: &st
         return;
     }
     let message = clean_terminal_telemetry_text(error);
+    log_cloud_sync_event("ws.disconnected", json!({ "error": message }));
     state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
     {
         let mut runtime = state.inner.lock().await;
@@ -4285,6 +4398,10 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         // collapse every queued/retrying backoff so the drain starts immediately.
         let _ = cloud_mcp_outbox_release_backoff_now();
         CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
+        log_cloud_sync_event(
+            "ws.ready",
+            json!({ "connection_id": connection_id.clone() }),
+        );
         cloud_mcp_note_sync_connection(true, "connected");
         if let Some(initial_live_runtime) = initial_live_runtime {
             cloud_mcp_update_todo_mirror_from_response(
@@ -11548,224 +11665,6 @@ async fn cloud_mcp_observe_terminal_output(
     runtime.terminal_contexts.remove(&terminal_key);
 }
 
-async fn cloud_mcp_record_direct_prompt_todo_dispatch(
-    state: &CloudMcpState,
-    refs: &CloudMcpDirectPromptTodoRefs,
-    repo_id: &str,
-    repo_root: &Path,
-    pane_id: &str,
-    instance_id: u64,
-    agent_id: &str,
-    agent_kind: Option<&str>,
-    prompt: &str,
-    prompt_metadata: &CloudMcpTerminalPromptMetadata,
-    session_mode: &str,
-) {
-    let workspace_id = prompt_metadata.workspace_id.trim();
-    if workspace_id.is_empty() || prompt.trim().is_empty() {
-        return;
-    }
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = device_profile["device_id"]
-        .as_str()
-        .unwrap_or("rust-diffforge-desktop")
-        .to_string();
-    let device_name = device_profile["device_name"]
-        .as_str()
-        .unwrap_or("Desktop")
-        .to_string();
-    let workspace_name = prompt_metadata.workspace_name.trim();
-    let workspace_root = workspace_path_display(repo_root);
-    let title = cloud_mcp_prompt_summary(prompt);
-    let todo_id = refs.todo_id.as_str();
-    let dispatch_id = refs.dispatch_id.as_str();
-    let command_id = refs.command_id.as_str();
-    let prompt_event_id = prompt_metadata.prompt_event_id.as_deref();
-    let prompt_event_source = prompt_metadata.prompt_event_source.as_deref();
-    let prompt_event_submitted_at = prompt_metadata.prompt_event_submitted_at.as_deref();
-    let thread_id = prompt_metadata.thread_id.as_deref();
-    let agent_kind = agent_kind.unwrap_or_default();
-    let created_at = prompt_metadata
-        .prompt_event_submitted_at
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    let mut snapshot_payload = json!({
-        "event_kind": "workspace_todo_snapshot",
-        "source": "rust-diffforge-direct-prompt",
-        "reason": "terminal_prompt_submitted",
-        "repo_id": repo_id,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name,
-        "workspaceName": workspace_name,
-        "workspace_root": workspace_root,
-        "workspaceRoot": workspace_root,
-        "device": device_profile.clone(),
-        "device_id": device_id.as_str(),
-        "deviceId": device_id.as_str(),
-        "machine_id": device_id.as_str(),
-        "machineId": device_id.as_str(),
-        "device_name": device_name.as_str(),
-        "machine_name": device_name.as_str(),
-        "snapshot_full": false,
-        "snapshotFull": false,
-        "prune_missing": false,
-        "pruneMissing": false,
-        "todos": [{
-            "id": todo_id,
-            "todo_id": todo_id,
-            "todoId": todo_id,
-            "todo_dispatch_id": dispatch_id,
-            "todoDispatchId": dispatch_id,
-            "command_id": command_id,
-            "commandId": command_id,
-            "text": prompt,
-            "body": prompt,
-            "title": title,
-            "status": "running",
-            "todo_status": "running",
-            "todoStatus": "running",
-            "source": "direct-terminal-prompt",
-            "source_kind": "direct-terminal-prompt",
-            "sourceKind": "direct-terminal-prompt",
-            "prompt_event_id": prompt_event_id,
-            "promptEventId": prompt_event_id,
-            "prompt_event_source": prompt_event_source,
-            "promptEventSource": prompt_event_source,
-            "prompt_event_submitted_at": prompt_event_submitted_at,
-            "promptEventSubmittedAt": prompt_event_submitted_at,
-            "created_at": created_at,
-            "createdAt": created_at,
-            "agent_id": agent_id,
-            "agentId": agent_id,
-            "agent_kind": agent_kind,
-            "agentKind": agent_kind,
-            "terminal_id": pane_id,
-            "terminalId": pane_id,
-            "pane_id": pane_id,
-            "paneId": pane_id,
-            "terminal_instance_id": instance_id,
-            "terminalInstanceId": instance_id,
-            "terminal_index": prompt_metadata.terminal_index,
-            "terminalIndex": prompt_metadata.terminal_index,
-            "thread_id": thread_id,
-            "threadId": thread_id,
-            "session_mode": session_mode,
-            "sessionMode": session_mode
-        }],
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    cloud_mcp_limit_workspace_todo_sync_payload(&mut snapshot_payload);
-    if let Err(error) =
-        cloud_mcp_post_event_endpoint(state, "workspace_todo_snapshot", &snapshot_payload).await
-    {
-        log_terminal_status_event(
-            "backend.direct_prompt_todo.snapshot_error",
-            json!({
-                "dispatch_id": dispatch_id,
-                "error": clean_terminal_telemetry_text(&error),
-                "todo_id": todo_id,
-                "workspace_id": workspace_id,
-            }),
-        );
-        return;
-    }
-
-    let mut dispatch_payload = json!({
-        "event_kind": "workspace_todo_dispatch_requested",
-        "source": "rust-diffforge-direct-prompt",
-        "reason": "terminal_prompt_submitted",
-        "repo_id": repo_id,
-        "workspace_id": workspace_id,
-        "workspaceId": workspace_id,
-        "workspace_name": workspace_name,
-        "workspaceName": workspace_name,
-        "workspace_root": workspace_root,
-        "workspaceRoot": workspace_root,
-        "device": device_profile,
-        "device_id": device_id.as_str(),
-        "deviceId": device_id.as_str(),
-        "machine_id": device_id.as_str(),
-        "machineId": device_id.as_str(),
-        "device_name": device_name.as_str(),
-        "machine_name": device_name.as_str(),
-        "requested_by_device_id": device_id.as_str(),
-        "requestedByDeviceId": device_id.as_str(),
-        "requested_by_workspace_id": workspace_id,
-        "requestedByWorkspaceId": workspace_id,
-        "dispatch_id": dispatch_id,
-        "dispatchId": dispatch_id,
-        "todo_dispatch_id": dispatch_id,
-        "todoDispatchId": dispatch_id,
-        "command_id": command_id,
-        "commandId": command_id,
-        "dispatch_kind": "local",
-        "dispatchKind": "local",
-        "todo_id": todo_id,
-        "todoId": todo_id,
-        "todo_device_id": device_id.as_str(),
-        "todoDeviceId": device_id.as_str(),
-        "todo_workspace_id": workspace_id,
-        "todoWorkspaceId": workspace_id,
-        "target_device_id": device_id.as_str(),
-        "targetDeviceId": device_id.as_str(),
-        "target_workspace_id": workspace_id,
-        "targetWorkspaceId": workspace_id,
-        "target_workspace_name": workspace_name,
-        "targetWorkspaceName": workspace_name,
-        "target_device_name": device_name.as_str(),
-        "targetDeviceName": device_name.as_str(),
-        "target_agent_id": agent_id,
-        "targetAgentId": agent_id,
-        "target_terminal_id": pane_id,
-        "targetTerminalId": pane_id,
-        "target_terminal_index": prompt_metadata.terminal_index,
-        "targetTerminalIndex": prompt_metadata.terminal_index,
-        "target_thread_id": thread_id,
-        "targetThreadId": thread_id,
-        "prompt_event_id": prompt_event_id,
-        "promptEventId": prompt_event_id,
-        "session_mode": session_mode,
-        "sessionMode": session_mode,
-        "ts_ms": cloud_mcp_now_ms(),
-    });
-    cloud_mcp_limit_workspace_todo_sync_payload(&mut dispatch_payload);
-    if let Err(error) = cloud_mcp_post_event_endpoint(
-        state,
-        "workspace_todo_dispatch_requested",
-        &dispatch_payload,
-    )
-    .await
-    {
-        log_terminal_status_event(
-            "backend.direct_prompt_todo.dispatch_error",
-            json!({
-                "dispatch_id": dispatch_id,
-                "error": clean_terminal_telemetry_text(&error),
-                "todo_id": todo_id,
-                "workspace_id": workspace_id,
-            }),
-        );
-        return;
-    }
-
-    cloud_mcp_record_direct_prompt_todo_dispatch_status(
-        state,
-        refs,
-        workspace_id,
-        "running",
-        json!({
-            "reason": "terminal_prompt_submitted",
-            "terminal_id": pane_id,
-            "terminal_instance_id": instance_id,
-            "prompt_event_id": prompt_metadata.prompt_event_id,
-        }),
-    )
-    .await;
-}
-
 async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
     state: &CloudMcpState,
     refs: &CloudMcpDirectPromptTodoRefs,
@@ -11774,6 +11673,11 @@ async fn cloud_mcp_record_direct_prompt_todo_dispatch_status(
     details: Value,
 ) {
     if refs.dispatch_id.trim().is_empty() {
+        return;
+    }
+    // Deleted todos are terminal: turn-status echoes (hook events, prompt
+    // ready) for a tombstoned id must never resurrect the row server-side.
+    if todo_store_tombstone_ids(workspace_id).contains(refs.todo_id.as_str()) {
         return;
     }
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -11943,31 +11847,18 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
         todo_action: None,
         todo_resume_requested: false,
     });
-    let direct_prompt_todo_refs = cloud_mcp_direct_prompt_todo_refs(
-        &prompt_metadata.workspace_id,
-        &pane_id,
-        instance_id,
-        prompt_metadata.terminal_index,
-        &prompt,
-        &prompt_metadata,
-    );
-    let effective_todo_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_id).or_else(|| {
-        direct_prompt_todo_refs
-            .as_ref()
-            .map(|refs| refs.todo_id.clone())
-    });
+    // Direct prompts are registered exclusively by the todo_dispatch capture
+    // (one unique todo per prompt, with tombstones and settlement). This
+    // pipeline used to fabricate parallel hash-derived `direct-prompt-*` refs
+    // here — a second writer whose context-cached ids were re-pushed on every
+    // hook event, mutating one cloud row across prompts and resurrecting
+    // deleted todos. The context now carries todo ids only when a REAL todo
+    // drove the prompt.
+    let effective_todo_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_id);
     let effective_todo_dispatch_id =
-        cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id).or_else(|| {
-            direct_prompt_todo_refs
-                .as_ref()
-                .map(|refs| refs.dispatch_id.clone())
-        });
-    let effective_todo_command_id = cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id)
-        .or_else(|| {
-            direct_prompt_todo_refs
-                .as_ref()
-                .map(|refs| refs.command_id.clone())
-        });
+        cloud_mcp_clean_optional_text(&prompt_metadata.todo_dispatch_id);
+    let effective_todo_command_id =
+        cloud_mcp_clean_optional_text(&prompt_metadata.todo_command_id);
     let effective_todo_action = cloud_mcp_clean_optional_text(&prompt_metadata.todo_action);
     let effective_todo_resume_requested = prompt_metadata.todo_resume_requested;
     {
@@ -12022,25 +11913,6 @@ async fn cloud_mcp_terminal_context_pack_for_prompt(
             }),
         );
         return;
-    }
-
-    if let Some(refs) = direct_prompt_todo_refs.as_ref() {
-        cloud_mcp_record_direct_prompt_todo_dispatch(
-            &state,
-            refs,
-            &repo_id,
-            &status_working_directory,
-            &pane_id,
-            instance_id,
-            &agent_id,
-            coordination
-                .as_ref()
-                .map(|coordination| coordination.agent_kind.as_str()),
-            &prompt,
-            &prompt_metadata,
-            session_mode.as_str(),
-        )
-        .await;
     }
 
     let payload = json!({
@@ -26604,14 +26476,14 @@ fn cloud_mcp_lease_path_from_resource_key(resource_key: &str) -> Option<String> 
 }
 
 pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
-    repo_path: Option<&str>,
-    db_path: Option<&Path>,
-    workspace_id: Option<&str>,
-    agent_id: Option<&str>,
-    session_id: Option<&str>,
+    _repo_path: Option<&str>,
+    _db_path: Option<&Path>,
+    _workspace_id: Option<&str>,
+    _agent_id: Option<&str>,
+    _session_id: Option<&str>,
     task_id: Option<&str>,
-    worktree_id: Option<&str>,
-    worktree_path: Option<&str>,
+    _worktree_id: Option<&str>,
+    _worktree_path: Option<&str>,
     resource_key: &str,
     mode: &str,
     reason: Option<&str>,
@@ -26629,142 +26501,27 @@ pub(crate) fn cloud_mcp_forward_agent_acquire_lease(
     let Some(path) = cloud_mcp_lease_path_from_resource_key(resource_key) else {
         return Ok(json!({"skipped": true, "reason": "non_file_resource"}));
     };
-    let repo_path_text = repo_path
-        .or(worktree_path)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let repo_id = repo_path_text
-        .as_deref()
-        .map(|value| format!("repo-{}", cloud_mcp_short_hash(value)));
-    let base_url = cloud_mcp_base_url();
-    let identity = CloudMcpProxyIdentity {
-        base_url: Some(base_url.clone()),
-        repo_path: repo_path_text.as_ref().map(PathBuf::from),
-        repo_id,
-        workspace_id: workspace_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        workspace_name: None,
-        agent_id: agent_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        session_id: session_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-        coordination_db_path: db_path.map(Path::to_path_buf),
-        pane_id: None,
-        terminal_instance_id: None,
-        slot_key: None,
-        agent_label: agent_id.and_then(cloud_mcp_short_agent_label),
-        client_id: CLOUD_MCP_RUST_CLIENT_ID.to_string(),
-    };
-    let data = acquire_result.get("data").unwrap_or(&Value::Null);
-    let lease_id = data["lease_id"]
-        .as_str()
-        .or_else(|| data["lease"]["id"].as_str());
-    let reason_text = reason
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Lease acquired for local agent work.");
-    let lease_scope = json!({
-        "resource_key": resource_key,
-        "path": path,
-        "mode": mode,
-        "reason": reason_text,
-        "lease_id": lease_id,
-        "lease_state": "active",
-        "file_state": "lease",
-    });
-    let mut metadata = serde_json::Map::new();
-    metadata.insert(
-        "reported_by".to_string(),
-        json!("coordination-kernel.acquire_lease"),
-    );
-    metadata.insert("resource_key".to_string(), json!(resource_key));
-    metadata.insert("path".to_string(), json!(path));
-    metadata.insert("mode".to_string(), json!(mode));
-    metadata.insert("lease_state".to_string(), json!("active"));
-    metadata.insert("file_state".to_string(), json!("lease"));
-    metadata.insert("local_lease_file_evidence".to_string(), json!(true));
-    metadata.insert(
-        "local_active_leases".to_string(),
-        json!([lease_scope.clone()]),
-    );
-    metadata.insert("acquire_result".to_string(), acquire_result.clone());
-    if let Some(lease_id) = lease_id {
-        metadata.insert("lease_id".to_string(), json!(lease_id));
-    }
-    metadata.insert("cloud_task_id".to_string(), json!(active_task_id));
-    metadata.insert("coordination_task_id".to_string(), json!(active_task_id));
-    metadata.insert(
-        "local_coordination_task_id".to_string(),
-        json!(active_task_id),
-    );
-    if let Some(worktree_id) = worktree_id {
-        metadata.insert("worktree_id".to_string(), json!(worktree_id));
-    }
-    if let Some(worktree_path) = worktree_path {
-        metadata.insert("worktree_path".to_string(), json!(worktree_path));
-    }
-
-    let mut arguments = serde_json::Map::new();
-    arguments.insert(
-        "source".to_string(),
-        json!("rust-diffforge-agent-acquire-lease"),
-    );
-    arguments.insert(
-        "spec_source".to_string(),
-        json!("rust_terminal_lease_scope"),
-    );
-    arguments.insert("record_spec_activity".to_string(), json!(true));
-    arguments.insert("client_id".to_string(), json!(identity.client_id.clone()));
-    arguments.insert("status".to_string(), json!("active"));
-    arguments.insert("task_status".to_string(), json!("active"));
-    arguments.insert("current_prompt".to_string(), json!(reason_text));
-    arguments.insert("progress_summary".to_string(), json!(reason_text));
-    arguments.insert("summary".to_string(), json!(reason_text));
-    arguments.insert("claimed_paths".to_string(), json!([lease_scope]));
-    arguments.insert("metadata".to_string(), Value::Object(metadata));
-    if let Some(repo_id) = identity.repo_id.as_deref() {
-        arguments.insert("repo_id".to_string(), json!(repo_id));
-    }
-    if let Some(repo_path) = identity.repo_path.as_ref() {
-        let repo_path = repo_path.to_string_lossy().to_string();
-        arguments.insert("repo_path".to_string(), json!(repo_path.clone()));
-        arguments.insert("workspace_root".to_string(), json!(repo_path));
-    }
-    if let Some(workspace_id) = identity.workspace_id.as_deref() {
-        arguments.insert("workspace_id".to_string(), json!(workspace_id));
-    }
-    if let Some(agent_id) = identity.cloud_agent_id() {
-        arguments.insert("agent_id".to_string(), json!(agent_id.clone()));
-        arguments.insert("self_agent_id".to_string(), json!(agent_id.clone()));
-        arguments.insert("current_agent_id".to_string(), json!(agent_id));
-    }
-    if let Some(session_id) = identity.session_id.as_deref() {
-        arguments.insert("session_id".to_string(), json!(session_id));
-    }
-    arguments.insert("task_id".to_string(), json!(active_task_id));
-    arguments.insert("run_id".to_string(), json!(active_task_id));
-
-    let event_kind = "agent_heartbeat";
-    let payload = Value::Object(arguments);
-    identity.log(
-        "cloud_mcp.agent_acquire_lease.queued",
-        "acquire_lease",
+    // Leases are locally authoritative: the coordination kernel records them
+    // and `lane_claimed` already reports the lane transition to the cloud.
+    // The per-lease "agent_heartbeat" event this used to queue duplicated the
+    // agent status sync (which carries claimed paths on every transition) and
+    // kept the sync outbox permanently busy, so lease acquisition no longer
+    // emits any cloud event.
+    log_cloud_sync_event(
+        "lease.local_only",
         json!({
-            "activity": "agent acquire_lease queued for background Cloud history sync",
-            "baseUrl": base_url,
-            "resourceKey": resource_key,
+            "resource_key": resource_key,
             "path": path,
-            "taskId": active_task_id,
+            "mode": mode,
+            "task_id": active_task_id,
+            "reason": reason.unwrap_or_default(),
         }),
     );
-    cloud_mcp_queue_event_background(&base_url, event_kind, &payload, "agent_acquire_lease")
+    Ok(json!({
+        "skipped": true,
+        "reason": "lease_sync_is_local",
+        "task_id": active_task_id,
+    }))
 }
 
 pub(crate) fn cloud_mcp_forward_agent_submit_patch(

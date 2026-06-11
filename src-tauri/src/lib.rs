@@ -140,6 +140,11 @@ const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
 const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
+/// Flip to trace the cloud sync/connect loop into logs/cloud-sync.jsonl:
+/// every connection-state note, ws phase change, route resolution, open
+/// attempt (with durations), disconnect reason, and outbox depth.
+const CLOUD_SYNC_LOGGING_ENABLED: bool = true;
+const CLOUD_SYNC_LOG_FILE: &str = "cloud-sync.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
 const TERMINAL_DIAGNOSTIC_LOG_MAX_TEXT: usize = 512;
@@ -194,6 +199,7 @@ static BIGVIEW_SYNC_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new(
 static WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static CLOUD_SYNC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
@@ -1751,6 +1757,9 @@ struct TerminalPromptSubmittedPayload {
     todo_command_id: Option<String>,
     todo_action: Option<String>,
     todo_resume_requested: bool,
+    /// When a direct prompt was captured as a Rust todo, the item id every
+    /// other surface (webview item, journal, receipts, cloud row) must reuse.
+    direct_todo_item_id: Option<String>,
     expected_prompt: Option<String>,
     observed_prompt: Option<String>,
     prompt_match: bool,
@@ -2525,6 +2534,42 @@ fn log_terminal_status_event(phase: &str, fields: Value) {
         "thread": terminal_diagnostic_thread_label(),
         "fields": fields,
     }));
+}
+
+/// Cloud sync/connect loop trace (gated by CLOUD_SYNC_LOGGING_ENABLED),
+/// written to logs/cloud-sync.jsonl in the project root.
+fn log_cloud_sync_event(phase: &str, fields: Value) {
+    if !CLOUD_SYNC_LOGGING_ENABLED {
+        return;
+    }
+
+    let entry = json!({
+        "ts_ms": current_time_ms(),
+        "ts": chrono_like_now_iso(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "fields": fields,
+    });
+    let log_path = diagnostic_log_path(CLOUD_SYNC_LOG_FILE);
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+    let lock = CLOUD_SYNC_LOG_LOCK.get_or_init(|| StdMutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{entry}");
 }
 
 fn log_terminal_crash_forensics_event(phase: &str, fields: Value) {

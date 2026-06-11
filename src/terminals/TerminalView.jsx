@@ -16677,12 +16677,14 @@ function TerminalView({
       const completedPaneId = String(
         pendingItem?.paneId || inFlightPrompt?.paneId || getTerminalPaneId(safeTerminalIndex) || "",
       ).trim();
-      // A finishing terminal always glows AND always rings: the cue cooldown
-      // in the notification reducer dedupes the SFX if the activity-hook
-      // listener already rang for this turn close.
+      // A finishing terminal always glows; whether it also RINGS is decided
+      // in the notification reducer from the causer tags below (workspaceId +
+      // paneId/terminalIndex): watching the causing workspace's Terminals tab
+      // in a focused window keeps the flash silent, while an unfocused or
+      // backgrounded window, a non-terminal tab, or another workspace rings
+      // and lights that workspace's unread badge.
       triggerTodoCompletionFlash(completedPaneId);
-      // AppShell turns this into a workspace notification + cue, which
-      // plays the SFX and lights the workspace rail indicator.
+      // AppShell turns this into a workspace notification + cue.
       window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
         detail: {
           agentId: pendingItem?.targetAgentId || pendingItem?.targetRole || inFlightPrompt?.agentId || "",
@@ -19796,7 +19798,12 @@ function TerminalView({
         || new Date().toISOString(),
     ).trim() || new Date().toISOString();
     const promptId = getTodoQueueTerminalDirectPromptId(event, targetTerminalIndex, text, submittedAt);
-    const itemId = getTodoQueueTerminalDirectItemId(promptId);
+    // The Rust capture is the id authority for direct prompts: when it
+    // registered this prompt it passes the item id along, so the webview
+    // item, the Rust queue store/journal/receipts, and the cloud row are all
+    // ONE todo instead of three id families for the same prompt.
+    const itemId = String(event.directTodoItemId || event.direct_todo_item_id || "").trim()
+      || getTodoQueueTerminalDirectItemId(promptId);
 
     if (terminalDirectTodoPromptIdsRef.current.has(promptId)) {
       return;
@@ -19810,15 +19817,13 @@ function TerminalView({
       String(pendingItem?.promptId || "").trim() === promptId
         || String(pendingItem?.itemId || "").trim() === itemId
     ));
-    const existingItem = todoQueueItemsRef.current.some((item) => {
-      const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
-      return String(item?.id || "").trim() === itemId
-        || String(queueState.promptId || queueState.promptEventId || "").trim() === promptId;
-    });
-    if (existingInFlight || existingPending || existingItem) {
+    if (existingInFlight || existingPending) {
       terminalDirectTodoPromptIdsRef.current.add(promptId);
       return;
     }
+    // The item may already exist (adopted from the Rust capture event, which
+    // shares this id): keep going so pending/in-flight tracking still
+    // attaches — the updater below skips re-creating the row itself.
 
     if (terminalDirectTodoPromptIdsRef.current.size > 500) {
       terminalDirectTodoPromptIdsRef.current.clear();

@@ -1786,6 +1786,32 @@ const TODO_DISPATCH_DIRECT_CAPTURE_EVENT: &str = "todo-dispatch-direct-todo-capt
 /// journal (a later webview mount adopts it), a live webview event (an open
 /// queue panel adopts it immediately and syncs it to cloud), and the cloud
 /// snapshot directly when no webview is alive.
+/// Mirrors the webview's `getTodoQueueTerminalDirectItemId`: both sides must
+/// derive the SAME item id from the prompt event so one direct prompt is one
+/// todo everywhere (queue store, journal, receipts, webview item, cloud row).
+fn todo_dispatch_direct_prompt_item_id(prompt_event_id: Option<&str>) -> String {
+    if let Some(event_id) = prompt_event_id.map(str::trim).filter(|value| !value.is_empty()) {
+        let mut safe = String::new();
+        let mut last_was_separator = false;
+        for character in event_id.chars() {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | ':' | '-') {
+                safe.push(character);
+                last_was_separator = false;
+            } else if !last_was_separator {
+                safe.push('_');
+                last_was_separator = true;
+            }
+            if safe.len() >= 160 {
+                break;
+            }
+        }
+        if !safe.is_empty() {
+            return format!("terminal-direct-{safe}");
+        }
+    }
+    format!("direct-{}-{}", todo_dispatch_now_ms(), uuid::Uuid::new_v4())
+}
+
 pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
     app: &AppHandle,
     workspace_id: &str,
@@ -1795,11 +1821,12 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
     thread_id: &str,
     agent_kind: &str,
     prompt: &str,
-) {
+    prompt_event_id: Option<&str>,
+) -> Option<String> {
     let workspace_id = workspace_id.trim();
     let prompt = prompt.trim();
     if workspace_id.is_empty() || prompt.is_empty() {
-        return;
+        return None;
     }
     // Only managed coding agents: shell terminals would turn every command
     // line into a phantom todo.
@@ -1807,14 +1834,14 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         agent_kind.trim().to_ascii_lowercase().as_str(),
         "codex" | "claude" | "opencode"
     ) {
-        return;
+        return None;
     }
     let now_iso = chrono_like_now_iso();
-    let item_id = format!(
-        "direct-{}-{}",
-        todo_dispatch_now_ms(),
-        uuid::Uuid::new_v4()
-    );
+    let item_id = todo_dispatch_direct_prompt_item_id(prompt_event_id);
+    if todo_store_tombstone_ids(workspace_id).contains(&item_id) {
+        // The user already deleted this exact prompt's todo: never re-create.
+        return None;
+    }
     let item = json!({
         "id": item_id,
         "kind": "todo",
@@ -1839,8 +1866,15 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        items.push(item.clone());
-        todo_dispatch_queue_write(workspace_id, &items);
+        // Ids are deterministic per prompt event now, so a second observer of
+        // the same prompt converges on the existing row instead of doubling.
+        if !items
+            .iter()
+            .any(|existing| todo_store_item_matches_id(existing, &item_id))
+        {
+            items.push(item.clone());
+            todo_dispatch_queue_write(workspace_id, &items);
+        }
     }
     todo_dispatch_journal_append(
         workspace_id,
@@ -1882,6 +1916,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
             "terminal_direct_submit",
         );
     }
+    Some(item_id)
 }
 
 /// Last hook-reported input-ready state for one pane (None when the pane has
