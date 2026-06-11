@@ -8633,34 +8633,11 @@ function todoQueueTerminalDirectLifecycleEventType(value) {
   return String(value || "").trim().toLowerCase().replace(/_/g, "-");
 }
 
-const TODO_QUEUE_TERMINAL_DIRECT_TEXT_DEDUPE_MS = 45000;
-
-// Cross-path dedupe for terminal-direct todos: the Rust capture (input gate
-// or UserPromptSubmit hook) and the webview lifecycle materializer can both
-// observe the same typed prompt; whichever lands first wins.
-function todoQueueItemsHaveRecentDirectPrompt(items, paneId, text, nowMs = Date.now()) {
-  const normalizedText = String(text || "").trim().replace(/\s+/g, " ");
-  const normalizedPane = String(paneId || "").trim();
-  if (!normalizedText) {
-    return false;
-  }
-  return (Array.isArray(items) ? items : []).some((item) => {
-    const itemText = String(getTodoQueueItemTerminalText(item) || item?.text || "")
-      .trim()
-      .replace(/\s+/g, " ");
-    if (itemText !== normalizedText) {
-      return false;
-    }
-    const itemPane = String(item?.targetTerminalId || item?.target_terminal_id || "").trim();
-    if (normalizedPane && itemPane && itemPane !== normalizedPane) {
-      return false;
-    }
-    const at = Date.parse(
-      item?.todoStatusUpdatedAt || item?.updatedAt || item?.createdAt || "",
-    ) || 0;
-    return at > 0 && nowMs - at <= TODO_QUEUE_TERMINAL_DIRECT_TEXT_DEDUPE_MS;
-  });
-}
+// Cross-path dedupe for terminal-direct todos is identity-based: the Rust
+// capture (input gate or UserPromptSubmit hook) is the id authority and the
+// webview materializer derives the same id per submission, so id/promptId
+// matching alone is enough. Same-text recency matching was removed — it
+// swallowed deliberately repeated prompts instead of giving each its own todo.
 
 function todoQueueTerminalDirectSourceIsEligible(value) {
   const source = String(value || "").trim().toLowerCase();
@@ -19625,7 +19602,14 @@ function TerminalView({
           })
           : item
       ))
-    ), { reason: `todo_queue_pending_${phase}` });
+    ), {
+      // Status transitions must reach the Rust store (and therefore Todos
+      // History + the activity overlay) the moment they happen — a debounced
+      // sync left "running" invisible until the turn finished.
+      force: true,
+      immediate: true,
+      reason: `todo_queue_pending_${phase}`,
+    });
     if (timeoutMs) {
       const timeoutId = window.setTimeout(() => {
         const currentPendingItem = todoQueuePendingItemsRef.current[safeItemId];
@@ -19890,11 +19874,15 @@ function TerminalView({
     const itemSummary = getTodoQueueItemLogSummary([queueItem])[0] || null;
 
     updateTodoQueueItems((currentItems) => {
+      // Identity-only dedupe: Rust and the webview derive the SAME item id
+      // per prompt submission, so a matching id/promptId means this exact
+      // submission. Repeating the same prompt text deliberately creates a
+      // new id and therefore a new todo.
       const alreadyPresent = currentItems.some((item) => {
         const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
         return String(item?.id || "").trim() === itemId
           || String(queueState.promptId || queueState.promptEventId || "").trim() === promptId;
-      }) || todoQueueItemsHaveRecentDirectPrompt(currentItems, paneId, text);
+      });
       return alreadyPresent ? currentItems : currentItems.concat([queueItem]);
     }, {
       force: true,
@@ -23475,14 +23463,9 @@ function TerminalView({
       if (!normalized) return;
       updateTodoQueueItems((currentItems) => {
         const itemId = String(normalized.id || "").trim();
+        // Identity-only dedupe: the Rust capture and the webview
+        // materialization share one item id per prompt submission.
         if (!itemId || currentItems.some((current) => String(current?.id || "").trim() === itemId)) {
-          return currentItems;
-        }
-        if (todoQueueItemsHaveRecentDirectPrompt(
-          currentItems,
-          normalized.targetTerminalId,
-          getTodoQueueItemTerminalText(normalized) || normalized.text,
-        )) {
           return currentItems;
         }
         return [...currentItems, normalized];

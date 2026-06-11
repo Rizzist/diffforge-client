@@ -5284,7 +5284,16 @@ export default function ArchitectureWorkspaceView({
           if (cancelled) return;
           setLocalTodoItems(jsonArray(result?.items));
         })
-        .catch(() => {});
+        .catch(() => {
+          // Never render an empty history because one command failed: the raw
+          // queue ledger still has this device's todos.
+          invoke("todo_dispatch_queue_get", { workspaceId })
+            .then((result) => {
+              if (cancelled) return;
+              setLocalTodoItems(jsonArray(result?.items));
+            })
+            .catch(() => {});
+        });
     };
     refreshLocalTodos();
     // Store mutations (deletes, cancels, sweeps, direct captures) and mirror

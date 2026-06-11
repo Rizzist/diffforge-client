@@ -541,10 +541,12 @@ const FloatWindowRoot = styled.main`
   img {
     width: 100%;
     height: 100%;
-    /* The snip must fill the preview to its edges whatever its aspect ratio
-       — a tall narrow capture letterboxed with contain reads as an empty
-       window. Cover keeps it centered and crops the overflow instead. */
-    object-fit: cover;
+    /* The window is a fixed golden-ratio rectangle, so the capture must
+       scale to FIT it: contain keeps the whole snip visible and dead-
+       centered whatever its aspect ratio. Cover is wrong here — it crops a
+       band off any non-matching capture, which reads as the preview being
+       shifted downward, and zooms tall snips until they disappear. */
+    object-fit: contain;
     object-position: center;
     pointer-events: none;
     user-select: none;

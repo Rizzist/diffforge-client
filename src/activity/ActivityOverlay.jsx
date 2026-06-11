@@ -12,6 +12,13 @@ const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-upd
 
 const REFRESH_DEBOUNCE_MS = 40;
 const CARD_LIMIT = 30;
+// Recently finished todos stay on the widget briefly (per workspace cap)
+// so completions are visible without flooding it with the history ledger.
+const OVERVIEW_FINISHED_CARD_LIMIT = 8;
+const OVERVIEW_FINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
+// Event-driven refreshes lead; the interval is a safety net so the overlay
+// window converges even if a tauri event never reaches it.
+const OVERVIEW_REFRESH_INTERVAL_MS = 5_000;
 const RECENT_FINISHED_MS = 5 * 60 * 1000;
 const TRANSFER_LINGER_MS = 8000;
 const EXIT_CELEBRATE_MS = 1400;
@@ -547,6 +554,79 @@ function todoCardFromItem(item, index, status, options = {}) {
   };
 }
 
+/// Authoritative todo cards from the Rust queue stores (`todo_dispatch_overview`):
+/// running, queued, AND listed todos render with zero cloud dependency — the
+/// store is the headless source of truth, the cloud mirror below only adds
+/// peer-device rows. Card ids share the mirror's `todo-` scheme so the same
+/// logical todo dedupes to the Rust row.
+function normalizeOverviewTodoCards(overview) {
+  const cards = [];
+  jsonArray(overview?.workspaces).forEach((workspace) => {
+    const workspaceObject = jsonObject(workspace) || {};
+    const workspaceName = text(
+      workspaceObject.workspaceName
+        || workspaceObject.workspace_name
+        || workspaceObject.workspaceId
+        || workspaceObject.workspace_id,
+    );
+    const finishedItems = [];
+    jsonArray(workspaceObject.items).forEach((item, index) => {
+      const object = jsonObject(item) || {};
+      const bucket = text(object.bucket).toLowerCase();
+      if (bucket === "finished") {
+        finishedItems.push({ index, object });
+        return;
+      }
+      if (!["running", "queued", "listed"].includes(bucket)) {
+        return;
+      }
+      const status = bucket === "running" ? "active" : bucket;
+      const card = todoCardFromItem(
+        { ...object, workspaceName },
+        index,
+        status,
+        {
+          fallbackTitle: bucket === "running"
+            ? "Running todo"
+            : bucket === "queued"
+              ? "Queued todo"
+              : "Listed todo",
+          lane: "todo",
+        },
+      );
+      if (bucket === "running") {
+        card.eyebrow = "running";
+        card.progress = 60;
+        card.tone = "hot";
+      }
+      cards.push(card);
+    });
+    // Recently finished todos stay visible (completed/failed/cancelled),
+    // newest first and capped per workspace so the retained history ledger
+    // doesn't flood the widget.
+    finishedItems
+      .map((entry) => ({ ...entry, updatedAt: todoUpdatedAt(entry.object) }))
+      .filter((entry) => entry.updatedAt
+        && Date.now() - entry.updatedAt <= OVERVIEW_FINISHED_WINDOW_MS)
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, OVERVIEW_FINISHED_CARD_LIMIT)
+      .forEach(({ index, object }) => {
+        const status = statusKey(object.status, "") === "failed" ? "failed" : "done";
+        const card = todoCardFromItem(
+          { ...object, workspaceName },
+          index,
+          status,
+          { fallbackTitle: "Finished todo", lane: "todo" },
+        );
+        card.eyebrow = text(object.status, status);
+        card.progress = 100;
+        card.tone = statusTone(status);
+        cards.push(card);
+      });
+  });
+  return uniqueCards(cards);
+}
+
 function normalizeTodoCards(status, workspaceId = "") {
   const workspaceTodos = workspaceTodosFromStatus(status);
   const listedCards = workspaceTodoCollection(
@@ -945,6 +1025,7 @@ function useActivityOverlayData(context) {
     cloudStatus: null,
     errors: [],
     library: null,
+    todoOverview: null,
     updatedAt: 0,
   }));
   const contextRef = useRef(context);
@@ -1000,7 +1081,7 @@ function useActivityOverlayData(context) {
         return null;
       });
     try {
-      const [cloudStatusResult, libraryResult] = await Promise.allSettled([
+      const [cloudStatusResult, libraryResult, todoOverviewResult] = await Promise.allSettled([
         invoke("cloud_mcp_get_status"),
         invoke("cloud_mcp_list_workspace_assets", {
           includeAllWorkspaces: true,
@@ -1008,6 +1089,9 @@ function useActivityOverlayData(context) {
           localOnly,
           repoPath: "",
         }),
+        // The Rust queue stores are the headless todo truth: running, queued,
+        // and listed todos render from here with no cloud round trip.
+        invoke("todo_dispatch_overview"),
       ]);
       const refreshedWorkspaceTodos = await cachedTodosPromise;
       if (contextKeyRef.current !== refreshContextKey) {
@@ -1039,6 +1123,9 @@ function useActivityOverlayData(context) {
           cloudStatus,
           errors,
           library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
+          todoOverview: todoOverviewResult.status === "fulfilled"
+            ? todoOverviewResult.value
+            : current.todoOverview,
           updatedAt: Date.now(),
         };
       });
@@ -1086,10 +1173,23 @@ function useActivityOverlayData(context) {
     };
 
     void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT);
+    // Rust store mutations (direct captures, queue syncs, settlements,
+    // deletes, sweeps) drive the authoritative todo cards.
+    void addListener("todo-store-changed");
     void addListener(CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT, { refreshOptions: { localOnly: false } });
+
+    // Safety-net poll: overlay windows are separate webviews that can open
+    // before listeners attach or miss an event entirely; the interval keeps
+    // them converging on the Rust store regardless.
+    const intervalId = window.setInterval(() => {
+      if (!cancelled) {
+        scheduleRefresh({});
+      }
+    }, OVERVIEW_REFRESH_INTERVAL_MS);
 
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
       if (refreshTimerRef.current) {
         window.clearTimeout(refreshTimerRef.current);
         refreshTimerRef.current = 0;
@@ -1203,10 +1303,21 @@ function RowGlyph({ celebrate = false, kind, status, tone }) {
 export function ActivityOverlayPanel({ embedded = false }) {
   const context = useActivityOverlayContext();
   const data = useActivityOverlayData(context);
-  const todoCards = useMemo(
-    () => normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, ""),
-    [data.cachedWorkspaceTodos],
-  );
+  const todoCards = useMemo(() => {
+    // Rust queue stores lead (running/queued/listed, headless truth); the
+    // cloud mirror only adds peer-device rows behind them. Mirror cards for
+    // a todo the store already covers drop by todo identity, whichever lane
+    // prefix ("todo-" item rows vs "todo-dispatch-" dispatch rows) they use.
+    const overviewCards = normalizeOverviewTodoCards(data.todoOverview);
+    const storeIdentities = new Set(
+      overviewCards.map((card) => String(card.id).replace(/^todo-/, "")),
+    );
+    const mirrorCards = normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, "")
+      .filter((card) => !storeIdentities.has(
+        String(card.id).replace(/^todo-dispatch-/, "").replace(/^todo-/, ""),
+      ));
+    return uniqueCards([...overviewCards, ...mirrorCards]);
+  }, [data.cachedWorkspaceTodos, data.todoOverview]);
   const terminalTodoStates = useMemo(
     () => normalizeTerminalTodoStates({ workspaceTodos: data.cachedWorkspaceTodos }),
     [data.cachedWorkspaceTodos],

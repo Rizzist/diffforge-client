@@ -2019,11 +2019,35 @@ fn todo_store_apply_newer_store_status_core(
         .collect()
 }
 
-/// Keeps settled rows alive across webview snapshot rewrites: the webview
-/// consumes completed items from its visible list, so its full-snapshot sync
-/// omits them — without this merge every finished todo would vanish from the
-/// store (and therefore from Todos History) on the next sync. Tombstoned ids
-/// stay dead, and retention is capped so the file stays bounded.
+/// Rust-owned rows: todos the Rust store created itself (direct-prompt
+/// captures, backend dispatches, headless remote intake). The webview is a
+/// renderer for these, not the owner — its full-snapshot sync must never be
+/// able to erase one it doesn't know about.
+fn todo_store_item_is_rust_owned(item: &Value) -> bool {
+    let source = todo_dispatch_text(item, &["source", "sourceKind", "source_kind"]);
+    if source == "terminal_direct" {
+        return true;
+    }
+    if todo_dispatch_text(item, &["todoStatusReason", "statusReason"])
+        == "todo_queue_backend_submit"
+    {
+        return true;
+    }
+    item.get("remoteCommand")
+        .and_then(|remote| remote.get("source"))
+        .and_then(Value::as_str)
+        == Some("remote_intake_headless")
+}
+
+/// Keeps store-owned rows alive across webview snapshot rewrites:
+/// 1. Settled rows (the webview consumes completed items from its visible
+///    list, so its full-snapshot sync omits them — without this merge every
+///    finished todo would vanish from Todos History on the next sync).
+/// 2. ACTIVE Rust-owned rows the webview never adopted (direct captures,
+///    backend dispatches, headless intake) — hook settlement and the orphan
+///    sweeps own their lifecycle, not the webview's replica.
+/// Tombstoned ids stay dead, and settled retention is capped so the file
+/// stays bounded.
 fn todo_store_retain_settled_items_core(
     stored_items: Vec<Value>,
     items: Vec<Value>,
@@ -2033,26 +2057,33 @@ fn todo_store_retain_settled_items_core(
         .iter()
         .flat_map(|item| todo_store_history_item_tokens(item))
         .collect::<HashSet<_>>();
-    let mut retained = stored_items
-        .into_iter()
-        .filter(|item| {
-            if !TODO_STORE_SETTLED_RETENTION_STATUSES
-                .contains(&todo_store_item_status(item).as_str())
-            {
-                return false;
-            }
-            !todo_store_history_item_tokens(item)
-                .iter()
-                .any(|token| incoming_tokens.contains(token) || tombstoned.contains(token))
-        })
-        .collect::<Vec<_>>();
-    if retained.is_empty() {
+    let (mut retained_settled, mut retained_active): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+    for item in stored_items {
+        let settled = TODO_STORE_SETTLED_RETENTION_STATUSES
+            .contains(&todo_store_item_status(&item).as_str());
+        if !settled && !todo_store_item_is_rust_owned(&item) {
+            continue;
+        }
+        if todo_store_history_item_tokens(&item)
+            .iter()
+            .any(|token| incoming_tokens.contains(token) || tombstoned.contains(token))
+        {
+            continue;
+        }
+        if settled {
+            retained_settled.push(item);
+        } else {
+            retained_active.push(item);
+        }
+    }
+    if retained_settled.is_empty() && retained_active.is_empty() {
         return items;
     }
-    retained.sort_by_key(|item| std::cmp::Reverse(todo_store_item_updated_ms(item)));
-    retained.truncate(TODO_STORE_SETTLED_RETENTION_MAX);
+    retained_settled.sort_by_key(|item| std::cmp::Reverse(todo_store_item_updated_ms(item)));
+    retained_settled.truncate(TODO_STORE_SETTLED_RETENTION_MAX);
     let mut items = items;
-    items.extend(retained);
+    items.extend(retained_active);
+    items.extend(retained_settled);
     items
 }
 
@@ -2485,6 +2516,39 @@ mod todo_store_tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|item| item["id"] == "todo-done"
             && todo_store_item_status(item) == "completed"));
+    }
+
+    #[test]
+    fn rust_owned_active_rows_survive_webview_snapshot_rewrites() {
+        let stored = vec![
+            // Direct-prompt capture the webview never adopted: must survive.
+            json!({
+                "id": "terminal-direct-abc",
+                "source": "terminal_direct",
+                "todoStatus": "running",
+                "todoStatusReason": "todo_queue_backend_submit",
+            }),
+            // Headless remote intake awaiting dispatch: must survive.
+            json!({
+                "id": "remote-cmd-1",
+                "todoStatus": "queued",
+                "remoteCommand": { "commandId": "remote-cmd-1", "source": "remote_intake_headless" },
+            }),
+            // Plain webview-owned active row missing from incoming: webview
+            // replica is authoritative for these, so it drops.
+            json!({ "id": "webview-owned", "todoStatus": "queued" }),
+        ];
+        let incoming = vec![json!({ "id": "other", "todoStatus": "listed" })];
+        let merged =
+            todo_store_retain_settled_items_core(stored, incoming, &HashSet::new());
+        let ids = merged
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"terminal-direct-abc"));
+        assert!(ids.contains(&"remote-cmd-1"));
+        assert!(ids.contains(&"other"));
+        assert!(!ids.contains(&"webview-owned"));
     }
 
     #[test]
@@ -3057,11 +3121,16 @@ async fn todo_dispatch_overview() -> Result<Value, String> {
             if workspace_id.is_empty() {
                 continue;
             }
-            let items = snapshot
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
+            let tombstoned = todo_store_tombstone_ids(&workspace_id);
+            let (kept_items, _) = todo_store_filter_tombstoned(
+                snapshot
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                &tombstoned,
+            );
+            let items = kept_items
                 .into_iter()
                 .map(|item| {
                     let status = item

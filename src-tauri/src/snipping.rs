@@ -3435,8 +3435,9 @@ fn snipping_save_edited_untracked_asset(
 const SNIPPING_FLOAT_WINDOW_PREFIX: &str = "snip-float";
 const SNIPPING_FLOAT_LOGICAL_WIDTH: f64 = 240.0;
 const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
-// Every preview is the same golden-ratio rectangle; the capture letterboxes
-// inside it (object-fit: contain in the webview) instead of sizing the window.
+// Every preview is the same golden-ratio rectangle; the capture scales to
+// fit inside it (object-fit: contain in the webview, centered, never
+// cropped) instead of sizing the window.
 const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;

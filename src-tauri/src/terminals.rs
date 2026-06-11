@@ -9198,7 +9198,12 @@ fn terminal_native_plan_update_from_claude_todos_file(session_id: &str) -> Optio
     Some(json!({ "tool": "todowrite", "steps": steps }))
 }
 
-const TERMINAL_DIRECT_PROMPT_DEDUPE_WINDOW_MS: u64 = 30_000;
+// Window for treating two observations of the SAME submission (write-time
+// input-gate emulation + the provider's UserPromptSubmit hook echo) as one
+// prompt. Those echoes land within ~1-2s of each other; keeping the window
+// short means a user deliberately re-sending the same prompt text gets a NEW
+// todo instead of being swallowed as a duplicate.
+const TERMINAL_DIRECT_PROMPT_DEDUPE_WINDOW_MS: u64 = 8_000;
 const TERMINAL_DIRECT_PROMPT_DEDUPE_MAX_PER_PANE: usize = 12;
 
 static TERMINAL_RECENT_SUBMITTED_PROMPTS: OnceLock<StdMutex<HashMap<String, Vec<(u64, String)>>>> =
