@@ -125,15 +125,26 @@ const AgentAccountPill = styled.button`
   cursor: pointer;
   transition: border-color 120ms ease, background 120ms ease;
 
+  /* Active account: same muted selected treatment as the account filter
+     tabs above — accent border + accent text on a faint tint, no fill. */
   &[data-active="true"] {
-    border-color: rgba(74, 222, 128, 0.55);
-    color: rgba(187, 247, 208, 0.96);
-    background: rgba(34, 197, 94, 0.14);
+    border-color: rgba(74, 222, 128, 0.6);
+    color: rgba(134, 239, 172, 0.95);
+    background: color-mix(in srgb, rgba(74, 222, 128, 1) 12%, rgba(15, 23, 42, 0.74));
     cursor: default;
+  }
+
+  &[data-active="true"] em {
+    color: rgba(134, 239, 172, 0.65);
   }
 
   &:hover:not([data-active="true"]) {
     border-color: rgba(125, 176, 255, 0.5);
+  }
+
+  html[data-forge-theme="light"] &[data-active="true"] {
+    color: rgba(22, 101, 52, 0.95);
+    background: color-mix(in srgb, rgba(34, 197, 94, 1) 10%, #ffffff);
   }
 
   em {
@@ -2032,8 +2043,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           </AccountTabs>
         ) : null}
 
-        <AgentAccountsManager />
-
         {error ? <TokenomicsError>{error}</TokenomicsError> : null}
 
         {status !== "ready" ? (
@@ -2248,6 +2257,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             ))}
           </StorageRows>
         </StorageCard>
+
+        <AgentAccountsManager />
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
