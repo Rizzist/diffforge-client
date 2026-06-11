@@ -6323,6 +6323,12 @@ export default function App() {
   const [billingStatus, setBillingStatus] = useState(null);
   const [billingStatusState, setBillingStatusState] = useState("idle");
   const [billingStatusError, setBillingStatusError] = useState("");
+  // Auth-flow callbacks read billing through this ref so their identities
+  // stay stable: putting billingStatus in their dep arrays re-armed the auth
+  // startup effect on every billing refresh, which re-ran session validation
+  // and flickered the app between login and dashboard.
+  const billingStatusRef = useRef(null);
+  billingStatusRef.current = billingStatus;
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
   const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
@@ -8745,7 +8751,7 @@ export default function App() {
     }
     if (options.syncCloud !== false) {
       void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
-        ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
+        ...cloudMcpBillingEntitlementPayload(billingStatusRef.current, sessionUser),
         onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
       });
     }
@@ -8785,7 +8791,7 @@ export default function App() {
     setStartupAgentGateState(isPaid ? "checking" : "idle");
     setStartupAgentUpdateMessage("");
     setWorkspaceError("");
-  }, [billingStatus, updateCloudWorkspaceProgress]);
+  }, [updateCloudWorkspaceProgress]);
 
   const showView = useCallback((nextView, options = {}) => {
     if (nextView === activeView && nextView === visibleView) {
@@ -9878,7 +9884,7 @@ export default function App() {
         connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
         connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
         flowId,
-        ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
+        ...cloudMcpBillingEntitlementPayload(billingStatusRef.current, sessionUser),
         onProgress: updateCloudWorkspaceProgress,
         requireConnected: true,
       });
@@ -9902,7 +9908,7 @@ export default function App() {
       });
       throw cloudError;
     }
-  }, [billingStatus, updateCloudWorkspaceProgress]);
+  }, [updateCloudWorkspaceProgress]);
 
   const validateStoredSession = useCallback(async () => {
     const token = authStore.getToken();
@@ -9911,6 +9917,14 @@ export default function App() {
 
     if (!isSafeAuthValue(token)) {
       setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
+      return;
+    }
+
+    // Auth state is monotonic for a session: once the user is authenticated,
+    // restore validation must never demote them back to the sign-in screen
+    // (setChecking flips status to signedOut, which reads as login/dashboard
+    // flicker). Re-validation of a live session goes through the quiet path.
+    if (authStore.getSnapshot().status === "authenticated") {
       return;
     }
 
@@ -13434,6 +13448,13 @@ export default function App() {
       });
 
     async function initializeAuth() {
+      // Startup auth resolution happens exactly once per process. The effect
+      // re-arms whenever a dependency callback changes identity (billing
+      // refreshes used to do this), and re-running validation after the user
+      // is in the app flickered login/dashboard.
+      if (authStartupFinishedRef.current) {
+        return;
+      }
       try {
         let startUrls = [];
         let handledDeepLink = false;

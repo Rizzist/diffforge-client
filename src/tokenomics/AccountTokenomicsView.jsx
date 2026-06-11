@@ -2380,7 +2380,7 @@ const ChartCard = styled.div`
 
 const ChartGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 450px), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 350px), 1fr));
   gap: 9px;
   min-width: 0;
   align-items: stretch;
