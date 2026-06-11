@@ -1398,6 +1398,7 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
             | "todo_queue_state"
             | "tokenomics_hourly_usage_snapshot"
             | "tokenomics_delta"
+            | "tokenomics_device_display_snapshot"
             | "workspace_architecture_snapshot"
             | "workspace_architectures_snapshot"
             | "workspace_architecture_updated"
@@ -2521,6 +2522,69 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         reason_for_worker,
     )
     .await;
+}
+
+/// The webview publishes the EXACT tokenomics summary it renders (scan data
+/// merged with live provider limits, post `mergeTokenomicsSummary`). Shipping
+/// the display model verbatim — instead of letting the server re-aggregate
+/// rollups — is what keeps every other surface (next dashboard, other rust
+/// clients) in lockstep with what this device shows. Each device is the sole
+/// authority for its own snapshot; the cloud only stores and fans it out.
+#[tauri::command]
+async fn tokenomics_publish_display_snapshot(
+    state: tauri::State<'_, CloudMcpState>,
+    summary: Value,
+) -> Result<Value, String> {
+    if !summary.is_object() {
+        return Err("A tokenomics summary object is required.".to_string());
+    }
+    let worker_state = state.inner().clone();
+    let (billing_scope_type, team_id) = cloud_mcp_account_scope(&worker_state).await;
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let snapshot_hash = format!(
+        "{billing_scope_type}:{}:{}",
+        team_id.clone().unwrap_or_default(),
+        cloud_mcp_outbox_payload_hash(&summary)
+    );
+    {
+        // Unchanged displays are not re-published: the webview calls this on
+        // every store refresh tick and the outbox should not churn for it.
+        static LAST_PUBLISHED: std::sync::OnceLock<std::sync::Mutex<String>> =
+            std::sync::OnceLock::new();
+        let last = LAST_PUBLISHED.get_or_init(|| std::sync::Mutex::new(String::new()));
+        if let Ok(mut last) = last.lock() {
+            if *last == snapshot_hash {
+                return Ok(json!({ "ok": true, "skipped": "unchanged" }));
+            }
+            *last = snapshot_hash.clone();
+        }
+    }
+    let payload = json!({
+        "source": "rust-diffforge-tokenomics-display",
+        "event_kind": "tokenomics_device_display_snapshot",
+        "billing_scope_type": billing_scope_type,
+        "team_id": team_id,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "summary": summary,
+        "snapshot_hash": snapshot_hash,
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    cloud_mcp_enqueue_background_sync(
+        &worker_state,
+        "tokenomics:display_snapshot".to_string(),
+        "tokenomics_device_display_snapshot",
+        payload,
+        CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_LOW,
+        "tokenomics_display_snapshot".to_string(),
+    )
+    .await;
+    Ok(json!({ "ok": true, "queued": true }))
 }
 
 fn cloud_mcp_base_url() -> String {

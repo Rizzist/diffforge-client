@@ -8342,15 +8342,26 @@ export const AudioBarShortcutHint = styled.span`
   position: absolute;
   left: calc(100% + 7px);
   top: -5px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--forge-orange, #ff9f43) 38%, transparent);
+  border-radius: 999px;
   color: var(--forge-orange, #ff9f43);
+  background: linear-gradient(
+    180deg,
+    rgba(28, 30, 36, 0.95),
+    rgba(18, 20, 25, 0.92)
+  );
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35);
   font-size: 10.5px;
   font-weight: 800;
   letter-spacing: 0.05em;
+  line-height: 1.3;
   white-space: nowrap;
-  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
 
   ${AudioBarIdleShell}[data-theme="light"] & {
-    text-shadow: none;
+    border-color: color-mix(in srgb, var(--forge-orange, #ff9f43) 55%, transparent);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 247, 250, 0.96));
+    box-shadow: 0 3px 10px rgba(29, 29, 31, 0.16);
   }
 `;
 

@@ -242,7 +242,6 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
            updated_at TEXT NOT NULL,
            updated_at_unix INTEGER NOT NULL DEFAULT 0
          );
-         DROP VIEW IF EXISTS tokenomics_display_rollups;
 		         CREATE TABLE IF NOT EXISTS tokenomics_meta(
 		           key TEXT PRIMARY KEY,
 		           value TEXT NOT NULL
@@ -347,8 +346,28 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("Unable to backfill Tokenomics billing scope source: {error}"))?;
     }
-    conn.execute_batch(
-        "DROP VIEW IF EXISTS tokenomics_display_daily_rollups;
+    // The display views are rebuilt ONLY when their stored schema version is
+    // stale, and the whole DDL batch runs inside one IMMEDIATE transaction.
+    // Rebuilding them unconditionally on every open (the old behavior) raced:
+    // each DDL statement auto-commits, this database is opened concurrently
+    // by the summary view, the scan scheduler, the Claude statusline
+    // collector and cloud handlers, so a reader could land in the gap between
+    // DROP VIEW and CREATE VIEW and fail with "no such table:
+    // tokenomics_display_daily_rollups". Bump the version whenever any view
+    // definition below changes (including when a new column must surface
+    // through the views).
+    const TOKENOMICS_VIEW_SCHEMA_VERSION: i64 = 1;
+    let view_version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|error| format!("Unable to read Tokenomics schema version: {error}"))?;
+    if view_version == TOKENOMICS_VIEW_SCHEMA_VERSION {
+        tokenomics_rebuild_rollups_for_identity_version(conn)?;
+        tokenomics_repair_provider_api_costs(conn)?;
+        return Ok(());
+    }
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         DROP VIEW IF EXISTS tokenomics_display_daily_rollups;
          DROP VIEW IF EXISTS tokenomics_display_hourly_rollups;
          DROP VIEW IF EXISTS tokenomics_daily_rollups;
          DROP VIEW IF EXISTS tokenomics_hourly_rollups;
@@ -493,8 +512,10 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_scope ON tokenomics_cloud_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_observed ON tokenomics_usage_events(observed_at);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
-         CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);",
-    )
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_scan_state_provider ON tokenomics_scan_state(provider, agent_kind, updated_at);
+         PRAGMA user_version={TOKENOMICS_VIEW_SCHEMA_VERSION};
+         COMMIT;",
+    ))
     .map_err(|error| format!("Unable to finalize Tokenomics database schema: {error}"))?;
     tokenomics_rebuild_rollups_for_identity_version(conn)?;
     tokenomics_repair_provider_api_costs(conn)?;

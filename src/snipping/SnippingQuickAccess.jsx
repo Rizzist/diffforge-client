@@ -2,24 +2,34 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
+import { BlurOn } from "@styled-icons/material-rounded/BlurOn";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudUpload } from "@styled-icons/material-rounded/CloudUpload";
 import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
+import { Crop } from "@styled-icons/material-rounded/Crop";
+import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { Gesture } from "@styled-icons/material-rounded/Gesture";
+import { Grain } from "@styled-icons/material-rounded/Grain";
+import { Highlight } from "@styled-icons/material-rounded/Highlight";
+import { HighlightAlt } from "@styled-icons/material-rounded/HighlightAlt";
+import { HorizontalRule } from "@styled-icons/material-rounded/HorizontalRule";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
+import { Numbers } from "@styled-icons/material-rounded/Numbers";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
 import { Send } from "@styled-icons/material-rounded/Send";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
+import { Texture } from "@styled-icons/material-rounded/Texture";
 import { Undo } from "@styled-icons/material-rounded/Undo";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled, { createGlobalStyle } from "styled-components";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
 const SNIPPING_SOURCE_UPDATED_EVENT = "forge-snip-source-updated";
 const SNIPPING_LIVE_PREVIEW_EVENT = "forge-snip-live-preview";
+const SNIPPING_FLOAT_ASSIGN_EVENT = "forge-snip-float-assign";
 // ~22fps: frames are tiny (max edge capped below), so the encode+emit cost
 // per frame stays in the low milliseconds and the preview tracks the pen in
 // realtime without pinning a core.
@@ -32,13 +42,65 @@ export const SNIPPING_EDITOR_HASH = "#/snipping-editor";
 export const SNIPPING_FLOAT_HASH = "#/snipping-float";
 
 
-const TOOL_OPTIONS = [
-  { id: "pen", label: "Pen", Icon: Gesture },
-  { id: "arrow", label: "Arrow", Icon: ArrowForward },
-  { id: "rect", label: "Box", Icon: Rectangle },
-  { id: "circle", label: "Circle", Icon: RadioButtonUnchecked },
-  { id: "text", label: "Text", Icon: TextFields },
+// Quick-access tools. Closed shapes (rect/oval) are one abstract "shape" tool
+// parameterized by kind + fill mode (outline | solid | marker | spotlight);
+// the rail exposes the common combos directly and the bottom options bar
+// unlocks every combination when a shape tool is active.
+const TOOL_GROUPS = [
+  [
+    { id: "pen", label: "Pen", Icon: Gesture, tool: "pen" },
+    { id: "line", label: "Line", Icon: HorizontalRule, tool: "line" },
+    { id: "arrow", label: "Arrow", Icon: ArrowForward, tool: "arrow" },
+  ],
+  [
+    { id: "rect-outline", label: "Rectangle outline", Icon: CropSquare, tool: "shape", shape: "rect", mode: "outline" },
+    { id: "rect-solid", label: "Solid rectangle", Icon: Rectangle, tool: "shape", shape: "rect", mode: "solid" },
+    { id: "oval-outline", label: "Oval outline", Icon: RadioButtonUnchecked, tool: "shape", shape: "oval", mode: "outline" },
+  ],
+  [
+    { id: "spotlight", label: "Highlight area (dims the rest)", Icon: HighlightAlt, tool: "shape", shape: "rect", mode: "spotlight" },
+    { id: "marker", label: "Highlighter", Icon: Highlight, tool: "shape", shape: "rect", mode: "marker" },
+    { id: "blur", label: "Blur (redact)", Icon: BlurOn, tool: "blur" },
+  ],
+  [
+    { id: "text", label: "Text", Icon: TextFields, tool: "text" },
+    { id: "number", label: "Number badge", Icon: Numbers, tool: "number" },
+    { id: "crop", label: "Crop", Icon: Crop, tool: "crop" },
+  ],
 ];
+
+const SHAPE_KIND_OPTIONS = [
+  { id: "rect", label: "Rectangle", Icon: CropSquare },
+  { id: "oval", label: "Oval", Icon: RadioButtonUnchecked },
+];
+
+const SHAPE_MODE_OPTIONS = [
+  { id: "outline", label: "Outline", Icon: CropSquare },
+  { id: "solid", label: "Solid fill", Icon: Rectangle },
+  { id: "marker", label: "Highlighter fill", Icon: Highlight },
+  { id: "spotlight", label: "Spotlight (dim the rest)", Icon: HighlightAlt },
+];
+
+const BLUR_STRATEGY_OPTIONS = [
+  { id: "pixelate", label: "Pixelate", Icon: Texture },
+  { id: "smooth", label: "Smooth blur", Icon: BlurOn },
+  { id: "static", label: "Static (blur + heavy noise)", Icon: Grain },
+];
+
+const BLUR_POWER_OPTIONS = [1, 2, 3, 4, 5];
+
+const TEXT_BG_OPTIONS = [
+  { id: "none", label: "No background" },
+  { id: "dark", label: "Dark card" },
+  { id: "light", label: "Light card" },
+  { id: "accent", label: "Accent card (uses the selected color)" },
+];
+
+const STROKE_OPTIONS = [3, 5, 9];
+// Text / number badge sizing rides the shared stroke selector (S/M/L), then
+// scales up with very large captures so labels stay legible.
+const TEXT_SIZE_BY_STROKE = { 3: 18, 5: 26, 9: 38 };
+const NUMBER_RADIUS_BY_STROKE = { 3: 14, 5: 18, 9: 26 };
 
 const COLOR_OPTIONS = ["#f8fafc", "#ef4444", "#f59e0b", "#22c55e", "#38bdf8", "#a855f7"];
 
@@ -193,15 +255,7 @@ function loadImageElementFromPath(localPath) {
 
 async function renderAnnotatedImageDataUrl(localPath, annotations = []) {
   const { image } = await loadImageElementFromPath(localPath);
-  const width = image.naturalWidth || image.width;
-  const height = image.naturalHeight || image.height;
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  context.drawImage(image, 0, 0, width, height);
-  annotations.forEach((annotation) => drawAnnotation(context, annotation));
-  return canvas.toDataURL("image/png");
+  return exportAnnotatedCanvas(image, annotations).toDataURL("image/png");
 }
 
 async function copySnipToClipboard(snip) {
@@ -286,9 +340,79 @@ export function SnippingFloatWindow() {
   const name = useMemo(() => assetName({ localPath }), [localPath]);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
+  // Rust watches the global cursor and arms the hover chrome — CSS :hover
+  // alone never fires while this window is unfocused, which used to hide the
+  // buttons until a focusing click (and made every action cost two clicks).
+  const [hoverArmed, setHoverArmed] = useState(false);
   const statusTimerRef = useRef(0);
 
   useFloatingWindowBody("float");
+
+  // Warm-pool adoption: this window may have booted with no path in its URL,
+  // parked hidden until a capture claims it. The path arrives by event, plus
+  // a queryable fallback in case adoption raced the page boot.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const ownLabel = getCurrentWindow().label;
+    const adopt = (path) => {
+      if (disposed || !path) return;
+      setLocalPath(path);
+      setImageVersion((version) => version + 1);
+      setLiveFrameUrl("");
+    };
+
+    listen(SNIPPING_FLOAT_ASSIGN_EVENT, (event) => {
+      const payload = event?.payload || {};
+      if (text(payload.label) !== ownLabel) return;
+      adopt(text(payload.path));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    if (!initialPath) {
+      invoke("snipping_float_assigned_path")
+        .then((result) => adopt(text(result?.path)))
+        .catch(() => {});
+    }
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [initialPath]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const ownLabel = getCurrentWindow().label;
+
+    listen("snipping-float-hover", (event) => {
+      if (disposed) return;
+      const payload = event?.payload || {};
+      if (text(payload.label) !== ownLabel) return;
+      setHoverArmed(payload.hovered === true);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     localPathRef.current = localPath;
@@ -457,6 +581,7 @@ export function SnippingFloatWindow() {
       <SnipFloatingGlobalStyle />
       <FloatWindowRoot
         data-busy={busy ? "true" : "false"}
+        data-hovered={hoverArmed ? "true" : "false"}
         onDoubleClick={() => runAction("edit")}
         onMouseDown={beginDrag}
         title={`${name} — drag anywhere, double-click to annotate`}
@@ -523,8 +648,9 @@ export function SnippingFloatWindow() {
 const FloatWindowRoot = styled.main`
   position: fixed;
   inset: 0;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 12px;
@@ -539,13 +665,17 @@ const FloatWindowRoot = styled.main`
   }
 
   img {
+    /* Absolutely pinned to the window box: percentage sizes on in-flow
+       children of auto grid/flex tracks don't resolve reliably in WebKit
+       (the img lays out at the capture's intrinsic size and the overflow
+       clip eats it off-center — seen in production). Against the fixed
+       containing block the box is exact, and object-fit: contain then
+       scales the whole capture to fit the golden-ratio window, dead-
+       centered, never cropped. */
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
-    /* The window is a fixed golden-ratio rectangle, so the capture must
-       scale to FIT it: contain keeps the whole snip visible and dead-
-       centered whatever its aspect ratio. Cover is wrong here — it crops a
-       band off any non-matching capture, which reads as the preview being
-       shifted downward, and zooms tall snips until they disappear. */
     object-fit: contain;
     object-position: center;
     pointer-events: none;
@@ -561,7 +691,9 @@ const FloatWindowRoot = styled.main`
   }
 
   /* All chrome (close, upload, action pill, status) stays invisible until
-     the preview is hovered; the bare image is the whole resting surface. */
+     the preview is hovered; the bare image is the whole resting surface.
+     data-hovered is the Rust cursor watcher's verdict — it arms the chrome
+     even while the window is unfocused, where CSS :hover never fires. */
   > button,
   > div {
     opacity: 0;
@@ -570,7 +702,9 @@ const FloatWindowRoot = styled.main`
   }
 
   &:hover > button,
-  &:hover > div {
+  &[data-hovered="true"] > button,
+  &:hover > div,
+  &[data-hovered="true"] > div {
     opacity: 1;
     pointer-events: auto;
   }
@@ -709,10 +843,24 @@ export function SnippingAnnotationEditorWindow() {
   const activeIndex = Math.max(0, localPaths.indexOf(activePath));
   const multiImage = localPaths.length > 1;
   const canvasRef = useRef(null);
+  const stageRef = useRef(null);
   const imageRef = useRef(null);
   const draftRef = useRef(null);
   const drawingRef = useRef(false);
   const [tool, setTool] = useState("pen");
+  const [shapeKind, setShapeKind] = useState("rect");
+  const [shapeMode, setShapeMode] = useState("outline");
+  const [blurStrategy, setBlurStrategy] = useState("pixelate");
+  const [blurPower, setBlurPower] = useState(3);
+  const [textBg, setTextBg] = useState("dark");
+  const [textEditor, setTextEditor] = useState(null);
+  const textEditorRef = useRef(null);
+  // Cursor-anchored copy/paste: the cursor's image-space position picks what
+  // ⌘C grabs and where ⌘V drops it; the hovered annotation gets an outline.
+  const cursorRef = useRef({ x: 0, y: 0, inside: false });
+  const annotationClipboardRef = useRef(null);
+  const pasteSpreadRef = useRef(0);
+  const [hoverIndex, setHoverIndex] = useState(-1);
   const [color, setColor] = useState("#ef4444");
   const [strokeWidth, setStrokeWidth] = useState(5);
   const [annotationsByPath, setAnnotationsByPath] = useState({});
@@ -724,6 +872,7 @@ export function SnippingAnnotationEditorWindow() {
   const [targetWorkspaceId, setTargetWorkspaceId] = useState("");
   const [targetThreadId, setTargetThreadId] = useState("");
   const annotations = annotationsByPath[activePath] || [];
+  const hasCrop = annotations.some((annotation) => annotation.type === "crop");
 
   useEffect(() => {
     let disposed = false;
@@ -769,6 +918,19 @@ export function SnippingAnnotationEditorWindow() {
   }, [targetWorkspace]);
 
   useFloatingWindowBody("editor");
+
+  // The native window is created hidden; reveal it only once this webview has
+  // committed its first painted frame (double rAF) so opening never flashes
+  // an unpainted window.
+  useEffect(() => {
+    let frame = window.requestAnimationFrame(() => {
+      frame = window.requestAnimationFrame(() => {
+        const current = getCurrentWindow();
+        current.show().then(() => current.setFocus()).catch(() => {});
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
 
   const updateActiveAnnotations = useCallback((updater) => {
     if (!activePath) return;
@@ -830,11 +992,12 @@ export function SnippingAnnotationEditorWindow() {
     canvas.width = canvasSize.width;
     canvas.height = canvasSize.height;
     const context = canvas.getContext("2d");
-    context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-    annotations.forEach((annotation) => drawAnnotation(context, annotation));
-    if (draft) drawAnnotation(context, draft);
-  }, [annotations, canvasSize.height, canvasSize.width, draft]);
+    const combined = draft ? [...annotations, draft] : annotations;
+    renderAnnotationsToContext(context, image, combined, { preview: true });
+    if (!draft && hoverIndex >= 0 && hoverIndex < annotations.length) {
+      drawHoverOutline(context, annotations[hoverIndex]);
+    }
+  }, [annotations, canvasSize.height, canvasSize.width, draft, hoverIndex]);
 
   useEffect(() => {
     drawCanvas();
@@ -850,41 +1013,127 @@ export function SnippingAnnotationEditorWindow() {
     };
   }, []);
 
+  // Text/number badge dimensions in image pixels: keyed off the shared
+  // stroke selector, scaled up for very large captures.
+  const imageScale = Math.max(1, canvasSize.width / 1400);
+  const textFontPx = Math.round((TEXT_SIZE_BY_STROKE[strokeWidth] || 26) * imageScale);
+  const numberRadiusPx = Math.round((NUMBER_RADIUS_BY_STROKE[strokeWidth] || 18) * imageScale);
+
+  useEffect(() => {
+    textEditorRef.current = textEditor;
+  }, [textEditor]);
+
+  // Switching images abandons any half-typed text annotation.
+  useEffect(() => {
+    setTextEditor(null);
+  }, [activePath]);
+
+  const commitTextEditor = useCallback(() => {
+    const editor = textEditorRef.current;
+    if (!editor) return;
+    setTextEditor(null);
+    const value = String(editor.value || "").replace(/\s+$/u, "");
+    if (!value.trim()) return;
+    const card = resolveTextCardStyle(textBg, color);
+    updateActiveAnnotations((current) => [
+      ...current,
+      {
+        type: "text",
+        x: editor.x,
+        y: editor.y,
+        text: value,
+        color,
+        bg: card.bg,
+        textColor: card.textColor,
+        size: textFontPx,
+      },
+    ]);
+    setStatus("Text added");
+  }, [color, textBg, textFontPx, updateActiveAnnotations]);
+
+  // Inline text editing: clicking with the text tool drops a real input on
+  // the canvas (window.prompt is unavailable inside the Tauri webview).
+  const openTextEditor = useCallback((point) => {
+    const canvas = canvasRef.current;
+    const stage = stageRef.current;
+    if (!canvas || !stage) return;
+    const canvasRect = canvas.getBoundingClientRect();
+    const stageRect = stage.getBoundingClientRect();
+    const scale = canvasRect.width / canvas.width;
+    setTextEditor({
+      x: point.x,
+      y: point.y,
+      left: canvasRect.left - stageRect.left + point.x * scale,
+      top: canvasRect.top - stageRect.top + point.y * scale,
+      scale,
+      value: "",
+    });
+  }, []);
+
+  const selectTool = useCallback((option) => {
+    commitTextEditor();
+    setTool(option.tool);
+    if (option.shape) setShapeKind(option.shape);
+    if (option.mode) setShapeMode(option.mode);
+  }, [commitTextEditor]);
+
+  const isToolOptionActive = useCallback((option) => (
+    option.tool === "shape"
+      ? tool === "shape" && shapeKind === option.shape && shapeMode === option.mode
+      : tool === option.tool
+  ), [shapeKind, shapeMode, tool]);
+
   const beginDraw = useCallback((event) => {
     if (event.button !== 0 || !canvasSize.width || !canvasSize.height) return;
     event.preventDefault();
     const point = pointFromEvent(event);
+    const hadTextEditor = Boolean(textEditorRef.current);
+    if (hadTextEditor) commitTextEditor();
     if (tool === "text") {
-      const value = window.prompt("Text annotation");
-      if (!value?.trim()) return;
-      updateActiveAnnotations((current) => [
-        ...current,
-        {
-          type: "text",
-          x: point.x,
-          y: point.y,
-          text: value.trim(),
-          color,
-          size: Math.max(14, strokeWidth * 5),
-        },
-      ]);
-      setStatus("Text added");
+      // The first click after an open editor only commits it; the next click
+      // starts a fresh label.
+      if (!hadTextEditor) openTextEditor(point);
       return;
     }
-    const annotation = {
-      type: tool,
+    if (tool === "number") {
+      updateActiveAnnotations((current) => {
+        const nextValue = current.reduce(
+          (max, annotation) => (annotation.type === "number" ? Math.max(max, annotation.value || 0) : max),
+          0,
+        ) + 1;
+        return [
+          ...current,
+          { type: "number", x: point.x, y: point.y, value: nextValue, color, radius: numberRadiusPx },
+        ];
+      });
+      setStatus("Number added");
+      return;
+    }
+    const base = {
       color,
       size: strokeWidth,
       startX: point.x,
       startY: point.y,
       endX: point.x,
       endY: point.y,
-      points: tool === "pen" ? [point] : undefined,
     };
+    const annotation = tool === "pen" ? { ...base, type: "pen", points: [point] }
+      : tool === "line" ? { ...base, type: "line" }
+        : tool === "arrow" ? { ...base, type: "arrow" }
+          : tool === "blur" ? {
+            ...base,
+            type: "blur",
+            strategy: blurStrategy,
+            power: blurPower,
+            // The noise layer is seeded so redraws are stable frame to frame.
+            seed: Math.floor(Math.random() * 2 ** 31),
+          }
+            : tool === "crop" ? { ...base, type: "crop" }
+              : { ...base, type: "shape", shape: shapeKind, mode: shapeMode };
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [canvasSize.height, canvasSize.width, color, pointFromEvent, strokeWidth, tool, updateActiveAnnotations]);
+  }, [blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, numberRadiusPx, openTextEditor, pointFromEvent, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -902,21 +1151,127 @@ export function SnippingAnnotationEditorWindow() {
     drawingRef.current = false;
     draftRef.current = null;
     setDraft(null);
+    // Area tools ignore accidental click-without-drag gestures.
+    const needsArea = annotation.type === "shape" || annotation.type === "blur" || annotation.type === "crop";
+    if (needsArea
+      && (Math.abs(annotation.endX - annotation.startX) < 4 || Math.abs(annotation.endY - annotation.startY) < 4)) {
+      return;
+    }
+    if (annotation.type === "crop") {
+      // One crop per image: redrawing replaces it, undo removes it.
+      updateActiveAnnotations((current) => [...current.filter((item) => item.type !== "crop"), annotation]);
+      setStatus("Crop set — saves and sends use the cropped area");
+      return;
+    }
     updateActiveAnnotations((current) => [...current, annotation]);
     setStatus("Annotation added");
   }, [updateActiveAnnotations]);
+
+  const handleCanvasMouseMove = useCallback((event) => {
+    const point = pointFromEvent(event);
+    cursorRef.current = { x: point.x, y: point.y, inside: true };
+    if (drawingRef.current) {
+      setHoverIndex(-1);
+      updateDraw(event);
+      return;
+    }
+    const context = canvasRef.current?.getContext("2d");
+    setHoverIndex(context ? annotationAtPoint(annotations, point, context) : -1);
+  }, [annotations, pointFromEvent, updateDraw]);
+
+  const handleCanvasMouseLeave = useCallback(() => {
+    cursorRef.current = { ...cursorRef.current, inside: false };
+    setHoverIndex(-1);
+    finishDraw();
+  }, [finishDraw]);
+
+  // ⌘C/⌘X over an annotation copies/cuts the topmost one under the cursor;
+  // ⌘V pastes the clipboard centered on the current cursor position (or
+  // staggered next to the original when the cursor is off the canvas). The
+  // clipboard survives image switches, so annotations copy across snips.
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== "c" && key !== "x" && key !== "v") return;
+      const target = event.target;
+      const tag = String(target?.tagName || "").toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) return;
+      const context = canvasRef.current?.getContext("2d");
+      if (!context) return;
+      if (key === "c" || key === "x") {
+        const cursor = cursorRef.current;
+        if (!cursor.inside) return;
+        const index = annotationAtPoint(annotations, cursor, context);
+        if (index < 0) return;
+        event.preventDefault();
+        annotationClipboardRef.current = JSON.parse(JSON.stringify(annotations[index]));
+        pasteSpreadRef.current = 0;
+        const label = annotationLabel(annotations[index]);
+        if (key === "x") {
+          updateActiveAnnotations((current) => current.filter((_, itemIndex) => itemIndex !== index));
+          setHoverIndex(-1);
+          setStatus(`Cut ${label} — ⌘V pastes at the cursor`);
+        } else {
+          setStatus(`Copied ${label} — ⌘V pastes at the cursor`);
+        }
+        return;
+      }
+      const clip = annotationClipboardRef.current;
+      if (!clip) return;
+      const bounds = annotationDisplayBounds(clip, context);
+      if (!bounds) return;
+      event.preventDefault();
+      const cursor = cursorRef.current;
+      let dx;
+      let dy;
+      if (cursor.inside) {
+        dx = cursor.x - (bounds.x + bounds.width / 2);
+        dy = cursor.y - (bounds.y + bounds.height / 2);
+      } else {
+        // No cursor anchor: stagger repeat pastes so copies don't stack.
+        pasteSpreadRef.current += 1;
+        dx = 26 * pasteSpreadRef.current;
+        dy = 26 * pasteSpreadRef.current;
+      }
+      const pasted = translateAnnotation(clip, dx, dy);
+      if (pasted.type === "blur") {
+        pasted.seed = Math.floor(Math.random() * 2 ** 31);
+      }
+      updateActiveAnnotations((current) => {
+        if (pasted.type === "number") {
+          pasted.value = current.reduce(
+            (max, item) => (item.type === "number" ? Math.max(max, item.value || 0) : max),
+            0,
+          ) + 1;
+        }
+        return [...current, pasted];
+      });
+      setStatus(`Pasted ${annotationLabel(pasted)}`);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [annotations, updateActiveAnnotations]);
 
   const undo = useCallback(() => {
     updateActiveAnnotations((current) => current.slice(0, -1));
     setStatus("Undone");
   }, [updateActiveAnnotations]);
 
+  // Exports re-render from the source image (never the visible canvas): the
+  // preview canvas carries UI-only chrome like the crop overlay, and crop
+  // itself changes the output dimensions.
+  const exportActiveDataUrl = useCallback(() => {
+    const image = imageRef.current;
+    if (!image) return "";
+    return exportAnnotatedCanvas(image, annotationsByPath[activePath] || []).toDataURL("image/png");
+  }, [activePath, annotationsByPath]);
+
   const copyCanvas = useCallback(async () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
     setStatus("Copying image...");
     try {
-      const imageDataUrl = canvas.toDataURL("image/png");
+      const imageDataUrl = exportActiveDataUrl();
+      if (!imageDataUrl) return;
       await invoke("diffforge_copy_image_data_url_to_clipboard", {
         imageDataUrl,
       });
@@ -924,7 +1279,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to copy image."));
     }
-  }, []);
+  }, [exportActiveDataUrl]);
 
   // Autosave chain: the first save of an original returns the new edited-copy
   // path; every later autosave for that original updates the same copy in
@@ -1007,12 +1362,12 @@ export function SnippingAnnotationEditorWindow() {
     }
   }, []);
   const persistAnnotatedImage = useCallback(async () => {
-    const canvas = canvasRef.current;
-    if (!canvas || !activePath || !canvas.width || !canvas.height) return;
+    if (!imageRef.current || !activePath) return;
     if (!(annotationsByPath[activePath] || []).length) return;
     setStatus("Saving…");
     try {
-      const imageDataUrl = canvas.toDataURL("image/png");
+      const imageDataUrl = exportActiveDataUrl();
+      if (!imageDataUrl) return;
       const sourcePath = autosaveTargetsRef.current[activePath] || activePath;
       const result = await invoke("snipping_save_edited_untracked_asset", {
         request: {
@@ -1028,7 +1383,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to save annotated image."));
     }
-  }, [activePath, annotationsByPath]);
+  }, [activePath, annotationsByPath, exportActiveDataUrl]);
 
   useEffect(() => {
     if (!(annotationsByPath[activePath] || []).length) return undefined;
@@ -1057,8 +1412,8 @@ export function SnippingAnnotationEditorWindow() {
     setStatus(`Queueing todo with ${localPaths.length} image${localPaths.length === 1 ? "" : "s"}...`);
     try {
       const images = await Promise.all(localPaths.map(async (path, index) => {
-        const imageDataUrl = activePath === path && canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0
-          ? canvasRef.current.toDataURL("image/png")
+        const imageDataUrl = activePath === path && imageRef.current
+          ? exportActiveDataUrl()
           : await renderAnnotatedImageDataUrl(path, annotationsByPath[path] || []);
         const imageName = assetName({ localPath: path });
         return {
@@ -1084,7 +1439,7 @@ export function SnippingAnnotationEditorWindow() {
     } catch (error) {
       setStatus(error?.message || String(error || "Unable to queue todo."));
     }
-  }, [activePath, annotationsByPath, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
+  }, [activePath, annotationsByPath, exportActiveDataUrl, localPaths, name, targetThreadId, targetWorkspace, targetWorkspaceId, todoDraft]);
 
   const closeEditor = useCallback(() => {
     getCurrentWindow().close().catch(() => {});
@@ -1138,15 +1493,48 @@ export function SnippingAnnotationEditorWindow() {
             </EditorBatchStrip>
           )}
 
-          <EditorStage>
+          <EditorStage ref={stageRef}>
             <canvas
               aria-label="Snip annotation canvas"
               onMouseDown={beginDraw}
-              onMouseLeave={finishDraw}
-              onMouseMove={updateDraw}
+              onMouseLeave={handleCanvasMouseLeave}
+              onMouseMove={handleCanvasMouseMove}
               onMouseUp={finishDraw}
               ref={canvasRef}
             />
+            {textEditor && (() => {
+              const card = resolveTextCardStyle(textBg, color);
+              return (
+                <EditorTextOverlayInput
+                  autoFocus
+                  aria-label="Text annotation"
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setTextEditor((current) => (current ? { ...current, value } : current));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      commitTextEditor();
+                    } else if (event.key === "Escape") {
+                      setTextEditor(null);
+                    }
+                  }}
+                  placeholder="Type…"
+                  rows={textEditor.value.split("\n").length}
+                  style={{
+                    left: textEditor.left,
+                    top: textEditor.top,
+                    fontSize: Math.max(11, textFontPx * textEditor.scale),
+                    color: card.textColor,
+                    background: card.bg || "transparent",
+                    width: `${Math.min(48, Math.max(8, textEditor.value.split("\n")
+                      .reduce((max, line) => Math.max(max, line.length), 0) + 3))}ch`,
+                  }}
+                  value={textEditor.value}
+                />
+              );
+            })()}
             {/* Creation tools stay on the left rail; the act-on-the-result
                 buttons live top-right (under the batch strip when several
                 images are selected) where they are quickest to reach. */}
@@ -1162,22 +1550,48 @@ export function SnippingAnnotationEditorWindow() {
               </EditorToolButton>
             </EditorActionCluster>
             <EditorFloatingRail aria-label="Annotation tools">
-              <EditorToolGroup>
-                {TOOL_OPTIONS.map(({ id, label, Icon }) => (
-                  <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
-                    <Icon aria-hidden="true" />
-                  </EditorToolButton>
-                ))}
-              </EditorToolGroup>
-              <EditorRailDivider aria-hidden="true" />
-              <EditorToolGroup data-compact="true">
+              {TOOL_GROUPS.map((group, groupIndex) => (
+                <Fragment key={group[0].id}>
+                  {groupIndex > 0 && <EditorRailDivider aria-hidden="true" />}
+                  <EditorToolGroup>
+                    {group.map((option) => (
+                      <EditorToolButton
+                        aria-label={option.label}
+                        data-active={isToolOptionActive(option)}
+                        key={option.id}
+                        onClick={() => selectTool(option)}
+                        title={option.label}
+                        type="button"
+                      >
+                        <option.Icon aria-hidden="true" />
+                      </EditorToolButton>
+                    ))}
+                  </EditorToolGroup>
+                </Fragment>
+              ))}
+            </EditorFloatingRail>
+            {/* Style + contextual options live in one bottom pill: colors and
+                stroke size are always one click away, and the active tool
+                appends its own controls (shape kind/fill, blur strategy and
+                power, text card background, crop reset) instead of cramming
+                everything into the rail. */}
+            <EditorOptionsBar aria-label="Style and tool options">
+              <EditorToolGroup data-compact="true" data-row="true">
                 {COLOR_OPTIONS.map((option) => (
                   <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
                 ))}
+                <CustomColorButton data-active={!COLOR_OPTIONS.includes(color)} title="Custom color">
+                  <input
+                    aria-label="Custom color"
+                    onChange={(event) => setColor(event.target.value)}
+                    type="color"
+                    value={color}
+                  />
+                </CustomColorButton>
               </EditorToolGroup>
-              <EditorRailDivider aria-hidden="true" />
-              <EditorToolGroup data-compact="true">
-                {[3, 5, 9].map((size) => (
+              <EditorBarDivider aria-hidden="true" />
+              <EditorToolGroup data-compact="true" data-row="true">
+                {STROKE_OPTIONS.map((size) => (
                   <SizeDotButton
                     aria-label={`Stroke size ${size}`}
                     data-active={strokeWidth === size ? "true" : "false"}
@@ -1190,7 +1604,108 @@ export function SnippingAnnotationEditorWindow() {
                   </SizeDotButton>
                 ))}
               </EditorToolGroup>
-            </EditorFloatingRail>
+              {tool === "shape" && (
+                <>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolGroup data-row="true">
+                    {SHAPE_KIND_OPTIONS.map((option) => (
+                      <EditorToolButton
+                        aria-label={option.label}
+                        data-active={shapeKind === option.id}
+                        key={option.id}
+                        onClick={() => setShapeKind(option.id)}
+                        title={option.label}
+                        type="button"
+                      >
+                        <option.Icon aria-hidden="true" />
+                      </EditorToolButton>
+                    ))}
+                  </EditorToolGroup>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolGroup data-row="true">
+                    {SHAPE_MODE_OPTIONS.map((option) => (
+                      <EditorToolButton
+                        aria-label={option.label}
+                        data-active={shapeMode === option.id}
+                        key={option.id}
+                        onClick={() => setShapeMode(option.id)}
+                        title={option.label}
+                        type="button"
+                      >
+                        <option.Icon aria-hidden="true" />
+                      </EditorToolButton>
+                    ))}
+                  </EditorToolGroup>
+                </>
+              )}
+              {tool === "blur" && (
+                <>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolGroup data-row="true">
+                    {BLUR_STRATEGY_OPTIONS.map((option) => (
+                      <EditorToolButton
+                        aria-label={option.label}
+                        data-active={blurStrategy === option.id}
+                        key={option.id}
+                        onClick={() => setBlurStrategy(option.id)}
+                        title={option.label}
+                        type="button"
+                      >
+                        <option.Icon aria-hidden="true" />
+                      </EditorToolButton>
+                    ))}
+                  </EditorToolGroup>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolGroup data-compact="true" data-row="true">
+                    {BLUR_POWER_OPTIONS.map((power) => (
+                      <SizeDotButton
+                        aria-label={`Blur power ${power}`}
+                        data-active={blurPower === power ? "true" : "false"}
+                        key={power}
+                        onClick={() => setBlurPower(power)}
+                        title={`Blur power ${power}`}
+                        type="button"
+                      >
+                        <i aria-hidden="true" style={{ width: power * 2 + 3, height: power * 2 + 3 }} />
+                      </SizeDotButton>
+                    ))}
+                  </EditorToolGroup>
+                </>
+              )}
+              {tool === "text" && (
+                <>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorToolGroup data-compact="true" data-row="true">
+                    {TEXT_BG_OPTIONS.map((option) => (
+                      <TextBgButton
+                        aria-label={option.label}
+                        data-active={textBg === option.id}
+                        data-kind={option.id}
+                        key={option.id}
+                        onClick={() => setTextBg(option.id)}
+                        style={option.id === "accent" ? { "--snip-color": color } : undefined}
+                        title={option.label}
+                        type="button"
+                      />
+                    ))}
+                  </EditorToolGroup>
+                </>
+              )}
+              {tool === "crop" && hasCrop && (
+                <>
+                  <EditorBarDivider aria-hidden="true" />
+                  <EditorBarTextButton
+                    onClick={() => {
+                      updateActiveAnnotations((current) => current.filter((item) => item.type !== "crop"));
+                      setStatus("Crop cleared");
+                    }}
+                    type="button"
+                  >
+                    Reset crop
+                  </EditorBarTextButton>
+                </>
+              )}
+            </EditorOptionsBar>
           </EditorStage>
 
           <EditorComposer onSubmit={queueTodo}>
@@ -1234,8 +1749,494 @@ export function SnippingAnnotationEditorWindow() {
   );
 }
 
+// --- Annotation rendering pipeline ---------------------------------------
+//
+// Annotations render in fixed passes so the result is deterministic no matter
+// the order things were drawn in: blur redactions touch the raw image first,
+// then spotlight highlights dim everything that is not highlighted, then the
+// drawn marks (pen/line/arrow/shapes/text/numbers) layer on top in creation
+// order. Crop never paints — it narrows the export bounds (and shows as a
+// preview-only overlay in the editor).
+function renderAnnotationsToContext(context, image, annotations, { preview = false } = {}) {
+  const canvas = context.canvas;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(image, 0, 0, canvas.width, canvas.height);
+  annotations.forEach((annotation) => {
+    if (annotation?.type === "blur") applyBlurAnnotation(context, annotation);
+  });
+  applySpotlightPass(
+    context,
+    annotations.filter((annotation) => annotation?.type === "shape" && annotation.mode === "spotlight"),
+  );
+  annotations.forEach((annotation) => {
+    if (!annotation || annotation.type === "blur" || annotation.type === "crop") return;
+    if (annotation.type === "shape" && annotation.mode === "spotlight") return;
+    drawAnnotation(context, annotation);
+  });
+  if (preview) {
+    const crop = lastCropOf(annotations);
+    if (crop) drawCropOverlay(context, crop);
+  }
+}
+
+function lastCropOf(annotations) {
+  for (let index = annotations.length - 1; index >= 0; index -= 1) {
+    if (annotations[index]?.type === "crop") return annotations[index];
+  }
+  return null;
+}
+
+function exportAnnotatedCanvas(image, annotations = []) {
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  const context = canvas.getContext("2d");
+  renderAnnotationsToContext(context, image, annotations);
+  const crop = lastCropOf(annotations);
+  if (!crop) return canvas;
+  const region = annotationBounds(crop, canvas);
+  if (region.width < 4 || region.height < 4) return canvas;
+  const cropped = document.createElement("canvas");
+  cropped.width = Math.round(region.width);
+  cropped.height = Math.round(region.height);
+  cropped.getContext("2d").drawImage(
+    canvas,
+    region.x, region.y, region.width, region.height,
+    0, 0, cropped.width, cropped.height,
+  );
+  return cropped;
+}
+
+// --- Cursor hit-testing for copy/paste ------------------------------------
+
+function normalizedBox(annotation) {
+  const x = Math.min(annotation.startX, annotation.endX);
+  const y = Math.min(annotation.startY, annotation.endY);
+  return {
+    x,
+    y,
+    width: Math.abs(annotation.endX - annotation.startX),
+    height: Math.abs(annotation.endY - annotation.startY),
+  };
+}
+
+function pointInBox(point, box, pad = 0) {
+  if (!box) return false;
+  return point.x >= box.x - pad
+    && point.x <= box.x + box.width + pad
+    && point.y >= box.y - pad
+    && point.y <= box.y + box.height + pad;
+}
+
+function distanceToSegment(point, from, to) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const lengthSq = dx * dx + dy * dy;
+  const t = lengthSq
+    ? Math.max(0, Math.min(1, ((point.x - from.x) * dx + (point.y - from.y) * dy) / lengthSq))
+    : 0;
+  return Math.hypot(point.x - (from.x + t * dx), point.y - (from.y + t * dy));
+}
+
+function textAnnotationBounds(annotation, context) {
+  const fontSize = annotation.size || 24;
+  const lines = String(annotation.text || "").split("\n");
+  context.save();
+  context.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
+  const textWidth = lines.reduce((max, line) => Math.max(max, context.measureText(line).width), 0);
+  context.restore();
+  const lineHeight = Math.round(fontSize * 1.25);
+  const paddingX = annotation.bg ? Math.round(fontSize * 0.45) : 0;
+  const paddingY = annotation.bg ? Math.round(fontSize * 0.3) : 0;
+  return {
+    x: annotation.x - paddingX,
+    y: annotation.y - paddingY,
+    width: textWidth + paddingX * 2,
+    height: lineHeight * lines.length + paddingY * 2,
+  };
+}
+
+/// Loose bounding box of any annotation, for hover outlines and paste
+/// anchoring. Returns null when the annotation has no usable geometry.
+function annotationDisplayBounds(annotation, context) {
+  if (!annotation) return null;
+  if (annotation.type === "text") return textAnnotationBounds(annotation, context);
+  if (annotation.type === "number") {
+    const radius = Math.max(10, annotation.radius || 18);
+    return { x: annotation.x - radius, y: annotation.y - radius, width: radius * 2, height: radius * 2 };
+  }
+  if (annotation.type === "pen") {
+    const points = annotation.points || [];
+    if (!points.length) return null;
+    const pad = (annotation.size || 5) / 2;
+    const minX = points.reduce((min, point) => Math.min(min, point.x), Infinity);
+    const minY = points.reduce((min, point) => Math.min(min, point.y), Infinity);
+    const maxX = points.reduce((max, point) => Math.max(max, point.x), -Infinity);
+    const maxY = points.reduce((max, point) => Math.max(max, point.y), -Infinity);
+    return { x: minX - pad, y: minY - pad, width: maxX - minX + pad * 2, height: maxY - minY + pad * 2 };
+  }
+  if (typeof annotation.startX !== "number") return null;
+  const pad = (annotation.size || 5) / 2;
+  const box = normalizedBox(annotation);
+  return { x: box.x - pad, y: box.y - pad, width: box.width + pad * 2, height: box.height + pad * 2 };
+}
+
+// Hit shapes follow what the annotation visually occupies: strokes test
+// against the stroked path, filled/area shapes against their interior, and
+// outlines only against a band around the border (so a big outline rect
+// doesn't swallow every copy underneath it).
+function annotationHitTest(annotation, point, context, pad) {
+  if (annotation.type === "pen") {
+    const points = annotation.points || [];
+    const reach = (annotation.size || 5) / 2 + pad;
+    if (!points.length) return false;
+    if (points.length === 1) return Math.hypot(point.x - points[0].x, point.y - points[0].y) <= reach;
+    for (let index = 1; index < points.length; index += 1) {
+      if (distanceToSegment(point, points[index - 1], points[index]) <= reach) return true;
+    }
+    return false;
+  }
+  if (annotation.type === "line" || annotation.type === "arrow") {
+    const reach = (annotation.size || 5) / 2 + pad + (annotation.type === "arrow" ? 4 : 0);
+    return distanceToSegment(
+      point,
+      { x: annotation.startX, y: annotation.startY },
+      { x: annotation.endX, y: annotation.endY },
+    ) <= reach;
+  }
+  if (annotation.type === "text") {
+    return pointInBox(point, textAnnotationBounds(annotation, context), pad);
+  }
+  if (annotation.type === "number") {
+    const radius = Math.max(10, annotation.radius || 18);
+    return Math.hypot(point.x - annotation.x, point.y - annotation.y) <= radius + pad;
+  }
+  if (annotation.type === "blur") {
+    return pointInBox(point, normalizedBox(annotation), pad);
+  }
+  if (annotation.type === "shape") {
+    const box = normalizedBox(annotation);
+    const stroke = (annotation.size || 5) / 2;
+    if (annotation.shape === "oval") {
+      const centerX = box.x + box.width / 2;
+      const centerY = box.y + box.height / 2;
+      const inside = (radiusX, radiusY) => radiusX > 0 && radiusY > 0
+        && ((point.x - centerX) / radiusX) ** 2 + ((point.y - centerY) / radiusY) ** 2 <= 1;
+      if (annotation.mode === "outline") {
+        return inside(box.width / 2 + stroke + pad, box.height / 2 + stroke + pad)
+          && !inside(box.width / 2 - stroke - pad, box.height / 2 - stroke - pad);
+      }
+      return inside(box.width / 2 + pad, box.height / 2 + pad);
+    }
+    if (annotation.mode === "outline") {
+      return pointInBox(point, box, stroke + pad) && !pointInBox(point, box, -(stroke + pad));
+    }
+    return pointInBox(point, box, pad);
+  }
+  return false;
+}
+
+/// Topmost annotation under the cursor (crop is positional, never copied).
+function annotationAtPoint(annotations, point, context) {
+  const pad = Math.max(6, context.canvas.width / 250);
+  for (let index = annotations.length - 1; index >= 0; index -= 1) {
+    const annotation = annotations[index];
+    if (!annotation || annotation.type === "crop") continue;
+    if (annotationHitTest(annotation, point, context, pad)) return index;
+  }
+  return -1;
+}
+
+function translateAnnotation(annotation, dx, dy) {
+  const moved = { ...annotation };
+  if (Array.isArray(annotation.points)) {
+    moved.points = annotation.points.map((point) => ({ ...point, x: point.x + dx, y: point.y + dy }));
+  }
+  if (typeof moved.startX === "number") {
+    moved.startX += dx;
+    moved.endX += dx;
+    moved.startY += dy;
+    moved.endY += dy;
+  }
+  if (typeof moved.x === "number") {
+    moved.x += dx;
+    moved.y += dy;
+  }
+  return moved;
+}
+
+function annotationLabel(annotation) {
+  if (annotation?.type === "shape") {
+    const shape = annotation.shape === "oval" ? "oval" : "rectangle";
+    const mode = annotation.mode === "spotlight" ? "highlight "
+      : annotation.mode === "marker" ? "highlighter "
+        : annotation.mode === "solid" ? "solid " : "";
+    return `${mode}${shape}`;
+  }
+  return {
+    pen: "pen stroke",
+    line: "line",
+    arrow: "arrow",
+    text: "text",
+    number: "number badge",
+    blur: "blur region",
+  }[annotation?.type] || "annotation";
+}
+
+function drawHoverOutline(context, annotation) {
+  const bounds = annotationDisplayBounds(annotation, context);
+  if (!bounds) return;
+  const pad = Math.max(4, context.canvas.width / 400);
+  context.save();
+  context.setLineDash([5, 4]);
+  context.lineWidth = Math.max(1.25, context.canvas.width / 1200);
+  context.strokeStyle = "rgba(147, 197, 253, 0.85)";
+  context.strokeRect(bounds.x - pad, bounds.y - pad, bounds.width + pad * 2, bounds.height + pad * 2);
+  context.restore();
+}
+
+/// Normalized start/end box clamped to the canvas.
+function annotationBounds(annotation, canvas) {
+  const left = Math.max(0, Math.min(annotation.startX, annotation.endX));
+  const top = Math.max(0, Math.min(annotation.startY, annotation.endY));
+  const right = Math.min(canvas.width, Math.max(annotation.startX, annotation.endX));
+  const bottom = Math.min(canvas.height, Math.max(annotation.startY, annotation.endY));
+  return {
+    x: Math.round(left),
+    y: Math.round(top),
+    width: Math.max(0, Math.round(right - left)),
+    height: Math.max(0, Math.round(bottom - top)),
+  };
+}
+
+// Deterministic PRNG: blur noise must be identical on every redraw (and in
+// the exported file) for a given annotation.
+function mulberry32(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function contrastColorFor(color) {
+  const hex = String(color || "").trim();
+  const match = /^#?([0-9a-f]{6})$/iu.exec(hex.length === 4 ? `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}` : hex);
+  if (!match) return "#f8fafc";
+  const value = parseInt(match[1], 16);
+  const r = (value >> 16) & 0xff;
+  const g = (value >> 8) & 0xff;
+  const b = value & 0xff;
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.62 ? "#0b1018" : "#f8fafc";
+}
+
+function colorWithAlpha(color, alpha) {
+  const hex = String(color || "").trim();
+  const normalized = /^#[0-9a-f]{3}$/iu.test(hex)
+    ? `#${hex[1]}${hex[1]}${hex[2]}${hex[2]}${hex[3]}${hex[3]}`
+    : hex;
+  const match = /^#([0-9a-f]{6})$/iu.exec(normalized);
+  if (!match) return color;
+  const value = parseInt(match[1], 16);
+  return `rgba(${(value >> 16) & 0xff}, ${(value >> 8) & 0xff}, ${value & 0xff}, ${alpha})`;
+}
+
+function resolveTextCardStyle(bgOption, accent) {
+  if (bgOption === "dark") return { bg: "rgba(8, 11, 17, 0.92)", textColor: accent };
+  if (bgOption === "light") {
+    // Near-white accents would vanish on the light card.
+    return {
+      bg: "rgba(248, 250, 252, 0.95)",
+      textColor: contrastColorFor(accent) === "#0b1018" ? "#0b1018" : accent,
+    };
+  }
+  if (bgOption === "accent") return { bg: accent, textColor: contrastColorFor(accent) };
+  return { bg: null, textColor: accent };
+}
+
+// Destructive redaction: pixel data is destroyed by downscaling (block
+// average or iterative resampling), then seeded noise is mixed in so the
+// region cannot be deconvolved back to the original, while still reading as
+// a smooth blur next to the rest of the image.
+function applyBlurAnnotation(context, annotation) {
+  const canvas = context.canvas;
+  const region = annotationBounds(annotation, canvas);
+  if (region.width < 3 || region.height < 3) return;
+  const power = Math.min(5, Math.max(1, annotation.power || 3));
+  const strategy = annotation.strategy || "pixelate";
+  const scratch = document.createElement("canvas");
+  const scratchContext = scratch.getContext("2d");
+  if (strategy === "pixelate") {
+    const block = Math.max(4, Math.round((Math.max(canvas.width, canvas.height) / 240) * power * 2.4));
+    scratch.width = Math.max(1, Math.round(region.width / block));
+    scratch.height = Math.max(1, Math.round(region.height / block));
+    scratchContext.imageSmoothingEnabled = true;
+    scratchContext.drawImage(canvas, region.x, region.y, region.width, region.height, 0, 0, scratch.width, scratch.height);
+    context.save();
+    context.imageSmoothingEnabled = false;
+    context.drawImage(scratch, 0, 0, scratch.width, scratch.height, region.x, region.y, region.width, region.height);
+    context.restore();
+  } else {
+    // smooth/static: two down/upscale bounces approximate a gaussian.
+    const factor = 1.6 + power * 1.7;
+    scratch.width = Math.max(1, Math.round(region.width / factor));
+    scratch.height = Math.max(1, Math.round(region.height / factor));
+    scratchContext.imageSmoothingEnabled = true;
+    scratchContext.drawImage(canvas, region.x, region.y, region.width, region.height, 0, 0, scratch.width, scratch.height);
+    const bounce = document.createElement("canvas");
+    bounce.width = Math.max(1, Math.round(scratch.width / 2));
+    bounce.height = Math.max(1, Math.round(scratch.height / 2));
+    const bounceContext = bounce.getContext("2d");
+    bounceContext.imageSmoothingEnabled = true;
+    bounceContext.drawImage(scratch, 0, 0, scratch.width, scratch.height, 0, 0, bounce.width, bounce.height);
+    context.save();
+    context.imageSmoothingEnabled = true;
+    context.drawImage(bounce, 0, 0, bounce.width, bounce.height, region.x, region.y, region.width, region.height);
+    context.restore();
+  }
+  const noiseAmplitude = strategy === "static" ? 26 + power * 9 : 7 + power * 3;
+  const random = mulberry32(annotation.seed || 1);
+  const imageData = context.getImageData(region.x, region.y, region.width, region.height);
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    const noise = (random() - 0.5) * 2 * noiseAmplitude;
+    data[index] += noise;
+    data[index + 1] += noise;
+    data[index + 2] += noise;
+  }
+  context.putImageData(imageData, region.x, region.y);
+}
+
+function traceShapePath(context, annotation) {
+  context.beginPath();
+  if (annotation.shape === "oval") {
+    const centerX = (annotation.startX + annotation.endX) / 2;
+    const centerY = (annotation.startY + annotation.endY) / 2;
+    const radiusX = Math.abs(annotation.endX - annotation.startX) / 2;
+    const radiusY = Math.abs(annotation.endY - annotation.startY) / 2;
+    context.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2);
+  } else {
+    const x = Math.min(annotation.startX, annotation.endX);
+    const y = Math.min(annotation.startY, annotation.endY);
+    context.rect(x, y, Math.abs(annotation.endX - annotation.startX), Math.abs(annotation.endY - annotation.startY));
+  }
+}
+
+// All spotlight shapes share one dim pass: the canvas (post-blur) is copied,
+// everything dims once, and each highlighted region is restored from the
+// copy — several spotlights never double-dim each other.
+function applySpotlightPass(context, spotlights) {
+  if (!spotlights.length) return;
+  const canvas = context.canvas;
+  const copy = document.createElement("canvas");
+  copy.width = canvas.width;
+  copy.height = canvas.height;
+  copy.getContext("2d").drawImage(canvas, 0, 0);
+  context.save();
+  context.fillStyle = "rgba(4, 7, 12, 0.62)";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  spotlights.forEach((annotation) => {
+    context.save();
+    traceShapePath(context, annotation);
+    context.clip();
+    context.drawImage(copy, 0, 0);
+    context.restore();
+    context.save();
+    traceShapePath(context, annotation);
+    context.lineWidth = Math.max(1.5, canvas.width / 1100);
+    context.strokeStyle = "rgba(248, 250, 252, 0.55)";
+    context.stroke();
+    context.restore();
+  });
+  context.restore();
+}
+
+function drawCropOverlay(context, crop) {
+  const canvas = context.canvas;
+  const region = annotationBounds(crop, canvas);
+  context.save();
+  context.beginPath();
+  context.rect(0, 0, canvas.width, canvas.height);
+  context.rect(region.x, region.y, region.width, region.height);
+  context.fillStyle = "rgba(3, 5, 9, 0.62)";
+  context.fill("evenodd");
+  context.setLineDash([7, 5]);
+  context.lineWidth = Math.max(1.5, canvas.width / 900);
+  context.strokeStyle = "rgba(248, 250, 252, 0.9)";
+  context.strokeRect(region.x, region.y, region.width, region.height);
+  context.restore();
+}
+
+function drawTextAnnotation(context, annotation) {
+  const fontSize = annotation.size || 24;
+  const lines = String(annotation.text || "").split("\n");
+  context.save();
+  context.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
+  context.textBaseline = "top";
+  const lineHeight = Math.round(fontSize * 1.25);
+  const textWidth = lines.reduce((max, line) => Math.max(max, context.measureText(line).width), 0);
+  if (annotation.bg) {
+    const paddingX = Math.round(fontSize * 0.45);
+    const paddingY = Math.round(fontSize * 0.3);
+    const boxHeight = lineHeight * lines.length + paddingY * 2;
+    context.beginPath();
+    if (typeof context.roundRect === "function") {
+      context.roundRect(annotation.x - paddingX, annotation.y - paddingY, textWidth + paddingX * 2, boxHeight, Math.min(10, fontSize * 0.4));
+    } else {
+      context.rect(annotation.x - paddingX, annotation.y - paddingY, textWidth + paddingX * 2, boxHeight);
+    }
+    context.fillStyle = annotation.bg;
+    context.fill();
+  }
+  lines.forEach((line, index) => {
+    const y = annotation.y + index * lineHeight;
+    if (!annotation.bg) {
+      // Bare text gets a contrast halo so it survives any backdrop.
+      context.lineWidth = Math.max(2, fontSize / 9);
+      context.lineJoin = "round";
+      context.strokeStyle = contrastColorFor(annotation.color) === "#f8fafc"
+        ? "rgba(248, 250, 252, 0.9)"
+        : "rgba(5, 8, 13, 0.85)";
+      context.strokeText(line, annotation.x, y);
+    }
+    context.fillStyle = annotation.textColor || annotation.color || "#ef4444";
+    context.fillText(line, annotation.x, y);
+  });
+  context.restore();
+}
+
+function drawNumberAnnotation(context, annotation) {
+  const radius = Math.max(10, annotation.radius || 18);
+  context.save();
+  context.beginPath();
+  context.arc(annotation.x, annotation.y, radius, 0, Math.PI * 2);
+  context.fillStyle = annotation.color || "#ef4444";
+  context.fill();
+  context.lineWidth = Math.max(2, radius * 0.14);
+  context.strokeStyle = "rgba(248, 250, 252, 0.92)";
+  context.stroke();
+  context.fillStyle = contrastColorFor(annotation.color || "#ef4444");
+  context.font = `800 ${Math.round(radius * 1.05)}px Inter, system-ui, sans-serif`;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(String(annotation.value || 1), annotation.x, annotation.y + radius * 0.05);
+  context.restore();
+}
+
 function drawAnnotation(context, annotation) {
   if (!annotation) return;
+  if (annotation.type === "text") {
+    drawTextAnnotation(context, annotation);
+    return;
+  }
+  if (annotation.type === "number") {
+    drawNumberAnnotation(context, annotation);
+    return;
+  }
   context.save();
   context.strokeStyle = annotation.color || "#ef4444";
   context.fillStyle = annotation.color || "#ef4444";
@@ -1255,49 +2256,26 @@ function drawAnnotation(context, annotation) {
       points.slice(1).forEach((point) => context.lineTo(point.x, point.y));
       context.stroke();
     }
-  } else if (annotation.type === "rect") {
-    const x = Math.min(annotation.startX, annotation.endX);
-    const y = Math.min(annotation.startY, annotation.endY);
-    const width = Math.abs(annotation.endX - annotation.startX);
-    const height = Math.abs(annotation.endY - annotation.startY);
-    context.strokeRect(x, y, width, height);
-  } else if (annotation.type === "circle") {
-    const x = (annotation.startX + annotation.endX) / 2;
-    const y = (annotation.startY + annotation.endY) / 2;
-    const radiusX = Math.abs(annotation.endX - annotation.startX) / 2;
-    const radiusY = Math.abs(annotation.endY - annotation.startY) / 2;
+  } else if (annotation.type === "line") {
     context.beginPath();
-    context.ellipse(x, y, radiusX, radiusY, 0, 0, Math.PI * 2);
+    context.moveTo(annotation.startX, annotation.startY);
+    context.lineTo(annotation.endX, annotation.endY);
     context.stroke();
   } else if (annotation.type === "arrow") {
     drawArrow(context, annotation.startX, annotation.startY, annotation.endX, annotation.endY, annotation.size || 5);
-  } else if (annotation.type === "text") {
-    // Text sits on a solid card so it stays readable for humans and for AI
-    // agents consuming the annotated image.
-    const fontSize = annotation.size || 24;
-    context.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
-    const paddingX = Math.round(fontSize * 0.5);
-    const paddingY = Math.round(fontSize * 0.32);
-    const textWidth = context.measureText(annotation.text).width;
-    const boxX = annotation.x - paddingX;
-    const boxY = annotation.y - fontSize - paddingY;
-    const boxWidth = textWidth + paddingX * 2;
-    const boxHeight = fontSize + paddingY * 2;
-    const radius = Math.min(10, boxHeight / 3);
-    context.beginPath();
-    if (typeof context.roundRect === "function") {
-      context.roundRect(boxX, boxY, boxWidth, boxHeight, radius);
+  } else if (annotation.type === "shape") {
+    if (annotation.mode === "solid") {
+      traceShapePath(context, annotation);
+      context.fill();
+    } else if (annotation.mode === "marker") {
+      // Highlighter: translucent color wash over the content.
+      context.fillStyle = colorWithAlpha(annotation.color || "#f59e0b", 0.38);
+      traceShapePath(context, annotation);
+      context.fill();
     } else {
-      context.rect(boxX, boxY, boxWidth, boxHeight);
+      traceShapePath(context, annotation);
+      context.stroke();
     }
-    context.fillStyle = "rgba(9, 11, 16, 0.88)";
-    context.fill();
-    context.lineWidth = Math.max(2, fontSize / 12);
-    context.strokeStyle = annotation.color || "#ef4444";
-    context.stroke();
-    context.fillStyle = "#f8fafc";
-    context.textBaseline = "alphabetic";
-    context.fillText(annotation.text, annotation.x, annotation.y - paddingY / 2);
   }
 
   context.restore();
@@ -1336,12 +2314,6 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
     user-select: none;
   }
 
-  /* The annotation editor window is opaque (native shadow, no transparent
-     gutter), so the page itself paints the editor background full-bleed. */
-  html[data-snipping-floating="editor"],
-  html[data-snipping-floating="editor"] body {
-    background: #05070b !important;
-  }
 `;
 
 const FloatingButton = styled.button`
@@ -1380,12 +2352,12 @@ const FloatingButton = styled.button`
   }
 `;
 
-// Full-bleed: the native window is opaque and draws its own shadow, so the
-// editor paints edge to edge with no gutter that could leak through.
+// The native window is transparent; the rounded editor card paints the whole
+// viewport and macOS derives the window shadow from its alpha.
 const EditorViewport = styled.div`
   width: 100vw;
   height: 100vh;
-  background: #05070b;
+  background: transparent;
 `;
 
 const EditorWindowRoot = styled.main`
@@ -1394,6 +2366,8 @@ const EditorWindowRoot = styled.main`
   width: 100%;
   height: 100%;
   overflow: hidden;
+  border: 1px solid rgba(230, 236, 245, 0.14);
+  border-radius: 14px;
   background: #05070b;
   color: #f8fafc;
   font-family:
@@ -1573,7 +2547,8 @@ const EditorStage = styled.section`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 12px 12px 20px 52px;
+  /* Bottom padding clears the floating options bar. */
+  padding: 12px 12px 56px 52px;
   background:
     radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
@@ -1583,9 +2558,12 @@ const EditorStage = styled.section`
     max-width: 100%;
     max-height: 100%;
     border-radius: 8px;
+    /* Crisp capture edge: a 1px light hairline ringed by a 1px dark halo
+       reads clearly against the dark stage and against light screenshots. */
     box-shadow:
-      0 18px 54px rgba(0, 0, 0, 0.5),
-      0 0 0 1px rgba(230, 236, 245, 0.09);
+      0 0 0 1px rgba(230, 236, 245, 0.45),
+      0 0 0 2px rgba(2, 4, 8, 0.95),
+      0 18px 54px rgba(0, 0, 0, 0.55);
     cursor: crosshair;
   }
 `;
@@ -1640,6 +2618,57 @@ const EditorRailDivider = styled.span`
   background: rgba(230, 236, 245, 0.12);
 `;
 
+// Bottom pill twin of the rail: always-available style controls plus the
+// active tool's own options, centered under the canvas.
+const EditorOptionsBar = styled.nav`
+  position: absolute;
+  left: 50%;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: calc(100% - 80px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 6px 12px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  background: rgba(10, 13, 19, 0.86);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  transform: translateX(-50%);
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+const EditorBarDivider = styled.span`
+  width: 1px;
+  height: 18px;
+  flex: none;
+  background: rgba(230, 236, 245, 0.12);
+`;
+
+const EditorBarTextButton = styled.button`
+  flex: none;
+  padding: 4px 10px;
+  border: 1px solid rgba(230, 236, 245, 0.16);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.85);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &:hover {
+    color: #ffffff;
+    background: rgba(230, 236, 245, 0.1);
+  }
+`;
+
 const EditorToolGroup = styled.div`
   display: flex;
   flex: none;
@@ -1649,6 +2678,10 @@ const EditorToolGroup = styled.div`
 
   &[data-compact="true"] {
     gap: 6px;
+  }
+
+  &[data-row="true"] {
+    flex-direction: row;
   }
 `;
 
@@ -1705,6 +2738,113 @@ const ColorButton = styled.button`
       0 0 0 2px rgba(8, 10, 15, 0.95),
       0 0 0 4px var(--snip-color);
     transform: scale(1.05);
+  }
+`;
+
+// Rainbow swatch wrapping a native color input: every color is reachable
+// without widening the bar beyond one extra dot.
+const CustomColorButton = styled.label`
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid rgba(230, 236, 245, 0.25);
+  border-radius: 999px;
+  background: conic-gradient(#ef4444, #f59e0b, #22c55e, #38bdf8, #a855f7, #ef4444);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+
+  input {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  &:hover {
+    transform: scale(1.15);
+  }
+
+  &[data-active="true"] {
+    box-shadow:
+      0 0 0 2px rgba(8, 10, 15, 0.95),
+      0 0 0 4px rgba(147, 197, 253, 0.8);
+    transform: scale(1.05);
+  }
+`;
+
+// Text card background swatches: none (slashed), dark, light, accent (mirrors
+// the selected color via --snip-color).
+const TextBgButton = styled.button`
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid rgba(230, 236, 245, 0.3);
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+
+  &[data-kind="none"]::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    background: linear-gradient(
+      135deg,
+      transparent 44%,
+      rgba(239, 107, 107, 0.9) 47%,
+      rgba(239, 107, 107, 0.9) 53%,
+      transparent 56%
+    );
+  }
+
+  &[data-kind="dark"] {
+    background: #0a0e15;
+  }
+
+  &[data-kind="light"] {
+    background: #f3f5f8;
+  }
+
+  &[data-kind="accent"] {
+    background: var(--snip-color, #ef4444);
+  }
+
+  &:hover {
+    transform: scale(1.15);
+  }
+
+  &[data-active="true"] {
+    box-shadow:
+      0 0 0 2px rgba(8, 10, 15, 0.95),
+      0 0 0 4px rgba(147, 197, 253, 0.8);
+    transform: scale(1.05);
+  }
+`;
+
+// Inline text annotation editor pinned over the canvas at the click point;
+// mirrors the exact font sizing the committed annotation will render with.
+const EditorTextOverlayInput = styled.textarea`
+  position: absolute;
+  z-index: 4;
+  min-width: 60px;
+  max-width: calc(100% - 24px);
+  padding: 2px 6px;
+  border: 1.5px dashed rgba(147, 197, 253, 0.75);
+  border-radius: 6px;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+  line-height: 1.25;
+  caret-color: #93c5fd;
+
+  &::placeholder {
+    color: rgba(148, 163, 184, 0.65);
   }
 `;
 

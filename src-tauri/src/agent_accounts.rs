@@ -231,9 +231,38 @@ fn agent_accounts_profile_display_label(profile: &Value) -> String {
         .to_string()
 }
 
+/// A captured pin that shows the exact account the Default pill currently
+/// holds is pure noise — one account must never render as two pills. It is
+/// hidden (not deleted: its snapshot keeps refreshing) and reappears the
+/// moment the default home moves to a different login. The active profile is
+/// never hidden.
+fn agent_accounts_profile_is_duplicate_of_default(
+    kind: &str,
+    profile: &Value,
+    active_id: &str,
+    default_email: &str,
+) -> bool {
+    if default_email.is_empty() {
+        return false;
+    }
+    if profile.get("source").and_then(Value::as_str) != Some("captured") {
+        return false;
+    }
+    let id = profile.get("id").and_then(Value::as_str).unwrap_or_default();
+    if id == active_id {
+        return false;
+    }
+    agent_accounts_profile_email(kind, profile) == default_email
+}
+
 fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
     let (active_id, profiles) = agent_accounts_kind_entry(registry, kind);
     let default_identity = agent_accounts_profile_identity(kind, None);
+    let default_email = default_identity
+        .get("email")
+        .and_then(Value::as_str)
+        .map(agent_accounts_email_key)
+        .unwrap_or_default();
     let mut views = vec![json!({
         "id": AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
         "label": "Default",
@@ -247,6 +276,10 @@ fn agent_accounts_kind_state(registry: &Value, kind: &str) -> Value {
         "loginCommand": "",
     })];
     for profile in &profiles {
+        if agent_accounts_profile_is_duplicate_of_default(kind, profile, &active_id, &default_email)
+        {
+            continue;
+        }
         views.push(agent_accounts_profile_view(kind, profile, &active_id));
     }
     json!({ "activeProfileId": active_id, "profiles": views })
@@ -887,6 +920,44 @@ mod agent_accounts_tests {
             "dev"
         );
         assert_eq!(agent_accounts_profile_display_label(&json!({})), "Account");
+    }
+
+    #[test]
+    fn captured_duplicate_of_default_is_hidden_unless_active() {
+        let captured = json!({
+            "id": "cap-x",
+            "email": "dev@example.com",
+            "source": "captured",
+            "dir": "/nonexistent-dir",
+        });
+        assert!(agent_accounts_profile_is_duplicate_of_default(
+            "codex",
+            &captured,
+            "default",
+            "dev@example.com"
+        ));
+        // The active profile always renders, even as a duplicate.
+        assert!(!agent_accounts_profile_is_duplicate_of_default(
+            "codex",
+            &captured,
+            "cap-x",
+            "dev@example.com"
+        ));
+        // A different default identity un-hides the pin.
+        assert!(!agent_accounts_profile_is_duplicate_of_default(
+            "codex",
+            &captured,
+            "default",
+            "other@example.com"
+        ));
+        // Manual profiles are never deduped away.
+        let manual = json!({ "id": "m1", "email": "dev@example.com", "dir": "/nonexistent-dir" });
+        assert!(!agent_accounts_profile_is_duplicate_of_default(
+            "codex",
+            &manual,
+            "default",
+            "dev@example.com"
+        ));
     }
 
     #[test]

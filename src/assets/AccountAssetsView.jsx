@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { openPath } from "@tauri-apps/plugin-opener";
 import styled, { keyframes } from "styled-components";
@@ -18,6 +18,7 @@ import { InsertDriveFile } from "@styled-icons/material-rounded/InsertDriveFile"
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { OpenInFull } from "@styled-icons/material-rounded/OpenInFull";
+import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import MediaTranscriptChip from "./MediaTranscriptChip.jsx";
 import HyperframeEditor, {
@@ -869,6 +870,23 @@ function AssetsPanel({
       }
       return;
     }
+    if (action === "pin") {
+      // Re-opens the image as a draggable snip preview window; Rust reuses
+      // (shows + focuses) an existing preview for the same file, so pinning
+      // never duplicates one.
+      if (!localPath) return;
+      const key = `${action}:${id || localPath}`;
+      setBusyKey(key);
+      setActionError("");
+      try {
+        await invoke("snipping_open_snip_float", { path: localPath });
+      } catch (nextError) {
+        setActionError(nextError?.message || String(nextError || "Unable to pin asset preview."));
+      } finally {
+        setBusyKey((current) => (current === key ? "" : current));
+      }
+      return;
+    }
     const actionWorkspace = workspaceOptionForAsset(asset);
     const actionRepoPath = assetRepoPath(asset) || actionWorkspace?.rootDirectory || repoPath;
     const actionWorkspaceId = assetWorkspaceId(asset) || actionWorkspace?.id;
@@ -1128,33 +1146,14 @@ function AssetsPanel({
           })}
         </AssetWorkspaceFilters>
       )}
-      {selectedAssets.length > 0 && (
-        <AssetSelectionToolbar>
-          <strong>{selectedAssets.length} selected</strong>
-          <span>{selectedImageAssets.length} annotatable image{selectedImageAssets.length === 1 ? "" : "s"}</span>
-          <AssetBatchButton
-            data-primary="true"
-            disabled={!selectedImageAssets.length || Boolean(busyKey)}
-            onClick={() => runSelectedAssetAction("annotate")}
-            type="button"
-          >
-            <ModeEdit aria-hidden="true" />
-            <span>Annotation</span>
-          </AssetBatchButton>
-          <AssetBatchButton
-            data-danger="true"
-            disabled={Boolean(busyKey)}
-            onClick={() => runSelectedAssetAction("delete")}
-            type="button"
-          >
-            <Delete aria-hidden="true" />
-            <span>Delete</span>
-          </AssetBatchButton>
-          <AssetBatchButton disabled={Boolean(busyKey)} onClick={clearSelectedAssets} type="button">
-            Clear
-          </AssetBatchButton>
-        </AssetSelectionToolbar>
-      )}
+      <AssetSelectionDock
+        busy={Boolean(busyKey)}
+        count={selectedAssets.length}
+        imageCount={selectedImageAssets.length}
+        onAnnotate={() => runSelectedAssetAction("annotate")}
+        onClear={clearSelectedAssets}
+        onDelete={() => runSelectedAssetAction("delete")}
+      />
       {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       {!filteredItems.length ? (
         <AssetEmptyState>{loading ? "Loading assets..." : hasWorkspaceFilters ? "No assets match those workspaces." : "No assets registered yet."}</AssetEmptyState>
@@ -1189,6 +1188,7 @@ function AssetsPanel({
             const deleteCloudBusy = busyKey === `deleteCloud:${id}`;
             const viewBusy = busyKey === `view:${id}`;
             const copyBusy = busyKey === `copy:${id}`;
+            const pinBusy = busyKey === `pin:${id}`;
             const untrackBusy = busyKey === `untrack:${id}`;
             const canUpload = canRunAssetAction && !transferActive && availability.hasLocal && !availability.hasCloud && Boolean(localPath);
             const canDownload = canRunAssetAction && !transferActive && availability.hasCloud && !availability.hasLocal;
@@ -1293,6 +1293,17 @@ function AssetsPanel({
                       type="button"
                     >
                       <ContentCopy aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
+                  {canCopy && (
+                    <AssetIconButton
+                      aria-label={`Pin ${name} as a floating snip preview`}
+                      disabled={pinBusy || Boolean(busyKey && !pinBusy)}
+                      onClick={() => runAssetAction("pin", asset)}
+                      title="Pin as floating snip preview"
+                      type="button"
+                    >
+                      <PushPin aria-hidden="true" />
                     </AssetIconButton>
                   )}
                   {canUntrack && (
@@ -1624,6 +1635,10 @@ function UntrackedAssetsPanel({
         await openPath(localPath);
       } else if (action === "view") {
         await invoke("snipping_open_annotation_editor", { path: localPath });
+      } else if (action === "pin") {
+        // Draggable snip preview for this file; Rust reuses an existing
+        // preview window instead of opening a duplicate.
+        await invoke("snipping_open_snip_float", { path: localPath });
       } else if (action === "copy") {
         await invoke("diffforge_copy_asset_to_clipboard", { path: localPath });
       } else if (action === "delete") {
@@ -1731,33 +1746,14 @@ function UntrackedAssetsPanel({
           </AssetIconButton>
         </AssetHeaderActions>
       </AssetsHeader>
-      {selectedAssets.length > 0 && (
-        <AssetSelectionToolbar>
-          <strong>{selectedAssets.length} selected</strong>
-          <span>{selectedImageAssets.length} annotatable image{selectedImageAssets.length === 1 ? "" : "s"}</span>
-          <AssetBatchButton
-            data-primary="true"
-            disabled={!selectedImageAssets.length || Boolean(busyKey)}
-            onClick={() => runSelectedUntrackedAction("annotate")}
-            type="button"
-          >
-            <ModeEdit aria-hidden="true" />
-            <span>Annotation</span>
-          </AssetBatchButton>
-          <AssetBatchButton
-            data-danger="true"
-            disabled={Boolean(busyKey)}
-            onClick={() => runSelectedUntrackedAction("delete")}
-            type="button"
-          >
-            <Delete aria-hidden="true" />
-            <span>Delete</span>
-          </AssetBatchButton>
-          <AssetBatchButton disabled={Boolean(busyKey)} onClick={clearSelectedAssets} type="button">
-            Clear
-          </AssetBatchButton>
-        </AssetSelectionToolbar>
-      )}
+      <AssetSelectionDock
+        busy={Boolean(busyKey)}
+        count={selectedAssets.length}
+        imageCount={selectedImageAssets.length}
+        onAnnotate={() => runSelectedUntrackedAction("annotate")}
+        onClear={clearSelectedAssets}
+        onDelete={() => runSelectedUntrackedAction("delete")}
+      />
       {(error || actionError) && <AssetError>{actionError || error}</AssetError>}
       {!items.length ? (
         <AssetEmptyState>
@@ -1776,6 +1772,7 @@ function UntrackedAssetsPanel({
             const openBusy = busyKey === `open:${id}`;
             const viewBusy = busyKey === `view:${id}`;
             const copyBusy = busyKey === `copy:${id}`;
+            const pinBusy = busyKey === `pin:${id}`;
             const trackBusy = busyKey === `track:${id}`;
             const renameBusy = busyKey === `rename:${id}`;
             const deleteBusy = busyKey === `delete:${id}`;
@@ -1854,6 +1851,17 @@ function UntrackedAssetsPanel({
                       <ContentCopy aria-hidden="true" />
                     </AssetIconButton>
                   )}
+                  {canCopy && (
+                    <AssetIconButton
+                      aria-label={`Pin ${name} as a floating snip preview`}
+                      disabled={!localPath || pinBusy || Boolean(busyKey && !pinBusy)}
+                      onClick={() => runUntrackedAction("pin", asset)}
+                      title="Pin as floating snip preview"
+                      type="button"
+                    >
+                      <PushPin aria-hidden="true" />
+                    </AssetIconButton>
+                  )}
                   <AssetIconButton
                     aria-label={`Open ${name}`}
                     disabled={!localPath || openBusy || Boolean(busyKey && !openBusy)}
@@ -1919,6 +1927,8 @@ const AssetsSurface = styled.section`
 `;
 
 const AssetsPane = styled.div`
+  /* Anchor for the floating selection dock. */
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -2405,17 +2415,35 @@ const AssetFilterButton = styled.button`
   }
 `;
 
-const AssetSelectionToolbar = styled.div`
+/* The selection bar floats over the bottom of the grid instead of sitting in
+   flow — an in-flow bar shoves every card down the moment the first asset is
+   selected. Always mounted: visibility is animated (slide + fade) so it can
+   play an exit, with the visibility flip delayed past the transition so it
+   stays clickable right up until it's gone. */
+const AssetSelectionDockBar = styled.div`
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  z-index: 12;
   display: flex;
-  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: center;
   gap: 7px;
-  min-width: 0;
-  padding: 8px 9px;
-  border: 1px solid rgba(45, 212, 191, 0.18);
-  border-radius: 9px;
-  background: rgba(13, 148, 136, 0.1);
+  max-width: calc(100% - 32px);
+  padding: 8px 12px;
+  border: 1px solid rgba(45, 212, 191, 0.22);
+  border-radius: 999px;
+  background: rgba(9, 16, 22, 0.9);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.45);
+  transform: translate(-50%, 0);
+  opacity: 1;
+  visibility: visible;
+  transition:
+    transform 340ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 240ms ease,
+    visibility 0s 0s;
 
   strong {
     color: rgba(204, 251, 241, 0.96);
@@ -2429,7 +2457,60 @@ const AssetSelectionToolbar = styled.div`
     font-size: 10px;
     font-weight: 780;
   }
+
+  &[data-visible="false"] {
+    transform: translate(-50%, calc(100% + 24px));
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      transform 240ms cubic-bezier(0.5, 0, 0.75, 0.4),
+      opacity 200ms ease,
+      visibility 0s 240ms;
+  }
 `;
+
+/* Floating batch-action dock for both asset views. Renders the last
+   non-empty counts while animating out so "0 selected" never flashes, and
+   every button hard-disables the moment the selection empties. */
+function AssetSelectionDock({ busy, count, imageCount, onAnnotate, onClear, onDelete }) {
+  const lastCountsRef = useRef({ count: 0, imageCount: 0 });
+  if (count > 0) {
+    lastCountsRef.current = { count, imageCount };
+  }
+  const visible = count > 0;
+  const shown = visible ? { count, imageCount } : lastCountsRef.current;
+  return (
+    <AssetSelectionDockBar
+      aria-hidden={visible ? "false" : "true"}
+      data-visible={visible ? "true" : "false"}
+    >
+      <strong>{shown.count} selected</strong>
+      <span>{shown.imageCount} annotatable image{shown.imageCount === 1 ? "" : "s"}</span>
+      <AssetBatchButton
+        data-primary="true"
+        disabled={!visible || !imageCount || busy}
+        onClick={onAnnotate}
+        type="button"
+      >
+        <ModeEdit aria-hidden="true" />
+        <span>Annotation</span>
+      </AssetBatchButton>
+      <AssetBatchButton
+        data-danger="true"
+        disabled={!visible || busy}
+        onClick={onDelete}
+        type="button"
+      >
+        <Delete aria-hidden="true" />
+        <span>Delete</span>
+      </AssetBatchButton>
+      <AssetBatchButton disabled={!visible || busy} onClick={onClear} type="button">
+        Clear
+      </AssetBatchButton>
+    </AssetSelectionDockBar>
+  );
+}
 
 const AssetBatchButton = styled.button`
   display: inline-flex;
@@ -2715,6 +2796,9 @@ const AssetSelectButton = styled.button.attrs({ "data-asset-select": "true" })`
   }
 `;
 
+/* Same glass-pill chrome as the floating snip previews (FloatActionBar in
+   SnippingQuickAccess): one dark rounded pill, borderless round icon buttons
+   that tint on hover instead of carrying their own boxes. */
 const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   position: absolute;
   right: auto;
@@ -2724,23 +2808,59 @@ const AssetCardActions = styled.div.attrs({ "data-asset-actions": "true" })`
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 4px;
+  gap: 3px;
   max-width: calc(100% - 14px);
-  padding: 4px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
+  padding: 4px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 999px;
-  background: rgba(2, 6, 23, 0.58);
+  background: rgba(7, 10, 16, 0.88);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
   opacity: 0;
   pointer-events: none;
-  transform: translate(-50%, 5px);
-  transition: opacity 130ms ease, transform 130ms ease;
-  backdrop-filter: blur(10px);
+  transform: translate(-50%, 6px);
+  transition: opacity 160ms ease, transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+  backdrop-filter: blur(12px);
 
   button {
     width: 26px;
     height: 26px;
-    background: rgba(2, 6, 23, 0.88);
-    backdrop-filter: blur(8px);
+    border: 0;
+    border-radius: 999px;
+    color: rgba(248, 250, 252, 0.82);
+    background: transparent;
+    backdrop-filter: none;
+    transition: background 120ms ease, color 120ms ease;
+  }
+
+  button svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  button:hover:not(:disabled),
+  button:focus-visible {
+    border: 0;
+    color: #ffffff;
+    background: rgba(125, 176, 255, 0.22);
+  }
+
+  button[data-primary="true"]:hover:not(:disabled) {
+    color: #06121f;
+    background: rgba(45, 212, 191, 0.85);
+  }
+
+  button[data-warning="true"]:hover:not(:disabled) {
+    color: #1f1304;
+    background: rgba(251, 191, 36, 0.82);
+  }
+
+  button[data-danger="true"]:hover:not(:disabled) {
+    color: #ffffff;
+    background: rgba(214, 69, 69, 0.85);
+  }
+
+  button:disabled {
+    opacity: 0.4;
   }
 `;
 

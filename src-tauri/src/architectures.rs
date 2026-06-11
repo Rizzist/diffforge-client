@@ -2846,3 +2846,52 @@ async fn architecture_graph_copy(
     .await
     .map_err(|error| format!("Architecture graph copy worker failed: {error}"))?
 }
+
+#[cfg(test)]
+mod architecture_folder_list_tests {
+    use super::*;
+
+    fn temp_workspace(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "diffforge-arch-list-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn folder_list_includes_all_subfolders_and_labels_git() {
+        let root = temp_workspace("mixed");
+        let git_repo = root.join("repo-a");
+        fs::create_dir_all(git_repo.join(".git")).unwrap();
+        fs::write(git_repo.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(root.join("plain-folder")).unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::create_dir_all(root.join(".hidden")).unwrap();
+
+        let list = architecture_repositories_from_mounts(&root, &[]);
+        let names: Vec<(String, bool)> = list
+            .repositories
+            .iter()
+            .map(|repo| (repo.name.clone(), repo.has_git))
+            .collect();
+
+        assert!(
+            names.iter().any(|(name, has_git)| name == "repo-a" && *has_git),
+            "git subfolder must be listed and labeled git: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|(name, has_git)| name == "plain-folder" && !*has_git),
+            "plain subfolder must be listed without git label: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|(name, _)| name == "node_modules" || name == ".hidden"),
+            "junk and hidden folders stay out: {names:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+}

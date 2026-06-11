@@ -7441,9 +7441,17 @@ export default function App() {
     )) || null;
   }, [architectureHubEntries]);
 
+  const architectureHubCatalogPromiseRef = useRef(null);
   const refreshArchitectureHubCatalog = useCallback((options = {}) => {
     if (architectureHubCatalogInFlightRef.current) {
-      return Promise.resolve(architectureHubRef.current.catalog);
+      if (!options.refresh) {
+        return Promise.resolve(architectureHubRef.current.catalog);
+      }
+      // A refresh must never be swallowed by an in-flight fetch: the startup
+      // fetch races workspace hydration, and dropping the post-hydration
+      // refresh latches a catalog with zero workspace groups forever.
+      const pending = architectureHubCatalogPromiseRef.current || Promise.resolve(null);
+      return pending.then(() => refreshArchitectureHubCatalog(options));
     }
     if (!options.refresh && architectureHubRef.current.catalog) {
       return Promise.resolve(architectureHubRef.current.catalog);
@@ -7457,17 +7465,23 @@ export default function App() {
       refreshing: true,
       state: current.catalog ? current.state : "loading",
     }));
-    const workspaceList = (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
-      .map((workspace) => ({
-        workspaceId: graphText(workspace?.id),
-        workspaceName: graphText(workspace?.name),
-        rootDirectory: cleanWorkspaceRootDirectory(
-          getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace?.id)
-            || defaultWorkingDirectoryRef.current,
-        ),
-      }))
-      .filter((workspace) => workspace.workspaceId && workspace.rootDirectory);
-    return invoke("cloud_mcp_architecture_hub_catalog", { workspaces: workspaceList })
+    // Callers that know the current workspace list pass it explicitly: the
+    // ref mirrors below are synced by effects declared later in this
+    // component, so during the very commit where workspaces hydrate they
+    // still hold the previous (empty) list.
+    const workspaceList = Array.isArray(options.workspaceList) && options.workspaceList.length
+      ? options.workspaceList
+      : (Array.isArray(workspacesRef.current) ? workspacesRef.current : [])
+        .map((workspace) => ({
+          workspaceId: graphText(workspace?.id),
+          workspaceName: graphText(workspace?.name),
+          rootDirectory: cleanWorkspaceRootDirectory(
+            getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace?.id)
+              || defaultWorkingDirectoryRef.current,
+          ),
+        }))
+        .filter((workspace) => workspace.workspaceId && workspace.rootDirectory);
+    const request = invoke("cloud_mcp_architecture_hub_catalog", { workspaces: workspaceList })
       .then((catalog) => {
         setArchitectureHub({
           catalog,
@@ -7490,6 +7504,8 @@ export default function App() {
       .finally(() => {
         architectureHubCatalogInFlightRef.current = false;
       });
+    architectureHubCatalogPromiseRef.current = request;
+    return request;
   }, []);
 
   const resolveArchitectureHubSyncContext = useCallback((repoPath) => {
@@ -7824,16 +7840,26 @@ export default function App() {
   // The startup catalog fetch often runs before workspaces/settings hydrate,
   // which builds (and caches) a catalog with zero workspace groups — git repo
   // entries never appear. Rebuild whenever the effective workspace list (ids
-  // + root directories) actually changes.
-  const architectureHubWorkspaceSignature = useMemo(() => (
+  // + root directories) actually changes. The list is computed from state
+  // (NOT the ref mirrors, which sync in later-declared effects and are stale
+  // during this very commit) and passed to the refresh explicitly.
+  const architectureHubWorkspaceList = useMemo(() => (
     (Array.isArray(workspaces) ? workspaces : [])
-      .map((workspace) => `${graphText(workspace?.id)}::${cleanWorkspaceRootDirectory(
-        getWorkspaceRootDirectory(workspaceSettings, workspace?.id) || defaultWorkingDirectory,
-      )}`)
-      .filter((entry) => !entry.startsWith("::"))
+      .map((workspace) => ({
+        workspaceId: graphText(workspace?.id),
+        workspaceName: graphText(workspace?.name),
+        rootDirectory: cleanWorkspaceRootDirectory(
+          getWorkspaceRootDirectory(workspaceSettings, workspace?.id) || defaultWorkingDirectory,
+        ),
+      }))
+      .filter((workspace) => workspace.workspaceId && workspace.rootDirectory)
+  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  const architectureHubWorkspaceSignature = useMemo(() => (
+    architectureHubWorkspaceList
+      .map((workspace) => `${workspace.workspaceId}::${workspace.rootDirectory}`)
       .sort()
       .join("|")
-  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  ), [architectureHubWorkspaceList]);
   const architectureHubWorkspaceSignatureRef = useRef("");
   useEffect(() => {
     if (authState !== "authenticated" || !architectureHubWorkspaceSignature) {
@@ -7843,8 +7869,16 @@ export default function App() {
       return;
     }
     architectureHubWorkspaceSignatureRef.current = architectureHubWorkspaceSignature;
-    void refreshArchitectureHubCatalog({ refresh: true });
-  }, [architectureHubWorkspaceSignature, authState, refreshArchitectureHubCatalog]);
+    void refreshArchitectureHubCatalog({
+      refresh: true,
+      workspaceList: architectureHubWorkspaceList,
+    });
+  }, [
+    architectureHubWorkspaceList,
+    architectureHubWorkspaceSignature,
+    authState,
+    refreshArchitectureHubCatalog,
+  ]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;

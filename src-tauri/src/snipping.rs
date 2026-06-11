@@ -157,6 +157,11 @@ struct SnippingState {
     /// compare their ticket and stop, so re-targeted reflows never fight.
     preview_animation_generation: Arc<AtomicU64>,
     preview_live_reflow_last_ms: Arc<AtomicU64>,
+    /// Labels of hidden, fully booted preview windows parked for instant
+    /// adoption by the next capture (webview creation + page boot paid ahead
+    /// of the capture hot path).
+    preview_pool: Arc<StdMutex<Vec<String>>>,
+    preview_pool_spawning: Arc<AtomicBool>,
 }
 
 impl SnippingState {
@@ -174,6 +179,8 @@ impl SnippingState {
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
             preview_animation_generation: Arc::new(AtomicU64::new(0)),
             preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
+            preview_pool: Arc::new(StdMutex::new(Vec::new())),
+            preview_pool_spawning: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1887,6 +1894,17 @@ fn snipping_emit_untracked_image_saved_with_toast(
     original_path: Option<String>,
     show_toast: bool,
 ) -> Result<Value, String> {
+    if show_toast {
+        // Every snip preview is its own draggable native window from the
+        // start; new captures stack in the bottom-left column. Open it FIRST
+        // — the asset item/library payload below scans the asset store, and
+        // the preview should not wait on that.
+        let app_for_preview = app.clone();
+        let preview_path = target.display().to_string();
+        let _ = app.run_on_main_thread(move || {
+            let _ = snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
+        });
+    }
     let root = diffforge_prepare_untracked_asset_root()?;
     let item = diffforge_untracked_asset_item(&root, target).ok();
     let saved_at_ms = cloud_mcp_now_ms();
@@ -1910,15 +1928,6 @@ fn snipping_emit_untracked_image_saved_with_toast(
     });
     diffforge_emit_untracked_assets_updated(app, "snip-saved", payload.get("item").cloned());
     snipping_push_recent_capture_toast(app, payload.clone());
-    if show_toast {
-        // Every snip preview is its own draggable native window from the
-        // start; new captures stack in the bottom-left column.
-        let app_for_preview = app.clone();
-        let preview_path = target.display().to_string();
-        let _ = app.run_on_main_thread(move || {
-            let _ = snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
-        });
-    }
     let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
     Ok(payload)
 }
@@ -2139,7 +2148,7 @@ fn snipping_open_annotation_editor_for_paths(
     // title bar + composer + stage padding vertically (plus the thumbnail
     // strip when editing several images). Matches the compact editor CSS.
     let chrome_width = 62.0;
-    let chrome_height = if files.len() > 1 { 138.0 } else { 102.0 };
+    let chrome_height = if files.len() > 1 { 174.0 } else { 138.0 };
     // Lean editor: cap well below the work area so the window reads as a
     // focused tool, not a second app taking over the screen.
     let (max_width, max_height) = monitor
@@ -2190,18 +2199,29 @@ fn snipping_open_annotation_editor_for_paths(
     .always_on_top(false)
     .focused(true)
     .accept_first_mouse(true)
-    // Opaque window: the webview paints the editor full-bleed and macOS draws
-    // the native shadow, so no transparent gutter can leak white edges.
-    .background_color(Color(5, 7, 11, 255))
+    // Transparent window: the webview paints a rounded editor card and macOS
+    // derives the native shadow from its alpha, so corners stay round and
+    // nothing opaque can flash white before the page's first paint.
+    .transparent(true)
+    .background_color(Color(0, 0, 0, 0))
     .visible(false)
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
     snipping_center_floating_window(app, &window);
-    window
-        .show()
-        .map_err(|error| format!("Unable to show annotation editor window: {error}"))?;
-    let _ = window.set_focus();
+    // The editor webview reveals the window itself right after its first
+    // painted frame, so the user never sees an unpainted flash. The fallback
+    // below only fires if the page fails to boot.
+    {
+        let window = window.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            if !window.is_visible().unwrap_or(false) {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        });
+    }
     Ok(json!({
         "kind": "snipping_floating_asset_window_opened",
         "label": label,
@@ -2849,6 +2869,10 @@ fn snipping_begin_area_snip_for(
     shortcut: String,
 ) -> Result<Value, String> {
     ensure_snipping_enabled(app)?;
+    // Boot the preview window for this capture while the user is still
+    // drawing the selection, so the draggable preview shows up instantly
+    // when the snip finishes.
+    snipping_warm_preview_pool(app);
     let monitors = snipping_area_monitors(app)?;
 
     // Freeze every display in parallel BEFORE any overlay shows, so no
@@ -3930,44 +3954,26 @@ fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
     let _ = app.emit_to("main", SNIPPING_PREVIEW_DRAG_OVER_EVENT, payload);
 }
 
-/// Opens one snip preview as its own draggable native window. Every preview is
-/// a standalone window from the moment it is captured: new previews stack in
-/// the bottom-left column and can be dragged anywhere (over any Space) without
-/// ever changing identity.
-fn snipping_open_snip_preview_window_for(
+const SNIPPING_FLOAT_ASSIGN_EVENT: &str = "forge-snip-float-assign";
+// One parked window is enough: refilling starts the moment a capture adopts
+// it, long before the user can finish the next selection.
+const SNIPPING_FLOAT_POOL_TARGET: usize = 1;
+
+/// Builds a snip preview window (hidden) with all of its chrome and window
+/// event wiring; shared by direct opens and the warm pool.
+fn snipping_build_preview_window(
     app: &AppHandle,
-    path: &str,
-    explicit_position: Option<(f64, f64)>,
+    label: &str,
+    encoded_path: &str,
     focused: bool,
-) -> Result<Value, String> {
-    let file = diffforge_local_asset_file(path)?;
-    let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
-    let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
-    let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
-
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.show();
-        if focused {
-            let _ = existing.set_focus();
-        }
-        return Ok(json!({
-            "kind": "snip_float_opened",
-            "label": label,
-            "path": file.display().to_string(),
-            "already_open": true,
-            "width": width,
-            "height": height,
-        }));
-    }
-
-    let encoded_path = snipping_url_token(&file.display().to_string());
+) -> Result<tauri::WebviewWindow, String> {
     let window = WebviewWindowBuilder::new(
         app,
-        label.clone(),
+        label.to_string(),
         WebviewUrl::App(format!("index.html#/snipping-float/{encoded_path}").into()),
     )
     .title("Snip")
-    .inner_size(width, height)
+    .inner_size(SNIPPING_FLOAT_LOGICAL_WIDTH, SNIPPING_FLOAT_LOGICAL_HEIGHT)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
@@ -3990,21 +3996,12 @@ fn snipping_open_snip_preview_window_for(
                     | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
                     | objc2_app_kit::NSWindowCollectionBehavior::Stationary,
             );
+            // Hover must work without the window ever having been clicked: a
+            // non-key NSWindow drops mouse-moved events by default, which left
+            // the preview's hover chrome unreachable until a focusing click
+            // (and made every button cost two clicks).
+            ns_window.setAcceptsMouseMovedEvents(true);
         }
-    }
-
-    match explicit_position {
-        Some((x, y)) => {
-            let _ = window.set_position(tauri::LogicalPosition::new(x.max(0.0), y.max(0.0)));
-        }
-        None => {
-            if let Some(position) = snipping_preview_stack_position(app, width, height) {
-                let _ = window.set_position(position);
-            }
-        }
-    }
-    if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
-        paths.insert(label.clone(), file.display().to_string());
     }
     // Dragging a preview out of the bottom-left column (or closing one) frees
     // its slot and the stack re-packs; dropping one back over the column
@@ -4013,7 +4010,7 @@ fn snipping_open_snip_preview_window_for(
     // points to the main webview so drop targets can highlight.
     {
         let app_for_events = app.clone();
-        let label_for_events = label.clone();
+        let label_for_events = label.to_string();
         window.on_window_event(move |event| {
             match event {
                 WindowEvent::Moved(_) => {
@@ -4031,21 +4028,268 @@ fn snipping_open_snip_preview_window_for(
                     if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
                         sessions.remove(&label_for_events);
                     }
+                    if let Ok(mut pool) = state.preview_pool.lock() {
+                        pool.retain(|pooled| pooled != &label_for_events);
+                    }
                     schedule_snipping_preview_stack_reflow(&app_for_events);
                 }
                 _ => {}
             }
         });
     }
+    Ok(window)
+}
+
+fn snipping_position_preview_window(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    explicit_position: Option<(f64, f64)>,
+) {
+    match explicit_position {
+        Some((x, y)) => {
+            let _ = window.set_position(tauri::LogicalPosition::new(x.max(0.0), y.max(0.0)));
+        }
+        None => {
+            if let Some(position) = snipping_preview_stack_position(
+                app,
+                SNIPPING_FLOAT_LOGICAL_WIDTH,
+                SNIPPING_FLOAT_LOGICAL_HEIGHT,
+            ) {
+                let _ = window.set_position(position);
+            }
+        }
+    }
+}
+
+/// Keeps one hidden, fully booted preview window parked so the next capture
+/// shows its preview instantly: webview creation and page boot — the slow
+/// part of opening a preview on every platform — happen ahead of time, off
+/// the capture hot path.
+fn snipping_warm_preview_pool(app: &AppHandle) {
+    let state = app.state::<SnippingState>();
+    let parked = state.preview_pool.lock().map(|pool| pool.len()).unwrap_or(0);
+    if parked >= SNIPPING_FLOAT_POOL_TARGET {
+        return;
+    }
+    if state.preview_pool_spawning.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let app_for_spawn = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let label = format!(
+            "{SNIPPING_FLOAT_WINDOW_PREFIX}-pool-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let built = snipping_build_preview_window(&app_for_spawn, &label, "", false);
+        let state = app_for_spawn.state::<SnippingState>();
+        state.preview_pool_spawning.store(false, Ordering::SeqCst);
+        if built.is_ok() {
+            if let Ok(mut pool) = state.preview_pool.lock() {
+                pool.push(label);
+            }
+        }
+    });
+    if queued.is_err() {
+        state.preview_pool_spawning.store(false, Ordering::SeqCst);
+    }
+}
+
+fn snipping_take_pooled_preview_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    let state = app.state::<SnippingState>();
+    loop {
+        let label = state.preview_pool.lock().ok()?.pop()?;
+        if let Some(window) = app.get_webview_window(&label) {
+            return Some(window);
+        }
+    }
+}
+
+/// Path currently assigned to a preview window. Pool windows boot with no
+/// path in their URL and may miss the assign event if adoption races their
+/// boot; this query closes that gap on mount.
+#[tauri::command]
+fn snipping_float_assigned_path(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Value, String> {
+    let label = window.label().to_string();
+    let path = app
+        .state::<SnippingState>()
+        .preview_paths
+        .lock()
+        .map_err(|_| "Unable to lock snip preview paths.".to_string())?
+        .get(&label)
+        .cloned()
+        .unwrap_or_default();
+    Ok(json!({
+        "kind": "snip_float_assigned_path",
+        "label": label,
+        "path": path,
+    }))
+}
+
+/// Opens one snip preview as its own draggable native window. Every preview is
+/// a standalone window from the moment it is captured: new previews stack in
+/// the bottom-left column and can be dragged anywhere (over any Space) without
+/// ever changing identity. A pre-booted pooled window is adopted when one is
+/// parked, making the preview effectively instant.
+fn snipping_open_snip_preview_window_for(
+    app: &AppHandle,
+    path: &str,
+    explicit_position: Option<(f64, f64)>,
+    focused: bool,
+) -> Result<Value, String> {
+    let file = diffforge_local_asset_file(path)?;
+    let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
+    let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
+    let path_string = file.display().to_string();
+    let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
+
+    // Already previewed: token-labelled windows match by label; adopted pool
+    // windows match through the label -> path registry.
+    let existing_label = if app.get_webview_window(&label).is_some() {
+        Some(label.clone())
+    } else {
+        app.state::<SnippingState>()
+            .preview_paths
+            .lock()
+            .ok()
+            .and_then(|paths| {
+                paths.iter().find_map(|(open_label, open_path)| {
+                    (open_path == &path_string && app.get_webview_window(open_label).is_some())
+                        .then(|| open_label.clone())
+                })
+            })
+    };
+    if let Some(existing_label) = existing_label {
+        if let Some(existing) = app.get_webview_window(&existing_label) {
+            let _ = existing.show();
+            if focused {
+                let _ = existing.set_focus();
+            }
+            return Ok(json!({
+                "kind": "snip_float_opened",
+                "label": existing_label,
+                "path": path_string,
+                "already_open": true,
+                "width": width,
+                "height": height,
+            }));
+        }
+    }
+
+    // Fast path: adopt a parked pre-booted window. The webview is already
+    // running, so the preview appears the moment the capture file lands.
+    if let Some(window) = snipping_take_pooled_preview_window(app) {
+        let pooled_label = window.label().to_string();
+        snipping_position_preview_window(app, &window, explicit_position);
+        if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+            paths.insert(pooled_label.clone(), path_string.clone());
+        }
+        let _ = app.emit_to(
+            pooled_label.as_str(),
+            SNIPPING_FLOAT_ASSIGN_EVENT,
+            json!({
+                "kind": "snip_float_assign",
+                "label": pooled_label,
+                "path": path_string,
+            }),
+        );
+        let _ = window.show();
+        if focused {
+            let _ = window.set_focus();
+        }
+        snipping_start_float_hover_watcher(app);
+        snipping_warm_preview_pool(app);
+        return Ok(json!({
+            "kind": "snip_float_opened",
+            "label": pooled_label,
+            "path": path_string,
+            "width": width,
+            "height": height,
+            "pooled": true,
+        }));
+    }
+
+    let encoded_path = snipping_url_token(&path_string);
+    let window = snipping_build_preview_window(app, &label, &encoded_path, focused)?;
+    snipping_position_preview_window(app, &window, explicit_position);
+    if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+        paths.insert(label.clone(), path_string.clone());
+    }
     let _ = window.show();
+    snipping_start_float_hover_watcher(app);
+    // Park a warm window so the next capture takes the fast path.
+    snipping_warm_preview_pool(app);
 
     Ok(json!({
         "kind": "snip_float_opened",
         "label": label,
-        "path": file.display().to_string(),
+        "path": path_string,
         "width": width,
         "height": height,
     }))
+}
+
+const SNIPPING_FLOAT_HOVER_EVENT: &str = "snipping-float-hover";
+const SNIPPING_FLOAT_HOVER_POLL_MS: u64 = 120;
+static SNIPPING_FLOAT_HOVER_WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Hover state for the floating snip previews, derived from the global cursor
+/// position in Rust. Webview `:hover` only fires while macOS delivers
+/// mouse-moved events to the window, which depends on key/active status — the
+/// watcher makes the hover chrome appear whenever the cursor is over a
+/// preview, no matter which window or app has focus. One loop serves every
+/// preview and exits when the last one closes.
+fn snipping_start_float_hover_watcher(app: &AppHandle) {
+    if SNIPPING_FLOAT_HOVER_WATCHER_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut hovered_by_label: HashMap<String, bool> = HashMap::new();
+        loop {
+            sleep(Duration::from_millis(SNIPPING_FLOAT_HOVER_POLL_MS)).await;
+            let windows = app
+                .webview_windows()
+                .into_iter()
+                .filter(|(label, window)| {
+                    label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX)
+                        // Parked pool windows are hidden; they neither hover
+                        // nor keep the watcher alive on their own.
+                        && window.is_visible().unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            if windows.is_empty() {
+                SNIPPING_FLOAT_HOVER_WATCHER_ACTIVE.store(false, Ordering::Release);
+                return;
+            }
+            let cursor = app.cursor_position().ok();
+            for (label, window) in windows {
+                let hovered = cursor
+                    .as_ref()
+                    .and_then(|cursor| {
+                        let position = window.outer_position().ok()?;
+                        let size = window.outer_size().ok()?;
+                        Some(
+                            cursor.x >= f64::from(position.x)
+                                && cursor.x <= f64::from(position.x) + f64::from(size.width)
+                                && cursor.y >= f64::from(position.y)
+                                && cursor.y <= f64::from(position.y) + f64::from(size.height),
+                        )
+                    })
+                    .unwrap_or(false);
+                if hovered_by_label.insert(label.clone(), hovered) != Some(hovered) {
+                    let _ = window.emit_to(
+                        label.as_str(),
+                        SNIPPING_FLOAT_HOVER_EVENT,
+                        json!({ "label": label, "hovered": hovered }),
+                    );
+                }
+            }
+            hovered_by_label.retain(|label, _| app.get_webview_window(label).is_some());
+        }
+    });
 }
 
 #[tauri::command]

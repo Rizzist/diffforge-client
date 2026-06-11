@@ -198,29 +198,6 @@ function commitParentShas(commit) {
   return text(commit?.parents).split(/\s+/).filter(Boolean);
 }
 
-function parseCommitRefs(commit) {
-  const rawList = Array.isArray(commit?.refs) ? commit.refs : text(commit?.refs).split(",");
-  return rawList
-    .map((entry) => String(entry || "").trim())
-    .filter(Boolean)
-    .map((entry) => {
-      if (entry.startsWith("HEAD ->")) {
-        return { head: true, kind: "branch", name: entry.slice("HEAD ->".length).trim() };
-      }
-      if (entry === "HEAD") {
-        return { head: true, kind: "branch", name: "HEAD" };
-      }
-      if (entry.startsWith("tag:")) {
-        return { kind: "tag", name: entry.slice("tag:".length).trim() };
-      }
-      if (entry.includes("/")) {
-        return { kind: "remote", name: entry };
-      }
-      return { kind: "branch", name: entry };
-    })
-    .filter((ref) => ref.name);
-}
-
 function relativeCommitTime(value) {
   const timestamp = Date.parse(text(value));
   if (!Number.isFinite(timestamp)) return "";
@@ -743,26 +720,39 @@ export default function GitWorkspaceView({
     setSelectedRepoPath(repoPath);
   }, []);
 
-  const handleRepoRailWheel = useCallback((event) => {
+  // Native non-passive wheel listener: React's synthetic onWheel can be
+  // registered passively in the WKWebView, which silently drops the
+  // preventDefault and lets ancestors consume two-finger trackpad scrolls.
+  useEffect(() => {
     const rail = repoRailRef.current;
-    if (!rail || rail.scrollWidth <= rail.clientWidth + 1) return;
+    if (!rail) return undefined;
+    const handleWheel = (event) => {
+      if (rail.scrollWidth <= rail.clientWidth + 1) return;
 
-    const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
-      ? event.deltaX
-      : event.deltaY;
-    if (!delta) return;
+      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+        ? event.deltaX
+        : event.deltaY;
+      if (!delta) return;
 
-    const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
-    const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, rail.scrollLeft + delta));
-    if (nextScrollLeft === rail.scrollLeft) return;
+      const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
+      const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, rail.scrollLeft + delta));
+      if (nextScrollLeft === rail.scrollLeft) return;
 
-    event.preventDefault();
-    rail.scrollLeft = nextScrollLeft;
-  }, []);
+      event.preventDefault();
+      rail.scrollLeft = nextScrollLeft;
+    };
+    rail.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      rail.removeEventListener("wheel", handleWheel);
+    };
+  }, [repositories.length]);
 
   const handleRepoRailPointerDown = useCallback((event) => {
     const rail = repoRailRef.current;
     if (!rail || rail.scrollWidth <= rail.clientWidth + 1) return;
+    // Primary mouse button (or touch/pen contact) only: right/middle presses
+    // keep their native behavior.
+    if (event.button !== 0) return;
 
     repoRailDragRef.current = {
       active: true,
@@ -772,8 +762,6 @@ export default function GitWorkspaceView({
       startScrollLeft: rail.scrollLeft,
       startX: event.clientX,
     };
-    setRepoRailDragging(true);
-    rail.setPointerCapture?.(event.pointerId);
   }, []);
 
   const handleRepoRailPointerMove = useCallback((event) => {
@@ -782,10 +770,18 @@ export default function GitWorkspaceView({
     if (!rail || !drag.active || drag.pointerId !== event.pointerId) return;
 
     const deltaX = event.clientX - drag.startX;
-    if (Math.abs(deltaX) > 3) {
+    if (!drag.moved && Math.abs(deltaX) <= 3) {
+      // Below the drag threshold this is still a click; capturing here would
+      // retarget the click away from the repo button under the pointer.
+      return;
+    }
+    if (!drag.moved) {
       drag.moved = true;
       drag.consumeClick = true;
+      setRepoRailDragging(true);
+      rail.setPointerCapture?.(event.pointerId);
     }
+    event.preventDefault();
     rail.scrollLeft = drag.startScrollLeft - deltaX;
   }, []);
 
@@ -826,11 +822,17 @@ export default function GitWorkspaceView({
         <RepoRail
           aria-label="Git repositories"
           data-dragging={repoRailDragging ? "true" : undefined}
+          onClickCapture={(event) => {
+            // A drag that ends on top of a repo card is a scroll, not a pick.
+            if (repoRailDragRef.current.consumeClick) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+          }}
           onPointerCancel={endRepoRailDrag}
           onPointerDown={handleRepoRailPointerDown}
           onPointerMove={handleRepoRailPointerMove}
           onPointerUp={endRepoRailDrag}
-          onWheel={handleRepoRailWheel}
           ref={repoRailRef}
           role="list"
         >
@@ -956,7 +958,6 @@ export default function GitWorkspaceView({
                 const commit = row.commit;
                 const active = expandedHistoryKeys.has(commit.sha);
                 const files = Array.isArray(commit.files) ? commit.files : [];
-                const refs = parseCommitRefs(commit);
                 const relativeTime = relativeCommitTime(commit.date);
                 // The dashed line from the uncommitted-changes dot continues
                 // into the HEAD commit's dot, like VS Code.
@@ -977,24 +978,6 @@ export default function GitWorkspaceView({
                         <strong>{commit.subject}</strong>
                       </HistoryCommitLine>
                       <HistoryMeta>
-                        {refs.map((ref, refIndex) => (
-                          <HistoryRefBadge
-                            data-head={ref.head ? "true" : undefined}
-                            data-kind={ref.kind}
-                            key={`${ref.kind}:${ref.name}:${refIndex}`}
-                            style={{ "--git-ref-color": graphLaneColor(row.lane) }}
-                            title={ref.name}
-                          >
-                            <span
-                              className={`codicon ${ref.kind === "tag"
-                                ? "codicon-tag"
-                                : ref.kind === "remote"
-                                  ? "codicon-cloud"
-                                  : "codicon-git-branch"}`}
-                            />
-                            {ref.name}
-                          </HistoryRefBadge>
-                        ))}
                         {commit.authorName ? <em>{commit.authorName}</em> : null}
                         {relativeTime ? <span>{relativeTime}</span> : null}
                         <code>{commit.shortSha || shortSha(commit.sha)}</code>
@@ -1105,8 +1088,6 @@ const RepoRail = styled.div`
   border-bottom: 1px solid var(--git-vscode-border-subtle);
   cursor: grab;
   overscroll-behavior-x: contain;
-  scroll-padding-inline: 10px;
-  scroll-snap-type: x proximity;
   scrollbar-color: color-mix(in srgb, var(--git-vscode-blue) 46%, transparent) transparent;
   scrollbar-width: thin;
   touch-action: pan-x;
@@ -1136,7 +1117,7 @@ const RepoRail = styled.div`
 const RepoButton = styled.button`
   display: grid;
   flex: 0 0 auto;
-  width: min(148px, 100%);
+  width: min(128px, 100%);
   min-width: 0;
   min-height: 0;
   align-content: start;
@@ -1148,7 +1129,6 @@ const RepoButton = styled.button`
   background: var(--git-card-bg);
   box-shadow: none;
   cursor: pointer;
-  scroll-snap-align: start;
   text-align: left;
   transition:
     border-color 140ms ease,
@@ -1581,38 +1561,6 @@ const HistoryMeta = styled.div`
 
 // VS Code-style ref decorations: branch / remote / tag pills colored by the
 // commit's lane.
-const HistoryRefBadge = styled.span`
-  display: inline-flex;
-  flex: none;
-  align-items: center;
-  gap: 3px;
-  max-width: 132px;
-  height: 16px;
-  overflow: hidden;
-  padding: 0 5px 0 3px;
-  border: 1px solid color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 55%, transparent);
-  border-radius: 3px;
-  color: var(--git-vscode-text);
-  background: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 14%, transparent);
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 14px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-
-  .codicon {
-    flex: none;
-    font-size: 11px;
-    color: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 86%, var(--git-vscode-text));
-  }
-
-  &[data-head="true"] {
-    border-color: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 86%, transparent);
-    background: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 30%, transparent);
-    font-weight: 700;
-  }
-`;
-
 const HistoryToggleIcon = styled.span`
   display: grid;
   width: 18px;

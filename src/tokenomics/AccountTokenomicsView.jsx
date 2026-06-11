@@ -62,6 +62,11 @@ const AgentAccountsSection = styled.section`
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Zero min-content contribution: the tokenomics panel is a single grid
+     column, so without this a wide pill (long account email) widens the
+     whole column past the rail and clips every card. */
+  min-width: 0;
+  max-width: 100%;
   padding: 12px 14px;
   border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 12px;
@@ -76,8 +81,10 @@ const AgentAccountsSection = styled.section`
 const AgentAccountsHeader = styled.div`
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   justify-content: space-between;
-  gap: 10px;
+  gap: 4px 10px;
+  min-width: 0;
 
   strong {
     color: rgba(226, 232, 240, 0.92);
@@ -102,6 +109,7 @@ const AgentAccountsRow = styled.div`
   align-items: center;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 `;
 
 const AgentAccountsKindLabel = styled.span`
@@ -115,6 +123,8 @@ const AgentAccountPill = styled.button`
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+  max-width: 100%;
   padding: 4px 10px;
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 999px;
@@ -125,44 +135,54 @@ const AgentAccountPill = styled.button`
   cursor: pointer;
   transition: border-color 120ms ease, background 120ms ease;
 
-  /* Active account: same muted selected treatment as the account filter
-     tabs above — accent border + accent text on a faint tint, no fill. */
+  /* The active account keeps the exact unselected design — its only marker
+     is the small green dot on the left. */
   &[data-active="true"] {
-    border-color: rgba(74, 222, 128, 0.6);
-    color: rgba(134, 239, 172, 0.95);
-    background: color-mix(in srgb, rgba(74, 222, 128, 1) 12%, rgba(15, 23, 42, 0.74));
     cursor: default;
-  }
-
-  &[data-active="true"] em {
-    color: rgba(134, 239, 172, 0.65);
   }
 
   &:hover:not([data-active="true"]) {
     border-color: rgba(125, 176, 255, 0.5);
   }
 
-  html[data-forge-theme="light"] &[data-active="true"] {
-    color: rgba(22, 101, 52, 0.95);
-    background: color-mix(in srgb, rgba(34, 197, 94, 1) 10%, #ffffff);
+  /* The account name; ellipsizes so one pill can never force the panel
+     wider than a thin rail (210px floor). */
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   em {
+    overflow: hidden;
+    min-width: 0;
     color: rgba(148, 163, 184, 0.75);
     font-size: 10.5px;
     font-style: normal;
     font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
+  /* Dot semantics: green = the active account, amber = captured but needs a
+     login; authenticated inactive accounts carry no dot at all. */
   i {
+    display: none;
     width: 6px;
     height: 6px;
+    flex: none;
     border-radius: 999px;
-    background: rgba(74, 222, 128, 0.9);
     font-style: normal;
   }
 
-  i[data-auth="false"] {
+  i[data-state="active"] {
+    display: inline-block;
+    background: rgba(74, 222, 128, 0.9);
+  }
+
+  i[data-state="needs-login"] {
+    display: inline-block;
     background: rgba(251, 146, 60, 0.95);
   }
 
@@ -211,6 +231,8 @@ const AgentAccountEditorForm = styled.form`
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
+  max-width: 100%;
   padding: 7px 10px;
   border: 1px solid rgba(125, 176, 255, 0.3);
   border-radius: 10px;
@@ -219,7 +241,9 @@ const AgentAccountEditorForm = styled.form`
   font-size: 11.5px;
 
   input[type="text"] {
-    width: 140px;
+    flex: 1 1 110px;
+    min-width: 0;
+    max-width: 180px;
     padding: 4px 9px;
     border: 1px solid rgba(148, 163, 184, 0.3);
     border-radius: 999px;
@@ -405,8 +429,13 @@ function AgentAccountsManager() {
                       : `Use this account for new ${kind} terminals`}
                     type="button"
                   >
-                    <i aria-hidden="true" data-auth={profile.identity?.authReady ? "true" : "false"} />
-                    {name}
+                    <i
+                      aria-hidden="true"
+                      data-state={profile.isActive
+                        ? "active"
+                        : profile.identity?.authReady ? "none" : "needs-login"}
+                    />
+                    <span>{name}</span>
                     {email && (profile.isDefault || showEmail) ? <em>{email}</em> : null}
                     {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
                     {canEdit && (
@@ -1578,10 +1607,40 @@ const tokenomicsStore = {
   subscribers: new Set(),
 };
 
+/* Device-authoritative cloud sync of the DISPLAY model: whatever summary
+   this store renders is published verbatim so the next dashboard and other
+   devices show byte-identical numbers. Throttled here; Rust additionally
+   hash-skips unchanged summaries so steady-state ticks cost nothing. */
+const TOKENOMICS_DISPLAY_PUBLISH_MIN_MS = 15_000;
+let tokenomicsDisplayPublishLastMs = 0;
+let tokenomicsDisplayPublishTimer = 0;
+
+function publishTokenomicsDisplaySnapshot() {
+  const summary = tokenomicsStore.state.summary;
+  if (!summary || typeof summary !== "object") {
+    return;
+  }
+  const now = Date.now();
+  const wait = Math.max(0, TOKENOMICS_DISPLAY_PUBLISH_MIN_MS - (now - tokenomicsDisplayPublishLastMs));
+  if (tokenomicsDisplayPublishTimer) {
+    return;
+  }
+  tokenomicsDisplayPublishTimer = window.setTimeout(() => {
+    tokenomicsDisplayPublishTimer = 0;
+    tokenomicsDisplayPublishLastMs = Date.now();
+    const current = tokenomicsStore.state.summary;
+    if (!current || typeof current !== "object") {
+      return;
+    }
+    invoke("tokenomics_publish_display_snapshot", { summary: current }).catch(() => {});
+  }, wait);
+}
+
 function notifyTokenomicsSubscribers() {
   for (const subscriber of tokenomicsStore.subscribers) {
     subscriber(tokenomicsStore.state);
   }
+  publishTokenomicsDisplaySnapshot();
 }
 
 function updateTokenomicsStore(patchOrUpdater) {
