@@ -297,7 +297,7 @@ function architectureTodoArrayFromCollection(collection) {
           : jsonArray(collection.recent);
 }
 
-function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
+function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId, localItems = []) {
   const collections = [
     architectureWorkspaceTodoCollection(
       workspaceTodos,
@@ -327,7 +327,12 @@ function architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId) {
   ];
 
   const seen = new Set();
-  return collections.flatMap(architectureTodoArrayFromCollection).filter((item, index) => {
+  // Local-first: the Rust queue ledger items lead so listed/queued/running
+  // todos render without any cloud round-trip; cloud snapshot entries with
+  // the same id dedupe away behind them.
+  const safeLocalItems = (Array.isArray(localItems) ? localItems : [])
+    .filter((item) => item && typeof item === "object");
+  return [...safeLocalItems, ...collections.flatMap(architectureTodoArrayFromCollection)].filter((item, index) => {
     if (!item || typeof item !== "object") return false;
     const id = text(
       item.todoDispatchId
@@ -846,8 +851,8 @@ function architectureTodoPlanEntries(item, relatedTasks = []) {
   return entries;
 }
 
-function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspaceId, tasks = []) {
-  return architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId)
+function architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, workspaceId, tasks = [], localItems = []) {
+  return architectureWorkspaceTodoRawItems(workspaceTodos, workspaceId, localItems)
     .map((item, index) => {
       const status = architectureNormalizeTodoStatus(
         item.todoStatus
@@ -5252,9 +5257,35 @@ export default function ArchitectureWorkspaceView({
 	      return finishedPlanRefs.has(planRef) ? taskWithCompletedTerminalPlan(task) : task;
 	    });
 	  }, [finishedPlanRefs, tasks]);
+  // Local-first todo history: the Rust queue ledger always has the listed/
+  // queued/running todos for this workspace, even offline or before any
+  // cloud snapshot lands; the cloud snapshot only adds peer-device entries.
+  const [localTodoItems, setLocalTodoItems] = useState([]);
+  useEffect(() => {
+    const workspaceId = text(activeWorkspaceId);
+    if (!workspaceId) {
+      setLocalTodoItems([]);
+      return undefined;
+    }
+    let cancelled = false;
+    const refreshLocalTodos = () => {
+      invoke("todo_dispatch_queue_get", { workspaceId })
+        .then((result) => {
+          if (cancelled) return;
+          setLocalTodoItems(jsonArray(result?.items));
+        })
+        .catch(() => {});
+    };
+    refreshLocalTodos();
+    const intervalId = window.setInterval(refreshLocalTodos, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeWorkspaceId]);
   const todoHistoryItems = useMemo(
-    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId, visibleTasks),
-    [activeWorkspaceId, visibleTasks, workspaceTodos],
+    () => architectureTodoHistoryItemsFromWorkspaceTodos(workspaceTodos, activeWorkspaceId, visibleTasks, localTodoItems),
+    [activeWorkspaceId, localTodoItems, visibleTasks, workspaceTodos],
   );
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
   const toolbarMeta = viewMode === "scannedResult"
@@ -5431,7 +5462,6 @@ export function ArchitectureHubView({
   catalog = null,
   catalogState = "idle",
   catalogError = "",
-  catalogRefreshing = false,
   onRefreshCatalog = null,
   graphLists = {},
   onCopyGraph = null,
@@ -5501,7 +5531,7 @@ export function ArchitectureHubView({
   const toolbarMeta = [
     "Architectures · account level",
     `${repositoryCount} repo${repositoryCount === 1 ? "" : "s"}`,
-    builtAtMs ? `cached ${new Date(builtAtMs).toLocaleTimeString()}` : "",
+    builtAtMs ? `synced ${new Date(builtAtMs).toLocaleTimeString()}` : "",
     catalog && catalog.cloudIndexAvailable === false ? "cloud index offline" : "",
   ].filter(Boolean).join(" · ");
 
@@ -5512,17 +5542,9 @@ export function ArchitectureHubView({
           <ViewToggleButton data-active="true" type="button">
             Architectures
           </ViewToggleButton>
-          <ViewToggleButton
-            data-active="false"
-            disabled={catalogState === "loading" || catalogRefreshing}
-            onClick={() => {
-              if (typeof onRefreshCatalog === "function") onRefreshCatalog({ refresh: true });
-            }}
-            type="button"
-          >
-            {catalogState === "loading" || catalogRefreshing ? "Refreshing…" : "Refresh"}
-          </ViewToggleButton>
         </ViewToggleGroup>
+        {/* No refresh button: the catalog auto-syncs from the Rust store
+            watcher and cloud broadcasts; manual refresh has no remaining job. */}
         <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
       </ArchitectureToolbar>
       <ArchitecturesPanel
@@ -5784,9 +5806,24 @@ function ArchitecturesPanel({
     workspaceSelectedRepoPath,
   ]);
 
+  // Auto-load is keyed on a stable cache signature, never on the cache entry
+  // object identity: every refresh writes a fresh entry object, and
+  // identity-keyed reloads hot-looped on repos whose list failed
+  // (load → error entry → "changed" entry → load → ...). Error entries do
+  // not auto-retry at all — the error renders with manual refresh.
+  const selectedGraphListCacheSignature = selectedGraphListCacheEntry
+    ? `${text(selectedGraphListCacheEntry.state)}:${Number(selectedGraphListCacheEntry.updatedAt || 0)}`
+    : "";
+  const selectedGraphListCacheRef = useRef(null);
+  selectedGraphListCacheRef.current = selectedGraphListCacheEntry;
   useEffect(() => {
-    void loadGraphList(selectedRepoPath, { silent: Boolean(selectedGraphListCacheEntry) });
-  }, [loadGraphList, selectedGraphListCacheEntry, selectedRepoPath]);
+    const cacheEntry = selectedGraphListCacheRef.current;
+    if (cacheEntry && text(cacheEntry.state) === "error") {
+      return;
+    }
+    void loadGraphList(selectedRepoPath, { silent: Boolean(cacheEntry) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadGraphList, selectedGraphListCacheSignature, selectedRepoPath]);
 
   useEffect(() => {
     if (!selectedRepoPath || !syncWorkspaceId) {

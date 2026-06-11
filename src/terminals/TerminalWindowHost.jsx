@@ -1,97 +1,65 @@
 import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { Close } from "@styled-icons/material-rounded/Close";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 
+import {
+  ButtonBrowserIcon,
+  ButtonCloseIcon,
+  ButtonDragIcon,
+  ButtonFullscreenIcon,
+  ButtonRefreshIcon,
+  ButtonSplitHorizontalIcon,
+  ButtonSplitVerticalIcon,
+  TerminalAgentDot,
+  TerminalAgentLabel,
+  TerminalCloseButton,
+  TerminalRailControls,
+  TerminalRailIdentity,
+  TerminalRestartButton,
+  TerminalRestartDropdown,
+  TerminalRestartMenu,
+  TerminalRestartOption,
+  TerminalRestartPill,
+  TerminalStateDebugBadge,
+} from "../app/appStyles.js";
 import { measureTerminalGrid } from "./terminalResizeController";
+import {
+  TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
+  TERMINAL_WINDOW_CONTROL_EVENT,
+  TERMINAL_WINDOW_CONTROL_FULLSCREEN,
+  TERMINAL_WINDOW_CONTROL_RESTART_AS,
+  TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
+  TERMINAL_WINDOW_CONTROL_SPLIT_VERTICAL,
+  TERMINAL_WINDOW_CONTROL_UI_VIEW,
+  TERMINAL_WINDOW_META_EVENT,
+  TERMINAL_WINDOW_META_REQUEST_EVENT,
+} from "./terminalWindowBridge.js";
+import { TERMINAL_DARK_THEME, TERMINAL_LIGHT_THEME } from "./WorkspaceTerminal/index.jsx";
 
 export const TERMINAL_WINDOW_HASH = "#/terminal-window";
 export const TERMINAL_WINDOW_CLOSED_EVENT = "forge-terminal-window-closed";
 
-const TERMINAL_WINDOW_BACKGROUND = "#020304";
 const TERMINAL_WINDOW_RESIZE_DEBOUNCE_MS = 90;
+const TERMINAL_WINDOW_REATTACH_DELAY_MS = 1200;
 
 const HostShell = styled.div`
   display: grid;
-  grid-template-rows: 34px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   width: 100vw;
   height: 100vh;
   overflow: hidden;
   border: 1px solid rgba(230, 236, 245, 0.14);
   border-radius: 10px;
-  background: ${TERMINAL_WINDOW_BACKGROUND};
+  background: ${TERMINAL_DARK_THEME.background};
   clip-path: inset(0 round 10px);
-`;
 
-const HostTitleBar = styled.header`
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  padding: 0 8px 0 12px;
-  border-bottom: 1px solid rgba(230, 236, 245, 0.09);
-  background: linear-gradient(180deg, rgba(37, 42, 49, 0.92), rgba(14, 17, 21, 0.94));
-  user-select: none;
-  -webkit-app-region: drag;
-`;
-
-const HostStatusDot = styled.span`
-  width: 7px;
-  height: 7px;
-  flex: none;
-  border-radius: 999px;
-  background: ${(props) => (props.$state === "ready"
-    ? "#4bd4aa"
-    : props.$state === "error" || props.$state === "closed"
-      ? "#ff6b6b"
-      : "#ff9f43")};
-`;
-
-const HostTitle = styled.span`
-  min-width: 0;
-  overflow: hidden;
-  color: rgba(230, 236, 245, 0.88);
-  font-size: 12px;
-  font-weight: 740;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const HostTitleMeta = styled.span`
-  margin-left: auto;
-  overflow: hidden;
-  color: rgba(230, 236, 245, 0.4);
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-`;
-
-const HostCloseButton = styled.button`
-  display: inline-flex;
-  width: 24px;
-  height: 24px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: 7px;
-  color: rgba(230, 236, 245, 0.62);
-  background: transparent;
-  cursor: pointer;
-  -webkit-app-region: no-drag;
-
-  svg {
-    width: 15px;
-    height: 15px;
-  }
-
-  &:hover {
-    color: #fff;
-    background: rgba(214, 69, 69, 0.85);
+  html[data-forge-theme="light"] & {
+    border-color: rgba(24, 34, 48, 0.16);
+    background: ${TERMINAL_LIGHT_THEME.background};
   }
 `;
 
@@ -100,7 +68,11 @@ const HostTerminalSurface = styled.div`
   min-width: 0;
   min-height: 0;
   padding: 6px 4px 6px 10px;
-  background: ${TERMINAL_WINDOW_BACKGROUND};
+  background: ${TERMINAL_DARK_THEME.background};
+
+  html[data-forge-theme="light"] & {
+    background: ${TERMINAL_LIGHT_THEME.background};
+  }
 
   .xterm {
     width: 100%;
@@ -128,11 +100,27 @@ const HostNotice = styled.div`
     color: rgba(230, 236, 245, 0.9);
     font-size: 13px;
   }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(24, 34, 48, 0.62);
+    background: rgba(255, 255, 255, 0.82);
+
+    strong {
+      color: rgba(24, 34, 48, 0.92);
+    }
+  }
 `;
 
 function parseTerminalWindowParams() {
   if (typeof window === "undefined") {
-    return { paneId: "", title: "Terminal" };
+    return {
+      agentKind: "",
+      agentLabel: "Terminal",
+      colorSlot: "",
+      paneId: "",
+      theme: "",
+      title: "Terminal",
+    };
   }
 
   const hash = window.location.hash || "";
@@ -140,7 +128,11 @@ function parseTerminalWindowParams() {
   const params = new URLSearchParams(queryIndex >= 0 ? hash.slice(queryIndex + 1) : "");
 
   return {
+    agentKind: params.get("agentKind") || "",
+    agentLabel: params.get("agentLabel") || params.get("title") || "Terminal",
+    colorSlot: params.get("colorSlot") || "",
     paneId: params.get("paneId") || "",
+    theme: params.get("theme") || "",
     title: params.get("title") || "Terminal",
   };
 }
@@ -154,51 +146,92 @@ function base64ToUint8Array(value) {
   return bytes;
 }
 
-const TERMINAL_WINDOW_THEME = {
-  background: TERMINAL_WINDOW_BACKGROUND,
-  black: "#1c2026",
-  blue: "#7db0ff",
-  brightBlack: "#565f6c",
-  brightBlue: "#9cc4ff",
-  brightCyan: "#9be8df",
-  brightGreen: "#7fe0c0",
-  brightMagenta: "#d9b2ff",
-  brightRed: "#ff9191",
-  brightWhite: "#f4f7fa",
-  brightYellow: "#ffd08a",
-  cursor: "#e6ecf5",
-  cyan: "#7fd6cb",
-  foreground: "#dbe3ee",
-  green: "#4bd4aa",
-  magenta: "#c08bff",
-  red: "#ff6b6b",
-  selectionBackground: "rgba(125, 176, 255, 0.32)",
-  white: "#dbe3ee",
-  yellow: "#ffb454",
-};
-
 /**
  * Window Breakout host: renders one running terminal pane in its own native
- * window. The pane's PTY keeps living in the main process; this window is an
- * extra subscriber on the terminal output transport (scrollback replayed from
- * the headless buffer), so opening/closing it never disturbs the agent.
+ * window with the exact in-grid header bar (agent dot, name, state badge,
+ * controls). The pane's PTY keeps living in the main process; this window is
+ * an extra subscriber on the terminal output transport (scrollback replayed
+ * from the headless buffer), so opening/closing it never disturbs the agent.
+ * The grid pane in the main window broadcasts live header meta and executes
+ * the control clicks this window emits back.
  */
 export default function TerminalWindowHost() {
-  const { paneId, title } = useMemo(parseTerminalWindowParams, []);
+  const params = useMemo(parseTerminalWindowParams, []);
+  const { paneId, theme, title } = params;
   const containerRef = useRef(null);
+  const restartMenuRef = useRef(null);
   const [status, setStatus] = useState("connecting");
   const [statusDetail, setStatusDetail] = useState("");
+  const [restartMenuOpen, setRestartMenuOpen] = useState(false);
+  const [meta, setMeta] = useState(() => ({
+    agentKind: params.agentKind,
+    agentLabel: params.agentLabel,
+    agentTitle: params.agentLabel,
+    canOpenUiView: false,
+    canSplit: true,
+    colorSlot: params.colorSlot,
+    roleOptions: [],
+    stateLabel: "",
+  }));
 
   useEffect(() => {
     document.documentElement.dataset.terminalWindow = "true";
     document.body.dataset.terminalWindow = "true";
     document.body.style.background = "transparent";
+    if (theme) {
+      document.documentElement.dataset.forgeTheme = theme;
+    }
 
     return () => {
       delete document.documentElement.dataset.terminalWindow;
       delete document.body.dataset.terminalWindow;
     };
-  }, []);
+  }, [theme]);
+
+  // Live header meta from the grid pane: agent identity, state badge, and
+  // which controls are currently available.
+  useEffect(() => {
+    if (!paneId) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TERMINAL_WINDOW_META_EVENT, (event) => {
+      if (disposed || String(event.payload?.paneId || "") !== paneId) {
+        return;
+      }
+      setMeta((current) => ({ ...current, ...event.payload }));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+        emit(TERMINAL_WINDOW_META_REQUEST_EVENT, { paneId }).catch(() => {});
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [paneId]);
+
+  useEffect(() => {
+    if (!restartMenuOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event) => {
+      if (!restartMenuRef.current?.contains(event.target)) {
+        setRestartMenuOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [restartMenuOpen]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -212,6 +245,7 @@ export default function TerminalWindowHost() {
     let socket = null;
     let term = null;
     let resizeTimer = 0;
+    let reattachTimer = 0;
     let detachResize = () => {};
 
     const fitTerminal = () => {
@@ -244,34 +278,36 @@ export default function TerminalWindowHost() {
       }, TERMINAL_WINDOW_RESIZE_DEBOUNCE_MS);
     };
 
-    const run = async () => {
-      const info = await invoke("terminal_pane_runtime_info", { paneId });
-      const instanceId = Number(info?.instanceId || 0);
-      if (disposed) {
+    // Restarting the terminal (e.g. from this window's restart menu) creates
+    // a new PTY instance and drops the old transport stream; reattach instead
+    // of dying so the window survives restarts. If the pane truly closes, the
+    // main window closes this window for us.
+    const scheduleReattach = () => {
+      if (disposed || reattachTimer) {
+        return;
+      }
+      setStatus("connecting");
+      setStatusDetail("Reattaching to the terminal...");
+      reattachTimer = window.setTimeout(() => {
+        reattachTimer = 0;
+        void attach();
+      }, TERMINAL_WINDOW_REATTACH_DELAY_MS);
+    };
+
+    const attach = async () => {
+      let instanceId = 0;
+      try {
+        const info = await invoke("terminal_pane_runtime_info", { paneId });
+        instanceId = Number(info?.instanceId || 0);
+      } catch {
+        scheduleReattach();
+        return;
+      }
+      if (disposed || !term) {
         return;
       }
 
-      term = new XTerm({
-        allowProposedApi: false,
-        convertEol: false,
-        cursorBlink: true,
-        cursorStyle: "block",
-        customGlyphs: true,
-        fastScrollModifier: "alt",
-        fastScrollSensitivity: 5,
-        fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
-        fontSize: 12,
-        lineHeight: 1.0,
-        macOptionIsMeta: true,
-        scrollback: 10000,
-        smoothScrollDuration: 0,
-        theme: TERMINAL_WINDOW_THEME,
-      });
-      term.open(container);
-
-      term.onData((data) => {
-        invoke("terminal_write", { paneId, data }).catch(() => {});
-      });
+      term.reset();
 
       // Replay the headless scrollback before live frames arrive.
       try {
@@ -294,6 +330,11 @@ export default function TerminalWindowHost() {
         return;
       }
 
+      try {
+        socket?.close();
+      } catch {
+        // Old socket teardown is best-effort.
+      }
       socket = new WebSocket(endpoint.url);
       socket.binaryType = "arraybuffer";
       socket.onopen = () => {
@@ -316,30 +357,56 @@ export default function TerminalWindowHost() {
         }
         if (typeof event.data === "string") {
           setStatus("ready");
+          setStatusDetail("");
           return;
         }
         term?.write(new Uint8Array(event.data));
       };
       socket.onclose = () => {
         if (!disposed) {
-          setStatus("closed");
-          setStatusDetail("The terminal session ended or restarted. Close this window and reopen it from the grid.");
+          scheduleReattach();
         }
       };
       socket.onerror = () => {
         if (!disposed) {
-          setStatus("error");
-          setStatusDetail("Lost the terminal output connection.");
+          scheduleReattach();
         }
       };
-
-      window.addEventListener("resize", scheduleFit);
-      detachResize = () => window.removeEventListener("resize", scheduleFit);
 
       window.requestAnimationFrame(() => {
         fitTerminal();
         term?.focus();
       });
+    };
+
+    const run = async () => {
+      const isLightTheme = document.documentElement.dataset.forgeTheme === "light";
+      term = new XTerm({
+        allowProposedApi: false,
+        convertEol: false,
+        cursorBlink: true,
+        cursorStyle: "block",
+        customGlyphs: true,
+        fastScrollModifier: "alt",
+        fastScrollSensitivity: 5,
+        fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
+        fontSize: 12,
+        lineHeight: 1.0,
+        macOptionIsMeta: true,
+        scrollback: 10000,
+        smoothScrollDuration: 0,
+        theme: isLightTheme ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME,
+      });
+      term.open(container);
+
+      term.onData((data) => {
+        invoke("terminal_write", { paneId, data }).catch(() => {});
+      });
+
+      window.addEventListener("resize", scheduleFit);
+      detachResize = () => window.removeEventListener("resize", scheduleFit);
+
+      await attach();
     };
 
     run().catch((error) => {
@@ -353,6 +420,9 @@ export default function TerminalWindowHost() {
       disposed = true;
       if (resizeTimer) {
         window.clearTimeout(resizeTimer);
+      }
+      if (reattachTimer) {
+        window.clearTimeout(reattachTimer);
       }
       detachResize();
       try {
@@ -368,29 +438,155 @@ export default function TerminalWindowHost() {
     };
   }, [paneId]);
 
-  const closeWindow = () => {
+  const sendControl = useCallback((control, extra = {}) => {
+    if (!paneId) {
+      return;
+    }
+    emit(TERMINAL_WINDOW_CONTROL_EVENT, { control, paneId, ...extra }).catch(() => {});
+  }, [paneId]);
+
+  const startWindowDrag = useCallback((event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    Promise.resolve(getCurrentWindow().startDragging()).catch(() => {});
+  }, []);
+
+  const closeWindow = useCallback(() => {
     try {
       Promise.resolve(getCurrentWindow().close()).catch(() => {});
     } catch {
       // Window close is best-effort; the main grid converges via events.
     }
-  };
+  }, []);
+
+  const handleRestartButtonClick = useCallback(() => {
+    if (meta.roleOptions.length) {
+      setRestartMenuOpen((isOpen) => !isOpen);
+      return;
+    }
+    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { roleId: meta.agentKind });
+  }, [meta.agentKind, meta.roleOptions.length, sendControl]);
+
+  const stateBadgeLabel = meta.stateLabel
+    || (status === "ready" ? "Live" : status === "connecting" ? "Linking" : "Off");
+  const agentTitle = meta.agentTitle || meta.agentLabel || title;
 
   return (
     <HostShell>
-      <HostTitleBar data-tauri-drag-region>
-        <HostStatusDot $state={status} aria-hidden="true" />
-        <HostTitle data-tauri-drag-region title={title}>{title}</HostTitle>
-        <HostTitleMeta data-tauri-drag-region>Window breakout</HostTitleMeta>
-        <HostCloseButton
-          aria-label="Return terminal to the grid"
-          onClick={closeWindow}
-          title="Return to grid"
-          type="button"
-        >
-          <Close aria-hidden="true" />
-        </HostCloseButton>
-      </HostTitleBar>
+      <TerminalRestartPill data-tauri-drag-region data-terminal-control="true">
+        <TerminalRailIdentity data-tauri-drag-region>
+          <TerminalAgentDot
+            aria-hidden="true"
+            data-agent={meta.agentKind || undefined}
+            data-slot={meta.colorSlot || undefined}
+            title={agentTitle}
+          />
+          <TerminalAgentLabel data-tauri-drag-region title={agentTitle}>
+            {meta.agentLabel || title}
+          </TerminalAgentLabel>
+          <TerminalStateDebugBadge title={`Terminal state: ${stateBadgeLabel}`}>
+            {stateBadgeLabel}
+          </TerminalStateDebugBadge>
+        </TerminalRailIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <TerminalRestartButton
+            aria-label="Move window"
+            onPointerDown={startWindowDrag}
+            title="Move window"
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalCloseButton
+            aria-label="Close terminal"
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL)}
+            title="Close terminal"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
+        <TerminalRailControls data-rail-row="secondary">
+          <TerminalRestartButton
+            aria-label="Return terminal to the app"
+            aria-pressed="true"
+            data-active="true"
+            onClick={closeWindow}
+            title="Return to app"
+            type="button"
+          >
+            <OpenInNew aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Show UI view in the app"
+            disabled={!meta.canOpenUiView}
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_UI_VIEW)}
+            title={meta.canOpenUiView ? "Return to the app and show UI view" : "No thread available"}
+            type="button"
+          >
+            <ButtonBrowserIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split terminal horizontally"
+            disabled={!meta.canSplit}
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL)}
+            title={meta.canSplit ? "Split terminal horizontally (new pane opens in the app)" : "Terminal limit reached"}
+            type="button"
+          >
+            <ButtonSplitHorizontalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split terminal vertically"
+            disabled={!meta.canSplit}
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_SPLIT_VERTICAL)}
+            title={meta.canSplit ? "Split terminal vertically (new pane opens in the app)" : "Terminal limit reached"}
+            type="button"
+          >
+            <ButtonSplitVerticalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Open terminal threads in the app"
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_FULLSCREEN)}
+            title="Return to the app and open terminal threads"
+            type="button"
+          >
+            <ButtonFullscreenIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartMenu data-terminal-control="true" ref={restartMenuRef}>
+            <TerminalRestartButton
+              aria-expanded={restartMenuOpen ? "true" : "false"}
+              aria-haspopup="menu"
+              aria-label="Restart terminal"
+              onClick={handleRestartButtonClick}
+              title="Restart terminal or choose runtime"
+              type="button"
+            >
+              <ButtonRefreshIcon aria-hidden="true" />
+            </TerminalRestartButton>
+            <TerminalRestartDropdown data-open={restartMenuOpen ? "true" : "false"} role="menu">
+              {meta.roleOptions.map((option) => (
+                <TerminalRestartOption
+                  data-role={option.id}
+                  data-selected={option.id === meta.agentKind ? "true" : "false"}
+                  key={option.id}
+                  onClick={() => {
+                    setRestartMenuOpen(false);
+                    sendControl(TERMINAL_WINDOW_CONTROL_RESTART_AS, { roleId: option.id });
+                  }}
+                  role="menuitem"
+                  title={option.id === meta.agentKind ? `Restart ${option.label}` : `Restart as ${option.label}`}
+                  type="button"
+                >
+                  <strong>
+                    {option.id === meta.agentKind ? `Restart ${option.label}` : option.label}
+                  </strong>
+                </TerminalRestartOption>
+              ))}
+            </TerminalRestartDropdown>
+          </TerminalRestartMenu>
+        </TerminalRailControls>
+      </TerminalRestartPill>
       <HostTerminalSurface ref={containerRef}>
         {status !== "ready" && (
           <HostNotice>

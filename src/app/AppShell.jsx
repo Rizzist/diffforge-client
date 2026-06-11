@@ -95,9 +95,11 @@ import {
   reconcileWorkspaceNotificationSnapshot,
   reduceTerminalParkedNotificationEvent,
   reduceThreadLifecycleNotificationEvent,
+  reduceTodoCompletedNotificationEvent,
   reduceWorkspaceNotificationEvent,
   resolveWorkspaceIdForNotificationEvent,
   TERMINAL_PARKED_PROMPT_EVENT,
+  TODO_COMPLETED_NOTIFICATION_EVENT,
   WORKSPACE_NOTIFICATION_EVENT,
 } from "../notifications/workspaceNotifications";
 import {
@@ -2659,6 +2661,7 @@ const CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE = Object.freeze({
   workspaceTodos: null,
 });
 const CLOUD_WORKSPACE_CONNECT_ATTEMPTS = 8;
+const ARCHITECTURE_GRAPH_LIST_ERROR_RETRY_MS = 30_000;
 const CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS = 2200;
 const CLOUD_WORKSPACE_STATUS_POLL_MS = 650;
 const CLOUD_WORKSPACE_STAGE_ORDER = Object.freeze({
@@ -7186,6 +7189,13 @@ export default function App() {
     if (!options.refresh && existingEntry?.state === "ready") {
       return Promise.resolve(existingGraphs);
     }
+    if (
+      !options.refresh
+      && existingEntry?.state === "error"
+      && Date.now() - Number(existingEntry.updatedAt || 0) < ARCHITECTURE_GRAPH_LIST_ERROR_RETRY_MS
+    ) {
+      return Promise.resolve(existingGraphs);
+    }
 
     const requestKey = `${stateKey}::${repoKey}`;
     if (workspaceArchitectureGraphListInFlightRef.current.has(requestKey)) {
@@ -7512,6 +7522,16 @@ export default function App() {
     if (!options.refresh && existingEntry?.state === "ready") {
       return Promise.resolve(existingGraphs);
     }
+    // Error entries are cached too: without a retry-after window, every
+    // cache write re-armed the view's auto-load effect and a failing repo
+    // hot-looped loading→error forever.
+    if (
+      !options.refresh
+      && existingEntry?.state === "error"
+      && Date.now() - Number(existingEntry.updatedAt || 0) < ARCHITECTURE_GRAPH_LIST_ERROR_RETRY_MS
+    ) {
+      return Promise.resolve(existingGraphs);
+    }
     if (architectureHubGraphListInFlightRef.current.has(repoKey)) {
       return Promise.resolve(existingGraphs);
     }
@@ -7669,6 +7689,77 @@ export default function App() {
       return result;
     });
   }, [refreshArchitectureHubGraphList, resolveArchitectureHubSyncContext]);
+
+  // Architecture auto-sync: the Rust store watcher reports graph-source
+  // changes (in-app saves, agent edits in terminals, direct file edits) and
+  // the cloud broadcasts report other devices' pushes. Both funnel into one
+  // debounced pass that rebuilds the catalog and silently re-lists every
+  // cached graph list, so the tab stays current without the refresh button.
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      return undefined;
+    }
+    let disposed = false;
+    let debounceTimer = 0;
+    const staggerTimers = new Set();
+    const unlisteners = [];
+
+    const runAutoRefresh = () => {
+      debounceTimer = 0;
+      if (disposed) {
+        return;
+      }
+      void refreshArchitectureHubCatalog({ refresh: true });
+      const cachedLists = {};
+      Object.values(workspaceGraphStateRef.current || {}).forEach((stateEntry) => {
+        Object.assign(cachedLists, stateEntry?.architectureGraphLists || {});
+      });
+      Object.assign(cachedLists, architectureHubGraphStateRef.current.architectureGraphLists || {});
+      Object.values(cachedLists).slice(0, 40).forEach((entry, index) => {
+        const repoPath = graphText(entry?.repoPath);
+        if (!repoPath) {
+          return;
+        }
+        const timer = window.setTimeout(() => {
+          staggerTimers.delete(timer);
+          if (!disposed) {
+            void refreshArchitectureHubGraphList(repoPath, { refresh: true, silent: true });
+          }
+        }, 120 * index);
+        staggerTimers.add(timer);
+      });
+    };
+
+    const scheduleAutoRefresh = () => {
+      if (disposed) {
+        return;
+      }
+      if (debounceTimer) {
+        window.clearTimeout(debounceTimer);
+      }
+      debounceTimer = window.setTimeout(runAutoRefresh, 800);
+    };
+
+    ["architecture-store-changed", "cloud-mcp-workspace-architectures-updated"].forEach((eventName) => {
+      void listen(eventName, scheduleAutoRefresh).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+          return;
+        }
+        unlisteners.push(unlisten);
+      }).catch(() => {});
+    });
+
+    return () => {
+      disposed = true;
+      if (debounceTimer) {
+        window.clearTimeout(debounceTimer);
+      }
+      staggerTimers.forEach((timer) => window.clearTimeout(timer));
+      staggerTimers.clear();
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
 
   // Account-level data loads at app startup, not on first tab visit: the
   // architecture hub catalog plus a background prefetch of every repo's graph
@@ -8429,6 +8520,28 @@ export default function App() {
       if (typeof unlistenParkedPrompt === "function") {
         unlistenParkedPrompt();
       }
+    };
+  }, [workspaceNotificationReducerOptions]);
+
+  useEffect(() => {
+    // TerminalView dispatches this only when a todo finished on a terminal the
+    // user is not watching; the cue plays the SFX and flashes the workspace
+    // rail row, and the unread notification keeps the rail badge lit.
+    const handleTodoCompleted = (event) => {
+      const detail = event?.detail || {};
+      const workspaceId = String(detail.workspaceId || "").trim();
+      if (!workspaceId) {
+        return;
+      }
+      setWorkspaceNotifications((current) => reduceTodoCompletedNotificationEvent(
+        current,
+        detail,
+        workspaceNotificationReducerOptions(workspaceId),
+      ));
+    };
+    window.addEventListener(TODO_COMPLETED_NOTIFICATION_EVENT, handleTodoCompleted);
+    return () => {
+      window.removeEventListener(TODO_COMPLETED_NOTIFICATION_EVENT, handleTodoCompleted);
     };
   }, [workspaceNotificationReducerOptions]);
 
@@ -10193,6 +10306,44 @@ export default function App() {
       return null;
     }
   }, [syncAgentInstallationsToCloud]);
+
+  // Headless agent inventory: the Rust watcher probes CLI installs/updates
+  // (including ones made in terminals while this window never looked) and
+  // emits the fresh statuses; apply them like a local refresh so the agent
+  // gates and Tools tab stay current without polling.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("agent-inventory-changed", (event) => {
+      if (disposed) {
+        return;
+      }
+      const statuses = Array.isArray(event?.payload?.statuses) ? event.payload.statuses : [];
+      if (!statuses.length) {
+        return;
+      }
+      const statusMap = new Map(statuses.map((status) => [status.id, status]));
+      const nextStatuses = AGENT_PROVIDERS.map((provider) => ({
+        ...DEFAULT_AGENT_STATUSES.find((status) => status.id === provider.id),
+        ...provider,
+        ...(statusMap.get(provider.id) || {}),
+      }));
+      persistAgentStatusCache(nextStatuses);
+      setAgentStatuses(nextStatuses);
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     syncAgentInstallationsToCloud(agentStatuses, "workspace_context_ready");
@@ -24379,7 +24530,6 @@ export default function App() {
                     architectures={{
                       catalog: architectureHub.catalog,
                       catalogError: architectureHub.error,
-                      catalogRefreshing: Boolean(architectureHub.refreshing),
                       catalogState: architectureHub.state,
                       graphLists: architectureHubGraphLists,
                       onCopyGraph: copyArchitectureHubGraph,

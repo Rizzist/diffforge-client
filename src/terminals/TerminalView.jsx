@@ -101,7 +101,7 @@ import {
   getTodoQueueComposerTargetAvailability,
 } from "./todoQueueComposerGate.js";
 import { selectTodoQueueDispatchCandidate } from "./todoQueueScheduler.js";
-import { playNotificationSfx } from "../notifications/notificationSfx";
+import { TODO_COMPLETED_NOTIFICATION_EVENT } from "../notifications/workspaceNotifications";
 import { sendNativeNotification } from "../notifications/nativeNotifications";
 import {
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
@@ -1078,6 +1078,51 @@ const TerminalSurfaceSlot = styled.div`
 
   &[data-terminal-fullscreen="true"] {
     z-index: 240;
+  }
+
+  /* A dragged snip preview window is hovering this terminal. */
+  &[data-snip-drop-active="true"]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 90;
+    pointer-events: none;
+    box-shadow:
+      inset 0 0 0 2px rgba(74, 222, 128, 0.85),
+      inset 0 0 22px rgba(74, 222, 128, 0.2);
+  }
+`;
+
+// Emitted by Rust when a dragged snip preview window hovers / settles over
+// the main window; payload points are main-webview CSS coordinates.
+const SNIP_PREVIEW_DROP_EVENT = "forge-snip-preview-drop";
+const SNIP_PREVIEW_DRAG_OVER_EVENT = "forge-snip-preview-drag-over";
+
+const TODO_COMPLETION_FLASH_MS = 1600;
+
+const todoCompletionFlashPulse = keyframes`
+  0% { opacity: 0; }
+  10% { opacity: 1; }
+  55% { opacity: 0.82; }
+  100% { opacity: 0; }
+`;
+
+const TerminalTodoCompletionFlash = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  pointer-events: none;
+  border-radius: inherit;
+  box-shadow:
+    inset 0 0 0 2px rgba(74, 222, 128, 0.9),
+    inset 0 0 26px rgba(74, 222, 128, 0.24);
+  opacity: 0;
+  animation: ${todoCompletionFlashPulse} 1.6s ease-out forwards;
+
+  html[data-forge-theme="light"] & {
+    box-shadow:
+      inset 0 0 0 2px rgba(22, 163, 74, 0.85),
+      inset 0 0 22px rgba(22, 163, 74, 0.18);
   }
 `;
 
@@ -2450,8 +2495,11 @@ const WorkspaceToolRailLabel = styled.div`
 `;
 
 const OrchestratorTopNav = styled.div`
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Every tool tab shares one row no matter how many tabs exist: tabs size
+     to their labels and flex-grow to fill, shrinking (then compacting via
+     the container query below) instead of wrapping. */
+  display: flex;
+  flex-wrap: nowrap;
   min-height: 40px;
   border-bottom: 1px solid rgba(230, 236, 245, 0.08);
   background: rgba(2, 4, 8, 0.44);
@@ -2467,6 +2515,7 @@ const OrchestratorTopNav = styled.div`
 
 const OrchestratorTopButton = styled.button`
   display: inline-flex;
+  flex: 1 1 auto;
   min-width: 0;
   align-items: center;
   justify-content: center;
@@ -2527,7 +2576,9 @@ const OrchestratorTopButton = styled.button`
     background: rgba(0, 102, 204, 0.08);
   }
 
-  @container (max-width: 340px) {
+  /* Compact labels engage before full labels would start truncating with
+     all five tabs sharing one row. */
+  @container (max-width: 372px) {
     [data-label="full"][data-has-compact="true"] {
       display: none;
     }
@@ -4076,6 +4127,13 @@ const TodoQueueItemCard = styled.article`
   &:hover::before,
   &:focus-within::before {
     opacity: 0;
+  }
+
+  /* A dragged snip preview window is hovering this todo. */
+  &[data-snip-drop-active="true"] {
+    border-radius: 8px;
+    background: rgba(74, 222, 128, 0.12);
+    box-shadow: inset 0 0 0 1.5px rgba(74, 222, 128, 0.6);
   }
 
   html[data-forge-theme="light"] & {
@@ -13407,6 +13465,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
 
                     return (
                       <TodoQueueItemCard
+                        data-snip-drop-todo-id={item.id}
                         data-todo-card="true"
                         data-todo-dragging={activeDragItemId === item.id ? "true" : undefined}
                         data-todo-editing={isEditing ? "true" : undefined}
@@ -14200,25 +14259,14 @@ function TerminalView({
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
-  // cmux-style tab groups: each display row is a tab group showing one
-  // terminal at a time. Active tabs are tracked by terminal index so the
-  // selection survives rows being renumbered during drags.
+  // No terminal tabs: every terminal is always visible in the resize grid
+  // (rows split vertically, terminals within a row split horizontally) and
+  // can be dragged between positions. The empty visibility map keeps every
+  // downstream `.get(index) !== false` check truthy.
   const [activeTabTerminals, setActiveTabTerminals] = useState([]);
-  const tabVisibilityByTerminal = useMemo(() => {
-    const visibility = new Map();
-    cloneTerminalRows(activeDisplayRows).forEach((row) => {
-      const activeIndex = row.terminalIndexes.find((index) => activeTabTerminals.includes(index))
-        ?? row.terminalIndexes[0];
-      row.terminalIndexes.forEach((terminalIndex) => {
-        visibility.set(terminalIndex, terminalIndex === activeIndex);
-      });
-    });
-    return visibility;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeDisplayRowsSignature, activeTabTerminals]);
-  const visibleTabTerminalIndexes = useMemo(() => (
-    logicalTerminalIndexes.filter((terminalIndex) => tabVisibilityByTerminal.get(terminalIndex) !== false)
-  ), [logicalTerminalIndexes, tabVisibilityByTerminal]);
+  void activeTabTerminals;
+  const tabVisibilityByTerminal = useMemo(() => new Map(), []);
+  const visibleTabTerminalIndexes = logicalTerminalIndexes;
   const todoQueueVisible = Boolean(
     hasVisibleWorkspaceTerminalPanes
     && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
@@ -15051,6 +15099,46 @@ function TerminalView({
   ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
+  const activeTerminalPaneIdRef = useRef(activePaneId);
+  useEffect(() => {
+    activeTerminalPaneIdRef.current = activePaneId;
+  }, [activePaneId]);
+  const isWorkspaceRuntimeVisibleRef = useRef(Boolean(isWorkspaceRuntimeVisible));
+  useEffect(() => {
+    isWorkspaceRuntimeVisibleRef.current = Boolean(isWorkspaceRuntimeVisible);
+  }, [isWorkspaceRuntimeVisible]);
+  const [todoCompletionFlashes, setTodoCompletionFlashes] = useState({});
+  const todoCompletionFlashTimersRef = useRef(new Map());
+  const triggerTodoCompletionFlash = useCallback((paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    const flashId = Date.now();
+    setTodoCompletionFlashes((current) => ({ ...current, [safePaneId]: flashId }));
+    const existingTimer = todoCompletionFlashTimersRef.current.get(safePaneId);
+    if (existingTimer) {
+      window.clearTimeout(existingTimer);
+    }
+    const timer = window.setTimeout(() => {
+      todoCompletionFlashTimersRef.current.delete(safePaneId);
+      setTodoCompletionFlashes((current) => {
+        if (current[safePaneId] !== flashId) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        return next;
+      });
+    }, TODO_COMPLETION_FLASH_MS);
+    todoCompletionFlashTimersRef.current.set(safePaneId, timer);
+  }, []);
+  useEffect(() => () => {
+    todoCompletionFlashTimersRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    todoCompletionFlashTimersRef.current.clear();
+  }, []);
   const workspaceThreadEntry = terminalWorkspace
     ? workspaceThreads?.[terminalWorkspace.id] || null
     : null;
@@ -16411,7 +16499,6 @@ function TerminalView({
       const todoQueueDrained = Object.keys(nextPendingItems).length === 0
         && todoQueueTerminalInFlightPromptsRef.current.size === 0;
       if (todoQueueDrained) {
-        playNotificationSfx("todo.queue.drained");
         // Native notification policy + dedupe live in Rust so it also fires
         // when the queue drains without a visible window.
         void invoke("todo_dispatch_notify_queue_drained", {
@@ -16419,6 +16506,35 @@ function TerminalView({
           workspaceId: terminalWorkspace?.id || "",
           workspaceName: terminalWorkspace?.name || "",
         }).catch(() => {});
+      }
+      const completedPaneId = String(
+        pendingItem?.paneId || inFlightPrompt?.paneId || getTerminalPaneId(safeTerminalIndex) || "",
+      ).trim();
+      const watchingCompletedTerminal = Boolean(
+        isWorkspaceRuntimeVisibleRef.current
+          && completedPaneId
+          && completedPaneId === activeTerminalPaneIdRef.current
+          && typeof document !== "undefined"
+          && document.hasFocus(),
+      );
+      if (watchingCompletedTerminal) {
+        triggerTodoCompletionFlash(completedPaneId);
+      } else {
+        // AppShell turns this into a workspace notification + cue, which
+        // plays the SFX and lights the workspace rail indicator.
+        window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
+          detail: {
+            agentId: pendingItem?.targetAgentId || pendingItem?.targetRole || inFlightPrompt?.agentId || "",
+            itemId,
+            paneId: completedPaneId,
+            queueDrained: todoQueueDrained,
+            terminalIndex: safeTerminalIndex,
+            threadId: inFlightPrompt?.threadId || "",
+            todoText: completedItem?.text ? String(completedItem.text).slice(0, 200) : "",
+            todoTitle: completedItem?.title || "",
+            workspaceId: pendingItem?.workspaceId || terminalWorkspace?.id || "",
+          },
+        }));
       }
       setTodoQueueDispatchRevision((revision) => revision + 1);
       return;
@@ -16650,9 +16766,12 @@ function TerminalView({
   }, [
     recordTodoQueueRemoteCommandReceipt,
     cloudDesktopDeviceId,
+    getTerminalPaneId,
     replaceTodoQueuePendingItems,
     syncTodoQueueItemsToCloud,
     terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    triggerTodoCompletionFlash,
   ]);
 
   const getTodoQueueTerminalSendTarget = useCallback((terminalIndex, item = null, options = {}) => {
@@ -18248,6 +18367,20 @@ function TerminalView({
       : `Terminal ${terminalIndex + 1}`;
   }, [getTerminalAgent, getTerminalThread]);
 
+  const openTerminalWindowForIndex = useCallback((terminalIndex, paneId) => {
+    const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
+    return invoke("terminal_window_open", {
+      agentKind: String(getTerminalAgent(terminalIndex)?.id || ""),
+      agentLabel: getTerminalWindowTitle(terminalIndex),
+      colorSlot: getTerminalAgentColorSlot(terminalIndex),
+      height: rect?.height || null,
+      paneId,
+      theme: document.documentElement?.dataset?.forgeTheme || "",
+      title: getTerminalWindowTitle(terminalIndex),
+      width: rect?.width || null,
+    });
+  }, [getTerminalAgent, getTerminalWindowTitle]);
+
   // Window Breakout: every grid terminal becomes its own native window. The
   // PTYs never restart; the windows attach as extra output subscribers, and
   // the grid keeps slim placeholder cards until the panes return.
@@ -18268,10 +18401,7 @@ function TerminalView({
         // Sequential on purpose: parallel window creation races the macOS
         // main-thread window builder.
         // eslint-disable-next-line no-await-in-loop
-        await invoke("terminal_window_open", {
-          paneId,
-          title: getTerminalWindowTitle(terminalIndex),
-        });
+        await openTerminalWindowForIndex(terminalIndex, paneId);
         opened[paneId] = true;
       } catch {
         // Panes that have not launched a PTY yet simply stay in the grid.
@@ -18284,9 +18414,9 @@ function TerminalView({
   }, [
     closeTerminalBreakout,
     getTerminalPaneId,
-    getTerminalWindowTitle,
     hasVisibleWorkspaceTerminalPanes,
     logicalTerminalIndexes,
+    openTerminalWindowForIndex,
     terminalWorkspace?.id,
   ]);
 
@@ -18324,15 +18454,12 @@ function TerminalView({
       .then((focused) => {
         if (!focused) {
           // The window vanished without an event (e.g. crash); reopen it.
-          return invoke("terminal_window_open", {
-            paneId,
-            title: getTerminalWindowTitle(terminalIndex),
-          });
+          return openTerminalWindowForIndex(terminalIndex, paneId);
         }
         return null;
       })
       .catch(() => {});
-  }, [getTerminalWindowTitle]);
+  }, [openTerminalWindowForIndex]);
 
   // A breakout window closing (its close button, OS close, or our toggle)
   // returns the pane to the grid and re-asserts the grid's PTY size.
@@ -18796,6 +18923,155 @@ function TerminalView({
       skipCloudSync: true,
     });
   }, [cloudDesktopDeviceId, terminalWorkspace?.id, updateTodoQueueItems]);
+
+  // Snip preview windows are native always-on-top windows, so dragging one
+  // over the app never produces DOM drag events. Rust streams the preview's
+  // position instead: drag-over points light up the todo card or terminal
+  // under the preview, and the drop event routes the image into it (the
+  // preview window is consumed once a target accepts).
+  const snipDropHighlightRef = useRef(null);
+  const setSnipDropHighlightElement = useCallback((element) => {
+    if (snipDropHighlightRef.current === element) {
+      return;
+    }
+    snipDropHighlightRef.current?.removeAttribute?.("data-snip-drop-active");
+    if (element) {
+      element.setAttribute("data-snip-drop-active", "true");
+    }
+    snipDropHighlightRef.current = element || null;
+  }, []);
+  const resolveSnipDropElement = useCallback((clientX, clientY) => {
+    if (typeof document === "undefined" || typeof document.elementFromPoint !== "function") {
+      return null;
+    }
+    const element = document.elementFromPoint(clientX, clientY);
+    return element?.closest?.("[data-snip-drop-todo-id], [data-terminal-surface-slot='true']") || null;
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(SNIP_PREVIEW_DRAG_OVER_EVENT, (event) => {
+      if (disposed || !isWorkspaceRuntimeVisibleRef.current) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const clientX = Number(payload.clientX);
+      const clientY = Number(payload.clientY);
+      if (payload.done || payload.outside || !Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+        setSnipDropHighlightElement(null);
+        return;
+      }
+      setSnipDropHighlightElement(resolveSnipDropElement(clientX, clientY));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+      setSnipDropHighlightElement(null);
+    };
+  }, [resolveSnipDropElement, setSnipDropHighlightElement]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(SNIP_PREVIEW_DROP_EVENT, async (event) => {
+      if (disposed || !isWorkspaceRuntimeVisibleRef.current) {
+        return;
+      }
+      setSnipDropHighlightElement(null);
+      const payload = event?.payload || {};
+      const label = String(payload.label || "").trim();
+      const path = String(payload.path || "").trim();
+      const clientX = Number(payload.clientX);
+      const clientY = Number(payload.clientY);
+      if (!label || !path || !Number.isFinite(clientX) || !Number.isFinite(clientY)) {
+        return;
+      }
+      const target = resolveSnipDropElement(clientX, clientY);
+      if (!target) {
+        return;
+      }
+      const snipName = path.split(/[\\/]/).filter(Boolean).pop() || "snip.png";
+
+      const todoId = String(target.getAttribute("data-snip-drop-todo-id") || "").trim();
+      if (todoId) {
+        if (!todoQueueItemsRef.current.some((item) => item.id === todoId)) {
+          return;
+        }
+        let dataUrl = "";
+        try {
+          dataUrl = String(await invoke("snipping_read_asset_data_url", { path }) || "");
+        } catch {
+          return;
+        }
+        if (!dataUrl || disposed) {
+          return;
+        }
+        const mimeEnd = dataUrl.indexOf(";");
+        const droppedImage = {
+          name: snipName,
+          size: 0,
+          src: dataUrl,
+          type: dataUrl.startsWith("data:") && mimeEnd > 5 ? dataUrl.slice(5, mimeEnd) : "image/png",
+        };
+        updateTodoQueueItems((currentItems) => currentItems.map((item) => {
+          if (item.id !== todoId) {
+            return item;
+          }
+          const nextImages = [...getTodoQueueItemImages(item), droppedImage];
+          return { ...item, image: nextImages[0], images: nextImages };
+        }), { reason: "snip_preview_dropped" });
+        invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
+        return;
+      }
+
+      const terminalIndex = Number.parseInt(target.getAttribute("data-terminal-index") || "", 10);
+      if (Number.isInteger(terminalIndex)) {
+        const accepted = queueWorkspaceFileForTerminalIndex(
+          {
+            name: snipName,
+            path,
+            workspaceId: terminalWorkspace?.id || "",
+          },
+          terminalIndex,
+          "snip_preview_drop",
+        );
+        if (accepted) {
+          invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
+        }
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    queueWorkspaceFileForTerminalIndex,
+    resolveSnipDropElement,
+    setSnipDropHighlightElement,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
 
   useEffect(() => {
     const workspaceId = terminalWorkspace?.id || "";
@@ -25091,70 +25367,34 @@ function TerminalView({
                 id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
                 minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
               >
-                <TerminalTabGroupShell data-terminal-tab-group="true">
-                  <TerminalTabStrip aria-label="Terminal tabs" role="tablist">
-                    {row.terminalIndexes.map((terminalIndex) => {
-                      const tabMeta = getTerminalTabAgentMeta(getTerminalRole(terminalIndex));
-                      const tabActive = tabVisibilityByTerminal.get(terminalIndex) !== false;
-                      return (
-                        <TerminalTab
-                          aria-selected={tabActive}
-                          data-active={tabActive ? "true" : "false"}
-                          data-terminal-tab="true"
-                          key={`tab-${terminalWorkspace.id}-${terminalIndex}`}
-                          onPointerDown={(event) => handleTerminalTabPointerDown(event, terminalIndex)}
-                          role="tab"
-                          tabIndex={0}
-                          title={`${tabMeta.label} - terminal ${terminalIndex + 1}`}
-                        >
-                          <TerminalTabGlyph $color={tabMeta.color} aria-hidden="true">
-                            {tabMeta.short}
-                          </TerminalTabGlyph>
-                          <TerminalTabDot
-                            $color={terminalColorForSlot(terminalIndex)}
-                            aria-hidden="true"
-                          />
-                          <span>{tabMeta.label}</span>
-                          <TerminalTabCloseGlyph
-                            aria-label={`Close ${tabMeta.label} terminal`}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              handleCloseTerminalTab(terminalIndex);
-                            }}
-                            onPointerDown={(event) => event.stopPropagation()}
-                            role="button"
-                          >
-                            ×
-                          </TerminalTabCloseGlyph>
-                        </TerminalTab>
-                      );
-                    })}
-                    <TerminalTabAddButton
-                      aria-label="New terminal tab in this group"
-                      disabled={!splitWorkspaceTerminal}
-                      onClick={() => handleSplitTerminal({
-                        direction: "vertical",
-                        terminalIndex: row.terminalIndexes[row.terminalIndexes.length - 1],
-                      })}
-                      title="New terminal tab"
-                      type="button"
-                    >
-                      +
-                    </TerminalTabAddButton>
-                  </TerminalTabStrip>
-                  <TerminalTabContentStack data-terminal-tab-content="true">
-                    {row.terminalIndexes.map((terminalIndex) => (
-                      <TerminalPanelAnchor
-                        data-terminal-drag-placeholder={
-                          terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
-                        }
-                        data-terminal-index={terminalIndex}
-                        data-terminal-panel-anchor="true"
-                        key={`${terminalWorkspace.id}-${terminalIndex}`}
-                      />
-                    ))}
-                  </TerminalTabContentStack>
-                </TerminalTabGroupShell>
+                <ResizePanelGroup
+                  id={`workspace-terminal-row-cols-${terminalWorkspace.id}-${row.rowIndex}`}
+                  orientation="horizontal"
+                >
+                  {row.terminalIndexes.map((terminalIndex, columnOrderIndex) => (
+                    <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
+                      {columnOrderIndex > 0 && (
+                        <ResizeHandle
+                          data-direction="horizontal"
+                        />
+                      )}
+                      <ResizePanel
+                        data-terminal-column="true"
+                        defaultSize={`${100 / row.terminalIndexes.length}%`}
+                        id={`workspace-terminal-pane-${terminalWorkspace.id}-${row.rowIndex}-${terminalIndex}`}
+                        minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                      >
+                        <TerminalPanelAnchor
+                          data-terminal-drag-placeholder={
+                            terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
+                          }
+                          data-terminal-index={terminalIndex}
+                          data-terminal-panel-anchor="true"
+                        />
+                      </ResizePanel>
+                    </Fragment>
+                  ))}
+                </ResizePanelGroup>
               </ResizePanel>
             </Fragment>
           ))}
@@ -25298,6 +25538,12 @@ function TerminalView({
               onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
               style={getTerminalSlotStyle(terminalIndex)}
             >
+              {todoCompletionFlashes[terminalPaneId] ? (
+                <TerminalTodoCompletionFlash
+                  aria-hidden="true"
+                  key={`todo-flash-${todoCompletionFlashes[terminalPaneId]}`}
+                />
+              ) : null}
               {terminalBreakoutLayoutActive && !fullscreenThisTerminal && (
                 <TerminalTabStrip data-breakout="true" data-terminal-control="true">
                   <TerminalTab as="div" data-active="true" data-terminal-control="true">

@@ -385,6 +385,7 @@ struct ArchitectureGraphList {
     repo_path: String,
     architecture_root: String,
     graphs: Vec<ArchitectureGraphSummary>,
+    missing: bool,
 }
 
 #[derive(Serialize)]
@@ -1486,6 +1487,19 @@ fn architecture_scanned_result_from_topology(
 }
 
 fn architecture_graphs_list_blocking(repo_path: String) -> Result<ArchitectureGraphList, String> {
+    // A root that no longer exists (deleted central-store entry, removed
+    // checkout) is an empty list, not an error: callers render "No graphs
+    // yet" calmly instead of hot-looping an error retry, and the entry drops
+    // off the catalog on its next refresh.
+    let trimmed = repo_path.trim();
+    if !trimmed.is_empty() && !Path::new(trimmed).exists() {
+        return Ok(ArchitectureGraphList {
+            repo_path: trimmed.to_string(),
+            architecture_root: String::new(),
+            graphs: Vec::new(),
+            missing: true,
+        });
+    }
     let (display_repo, repo) = architecture_resolved_and_storage(repo_path.as_str())?;
     let graphs = architecture_graph_summaries(&repo)?;
     if architecture_agents_root(&repo).exists() {
@@ -1496,6 +1510,7 @@ fn architecture_graphs_list_blocking(repo_path: String) -> Result<ArchitectureGr
         repo_path: workspace_path_display(&display_repo),
         architecture_root: workspace_path_display(&architecture_agents_root(&repo)),
         graphs,
+        missing: false,
     })
 }
 
@@ -2210,6 +2225,89 @@ async fn architecture_graph_delete(
     .map_err(|error| format!("Architecture graph delete worker failed: {error}"))?
 }
 
+const ARCHITECTURE_STORE_CHANGED_EVENT: &str = "architecture-store-changed";
+
+/// One recursive watcher over the centralized architecture store keeps the
+/// Architecture tab auto-synced: any graph source change — in-app saves,
+/// agent edits from terminals, direct file edits — emits a debounced
+/// `architecture-store-changed` event the webview reacts to. Only paths under
+/// a `graphs/` directory count, so generated files (index.json, AGENTS.md,
+/// icon-aliases.json, revisions) written during listing cannot self-trigger.
+fn architecture_store_changed_slug(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    if !components.iter().any(|component| *component == "graphs") {
+        return None;
+    }
+    match components.first().copied() {
+        Some("repos") => components.get(1).map(|slug| slug.to_string()),
+        Some("global") => Some(ARCHITECTURE_GLOBAL_REPO_ID.to_string()),
+        _ => None,
+    }
+}
+
+pub(crate) fn architecture_store_watcher_start(app: AppHandle) {
+    std::thread::spawn(move || {
+        use notify::Watcher as _;
+        let Some(root) = architecture_central_data_root() else {
+            return;
+        };
+        if fs::create_dir_all(&root).is_err() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let Ok(mut watcher) = notify::recommended_watcher(tx) else {
+            return;
+        };
+        if watcher
+            .watch(&root, notify::RecursiveMode::Recursive)
+            .is_err()
+        {
+            return;
+        }
+        let collect = |event: notify::Result<notify::Event>, slugs: &mut HashSet<String>| {
+            let Ok(event) = event else {
+                return;
+            };
+            for path in &event.paths {
+                if let Some(slug) = architecture_store_changed_slug(&root, path) {
+                    slugs.insert(slug);
+                }
+            }
+        };
+        loop {
+            let mut pending_slugs = HashSet::new();
+            let Ok(first) = rx.recv() else {
+                return;
+            };
+            collect(first, &mut pending_slugs);
+            // Quiet-window debounce: keep absorbing the burst until 600ms of
+            // silence, then emit one change event for the whole batch.
+            loop {
+                match rx.recv_timeout(Duration::from_millis(600)) {
+                    Ok(event) => collect(event, &mut pending_slugs),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            if pending_slugs.is_empty() {
+                continue;
+            }
+            let slugs = pending_slugs.into_iter().collect::<Vec<_>>();
+            let _ = app.emit(
+                ARCHITECTURE_STORE_CHANGED_EVENT,
+                json!({
+                    "slugs": slugs,
+                    "changedAtMs": architecture_now_millis(),
+                }),
+            );
+        }
+    });
+}
+
 pub(crate) fn architecture_global_root_dir() -> Result<PathBuf, String> {
     let root = cloud_mcp_local_data_file_path("architectures")
         .ok_or_else(|| "Global architectures root is unavailable.".to_string())?
@@ -2371,6 +2469,29 @@ static ARCHITECTURE_CENTRAL_REPO_ROOT_CACHE: OnceLock<StdMutex<HashMap<String, P
 /// folder on every device). Existing repo-local `.agents/architectures`
 /// content and legacy `orphans/<identity>` folders are migrated in once.
 pub(crate) fn architecture_central_repo_root_for(repo: &Path) -> Result<PathBuf, String> {
+    // Ephemeral guard: repos living under the OS temp dir never register in
+    // the central architecture store — test harnesses and scratch checkouts
+    // were polluting the Architecture hub with one entry per run. They get
+    // the legacy repo-local `.agents/architectures` layout instead, so every
+    // tool still works. An env-overridden data root (explicit test isolation)
+    // is exempt and may exercise the central-store path.
+    if cloud_mcp_env_path(CLOUD_MCP_LOCAL_DATA_DIR_ENV).is_none()
+        && cloud_mcp_env_path(CLOUD_MCP_LOCAL_HOME_ENV).is_none()
+    {
+        let temp_dir = std::env::temp_dir();
+        // Callers pass canonicalized roots (macOS /var → /private/var), so
+        // match both the raw and the canonicalized temp dir.
+        let repo_key = normalized_path_key(repo);
+        let is_temp = [Some(temp_dir.clone()), temp_dir.canonicalize().ok()]
+            .into_iter()
+            .flatten()
+            .any(|root| {
+                normalized_path_key_is_same_or_child(&repo_key, &normalized_path_key(&root))
+            });
+        if is_temp {
+            return Ok(repo.to_path_buf());
+        }
+    }
     let cache_key = normalized_path_key(repo);
     let cache = ARCHITECTURE_CENTRAL_REPO_ROOT_CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
     if let Some(cached) = cache

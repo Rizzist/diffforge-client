@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   reduceThreadLifecycleNotificationEvent,
+  reduceTodoCompletedNotificationEvent,
   reduceWorkspaceNotificationEvent,
 } from "./workspaceNotifications.js";
 
@@ -117,5 +118,42 @@ test("terminal prompt cues only ring for manual acceptance prompt kinds", () => 
   assert.equal(
     staleTerminalOutput.workspaces["workspace-1"].notifications["user-input:workspace-1:thread-2:agent:prompt-output"],
     undefined,
+  );
+});
+
+test("todo completion always cues and stays unread for unwatched workspaces", () => {
+  const completed = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "todo-1",
+    paneId: "pane-1",
+    queueDrained: false,
+    terminalIndex: 2,
+    todoTitle: "Fix the login form",
+    workspaceId: "workspace-1",
+  }, {
+    workspaceVisibleAndFocused: false,
+  });
+
+  assert.equal(completed.cues.length, 1);
+  assert.equal(completed.cues[0].kind, "todo.completed");
+  const notification = completed.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-1"];
+  assert.equal(notification.kind, "todo.completed");
+  assert.equal(notification.status, "unread");
+  assert.equal(notification.terminalIndex, 2);
+});
+
+test("todo completion that drains the queue cues the drained tone and reads on arrival when watching", () => {
+  const drained = reduceTodoCompletedNotificationEvent({}, {
+    itemId: "todo-2",
+    queueDrained: true,
+    workspaceId: "workspace-1",
+  }, {
+    workspaceVisibleAndFocused: true,
+  });
+
+  assert.equal(drained.cues.length, 1);
+  assert.equal(drained.cues[0].kind, "todo.queue.drained");
+  assert.equal(
+    drained.workspaces["workspace-1"].notifications["todo-completed:workspace-1:todo-2"].status,
+    "read",
   );
 });

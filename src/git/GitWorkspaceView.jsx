@@ -158,6 +158,275 @@ function historyGitStatus(file) {
   return "modified";
 }
 
+// --- VS Code-style commit graph -------------------------------------------
+// History rows render like VS Code's Source Control Graph: a lane column with
+// colored dots and branch/merge curves, the commit subject, ref badges, and
+// author/time/sha on the right. Lanes are computed from parent topology.
+
+const GRAPH_LANE_WIDTH = 11;
+const GRAPH_ROW_HEIGHT = 24;
+const GRAPH_EDGE_PAD = 5;
+// VS Code source-control graph chart palette, cycled per lane.
+const GRAPH_LANE_COLORS = [
+  "#3794ff",
+  "#f14c4c",
+  "#3fb950",
+  "#cca700",
+  "#b180d7",
+  "#29b8db",
+  "#ff8c00",
+  "#75beff",
+];
+
+function graphLaneColor(laneIndex) {
+  const safe = Number.isInteger(laneIndex) && laneIndex >= 0 ? laneIndex : 0;
+  return GRAPH_LANE_COLORS[safe % GRAPH_LANE_COLORS.length];
+}
+
+function graphLaneX(laneIndex) {
+  return GRAPH_EDGE_PAD + GRAPH_LANE_WIDTH / 2 + laneIndex * GRAPH_LANE_WIDTH;
+}
+
+function graphColumnWidthFor(maxLanes) {
+  return GRAPH_EDGE_PAD * 2 + Math.max(1, maxLanes) * GRAPH_LANE_WIDTH;
+}
+
+function commitParentShas(commit) {
+  if (Array.isArray(commit?.parents)) {
+    return commit.parents.map((parent) => text(parent)).filter(Boolean);
+  }
+  return text(commit?.parents).split(/\s+/).filter(Boolean);
+}
+
+function parseCommitRefs(commit) {
+  const rawList = Array.isArray(commit?.refs) ? commit.refs : text(commit?.refs).split(",");
+  return rawList
+    .map((entry) => String(entry || "").trim())
+    .filter(Boolean)
+    .map((entry) => {
+      if (entry.startsWith("HEAD ->")) {
+        return { head: true, kind: "branch", name: entry.slice("HEAD ->".length).trim() };
+      }
+      if (entry === "HEAD") {
+        return { head: true, kind: "branch", name: "HEAD" };
+      }
+      if (entry.startsWith("tag:")) {
+        return { kind: "tag", name: entry.slice("tag:".length).trim() };
+      }
+      if (entry.includes("/")) {
+        return { kind: "remote", name: entry };
+      }
+      return { kind: "branch", name: entry };
+    })
+    .filter((ref) => ref.name);
+}
+
+function relativeCommitTime(value) {
+  const timestamp = Date.parse(text(value));
+  if (!Number.isFinite(timestamp)) return "";
+  const minutes = Math.floor(Math.max(0, Date.now() - timestamp) / 60000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo`;
+  return `${Math.floor(days / 365)}y`;
+}
+
+// Classic lane tracker: each lane waits for a sha. A commit lands on the
+// first lane waiting for it (others waiting for it curve into the same dot),
+// its first parent keeps the lane, and extra parents fork to existing or new
+// lanes. Snapshots without parent data degrade to a single linear lane.
+function buildHistoryGraph(history) {
+  const rows = [];
+  const lanes = [];
+  const hasParentData = history.some((commit) => commitParentShas(commit).length > 0);
+
+  history.forEach((commit, index) => {
+    const sha = text(commit?.sha);
+    const parents = hasParentData
+      ? commitParentShas(commit)
+      : (history[index + 1] ? [text(history[index + 1].sha)].filter(Boolean) : []);
+
+    const joinLanes = [];
+    lanes.forEach((expected, laneIndex) => {
+      if (expected && expected === sha) joinLanes.push(laneIndex);
+    });
+    let lane = joinLanes.length ? joinLanes[0] : lanes.indexOf(null);
+    if (lane === -1) {
+      lane = lanes.length;
+      lanes.push(null);
+    }
+    const ownTop = joinLanes.length > 0;
+    const joinCurves = joinLanes.slice(1);
+    joinCurves.forEach((laneIndex) => {
+      lanes[laneIndex] = null;
+    });
+
+    const passLanes = [];
+    lanes.forEach((expected, laneIndex) => {
+      if (laneIndex !== lane && expected) passLanes.push(laneIndex);
+    });
+
+    const forkCurves = [];
+    if (parents.length) {
+      lanes[lane] = parents[0];
+      parents.slice(1).forEach((parent) => {
+        let target = lanes.findIndex((expected) => expected === parent);
+        if (target === -1) {
+          target = lanes.indexOf(null);
+          if (target === -1) {
+            target = lanes.length;
+            lanes.push(parent);
+          } else {
+            lanes[target] = parent;
+          }
+        }
+        if (target !== lane) forkCurves.push(target);
+      });
+    } else {
+      lanes[lane] = null;
+    }
+
+    const continueLanes = [];
+    lanes.forEach((expected, laneIndex) => {
+      if (expected) continueLanes.push(laneIndex);
+    });
+    while (lanes.length && lanes[lanes.length - 1] === null) {
+      lanes.pop();
+    }
+    const laneCount = Math.max(
+      lanes.length,
+      ...[lane, ...passLanes, ...joinCurves, ...forkCurves].map((laneIndex) => laneIndex + 1),
+    );
+
+    rows.push({
+      commit,
+      continueLanes,
+      forkCurves,
+      joinCurves,
+      lane,
+      laneCount,
+      ownBottom: parents.length > 0,
+      ownTop,
+      passLanes,
+    });
+  });
+
+  const maxLanes = rows.reduce((max, row) => Math.max(max, row.laneCount), 1);
+  return { maxLanes, rows };
+}
+
+function HistoryGraphCell({ maxLanes, row, variant = "commit" }) {
+  const width = graphColumnWidthFor(maxLanes);
+  const height = GRAPH_ROW_HEIGHT;
+  const midY = height / 2;
+  const dotX = graphLaneX(row.lane);
+  const ownColor = graphLaneColor(row.lane);
+  const dashed = variant === "uncommitted";
+  return (
+    <GraphSvg
+      aria-hidden="true"
+      height={height}
+      preserveAspectRatio="xMinYMid meet"
+      viewBox={`0 0 ${width} ${height}`}
+      width={width}
+    >
+      {row.passLanes.map((laneIndex) => (
+        <line
+          key={`pass-${laneIndex}`}
+          stroke={graphLaneColor(laneIndex)}
+          strokeWidth="2"
+          x1={graphLaneX(laneIndex)}
+          x2={graphLaneX(laneIndex)}
+          y1="0"
+          y2={height}
+        />
+      ))}
+      {row.ownTop && (
+        <line
+          stroke={ownColor}
+          strokeDasharray={row.topDashed ? "2 3" : undefined}
+          strokeWidth="2"
+          x1={dotX}
+          x2={dotX}
+          y1="0"
+          y2={midY}
+        />
+      )}
+      {row.ownBottom && (
+        <line
+          stroke={ownColor}
+          strokeDasharray={dashed ? "2 3" : undefined}
+          strokeWidth="2"
+          x1={dotX}
+          x2={dotX}
+          y1={midY}
+          y2={height}
+        />
+      )}
+      {row.joinCurves.map((laneIndex) => (
+        <path
+          d={`M ${graphLaneX(laneIndex)} 0 C ${graphLaneX(laneIndex)} ${midY * 0.8}, ${dotX} ${midY * 0.2}, ${dotX} ${midY}`}
+          fill="none"
+          key={`join-${laneIndex}`}
+          stroke={graphLaneColor(laneIndex)}
+          strokeWidth="2"
+        />
+      ))}
+      {row.forkCurves.map((laneIndex) => (
+        <path
+          d={`M ${dotX} ${midY} C ${dotX} ${height - midY * 0.2}, ${graphLaneX(laneIndex)} ${midY + midY * 0.2}, ${graphLaneX(laneIndex)} ${height}`}
+          fill="none"
+          key={`fork-${laneIndex}`}
+          stroke={graphLaneColor(laneIndex)}
+          strokeWidth="2"
+        />
+      ))}
+      {dashed ? (
+        <circle
+          cx={dotX}
+          cy={midY}
+          fill="var(--git-vscode-sidebar)"
+          r="3.4"
+          stroke={ownColor}
+          strokeDasharray="2 2"
+          strokeWidth="1.6"
+        />
+      ) : (
+        <circle
+          cx={dotX}
+          cy={midY}
+          fill={ownColor}
+          r="3.6"
+          stroke="var(--git-vscode-sidebar)"
+          strokeWidth="1.4"
+        />
+      )}
+    </GraphSvg>
+  );
+}
+
+function GraphContinuationLines({ dashed = false, lanes }) {
+  return (
+    <GraphContinuation aria-hidden="true">
+      {lanes.map((laneIndex) => (
+        <i
+          data-dashed={dashed ? "true" : undefined}
+          key={laneIndex}
+          style={{
+            "--git-lane-color": graphLaneColor(laneIndex),
+            left: `${graphLaneX(laneIndex) - 1}px`,
+          }}
+        />
+      ))}
+    </GraphContinuation>
+  );
+}
+
 export default function GitWorkspaceView({
   onRefreshRepositories = null,
   onRefreshSnapshot = null,
@@ -238,6 +507,21 @@ export default function GitWorkspaceView({
     () => repositories.find((repo) => repo.path === selectedRepoPath) || null,
     [repositories, selectedRepoPath],
   );
+  const historyGraph = useMemo(() => buildHistoryGraph(history), [history]);
+  const graphColumnWidth = graphColumnWidthFor(historyGraph.maxLanes);
+  const uncommittedGraphRow = useMemo(() => {
+    const lane = historyGraph.rows[0]?.lane ?? 0;
+    return {
+      continueLanes: historyGraph.rows.length ? [lane] : [],
+      forkCurves: [],
+      joinCurves: [],
+      lane,
+      laneCount: lane + 1,
+      ownBottom: historyGraph.rows.length > 0,
+      ownTop: false,
+      passLanes: [],
+    };
+  }, [historyGraph]);
   const operationBlocked = snapshot?.operationState && snapshot.operationState.clean === false;
   const hasChanges = changedFiles.length > 0;
   const commitBusy = commitState === "generating" || commitState === "committing";
@@ -611,7 +895,7 @@ export default function GitWorkspaceView({
           {commitNotice && <GitNotice>{commitNotice}</GitNotice>}
 
           <HistoryPane>
-            <HistoryList>
+            <HistoryList style={{ "--git-graph-width": `${graphColumnWidth}px` }}>
               {hasChanges && (() => {
                 const active = expandedHistoryKeys.has(WORKING_TREE_HISTORY_KEY);
                 return (
@@ -623,15 +907,22 @@ export default function GitWorkspaceView({
                       title="Uncommitted working tree changes"
                       type="button"
                     >
-                      <HistoryGraph aria-hidden="true" data-node="uncommitted" />
+                      <HistoryGraphCell
+                        maxLanes={historyGraph.maxLanes}
+                        row={uncommittedGraphRow}
+                        variant="uncommitted"
+                      />
                       <HistoryCommitLine>
-                        <strong>Changes</strong>
-                        <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"}</span>
+                        <strong data-uncommitted="true">Changes</strong>
                       </HistoryCommitLine>
+                      <HistoryMeta>
+                        <span>{changedFiles.length} file{changedFiles.length === 1 ? "" : "s"}</span>
+                      </HistoryMeta>
                       <HistoryToggleIcon aria-hidden="true" data-open={active ? "true" : undefined}>›</HistoryToggleIcon>
                     </HistoryButton>
                     {active && (
                       <HistoryFileList>
+                        <GraphContinuationLines dashed lanes={uncommittedGraphRow.continueLanes} />
                         {changedFiles.map((file) => {
                           const icon = fileIconMeta(file.path);
                           const gitStatus = changeGitStatus(file);
@@ -661,28 +952,58 @@ export default function GitWorkspaceView({
                   </HistoryEntry>
                 );
               })()}
-              {history.length ? history.map((commit) => {
+              {historyGraph.rows.length ? historyGraph.rows.map((row, rowIndex) => {
+                const commit = row.commit;
                 const active = expandedHistoryKeys.has(commit.sha);
                 const files = Array.isArray(commit.files) ? commit.files : [];
+                const refs = parseCommitRefs(commit);
+                const relativeTime = relativeCommitTime(commit.date);
+                // The dashed line from the uncommitted-changes dot continues
+                // into the HEAD commit's dot, like VS Code.
+                const renderRow = rowIndex === 0 && hasChanges
+                  ? { ...row, ownTop: true, topDashed: true }
+                  : row;
                 return (
                   <HistoryEntry data-active={active ? "true" : undefined} key={commit.sha}>
                     <HistoryButton
                       data-active={active ? "true" : undefined}
                       aria-expanded={active}
                       onClick={() => toggleHistoryKey(commit.sha)}
-                      title={commit.subject}
+                      title={[commit.subject, commit.authorName, commit.date].filter(Boolean).join(" — ")}
                       type="button"
                     >
-                      <HistoryGraph aria-hidden="true" data-node="committed" />
+                      <HistoryGraphCell maxLanes={historyGraph.maxLanes} row={renderRow} />
                       <HistoryCommitLine>
                         <strong>{commit.subject}</strong>
-                        <span>{commit.shortSha || shortSha(commit.sha)}</span>
-                        <span>{files.length} file{files.length === 1 ? "" : "s"}</span>
                       </HistoryCommitLine>
+                      <HistoryMeta>
+                        {refs.map((ref, refIndex) => (
+                          <HistoryRefBadge
+                            data-head={ref.head ? "true" : undefined}
+                            data-kind={ref.kind}
+                            key={`${ref.kind}:${ref.name}:${refIndex}`}
+                            style={{ "--git-ref-color": graphLaneColor(row.lane) }}
+                            title={ref.name}
+                          >
+                            <span
+                              className={`codicon ${ref.kind === "tag"
+                                ? "codicon-tag"
+                                : ref.kind === "remote"
+                                  ? "codicon-cloud"
+                                  : "codicon-git-branch"}`}
+                            />
+                            {ref.name}
+                          </HistoryRefBadge>
+                        ))}
+                        {commit.authorName ? <em>{commit.authorName}</em> : null}
+                        {relativeTime ? <span>{relativeTime}</span> : null}
+                        <code>{commit.shortSha || shortSha(commit.sha)}</code>
+                      </HistoryMeta>
                       <HistoryToggleIcon aria-hidden="true" data-open={active ? "true" : undefined}>›</HistoryToggleIcon>
                     </HistoryButton>
                     {active && (
                       <HistoryFileList>
+                        <GraphContinuationLines lanes={row.continueLanes} />
                         {files.length ? files.map((file, index) => {
                           const icon = fileIconMeta(file.path);
                           const gitStatus = historyGitStatus(file);
@@ -777,10 +1098,10 @@ const RepoRail = styled.div`
   align-items: flex-start;
   flex-wrap: nowrap;
   min-width: 0;
-  gap: 7px;
+  gap: 6px;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--git-vscode-border-subtle);
   cursor: grab;
   overscroll-behavior-x: contain;
@@ -815,14 +1136,14 @@ const RepoRail = styled.div`
 const RepoButton = styled.button`
   display: grid;
   flex: 0 0 auto;
-  width: min(184px, 100%);
+  width: min(148px, 100%);
   min-width: 0;
-  min-height: 58px;
+  min-height: 0;
   align-content: start;
-  gap: 4px;
-  padding: 8px 9px;
+  gap: 2px;
+  padding: 5px 8px;
   border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 8px;
+  border-radius: 7px;
   color: var(--git-vscode-text);
   background: var(--git-card-bg);
   box-shadow: none;
@@ -845,19 +1166,19 @@ const RepoButton = styled.button`
 
   strong {
     color: var(--git-vscode-selection-text);
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 850;
   }
 
   span {
     color: var(--git-vscode-text-muted);
-    font-size: 10px;
+    font-size: 9.5px;
     font-weight: 720;
   }
 
   em {
     color: color-mix(in srgb, var(--git-vscode-text) 76%, transparent);
-    font-size: 10px;
+    font-size: 9.5px;
     font-style: normal;
     font-weight: 760;
   }
@@ -1129,52 +1450,49 @@ const HistoryEntry = styled.article`
   min-width: 0;
 `;
 
-const HistoryGraph = styled.span`
-  --git-history-line-x: 20px;
-
-  position: relative;
+const GraphSvg = styled.svg`
   display: block;
-  width: 40px;
-  height: 24px;
+  flex: none;
+  align-self: center;
+`;
 
-  &::before {
+// Lane lines continuing behind an expanded commit's file list, so the graph
+// column reads as one continuous tree like VS Code's source control graph.
+const GraphContinuation = styled.span`
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  display: block;
+  width: var(--git-graph-width, 40px);
+  pointer-events: none;
+
+  i {
     position: absolute;
     top: 0;
     bottom: 0;
-    left: var(--git-history-line-x);
-    width: 1px;
-    background: color-mix(in srgb, var(--git-vscode-blue) 58%, transparent);
-    content: "";
-    transform: translateX(-50%);
+    width: 2px;
+    background: var(--git-lane-color, var(--git-vscode-blue));
   }
 
-  &::after {
-    box-sizing: border-box;
-    position: absolute;
-    top: 50%;
-    left: var(--git-history-line-x);
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--git-vscode-blue);
-    border-radius: 999px;
-    background: var(--git-vscode-sidebar);
-    content: "";
-    transform: translate(-50%, -50%);
-  }
-
-  &[data-node="committed"]::after {
-    background: var(--git-vscode-blue);
+  i[data-dashed="true"] {
+    background: repeating-linear-gradient(
+      180deg,
+      var(--git-lane-color, var(--git-vscode-blue)) 0 3px,
+      transparent 3px 6px
+    );
   }
 `;
 
 const HistoryButton = styled.button`
   display: grid;
   width: 100%;
-  min-height: 28px;
+  height: 24px;
+  min-height: 24px;
   min-width: 0;
-  grid-template-columns: 40px minmax(0, 1fr) 22px;
+  grid-template-columns: var(--git-graph-width, 40px) minmax(0, 1fr) auto 18px;
   align-items: center;
-  padding: 0 8px 0 0;
+  padding: 0 4px 0 0;
   border: 0;
   border-radius: 0;
   color: var(--git-vscode-text);
@@ -1191,10 +1509,6 @@ const HistoryButton = styled.button`
     background: var(--git-vscode-selection);
   }
 
-  &[data-active="true"] ${HistoryGraph}::after {
-    background: var(--git-vscode-blue);
-  }
-
   &:focus-visible {
     outline: 1px solid var(--git-vscode-focus);
     outline-offset: -1px;
@@ -1208,33 +1522,95 @@ const HistoryCommitLine = styled.div`
   align-items: center;
   gap: 8px;
 
-  strong,
-  span {
+  strong {
     min-width: 0;
     overflow: hidden;
+    color: inherit;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 24px;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  strong {
-    color: inherit;
-    font-size: 13px;
-    font-weight: 400;
-    line-height: 28px;
-  }
-
-  span {
-    flex: 0 1 auto;
+  strong[data-uncommitted="true"] {
     color: var(--git-vscode-text-muted);
-    font-size: 13px;
+    font-style: italic;
+  }
+`;
+
+const HistoryMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  max-width: 60%;
+  align-items: center;
+  gap: 7px;
+  padding-left: 8px;
+
+  em,
+  span,
+  code {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--git-vscode-text-muted);
+    font-size: 11px;
+    font-style: normal;
     font-weight: 400;
-    line-height: 28px;
+    line-height: 24px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  ${HistoryButton}[data-active="true"] & span {
+  em {
+    max-width: 96px;
+  }
+
+  code {
+    flex: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px;
+  }
+
+  ${HistoryButton}[data-active="true"] & em,
+  ${HistoryButton}[data-active="true"] & span,
+  ${HistoryButton}[data-active="true"] & code {
     color: color-mix(in srgb, var(--git-vscode-selection-text) 72%, transparent);
   }
+`;
 
+// VS Code-style ref decorations: branch / remote / tag pills colored by the
+// commit's lane.
+const HistoryRefBadge = styled.span`
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  max-width: 132px;
+  height: 16px;
+  overflow: hidden;
+  padding: 0 5px 0 3px;
+  border: 1px solid color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 55%, transparent);
+  border-radius: 3px;
+  color: var(--git-vscode-text);
+  background: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 14%, transparent);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  .codicon {
+    flex: none;
+    font-size: 11px;
+    color: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 86%, var(--git-vscode-text));
+  }
+
+  &[data-head="true"] {
+    border-color: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 86%, transparent);
+    background: color-mix(in srgb, var(--git-ref-color, var(--git-vscode-blue)) 30%, transparent);
+    font-weight: 700;
+  }
 `;
 
 const HistoryToggleIcon = styled.span`
@@ -1259,18 +1635,7 @@ const HistoryFileList = styled.div`
   position: relative;
   align-content: start;
   min-width: 0;
-  padding: 0 0 4px 40px;
-
-  &::before {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 20px;
-    width: 1px;
-    background: var(--git-vscode-dotted);
-    content: "";
-    transform: translateX(-50%);
-  }
+  padding: 0 0 4px var(--git-graph-width, 40px);
 
   ${GitFileItem} {
     padding-left: 0;

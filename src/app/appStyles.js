@@ -4662,28 +4662,31 @@ export const TerminalClosingOverlay = styled.div`
 `;
 
 export const TerminalRestartPill = styled.div`
-  position: absolute;
-  top: 5px;
-  left: 50%;
+  position: relative;
   z-index: 80;
-  display: inline-flex;
-  width: fit-content;
-  max-width: 92%;
-  min-height: 26px;
+  display: flex;
+  width: 100%;
+  max-width: none;
+  min-height: 30px;
   height: auto;
+  flex: 0 0 auto;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
   align-content: center;
-  column-gap: 3px;
+  column-gap: 6px;
   row-gap: 1px;
-  padding: 2px 5px;
+  padding: 3px 8px;
   border: 0;
-  border-radius: 14px;
-  background: rgba(65, 71, 82, 0.58);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.2);
-  transform: translateX(-50%);
-  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(226, 232, 240, 0.08);
+  border-radius: 0;
+  background: #0b0e14;
+  box-shadow: none;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(24, 34, 48, 0.12);
+    background: #eef1f5;
+  }
 `;
 
 export const TerminalRailIdentity = styled.span`

@@ -61,7 +61,6 @@ const MCP_CLIENT_EVENT_TYPES: &[&str] = &[
 ];
 const CODEX_AUTO_APPROVED_COORDINATION_TOOLS: &[&str] = &[
     "start_task",
-    "create_plan",
     "acquire_lease",
     "checkpoint",
     "complete_task",
@@ -5065,6 +5064,223 @@ impl CoordinationKernel {
             }))
         })();
         self.finish_transaction(result, "record terminal todo plan from create_plan")
+            .map(Some)
+    }
+
+    /// Native plan capture: upserts a Plans-tab plan from a provider's own
+    /// plan/todo tool (Claude TodoWrite, Codex update_plan, OpenCode
+    /// todowrite, ExitPlanMode). Native lists are full rewrites without
+    /// stable identity, so this gives them one: the latest non-completed plan
+    /// for the same terminal session is reused when the new list overlaps it
+    /// (shared step titles or same length); otherwise a list reset starts a
+    /// new plan.
+    pub fn record_terminal_todo_plan_from_native_update(
+        &self,
+        session_id: &str,
+        agent_id: Option<&str>,
+        workspace_id: Option<&str>,
+        update: &Value,
+    ) -> Result<Option<Value>, String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Ok(None);
+        }
+        let tool = string_from_value_keys(update, &["tool", "tool_name", "toolName"])
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "todowrite".to_string());
+        let source = format!("cli-native.{tool}");
+        let steps = update
+            .get("steps")
+            .and_then(Value::as_array)
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter_map(|step| {
+                        let title = terminal_todo_plan_step_title_from_value(step)?;
+                        let status = normalize_terminal_todo_plan_step_status(
+                            string_from_value_keys(step, &["status", "state", "phase"])
+                                .as_deref()
+                                .unwrap_or("queued"),
+                        );
+                        Some((title, status, terminal_todo_plan_step_detail_from_value(step)))
+                    })
+                    .take(120)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if steps.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized_title_key =
+            |value: &str| value.trim().to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+        let new_title_keys = steps
+            .iter()
+            .map(|(title, _, _)| normalized_title_key(title))
+            .collect::<HashSet<_>>();
+
+        let all_completed = steps.iter().all(|(_, status, _)| status == "completed");
+        let any_running = steps.iter().any(|(_, status, _)| status == "in_progress");
+        let plan_status = if all_completed {
+            "completed".to_string()
+        } else if any_running {
+            "active".to_string()
+        } else {
+            "listed".to_string()
+        };
+        let current_step_index = steps
+            .iter()
+            .position(|(_, status, _)| status == "in_progress")
+            .or_else(|| steps.iter().position(|(_, status, _)| status != "completed"))
+            .unwrap_or(steps.len().saturating_sub(1)) as i64;
+        let new_plan_title = string_from_value_keys(update, &["title", "explanation"])
+            .map(|value| compact_terminal_todo_plan_text(&value, 160))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                compact_terminal_todo_plan_text(&steps[0].0, 160)
+            });
+        let now = now_rfc3339();
+        let actor_id = agent_id.unwrap_or(REPO_ID);
+
+        let result = (|| {
+            self.begin_immediate_transaction("record terminal todo plan from native update")?;
+            let candidate = self
+                .query_json(
+                    "SELECT id, status FROM terminal_todo_plans
+                     WHERE session_id=?1
+                     ORDER BY updated_at DESC LIMIT 1",
+                    &[&session_id],
+                )?
+                .into_iter()
+                .next();
+            let reuse_plan_id = candidate.and_then(|row| {
+                let plan_id = row["id"].as_str().map(str::to_string)?;
+                let status = row["status"].as_str().unwrap_or_default().to_string();
+                if normalize_terminal_todo_plan_status(&status) == "completed" {
+                    return None;
+                }
+                let existing_titles = self
+                    .query_json(
+                        "SELECT title FROM terminal_todo_plan_steps WHERE plan_id=?1",
+                        &[&plan_id],
+                    )
+                    .ok()?;
+                let existing_keys = existing_titles
+                    .iter()
+                    .filter_map(|row| row["title"].as_str())
+                    .map(normalized_title_key)
+                    .collect::<HashSet<_>>();
+                let overlaps = existing_keys
+                    .intersection(&new_title_keys)
+                    .next()
+                    .is_some();
+                if overlaps || existing_keys.len() == new_title_keys.len() {
+                    Some(plan_id)
+                } else {
+                    None
+                }
+            });
+            let is_new_plan = reuse_plan_id.is_none();
+            let plan_id = reuse_plan_id.unwrap_or_else(|| format!("native-{}", uuid()));
+
+            self.conn
+                .execute(
+                    "INSERT INTO terminal_todo_plans(
+                        id, todo_id, workspace_id, agent_id, session_id, title, status,
+                        current_step_index, revision, created_at, updated_at, completed_at,
+                        interrupted_at
+                     ) VALUES(?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?9, NULL)
+                     ON CONFLICT(id) DO UPDATE SET
+                        workspace_id=COALESCE(excluded.workspace_id, terminal_todo_plans.workspace_id),
+                        agent_id=COALESCE(excluded.agent_id, terminal_todo_plans.agent_id),
+                        session_id=excluded.session_id,
+                        status=excluded.status,
+                        current_step_index=excluded.current_step_index,
+                        completed_at=excluded.completed_at,
+                        interrupted_at=NULL,
+                        updated_at=excluded.updated_at,
+                        revision=terminal_todo_plans.revision + 1",
+                    params![
+                        &plan_id,
+                        workspace_id,
+                        agent_id,
+                        &session_id,
+                        &new_plan_title,
+                        &plan_status,
+                        current_step_index,
+                        &now,
+                        if all_completed { Some(now.as_str()) } else { None },
+                    ],
+                )
+                .map_err(|error| format!("Unable to record native terminal todo plan: {error}"))?;
+            for (index, (title, status, detail)) in steps.iter().enumerate() {
+                let step_index = index as i64;
+                self.conn
+                    .execute(
+                        "INSERT INTO terminal_todo_plan_steps(
+                            id, plan_id, todo_id, step_index, title, detail, status,
+                            source, revision, started_at, completed_at, created_at, updated_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, NULL, NULL, ?9, ?9)
+                         ON CONFLICT(plan_id, step_index) DO UPDATE SET
+                            title=excluded.title,
+                            detail=COALESCE(excluded.detail, terminal_todo_plan_steps.detail),
+                            status=excluded.status,
+                            source=excluded.source,
+                            updated_at=excluded.updated_at,
+                            revision=terminal_todo_plan_steps.revision + 1",
+                        params![
+                            format!("{plan_id}-step-{step_index}"),
+                            &plan_id,
+                            format!("{plan_id}-todo-{}", step_index + 1),
+                            step_index,
+                            title,
+                            detail.as_deref(),
+                            status,
+                            &source,
+                            &now,
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!("Unable to record native terminal todo plan step: {error}")
+                    })?;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM terminal_todo_plan_steps WHERE plan_id=?1 AND step_index>=?2",
+                    params![&plan_id, steps.len() as i64],
+                )
+                .map_err(|error| {
+                    format!("Unable to trim native terminal todo plan steps: {error}")
+                })?;
+            let event_id = self.emit_event(
+                if is_new_plan {
+                    "terminal_todo_plan_created"
+                } else {
+                    "terminal_todo_plan_checkpoint"
+                },
+                "agent",
+                actor_id,
+                EventRefs {
+                    agent_id: agent_id.map(str::to_string),
+                    session_id: Some(session_id.to_string()),
+                    resource_id: Some(plan_id.clone()),
+                    ..EventRefs::default()
+                },
+                json!({
+                    "plan_id": plan_id.clone(),
+                    "workspace_id": workspace_id,
+                    "source": source,
+                    "tool": tool,
+                }),
+            )?;
+            Ok(json!({
+                "event_id": event_id,
+                "plan": self.terminal_todo_plan_view_by_plan_ref(&plan_id)?,
+                "compact_plan": self.terminal_todo_plan_compact_for_plan_ref(&plan_id)?.unwrap_or(Value::Null),
+            }))
+        })();
+        self.finish_transaction(result, "record terminal todo plan from native update")
             .map(Some)
     }
 
@@ -20199,7 +20415,7 @@ impl CoordinationKernel {
                 "agent_visible_mcp_tools": crate::coordination::mcp::TOOL_NAMES,
                 "next": [
                     "Inspect files freely without more task/checkpoint calls until you are ready to edit.",
-                    "Call create_plan after start_task when the task has multiple visible steps; checkpoint advances the terminal todo plan.",
+                    "Use your CLI's native plan/todo list for multi-step work; Diff Forge captures it into the Plans tab automatically, and checkpoint advances the terminal todo plan.",
                     "Acquire leases for the exact files/resources you will edit, passing the task_id returned by start_task.",
                     "Call checkpoint with that task_id and one short summary only after meaningful active-task edit progress.",
                     "Use normal shell and edit tools after leases, following the reported file authority: direct sessions edit leased files in the selected repo root; isolated sessions edit leased files in COORDINATION_AGENT_BRANCH_ROOT.",
@@ -20659,7 +20875,6 @@ impl CoordinationKernel {
         let apply_merge_listed = mcp_tools.contains(&"apply_merge");
         let minimal_agent_tools = [
             "start_task",
-            "create_plan",
             "acquire_lease",
             "checkpoint",
             "complete_task",
@@ -20743,9 +20958,9 @@ impl CoordinationKernel {
             } else if !missing_minimal_agent_tools.is_empty()
                 || mcp_tools.len() != minimal_agent_tools.len()
             {
-                "Agent MCP should expose only start_task, create_plan, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status."
+                "Agent MCP should expose only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status."
             } else {
-                "Agent MCP exposes only start_task, create_plan, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
+                "Agent MCP exposes only start_task, acquire_lease, checkpoint, complete_task, submit_patch, and submit_patch_status; merge resolution initialization, violation resolution, and merge application stay off the agent surface."
             },
             json!({
                 "request_merge_listed": request_merge_listed,
@@ -27490,6 +27705,90 @@ mod tests {
     }
 
     #[test]
+    fn native_plan_update_records_reuses_and_resets_session_plans() {
+        let repo = init_git_repo("native_plan_capture");
+        let kernel = CoordinationKernel::init(&repo, None).unwrap();
+
+        let first = kernel
+            .record_terminal_todo_plan_from_native_update(
+                "session-native",
+                Some("codex"),
+                Some("workspace-test"),
+                &json!({
+                    "tool": "todowrite",
+                    "steps": [
+                        {"title": "Find the bug", "status": "completed"},
+                        {"title": "Fix the bug", "status": "in_progress"},
+                        {"title": "Run tests", "status": "pending"}
+                    ]
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let plan_id = first["plan"]["plan_id"].as_str().unwrap().to_string();
+        assert!(plan_id.starts_with("native-"));
+        assert_eq!(first["plan"]["status"].as_str(), Some("active"));
+        assert_eq!(first["plan"]["current_step_index"].as_i64(), Some(1));
+        assert_eq!(first["plan"]["steps"].as_array().map(Vec::len), Some(3));
+
+        // Same-session rewrite with overlapping titles updates the same plan.
+        let second = kernel
+            .record_terminal_todo_plan_from_native_update(
+                "session-native",
+                Some("codex"),
+                Some("workspace-test"),
+                &json!({
+                    "tool": "todowrite",
+                    "steps": [
+                        {"title": "Find the bug", "status": "completed"},
+                        {"title": "Fix the bug", "status": "completed"},
+                        {"title": "Run tests", "status": "completed"}
+                    ]
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second["plan"]["plan_id"].as_str(), Some(plan_id.as_str()));
+        assert_eq!(second["plan"]["status"].as_str(), Some("completed"));
+
+        // A disjoint list after completion starts a fresh plan (list reset).
+        let third = kernel
+            .record_terminal_todo_plan_from_native_update(
+                "session-native",
+                Some("codex"),
+                Some("workspace-test"),
+                &json!({
+                    "tool": "update_plan",
+                    "explanation": "Ship the docs",
+                    "steps": [
+                        {"title": "Write release notes", "status": "in_progress"},
+                        {"title": "Publish docs", "status": "pending"}
+                    ]
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let third_plan_id = third["plan"]["plan_id"].as_str().unwrap();
+        assert_ne!(third_plan_id, plan_id.as_str());
+        assert_eq!(third["plan"]["title"].as_str(), Some("Ship the docs"));
+
+        // Session-targeted snapshot resolves the newest native plan.
+        let snapshot = kernel
+            .terminal_todo_plan_snapshot(None, Some("session-native"), None, None)
+            .unwrap();
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["plan_id"].as_str(),
+            Some(third_plan_id)
+        );
+        assert_eq!(
+            snapshot["data"]["selected_plan"]["steps"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn update_plan_ticks_steps_without_task_id() {
         let repo = init_git_repo("taskless_terminal_todo_plan_update");
         let kernel = CoordinationKernel::init(&repo, None).unwrap();
@@ -28537,7 +28836,6 @@ mod tests {
         assert!(config.contains("[mcp_servers.workspace-mcp-gateway]\ncommand = "));
         for tool in [
             "start_task",
-            "create_plan",
             "acquire_lease",
             "checkpoint",
             "complete_task",
@@ -29199,8 +29497,6 @@ command = "diffforge --diff-forge-write-guard"
             tools,
             &[
                 "start_task",
-                "create_plan",
-                "update_plan",
                 "architecture_context",
                 "architecture_list",
                 "architecture_icon_reference",

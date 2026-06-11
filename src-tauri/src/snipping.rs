@@ -73,6 +73,20 @@ extern "C" {
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
     fn CGEventGetFlags(event: *mut std::ffi::c_void) -> u64;
     fn CGEventGetIntegerValueField(event: *mut std::ffi::c_void, field: u32) -> i64;
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+}
+
+/// kCGEventSourceStateCombinedSessionState / kCGMouseButtonLeft: true while
+/// the left mouse button is held anywhere in the session (a native window
+/// drag is still in progress).
+#[cfg(target_os = "macos")]
+fn snipping_left_mouse_button_pressed() -> bool {
+    unsafe { CGEventSourceButtonState(0, 0) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn snipping_left_mouse_button_pressed() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -101,6 +115,15 @@ struct SnippingState {
     recent_capture_toasts: Arc<StdMutex<Vec<Value>>>,
     asset_target: Arc<StdMutex<SnippingAssetTarget>>,
     dispatch_targets: Arc<StdMutex<Value>>,
+    preview_restack_generation: Arc<AtomicU64>,
+    /// Preview window label -> asset path currently shown in that window
+    /// (retargeted when an annotated copy takes over the preview).
+    preview_paths: Arc<StdMutex<HashMap<String, String>>>,
+    /// Preview window label -> outer position when the user grabbed it.
+    /// Presence marks an in-flight user drag; the start position separates
+    /// real drags from plain clicks when the drag settles.
+    preview_drag_sessions: Arc<StdMutex<HashMap<String, (i32, i32)>>>,
+    preview_drag_over_last_emit_ms: Arc<AtomicU64>,
 }
 
 impl SnippingState {
@@ -112,6 +135,10 @@ impl SnippingState {
             recent_capture_toasts: Arc::new(StdMutex::new(Vec::new())),
             asset_target: Arc::new(StdMutex::new(SnippingAssetTarget::default())),
             dispatch_targets: Arc::new(StdMutex::new(Value::Array(Vec::new()))),
+            preview_restack_generation: Arc::new(AtomicU64::new(0)),
+            preview_paths: Arc::new(StdMutex::new(HashMap::new())),
+            preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
+            preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1981,6 +2008,21 @@ fn snipping_save_edited_untracked_asset_for(
         }),
     );
 
+    // The original's preview window keeps its label but now shows the edited
+    // copy; keep the label -> path map in sync so a later drop consumes the
+    // annotated image, not the stale original.
+    if !source_is_edited_copy {
+        let preview_label = format!(
+            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
+            snipping_window_token(&source)
+        );
+        if app.get_webview_window(&preview_label).is_some() {
+            if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+                paths.insert(preview_label, target_path.clone());
+            }
+        }
+    }
+
     if !source_is_edited_copy {
         // No preview is showing the original (already dismissed): give the
         // fresh edited copy its own preview window instead.
@@ -2616,8 +2658,24 @@ fn snipping_save_edited_untracked_asset(
 
 const SNIPPING_FLOAT_WINDOW_PREFIX: &str = "snip-float";
 const SNIPPING_FLOAT_LOGICAL_WIDTH: f64 = 240.0;
+const SNIPPING_FLOAT_GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
+// Every preview is the same golden-ratio rectangle; the capture letterboxes
+// inside it (object-fit: contain in the webview) instead of sizing the window.
+const SNIPPING_FLOAT_LOGICAL_HEIGHT: f64 = SNIPPING_FLOAT_LOGICAL_WIDTH / SNIPPING_FLOAT_GOLDEN_RATIO;
 const SNIPPING_FLOAT_STACK_MARGIN: f64 = 16.0;
 const SNIPPING_FLOAT_STACK_GAP: f64 = 10.0;
+// A native window drag streams Moved events; the stack only re-packs after
+// the window has sat still this long (also long enough to skip mid-drag
+// pauses being treated as drops in most cases).
+const SNIPPING_FLOAT_RESTACK_SETTLE_MS: u64 = 420;
+// Webview events for dropping a preview window onto the main window: the
+// main webview hit-tests the point for a drop target (todo card, terminal
+// pane, ...) and consumes the preview when one accepts.
+const SNIPPING_PREVIEW_DROP_EVENT: &str = "forge-snip-preview-drop";
+const SNIPPING_PREVIEW_DRAG_OVER_EVENT: &str = "forge-snip-preview-drag-over";
+const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 50;
+// Anything closer than this to the grab position is a click, not a drop.
+const SNIPPING_PREVIEW_DRAG_MIN_DISTANCE: i32 = 8;
 
 /// Bottom-left stacking slot for a new preview window: directly above the
 /// highest preview still sitting in the left column, or the bottom corner of
@@ -2666,6 +2724,220 @@ fn snipping_preview_stack_position(
     Some(tauri::PhysicalPosition::new(x, y))
 }
 
+/// Re-packs every preview parked in the bottom-left column into a tight
+/// bottom-up stack. A preview dragged out of the column stops reserving a
+/// slot (the ones above slide down to fill it), and a preview dropped back
+/// over the column is adopted into the stack at the height it was dropped.
+fn snipping_reflow_preview_stack(app: &AppHandle) {
+    let Some(monitor) = app
+        .get_webview_window("main")
+        .and_then(|main_window| main_window.current_monitor().ok().flatten())
+    else {
+        return;
+    };
+    let work_area = monitor.work_area();
+    let scale = monitor.scale_factor().max(0.1);
+    let margin = (SNIPPING_FLOAT_STACK_MARGIN * scale).round() as i32;
+    let gap = (SNIPPING_FLOAT_STACK_GAP * scale).round() as i32;
+    let width_physical = (SNIPPING_FLOAT_LOGICAL_WIDTH * scale).round() as i32;
+    let height_physical = (SNIPPING_FLOAT_LOGICAL_HEIGHT * scale).round() as i32;
+    let x = work_area.position.x + margin;
+    let top_limit = work_area.position.y + margin;
+
+    let mut docked: Vec<(tauri::PhysicalPosition<i32>, i32, tauri::WebviewWindow)> = Vec::new();
+    for (label, window) in app.webview_windows() {
+        if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+            continue;
+        }
+        if !window.is_visible().unwrap_or(false) {
+            continue;
+        }
+        let Ok(position) = window.outer_position() else {
+            continue;
+        };
+        // Same column membership test as snipping_preview_stack_position.
+        if (position.x - x).abs() > width_physical {
+            continue;
+        }
+        let height = window
+            .outer_size()
+            .map(|size| size.height as i32)
+            .unwrap_or(height_physical)
+            .max(1);
+        docked.push((position, height, window));
+    }
+
+    // The lowest window keeps the bottom slot; on-screen order is preserved.
+    docked.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
+    let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
+    for (position, height, window) in docked {
+        let y = (bottom_edge - height).max(top_limit);
+        // Skipping already-settled windows keeps this idempotent, so the
+        // Moved events our own set_position emits cannot ping-pong forever.
+        if position.x != x || position.y != y {
+            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+        }
+        bottom_edge = y - gap;
+    }
+}
+
+/// Debounced settle trigger fed by preview Moved/Destroyed window events.
+fn schedule_snipping_preview_stack_reflow(app: &AppHandle) {
+    let generation = app
+        .state::<SnippingState>()
+        .preview_restack_generation
+        .clone();
+    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(SNIPPING_FLOAT_RESTACK_SETTLE_MS));
+        if generation.load(Ordering::SeqCst) != ticket {
+            return;
+        }
+        let app_for_settle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            snipping_settle_preview_windows(&app_for_settle);
+        });
+    });
+}
+
+/// Runs once a preview window has stopped moving AND the mouse button is up:
+/// first offers any user-dragged preview to the main webview as a drop, then
+/// re-packs the bottom-left stack.
+fn snipping_settle_preview_windows(app: &AppHandle) {
+    if snipping_left_mouse_button_pressed() {
+        // Still mid-drag (the user paused without releasing): check again.
+        schedule_snipping_preview_stack_reflow(app);
+        return;
+    }
+    snipping_resolve_preview_drop_candidates(app);
+    snipping_reflow_preview_stack(app);
+}
+
+/// Maps a preview window's center to main-webview CSS coordinates, or None
+/// when the point is outside the main window's webview.
+fn snipping_preview_point_in_main(
+    app: &AppHandle,
+    preview: &tauri::WebviewWindow,
+) -> Option<(f64, f64)> {
+    let main = app.get_webview_window("main")?;
+    if !main.is_visible().unwrap_or(false) || main.is_minimized().unwrap_or(false) {
+        return None;
+    }
+    let position = preview.outer_position().ok()?;
+    let size = preview.outer_size().ok()?;
+    let center_x = position.x + size.width as i32 / 2;
+    let center_y = position.y + size.height as i32 / 2;
+    let main_origin = main.inner_position().ok()?;
+    let main_size = main.inner_size().ok()?;
+    if center_x < main_origin.x
+        || center_y < main_origin.y
+        || center_x >= main_origin.x + main_size.width as i32
+        || center_y >= main_origin.y + main_size.height as i32
+    {
+        return None;
+    }
+    let scale = main.scale_factor().unwrap_or(1.0).max(0.1);
+    Some((
+        f64::from(center_x - main_origin.x) / scale,
+        f64::from(center_y - main_origin.y) / scale,
+    ))
+}
+
+/// Offers every settled user drag to the main webview as a drop candidate.
+/// The webview decides whether something accepts it (and then calls
+/// snipping_consume_snip_preview); Rust only reports where it landed.
+fn snipping_resolve_preview_drop_candidates(app: &AppHandle) {
+    let state = app.state::<SnippingState>();
+    let sessions: Vec<(String, (i32, i32))> = match state.preview_drag_sessions.lock() {
+        Ok(mut guard) => guard.drain().collect(),
+        Err(_) => return,
+    };
+    if sessions.is_empty() {
+        return;
+    }
+    // Always tell the webview the drag ended so target highlights clear.
+    let _ = app.emit_to(
+        "main",
+        SNIPPING_PREVIEW_DRAG_OVER_EVENT,
+        json!({ "kind": "snip_preview_drag_over", "done": true }),
+    );
+    for (label, (start_x, start_y)) in sessions {
+        let Some(window) = app.get_webview_window(&label) else {
+            continue;
+        };
+        let Ok(position) = window.outer_position() else {
+            continue;
+        };
+        if (position.x - start_x).abs() < SNIPPING_PREVIEW_DRAG_MIN_DISTANCE
+            && (position.y - start_y).abs() < SNIPPING_PREVIEW_DRAG_MIN_DISTANCE
+        {
+            continue;
+        }
+        let Some((client_x, client_y)) = snipping_preview_point_in_main(app, &window) else {
+            continue;
+        };
+        let path = state
+            .preview_paths
+            .lock()
+            .ok()
+            .and_then(|paths| paths.get(&label).cloned())
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        let _ = app.emit_to(
+            "main",
+            SNIPPING_PREVIEW_DROP_EVENT,
+            json!({
+                "kind": "snip_preview_drop",
+                "label": label,
+                "path": path,
+                "clientX": client_x,
+                "clientY": client_y,
+            }),
+        );
+    }
+}
+
+/// Streams throttled drag-over points to the main webview while the user is
+/// dragging a preview, so potential drop targets can highlight live.
+fn snipping_emit_preview_drag_over(app: &AppHandle, label: &str) {
+    let state = app.state::<SnippingState>();
+    let dragging = state
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(label))
+        .unwrap_or(false);
+    if !dragging {
+        return;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let last_ms = state.preview_drag_over_last_emit_ms.load(Ordering::SeqCst);
+    if now_ms.saturating_sub(last_ms) < SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS {
+        return;
+    }
+    state
+        .preview_drag_over_last_emit_ms
+        .store(now_ms, Ordering::SeqCst);
+    let Some(window) = app.get_webview_window(label) else {
+        return;
+    };
+    let payload = match snipping_preview_point_in_main(app, &window) {
+        Some((client_x, client_y)) => json!({
+            "kind": "snip_preview_drag_over",
+            "label": label,
+            "clientX": client_x,
+            "clientY": client_y,
+        }),
+        None => json!({ "kind": "snip_preview_drag_over", "label": label, "outside": true }),
+    };
+    let _ = app.emit_to("main", SNIPPING_PREVIEW_DRAG_OVER_EVENT, payload);
+}
+
 /// Opens one snip preview as its own draggable native window. Every preview is
 /// a standalone window from the moment it is captured: new previews stack in
 /// the bottom-left column and can be dragged anywhere (over any Space) without
@@ -2677,15 +2949,8 @@ fn snipping_open_snip_preview_window_for(
     focused: bool,
 ) -> Result<Value, String> {
     let file = diffforge_local_asset_file(path)?;
-    let (image_width, image_height) = xcap::image::image_dimensions(&file)
-        .map_err(|error| format!("Unable to read snip dimensions: {error}"))?;
-    let aspect = if image_width > 0 {
-        f64::from(image_height) / f64::from(image_width)
-    } else {
-        0.75
-    };
     let width = SNIPPING_FLOAT_LOGICAL_WIDTH;
-    let height = (width * aspect).clamp(60.0, 420.0);
+    let height = SNIPPING_FLOAT_LOGICAL_HEIGHT;
     let label = format!("{SNIPPING_FLOAT_WINDOW_PREFIX}-{}", snipping_window_token(&file));
 
     if let Some(existing) = app.get_webview_window(&label) {
@@ -2746,6 +3011,37 @@ fn snipping_open_snip_preview_window_for(
             }
         }
     }
+    if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
+        paths.insert(label.clone(), file.display().to_string());
+    }
+    // Dragging a preview out of the bottom-left column (or closing one) frees
+    // its slot and the stack re-packs; dropping one back over the column
+    // re-adopts it. Reflow is debounced until the window stops moving. While
+    // a user drag is in flight, the move stream also feeds live drag-over
+    // points to the main webview so drop targets can highlight.
+    {
+        let app_for_events = app.clone();
+        let label_for_events = label.clone();
+        window.on_window_event(move |event| {
+            match event {
+                WindowEvent::Moved(_) => {
+                    snipping_emit_preview_drag_over(&app_for_events, &label_for_events);
+                    schedule_snipping_preview_stack_reflow(&app_for_events);
+                }
+                WindowEvent::Destroyed => {
+                    let state = app_for_events.state::<SnippingState>();
+                    if let Ok(mut paths) = state.preview_paths.lock() {
+                        paths.remove(&label_for_events);
+                    }
+                    if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
+                        sessions.remove(&label_for_events);
+                    }
+                    schedule_snipping_preview_stack_reflow(&app_for_events);
+                }
+                _ => {}
+            }
+        });
+    }
     let _ = window.show();
 
     Ok(json!({
@@ -2769,6 +3065,58 @@ fn snipping_open_snip_float(
         _ => None,
     };
     snipping_open_snip_preview_window_for(&app, &path, explicit_position, true)
+}
+
+/// Called by a preview window's webview right before it starts the native
+/// window drag. Marks the drag session so the settle pass can tell a real
+/// user drag (drop candidate) from programmatic restacking.
+#[tauri::command]
+fn snipping_preview_drag_started(app: AppHandle, label: String) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        return Err("Not a snip preview window.".to_string());
+    }
+    let Some(window) = app.get_webview_window(&label) else {
+        return Err("Snip preview window is not open.".to_string());
+    };
+    let position = window
+        .outer_position()
+        .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
+    if let Ok(mut sessions) = app
+        .state::<SnippingState>()
+        .preview_drag_sessions
+        .lock()
+    {
+        sessions.insert(label, (position.x, position.y));
+    }
+    // A plain click never emits Moved events, so make sure the session still
+    // gets settled (and cleared) shortly after.
+    schedule_snipping_preview_stack_reflow(&app);
+    Ok(json!({ "ok": true }))
+}
+
+/// A drop target in the main webview accepted the snip: the preview window
+/// closes and its capture toast is dismissed, like a manual dismiss.
+#[tauri::command]
+fn snipping_consume_snip_preview(app: AppHandle, label: String, path: String) -> Result<Value, String> {
+    let label = label.trim().to_string();
+    if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
+        return Err("Not a snip preview window.".to_string());
+    }
+    if !path.trim().is_empty() {
+        let _ = snipping_dismiss_capture_toast_for(
+            &app,
+            SnippingCaptureToastDismissRequest {
+                id: None,
+                path: Some(path.trim().to_string()),
+                local_path: None,
+            },
+        );
+    }
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.close();
+    }
+    Ok(json!({ "ok": true, "label": label }))
 }
 
 #[tauri::command]

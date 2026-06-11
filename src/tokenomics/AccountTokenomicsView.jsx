@@ -2208,8 +2208,14 @@ const LimitCard = styled.div`
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.72);
+  container-type: inline-size;
 
   --tone: ${({ tone }) => toneColor(tone)};
+
+  @container (max-width: 450px) {
+    gap: 6px;
+    padding: 8px;
+  }
 
   html[data-forge-theme="light"] & {
     border-color: rgba(15, 23, 42, 0.08);
@@ -2223,6 +2229,10 @@ const MetricHeading = styled.div`
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
+
+  @container (max-width: 450px) {
+    gap: 6px;
+  }
 `;
 
 const MetricName = styled.div`
@@ -2233,6 +2243,11 @@ const MetricName = styled.div`
   color: #e5eefb;
   font-size: clamp(12px, 3.1vw, 14px);
   font-weight: 900;
+
+  @container (max-width: 450px) {
+    gap: 6px;
+    font-size: 12px;
+  }
 
   span {
     min-width: 0;
@@ -2248,6 +2263,13 @@ const MetricName = styled.div`
     fill: none;
     stroke: var(--tone);
     stroke-width: 2;
+  }
+
+  @container (max-width: 450px) {
+    svg {
+      width: 13px;
+      height: 13px;
+    }
   }
 
   html[data-forge-theme="light"] & {
@@ -2268,6 +2290,15 @@ const MetricScore = styled.div`
   strong {
     font-size: clamp(12px, 3vw, 15px);
   }
+
+  @container (max-width: 450px) {
+    gap: 4px;
+    font-size: 10px;
+
+    strong {
+      font-size: 13px;
+    }
+  }
 `;
 
 const ProgressTrack = styled.div`
@@ -2278,6 +2309,10 @@ const ProgressTrack = styled.div`
 
   html[data-forge-theme="light"] & {
     background: rgba(15, 23, 42, 0.12);
+  }
+
+  @container (max-width: 450px) {
+    height: 6px;
   }
 `;
 
@@ -2299,6 +2334,12 @@ const MetricFoot = styled.div`
   color: #8794a8;
   font-size: clamp(9px, 2.5vw, 11px);
   font-weight: 900;
+
+  @container (max-width: 450px) {
+    gap: 6px;
+    font-size: 9px;
+    line-height: 1.15;
+  }
 
   span {
     min-width: 0;
@@ -2339,14 +2380,10 @@ const ChartCard = styled.div`
 
 const ChartGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 450px), 1fr));
   gap: 9px;
   min-width: 0;
   align-items: stretch;
-
-  @media (max-width: 900px) {
-    grid-template-columns: 1fr;
-  }
 `;
 
 const PanelTitle = styled.div`

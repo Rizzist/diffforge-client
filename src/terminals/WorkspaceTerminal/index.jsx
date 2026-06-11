@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -9,6 +10,17 @@ import {
   collapseFunctionalRepoPathToCoreRepoPath,
   createCoreRepoNameDisplayMasker,
 } from "../coreRepoNameDisplay";
+import {
+  TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
+  TERMINAL_WINDOW_CONTROL_EVENT,
+  TERMINAL_WINDOW_CONTROL_FULLSCREEN,
+  TERMINAL_WINDOW_CONTROL_RESTART_AS,
+  TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
+  TERMINAL_WINDOW_CONTROL_SPLIT_VERTICAL,
+  TERMINAL_WINDOW_CONTROL_UI_VIEW,
+  TERMINAL_WINDOW_META_EVENT,
+  TERMINAL_WINDOW_META_REQUEST_EVENT,
+} from "../terminalWindowBridge.js";
 import {
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
 } from "../todoQueueSources.js";
@@ -1289,7 +1301,7 @@ const TERMINAL_SESSION_MODE_ACTIVITY = "activity";
 const TERMINAL_SESSION_MODE_FREE = "free";
 const TERMINAL_SESSION_MODE_REMOTE_OPS = "remote_ops";
 const FORGE_LIGHT_THEME_ID = "light";
-const TERMINAL_DARK_THEME = {
+export const TERMINAL_DARK_THEME = {
   background: TERMINAL_THEME_BACKGROUND,
   foreground: "#e8eef8",
   cursor: "#ff9a3d",
@@ -1315,7 +1327,7 @@ const TERMINAL_DARK_THEME = {
   scrollbarSliderHoverBackground: "rgba(192, 204, 224, 0.62)",
   scrollbarSliderActiveBackground: "rgba(210, 221, 238, 0.78)",
 };
-const TERMINAL_LIGHT_THEME = {
+export const TERMINAL_LIGHT_THEME = {
   background: "#ffffff",
   foreground: "#1d1d1f",
   cursor: "#0066cc",
@@ -13373,6 +13385,124 @@ function WorkspaceTerminal({
     parked: Boolean(parkedPrompt),
     terminalState,
   }));
+
+  // Window Breakout bridge: while this pane lives in its own native window,
+  // the grid pane (still mounted as the placeholder) stays the source of
+  // truth. It broadcasts the header identity/state the window renders, and
+  // executes the control clicks the window sends back, so the breakout bar
+  // is the exact in-grid bar and the PTY/agent never notices either move.
+  const windowBreakoutMetaSignature = windowBreakoutHosted && paneId
+    ? JSON.stringify({
+      agentKind: terminalAgentKind,
+      agentLabel: terminalRailAgentLabel,
+      agentTitle: terminalRailAgentTitle,
+      canOpenUiView: canOpenTerminalUiView,
+      canSplit: canSplitTerminal,
+      colorSlot: getTerminalAgentColorSlot(terminalIndex),
+      paneId,
+      roleOptions: getTerminalRoleSwitchOptions(agentStatuses)
+        .map((option) => ({ id: option.id, label: option.label })),
+      stateLabel: terminalStateDebugLabel,
+    })
+    : "";
+
+  useEffect(() => {
+    if (!windowBreakoutMetaSignature) {
+      return undefined;
+    }
+
+    const meta = JSON.parse(windowBreakoutMetaSignature);
+    emit(TERMINAL_WINDOW_META_EVENT, meta).catch(() => {});
+
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TERMINAL_WINDOW_META_REQUEST_EVENT, (event) => {
+      if (disposed || String(event.payload?.paneId || "") !== meta.paneId) {
+        return;
+      }
+      emit(TERMINAL_WINDOW_META_EVENT, meta).catch(() => {});
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [windowBreakoutMetaSignature]);
+
+  useEffect(() => {
+    if (!windowBreakoutHosted || !paneId) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TERMINAL_WINDOW_CONTROL_EVENT, (event) => {
+      if (disposed || String(event.payload?.paneId || "") !== paneId) {
+        return;
+      }
+
+      const returnPaneToApp = () => {
+        invoke("terminal_window_close", { paneId }).catch(() => {});
+        getCurrentWindow().setFocus().catch(() => {});
+      };
+
+      switch (String(event.payload?.control || "")) {
+        case TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL:
+          closeTerminal();
+          break;
+        case TERMINAL_WINDOW_CONTROL_RESTART_AS:
+          restartTerminalAs(String(event.payload?.roleId || "") || undefined);
+          break;
+        case TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL:
+          splitTerminalHorizontal();
+          break;
+        case TERMINAL_WINDOW_CONTROL_SPLIT_VERTICAL:
+          splitTerminalVertical();
+          break;
+        case TERMINAL_WINDOW_CONTROL_UI_VIEW:
+          returnPaneToApp();
+          toggleTerminalUiView();
+          break;
+        case TERMINAL_WINDOW_CONTROL_FULLSCREEN:
+          returnPaneToApp();
+          toggleTerminalFullscreen();
+          break;
+        default:
+          break;
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    closeTerminal,
+    paneId,
+    restartTerminalAs,
+    splitTerminalHorizontal,
+    splitTerminalVertical,
+    toggleTerminalFullscreen,
+    toggleTerminalUiView,
+    windowBreakoutHosted,
+  ]);
+
   if (!agent) {
     return (
       <TerminalWorkspaceSurface>

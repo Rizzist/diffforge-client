@@ -1,11 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import styled from "styled-components";
+import styled, { keyframes } from "styled-components";
 
 import { ArchitectureHubView } from "../architecture/ArchitectureWorkspaceView.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { MCP_CATALOG } from "./mcpCatalog.js";
+import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
+import {
+  parseSkillsLibrary,
+  serializeSkillsLibrary,
+  skillSlug,
+  skillToneColor,
+} from "./skillsLibrary.js";
 
 const SECTIONS = [
   { id: "architectures", label: "Architectures" },
@@ -51,6 +59,16 @@ function cliSnapshotFromStatuses(statuses) {
     updateAvailable: Boolean(status?.npmUpdateAvailable || status?.npm_update_available),
     activeModel: text(status?.activeModel || status?.active_model),
   }));
+}
+
+function SkillIconGlyph({ icon, title }) {
+  const CliIcon = skillCliIcon(icon);
+  if (CliIcon) return <CliIcon />;
+  const key = String(icon || "");
+  if (key.startsWith("codicon:")) {
+    return <span className={`codicon codicon-${key.slice("codicon:".length)}`} />;
+  }
+  return <span>{text(title, "S").slice(0, 1).toUpperCase()}</span>;
 }
 
 export default function ToolsWorkspaceView({
@@ -125,13 +143,18 @@ export default function ToolsWorkspaceView({
   const mcpScopeReady = activeMcpScope !== GLOBAL_MCP_DEFAULTS_SCOPE
     || (globalMcpDefaults.state === "ready" && Boolean(globalMcpDefaults.rootDirectory));
 
-  // ---- Skills (account-level, server synced) ----
-  const [skillsDraft, setSkillsDraft] = useState("");
+  // ---- Skills (account-level structured library; the cloud document is
+  // still the SKILLS.md blob, synced + offline-cached headlessly by Rust) ----
+  const [skillsLibrary, setSkillsLibrary] = useState({ preamble: "", skills: [] });
   const [skillsRevision, setSkillsRevision] = useState(null);
   const [skillsMeta, setSkillsMeta] = useState({ updatedAt: "", updatedBy: "", offline: false });
   const [skillsState, setSkillsState] = useState("loading");
   const [skillsError, setSkillsError] = useState("");
-  const [skillsDirty, setSkillsDirty] = useState(false);
+  const [skillsQuery, setSkillsQuery] = useState("");
+  // "library:<id>" or "catalog:<id>" — selecting a skill shows its contents.
+  const [selectedSkillKey, setSelectedSkillKey] = useState("");
+  // { id: ""|skillId, title, description, content } while creating/editing.
+  const [skillEditor, setSkillEditor] = useState(null);
 
   // ---- CLIs ----
   const [cliStatuses, setCliStatuses] = useState([]);
@@ -151,7 +174,7 @@ export default function ToolsWorkspaceView({
       const data = await invoke("cloud_mcp_get_account_tools");
       const skills = data?.skills || {};
       const skillsMd = text(skills.skills_md ?? skills.skillsMd, "");
-      setSkillsDraft((current) => (skillsDirty ? current : skillsMd));
+      setSkillsLibrary(parseSkillsLibrary(skillsMd));
       setSkillsRevision(
         Number.isFinite(Number(skills.revision)) && skills.revision !== null
           ? Number(skills.revision)
@@ -167,7 +190,7 @@ export default function ToolsWorkspaceView({
       setSkillsError(getErrorMessage(error, "Unable to load account tools."));
       setSkillsState("error");
     }
-  }, [skillsDirty]);
+  }, []);
 
   const refreshCliStatuses = useCallback(async ({ report = true } = {}) => {
     setCliState((current) => (current === "ready" ? "refreshing" : "loading"));
@@ -214,12 +237,47 @@ export default function ToolsWorkspaceView({
     void refreshCliStatuses();
   }, [refreshCliStatuses]);
 
-  const saveSkills = useCallback(async () => {
+  // The Rust inventory watcher reports CLI installs/updates made outside the
+  // app (terminals, remote levers, background mode); apply them live.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    void listen("agent-inventory-changed", (event) => {
+      if (disposed) {
+        return;
+      }
+      const statuses = Array.isArray(event?.payload?.statuses) ? event.payload.statuses : [];
+      if (!statuses.length) {
+        return;
+      }
+      setCliStatuses(statuses);
+      setCliState("ready");
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+      } else {
+        unlisten = dispose;
+      }
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, []);
+
+  // Applies the next skill list locally right away, then syncs the serialized
+  // SKILLS.md through Rust in the background (Rust owns the HTTP call and the
+  // offline cache, so the save completes even if the user navigates away).
+  const persistSkillsLibrary = useCallback(async (nextSkills) => {
+    const nextLibrary = { preamble: skillsLibrary.preamble, skills: nextSkills };
+    setSkillsLibrary(nextLibrary);
     setSkillsState("saving");
     setSkillsError("");
     try {
       const result = await invoke("cloud_mcp_save_account_skills", {
-        skillsMd: skillsDraft,
+        skillsMd: serializeSkillsLibrary(nextLibrary.skills, nextLibrary.preamble),
         baseRevision: skillsRevision,
       });
       setSkillsRevision(
@@ -230,18 +288,83 @@ export default function ToolsWorkspaceView({
         updatedAt: text(result?.updated_at || result?.updatedAt, current.updatedAt),
         offline: false,
       }));
-      setSkillsDirty(false);
       setSkillsState("ready");
+      return true;
     } catch (error) {
-      const message = getErrorMessage(error, "Unable to save SKILLS.md.");
-      setSkillsError(message);
+      // Stale revision or offline: the local list keeps the change so nothing
+      // is lost; the next successful save syncs the whole document.
+      setSkillsError(getErrorMessage(error, "Unable to sync skills."));
       setSkillsState("ready");
-      if (message.includes("changed on another device")) {
-        // Stale revision: keep the draft so nothing is lost; the user can
-        // reload to pick up the remote version first.
-      }
+      return false;
     }
-  }, [skillsDraft, skillsRevision]);
+  }, [skillsLibrary.preamble, skillsRevision]);
+
+  const addCatalogSkill = useCallback((entry) => {
+    const existingIds = new Set(skillsLibrary.skills.map((skill) => skill.id));
+    if (existingIds.has(entry.id)) {
+      setSelectedSkillKey(`library:${entry.id}`);
+      return;
+    }
+    const skill = {
+      content: String(entry.content || "").trim(),
+      description: text(entry.description),
+      icon: text(entry.icon),
+      id: entry.id,
+      source: text(entry.source, "catalog"),
+      title: text(entry.title, entry.id),
+      tone: text(entry.tone),
+      updatedAt: new Date().toISOString(),
+    };
+    void persistSkillsLibrary([...skillsLibrary.skills, skill]);
+    setSelectedSkillKey(`library:${skill.id}`);
+  }, [persistSkillsLibrary, skillsLibrary.skills]);
+
+  const removeSkill = useCallback((skillId) => {
+    const skill = skillsLibrary.skills.find((entry) => entry.id === skillId);
+    if (!skill) return;
+    if (typeof window !== "undefined" && !window.confirm(`Remove the skill "${skill.title}"?`)) {
+      return;
+    }
+    void persistSkillsLibrary(skillsLibrary.skills.filter((entry) => entry.id !== skillId));
+    setSelectedSkillKey("");
+  }, [persistSkillsLibrary, skillsLibrary.skills]);
+
+  const saveSkillEditor = useCallback(() => {
+    if (!skillEditor || !text(skillEditor.title)) return;
+    const existing = skillEditor.id
+      ? skillsLibrary.skills.find((entry) => entry.id === skillEditor.id)
+      : null;
+    const updatedAt = new Date().toISOString();
+    let nextSkills;
+    let savedId;
+    if (existing) {
+      savedId = existing.id;
+      nextSkills = skillsLibrary.skills.map((entry) => (entry.id === existing.id
+        ? {
+          ...entry,
+          content: String(skillEditor.content || "").trim(),
+          description: text(skillEditor.description),
+          title: text(skillEditor.title),
+          updatedAt,
+        }
+        : entry));
+    } else {
+      savedId = skillSlug(skillEditor.title, new Set(skillsLibrary.skills.map((entry) => entry.id)));
+      nextSkills = [...skillsLibrary.skills, {
+        content: String(skillEditor.content || "").trim(),
+        description: text(skillEditor.description),
+        icon: "",
+        id: savedId,
+        source: "custom",
+        title: text(skillEditor.title),
+        tone: "",
+        updatedAt,
+      }];
+    }
+    void persistSkillsLibrary(nextSkills);
+    setSkillEditor(null);
+    setSelectedSkillKey(`library:${savedId}`);
+  }, [persistSkillsLibrary, skillEditor, skillsLibrary.skills]);
 
   const runCliAction = useCallback(async (provider, action) => {
     const key = `${provider}:${action}`;
@@ -301,25 +424,115 @@ export default function ToolsWorkspaceView({
     }
   }, [refreshCliStatuses]);
 
-  const visibleCatalog = useMemo(() => {
+  // One flat "installed programs" list: coding-agent CLIs and the developer
+  // catalog merged, installed entries first, filtered by the search query.
+  const cliRows = useMemo(() => {
     const query = text(catalogQuery).toLowerCase();
-    if (!query) return CLI_CATALOG;
-    return CLI_CATALOG.filter((entry) => (
-      entry.label.toLowerCase().includes(query) || entry.binary.toLowerCase().includes(query)
-    ));
-  }, [catalogQuery]);
+    const agentRows = (Array.isArray(cliStatuses) ? cliStatuses : []).map((status) => {
+      const provider = text(status?.provider || status?.id);
+      const label = text(status?.label, provider);
+      return {
+        busyAction: cliBusy[provider] || "",
+        icon: null,
+        id: `agent:${provider}`,
+        installed: Boolean(status?.installed),
+        kind: "agent",
+        label,
+        manageable: true,
+        provider,
+        searchText: `${label} ${provider}`.toLowerCase(),
+        sub: "coding agent",
+        updateAvailable: Boolean(status?.npmUpdateAvailable || status?.npm_update_available),
+        version: text(status?.version),
+      };
+    });
+    const catalogRows = CLI_CATALOG.map((entry) => ({
+      busyAction: catalogBusy[entry.id] || "",
+      entry,
+      icon: entry.icon || null,
+      id: `catalog:${entry.id}`,
+      installed: Boolean(catalogChecks?.[entry.binary]?.installed),
+      kind: "catalog",
+      label: entry.label,
+      manageable: Boolean(cliInstallManager(entry)),
+      searchText: `${entry.label} ${entry.binary}`.toLowerCase(),
+      sub: entry.binary,
+      updateAvailable: false,
+      version: "",
+    }));
+    return [...agentRows, ...catalogRows]
+      .filter((row) => !query || row.searchText.includes(query))
+      .sort((a, b) => {
+        if (a.installed !== b.installed) return a.installed ? -1 : 1;
+        return a.label.localeCompare(b.label);
+      });
+  }, [catalogBusy, catalogChecks, catalogQuery, cliBusy, cliStatuses]);
+
+  const handleCliRowAction = useCallback((row, action) => {
+    if (row.kind === "agent") {
+      void runCliAction(row.provider, action);
+    } else if (row.entry) {
+      void runCatalogAction(row.entry, action);
+    }
+  }, [runCatalogAction, runCliAction]);
 
   const skillsStatusLabel = useMemo(() => {
     if (skillsState === "loading") return "Loading…";
-    if (skillsState === "saving") return "Saving…";
+    if (skillsState === "saving") return "Syncing…";
     if (skillsMeta.offline) return "Offline — showing cached copy";
-    if (skillsDirty) return "Unsaved changes";
     const parts = [];
     if (skillsRevision !== null) parts.push(`rev ${skillsRevision}`);
     if (skillsMeta.updatedAt) parts.push(`updated ${timeAgo(skillsMeta.updatedAt)}`);
     if (skillsMeta.updatedBy) parts.push(`by ${skillsMeta.updatedBy}`);
     return parts.join(" · ") || "Synced to your account";
-  }, [skillsDirty, skillsMeta, skillsRevision, skillsState]);
+  }, [skillsMeta, skillsRevision, skillsState]);
+
+  // Library skills filtered by search; catalog entries the user hasn't added
+  // yet, with skills for CLIs installed on this device surfaced first.
+  const librarySkillRows = useMemo(() => {
+    const query = text(skillsQuery).toLowerCase();
+    return skillsLibrary.skills.filter((skill) => (
+      !query
+        || skill.title.toLowerCase().includes(query)
+        || skill.description.toLowerCase().includes(query)
+    ));
+  }, [skillsLibrary.skills, skillsQuery]);
+
+  const catalogSkillRows = useMemo(() => {
+    const query = text(skillsQuery).toLowerCase();
+    const ownedIds = new Set(skillsLibrary.skills.map((skill) => skill.id));
+    return SKILLS_CATALOG
+      .filter((entry) => !ownedIds.has(entry.id))
+      .filter((entry) => (
+        !query
+          || entry.title.toLowerCase().includes(query)
+          || entry.description.toLowerCase().includes(query)
+      ))
+      .map((entry) => ({
+        ...entry,
+        cliInstalled: Boolean(catalogChecks?.[skillCliBinary(entry)]?.installed),
+      }))
+      .sort((a, b) => {
+        if (a.cliInstalled !== b.cliInstalled) return a.cliInstalled ? -1 : 1;
+        if (a.source !== b.source) return a.source === "catalog" ? -1 : 1;
+        return a.title.localeCompare(b.title);
+      });
+  }, [catalogChecks, skillsLibrary.skills, skillsQuery]);
+
+  const selectedSkill = useMemo(() => {
+    const [scope, ...rest] = selectedSkillKey.split(":");
+    const id = rest.join(":");
+    if (!id) return null;
+    if (scope === "library") {
+      const skill = skillsLibrary.skills.find((entry) => entry.id === id);
+      return skill ? { ...skill, owned: true } : null;
+    }
+    if (scope === "catalog") {
+      const entry = SKILLS_CATALOG.find((candidate) => candidate.id === id);
+      return entry ? { ...entry, owned: false } : null;
+    }
+    return null;
+  }, [selectedSkillKey, skillsLibrary.skills]);
 
   return (
     <ToolsHubShell aria-label="Global toolkit" data-section={section}>
@@ -354,7 +567,6 @@ export default function ToolsWorkspaceView({
             <ArchitectureHubView
               catalog={architectures.catalog}
               catalogError={architectures.catalogError}
-              catalogRefreshing={Boolean(architectures.catalogRefreshing)}
               catalogState={architectures.catalogState}
               graphLists={architectures.graphLists}
               onCopyGraph={architectures.onCopyGraph}
@@ -467,200 +679,327 @@ export default function ToolsWorkspaceView({
         <ToolsScroll>
           <ToolsLayout>
             {section === "skills" && (
-              <ToolsPanel aria-label="Account skills">
-                <ToolsPanelTopline>
-                  <div>
-                    <ToolsPanelTitle>SKILLS.md</ToolsPanelTitle>
-                    <ToolsPanelHint>
-                      One shared playbook for your coding agents, synced at the account level.
-                      Pair it with the CLIs below — skills describe how, CLIs do the work.
-                    </ToolsPanelHint>
-                  </div>
-                  <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : skillsDirty ? "warn" : "good"}>
-                    {skillsStatusLabel}
-                  </ToolsStatusPill>
-                </ToolsPanelTopline>
-                <ToolsSkillsEditor
-                  aria-label="SKILLS.md content"
-                  disabled={skillsState === "loading" || skillsState === "saving"}
-                  onChange={(event) => {
-                    setSkillsDraft(event.target.value);
-                    setSkillsDirty(true);
-                  }}
-                  placeholder={"# Skills\n\nDocument the repeatable workflows, commands, and conventions your agents should know…"}
-                  spellCheck={false}
-                  value={skillsDraft}
-                />
-                {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
-                <ToolsPanelActions>
-                  <ToolsGhostButton
-                    disabled={skillsState === "loading" || skillsState === "saving"}
-                    onClick={() => {
-                      setSkillsDirty(false);
-                      void loadAccountTools();
-                    }}
-                    type="button"
-                  >
-                    Reload
-                  </ToolsGhostButton>
-                  <ToolsPrimaryButton
-                    disabled={!skillsDirty || skillsState === "saving" || skillsMeta.offline}
-                    onClick={saveSkills}
-                    type="button"
-                  >
-                    {skillsState === "saving" ? "Saving…" : "Save & sync"}
-                  </ToolsPrimaryButton>
-                </ToolsPanelActions>
+              <ToolsPanel aria-label="Skills">
+                {skillEditor ? (
+                  <>
+                    <ToolsPanelTopline>
+                      <div>
+                        <ToolsPanelTitle>{skillEditor.id ? "Edit skill" : "New skill"}</ToolsPanelTitle>
+                        <ToolsPanelHint>
+                          Skills sync to your account and feed every coding agent.
+                        </ToolsPanelHint>
+                      </div>
+                      <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
+                        {skillsStatusLabel}
+                      </ToolsStatusPill>
+                    </ToolsPanelTopline>
+                    <SkillEditorField
+                      aria-label="Skill title"
+                      onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
+                      placeholder="Skill title"
+                      value={skillEditor.title}
+                    />
+                    <SkillEditorField
+                      aria-label="Skill description"
+                      onChange={(event) => setSkillEditor((current) => ({ ...current, description: event.target.value }))}
+                      placeholder="One-line description"
+                      value={skillEditor.description}
+                    />
+                    <ToolsSkillsEditor
+                      aria-label="Skill content"
+                      onChange={(event) => setSkillEditor((current) => ({ ...current, content: event.target.value }))}
+                      placeholder={"Document the workflow, commands, and conventions this skill covers…"}
+                      spellCheck={false}
+                      value={skillEditor.content}
+                    />
+                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
+                    <ToolsPanelActions>
+                      <ToolsGhostButton onClick={() => setSkillEditor(null)} type="button">
+                        Cancel
+                      </ToolsGhostButton>
+                      <ToolsPrimaryButton
+                        disabled={!text(skillEditor.title) || skillsState === "saving"}
+                        onClick={saveSkillEditor}
+                        type="button"
+                      >
+                        {skillsState === "saving" ? "Syncing…" : "Save skill"}
+                      </ToolsPrimaryButton>
+                    </ToolsPanelActions>
+                  </>
+                ) : selectedSkill ? (
+                  <>
+                    <SkillDetailHeader>
+                      <ToolsGhostButton onClick={() => setSelectedSkillKey("")} type="button">
+                        ‹ Skills
+                      </ToolsGhostButton>
+                      <SkillDetailActions>
+                        {selectedSkill.owned ? (
+                          <>
+                            <ToolsGhostButton
+                              onClick={() => setSkillEditor({
+                                content: selectedSkill.content,
+                                description: selectedSkill.description,
+                                id: selectedSkill.id,
+                                title: selectedSkill.title,
+                              })}
+                              type="button"
+                            >
+                              Edit
+                            </ToolsGhostButton>
+                            <ToolsGhostButton
+                              data-danger="true"
+                              onClick={() => removeSkill(selectedSkill.id)}
+                              type="button"
+                            >
+                              Remove
+                            </ToolsGhostButton>
+                          </>
+                        ) : (
+                          <ToolsPrimaryButton
+                            disabled={skillsState === "saving"}
+                            onClick={() => addCatalogSkill(selectedSkill)}
+                            type="button"
+                          >
+                            {skillsState === "saving" ? "Adding…" : "Add to my skills"}
+                          </ToolsPrimaryButton>
+                        )}
+                      </SkillDetailActions>
+                    </SkillDetailHeader>
+                    <SkillDetailTitle>
+                      <SkillRowIcon
+                        aria-hidden="true"
+                        style={{ "--skill-color": skillToneColor(selectedSkill.tone, selectedSkill.title) }}
+                      >
+                        <SkillIconGlyph icon={selectedSkill.icon} title={selectedSkill.title} />
+                      </SkillRowIcon>
+                      <div>
+                        <strong>{selectedSkill.title}</strong>
+                        <span>{selectedSkill.description}</span>
+                      </div>
+                    </SkillDetailTitle>
+                    <SkillDetailMeta>
+                      <SkillSourceBadge data-source={selectedSkill.source}>
+                        {selectedSkill.source === "cli"
+                          ? "CLI skill"
+                          : selectedSkill.source === "catalog"
+                            ? "Curated"
+                            : "Custom"}
+                      </SkillSourceBadge>
+                      {selectedSkill.owned && selectedSkill.updatedAt && (
+                        <span>updated {timeAgo(selectedSkill.updatedAt)}</span>
+                      )}
+                      {!selectedSkill.owned && <span>preview — not in your library yet</span>}
+                    </SkillDetailMeta>
+                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
+                    <SkillContent>{selectedSkill.content || "This skill has no content yet."}</SkillContent>
+                  </>
+                ) : (
+                  <>
+                    <CliSearchRow>
+                      <CliSearchInput
+                        aria-label="Search skills"
+                        onChange={(event) => setSkillsQuery(event.target.value)}
+                        placeholder="Search skills…"
+                        type="search"
+                        value={skillsQuery}
+                      />
+                      <ToolsGhostButton
+                        onClick={() => setSkillEditor({ content: "", description: "", id: "", title: "" })}
+                        type="button"
+                      >
+                        New skill
+                      </ToolsGhostButton>
+                      <ToolsStatusPill data-tone={skillsMeta.offline ? "warn" : "good"}>
+                        {skillsStatusLabel}
+                      </ToolsStatusPill>
+                    </CliSearchRow>
+                    {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
+                    {skillsState === "loading" ? (
+                      <ToolsEmpty>Loading skills…</ToolsEmpty>
+                    ) : (
+                      <>
+                        <SkillsGroupLabel>{`Your skills · ${librarySkillRows.length}`}</SkillsGroupLabel>
+                        <SkillsList role="list">
+                          {librarySkillRows.map((skill) => (
+                            <SkillRow
+                              key={skill.id}
+                              onClick={() => setSelectedSkillKey(`library:${skill.id}`)}
+                              role="listitem"
+                              type="button"
+                            >
+                              <SkillRowIcon
+                                aria-hidden="true"
+                                style={{ "--skill-color": skillToneColor(skill.tone, skill.title) }}
+                              >
+                                <SkillIconGlyph icon={skill.icon} title={skill.title} />
+                              </SkillRowIcon>
+                              <SkillRowCopy>
+                                <strong>{skill.title}</strong>
+                                <span>{skill.description || "No description"}</span>
+                              </SkillRowCopy>
+                              <SkillRowSide>
+                                <SkillSourceBadge data-source={skill.source}>
+                                  {skill.source === "cli" ? "CLI" : skill.source === "catalog" ? "Curated" : "Custom"}
+                                </SkillSourceBadge>
+                                <SkillRowChevron aria-hidden="true">›</SkillRowChevron>
+                              </SkillRowSide>
+                            </SkillRow>
+                          ))}
+                          {!librarySkillRows.length && (
+                            <ToolsEmpty>
+                              {text(skillsQuery)
+                                ? "No skills match your search."
+                                : "No skills yet — add one from the catalog below or create your own."}
+                            </ToolsEmpty>
+                          )}
+                        </SkillsList>
+                        {catalogSkillRows.length > 0 && (
+                          <>
+                            <SkillsGroupLabel>Downloadable skills</SkillsGroupLabel>
+                            <SkillsList role="list">
+                              {catalogSkillRows.map((entry) => (
+                                <SkillRow
+                                  key={entry.id}
+                                  onClick={() => setSelectedSkillKey(`catalog:${entry.id}`)}
+                                  role="listitem"
+                                  type="button"
+                                >
+                                  <SkillRowIcon
+                                    aria-hidden="true"
+                                    style={{ "--skill-color": skillToneColor(entry.tone, entry.title) }}
+                                  >
+                                    <SkillIconGlyph icon={entry.icon} title={entry.title} />
+                                  </SkillRowIcon>
+                                  <SkillRowCopy>
+                                    <strong>{entry.title}</strong>
+                                    <span>{entry.description}</span>
+                                  </SkillRowCopy>
+                                  <SkillRowSide>
+                                    {entry.cliInstalled && (
+                                      <SkillSourceBadge data-source="cli">CLI installed</SkillSourceBadge>
+                                    )}
+                                    <CliRowButton
+                                      disabled={skillsState === "saving"}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        addCatalogSkill(entry);
+                                      }}
+                                      type="button"
+                                    >
+                                      Add
+                                    </CliRowButton>
+                                  </SkillRowSide>
+                                </SkillRow>
+                              ))}
+                            </SkillsList>
+                          </>
+                        )}
+                      </>
+                    )}
+                  </>
+                )}
               </ToolsPanel>
             )}
 
             {section === "clis" && (
-              <ToolsPanel aria-label="Coding CLIs">
-                <ToolsPanelTopline>
-                  <div>
-                    <ToolsPanelTitle>Coding CLIs</ToolsPanelTitle>
-                    <ToolsPanelHint>
-                      Install state lives on this device and is reported to your account, so every
-                      device knows what is available where.
-                    </ToolsPanelHint>
-                  </div>
+              <ToolsPanel aria-label="CLIs">
+                <CliSearchRow>
+                  <CliSearchInput
+                    aria-label="Search CLIs by name"
+                    onChange={(event) => setCatalogQuery(event.target.value)}
+                    placeholder="Search CLIs…"
+                    type="search"
+                    value={catalogQuery}
+                  />
                   <ToolsGhostButton
                     disabled={cliState === "loading" || cliState === "refreshing"}
                     onClick={() => void refreshCliStatuses()}
+                    title="Re-check installed CLIs"
                     type="button"
                   >
-                    {cliState === "refreshing" ? "Refreshing…" : "Refresh"}
+                    {cliState === "refreshing" ? "Checking…" : "Refresh"}
                   </ToolsGhostButton>
-                </ToolsPanelTopline>
+                </CliSearchRow>
                 {cliError && <ToolsError role="alert">{cliError}</ToolsError>}
                 {cliMessage && <ToolsNotice>{cliMessage}</ToolsNotice>}
                 {cliState === "loading" ? (
                   <ToolsEmpty>Checking installed CLIs…</ToolsEmpty>
                 ) : (
-                  <ToolsCliGrid>
-                    {cliStatuses.map((status) => {
-                      const provider = text(status?.provider || status?.id);
-                      const busyAction = cliBusy[provider] || "";
-                      const installed = Boolean(status?.installed);
-                      const updateAvailable = Boolean(status?.npmUpdateAvailable || status?.npm_update_available);
-                      const version = text(status?.version);
+                  <CliList aria-label="CLI programs" role="list">
+                    {cliRows.map((row) => {
+                      const Icon = row.icon;
                       return (
-                        <ToolsCliCard data-installed={installed ? "true" : "false"} key={provider}>
-                          <ToolsCliTopline>
-                            <strong>{text(status?.label, provider)}</strong>
-                            <ToolsStatusPill data-tone={installed ? "good" : "muted"}>
-                              {busyAction
-                                ? `${busyAction === "install" ? "Installing" : busyAction === "update" ? "Updating" : "Uninstalling"}…`
-                                : installed
-                                  ? version
-                                    ? `Installed · ${version}`
-                                    : "Installed"
-                                  : "Not installed"}
-                            </ToolsStatusPill>
-                          </ToolsCliTopline>
-                          <ToolsCliMeta>
-                            {Boolean(status?.authenticated) && <span>signed in</span>}
-                            {updateAvailable && <span data-tone="warn">update available</span>}
-                            {text(status?.activeModel || status?.active_model) && (
-                              <span>{text(status?.activeModel || status?.active_model)}</span>
-                            )}
-                          </ToolsCliMeta>
-                          <ToolsCliActions>
-                            {!installed && (
-                              <ToolsPrimaryButton
-                                disabled={Boolean(busyAction)}
-                                onClick={() => void runCliAction(provider, "install")}
-                                type="button"
+                        <CliRow
+                          data-installed={row.installed ? "true" : "false"}
+                          key={row.id}
+                          role="listitem"
+                        >
+                          <CliRowIcon aria-hidden="true">
+                            {Icon ? <Icon /> : <span>{row.label.slice(0, 1).toUpperCase()}</span>}
+                          </CliRowIcon>
+                          <CliRowName>
+                            <strong>{row.label}</strong>
+                            {row.sub && <span>{row.sub}</span>}
+                          </CliRowName>
+                          <CliRowState>
+                            {row.busyAction ? (
+                              <CliStateText data-tone="busy">
+                                {row.busyAction === "install"
+                                  ? "Installing…"
+                                  : row.busyAction === "update"
+                                    ? "Updating…"
+                                    : "Uninstalling…"}
+                              </CliStateText>
+                            ) : row.installed ? (
+                              <>
+                                <CliRowButton
+                                  data-danger="true"
+                                  data-hover-only="true"
+                                  onClick={() => handleCliRowAction(row, "uninstall")}
+                                  type="button"
+                                >
+                                  Uninstall
+                                </CliRowButton>
+                                {row.updateAvailable && (
+                                  <CliRowButton
+                                    onClick={() => handleCliRowAction(row, "update")}
+                                    type="button"
+                                  >
+                                    Update
+                                  </CliRowButton>
+                                )}
+                                <CliStateText data-tone="good">
+                                  {row.version ? `Installed · ${row.version}` : "Installed"}
+                                </CliStateText>
+                              </>
+                            ) : row.manageable ? (
+                              <>
+                                <CliRowButton
+                                  data-hover-only="true"
+                                  onClick={() => handleCliRowAction(row, "install")}
+                                  type="button"
+                                >
+                                  Install
+                                </CliRowButton>
+                                <CliStateText data-tone="muted">Not installed</CliStateText>
+                              </>
+                            ) : (
+                              <CliStateText
+                                data-tone="muted"
+                                title="No managed installer for this device — install manually"
                               >
-                                {busyAction === "install" ? "Installing…" : "Install"}
-                              </ToolsPrimaryButton>
+                                Not installed
+                              </CliStateText>
                             )}
-                            {installed && updateAvailable && (
-                              <ToolsPrimaryButton
-                                disabled={Boolean(busyAction)}
-                                onClick={() => void runCliAction(provider, "update")}
-                                type="button"
-                              >
-                                {busyAction === "update" ? "Updating…" : "Update"}
-                              </ToolsPrimaryButton>
-                            )}
-                            {installed && (
-                              <ToolsDangerButton
-                                disabled={Boolean(busyAction)}
-                                onClick={() => void runCliAction(provider, "uninstall")}
-                                type="button"
-                              >
-                                {busyAction === "uninstall" ? "Uninstalling…" : "Uninstall"}
-                              </ToolsDangerButton>
-                            )}
-                          </ToolsCliActions>
-                        </ToolsCliCard>
+                          </CliRowState>
+                        </CliRow>
                       );
                     })}
-                  </ToolsCliGrid>
+                    {!cliRows.length && (
+                      <ToolsEmpty>{`No CLIs match "${text(catalogQuery)}".`}</ToolsEmpty>
+                    )}
+                  </CliList>
                 )}
-
-                <ToolsPanelTopline>
-                  <div>
-                    <ToolsPanelTitle>Developer CLI catalog</ToolsPanelTitle>
-                    <ToolsPanelHint>
-                      {`${CLI_CATALOG.length} common developer CLIs. Detection runs on this device; installs use Homebrew or npm.`}
-                    </ToolsPanelHint>
-                  </div>
-                  <ToolsSearchInput
-                    aria-label="Filter CLI catalog"
-                    onChange={(event) => setCatalogQuery(event.target.value)}
-                    placeholder="Filter CLIs…"
-                    type="search"
-                    value={catalogQuery}
-                  />
-                </ToolsPanelTopline>
-                <ToolsCatalogGrid>
-                  {visibleCatalog.map((entry) => {
-                    const Icon = entry.icon;
-                    const check = catalogChecks?.[entry.binary] || {};
-                    const installed = Boolean(check.installed);
-                    const busyAction = catalogBusy[entry.id] || "";
-                    const manageable = Boolean(cliInstallManager(entry));
-                    return (
-                      <ToolsCatalogCard data-installed={installed ? "true" : "false"} key={entry.id}>
-                        <ToolsCatalogIcon aria-hidden="true">
-                          {Icon ? <Icon /> : <span>{entry.label.slice(0, 1)}</span>}
-                        </ToolsCatalogIcon>
-                        <ToolsCatalogCopy>
-                          <strong>{entry.label}</strong>
-                          <span>{installed ? "installed" : "not installed"}</span>
-                        </ToolsCatalogCopy>
-                        {busyAction ? (
-                          <ToolsStatusPill data-tone="warn">
-                            {busyAction === "install" ? "Installing…" : "Removing…"}
-                          </ToolsStatusPill>
-                        ) : installed ? (
-                          manageable ? (
-                            <ToolsCatalogButton
-                              data-danger="true"
-                              onClick={() => void runCatalogAction(entry, "uninstall")}
-                              type="button"
-                            >
-                              Uninstall
-                            </ToolsCatalogButton>
-                          ) : (
-                            <ToolsStatusPill data-tone="good">Installed</ToolsStatusPill>
-                          )
-                        ) : manageable ? (
-                          <ToolsCatalogButton
-                            onClick={() => void runCatalogAction(entry, "install")}
-                            type="button"
-                          >
-                            Install
-                          </ToolsCatalogButton>
-                        ) : (
-                          <ToolsStatusPill data-tone="muted">Manual</ToolsStatusPill>
-                        )}
-                      </ToolsCatalogCard>
-                    );
-                  })}
-                </ToolsCatalogGrid>
               </ToolsPanel>
             )}
           </ToolsLayout>
@@ -951,15 +1290,15 @@ const ToolsGhostButton = styled.button`
     cursor: default;
     opacity: 0.5;
   }
-`;
 
-const ToolsDangerButton = styled(ToolsGhostButton)`
-  border-color: rgba(239, 107, 107, 0.3);
-  color: rgba(250, 180, 180, 0.92);
+  &[data-danger="true"] {
+    border-color: rgba(239, 107, 107, 0.3);
+    color: rgba(250, 180, 180, 0.92);
+  }
 
-  &:hover:not(:disabled) {
-    color: rgba(255, 205, 205, 1);
+  &[data-danger="true"]:hover:not(:disabled) {
     border-color: rgba(239, 107, 107, 0.5);
+    color: rgba(255, 205, 205, 1);
     background: rgba(127, 29, 29, 0.18);
   }
 `;
@@ -992,57 +1331,6 @@ const ToolsEmpty = styled.p`
   justify-self: center;
   color: var(--forge-text-muted, #7a8493);
   font-size: 12px;
-`;
-
-const ToolsCliGrid = styled.div`
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 10px;
-`;
-
-const ToolsCliCard = styled.article`
-  display: grid;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
-  border-radius: 9px;
-  background: rgba(7, 9, 13, 0.45);
-
-  &[data-installed="true"] {
-    border-color: rgba(60, 203, 127, 0.18);
-  }
-`;
-
-const ToolsCliTopline = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-
-  strong {
-    font-size: 13px;
-    font-weight: 800;
-  }
-`;
-
-const ToolsCliMeta = styled.div`
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-  min-height: 14px;
-  color: var(--forge-text-muted, #7a8493);
-  font-size: 11px;
-  font-weight: 600;
-
-  span[data-tone="warn"] {
-    color: rgba(240, 200, 140, 0.95);
-  }
-`;
-
-const ToolsCliActions = styled.div`
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
 `;
 
 const ToolsSearchInput = styled.input`
@@ -1143,5 +1431,359 @@ const ToolsCatalogButton = styled.button`
 
   &[data-danger="true"]:hover {
     background: rgba(127, 29, 29, 0.2);
+  }
+`;
+
+// --- Minimalist CLI list (installed-programs style) ------------------------
+
+const CliSearchRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const CliSearchInput = styled(ToolsSearchInput)`
+  flex: 1 1 auto;
+  width: 100%;
+`;
+
+const CliList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border-radius: 9px;
+  background: rgba(7, 9, 13, 0.4);
+`;
+
+const CliRow = styled.div`
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  &:hover {
+    background: rgba(230, 236, 245, 0.035);
+  }
+
+  /* Install/Uninstall affordances stay hidden until the row is hovered, so
+     the resting view is just icon + name + state. */
+  [data-hover-only="true"] {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 110ms ease;
+  }
+
+  &:hover [data-hover-only="true"],
+  &:focus-within [data-hover-only="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+`;
+
+const CliRowIcon = styled.span`
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: rgba(230, 236, 245, 0.06);
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  span {
+    font-size: 11px;
+    font-weight: 800;
+  }
+`;
+
+const CliRowName = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+
+  strong {
+    overflow: hidden;
+    font-size: 12.5px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const CliRowState = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const cliBusyPulse = keyframes`
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+`;
+
+const CliStateText = styled.span`
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+
+  &[data-tone="good"] {
+    color: rgba(140, 230, 180, 0.95);
+  }
+
+  &[data-tone="busy"] {
+    color: rgba(240, 200, 140, 0.95);
+    animation: ${cliBusyPulse} 1.2s ease-in-out infinite;
+  }
+`;
+
+const CliRowButton = styled.button`
+  padding: 3px 9px;
+  border: 1px solid rgba(125, 176, 255, 0.3);
+  border-radius: 6px;
+  color: rgba(200, 222, 255, 0.95);
+  background: rgba(59, 130, 246, 0.12);
+  font-size: 10.5px;
+  font-weight: 750;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(59, 130, 246, 0.24);
+  }
+
+  &[data-danger="true"] {
+    border-color: rgba(239, 107, 107, 0.3);
+    color: rgba(250, 180, 180, 0.92);
+    background: transparent;
+  }
+
+  &[data-danger="true"]:hover {
+    background: rgba(127, 29, 29, 0.2);
+  }
+`;
+
+// --- Skills library (list + detail) ----------------------------------------
+
+const SkillsGroupLabel = styled.span`
+  margin-top: 2px;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+`;
+
+const SkillsList = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border-radius: 9px;
+  background: rgba(7, 9, 13, 0.4);
+`;
+
+const SkillRow = styled.button`
+  display: grid;
+  width: 100%;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 6px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--forge-border, rgba(230, 236, 245, 0.05));
+  color: var(--forge-text, #f4f7fa);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  &:hover {
+    background: rgba(230, 236, 245, 0.035);
+  }
+`;
+
+const SkillRowIcon = styled.span`
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--skill-color, #8ea0b8);
+  background: color-mix(in srgb, var(--skill-color, #8ea0b8) 14%, transparent);
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .codicon {
+    font-size: 16px;
+  }
+
+  > span:not(.codicon) {
+    font-size: 13px;
+    font-weight: 800;
+  }
+`;
+
+const SkillRowCopy = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+
+  strong {
+    overflow: hidden;
+    font-size: 12.5px;
+    font-weight: 750;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const SkillRowSide = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const SkillRowChevron = styled.span`
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 15px;
+  font-weight: 700;
+`;
+
+const SkillSourceBadge = styled.span`
+  padding: 2px 7px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.14));
+  border-radius: 999px;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 9.5px;
+  font-weight: 780;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-source="catalog"] {
+    border-color: rgba(125, 176, 255, 0.3);
+    color: rgba(180, 210, 255, 0.92);
+  }
+
+  &[data-source="cli"] {
+    border-color: rgba(60, 203, 127, 0.3);
+    color: rgba(150, 230, 185, 0.92);
+  }
+`;
+
+const SkillDetailHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+`;
+
+const SkillDetailActions = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+`;
+
+const SkillDetailTitle = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+
+  > div {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  strong {
+    font-size: 16px;
+    font-weight: 800;
+  }
+
+  span {
+    color: var(--forge-text-muted, #7a8493);
+    font-size: 12px;
+  }
+`;
+
+const SkillDetailMeta = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--forge-text-muted, #7a8493);
+  font-size: 11px;
+  font-weight: 650;
+`;
+
+const SkillContent = styled.pre`
+  margin: 0;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 14px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.08));
+  border-radius: 9px;
+  color: var(--forge-text, #e8eef8);
+  background: rgba(7, 9, 13, 0.55);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+`;
+
+const SkillEditorField = styled.input`
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  color: var(--forge-text, #f4f7fa);
+  background: rgba(7, 9, 13, 0.55);
+  font-size: 12.5px;
+  font-weight: 650;
+
+  &:focus-visible {
+    outline: 2px solid rgba(125, 176, 255, 0.35);
+    outline-offset: -1px;
   }
 `;

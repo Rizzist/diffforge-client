@@ -4085,6 +4085,11 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
+            architecture_store_watcher_start(app.handle().clone());
+            cloud_mcp_start_agent_inventory_watcher(
+                app.handle().clone(),
+                app.state::<CloudMcpState>().inner().clone(),
+            );
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
             // (The tray icon is created only when background mode is entered.)
@@ -4240,6 +4245,8 @@ pub fn run() {
             snipping_open_annotation_editor,
             snipping_read_asset_data_url,
             snipping_open_snip_float,
+            snipping_preview_drag_started,
+            snipping_consume_snip_preview,
             snipping_set_dispatch_targets,
             snipping_dispatch_targets,
             snipping_open_annotation_editor_batch,
@@ -4329,6 +4336,7 @@ pub fn run() {
             todo_dispatch_dispatcher_heartbeat,
             todo_dispatch_backend_submissions_drain,
             todo_dispatch_overview,
+            todo_dispatch_queue_get,
             app_enter_background,
             app_exit_background,
             app_background_mode_state,

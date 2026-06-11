@@ -1090,6 +1090,30 @@ async fn todo_dispatch_backend_submissions_drain(workspace_id: String) -> Result
     .map_err(|error| format!("Todo dispatch journal drain worker failed: {error}"))?
 }
 
+/// Full queue snapshot for one workspace, as last pushed by the webview (or
+/// updated by backend dispatch/settlement). This is the local-first source
+/// the Todos History view reads so listed todos show without any cloud
+/// round-trip.
+#[tauri::command]
+async fn todo_dispatch_queue_get(workspace_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_id = workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err("workspace_id is required.".to_string());
+        }
+        let snapshot = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| todo_dispatch_queue_read(&path))
+            .unwrap_or_else(|| json!({}));
+        Ok(json!({
+            "workspaceId": workspace_id,
+            "items": snapshot.get("items").cloned().unwrap_or_else(|| json!([])),
+            "updatedAtMs": snapshot.get("updatedAtMs").cloned().unwrap_or(json!(0)),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo dispatch queue get worker failed: {error}"))?
+}
+
 /// Aggregated view of every workspace queue snapshot for the background
 /// monitor window: items grouped by lifecycle bucket with workspace labels
 /// resolved best-effort from the terminal runtime registry.

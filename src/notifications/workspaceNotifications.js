@@ -1,5 +1,6 @@
 export const WORKSPACE_NOTIFICATION_EVENT = "diffforge:workspace-notification-event";
 export const TERMINAL_PARKED_PROMPT_EVENT = "forge-terminal-parked-prompt";
+export const TODO_COMPLETED_NOTIFICATION_EVENT = "diffforge:todo-completed-notification";
 
 const WORKSPACE_NOTIFICATION_STORAGE_KEY = "diffforge.workspaceNotifications.v1";
 const WORKSPACE_NOTIFICATION_VERSION = 1;
@@ -446,6 +447,8 @@ function notificationTitleForKind(kind) {
       return "Approval resolved";
     case "task.parked":
       return "Task parked";
+    case "todo.completed":
+      return "Todo completed";
     case "task.resume.ready":
     case "task.resume_ready":
       return "Task ready to resume";
@@ -1338,6 +1341,66 @@ export function reduceTerminalParkedNotificationEvent(state, parkedEvent, option
     options,
   );
   return trimWorkspaceNotifications(setWorkspaceBucket(cueResult.state, workspaceId, cueResult.bucket), workspaceId);
+}
+
+export function reduceTodoCompletedNotificationEvent(state, completionEvent, options = {}) {
+  const workspaceId = cleanText(
+    completionEvent?.workspaceId || completionEvent?.workspace_id || options.workspaceId,
+  );
+  if (!workspaceId) {
+    return normalizeWorkspaceNotificationState(state);
+  }
+  const { bucket, state: currentState } = getWorkspaceBucket(state, workspaceId);
+  const createdAt = nowIso();
+  const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
+  const rawTerminalIndex = Number(completionEvent?.terminalIndex ?? completionEvent?.terminal_index);
+  const id = `todo-completed:${workspaceId}:${cleanText(completionEvent?.itemId, String(Date.now()))}`;
+  const notification = {
+    actionability: "open_thread",
+    agentId: cleanText(completionEvent?.agentId || completionEvent?.agent_id),
+    approvalId: "",
+    body: cleanText(completionEvent?.todoTitle || completionEvent?.todoText).slice(0, 200),
+    createdAt,
+    dbChangeRequestId: "",
+    dedupeKey: id,
+    id,
+    kind: "todo.completed",
+    paneId: cleanText(completionEvent?.paneId || completionEvent?.pane_id),
+    pendingAction: false,
+    seenAt: seenOnArrival ? createdAt : "",
+    sessionId: "",
+    severity: "success",
+    sourceEventId: "",
+    sourceSeq: null,
+    status: seenOnArrival ? "read" : "unread",
+    taskId: "",
+    terminalIndex: Number.isInteger(rawTerminalIndex) ? rawTerminalIndex : null,
+    threadId: cleanText(completionEvent?.threadId || completionEvent?.thread_id),
+    title: notificationTitleForKind("todo.completed"),
+    updatedAt: createdAt,
+    workspaceId,
+  };
+  let nextBucket = {
+    ...bucket,
+    notifications: {
+      ...bucket.notifications,
+      [id]: notification,
+    },
+  };
+  const nextState = setWorkspaceBucket(currentState, workspaceId, nextBucket);
+  // The terminal view only reports completions the user is not watching (the
+  // watched terminal gets a border flash instead), so this cue bypasses the
+  // manual-acceptance gate and always rings. When the completion also drained
+  // the queue, ring the drained tone instead of the per-todo tone.
+  const cueResult = appendCue(
+    nextState,
+    nextBucket,
+    workspaceId,
+    completionEvent?.queueDrained ? "todo.queue.drained" : "todo.completed",
+    options,
+  );
+  nextBucket = cueResult.bucket;
+  return trimWorkspaceNotifications(setWorkspaceBucket(cueResult.state, workspaceId, nextBucket), workspaceId);
 }
 
 export function reconcileWorkspaceNotificationSnapshot(state, workspaceId, snapshot, options = {}) {

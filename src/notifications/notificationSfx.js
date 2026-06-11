@@ -114,6 +114,7 @@ const KIND_TO_TONE = {
   "task.resume_ready": "ready",
   "terminal.ready": "ready",
   "todo.arrived": "arrive",
+  "todo.completed": "ready",
   "todo.queue.drained": "drained",
   "tool.failed": "alert",
   "user.input.required": "attention",

@@ -1852,7 +1852,7 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
             "log",
             "--name-status",
             "--date=iso-strict",
-            "--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s",
+            "--pretty=format:%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%P%x1f%D%x1f%s",
             "-n",
             "40",
         ],
@@ -1868,7 +1868,7 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
             let mut lines = trimmed.lines();
             let header = lines.next().unwrap_or_default();
             let fields = header.split('\x1f').collect::<Vec<_>>();
-            if fields.len() < 6 {
+            if fields.len() < 8 {
                 return None;
             }
             let files = lines
@@ -1896,7 +1896,13 @@ fn workspace_git_history(root: &Path) -> Vec<Value> {
                 "authorName": fields[2],
                 "authorEmail": fields[3],
                 "date": fields[4],
-                "subject": fields[5],
+                "parents": fields[5].split_whitespace().collect::<Vec<_>>(),
+                "refs": fields[6]
+                    .split(", ")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>(),
+                "subject": fields[7],
                 "files": files,
             }))
         })
@@ -9038,6 +9044,152 @@ fn terminal_activity_hook_payload(
     })
 }
 
+const TERMINAL_NATIVE_PLAN_BACKFILL_MAX_BYTES: u64 = 512 * 1024;
+
+/// Recovery source for native plan capture: Claude Code persists the live
+/// TodoWrite list to ~/.claude/todos/<sessionId>*.json. Reading it at turn
+/// boundaries backfills plans whose PostToolUse events were missed (app
+/// restart, hook gap).
+fn terminal_native_plan_update_from_claude_todos_file(session_id: &str) -> Option<Value> {
+    let todos_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)?
+        .join(".claude")
+        .join("todos");
+    let entries = std::fs::read_dir(&todos_dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(session_id) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.len() > TERMINAL_NATIVE_PLAN_BACKFILL_MAX_BYTES {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if newest.as_ref().map_or(true, |(time, _)| modified > *time) {
+            newest = Some((modified, entry.path()));
+        }
+    }
+    let (_, path) = newest?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let todos = serde_json::from_str::<Value>(&contents).ok()?;
+    let steps = todos
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let title = item
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let status = item
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            Some(json!({
+                "title": title.chars().take(500).collect::<String>(),
+                "status": status,
+            }))
+        })
+        .take(120)
+        .collect::<Vec<_>>();
+    if steps.is_empty() {
+        return None;
+    }
+    Some(json!({ "tool": "todowrite", "steps": steps }))
+}
+
+/// Native plan capture: when a provider's own plan/todo tool fires (Claude
+/// TodoWrite/ExitPlanMode, Codex update_plan, OpenCode todowrite), the hook
+/// record carries a normalized planUpdate. Forward it into the coordination
+/// kernel's Plans-tab store; the kernel event bridge then pushes the live
+/// snapshot to the UI. The agent never calls a plan MCP tool.
+fn terminal_native_plan_capture_observe(
+    instance: &TerminalInstance,
+    event: &Value,
+    payload: &TerminalActivityHookPayload,
+) {
+    let Some(coordination) = instance.coordination.clone() else {
+        return;
+    };
+
+    let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
+    let plan_update = if hook_key == "posttooluse" {
+        event
+            .get("planUpdate")
+            .filter(|value| value.is_object())
+            .cloned()
+    } else {
+        None
+    };
+    let backfill_session_id = if plan_update.is_none()
+        && payload.provider == "claude"
+        && matches!(hook_key.as_str(), "stop" | "sessionstart" | "sessionend")
+    {
+        payload
+            .provider_session_id
+            .clone()
+            .or_else(|| payload.native_session_id.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    if plan_update.is_none() && backfill_session_id.is_none() {
+        return;
+    }
+
+    let workspace_id = payload.workspace_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan_update = plan_update.or_else(|| {
+            backfill_session_id
+                .as_deref()
+                .and_then(terminal_native_plan_update_from_claude_todos_file)
+        });
+        let Some(plan_update) = plan_update else {
+            return;
+        };
+        if plan_update
+            .get("steps")
+            .and_then(Value::as_array)
+            .map_or(true, |steps| steps.is_empty())
+        {
+            return;
+        }
+        match crate::coordination::CoordinationKernel::open(
+            &coordination.repo_path,
+            Some(PathBuf::from(&coordination.db_path)),
+        ) {
+            Ok(kernel) => {
+                if let Err(error) = kernel.record_terminal_todo_plan_from_native_update(
+                    &coordination.session_id,
+                    Some(coordination.agent_id.as_str()),
+                    Some(workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
+                    &plan_update,
+                ) {
+                    log_terminal_status_event(
+                        "backend.terminal_native_plan.record_error",
+                        json!({
+                            "error": clean_terminal_diagnostic_log_text(&error),
+                        }),
+                    );
+                }
+            }
+            Err(error) => log_terminal_status_event(
+                "backend.terminal_native_plan.kernel_open_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                }),
+            ),
+        }
+    });
+}
+
 async fn terminal_activity_hook_current_instance(
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
     pane_id: &str,
@@ -9239,6 +9391,7 @@ fn spawn_terminal_activity_hook_watcher(
                                 .await;
                             });
                             todo_dispatch_observe_activity_hook(&app, &payload);
+                            terminal_native_plan_capture_observe(&instance, &event, &payload);
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
                             if let Some(payload) = architecture_payload {
                                 let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
@@ -11513,11 +11666,18 @@ fn emit_terminal_window_closed(app: &AppHandle, pane_id: &str) {
 /// The PTY stays untouched; the window attaches as an extra output-transport
 /// subscriber, so opening and closing windows never restarts agents.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn terminal_window_open(
     app: AppHandle,
     state: State<'_, TerminalState>,
     pane_id: String,
     title: Option<String>,
+    agent_kind: Option<String>,
+    agent_label: Option<String>,
+    color_slot: Option<String>,
+    theme: Option<String>,
+    width: Option<f64>,
+    height: Option<f64>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     let _ = get_terminal_instance(&state, &pane_id).await?;
@@ -11533,15 +11693,41 @@ async fn terminal_window_open(
         .map(|value| value.trim().chars().take(120).collect::<String>())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "Terminal".to_string());
-    let url = format!(
+    let mut url = format!(
         "index.html#/terminal-window?paneId={}&title={}",
         percent_encode_query_component(&pane_id),
         percent_encode_query_component(&title_text),
     );
+    for (key, value) in [
+        ("agentKind", agent_kind),
+        ("agentLabel", agent_label),
+        ("colorSlot", color_slot),
+        ("theme", theme),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let trimmed = value.trim().chars().take(120).collect::<String>();
+        if trimmed.is_empty() {
+            continue;
+        }
+        url.push_str(&format!("&{key}={}", percent_encode_query_component(&trimmed)));
+    }
+
+    // Open at the pane's current grid size so the terminal carries its exact
+    // shape into the window; the OS resize handles take over from there.
+    let window_width = width
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(420.0, 2400.0))
+        .unwrap_or(TERMINAL_WINDOW_DEFAULT_WIDTH);
+    let window_height = height
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(260.0, 1600.0))
+        .unwrap_or(TERMINAL_WINDOW_DEFAULT_HEIGHT);
 
     let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(url.into()))
         .title(format!("{title_text} - Diff Forge"))
-        .inner_size(TERMINAL_WINDOW_DEFAULT_WIDTH, TERMINAL_WINDOW_DEFAULT_HEIGHT)
+        .inner_size(window_width, window_height)
         .min_inner_size(420.0, 260.0)
         .resizable(true)
         .decorations(false)

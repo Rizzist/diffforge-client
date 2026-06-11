@@ -1651,13 +1651,26 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
 
 fn cloud_mcp_outbox_release_backoff_now() -> Result<usize, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
+    // Reconnect releases only rows that failed because the websocket was
+    // unavailable (the offline backlog). Rows that failed WITH a server reply
+    // (application errors, request timeouts) keep their capped backoff —
+    // re-firing those on every reconnect turned one poison row into a
+    // permanent retry storm.
     let released = conn
         .execute(
             &format!(
                 "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
                  SET status='retrying', next_attempt_at_ms=0
                  WHERE status IN ('queued', 'retrying', 'dead_letter')
-                   AND next_attempt_at_ms>0"
+                   AND next_attempt_at_ms>0
+                   AND (
+                        last_error=''
+                        OR last_error LIKE '%not accepting messages%'
+                        OR last_error LIKE '%not connected%'
+                        OR last_error LIKE '%sender closed%'
+                        OR last_error LIKE '%websocket unavailable%'
+                        OR last_error LIKE '%did not send a ready frame%'
+                   )"
             ),
             [],
         )
@@ -1774,6 +1787,7 @@ fn cloud_mcp_outbox_error_is_permanent_rejection(error: &str) -> bool {
         "reached the workspace limit",
         "idempotency key was reused with a different payload",
         "workspace delete requires a workspace_id",
+        "voice plan task was not found",
     ]
     .iter()
     .any(|needle| error.contains(needle))
@@ -3810,6 +3824,14 @@ async fn cloud_mcp_open_global_ws(
     let ready_timeout = sleep(Duration::from_secs(CLOUD_MCP_WS_READY_TIMEOUT_SECS));
     tokio::pin!(ready_timeout);
     let mut ready_seen = false;
+    // Deliberate connection health policy: a client ping every 30s keeps the
+    // protocol-level pong flowing, and 90s of total inbound silence (three
+    // missed pongs) proves the socket is dead. This replaces the old
+    // accidental health check where any single request timeout tore the
+    // shared connection down (which caused reconnect storms).
+    let mut last_inbound_at = Instant::now();
+    let mut keepalive = tokio::time::interval(Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result: Result<(), String> = loop {
         tokio::select! {
             biased;
@@ -3819,10 +3841,26 @@ async fn cloud_mcp_open_global_ws(
                     CLOUD_MCP_WS_READY_TIMEOUT_SECS
                 ));
             }
+            _ = keepalive.tick() => {
+                if last_inbound_at.elapsed() >= Duration::from_secs(90) {
+                    break Err(
+                        "Cloud MCP app websocket went silent (no frames for 90 seconds)."
+                            .to_string(),
+                    );
+                }
+                if let Err(error) = write.send(Message::Ping(Default::default())).await {
+                    break Err(format!(
+                        "Cloud MCP app websocket keepalive ping failed (write failed): {error}"
+                    ));
+                }
+            }
             incoming = read.next() => {
                 let Some(incoming) = incoming else {
                     break Err("Cloud MCP app websocket closed by server.".to_string());
                 };
+                if incoming.is_ok() {
+                    last_inbound_at = Instant::now();
+                }
                 match incoming {
                     Ok(Message::Text(text)) => cloud_mcp_handle_global_ws_message(state, text.as_str()).await,
                     Ok(Message::Binary(bytes)) => {
@@ -4137,6 +4175,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         // Reconnect means the whole offline backlog is sendable right now;
         // collapse every queued/retrying backoff so the drain starts immediately.
         let _ = cloud_mcp_outbox_release_backoff_now();
+        CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
         cloud_mcp_note_sync_connection(true, "connected");
         if let Some(initial_live_runtime) = initial_live_runtime {
             cloud_mcp_update_todo_mirror_from_response(
@@ -4946,6 +4985,7 @@ async fn cloud_mcp_start_remote_command_listener(
             todo_dispatch_record_remote_intake(&app, &event);
             todo_dispatch_apply_remote_delete(&app, &event);
             cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
+            cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
             let (status, message) = if emit_result.is_ok() {
                 ("received", "Remote command received by desktop.")
@@ -5149,6 +5189,185 @@ pub(crate) fn cloud_mcp_start_architecture_headless_watcher(app: AppHandle, stat
                 .await;
             }
         }
+    });
+}
+
+const CLOUD_MCP_AGENT_INVENTORY_EVENT: &str = "agent-inventory-changed";
+const CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS: u64 = 90;
+const CLOUD_MCP_AGENT_INVENTORY_SCAN_INTERVAL_SECS: u64 = 600;
+
+static CLOUD_MCP_AGENT_INVENTORY_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
+
+/// Probes the coding-agent CLI inventory (installed, version, npm latest,
+/// auth, update availability) natively, and on change emits the webview event
+/// plus the durable cloud snapshot. Signature-deduped so quiet scans cost a
+/// few subprocess/npm checks and nothing else.
+pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    reason: &str,
+    force: bool,
+) {
+    let Ok(statuses) = agent_statuses().await else {
+        return;
+    };
+    let payload = serde_json::to_value(&statuses).unwrap_or_else(|_| json!([]));
+    let signature = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
+    {
+        let lock = CLOUD_MCP_AGENT_INVENTORY_SIGNATURE.get_or_init(|| StdMutex::new(String::new()));
+        let Ok(mut last) = lock.lock() else {
+            return;
+        };
+        if !force && *last == signature {
+            return;
+        }
+        *last = signature;
+    }
+    let _ = app.emit(
+        CLOUD_MCP_AGENT_INVENTORY_EVENT,
+        json!({
+            "statuses": payload.clone(),
+            "reason": reason,
+            "updatedAtMs": cloud_mcp_now_ms(),
+        }),
+    );
+    let _ = cloud_mcp_sync_agent_installations_internal(
+        state,
+        String::new(),
+        None,
+        None,
+        payload,
+        Some(reason.to_string()),
+    )
+    .await;
+}
+
+/// Headless agent inventory watcher: keeps the cloud (and an open webview)
+/// current when agents are installed/updated outside the app — for example
+/// `npm i -g @openai/codex` in a terminal — including in background mode.
+pub(crate) fn cloud_mcp_start_agent_inventory_watcher(app: AppHandle, state: CloudMcpState) {
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_secs(CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS)).await;
+        loop {
+            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) == APP_SHUTDOWN_PHASE_RUNNING {
+                cloud_mcp_agent_inventory_probe_and_sync(
+                    &app,
+                    &state,
+                    "agent_inventory_watcher",
+                    false,
+                )
+                .await;
+            }
+            sleep(Duration::from_secs(CLOUD_MCP_AGENT_INVENTORY_SCAN_INTERVAL_SECS)).await;
+        }
+    });
+}
+
+/// Headless actuation for remote agent package levers (install/update/
+/// uninstall of codex, claude code, opencode). Only runs when no webview is
+/// alive — an open webview handles the same commands itself with richer UI
+/// state. Replies with running → completed/failed and re-probes the
+/// inventory afterwards so cloud and any later webview converge.
+fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+    if todo_dispatch_webview_dispatcher_active() {
+        return;
+    }
+    let command_kind = cloud_mcp_payload_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .unwrap_or_default()
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_");
+    let action = match command_kind.as_str() {
+        "agent_install" | "install_agent" | "cli_install" => "install",
+        "agent_update" | "update_agent" | "cli_update" => "update",
+        "agent_uninstall" | "uninstall_agent" | "cli_uninstall" => "uninstall",
+        _ => return,
+    };
+    let provider = cloud_mcp_payload_text(
+        event,
+        &[
+            "provider",
+            "agent_provider",
+            "agentProvider",
+            "agent_id",
+            "agentId",
+            "target_agent_id",
+            "targetAgentId",
+        ],
+    )
+    .unwrap_or_default();
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    let action = action.to_string();
+    tauri::async_runtime::spawn(async move {
+        if provider.is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Remote agent package command did not include a provider.",
+                None,
+            )
+            .await;
+            return;
+        }
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state,
+            &event,
+            "running",
+            &format!("Running headless agent {action} on this desktop."),
+            None,
+        )
+        .await;
+        let result = match action.as_str() {
+            "install" => install_agent(provider.clone()).await,
+            "update" => update_agent(provider.clone()).await,
+            _ => uninstall_agent(provider.clone()).await,
+        };
+        let (status, message) = match &result {
+            Ok(outcome) => {
+                let succeeded = if action == "uninstall" {
+                    !outcome.installed
+                } else {
+                    outcome.installed
+                };
+                if succeeded {
+                    (
+                        "completed",
+                        if outcome.message.is_empty() {
+                            format!("Agent {action} completed headless.")
+                        } else {
+                            outcome.message.clone()
+                        },
+                    )
+                } else {
+                    (
+                        "failed",
+                        if outcome.message.is_empty() {
+                            format!("Agent {action} did not complete.")
+                        } else {
+                            outcome.message.clone()
+                        },
+                    )
+                }
+            }
+            Err(error) => ("failed", error.clone()),
+        };
+        let _ = cloud_mcp_send_remote_command_status_event(
+            &state, &event, status, &message, None,
+        )
+        .await;
+        // Converge inventory everywhere after the action.
+        cloud_mcp_agent_inventory_probe_and_sync(
+            &app,
+            &state,
+            &format!("remote_agent_{action}_headless"),
+            true,
+        )
+        .await;
     });
 }
 
@@ -7040,17 +7259,35 @@ async fn cloud_mcp_ws_request_with_timeout(
         match cloud_mcp_ws_request_once_with_timeout(state, request_kind, payload, response_timeout)
             .await
         {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                let _ = cloud_mcp_ws_note_request_outcome(false);
+                return Ok(response);
+            }
             Err(error) => {
+                let timed_out = error.contains("request timed out");
+                let strike_out = cloud_mcp_ws_note_request_outcome(timed_out);
                 if !retry_transient_errors
                     || !cloud_mcp_ws_request_error_is_transient(&error)
                     || attempt > 0
                 {
+                    if strike_out {
+                        cloud_mcp_mark_global_ws_disconnected(state, &error).await;
+                        state.global_ws_reconnect.notify_waiters();
+                    }
                     return Err(error);
                 }
                 last_error = error.clone();
-                cloud_mcp_mark_global_ws_disconnected(state, &error).await;
-                state.global_ws_reconnect.notify_waiters();
+                // Tear the shared websocket down only when the error proves
+                // the connection itself is gone, or when consecutive request
+                // timeouts strike out. A single request timeout on an
+                // otherwise healthy socket must not kill the connection:
+                // doing so caused a reconnect storm (teardown → ready →
+                // snapshot replay + backlog release → next timeout → repeat)
+                // that flapped the sync pill between Connecting and Syncing.
+                if strike_out || cloud_mcp_ws_request_error_indicates_dead_connection(&error) {
+                    cloud_mcp_mark_global_ws_disconnected(state, &error).await;
+                    state.global_ws_reconnect.notify_waiters();
+                }
             }
         }
     }
@@ -7206,6 +7443,46 @@ fn cloud_mcp_ws_request_error_is_transient(error: &str) -> bool {
         "sender",
         "timed out",
         "cancelled",
+        "closed",
+        "disconnected",
+        "write failed",
+        "read failed",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+static CLOUD_MCP_WS_TIMEOUT_STRIKES: AtomicUsize = AtomicUsize::new(0);
+const CLOUD_MCP_WS_TIMEOUT_STRIKE_LIMIT: usize = 2;
+
+/// Two-strike request-timeout policy: one timeout on a healthy socket is
+/// tolerated (the silence watchdog covers genuinely dead connections), but
+/// consecutive timeouts with no successful response in between indicate a
+/// connection that looks alive yet serves nothing — tear it down.
+fn cloud_mcp_ws_note_request_outcome(timed_out: bool) -> bool {
+    if !timed_out {
+        CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
+        return false;
+    }
+    let strikes = CLOUD_MCP_WS_TIMEOUT_STRIKES.fetch_add(1, Ordering::AcqRel) + 1;
+    if strikes >= CLOUD_MCP_WS_TIMEOUT_STRIKE_LIMIT {
+        CLOUD_MCP_WS_TIMEOUT_STRIKES.store(0, Ordering::Release);
+        return true;
+    }
+    false
+}
+
+/// Subset of transient errors that prove the shared websocket itself is dead
+/// (versus a single request that timed out on a healthy connection).
+fn cloud_mcp_ws_request_error_indicates_dead_connection(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if !error.contains("cloud mcp app websocket") && !error.contains("cloud mcp websocket") {
+        return false;
+    }
+    [
+        "not accepting",
+        "not connected",
+        "sender",
         "closed",
         "disconnected",
         "write failed",
@@ -12312,6 +12589,27 @@ async fn cloud_mcp_sync_agent_installations(
     agent_statuses: Value,
     reason: Option<String>,
 ) -> Result<Value, String> {
+    cloud_mcp_sync_agent_installations_internal(
+        state.inner(),
+        repo_path,
+        workspace_id,
+        workspace_name,
+        agent_statuses,
+        reason,
+    )
+    .await
+}
+
+/// Internal agent-inventory push so the headless watcher and remote levers
+/// can converge the cloud without a tauri command context.
+pub(crate) async fn cloud_mcp_sync_agent_installations_internal(
+    state: &CloudMcpState,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    agent_statuses: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
     let clean_option = |value: Option<String>| {
         value
             .map(|value| value.trim().to_string())
@@ -12373,7 +12671,7 @@ async fn cloud_mcp_sync_agent_installations(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
-    cloud_mcp_post_event_endpoint(state.inner(), "agent_installation_snapshot", &payload).await
+    cloud_mcp_post_event_endpoint(state, "agent_installation_snapshot", &payload).await
 }
 
 fn cloud_mcp_sanitize_coding_agent_status(agent: &Value) -> Option<Value> {
@@ -20064,6 +20362,10 @@ fn cloud_mcp_todo_history_from_file(
     }
 }
 
+// Internal create-plan writer: the agent-facing MCP create_plan tool was
+// retired in favor of native plan capture (TodoWrite/update_plan hooks), but
+// the voice/orchestrator path and tests still build local plan rows here.
+#[allow(dead_code)]
 #[derive(Clone)]
 struct CloudMcpAgentCreatePlanTodoRows {
     plan_id: String,
@@ -20073,6 +20375,7 @@ struct CloudMcpAgentCreatePlanTodoRows {
     dispatch_rows: Vec<Value>,
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_agent_plan_text(value: &str, max_chars: usize) -> String {
     value
         .replace(|character: char| character.is_control(), " ")
@@ -20084,6 +20387,7 @@ fn cloud_mcp_agent_plan_text(value: &str, max_chars: usize) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_agent_create_plan_required_text(
     value: &Value,
     keys: &[&str],
@@ -20095,6 +20399,7 @@ fn cloud_mcp_agent_create_plan_required_text(
         .ok_or_else(|| format!("create_plan generated invalid todo plan row without {label}."))
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_validate_agent_create_plan_rows(
     rows: &CloudMcpAgentCreatePlanTodoRows,
 ) -> Result<(), String> {
@@ -20220,6 +20525,7 @@ fn cloud_mcp_validate_agent_create_plan_rows(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_agent_create_plan_step_body(step: &Value) -> Option<(String, String, Value)> {
     if let Some(text) = step
         .as_str()
@@ -20265,6 +20571,7 @@ fn cloud_mcp_agent_create_plan_step_body(step: &Value) -> Option<(String, String
     Some((step_title, step_body, detail))
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn cloud_mcp_agent_create_plan_todo_rows(
     repo_id: Option<&str>,
@@ -20598,6 +20905,7 @@ fn cloud_mcp_agent_create_plan_todo_rows(
     Ok(rows)
 }
 
+#[allow(dead_code)]
 pub(crate) fn cloud_mcp_record_agent_create_plan_todos(
     repo_path: Option<&str>,
     workspace_id: Option<&str>,

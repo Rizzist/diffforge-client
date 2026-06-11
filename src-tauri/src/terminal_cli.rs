@@ -2108,6 +2108,191 @@ fn diff_forge_architecture_graph_path_from_value(value: &Value) -> String {
     }
 }
 
+fn diff_forge_plan_tool_key(tool_name: &str) -> String {
+    tool_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn diff_forge_plan_step_value(step: &Value, status_fallback: &str) -> Option<Value> {
+    let title = step
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            step.as_object().and_then(|object| {
+                [
+                    "content",
+                    "step",
+                    "title",
+                    "text",
+                    "name",
+                    "summary",
+                    "activeForm",
+                    "active_form",
+                ]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::to_string)
+            })
+        })
+        .map(|value| value.trim().chars().take(500).collect::<String>())
+        .filter(|value| !value.is_empty())?;
+    let status = step
+        .as_object()
+        .and_then(|object| {
+            ["status", "state", "phase"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(status_fallback);
+    Some(json!({ "title": title, "status": status }))
+}
+
+/// Native plan capture: providers maintain their own plan/todo lists through
+/// built-in tools (Claude TodoWrite + ExitPlanMode, Codex update_plan,
+/// OpenCode todowrite). When one of those tools fires, normalize the full
+/// list into a compact planUpdate the app forwards into the Plans-tab store —
+/// no agent-facing create_plan tool involved.
+fn diff_forge_native_plan_update(tool_name: &str, tool_input: &Value, hook_input: &Value) -> Value {
+    let tool_key = diff_forge_plan_tool_key(tool_name);
+    let arguments = if tool_input.is_object() {
+        tool_input
+    } else {
+        hook_input
+            .get("arguments")
+            .or_else(|| hook_input.get("toolArguments"))
+            .or_else(|| hook_input.get("tool_arguments"))
+            .unwrap_or(tool_input)
+    };
+
+    match tool_key.as_str() {
+        "todowrite" => {
+            let steps = arguments
+                .get("todos")
+                .or_else(|| arguments.get("items"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| diff_forge_plan_step_value(item, "pending"))
+                        .take(120)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if steps.is_empty() {
+                return Value::Null;
+            }
+            json!({ "tool": "todowrite", "steps": steps })
+        }
+        "updateplan" => {
+            let steps = arguments
+                .get("plan")
+                .or_else(|| arguments.get("steps"))
+                .or_else(|| arguments.get("items"))
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| diff_forge_plan_step_value(item, "pending"))
+                        .take(120)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if steps.is_empty() {
+                return Value::Null;
+            }
+            let explanation = arguments
+                .get("explanation")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(500).collect::<String>());
+            json!({
+                "tool": "update_plan",
+                "steps": steps,
+                "explanation": explanation,
+            })
+        }
+        "exitplanmode" => {
+            let plan_text = arguments
+                .get("plan")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default();
+            if plan_text.is_empty() {
+                return Value::Null;
+            }
+            let title = plan_text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(|line| {
+                    line.trim_start_matches('#')
+                        .trim()
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let mut steps = plan_text
+                .lines()
+                .map(str::trim)
+                .filter_map(|line| {
+                    let unprefixed = line
+                        .strip_prefix("- ")
+                        .or_else(|| line.strip_prefix("* "))
+                        .or_else(|| line.strip_prefix("+ "))
+                        .or_else(|| {
+                            line.split_once(". ")
+                                .filter(|(ordinal, _)| {
+                                    !ordinal.is_empty()
+                                        && ordinal.chars().all(|value| value.is_ascii_digit())
+                                })
+                                .map(|(_, rest)| rest)
+                        })?;
+                    let completed =
+                        unprefixed.starts_with("[x] ") || unprefixed.starts_with("[X] ");
+                    let step_title = unprefixed
+                        .trim_start_matches("[ ] ")
+                        .trim_start_matches("[x] ")
+                        .trim_start_matches("[X] ")
+                        .trim();
+                    if step_title.is_empty() {
+                        return None;
+                    }
+                    Some(json!({
+                        "title": step_title.chars().take(500).collect::<String>(),
+                        "status": if completed { "completed" } else { "pending" },
+                    }))
+                })
+                .take(120)
+                .collect::<Vec<_>>();
+            if steps.is_empty() {
+                steps.push(json!({
+                    "title": if title.is_empty() {
+                        "Review plan proposal".to_string()
+                    } else {
+                        title.clone()
+                    },
+                    "status": "pending",
+                }));
+            }
+            json!({
+                "tool": "exitplanmode",
+                "title": title,
+                "steps": steps,
+                "planText": plan_text.chars().take(4000).collect::<String>(),
+            })
+        }
+        _ => Value::Null,
+    }
+}
+
 fn diff_forge_activity_hook_record(
     provider: &str,
     pane_id: &str,
@@ -2291,6 +2476,7 @@ fn diff_forge_activity_hook_record(
         "terminal_is_prompting_user",
         "terminalIsPromptingUser",
     ]);
+    let plan_update = diff_forge_native_plan_update(&tool_name, tool_input, hook_input);
     json!({
         "timestampMs": current_time_ms(),
         "provider": provider,
@@ -2300,6 +2486,7 @@ fn diff_forge_activity_hook_record(
         "terminalIndex": terminal_index,
         "eventName": hook_event_name.clone(),
         "hookEventName": hook_event_name,
+        "planUpdate": plan_update,
         "sessionId": session_id,
         "turnId": turn_id,
         "cwd": hook_string(&["cwd"]),
@@ -2337,6 +2524,83 @@ fn diff_forge_activity_hook_record(
 #[cfg(test)]
 mod terminal_cli_tests {
     use super::*;
+
+    #[test]
+    fn native_plan_update_extracts_provider_plan_tools() {
+        let todo = diff_forge_native_plan_update(
+            "TodoWrite",
+            &json!({"todos": [
+                {"content": "Find bug", "status": "completed"},
+                {"content": "Fix bug", "status": "in_progress"}
+            ]}),
+            &json!({}),
+        );
+        assert_eq!(todo["tool"], "todowrite");
+        assert_eq!(todo["steps"].as_array().map(Vec::len), Some(2));
+        assert_eq!(todo["steps"][1]["status"], "in_progress");
+
+        let codex = diff_forge_native_plan_update(
+            "update_plan",
+            &json!({"explanation": "Ship it", "plan": [
+                {"step": "Write code", "status": "completed"},
+                {"step": "Run tests", "status": "pending"}
+            ]}),
+            &json!({}),
+        );
+        assert_eq!(codex["tool"], "update_plan");
+        assert_eq!(codex["explanation"], "Ship it");
+        assert_eq!(codex["steps"][0]["title"], "Write code");
+
+        let plan_mode = diff_forge_native_plan_update(
+            "ExitPlanMode",
+            &json!({"plan": "# Fix login\n\n1. Reproduce\n2. Patch handler\n- [x] Write test"}),
+            &json!({}),
+        );
+        assert_eq!(plan_mode["tool"], "exitplanmode");
+        assert_eq!(plan_mode["title"], "Fix login");
+        assert_eq!(plan_mode["steps"].as_array().map(Vec::len), Some(3));
+        assert_eq!(plan_mode["steps"][2]["status"], "completed");
+        assert_eq!(plan_mode["steps"][2]["title"], "Write test");
+
+        assert!(
+            diff_forge_native_plan_update("Bash", &json!({"command": "ls"}), &json!({})).is_null()
+        );
+    }
+
+    #[test]
+    fn activity_hook_record_carries_plan_update_for_todo_write() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "PostToolUse",
+                "toolName": "TodoWrite",
+                "toolInput": {"todos": [{"content": "Step one", "status": "pending"}]}
+            }),
+        );
+        assert_eq!(record["planUpdate"]["tool"], "todowrite");
+        assert_eq!(
+            record["planUpdate"]["steps"].as_array().map(Vec::len),
+            Some(1)
+        );
+
+        let plain = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "PostToolUse",
+                "toolName": "Bash",
+                "toolInput": {"command": "ls"}
+            }),
+        );
+        assert!(plain["planUpdate"].is_null());
+    }
 
     #[test]
     fn activity_hook_record_accepts_camel_case_fields() {

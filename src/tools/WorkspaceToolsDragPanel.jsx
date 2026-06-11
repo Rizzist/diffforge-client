@@ -44,6 +44,8 @@ function parseSkillsEntries(skillsMd) {
   const entries = [];
   let current = null;
   lines.forEach((line) => {
+    // Structured skill metadata from the Tools tab library; not todo content.
+    if (/^<!--\s*diffforge-skill\b.*-->\s*$/u.test(line.trim())) return;
     const heading = line.match(/^#{1,3}\s+(.+)$/u);
     if (heading) {
       if (current && (current.title || current.body.trim())) entries.push(current);

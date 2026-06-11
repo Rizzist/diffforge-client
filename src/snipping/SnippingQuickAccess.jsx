@@ -356,6 +356,11 @@ export function SnippingFloatWindow() {
       return;
     }
     lastPressAtRef.current = now;
+    // Rust tracks the drag so releasing this preview over a drop target in
+    // the main window (todo card, terminal pane) can consume it.
+    invoke("snipping_preview_drag_started", {
+      label: getCurrentWindow().label,
+    }).catch(() => {});
     getCurrentWindow().startDragging().catch(() => {});
   }, [runAction]);
 
