@@ -259,12 +259,15 @@ fn agent_accounts_active_profile_label(kind: &str) -> (String, String) {
     (active_id, label)
 }
 
-/// All registered Claude profiles with existing dirs, for tokenomics scan
-/// roots: each profile's transcripts live under `<dir>/projects`, so every
-/// account's usage is counted and attributed to its own account key.
-pub(crate) fn agent_accounts_claude_profiles_for_tokenomics() -> Vec<(String, String, PathBuf)> {
+/// All registered profiles of one kind with existing dirs, for tokenomics:
+/// Claude profiles contribute transcript scan roots (`<dir>/projects`), Codex
+/// profiles contribute per-account auth for the live usage endpoint — each
+/// attributed to its own account key.
+pub(crate) fn agent_accounts_profiles_for_tokenomics(
+    kind: &str,
+) -> Vec<(String, String, PathBuf)> {
     let registry = agent_accounts_registry_read();
-    let (_, profiles) = agent_accounts_kind_entry(&registry, "claude");
+    let (_, profiles) = agent_accounts_kind_entry(&registry, kind);
     profiles
         .iter()
         .filter_map(|profile| {

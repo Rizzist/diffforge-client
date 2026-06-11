@@ -686,7 +686,8 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
     // Additional Claude account profiles: each isolated CLAUDE_CONFIG_DIR
     // keeps its own transcript tree, so without these roots every non-default
     // account's usage would be invisible to tokenomics.
-    for (profile_id, profile_label, profile_dir) in agent_accounts_claude_profiles_for_tokenomics()
+    for (profile_id, profile_label, profile_dir) in
+        agent_accounts_profiles_for_tokenomics("claude")
     {
         sources.push(TokenomicsSource {
             provider: "anthropic",
@@ -5427,6 +5428,40 @@ fn tokenomics_provider_limits(
         ));
     }
 
+    // Codex agent-account profiles: each profile dir carries its own
+    // auth.json, so the usage endpoint reports per-account windows (including
+    // consumption from other devices on that account). Profiles that haven't
+    // completed login are skipped instead of rendering unknown rows.
+    for (profile_id, profile_label, profile_dir) in agent_accounts_profiles_for_tokenomics("codex")
+    {
+        let profile_plan =
+            tokenomics_codex_plan_state_for_auth_path(Some(profile_dir.join("auth.json")));
+        let has_token = profile_plan
+            .get("access_token")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|token| !token.is_empty());
+        if !has_token {
+            continue;
+        }
+        let profile_account = TokenomicsProviderAccount {
+            key: format!("openai:codex:profile:{profile_id}"),
+            label: format!("Codex · {profile_label}"),
+        };
+        if let Some(profile_usage) = tokenomics_codex_live_usage(
+            conn,
+            &profile_plan,
+            &profile_account,
+            include_stale_provider_cache,
+        ) {
+            limits.extend(tokenomics_codex_live_limit_snapshots(
+                &profile_plan,
+                &profile_usage,
+                &profile_account,
+            ));
+        }
+    }
+
     let claude_plan = tokenomics_claude_plan_state();
     let claude_account = tokenomics_provider_account("anthropic", "claude");
     let _ = tokenomics_ensure_claude_statusline_collector(&claude_plan);
@@ -5461,6 +5496,40 @@ fn tokenomics_provider_limits(
             "weekly",
             "Weekly Limit",
         ));
+    }
+
+    // Claude agent-account profiles: live window limits per account when the
+    // profile keeps file-based credentials (macOS Keychain installs don't —
+    // those profiles still get per-account token stats from their transcript
+    // scan roots, just not the live limit gauges).
+    for (profile_id, profile_label, profile_dir) in
+        agent_accounts_profiles_for_tokenomics("claude")
+    {
+        let credentials = tokenomics_read_json_file(profile_dir.join(".credentials.json"));
+        let Some(access_token) = credentials.as_ref().and_then(|credentials| {
+            credentials
+                .get("claudeAiOauth")
+                .and_then(|oauth| tokenomics_value_string(oauth, &["accessToken", "access_token"]))
+        }) else {
+            continue;
+        };
+        let profile_plan = tokenomics_claude_plan_state_from_credentials(credentials.as_ref());
+        let profile_account = TokenomicsProviderAccount {
+            key: format!("anthropic:claude:profile:{profile_id}"),
+            label: format!("Claude · {profile_label}"),
+        };
+        if let Some(profile_usage) = tokenomics_claude_live_usage_with_token(
+            conn,
+            &access_token,
+            &profile_account,
+            include_stale_provider_cache,
+        ) {
+            limits.extend(tokenomics_claude_live_limit_snapshots(
+                &profile_plan,
+                &profile_usage,
+                &profile_account,
+            ));
+        }
     }
 
     if include_cloud_last_known {
@@ -5811,6 +5880,18 @@ fn tokenomics_claude_live_usage(
     allow_stale_cache: bool,
 ) -> Option<Value> {
     let access_token = tokenomics_claude_access_token()?;
+    tokenomics_claude_live_usage_with_token(conn, &access_token, provider_account, allow_stale_cache)
+}
+
+/// Claude live usage with an explicit OAuth token — agent-account profiles
+/// read theirs from the profile dir's credentials file (absent on macOS
+/// Keychain installs, in which case the caller skips gracefully).
+fn tokenomics_claude_live_usage_with_token(
+    conn: &rusqlite::Connection,
+    access_token: &str,
+    provider_account: &TokenomicsProviderAccount,
+    allow_stale_cache: bool,
+) -> Option<Value> {
     let cache_key = tokenomics_claude_usage_cache_key(provider_account);
     let now_unix = tokenomics_unix_now();
     if let Ok(Some(cached)) = tokenomics_cached_claude_usage(
@@ -5821,7 +5902,7 @@ fn tokenomics_claude_live_usage(
     ) {
         return Some(cached);
     }
-    let fetched = tokenomics_fetch_claude_live_usage(access_token.as_str());
+    let fetched = tokenomics_fetch_claude_live_usage(access_token);
     if let Some(mut usage) = fetched {
         tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
         let _ = tokenomics_store_claude_usage_cache(conn, &cache_key, &usage);
@@ -6622,10 +6703,17 @@ fn tokenomics_value_string(value: &Value, keys: &[&str]) -> Option<String> {
 }
 
 fn tokenomics_codex_plan_state() -> Value {
-    let auth_path = env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .map(|home| home.join(".codex").join("auth.json"));
+    tokenomics_codex_plan_state_for_auth_path(
+        env::var("HOME")
+            .ok()
+            .map(PathBuf::from)
+            .map(|home| home.join(".codex").join("auth.json")),
+    )
+}
+
+/// Codex plan state from an explicit auth.json path — agent-account profiles
+/// each carry their own auth, so their live usage is queried per account.
+fn tokenomics_codex_plan_state_for_auth_path(auth_path: Option<PathBuf>) -> Value {
     let auth = auth_path
         .as_ref()
         .and_then(|path| fs::read_to_string(path).ok())

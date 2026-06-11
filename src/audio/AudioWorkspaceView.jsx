@@ -35,6 +35,7 @@ import {
   readAudioRecorderMode,
   readAudioWidgetStyle,
   writeAudioWidgetStyle,
+  readOrchestratorRealtimeEnabled,
   readOrchestratorVoiceSubmissionMode,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
@@ -47,6 +48,7 @@ import {
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
   writeAudioRecorderMode,
+  writeOrchestratorRealtimeEnabled,
   writeOrchestratorVoiceSubmissionMode,
   writeAudioTranscriptionProvider,
   writeAutoOpenAudioRecorder,
@@ -1109,6 +1111,7 @@ export default function AudioWorkspaceView({
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
+  const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [audioHistory, setAudioHistory] = useState(readAudioTranscriptionHistory);
   const [historyScrollTop, setHistoryScrollTop] = useState(0);
@@ -1453,6 +1456,12 @@ export default function AudioWorkspaceView({
         : { id, match: "", replacement: "", isRegex: false, enabled: true };
     updateVoiceRulesList(kind, (entries) => [...entries, blankEntry]);
   }, [updateVoiceRulesList]);
+
+  const updateOrchestratorRealtimeEnabled = useCallback((enabled) => {
+    setOrchestratorRealtimeEnabled(Boolean(enabled));
+    writeOrchestratorRealtimeEnabled(Boolean(enabled));
+    notifyAudioSettingsChanged("orchestrator-voice-engine");
+  }, []);
 
   const updateOrchestratorSubmissionMode = useCallback((nextMode) => {
     setOrchestratorSubmissionMode(nextMode);
@@ -2074,6 +2083,32 @@ export default function AudioWorkspaceView({
                 <span>
                   <strong>Manual</strong>
                   <span>Press to submit</span>
+                </span>
+              </AudioModeButton>
+            </AudioModeGrid>
+            <AudioModeGrid role="group" aria-label="Orchestrator voice engine">
+              <AudioModeButton
+                aria-pressed={orchestratorRealtimeEnabled}
+                onClick={() => updateOrchestratorRealtimeEnabled(true)}
+                title="One native speech-to-speech GPT-Realtime session: faster, more natural, with the same orchestrator tools."
+                type="button"
+              >
+                <ButtonMicIcon aria-hidden="true" />
+                <span>
+                  <strong>GPT-Realtime 2.0</strong>
+                  <span>Native speech-to-speech</span>
+                </span>
+              </AudioModeButton>
+              <AudioModeButton
+                aria-pressed={!orchestratorRealtimeEnabled}
+                onClick={() => updateOrchestratorRealtimeEnabled(false)}
+                title="Classic pipeline: Deepgram transcription, LLM orchestration, Aura speech."
+                type="button"
+              >
+                <ButtonKeyIcon aria-hidden="true" />
+                <span>
+                  <strong>Pipeline</strong>
+                  <span>STT → LLM → TTS</span>
                 </span>
               </AudioModeButton>
             </AudioModeGrid>

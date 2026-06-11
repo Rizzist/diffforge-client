@@ -73,6 +73,27 @@ export function normalizeOrchestratorVoiceSubmissionMode(value) {
     : AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO;
 }
 
+const AUDIO_ORCHESTRATOR_REALTIME_STORAGE_KEY = "diffforge.audio.orchestratorRealtime.v1";
+
+/// GPT-Realtime voice engine for the orchestrator: one native
+/// speech-to-speech session instead of the STT → LLM → TTS pipeline.
+/// Enabled by default; the stored value only records an explicit opt-out.
+export function readOrchestratorRealtimeEnabled() {
+  if (!canUseStorage()) {
+    return true;
+  }
+  return window.localStorage.getItem(AUDIO_ORCHESTRATOR_REALTIME_STORAGE_KEY) !== "false";
+}
+
+export function writeOrchestratorRealtimeEnabled(enabled) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_ORCHESTRATOR_REALTIME_STORAGE_KEY,
+      enabled === false ? "false" : "true",
+    );
+  }
+}
+
 export function normalizeAudioWidgetTheme(value) {
   return value === AUDIO_WIDGET_THEME_LIGHT ? AUDIO_WIDGET_THEME_LIGHT : AUDIO_WIDGET_THEME_DARK;
 }

@@ -2076,6 +2076,9 @@ struct CloudVoiceAgentStartRequest {
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     workspace_root: Option<String>,
+    /// GPT-Realtime engine opt-in: one native speech-to-speech session on the
+    /// cloud instead of the STT → LLM → TTS pipeline.
+    realtime: Option<bool>,
 }
 
 #[derive(Deserialize)]

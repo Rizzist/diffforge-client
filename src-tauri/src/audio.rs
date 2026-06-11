@@ -4375,7 +4375,9 @@ async fn start_cloud_voice_agent_stream(
         workspace_id,
         workspace_name,
         workspace_root,
+        realtime,
     } = request;
+    let realtime_engine = realtime.unwrap_or(false);
     let submission_mode = normalize_cloud_voice_agent_submission_mode(submission_mode);
     let workspace_id = clean_cloud_voice_agent_text(workspace_id, 120);
     let workspace_name = clean_cloud_voice_agent_text(workspace_name, 240);
@@ -4546,6 +4548,10 @@ async fn start_cloud_voice_agent_stream(
             "contract": CLOUD_VOICE_AGENT_CONTRACT,
             "voice_protocol": "diffforge.voice.realtime.v2",
             "lane": "control",
+            // GPT-Realtime engine opt-in (cloud falls back to the pipeline
+            // when its env kill switch is set).
+            "realtime": realtime_engine,
+            "voice_engine": if realtime_engine { "gpt_realtime" } else { "pipeline" },
             "voice_session_id": voice_session_id.clone(),
             "device_id": device_profile["device_id"].clone(),
             "machine_id": device_profile["device_id"].clone(),

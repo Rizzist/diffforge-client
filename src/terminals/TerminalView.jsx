@@ -54,6 +54,7 @@ import {
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT,
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL,
   getAudioInputErrorMessage,
+  readOrchestratorRealtimeEnabled,
   readOrchestratorVoiceSubmissionMode,
   readSelectedAudioInputDeviceId,
   startLowPowerAudioBuffer,
@@ -12454,6 +12455,7 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       await startCloudVoiceAgentStream({
         ...getCloudVoiceAgentRequestContext(),
         submissionMode,
+        realtime: readOrchestratorRealtimeEnabled(),
       });
       cloudStarted = true;
       if (orchestratorVoiceRunRef.current !== runId) {
