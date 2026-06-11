@@ -5268,6 +5268,7 @@ export default function ArchitectureWorkspaceView({
       return undefined;
     }
     let cancelled = false;
+    let unlistenStoreChanged = null;
     const refreshLocalTodos = () => {
       invoke("todo_dispatch_queue_get", { workspaceId })
         .then((result) => {
@@ -5277,10 +5278,28 @@ export default function ArchitectureWorkspaceView({
         .catch(() => {});
     };
     refreshLocalTodos();
+    // Store mutations (deletes, cancels, sweeps) must show instantly; the
+    // interval is only a safety net for missed events.
+    listen("todo-store-changed", (event) => {
+      if (cancelled) return;
+      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
+        refreshLocalTodos();
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenStoreChanged = unlisten;
+    }).catch(() => {});
     const intervalId = window.setInterval(refreshLocalTodos, 2500);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
+      if (unlistenStoreChanged) {
+        unlistenStoreChanged();
+      }
     };
   }, [activeWorkspaceId]);
   const todoHistoryItems = useMemo(
@@ -5528,9 +5547,11 @@ export function ArchitectureHubView({
   const scanState = catalogState === "ready" || catalog ? "ready" : catalogState;
 
   // No toolbar bar: the catalog auto-syncs from the Rust store watcher and
-  // cloud broadcasts, so the hub renders the panel full-height.
+  // cloud broadcasts, so the hub renders the panel full-height. data-layout
+  // "single" collapses the surface to one bounded row — without it the panel
+  // lands in the toolbar's `auto` row and only sizes to its content.
   return (
-    <ArchitectureSurface aria-label="Architectures" data-state={scanState}>
+    <ArchitectureSurface aria-label="Architectures" data-layout="single" data-state={scanState}>
       <ArchitecturesPanel
         graphLists={graphLists}
         onCopyGraph={onCopyGraph}
@@ -9199,6 +9220,13 @@ function TodosHistoryPanel({
   const dispatchTodoAction = useCallback((item, action, extra = {}) => {
     const requestId = `todo-history-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     actionRequestRef.current = requestId;
+    // Cancel, delete, and unqueue are client-authoritative: the Rust todo
+    // store applies them immediately (tombstone or status flip + local
+    // emits) and syncs the cloud in the background, so the UI settles
+    // instantly and the row can never come back from a later hydration. The
+    // bus event still fires in parallel so a mounted TerminalView can
+    // interrupt live panes and prune its in-memory queue state.
+    const storeOwnsAction = action === "cancel" || action === "delete" || action === "unqueue";
     window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_EVENT, {
       detail: {
         action,
@@ -9207,63 +9235,54 @@ function TodosHistoryPanel({
         itemId: text(item.raw?.id),
         promptEventId: item.promptEventId,
         requestId,
+        storeApplied: storeOwnsAction,
         todoId: item.todoId,
         todoIds: item.todoIds,
         workspaceId,
         ...extra,
       },
     }));
-    // Cancel, delete, and unqueue must work even when no TerminalView holds
-    // this workspace (other tab, background mode) or the row only exists in
-    // the cloud mirror: if the control bus doesn't answer, apply the action
-    // through the Rust todo store directly — it owns tombstones and status
-    // corrections, so the outcome is guaranteed.
-    if (action !== "cancel" && action !== "delete" && action !== "unqueue") {
+    if (!storeOwnsAction) {
       return;
     }
-    window.setTimeout(() => {
-      if (actionRequestRef.current !== requestId) {
-        return;
-      }
-      const respond = (ok, reason = "") => {
-        window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
-          detail: { action, ok, reason, requestId, workspaceId },
-        }));
-      };
-      const todoIds = [
-        ...new Set(
-          [text(item.raw?.id), item.todoId, ...(Array.isArray(item.todoIds) ? item.todoIds : [])]
-            .map((value) => String(value || "").trim())
-            .filter(Boolean),
-        ),
-      ];
-      const todoRefs = {
-        todoId: String(item.todoId || text(item.raw?.id) || "").trim() || null,
-        commandId: String(item.commandId || "").trim() || null,
-        dispatchId: String(item.dispatchId || "").trim() || null,
-      };
-      const request = action === "cancel"
-        ? invoke("todo_store_cancel", {
+    const respond = (ok, reason = "") => {
+      window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
+        detail: { action, ok, reason, requestId, workspaceId },
+      }));
+    };
+    const todoIds = [
+      ...new Set(
+        [text(item.raw?.id), item.todoId, ...(Array.isArray(item.todoIds) ? item.todoIds : [])]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+    const todoRefs = {
+      todoId: String(item.todoId || text(item.raw?.id) || "").trim() || null,
+      commandId: String(item.commandId || "").trim() || null,
+      dispatchId: String(item.dispatchId || "").trim() || null,
+    };
+    const request = action === "cancel"
+      ? invoke("todo_store_cancel", {
+        workspaceId,
+        ...todoRefs,
+        reason: "todo_history_cancel",
+      })
+      : action === "unqueue"
+        ? invoke("todo_store_set_status", {
           workspaceId,
           ...todoRefs,
-          reason: "todo_history_cancel",
+          status: "listed",
+          reason: "todo_history_unqueue",
         })
-        : action === "unqueue"
-          ? invoke("todo_store_set_status", {
-            workspaceId,
-            ...todoRefs,
-            status: "listed",
-            reason: "todo_history_unqueue",
-          })
-          : invoke("todo_store_delete", {
-            workspaceId,
-            todoIds,
-            reason: "todo_history_delete",
-          });
-      request
-        .then(() => respond(true))
-        .catch((error) => respond(false, String(error?.message || error || "The todo action could not be applied.")));
-    }, 1200);
+        : invoke("todo_store_delete", {
+          workspaceId,
+          todoIds,
+          reason: "todo_history_delete",
+        });
+    request
+      .then(() => respond(true))
+      .catch((error) => respond(false, String(error?.message || error || "The todo action could not be applied.")));
   }, [workspaceId]);
 
   const queuedTargetValue = useCallback((item) => {

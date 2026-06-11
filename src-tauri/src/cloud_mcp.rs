@@ -19129,6 +19129,19 @@ pub(crate) fn cloud_mcp_todo_mirror_correction_item(
 /// the zombie class nothing will ever settle. Returns (workspace_id, minimal
 /// item) pairs ready for a status-correction push.
 pub(crate) fn cloud_mcp_todo_mirror_stale_active_items(older_than_ms: u64) -> Vec<(String, Value)> {
+    cloud_mcp_todo_mirror_device_items_in_statuses(&["running", "sending"], older_than_ms)
+}
+
+/// Device-authored mirror rows in the given statuses older than the cutoff.
+/// Returns (workspace_id, minimal item) pairs ready for a status-correction
+/// push.
+pub(crate) fn cloud_mcp_todo_mirror_device_items_in_statuses(
+    statuses: &[&str],
+    older_than_ms: u64,
+) -> Vec<(String, Value)> {
+    if statuses.is_empty() {
+        return Vec::new();
+    }
     let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
         return Vec::new();
     };
@@ -19143,12 +19156,17 @@ pub(crate) fn cloud_mcp_todo_mirror_stale_active_items(older_than_ms: u64) -> Ve
         return Vec::new();
     }
     let cutoff_ms = cloud_mcp_now_ms().saturating_sub(older_than_ms) as i64;
-    let Ok(mut statement) = conn.prepare(
+    let status_clause = statuses
+        .iter()
+        .map(|status| format!("'{}'", status.replace('\'', "")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Ok(mut statement) = conn.prepare(&format!(
         "SELECT workspace_id, row_json FROM workspace_todo_mirror_rows
-         WHERE row_kind = 'todo' AND status IN ('running', 'sending')
+         WHERE row_kind = 'todo' AND status IN ({status_clause})
            AND mirror_updated_at_ms > 0 AND mirror_updated_at_ms < ?1
          LIMIT 200",
-    ) else {
+    )) else {
         return Vec::new();
     };
     let rows = statement
@@ -19937,6 +19955,14 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
     let base_url = base_url.unwrap_or_default();
     let repo_id = repo_id.unwrap_or_default();
     let observer_workspace_id = workspace_id.unwrap_or_default();
+    // Local tombstones outrank every hydration: a row the user deleted on
+    // this device must never re-enter the mirror from a cloud snapshot that
+    // raced the removal push (that's the appear/disappear ghost loop).
+    let tombstoned_ids = if rows.is_empty() {
+        HashSet::new()
+    } else {
+        todo_store_all_tombstone_ids()
+    };
     for row in rows {
         let row_kind = cloud_mcp_todo_mirror_row_kind(row);
         let Some(status_row_key) = cloud_mcp_todo_mirror_status_row_key(row) else {
@@ -20002,6 +20028,13 @@ fn cloud_mcp_todo_mirror_upsert_rows_into(
                     || origin_workspace_id.is_empty()
                     || target_device_id.is_empty()
                     || target_workspace_id.is_empty()))
+        {
+            continue;
+        }
+        if !tombstoned_ids.is_empty()
+            && ((!todo_id.is_empty() && tombstoned_ids.contains(&todo_id))
+                || (!command_id.is_empty() && tombstoned_ids.contains(&command_id))
+                || (!dispatch_id.is_empty() && tombstoned_ids.contains(&dispatch_id)))
         {
             continue;
         }
@@ -20207,14 +20240,135 @@ fn cloud_mcp_todo_mirror_apply_removed_todo_ids(
         if todo_id.is_empty() {
             continue;
         }
-        removed += conn
-            .execute(
-                "DELETE FROM workspace_todo_mirror_rows WHERE todo_id=?1",
-                rusqlite::params![todo_id],
-            )
-            .map_err(|error| format!("Unable to remove deleted todo mirror rows: {error}"))?;
+        // Deleted ids can surface under command/dispatch aliases in either
+        // mirror table; a deletion must clear every alias or the row
+        // reappears through the surviving one.
+        for table in [
+            CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+            CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+        ] {
+            removed += conn
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE todo_id=?1 OR command_id=?1 OR dispatch_id=?1"
+                    ),
+                    rusqlite::params![todo_id],
+                )
+                .map_err(|error| format!("Unable to remove deleted todo mirror rows: {error}"))?;
+        }
     }
     Ok(removed)
+}
+
+/// Immediately applies status corrections to local mirror rows so the UI
+/// converges before the cloud round trip. Matches each correction item's
+/// todo/command/dispatch refs against both mirror tables and rewrites the
+/// status column plus the embedded row_json status fields.
+pub(crate) fn cloud_mcp_todo_mirror_apply_local_corrections(items: &[Value]) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
+        return 0;
+    };
+    if cloud_mcp_todo_mirror_init_conn(&conn).is_err() {
+        return 0;
+    }
+    let now_ms = cloud_mcp_now_ms();
+    let mut changed = 0usize;
+    for item in items {
+        let status = cloud_mcp_payload_text(item, &["todoStatus", "todo_status", "status"])
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if status.is_empty() {
+            continue;
+        }
+        let reason = cloud_mcp_payload_text(
+            item,
+            &["todoStatusReason", "todo_status_reason", "statusReason", "status_reason"],
+        )
+        .unwrap_or_default();
+        let refs = [
+            cloud_mcp_payload_text(item, &["id"]),
+            cloud_mcp_payload_text(item, &["todoId", "todo_id"]),
+            cloud_mcp_payload_text(item, &["commandId", "command_id"]),
+            cloud_mcp_payload_text(item, &["dispatchId", "dispatch_id"]),
+            cloud_mcp_payload_text(item, &["remoteCommand", "commandId"]),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+        for reference in refs {
+            for table in [
+                CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+                CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+            ] {
+                let rows: Vec<(String, String)> = conn
+                    .prepare(&format!(
+                        "SELECT key, row_json FROM {table}
+                         WHERE todo_id=?1 OR command_id=?1 OR dispatch_id=?1"
+                    ))
+                    .and_then(|mut statement| {
+                        statement
+                            .query_map(rusqlite::params![reference], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .map(|mapped| mapped.flatten().collect())
+                    })
+                    .unwrap_or_default();
+                for (key, row_json) in rows {
+                    let mut row = serde_json::from_str::<Value>(&row_json)
+                        .unwrap_or_else(|_| json!({}));
+                    if let Some(object) = row.as_object_mut() {
+                        for field in ["status", "todo_status", "todoStatus", "dispatch_status", "dispatchStatus"] {
+                            if object.contains_key(field) || matches!(field, "status" | "todo_status" | "todoStatus") {
+                                object.insert(field.to_string(), json!(status.clone()));
+                            }
+                        }
+                        if !reason.is_empty() {
+                            object.insert("statusReason".to_string(), json!(reason.clone()));
+                            object.insert("todoStatusReason".to_string(), json!(reason.clone()));
+                        }
+                    }
+                    let updated = conn
+                        .execute(
+                            &format!(
+                                "UPDATE {table}
+                                 SET status=?2, row_json=?3, mirror_updated_at_ms=?4, last_seen_ms=?4
+                                 WHERE key=?1"
+                            ),
+                            rusqlite::params![
+                                key,
+                                status,
+                                serde_json::to_string(&row).unwrap_or(row_json),
+                                now_ms,
+                            ],
+                        )
+                        .unwrap_or(0);
+                    changed += updated;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Immediately purges mirror rows for locally deleted todo ids. This is the
+/// client-authoritative half of a delete: the UI converges from the local
+/// mirror right away while the cloud removal syncs in the background.
+pub(crate) fn cloud_mcp_todo_mirror_purge_todo_ids(todo_ids: &[String]) -> usize {
+    if todo_ids.is_empty() {
+        return 0;
+    }
+    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
+        return 0;
+    };
+    if cloud_mcp_todo_mirror_init_conn(&conn).is_err() {
+        return 0;
+    }
+    cloud_mcp_todo_mirror_apply_removed_todo_ids(&conn, todo_ids).unwrap_or(0)
 }
 
 fn cloud_mcp_update_todo_mirror_conn(

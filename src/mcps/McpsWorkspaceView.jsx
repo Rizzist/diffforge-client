@@ -183,6 +183,35 @@ const MCP_SELECT_STYLES = {
   }),
 };
 
+// Compact variant for the single-row hub bar: same look as
+// MCP_SELECT_STYLES, sized to sit beside the search input and ghost buttons.
+const MCP_BAR_SELECT_STYLES = {
+  ...MCP_SELECT_STYLES,
+  container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 132, maxWidth: 224 }),
+  control: (base, state) => ({
+    ...MCP_SELECT_STYLES.control(base, state),
+    minHeight: 34,
+    height: 34,
+    backgroundColor: "rgba(230, 236, 245, 0.05)",
+    borderColor: state.isFocused
+      ? "rgba(147, 197, 253, 0.44)"
+      : "var(--forge-border, rgba(230, 236, 245, 0.12))",
+    cursor: "pointer",
+  }),
+  valueContainer: (base) => ({ ...base, padding: "0 2px 0 10px", flexWrap: "nowrap" }),
+  singleValue: (base) => ({
+    ...MCP_SELECT_STYLES.singleValue(base),
+    whiteSpace: "nowrap",
+  }),
+  dropdownIndicator: (base, state) => ({
+    ...base,
+    color: state.isFocused ? "var(--forge-text)" : "var(--forge-text-muted)",
+    padding: "0 8px 0 2px",
+    transition: "transform 160ms ease",
+    transform: state.selectProps.menuIsOpen ? "rotate(180deg)" : "none",
+  }),
+};
+
 function unwrapData(response, fallback = {}) {
   if (!response || typeof response !== "object") {
     return fallback;
@@ -194,11 +223,6 @@ function errorMessage(error) {
   if (typeof error === "string") return error;
   if (error?.message) return error.message;
   return "Unable to load workspace MCP state.";
-}
-
-function numberValue(value) {
-  const parsed = Number(value || 0);
-  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function textValue(value, fallback = "") {
@@ -1538,30 +1562,10 @@ export default function McpsWorkspaceView({
     </McpHubList>
   );
 
+  // The installed/catalog switch lives in the top bar's view dropdown; the
+  // list screen is just the list itself.
   const renderListScreen = () => (
-    <>
-      <McpHubTabs role="tablist">
-        <McpHubTab
-          aria-selected={listTab === "installed"}
-          data-active={listTab === "installed" ? "true" : "false"}
-          onClick={() => setListTab("installed")}
-          role="tab"
-          type="button"
-        >
-          {`${scopeValue === "global-defaults" ? "Global MCPs" : "Workspace MCPs"} · ${servers.length}`}
-        </McpHubTab>
-        <McpHubTab
-          aria-selected={listTab === "catalog"}
-          data-active={listTab === "catalog" ? "true" : "false"}
-          onClick={() => setListTab("catalog")}
-          role="tab"
-          type="button"
-        >
-          {`Browse catalog · ${MCP_CATALOG.length}`}
-        </McpHubTab>
-      </McpHubTabs>
-      {listTab === "catalog" ? renderCatalogList() : renderInstalledList()}
-    </>
+    listTab === "catalog" ? renderCatalogList() : renderInstalledList()
   );
 
   const renderSourcesScreen = () => (
@@ -1923,6 +1927,14 @@ export default function McpsWorkspaceView({
             Add
           </button>
         </McpEditorActions>
+        {scopeValue === "global-defaults" && (
+          <McpEmptyAccess>
+            Global secrets vault: these values (with the rest of the global
+            MCP defaults) are copied into each new workspace the first time
+            it opens its MCP registry. Values stay on this device and never
+            sync to Cloud.
+          </McpEmptyAccess>
+        )}
         {secrets.length || secretDraftRows.length ? (
           <McpSecretRows>
             {secrets.map((secret) => {
@@ -2056,6 +2068,14 @@ export default function McpsWorkspaceView({
     );
     const selectedTools = asArray(selectedServer.tools_json);
     const selectedIsSecrets = isSecretsServer(selectedServer);
+    const savedConfigValues = configValuesFromServer(selectedServer);
+    const configKeys = new Set([
+      ...Object.keys(savedConfigValues),
+      ...Object.keys(configDraft || {}),
+    ]);
+    const configDirty = Array.from(configKeys).some(
+      (key) => String(configDraft?.[key] ?? "") !== String(savedConfigValues?.[key] ?? ""),
+    );
 
     return (
       <McpEditorPanel>
@@ -2270,8 +2290,16 @@ export default function McpsWorkspaceView({
                 <ButtonKeyIcon aria-hidden="true" />
                 Configuration
               </span>
-              <McpStatusBadge data-state={missingRequired.length ? "blocked" : "enabled"}>
-                {missingRequired.length ? "Required" : "Ready"}
+              <McpStatusBadge
+                data-state={
+                  missingRequired.length ? "blocked" : configDirty ? "planned" : "enabled"
+                }
+              >
+                {missingRequired.length
+                  ? `${missingRequired.length} required`
+                  : configDirty
+                    ? "Unsaved changes"
+                    : "Saved"}
               </McpStatusBadge>
             </McpAccessTopline>
             {asArray(selectedServer.env_schema_json).length ? (
@@ -2279,16 +2307,24 @@ export default function McpsWorkspaceView({
                 {asArray(selectedServer.env_schema_json).map((item) => {
                   const key = item.key || "";
                   const missing = item.required && !String(configDraft[key] || "").trim();
+                  const fieldDirty =
+                    String(configDraft?.[key] ?? "") !== String(savedConfigValues?.[key] ?? "");
                   return (
                     <McpWideField key={key}>
                       <PanelKicker>
-                        {item.label || key} · {item.secret ? "secret" : "workspace"} ·{" "}
-                        {item.required ? "required" : "optional"}
+                        {item.label || key}
+                        {item.secret ? " · secret" : ""}
+                        {item.required ? " · required" : ""}
+                        {fieldDirty ? " · edited" : ""}
                       </PanelKicker>
                       <McpInput
                         data-state={missing ? "blocked" : "planned"}
                         onChange={(event) =>
                           setConfigDraft((draft) => ({ ...draft, [key]: event.target.value }))
+                        }
+                        placeholder={
+                          item.placeholder
+                            || (item.secret ? "Secret value" : item.example || "")
                         }
                         type={item.secret ? "password" : "text"}
                         value={configDraft[key] || ""}
@@ -2303,15 +2339,17 @@ export default function McpsWorkspaceView({
             {!selectedServer.built_in && (
               <McpEditorActions>
                 <button
-                  disabled={actionState !== "idle"}
+                  disabled={actionState !== "idle" || !configDirty}
                   onClick={() => setConfigDraft(configValuesFromServer(selectedServer))}
+                  title="Discard edits and restore the saved values"
                   type="button"
                 >
                   Reset
                 </button>
                 <button
-                  disabled={actionState !== "idle"}
+                  disabled={actionState !== "idle" || !configDirty}
                   onClick={() => updateSelected({ config_values: configDraft })}
+                  title={configDirty ? "Save the edited values" : "Everything is saved"}
                   type="button"
                 >
                   {buttonContent(actionState === "saving_config", "Save Config", "Saving")}
@@ -2396,28 +2434,44 @@ export default function McpsWorkspaceView({
     );
   };
 
-  const summary = registry?.summary || {};
   const isLoading = status === "loading";
   const isActionBusy = actionState !== "idle";
   const isBusy = isActionBusy || isLoading;
   const busyCopy = actionCopy(isActionBusy ? actionState : "loading", actionContext);
+  const listViewOptions = [
+    {
+      value: "installed",
+      label: `${scopeValue === "global-defaults" ? "Global MCPs" : "Workspace MCPs"} · ${servers.length}`,
+    },
+    { value: "catalog", label: `Browse catalog · ${MCP_CATALOG.length}` },
+  ];
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
-      {/* No title area: one compact bar holds the scope picker, search, and
-          the secondary actions. */}
+      {/* One compact bar holds every selection: scope, list view, search,
+          and the secondary actions — no second selector row. */}
       <McpHubTopBar>
         {scopeOptions.length > 0 && typeof onScopeChange === "function" && (
-          <McpHubScopeSelect
+          <Select
             aria-label="MCP scope"
-            onChange={(event) => onScopeChange(event.target.value)}
-            title={`${numberValue(summary.enabled_count)}/${numberValue(summary.installed_count)} enabled`}
-            value={scopeValue}
-          >
-            {scopeOptions.map((option) => (
-              <option key={option.value} value={option.value}>{option.label}</option>
-            ))}
-          </McpHubScopeSelect>
+            isSearchable={scopeOptions.length > 6}
+            menuPortalTarget={selectPortalTarget()}
+            onChange={(option) => onScopeChange(option?.value || "")}
+            options={scopeOptions}
+            styles={MCP_BAR_SELECT_STYLES}
+            value={optionForValue(scopeOptions, scopeValue)}
+          />
+        )}
+        {screen === "list" && (
+          <Select
+            aria-label="MCP list view"
+            isSearchable={false}
+            menuPortalTarget={selectPortalTarget()}
+            onChange={(option) => setListTab(option?.value || "installed")}
+            options={listViewOptions}
+            styles={MCP_BAR_SELECT_STYLES}
+            value={optionForValue(listViewOptions, listTab)}
+          />
         )}
         <McpHubSearchInput
           aria-label="Search MCPs"
@@ -2487,60 +2541,7 @@ const McpHubTopBar = styled.div`
   align-items: center;
   gap: 8px;
   min-width: 0;
-  flex-wrap: wrap;
-`;
-
-const McpHubScopeSelect = styled.select`
-  flex: 0 1 auto;
-  max-width: 230px;
-  min-width: 130px;
-  height: 36px;
-  padding: 0 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
-  border-radius: 8px;
-  color: var(--forge-text, #e7ecf3);
-  background: rgba(230, 236, 245, 0.05);
-  font-size: 12px;
-  font-weight: 700;
-  outline: none;
-  cursor: pointer;
-
-  &:hover,
-  &:focus {
-    border-color: rgba(147, 197, 253, 0.4);
-  }
-`;
-
-const McpHubTabs = styled.div`
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
-  border-radius: 9px;
-  background: rgba(230, 236, 245, 0.04);
-  justify-self: start;
-`;
-
-const McpHubTab = styled.button`
-  padding: 6px 13px;
-  border: 0;
-  border-radius: 7px;
-  color: var(--forge-text-soft, #b6c0cc);
-  background: transparent;
-  font-size: 12px;
-  font-weight: 750;
-  cursor: pointer;
-  white-space: nowrap;
-
-  &:hover {
-    color: var(--forge-text, #e7ecf3);
-  }
-
-  &[data-active="true"] {
-    color: var(--forge-text, #f3f6fa);
-    background: rgba(230, 236, 245, 0.1);
-  }
+  flex-wrap: nowrap;
 `;
 
 const McpHubScroll = styled.div`

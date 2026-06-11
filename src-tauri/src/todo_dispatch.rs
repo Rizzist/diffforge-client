@@ -885,6 +885,29 @@ pub(crate) fn todo_store_tombstone_ids(workspace_id: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Union of every workspace's tombstoned todo ids. The cloud mirror is
+/// account-scoped (peer devices, repo-peer workspaces), so mirror writes must
+/// honor deletions no matter which workspace the delete happened under.
+pub(crate) fn todo_store_all_tombstone_ids() -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for path in todo_dispatch_data_workspace_files("tombstones") {
+        let Some(entries) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.as_object().cloned())
+        else {
+            continue;
+        };
+        ids.extend(
+            entries
+                .keys()
+                .map(|key| key.trim().to_string())
+                .filter(|key| !key.is_empty()),
+        );
+    }
+    ids
+}
+
 /// Records terminal tombstones for the given todo ids. Returns the ids that
 /// were newly tombstoned (already-tombstoned ids are skipped so callers can
 /// avoid duplicate downstream pushes).
@@ -1068,6 +1091,19 @@ fn todo_store_push_corrections(
     if items.is_empty() {
         return;
     }
+    // Client-authoritative: stamp the corrected statuses onto the local
+    // mirror first so every view settles instantly; the cloud push below is
+    // background convergence, not the source of UI truth.
+    if cloud_mcp_todo_mirror_apply_local_corrections(&items) > 0 {
+        let _ = app.emit(
+            CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
+            json!({
+                "reason": reason,
+                "source": "todo_store_correction",
+                "workspaceId": workspace_id,
+            }),
+        );
+    }
     let workspace_id = workspace_id.to_string();
     let reason = reason.to_string();
     let app = app.clone();
@@ -1131,8 +1167,21 @@ pub(crate) fn todo_store_delete_internal(
             }),
         );
     }
+    // Client-authoritative: purge the local mirror right away so every view
+    // converges instantly; the cloud removal below syncs in the background.
+    let purged = cloud_mcp_todo_mirror_purge_todo_ids(&all_ids);
     todo_store_push_removals(app, workspace_id, all_ids, reason);
     todo_store_emit_changed(app, workspace_id, reason, "store");
+    if purged > 0 {
+        let _ = app.emit(
+            CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
+            json!({
+                "reason": reason,
+                "source": "todo_store_delete",
+                "workspaceId": workspace_id,
+            }),
+        );
+    }
     tombstoned
 }
 
@@ -1550,6 +1599,90 @@ async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
     }
 }
 
+/// App-start sweep: everything still marked queued/sending/running in the
+/// queue stores belonged to a process that no longer exists, so none of it
+/// can legitimately dispatch again. Flip it all to interrupted before the
+/// webview loads, and heal this device's mirror rows the same way so stale
+/// "queued" claims don't outlive the restart anywhere on the account.
+pub(crate) fn todo_store_startup_sweep(app: &AppHandle) {
+    const SWEPT_STATUSES: [&str; 5] = ["queued", "sending", "submitted", "running", "dispatching"];
+    for path in todo_dispatch_data_workspace_files("queues") {
+        let snapshot = todo_dispatch_queue_read(&path);
+        let workspace_id = snapshot
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if workspace_id.is_empty() {
+            continue;
+        }
+        let mut items = snapshot
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut flipped = Vec::new();
+        for item in items.iter_mut() {
+            let status = todo_store_item_status(item);
+            if !SWEPT_STATUSES.contains(&status.as_str()) {
+                continue;
+            }
+            todo_store_set_item_status(item, "interrupted", "app_restart");
+            flipped.push(item.clone());
+        }
+        if flipped.is_empty() {
+            continue;
+        }
+        todo_dispatch_queue_write(&workspace_id, &items);
+        log_terminal_status_event(
+            "backend.todo_store.startup_sweep",
+            json!({ "workspace_id": workspace_id, "flipped": flipped.len() }),
+        );
+        todo_store_push_corrections(app, &workspace_id, flipped, "app_restart");
+        todo_store_emit_changed(app, &workspace_id, "app_restart", "store");
+    }
+
+    // Device-authored mirror rows still claiming queued/running/sending from
+    // the previous run: the queue-store pass above already corrected the ids
+    // it tracks; everything else gets an interrupted correction now instead
+    // of waiting out the 15-minute orphan cutoff.
+    let stale =
+        cloud_mcp_todo_mirror_device_items_in_statuses(&["queued", "running", "sending"], 0);
+    let mut by_workspace: HashMap<String, Vec<Value>> = HashMap::new();
+    for (workspace_id, mut item) in stale {
+        if workspace_id.is_empty() {
+            continue;
+        }
+        let tracked = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| {
+                todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|candidate| {
+                            let id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .unwrap_or_default();
+                            todo_store_item_matches_id(candidate, id)
+                        })
+                    })
+            })
+            .unwrap_or(false);
+        if tracked {
+            continue;
+        }
+        todo_store_set_item_status(&mut item, "interrupted", "app_restart");
+        by_workspace.entry(workspace_id).or_default().push(item);
+    }
+    for (workspace_id, items) in by_workspace {
+        todo_store_push_corrections(app, &workspace_id, items, "app_restart");
+        todo_store_emit_changed(app, &workspace_id, "app_restart", "store");
+    }
+}
+
 pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS)).await;
@@ -1558,6 +1691,77 @@ pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
             sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS)).await;
         }
     });
+}
+
+const TODO_STORE_SWEEP_REASONS: [&str; 3] =
+    ["app_restart", "app_crash_recovered", "todo_store_orphan_sweep"];
+const TODO_STORE_SWEPT_ACTIVE_STATUSES: [&str; 5] =
+    ["queued", "sending", "submitted", "running", "dispatching"];
+
+/// Sweep flips are sticky against stale replicas: a webview snapshot loaded
+/// from localStorage before the startup/orphan sweep ran still claims
+/// queued/running for items the store already settled. An incoming active
+/// claim only wins over a sweep-settled row when its status timestamp is
+/// strictly newer than the flip (a real user re-queue stamps a fresh one).
+fn todo_store_keep_settled_sweep_flips(workspace_id: &str, items: Vec<Value>) -> Vec<Value> {
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return items;
+    };
+    let stored_items = todo_dispatch_queue_read(&path)
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    todo_store_keep_settled_sweep_flips_core(stored_items, items)
+}
+
+fn todo_store_keep_settled_sweep_flips_core(
+    stored_items: Vec<Value>,
+    items: Vec<Value>,
+) -> Vec<Value> {
+    let swept = stored_items
+        .into_iter()
+        .filter(|item| {
+            let reason = todo_dispatch_text(item, &["todoStatusReason", "statusReason"]);
+            matches!(
+                todo_store_item_status(item).as_str(),
+                "interrupted" | "cancelled"
+            ) && TODO_STORE_SWEEP_REASONS.contains(&reason.as_str())
+        })
+        .collect::<Vec<_>>();
+    if swept.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|item| {
+            if !TODO_STORE_SWEPT_ACTIVE_STATUSES
+                .contains(&todo_store_item_status(&item).as_str())
+            {
+                return item;
+            }
+            let item_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let Some(swept_item) = swept
+                .iter()
+                .find(|candidate| todo_store_item_matches_id(candidate, &item_id))
+            else {
+                return item;
+            };
+            let incoming_at = todo_dispatch_text(&item, &["todoStatusUpdatedAt"]);
+            let swept_at = todo_dispatch_text(swept_item, &["todoStatusUpdatedAt"]);
+            // Both sides stamp 24-char "YYYY-MM-DDTHH:MM:SS.mmmZ", so the
+            // lexicographic comparison is chronological.
+            if !incoming_at.is_empty() && !swept_at.is_empty() && incoming_at > swept_at {
+                return item;
+            }
+            swept_item.clone()
+        })
+        .collect()
 }
 
 fn todo_dispatch_queue_item_command_id(item: &Value) -> String {
@@ -1734,6 +1938,77 @@ mod todo_store_tests {
         });
         assert_eq!(todo_store_item_status(&item), "running");
         assert_eq!(todo_store_item_pane_id(&item), "pane-9");
+    }
+
+    #[test]
+    fn sweep_flip_outranks_stale_active_replica() {
+        let stored = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "interrupted",
+            "todoStatusReason": "app_restart",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "queued",
+            "todoStatusUpdatedAt": "2026-06-11T09:00:00.000Z",
+        })];
+        let merged = todo_store_keep_settled_sweep_flips_core(stored, incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(todo_store_item_status(&merged[0]), "interrupted");
+    }
+
+    #[test]
+    fn fresh_requeue_outranks_sweep_flip() {
+        let stored = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "interrupted",
+            "todoStatusReason": "app_restart",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "todo-1",
+            "todoStatus": "queued",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_keep_settled_sweep_flips_core(stored, incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(todo_store_item_status(&merged[0]), "queued");
+    }
+
+    #[test]
+    fn sweep_guard_ignores_user_settled_rows_and_inactive_incoming() {
+        // A row the USER cancelled (not a sweep) must not hijack incoming
+        // updates, and non-active incoming statuses pass through untouched.
+        let stored = vec![
+            json!({
+                "id": "todo-user",
+                "todoStatus": "cancelled",
+                "todoStatusReason": "todo_history_cancel",
+                "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+            }),
+            json!({
+                "id": "todo-swept",
+                "todoStatus": "interrupted",
+                "todoStatusReason": "app_restart",
+                "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+            }),
+        ];
+        let incoming = vec![
+            json!({
+                "id": "todo-user",
+                "todoStatus": "queued",
+                "todoStatusUpdatedAt": "2026-06-11T09:00:00.000Z",
+            }),
+            json!({
+                "id": "todo-swept",
+                "todoStatus": "listed",
+                "todoStatusUpdatedAt": "2026-06-11T09:00:00.000Z",
+            }),
+        ];
+        let merged = todo_store_keep_settled_sweep_flips_core(stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "queued");
+        assert_eq!(todo_store_item_status(&merged[1]), "listed");
     }
 }
 
@@ -2090,6 +2365,7 @@ async fn todo_dispatch_queue_sync(
             .filter(|item| item.is_object())
             .collect::<Vec<_>>();
         let (items, rejected_ids) = todo_store_filter_tombstoned(items, &tombstoned);
+        let items = todo_store_keep_settled_sweep_flips(&workspace_id, items);
         todo_dispatch_queue_write(&workspace_id, &items);
         // Origin "webview": the webview's own changed-listener skips these to
         // avoid sync feedback loops; other windows still refresh.

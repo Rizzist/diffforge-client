@@ -971,6 +971,10 @@ const ToolsHubHeader = styled.header`
 
 const ToolsHubFill = styled.div`
   display: grid;
+  /* Explicit bounded row: without it the implicit auto row sizes to content,
+     the child's height:100% resolves as auto, and the inner scroll pane gets
+     clipped instead of scrolling (the "can't scroll the MCP list" bug). */
+  grid-template-rows: minmax(0, 1fr);
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;

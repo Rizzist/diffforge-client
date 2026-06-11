@@ -22631,6 +22631,12 @@ function TerminalView({
   // delete/cancel actions arrive as window events with cloud todo refs.
   useEffect(() => {
     const respond = (detail, ok, reason = "") => {
+      if (detail?.storeApplied === true) {
+        // The history view already applied this action through the Rust
+        // store and owns the result; this handler only does live-pane
+        // actuation and local state pruning.
+        return;
+      }
       window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
         detail: {
           action: String(detail.action || ""),
@@ -22685,15 +22691,7 @@ function TerminalView({
           // Rust store to cancel with a guaranteed outcome — it flips the
           // store row or pushes a cancelled correction for mirror-only rows —
           // so the history view converges instead of erroring forever.
-          const cancelWorkspaceId = String(detail.workspaceId || terminalWorkspace?.id || "").trim();
-          void invoke("todo_store_cancel", {
-            workspaceId: cancelWorkspaceId,
-            todoId: String(detail.todoId || detail.itemId || "").trim() || null,
-            commandId: String(detail.commandId || "").trim() || null,
-            dispatchId: String(detail.dispatchId || "").trim() || null,
-            reason: "todo_history_cancel",
-          }).then(() => {
-            respond(detail, true);
+          const applyLocalCancelCorrection = () => {
             const staleIds = new Set(
               [detail.itemId, detail.todoId, detail.commandId, detail.dispatchId]
                 .map((value) => String(value || "").trim())
@@ -22718,6 +22716,23 @@ function TerminalView({
               immediate: true,
               reason: "todo_history_cancel_correction",
             });
+          };
+          if (detail.storeApplied === true) {
+            // The history view already ran todo_store_cancel; only converge
+            // this session's local copies.
+            applyLocalCancelCorrection();
+            return;
+          }
+          const cancelWorkspaceId = String(detail.workspaceId || terminalWorkspace?.id || "").trim();
+          void invoke("todo_store_cancel", {
+            workspaceId: cancelWorkspaceId,
+            todoId: String(detail.todoId || detail.itemId || "").trim() || null,
+            commandId: String(detail.commandId || "").trim() || null,
+            dispatchId: String(detail.dispatchId || "").trim() || null,
+            reason: "todo_history_cancel",
+          }).then(() => {
+            respond(detail, true);
+            applyLocalCancelCorrection();
           }).catch((error) => {
             respond(detail, false, getErrorMessage(error, "Unable to cancel this todo."));
           });
@@ -22767,6 +22782,12 @@ function TerminalView({
           getTodoQueueDeletedReceiptStorageKey(terminalWorkspace?.id || ""),
           tombstoneIds,
         );
+        if (detail.storeApplied === true) {
+          // The history view already tombstoned through the Rust store (which
+          // pushes the removal to the cloud); only the receipts above are
+          // needed so this session never re-imports the ids.
+          return;
+        }
         // Rust tombstones are terminal: they survive restarts, gate journal
         // re-adoption, and push the removal durably through the outbox.
         void invoke("todo_store_delete", {
@@ -22783,8 +22804,32 @@ function TerminalView({
         respond(detail, true);
         return;
       }
+      if (!item && action === "unqueue") {
+        if (detail.storeApplied === true) {
+          // The history view already pushed the listed correction.
+          return;
+        }
+        // Mirror-only rows (peer scope, lost local replica) still need a
+        // working unqueue: the Rust store flips the matched row or pushes a
+        // listed correction built from the mirror, so it never dead-ends.
+        void invoke("todo_store_set_status", {
+          workspaceId: String(detail.workspaceId || terminalWorkspace?.id || "").trim(),
+          todoId: String(detail.todoId || detail.itemId || "").trim() || null,
+          commandId: String(detail.commandId || "").trim() || null,
+          dispatchId: String(detail.dispatchId || "").trim() || null,
+          status: "listed",
+          reason: "todo_history_unqueue",
+        }).then(() => {
+          respond(detail, true);
+        }).catch((error) => {
+          respond(detail, false, getErrorMessage(error, "Unable to unqueue this todo."));
+        });
+        return;
+      }
       if (!item) {
-        respond(detail, false, "This todo is not in this device's local todo list.");
+        respond(detail, false, action === "queue" || action === "retarget"
+          ? "This todo lives on another device or workspace; queue it from the device that owns it."
+          : "This todo is not in this device's local todo list.");
         return;
       }
       const itemId = String(item.id || "").trim();

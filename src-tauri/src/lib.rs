@@ -4231,6 +4231,10 @@ pub fn run() {
                             json!({ "marked": marked }),
                         );
                     }
+                    // Queued/running todos from the previous process can never
+                    // dispatch again: flip them to interrupted before the UI
+                    // imports them as live work.
+                    todo_store_startup_sweep(&sweep_app);
                 });
             }
             register_terminal_input_event_listener(app);

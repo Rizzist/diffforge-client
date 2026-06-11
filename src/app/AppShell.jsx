@@ -8434,7 +8434,13 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlistenCaptureSaved = null;
-    listen("forge-snipping-capture-saved", () => {
+    listen("forge-snipping-capture-saved", (event) => {
+      // Annotation-editor saves reuse the capture-saved event for library
+      // refreshes; only fresh captures get the shutter cue.
+      const reason = String(event?.payload?.reason || "");
+      if (reason === "annotation-editor") {
+        return;
+      }
       playNotificationSfx("snip.captured");
     }).then((unlisten) => {
       if (disposed) {

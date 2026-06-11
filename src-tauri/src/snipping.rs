@@ -2152,8 +2152,29 @@ fn snipping_open_annotation_editor_for_paths(
             (area.width * 0.78, area.height * 0.78)
         })
         .unwrap_or((1100.0, 740.0));
-    let inner_width = (image_width + chrome_width).clamp(420.0, max_width.max(420.0));
-    let inner_height = (image_height + chrome_height).clamp(320.0, max_height.max(320.0));
+    // Golden-ratio window, like the snip previews: the canvas letterboxes
+    // inside the stage, so grow the short dimension until W/H = φ around the
+    // content, then scale down uniformly (ratio preserved) to the cap.
+    let content_width = (image_width + chrome_width).max(420.0);
+    let content_height = (image_height + chrome_height).max(1.0);
+    let (mut inner_width, mut inner_height) =
+        if content_width / content_height > SNIPPING_FLOAT_GOLDEN_RATIO {
+            (content_width, content_width / SNIPPING_FLOAT_GOLDEN_RATIO)
+        } else {
+            (content_height * SNIPPING_FLOAT_GOLDEN_RATIO, content_height)
+        };
+    let fit = (max_width / inner_width)
+        .min(max_height / inner_height)
+        .min(1.0)
+        .max(0.05);
+    inner_width *= fit;
+    inner_height *= fit;
+    let min_inner_width = 420.0;
+    let min_inner_height = min_inner_width / SNIPPING_FLOAT_GOLDEN_RATIO;
+    if inner_width < min_inner_width {
+        inner_width = min_inner_width;
+        inner_height = min_inner_height;
+    }
     let window = WebviewWindowBuilder::new(
         app,
         label.clone(),
@@ -2161,7 +2182,7 @@ fn snipping_open_annotation_editor_for_paths(
     )
     .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
     .inner_size(inner_width, inner_height)
-    .min_inner_size(420.0, 320.0)
+    .min_inner_size(min_inner_width, min_inner_height)
     .resizable(true)
     .decorations(false)
     // Normal z-order: clicking the main Diff Forge window brings it in front
@@ -3488,10 +3509,10 @@ fn snipping_preview_stack_position(
     Some(tauri::PhysicalPosition::new(x, y))
 }
 
+// One tween duration everywhere — mid-drag re-packs and the final settle
+// share the same 240ms ease-out; re-targets pick up from current positions
+// so the parting still tracks the hand.
 const SNIPPING_FLOAT_ANIMATE_MS: f64 = 240.0;
-// Mid-drag re-packs use a shorter tween so the parting stack tracks the hand
-// instead of perpetually trailing it by a quarter second.
-const SNIPPING_FLOAT_DRAG_ANIMATE_MS: f64 = 120.0;
 const SNIPPING_FLOAT_ANIMATE_FRAME_MS: u64 = 12;
 const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 33;
 
@@ -3558,9 +3579,10 @@ fn snipping_animate_previews(
 /// Re-packs every preview parked in the bottom-left column into a tight
 /// bottom-up stack, animating each window to its slot. A preview dragged out
 /// of the column stops reserving a slot (the ones above slide down to fill
-/// it); a preview being dragged OVER the column keeps a slot at its on-screen
-/// ordinal so the others part around it live, and a preview dropped back over
-/// the column is adopted into the stack at the height it was dropped.
+/// it); a preview being dragged OVER the column blocks the exact band it
+/// covers so the others part around it live without ever overlapping it, and
+/// a preview dropped back over the column is adopted into the stack at the
+/// height it was dropped.
 fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64) {
     let Some(monitor) = app
         .get_webview_window("main")
@@ -3614,13 +3636,36 @@ fn snipping_reflow_preview_stack(app: &AppHandle, animate_ms: f64) {
 
     // The lowest window keeps the bottom slot; on-screen order is preserved.
     docked.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
+    // A held window is an obstacle at its REAL on-screen band, not at a
+    // canonical packed slot: packed slots must never intersect it, so the
+    // stack visibly makes room under the cursor instead of letting the
+    // others slide underneath the held preview (which read as overlap).
+    let mut obstacle_bands: Vec<(i32, i32)> = docked
+        .iter()
+        .filter(|(_, _, _, dragging)| *dragging)
+        .map(|(position, height, _, _)| (position.y, position.y + height))
+        .collect();
+    obstacle_bands.sort_by(|a, b| b.1.cmp(&a.1));
     let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
     let mut moves = Vec::new();
     for (position, height, window, dragging) in docked {
-        let y = (bottom_edge - height).max(top_limit);
-        // A window the user is holding reserves its slot but never moves; the
-        // OS drag owns its position until the drop settles.
-        if !dragging && (position.x != x || position.y != y) {
+        if dragging {
+            // The OS drag owns the held window's position; its band above
+            // already blocks every slot it covers.
+            continue;
+        }
+        let mut y = bottom_edge - height;
+        for (band_top, band_bottom) in &obstacle_bands {
+            let intersects = y < band_bottom + gap && y + height > band_top - gap;
+            if intersects {
+                // The lowest free slot would collide with the held preview:
+                // hop fully above it (bands are visited lowest-first, so a
+                // hop can cascade past stacked obstacles).
+                y = band_top - gap - height;
+            }
+        }
+        let y = y.max(top_limit);
+        if position.x != x || position.y != y {
             moves.push((window, position, tauri::PhysicalPosition::new(x, y)));
         }
         bottom_edge = y - gap;
@@ -3651,7 +3696,7 @@ fn snipping_live_reflow_on_drag(app: &AppHandle, label: &str) {
     state
         .preview_live_reflow_last_ms
         .store(now_ms, Ordering::SeqCst);
-    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_DRAG_ANIMATE_MS);
+    snipping_reflow_preview_stack(app, SNIPPING_FLOAT_ANIMATE_MS);
 }
 
 fn snipping_now_epoch_ms() -> u64 {
