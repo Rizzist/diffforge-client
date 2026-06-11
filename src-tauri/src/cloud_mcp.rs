@@ -9,7 +9,7 @@ const CLOUD_MCP_CONNECT_TIMEOUT_SECS: u64 = 25;
 const CLOUD_MCP_SYNC_TIMEOUT_SECS: u64 = 60;
 const CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS: u64 = 15 * 60;
 const CLOUD_MCP_ASSET_UPLOAD_SIZE_SLACK_BYTES: u64 = 1024 * 1024;
-const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 8;
+const CLOUD_MCP_AUTH_TIMEOUT_SECS: u64 = 15;
 const CLOUD_MCP_WS_READY_TIMEOUT_SECS: u64 = 8;
 const CLOUD_MCP_APPWRITE_JWT_DEFAULT_TTL_SECS: u64 = 840;
 const CLOUD_MCP_APPWRITE_JWT_MIN_TTL_SECS: u64 = 60;
@@ -3542,10 +3542,14 @@ async fn cloud_mcp_set_global_ws_phase(
     global_ws_status: &str,
 ) {
     let mut runtime = state.inner.lock().await;
-    let previous_status = std::mem::replace(&mut runtime.status, status.to_string());
-    runtime.connected = false;
-    runtime.global_ws_connected = false;
-    runtime.global_ws_status = global_ws_status.to_string();
+    let previous_status = runtime.status.clone();
+    let preserve_connected = runtime.connected && runtime.global_ws_connected;
+    if !preserve_connected {
+        runtime.status = status.to_string();
+        runtime.connected = false;
+        runtime.global_ws_connected = false;
+        runtime.global_ws_status = global_ws_status.to_string();
+    }
     drop(runtime);
     log_cloud_sync_event(
         "ws.phase",
@@ -3553,9 +3557,14 @@ async fn cloud_mcp_set_global_ws_phase(
             "status": status,
             "global_ws_status": global_ws_status,
             "previous_status": previous_status,
+            "preserved_connected": preserve_connected,
         }),
     );
-    cloud_mcp_note_sync_connection(false, status);
+    if preserve_connected {
+        cloud_mcp_note_sync_connection(true, "connected");
+    } else {
+        cloud_mcp_note_sync_connection(false, status);
+    }
 }
 
 async fn require_cloud_mcp_connected_state(
@@ -7618,6 +7627,8 @@ async fn cloud_mcp_fetch_direct_route_async(
         "deviceLimit": device_limit,
         "deviceId": device_id,
         "regionHint": region_hint,
+        "waitForReady": true,
+        "waitMs": 8_000,
     });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -28262,6 +28273,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
     device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
         "billingScopeType": billing_scope_type,
@@ -28270,6 +28282,9 @@ fn cloud_mcp_fetch_direct_route_blocking(
         "planName": plan_name,
         "deviceLimit": device_limit,
         "deviceId": device_id,
+        "regionHint": region_hint,
+        "waitForReady": true,
+        "waitMs": 8_000,
     });
     let response = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -28292,6 +28307,12 @@ fn cloud_mcp_fetch_direct_route_blocking(
                 if let Ok(value) = reqwest::header::HeaderValue::from_str(device_id) {
                     headers.insert("x-diffforge-device-id", value);
                 }
+            }
+            if let Some(region_hint) = region_hint {
+                headers.insert(
+                    "x-diffforge-region-hint",
+                    reqwest::header::HeaderValue::from_static(region_hint),
+                );
             }
             if billing_scope_type == "team" {
                 if let Some(team_id) = team_id {
