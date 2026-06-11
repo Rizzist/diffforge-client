@@ -816,7 +816,10 @@ function parseMarketplaceCommand(provider, command) {
 
 export default function McpsWorkspaceView({
   defaultWorkingDirectory,
+  onScopeChange = null,
   rootDirectory,
+  scopeOptions = [],
+  scopeValue = "",
   workspace,
 }) {
   const workspaceId = workspace?.id || "";
@@ -831,6 +834,9 @@ export default function McpsWorkspaceView({
   // "list" (search + installed + popular), "detail" (one server's settings),
   // "manual" (paste a custom command), "sources" (marketplaces + discovery).
   const [screen, setScreen] = useState("list");
+  // "installed" (this scope's MCPs with toggles) vs "catalog" (the full
+  // install-from list, installed entries sorted on top — like the CLIs tab).
+  const [listTab, setListTab] = useState("installed");
   const [selectedId, setSelectedId] = useState("coordination-kernel");
   const [search, setSearch] = useState("");
   const [configDraft, setConfigDraft] = useState({});
@@ -1361,13 +1367,27 @@ export default function McpsWorkspaceView({
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(searchQuery))
   ));
-  const visiblePopular = MCP_CATALOG
-    .filter((entry) => !installedServerKeys.has(entry.id))
+  const serversByKey = useMemo(
+    () => new Map(servers.map((server) => [String(server.server_key || ""), server])),
+    [servers],
+  );
+  // Catalog tab rows: installed entries float to the top (like the CLI list),
+  // the rest stay alphabetical for scanning.
+  const catalogRows = MCP_CATALOG
     .filter((entry) => (
       !searchQuery
         || entry.label.toLowerCase().includes(searchQuery)
         || entry.description.toLowerCase().includes(searchQuery)
         || entry.packageRef.toLowerCase().includes(searchQuery)
+    ))
+    .map((entry) => ({
+      entry,
+      installed: installedServerKeys.has(entry.id),
+      server: serversByKey.get(entry.id) || null,
+    }))
+    .sort((left, right) => (
+      Number(right.installed) - Number(left.installed)
+        || left.entry.label.localeCompare(right.entry.label)
     ));
 
   const renderServerRowIcon = (server) => {
@@ -1377,35 +1397,8 @@ export default function McpsWorkspaceView({
     return <ButtonHubIcon aria-hidden="true" />;
   };
 
-  const renderListScreen = () => (
+  const renderInstalledList = () => (
     <>
-      <McpHubSearchRow>
-        <McpHubSearchInput
-          aria-label="Search MCPs"
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search MCPs…"
-          type="search"
-          value={search}
-        />
-        <McpHubGhostButton
-          disabled={isBusy}
-          onClick={() => setScreen("manual")}
-          title="Paste a codex/claude mcp add command"
-          type="button"
-        >
-          Add custom
-        </McpHubGhostButton>
-        <McpHubGhostButton
-          disabled={isBusy}
-          onClick={() => setScreen("sources")}
-          title="Marketplace sources and discovered MCPs"
-          type="button"
-        >
-          Sources
-        </McpHubGhostButton>
-      </McpHubSearchRow>
-
-      <McpHubSectionLabel>{`Installed · ${servers.length}`}</McpHubSectionLabel>
       <McpHubList role="list">
         {visibleServers.map((server) => {
           const statusInfo = serverStatus(server);
@@ -1475,43 +1468,99 @@ export default function McpsWorkspaceView({
           <McpEmptyAccess>No installed MCPs match your search.</McpEmptyAccess>
         )}
       </McpHubList>
+    </>
+  );
 
-      {visiblePopular.length > 0 && (
-        <>
-          <McpHubSectionLabel>Popular MCPs</McpHubSectionLabel>
-          <McpHubList role="list">
-            {visiblePopular.map((entry) => {
-              const Icon = entry.icon;
-              const installingThis = actionState === "installing_catalog"
-                && actionContext.name === entry.label;
-              const needsKeys = (entry.env || []).some((item) => item?.required);
-              return (
-                <McpHubRow key={entry.id} role="listitem">
-                  <McpHubRowStatic>
-                    <McpHubRowIcon data-state="planned">
-                      {Icon ? <Icon aria-hidden="true" /> : <span>{entry.label.slice(0, 1)}</span>}
-                    </McpHubRowIcon>
-                    <McpHubRowCopy>
-                      <strong>{entry.label}</strong>
-                      <span>{entry.description}</span>
-                    </McpHubRowCopy>
-                  </McpHubRowStatic>
-                  <McpHubRowSide>
-                    {needsKeys && <McpHubRowHint>needs key</McpHubRowHint>}
-                    <McpHubRowButtonAction
-                      disabled={actionState !== "idle"}
-                      onClick={() => void installPopularItem(entry)}
-                      type="button"
-                    >
-                      {installingThis ? "Installing…" : "Install"}
-                    </McpHubRowButtonAction>
-                  </McpHubRowSide>
-                </McpHubRow>
-              );
-            })}
-          </McpHubList>
-        </>
+  const renderCatalogList = () => (
+    <McpHubList role="list">
+      {catalogRows.map(({ entry, installed, server }) => {
+        const Icon = entry.icon;
+        const installingThis = actionState === "installing_catalog"
+          && actionContext.name === entry.label;
+        const needsKeys = (entry.env || []).some((item) => item?.required);
+        const statusInfo = installed ? serverStatus(server) : null;
+        return (
+          <McpHubRow key={entry.id} role="listitem">
+            {installed && server ? (
+              <McpHubRowButton
+                onClick={() => {
+                  setSelectedId(server.id);
+                  setScreen("detail");
+                }}
+                type="button"
+              >
+                <McpHubRowIcon data-state={statusInfo.state}>
+                  {Icon ? <Icon aria-hidden="true" /> : <span>{entry.label.slice(0, 1)}</span>}
+                </McpHubRowIcon>
+                <McpHubRowCopy>
+                  <strong>{entry.label}</strong>
+                  <span>{entry.description}</span>
+                </McpHubRowCopy>
+              </McpHubRowButton>
+            ) : (
+              <McpHubRowStatic>
+                <McpHubRowIcon data-state="planned">
+                  {Icon ? <Icon aria-hidden="true" /> : <span>{entry.label.slice(0, 1)}</span>}
+                </McpHubRowIcon>
+                <McpHubRowCopy>
+                  <strong>{entry.label}</strong>
+                  <span>{entry.description}</span>
+                </McpHubRowCopy>
+              </McpHubRowStatic>
+            )}
+            <McpHubRowSide>
+              {installed && statusInfo ? (
+                <McpStatusBadge
+                  data-pending={statusInfo.pending ? "true" : undefined}
+                  data-state={statusInfo.state}
+                >
+                  {statusInfo.label}
+                </McpStatusBadge>
+              ) : (
+                <>
+                  {needsKeys && <McpHubRowHint>needs key</McpHubRowHint>}
+                  <McpHubRowButtonAction
+                    disabled={actionState !== "idle"}
+                    onClick={() => void installPopularItem(entry)}
+                    type="button"
+                  >
+                    {installingThis ? "Installing…" : "Install"}
+                  </McpHubRowButtonAction>
+                </>
+              )}
+            </McpHubRowSide>
+          </McpHubRow>
+        );
+      })}
+      {!catalogRows.length && (
+        <McpEmptyAccess>No catalog MCPs match your search.</McpEmptyAccess>
       )}
+    </McpHubList>
+  );
+
+  const renderListScreen = () => (
+    <>
+      <McpHubTabs role="tablist">
+        <McpHubTab
+          aria-selected={listTab === "installed"}
+          data-active={listTab === "installed" ? "true" : "false"}
+          onClick={() => setListTab("installed")}
+          role="tab"
+          type="button"
+        >
+          {`${scopeValue === "global-defaults" ? "Global MCPs" : "Workspace MCPs"} · ${servers.length}`}
+        </McpHubTab>
+        <McpHubTab
+          aria-selected={listTab === "catalog"}
+          data-active={listTab === "catalog" ? "true" : "false"}
+          onClick={() => setListTab("catalog")}
+          role="tab"
+          type="button"
+        >
+          {`Browse catalog · ${MCP_CATALOG.length}`}
+        </McpHubTab>
+      </McpHubTabs>
+      {listTab === "catalog" ? renderCatalogList() : renderInstalledList()}
     </>
   );
 
@@ -2355,31 +2404,56 @@ export default function McpsWorkspaceView({
 
   return (
     <McpWorkspaceSurface aria-label="Workspace MCPs">
-      <McpHubHeader>
-        <div>
-          <PanelHeading>MCPs</PanelHeading>
-          <PageSubline>
-            {`${workspaceName} · ${numberValue(summary.enabled_count)}/${numberValue(summary.installed_count)} enabled`}
-            {numberValue(summary.config_required_count)
-              ? ` · ${numberValue(summary.config_required_count)} need config`
-              : ""}
-          </PageSubline>
-        </div>
-        <McpHubHeaderSide>
-          {isBusy && (
-            <McpActionStatus aria-live="polite">
-              <McpButtonSpinner aria-hidden="true" />
-              <span>
-                <strong>{busyCopy.title}</strong>
-                <small>{busyCopy.detail}</small>
-              </span>
-            </McpActionStatus>
-          )}
-          <McpHubGhostButton disabled={isBusy} onClick={refresh} type="button">
-            {buttonContent(isLoading && !isActionBusy, "Refresh", "Refreshing")}
-          </McpHubGhostButton>
-        </McpHubHeaderSide>
-      </McpHubHeader>
+      {/* No title area: one compact bar holds the scope picker, search, and
+          the secondary actions. */}
+      <McpHubTopBar>
+        {scopeOptions.length > 0 && typeof onScopeChange === "function" && (
+          <McpHubScopeSelect
+            aria-label="MCP scope"
+            onChange={(event) => onScopeChange(event.target.value)}
+            title={`${numberValue(summary.enabled_count)}/${numberValue(summary.installed_count)} enabled`}
+            value={scopeValue}
+          >
+            {scopeOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </McpHubScopeSelect>
+        )}
+        <McpHubSearchInput
+          aria-label="Search MCPs"
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search MCPs…"
+          type="search"
+          value={search}
+        />
+        <McpHubGhostButton
+          disabled={isBusy}
+          onClick={() => setScreen("manual")}
+          title="Paste a codex/claude mcp add command"
+          type="button"
+        >
+          Add custom
+        </McpHubGhostButton>
+        <McpHubGhostButton
+          disabled={isBusy}
+          onClick={() => setScreen("sources")}
+          title="Marketplace sources and discovered MCPs"
+          type="button"
+        >
+          Sources
+        </McpHubGhostButton>
+        <McpHubGhostButton disabled={isBusy} onClick={refresh} type="button">
+          {buttonContent(isLoading && !isActionBusy, "Refresh", "Refreshing")}
+        </McpHubGhostButton>
+        {isActionBusy && (
+          <McpActionStatus aria-live="polite" title={busyCopy.detail}>
+            <McpButtonSpinner aria-hidden="true" />
+            <span>
+              <strong>{busyCopy.title}</strong>
+            </span>
+          </McpActionStatus>
+        )}
+      </McpHubTopBar>
 
       <McpHubScroll>
         {error && screen !== "detail" && <McpEmptyAccess role="alert">{error}</McpEmptyAccess>}
@@ -2408,26 +2482,65 @@ export default function McpsWorkspaceView({
 
 // --- Single-column MCP hub (list + detail) ---------------------------------
 
-const McpHubHeader = styled.header`
+const McpHubTopBar = styled.div`
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   min-width: 0;
   flex-wrap: wrap;
+`;
 
-  > div:first-child {
-    display: grid;
-    min-width: 0;
-    gap: 2px;
+const McpHubScopeSelect = styled.select`
+  flex: 0 1 auto;
+  max-width: 230px;
+  min-width: 130px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  color: var(--forge-text, #e7ecf3);
+  background: rgba(230, 236, 245, 0.05);
+  font-size: 12px;
+  font-weight: 700;
+  outline: none;
+  cursor: pointer;
+
+  &:hover,
+  &:focus {
+    border-color: rgba(147, 197, 253, 0.4);
   }
 `;
 
-const McpHubHeaderSide = styled.div`
+const McpHubTabs = styled.div`
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  min-width: 0;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
+  border-radius: 9px;
+  background: rgba(230, 236, 245, 0.04);
+  justify-self: start;
+`;
+
+const McpHubTab = styled.button`
+  padding: 6px 13px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--forge-text-soft, #b6c0cc);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+  white-space: nowrap;
+
+  &:hover {
+    color: var(--forge-text, #e7ecf3);
+  }
+
+  &[data-active="true"] {
+    color: var(--forge-text, #f3f6fa);
+    background: rgba(230, 236, 245, 0.1);
+  }
 `;
 
 const McpHubScroll = styled.div`
@@ -2443,15 +2556,9 @@ const McpHubScroll = styled.div`
   scrollbar-width: thin;
 `;
 
-const McpHubSearchRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-`;
-
 const McpHubSearchInput = styled(McpInput)`
-  flex: 1 1 auto;
+  flex: 1 1 160px;
+  min-width: 140px;
   width: 100%;
 `;
 

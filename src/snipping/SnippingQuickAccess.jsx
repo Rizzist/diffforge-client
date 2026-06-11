@@ -14,6 +14,7 @@ import { Send } from "@styled-icons/material-rounded/Send";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
 import { Undo } from "@styled-icons/material-rounded/Undo";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Select from "react-select";
 import styled, { createGlobalStyle } from "styled-components";
 
 const SNIPPING_CAPTURE_SAVED_EVENT = "forge-snipping-capture-saved";
@@ -37,6 +38,79 @@ const TOOL_OPTIONS = [
 ];
 
 const COLOR_OPTIONS = ["#f8fafc", "#ef4444", "#f59e0b", "#22c55e", "#38bdf8", "#a855f7"];
+
+// react-select theme for the composer's workspace/terminal pickers: compact
+// dark pills with an upward menu (the composer sits on the bottom edge).
+const TARGET_SELECT_STYLES = {
+  container: (base) => ({ ...base, flex: "0 1 auto", minWidth: 118, maxWidth: 188 }),
+  control: (base, state) => ({
+    ...base,
+    minHeight: 36,
+    height: 36,
+    borderRadius: 999,
+    backgroundColor: state.isFocused ? "rgba(230, 236, 245, 0.09)" : "rgba(230, 236, 245, 0.06)",
+    borderColor: state.isFocused ? "rgba(147, 197, 253, 0.45)" : "rgba(230, 236, 245, 0.12)",
+    boxShadow: "none",
+    cursor: "pointer",
+    transition: "border-color 120ms ease, background-color 120ms ease",
+    ":hover": { borderColor: "rgba(147, 197, 253, 0.4)" },
+  }),
+  valueContainer: (base) => ({ ...base, padding: "0 2px 0 13px", flexWrap: "nowrap" }),
+  singleValue: (base) => ({
+    ...base,
+    color: "rgba(248, 250, 252, 0.9)",
+    fontSize: 12,
+    fontWeight: 700,
+  }),
+  placeholder: (base) => ({
+    ...base,
+    color: "rgba(248, 250, 252, 0.42)",
+    fontSize: 12,
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  }),
+  input: (base) => ({ ...base, color: "#f8fafc", fontSize: 12, margin: 0, padding: 0 }),
+  indicatorSeparator: () => ({ display: "none" }),
+  dropdownIndicator: (base, state) => ({
+    ...base,
+    padding: "0 9px 0 1px",
+    color: state.isFocused ? "rgba(248, 250, 252, 0.85)" : "rgba(248, 250, 252, 0.45)",
+    transition: "color 120ms ease, transform 160ms ease",
+    transform: state.selectProps.menuIsOpen ? "rotate(180deg)" : "none",
+    ":hover": { color: "#ffffff" },
+  }),
+  menu: (base) => ({
+    ...base,
+    borderRadius: 12,
+    backgroundColor: "rgba(15, 19, 27, 0.99)",
+    border: "1px solid rgba(230, 236, 245, 0.12)",
+    boxShadow: "0 -10px 36px rgba(0, 0, 0, 0.5), 0 18px 48px rgba(0, 0, 0, 0.45)",
+    overflow: "hidden",
+    marginBottom: 8,
+  }),
+  menuList: (base) => ({ ...base, padding: 5, maxHeight: 240 }),
+  option: (base, state) => ({
+    ...base,
+    borderRadius: 8,
+    padding: "7px 10px",
+    fontSize: 12,
+    fontWeight: 650,
+    color: state.isSelected ? "#ffffff" : "rgba(248, 250, 252, 0.85)",
+    backgroundColor: state.isSelected
+      ? "rgba(59, 130, 246, 0.45)"
+      : state.isFocused
+        ? "rgba(230, 236, 245, 0.09)"
+        : "transparent",
+    cursor: "pointer",
+    ":active": { backgroundColor: "rgba(59, 130, 246, 0.32)" },
+  }),
+  noOptionsMessage: (base) => ({
+    ...base,
+    color: "rgba(248, 250, 252, 0.5)",
+    fontSize: 12,
+    fontWeight: 650,
+  }),
+};
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -664,6 +738,19 @@ export function SnippingAnnotationEditorWindow() {
     [dispatchTargets, targetWorkspaceId],
   );
 
+  const workspaceOptions = useMemo(() => dispatchTargets.map((target) => ({
+    label: text(target.workspaceName, target.workspaceId),
+    value: target.workspaceId,
+  })), [dispatchTargets]);
+
+  const threadOptions = useMemo(() => [
+    { label: "Any terminal", value: "" },
+    ...(targetWorkspace?.threads || []).map((thread) => ({
+      label: text(thread.label, thread.threadId),
+      value: thread.threadId,
+    })),
+  ], [targetWorkspace]);
+
   useEffect(() => {
     setTargetThreadId((current) => {
       if (!current) return current;
@@ -1081,31 +1168,28 @@ export function SnippingAnnotationEditorWindow() {
           </EditorStage>
 
           <EditorComposer onSubmit={queueTodo}>
-            <EditorTargetSelect
+            <Select
               aria-label="Target workspace"
-              onChange={(event) => setTargetWorkspaceId(event.target.value)}
-              value={targetWorkspaceId}
-            >
-              {!dispatchTargets.length && <option value="">No workspaces</option>}
-              {dispatchTargets.map((target) => (
-                <option key={target.workspaceId} value={target.workspaceId}>
-                  {target.workspaceName || target.workspaceId}
-                </option>
-              ))}
-            </EditorTargetSelect>
-            <EditorTargetSelect
+              isDisabled={!dispatchTargets.length}
+              isSearchable={false}
+              menuPlacement="top"
+              onChange={(option) => setTargetWorkspaceId(option?.value || "")}
+              options={workspaceOptions}
+              placeholder="Workspace"
+              styles={TARGET_SELECT_STYLES}
+              value={workspaceOptions.find((option) => option.value === targetWorkspaceId) || null}
+            />
+            <Select
               aria-label="Target terminal"
-              disabled={!(targetWorkspace?.threads || []).length}
-              onChange={(event) => setTargetThreadId(event.target.value)}
-              value={targetThreadId}
-            >
-              <option value="">Any terminal</option>
-              {(targetWorkspace?.threads || []).map((thread) => (
-                <option key={thread.threadId} value={thread.threadId}>
-                  {thread.label}
-                </option>
-              ))}
-            </EditorTargetSelect>
+              isDisabled={!(targetWorkspace?.threads || []).length}
+              isSearchable={false}
+              menuPlacement="top"
+              onChange={(option) => setTargetThreadId(option?.value || "")}
+              options={threadOptions}
+              placeholder="Any terminal"
+              styles={TARGET_SELECT_STYLES}
+              value={threadOptions.find((option) => option.value === targetThreadId) || threadOptions[0] || null}
+            />
             <input
               aria-label="Todo for coding agent"
               onChange={(event) => setTodoDraft(event.target.value)}
@@ -1207,6 +1291,12 @@ function drawArrow(context, startX, startY, endX, endY, size) {
 }
 
 const SnipFloatingGlobalStyle = createGlobalStyle`
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
   html,
   body,
   #app {
@@ -1218,6 +1308,12 @@ const SnipFloatingGlobalStyle = createGlobalStyle`
     user-select: none;
   }
 
+  /* The annotation editor window is opaque (native shadow, no transparent
+     gutter), so the page itself paints the editor background full-bleed. */
+  html[data-snipping-floating="editor"],
+  html[data-snipping-floating="editor"] body {
+    background: #05070b !important;
+  }
 `;
 
 const FloatingButton = styled.button`
@@ -1256,13 +1352,12 @@ const FloatingButton = styled.button`
   }
 `;
 
-// Transparent gutter so the rounded chrome and its CSS shadow render fully
-// inside the (shadowless, transparent) native window.
+// Full-bleed: the native window is opaque and draws its own shadow, so the
+// editor paints edge to edge with no gutter that could leak through.
 const EditorViewport = styled.div`
   width: 100vw;
   height: 100vh;
-  padding: 12px;
-  background: transparent;
+  background: #05070b;
 `;
 
 const EditorWindowRoot = styled.main`
@@ -1271,14 +1366,8 @@ const EditorWindowRoot = styled.main`
   width: 100%;
   height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(230, 236, 245, 0.1);
-  border-radius: 18px;
-  background: rgba(8, 10, 15, 0.97);
+  background: #05070b;
   color: #f8fafc;
-  clip-path: inset(0 round 18px);
-  box-shadow:
-    0 28px 80px rgba(0, 0, 0, 0.55),
-    0 4px 18px rgba(0, 0, 0, 0.4);
   font-family:
     Inter,
     ui-sans-serif,
@@ -1449,19 +1538,19 @@ const EditorStage = styled.section`
   min-height: 0;
   place-items: center;
   overflow: hidden;
-  padding: 14px 14px 14px 68px;
+  padding: 12px 12px 12px 64px;
   background:
-    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.1), transparent 42%),
+    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.08), transparent 42%),
     #05070b;
 
   canvas {
     display: block;
     max-width: 100%;
     max-height: 100%;
-    border-radius: 10px;
+    border-radius: 8px;
     box-shadow:
-      0 24px 70px rgba(0, 0, 0, 0.5),
-      0 0 0 1px rgba(230, 236, 245, 0.08);
+      0 18px 54px rgba(0, 0, 0, 0.5),
+      0 0 0 1px rgba(230, 236, 245, 0.09);
     cursor: crosshair;
   }
 `;
@@ -1597,37 +1686,14 @@ const SizeDotButton = styled.button`
   }
 `;
 
-const EditorTargetSelect = styled.select`
-  height: 32px;
-  max-width: 150px;
-  padding: 0 9px;
-  border: 1px solid rgba(230, 236, 245, 0.12);
-  border-radius: 999px;
-  color: rgba(248, 250, 252, 0.85);
-  background: rgba(230, 236, 245, 0.06);
-  font-size: 11px;
-  font-weight: 750;
-  outline: none;
-  cursor: pointer;
-
-  &:hover:not(:disabled),
-  &:focus {
-    border-color: rgba(147, 197, 253, 0.4);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.45;
-  }
-`;
-
 const EditorComposer = styled.form`
   display: flex;
   flex: none;
   align-items: center;
   gap: 8px;
   padding: 10px 12px 12px;
-  background: transparent;
+  border-top: 1px solid rgba(230, 236, 245, 0.07);
+  background: rgba(10, 13, 19, 0.6);
 
   input {
     flex: 1;

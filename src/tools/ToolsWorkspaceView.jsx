@@ -583,28 +583,6 @@ export default function ToolsWorkspaceView({
 
       {section === "mcps" && (
         <ToolsMcpPane aria-label="MCP settings">
-          <ToolsScopeBar>
-            <ToolsScopeCopy>
-              <strong>MCP scope</strong>
-              <span>
-                {activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE
-                  ? "Global defaults are copied into every new workspace; existing workspaces keep their own settings."
-                  : "Workspace-level MCP settings override the global defaults for this workspace only."}
-              </span>
-            </ToolsScopeCopy>
-            <ToolsScopeControls>
-              <ToolsScopeSelect
-                aria-label="MCP settings scope"
-                onChange={(event) => setMcpScope(event.target.value)}
-                value={activeMcpScope}
-              >
-                <option value={GLOBAL_MCP_DEFAULTS_SCOPE}>Global defaults (new workspaces inherit)</option>
-                {workspaceOptions.map((workspace) => (
-                  <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
-                ))}
-              </ToolsScopeSelect>
-            </ToolsScopeControls>
-          </ToolsScopeBar>
           {globalMcpDefaults.error && activeMcpScope === GLOBAL_MCP_DEFAULTS_SCOPE && (
             <ToolsError role="alert">{globalMcpDefaults.error}</ToolsError>
           )}
@@ -613,7 +591,16 @@ export default function ToolsWorkspaceView({
               <McpsWorkspaceView
                 defaultWorkingDirectory={activeMcpRootDirectory || defaultWorkingDirectory}
                 key={activeMcpScope}
+                onScopeChange={setMcpScope}
                 rootDirectory={activeMcpRootDirectory}
+                scopeOptions={[
+                  { value: GLOBAL_MCP_DEFAULTS_SCOPE, label: "Global defaults" },
+                  ...workspaceOptions.map((workspaceOption) => ({
+                    value: workspaceOption.id,
+                    label: workspaceOption.name,
+                  })),
+                ]}
+                scopeValue={activeMcpScope}
                 workspace={activeMcpWorkspace}
               />
             ) : (
@@ -1007,58 +994,6 @@ const ToolsMcpPane = styled.div`
   height: 100%;
   overflow: hidden;
   padding: 12px 16px 0;
-`;
-
-const ToolsScopeBar = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 10px 12px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.1));
-  border-radius: 10px;
-  background: rgba(13, 17, 23, 0.6);
-`;
-
-const ToolsScopeCopy = styled.div`
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-
-  strong {
-    font-size: 12px;
-    font-weight: 800;
-  }
-
-  span {
-    color: var(--forge-text-muted, #7a8493);
-    font-size: 11px;
-  }
-`;
-
-const ToolsScopeControls = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-`;
-
-const ToolsScopeSelect = styled.select`
-  min-width: 220px;
-  padding: 8px 10px;
-  border: 1px solid var(--forge-border, rgba(230, 236, 245, 0.14));
-  border-radius: 8px;
-  color: var(--forge-text, #f4f7fa);
-  background: rgba(7, 9, 13, 0.6);
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-
-  &:focus-visible {
-    outline: 2px solid rgba(125, 176, 255, 0.35);
-    outline-offset: -1px;
-  }
 `;
 
 const ToolsLayout = styled.section`

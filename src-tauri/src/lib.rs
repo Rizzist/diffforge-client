@@ -4165,6 +4165,7 @@ pub fn run() {
             // takes over queued-todo submission when the window goes away.
             // (The tray icon is created only when background mode is entered.)
             todo_dispatch_start_background_dispatcher(app.handle().clone());
+            todo_store_orphan_sweep_start(app.handle().clone());
             {
                 // Crash recovery: anything still marked in-flight in the todo
                 // ledger is a leftover from a previous process and gets
@@ -4412,6 +4413,11 @@ pub fn run() {
             todo_dispatch_backend_submissions_drain,
             todo_dispatch_overview,
             todo_dispatch_queue_get,
+            todo_store_snapshot,
+            todo_store_delete,
+            todo_store_cancel,
+            todo_store_set_status,
+            todo_read_image_data_url,
             app_enter_background,
             app_exit_background,
             app_background_mode_state,

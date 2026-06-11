@@ -124,6 +124,10 @@ struct SnippingState {
     /// real drags from plain clicks when the drag settles.
     preview_drag_sessions: Arc<StdMutex<HashMap<String, (i32, i32)>>>,
     preview_drag_over_last_emit_ms: Arc<AtomicU64>,
+    /// Bumped whenever a new stack animation starts; in-flight tween threads
+    /// compare their ticket and stop, so re-targeted reflows never fight.
+    preview_animation_generation: Arc<AtomicU64>,
+    preview_live_reflow_last_ms: Arc<AtomicU64>,
 }
 
 impl SnippingState {
@@ -139,6 +143,8 @@ impl SnippingState {
             preview_paths: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_sessions: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_over_last_emit_ms: Arc::new(AtomicU64::new(0)),
+            preview_animation_generation: Arc::new(AtomicU64::new(0)),
+            preview_live_reflow_last_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -1824,6 +1830,23 @@ fn snipping_open_floating_asset_window(
     }))
 }
 
+/// Width/height from a PNG header (snips are always PNG); None for other
+/// formats or unreadable files.
+fn snipping_png_dimensions(path: &Path) -> Option<(u32, u32)> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).ok()?;
+    if header[0..8] != [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+        || &header[12..16] != b"IHDR"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes([header[16], header[17], header[18], header[19]]);
+    let height = u32::from_be_bytes([header[20], header[21], header[22], header[23]]);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 fn snipping_open_annotation_editor_for_paths(
     app: &AppHandle,
     paths: Vec<String>,
@@ -1852,14 +1875,47 @@ fn snipping_open_annotation_editor_for_paths(
         &serde_json::to_string(&path_values)
             .map_err(|error| format!("Unable to encode annotation paths: {error}"))?,
     );
+    // Size the editor to the snip itself so the canvas fills the stage
+    // instead of floating inside empty chrome: image logical size plus the
+    // tool rail / title bar / composer, clamped to the monitor work area.
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|main_window| main_window.current_monitor().ok().flatten());
+    let scale = monitor
+        .as_ref()
+        .map(|monitor| monitor.scale_factor())
+        .unwrap_or(1.0)
+        .max(0.5);
+    let (image_width, image_height) = files
+        .first()
+        .and_then(|file| snipping_png_dimensions(file))
+        .map(|(width, height)| (f64::from(width) / scale, f64::from(height) / scale))
+        .unwrap_or((760.0, 480.0));
+    // CSS chrome around the canvas: tool rail + stage padding horizontally;
+    // title bar + composer + stage padding vertically (plus the thumbnail
+    // strip when editing several images).
+    let chrome_width = 76.0;
+    let chrome_height = if files.len() > 1 { 164.0 } else { 120.0 };
+    let (max_width, max_height) = monitor
+        .as_ref()
+        .map(|monitor| {
+            let area = monitor
+                .work_area()
+                .size
+                .to_logical::<f64>(monitor.scale_factor());
+            (area.width * 0.92, area.height * 0.92)
+        })
+        .unwrap_or((1280.0, 860.0));
+    let inner_width = (image_width + chrome_width).clamp(480.0, max_width.max(480.0));
+    let inner_height = (image_height + chrome_height).clamp(360.0, max_height.max(360.0));
     let window = WebviewWindowBuilder::new(
         app,
         label.clone(),
         WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
     )
     .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
-    .inner_size(840.0, 620.0)
-    .min_inner_size(380.0, 280.0)
+    .inner_size(inner_width, inner_height)
+    .min_inner_size(480.0, 360.0)
     .resizable(true)
     .decorations(false)
     // Normal z-order: clicking the main Diff Forge window brings it in front
@@ -1867,13 +1923,11 @@ fn snipping_open_annotation_editor_for_paths(
     .always_on_top(false)
     .focused(true)
     .accept_first_mouse(true)
-    .transparent(true)
-    .background_color(Color(0, 0, 0, 0))
+    // Opaque window: the webview paints the editor full-bleed and macOS draws
+    // the native shadow, so no transparent gutter can leak white edges.
+    .background_color(Color(5, 7, 11, 255))
     .visible(false)
-    // The native shadow is computed from the window frame, which paints a
-    // square halo behind the rounded CSS chrome; the webview draws its own
-    // shadow inside a transparent gutter instead.
-    .shadow(false)
+    .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
     snipping_center_floating_window(app, &window);
@@ -2754,10 +2808,74 @@ fn snipping_preview_stack_position(
     Some(tauri::PhysicalPosition::new(x, y))
 }
 
+const SNIPPING_FLOAT_ANIMATE_MS: f64 = 240.0;
+const SNIPPING_FLOAT_ANIMATE_FRAME_MS: u64 = 12;
+const SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS: u64 = 70;
+
+/// Tweens preview windows to their stack slots (ease-out cubic) instead of
+/// snapping them. A new animation (or a re-targeted reflow mid-drag) bumps
+/// the generation, which stops in-flight tween threads at their next frame —
+/// the new tween picks up from wherever each window currently is, so rapid
+/// re-targets stay fluid.
+fn snipping_animate_previews(
+    app: &AppHandle,
+    moves: Vec<(
+        tauri::WebviewWindow,
+        tauri::PhysicalPosition<i32>,
+        tauri::PhysicalPosition<i32>,
+    )>,
+) {
+    if moves.is_empty() {
+        return;
+    }
+    let generation = app
+        .state::<SnippingState>()
+        .preview_animation_generation
+        .clone();
+    let ticket = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            if generation.load(Ordering::SeqCst) != ticket {
+                return;
+            }
+            let progress =
+                (started.elapsed().as_millis() as f64 / SNIPPING_FLOAT_ANIMATE_MS).min(1.0);
+            let eased = 1.0 - (1.0 - progress).powi(3);
+            let frame: Vec<(tauri::WebviewWindow, i32, i32)> = moves
+                .iter()
+                .map(|(window, from, to)| {
+                    (
+                        window.clone(),
+                        from.x + (f64::from(to.x - from.x) * eased).round() as i32,
+                        from.y + (f64::from(to.y - from.y) * eased).round() as i32,
+                    )
+                })
+                .collect();
+            let frame_generation = generation.clone();
+            let _ = app.run_on_main_thread(move || {
+                if frame_generation.load(Ordering::SeqCst) != ticket {
+                    return;
+                }
+                for (window, x, y) in frame {
+                    let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+                }
+            });
+            if progress >= 1.0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(SNIPPING_FLOAT_ANIMATE_FRAME_MS));
+        }
+    });
+}
+
 /// Re-packs every preview parked in the bottom-left column into a tight
-/// bottom-up stack. A preview dragged out of the column stops reserving a
-/// slot (the ones above slide down to fill it), and a preview dropped back
-/// over the column is adopted into the stack at the height it was dropped.
+/// bottom-up stack, animating each window to its slot. A preview dragged out
+/// of the column stops reserving a slot (the ones above slide down to fill
+/// it); a preview being dragged OVER the column keeps a slot at its on-screen
+/// ordinal so the others part around it live, and a preview dropped back over
+/// the column is adopted into the stack at the height it was dropped.
 fn snipping_reflow_preview_stack(app: &AppHandle) {
     let Some(monitor) = app
         .get_webview_window("main")
@@ -2774,7 +2892,19 @@ fn snipping_reflow_preview_stack(app: &AppHandle) {
     let x = work_area.position.x + margin;
     let top_limit = work_area.position.y + margin;
 
-    let mut docked: Vec<(tauri::PhysicalPosition<i32>, i32, tauri::WebviewWindow)> = Vec::new();
+    let dragging_labels: HashSet<String> = app
+        .state::<SnippingState>()
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let mut docked: Vec<(
+        tauri::PhysicalPosition<i32>,
+        i32,
+        tauri::WebviewWindow,
+        bool,
+    )> = Vec::new();
     for (label, window) in app.webview_windows() {
         if !label.starts_with(SNIPPING_FLOAT_WINDOW_PREFIX) {
             continue;
@@ -2794,21 +2924,49 @@ fn snipping_reflow_preview_stack(app: &AppHandle) {
             .map(|size| size.height as i32)
             .unwrap_or(height_physical)
             .max(1);
-        docked.push((position, height, window));
+        docked.push((position, height, window, dragging_labels.contains(&label)));
     }
 
     // The lowest window keeps the bottom slot; on-screen order is preserved.
     docked.sort_by(|a, b| (b.0.y + b.1).cmp(&(a.0.y + a.1)));
     let mut bottom_edge = work_area.position.y + work_area.size.height as i32 - margin;
-    for (position, height, window) in docked {
+    let mut moves = Vec::new();
+    for (position, height, window, dragging) in docked {
         let y = (bottom_edge - height).max(top_limit);
-        // Skipping already-settled windows keeps this idempotent, so the
-        // Moved events our own set_position emits cannot ping-pong forever.
-        if position.x != x || position.y != y {
-            let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+        // A window the user is holding reserves its slot but never moves; the
+        // OS drag owns its position until the drop settles.
+        if !dragging && (position.x != x || position.y != y) {
+            moves.push((window, position, tauri::PhysicalPosition::new(x, y)));
         }
         bottom_edge = y - gap;
     }
+    snipping_animate_previews(app, moves);
+}
+
+/// Throttled live re-pack while the user drags a preview: the rest of the
+/// stack parts around (or collapses behind) the held window in real time.
+fn snipping_live_reflow_on_drag(app: &AppHandle, label: &str) {
+    let state = app.state::<SnippingState>();
+    let is_dragging = state
+        .preview_drag_sessions
+        .lock()
+        .map(|sessions| sessions.contains_key(label))
+        .unwrap_or(false);
+    if !is_dragging {
+        return;
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let last_ms = state.preview_live_reflow_last_ms.load(Ordering::SeqCst);
+    if now_ms.saturating_sub(last_ms) < SNIPPING_FLOAT_LIVE_REFLOW_THROTTLE_MS {
+        return;
+    }
+    state
+        .preview_live_reflow_last_ms
+        .store(now_ms, Ordering::SeqCst);
+    snipping_reflow_preview_stack(app);
 }
 
 /// Debounced settle trigger fed by preview Moved/Destroyed window events.
@@ -3056,6 +3214,9 @@ fn snipping_open_snip_preview_window_for(
             match event {
                 WindowEvent::Moved(_) => {
                     snipping_emit_preview_drag_over(&app_for_events, &label_for_events);
+                    // While the user holds this preview, the rest of the stack
+                    // re-packs around it live (throttled, animated).
+                    snipping_live_reflow_on_drag(&app_for_events, &label_for_events);
                     schedule_snipping_preview_stack_reflow(&app_for_events);
                 }
                 WindowEvent::Destroyed => {

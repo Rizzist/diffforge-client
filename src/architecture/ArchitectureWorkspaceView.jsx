@@ -5518,7 +5518,6 @@ export function ArchitectureHubView({
   const repositoryScan = useMemo(() => ({
     repositories: repositoryGroups.flatMap((group) => group.repositories),
   }), [repositoryGroups]);
-  const repositoryCount = repositoryScan.repositories.length;
   const createNamedFolder = useCallback(async (name) => {
     const entry = await invoke("architecture_named_root", { name });
     if (typeof onRefreshCatalog === "function") {
@@ -5527,26 +5526,11 @@ export function ArchitectureHubView({
     return entry;
   }, [onRefreshCatalog]);
   const scanState = catalogState === "ready" || catalog ? "ready" : catalogState;
-  const builtAtMs = Number(catalog?.builtAtMs || 0);
-  const toolbarMeta = [
-    "Architectures · account level",
-    `${repositoryCount} repo${repositoryCount === 1 ? "" : "s"}`,
-    builtAtMs ? `synced ${new Date(builtAtMs).toLocaleTimeString()}` : "",
-    catalog && catalog.cloudIndexAvailable === false ? "cloud index offline" : "",
-  ].filter(Boolean).join(" · ");
 
+  // No toolbar bar: the catalog auto-syncs from the Rust store watcher and
+  // cloud broadcasts, so the hub renders the panel full-height.
   return (
     <ArchitectureSurface aria-label="Architectures" data-state={scanState}>
-      <ArchitectureToolbar>
-        <ViewToggleGroup aria-label="Architecture hub mode">
-          <ViewToggleButton data-active="true" type="button">
-            Architectures
-          </ViewToggleButton>
-        </ViewToggleGroup>
-        {/* No refresh button: the catalog auto-syncs from the Rust store
-            watcher and cloud broadcasts; manual refresh has no remaining job. */}
-        <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
-      </ArchitectureToolbar>
       <ArchitecturesPanel
         graphLists={graphLists}
         onCopyGraph={onCopyGraph}
@@ -9229,6 +9213,57 @@ function TodosHistoryPanel({
         ...extra,
       },
     }));
+    // Cancel, delete, and unqueue must work even when no TerminalView holds
+    // this workspace (other tab, background mode) or the row only exists in
+    // the cloud mirror: if the control bus doesn't answer, apply the action
+    // through the Rust todo store directly — it owns tombstones and status
+    // corrections, so the outcome is guaranteed.
+    if (action !== "cancel" && action !== "delete" && action !== "unqueue") {
+      return;
+    }
+    window.setTimeout(() => {
+      if (actionRequestRef.current !== requestId) {
+        return;
+      }
+      const respond = (ok, reason = "") => {
+        window.dispatchEvent(new CustomEvent(TODO_HISTORY_CONTROL_RESULT_EVENT, {
+          detail: { action, ok, reason, requestId, workspaceId },
+        }));
+      };
+      const todoIds = [
+        ...new Set(
+          [text(item.raw?.id), item.todoId, ...(Array.isArray(item.todoIds) ? item.todoIds : [])]
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        ),
+      ];
+      const todoRefs = {
+        todoId: String(item.todoId || text(item.raw?.id) || "").trim() || null,
+        commandId: String(item.commandId || "").trim() || null,
+        dispatchId: String(item.dispatchId || "").trim() || null,
+      };
+      const request = action === "cancel"
+        ? invoke("todo_store_cancel", {
+          workspaceId,
+          ...todoRefs,
+          reason: "todo_history_cancel",
+        })
+        : action === "unqueue"
+          ? invoke("todo_store_set_status", {
+            workspaceId,
+            ...todoRefs,
+            status: "listed",
+            reason: "todo_history_unqueue",
+          })
+          : invoke("todo_store_delete", {
+            workspaceId,
+            todoIds,
+            reason: "todo_history_delete",
+          });
+      request
+        .then(() => respond(true))
+        .catch((error) => respond(false, String(error?.message || error || "The todo action could not be applied.")));
+    }, 1200);
   }, [workspaceId]);
 
   const queuedTargetValue = useCallback((item) => {
@@ -9346,6 +9381,17 @@ function TodosHistoryPanel({
                           >
                             Stop
                           </TodoActionButton>
+                          <TodoActionButton
+                            data-danger="true"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "delete");
+                            }}
+                            title="Delete this todo everywhere (interrupts the turn if one is live; tombstoned on the server)"
+                            type="button"
+                          >
+                            Delete
+                          </TodoActionButton>
                         </TodoHistoryRowActions>
                       )}
                       {group.id === "queued" && (
@@ -9365,6 +9411,17 @@ function TodosHistoryPanel({
                             type="button"
                           >
                             Unqueue
+                          </TodoActionButton>
+                          <TodoActionButton
+                            data-danger="true"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dispatchTodoAction(item, "delete");
+                            }}
+                            title="Delete this todo everywhere (tombstoned on the server)"
+                            type="button"
+                          >
+                            Delete
                           </TodoActionButton>
                         </TodoHistoryRowActions>
                       )}

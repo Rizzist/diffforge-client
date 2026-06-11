@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
 import { Linux as DeviceLinuxIcon } from "@styled-icons/fa-brands/Linux";
 import { Windows as DeviceWindowsIcon } from "@styled-icons/fa-brands/Windows";
@@ -241,6 +242,8 @@ const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
 const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
+const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
+const TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT = "todo-store-cancel-requested";
 const REMOTE_TODO_DELETE_EVENT = "diffforge:remote-todo-delete";
 const VOICE_PLAN_SNAPSHOT_EVENT = "diffforge:voice-plan-snapshot";
 const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
@@ -988,6 +991,14 @@ const TerminalTabContentStack = styled.div`
   }
 `;
 
+/* One green pulse confirming a drop (snip preview or OS file) was accepted
+   by the target under the cursor. */
+const todoDropAcceptFlash = keyframes`
+  0% { opacity: 0; }
+  12% { opacity: 1; }
+  100% { opacity: 0; }
+`;
+
 const TerminalSurfaceSlot = styled.div`
   position: absolute;
   top: 0;
@@ -1080,7 +1091,7 @@ const TerminalSurfaceSlot = styled.div`
     z-index: 240;
   }
 
-  /* A dragged snip preview window is hovering this terminal. */
+  /* A dragged snip preview window or OS file is hovering this terminal. */
   &[data-snip-drop-active="true"]::after {
     content: "";
     position: absolute;
@@ -1091,12 +1102,29 @@ const TerminalSurfaceSlot = styled.div`
       inset 0 0 0 2px rgba(74, 222, 128, 0.85),
       inset 0 0 22px rgba(74, 222, 128, 0.2);
   }
+
+  /* A drop just landed here. */
+  &[data-drop-flash="true"]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 90;
+    pointer-events: none;
+    box-shadow:
+      inset 0 0 0 2px rgba(74, 222, 128, 0.95),
+      inset 0 0 30px rgba(74, 222, 128, 0.32);
+    animation: ${todoDropAcceptFlash} 900ms ease-out forwards;
+  }
 `;
 
 // Emitted by Rust when a dragged snip preview window hovers / settles over
 // the main window; payload points are main-webview CSS coordinates.
 const SNIP_PREVIEW_DROP_EVENT = "forge-snip-preview-drop";
 const SNIP_PREVIEW_DRAG_OVER_EVENT = "forge-snip-preview-drag-over";
+// Window event the queue panel listens for: media dropped on the draft
+// composer becomes a brand-new (not yet submitted) todo with the attachment.
+const TODO_COMPOSER_MEDIA_DROP_EVENT = "diffforge:todo-composer-media-drop";
+const TODO_DROP_IMAGE_PATH_PATTERN = /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i;
 
 const TODO_COMPLETION_FLASH_MS = 2000;
 
@@ -3998,6 +4026,26 @@ const TodoQueueComposer = styled.form`
   min-width: 0;
   min-height: 35px;
   flex: 0 0 auto;
+
+  /* A dragged snip preview window or OS file is hovering the draft area:
+     dropping creates a new (uncreated) todo carrying the attachment. */
+  &[data-snip-drop-active="true"] {
+    border-radius: 8px;
+    background: rgba(74, 222, 128, 0.12);
+    box-shadow: inset 0 0 0 1.5px rgba(74, 222, 128, 0.6);
+  }
+
+  &[data-drop-flash="true"]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 8px;
+    pointer-events: none;
+    box-shadow:
+      inset 0 0 0 1.5px rgba(74, 222, 128, 0.9),
+      inset 0 0 18px rgba(74, 222, 128, 0.3);
+    animation: ${todoDropAcceptFlash} 900ms ease-out forwards;
+  }
 `;
 
 const TodoQueueBoard = styled.div`
@@ -4134,11 +4182,24 @@ const TodoQueueItemCard = styled.article`
     opacity: 0;
   }
 
-  /* A dragged snip preview window is hovering this todo. */
+  /* A dragged snip preview window or OS file is hovering this todo. */
   &[data-snip-drop-active="true"] {
     border-radius: 8px;
     background: rgba(74, 222, 128, 0.12);
     box-shadow: inset 0 0 0 1.5px rgba(74, 222, 128, 0.6);
+  }
+
+  /* A drop just landed on this todo. */
+  &[data-drop-flash="true"]::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 8px;
+    pointer-events: none;
+    box-shadow:
+      inset 0 0 0 1.5px rgba(74, 222, 128, 0.9),
+      inset 0 0 18px rgba(74, 222, 128, 0.3);
+    animation: ${todoDropAcceptFlash} 900ms ease-out forwards;
   }
 
   html[data-forge-theme="light"] & {
@@ -4553,12 +4614,6 @@ const TodoQueueItemText = styled.p`
   overflow-wrap: anywhere;
   color: #edf5ff;
   font: 12px/1.45 "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
-
-  /* Cloud-generated titles read as headlines; the raw todo text stays on hover. */
-  &[data-llm-title="true"] {
-    font-weight: 720;
-    white-space: normal;
-  }
 
   html[data-forge-theme="light"] & {
     color: #1d1d1f;
@@ -12611,6 +12666,33 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
     onSubmitDraft();
   }, [onSubmitDraft]);
 
+  // Media dropped on the draft composer (snip preview windows or OS files)
+  // becomes a brand-new todo carrying the attachment — same flow as pasting
+  // an image, including dropping straight into edit mode.
+  useEffect(() => {
+    const handleComposerMediaDrop = (event) => {
+      const detail = event?.detail || {};
+      if (String(detail.workspaceId || "").trim() !== String(workspaceId || "").trim()) {
+        return;
+      }
+      const images = dedupeTodoQueueImages(Array.isArray(detail.images) ? detail.images : []);
+      if (!images.length) {
+        return;
+      }
+      const createdItems = onSubmitDraft({ images }) || [];
+      const firstImageItem = createdItems.find((item) => getTodoQueueItemImage(item)) || createdItems[0];
+      if (firstImageItem?.id) {
+        setEditingItemId(firstImageItem.id);
+        setEditingDraft(normalizeTodoQueueText(firstImageItem.text));
+        skipEditBlurCommitRef.current = false;
+      }
+    };
+    window.addEventListener(TODO_COMPOSER_MEDIA_DROP_EVENT, handleComposerMediaDrop);
+    return () => {
+      window.removeEventListener(TODO_COMPOSER_MEDIA_DROP_EVENT, handleComposerMediaDrop);
+    };
+  }, [onSubmitDraft, workspaceId]);
+
   const beginItemEdit = useCallback((item) => {
     const text = normalizeTodoQueueText(item?.text);
     if (!item?.id || pendingItems[item.id]) {
@@ -13259,7 +13341,23 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
       return "";
     }
     const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
-    return todoId ? (todoLlmTitles.get(todoId) || "") : "";
+    const entry = todoId ? todoLlmTitles.get(todoId) : null;
+    if (!entry) {
+      return "";
+    }
+    // Legacy plain-string entries have no text to validate against.
+    if (typeof entry === "string") {
+      return entry;
+    }
+    // A title belongs to the text it was generated from: once the user edits
+    // the todo, the stale title disappears immediately and the regenerated
+    // one (for the new contents) shows when the mirror catches up.
+    const mirrorText = normalizeTodoQueueText(entry.text || "");
+    const itemText = normalizeTodoQueueText(item?.text || "");
+    if (mirrorText && itemText && mirrorText !== itemText) {
+      return "";
+    }
+    return entry.title || "";
   }, [todoLlmTitles]);
   const workspaceTodoDispatchTargets = Array.isArray(dispatchTargets)
     ? dispatchTargets.filter((target) => target?.canQueue !== false)
@@ -13622,12 +13720,13 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                                 spellCheck="true"
                                 value={editingDraft}
                               />
-                            ) : todoLlmTitleFor(item) ? (
-                              <TodoQueueItemText data-llm-title="true" title={item.text}>
-                                {todoLlmTitleFor(item)}
-                              </TodoQueueItemText>
                             ) : (
-                              <TodoQueueItemText>{item.text}</TodoQueueItemText>
+                              // The todo's own input text is the row content;
+                              // a generated title only ever appears as a
+                              // hover tooltip, never replacing what was typed.
+                              <TodoQueueItemText title={todoLlmTitleFor(item) || undefined}>
+                                {item.text}
+                              </TodoQueueItemText>
                             )}
                             {!isEditing && recoverableStatusLabel && (
                               <TodoQueueStatusPill data-todo-status={recoverableStatus}>
@@ -13720,11 +13819,8 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                             {item.deviceTag}
                           </TodoQueuePeerDeviceTag>
                           <TodoQueuePeerBody>
-                            <TodoQueueItemText
-                              data-llm-title={item.llmTitle ? "true" : undefined}
-                              title={item.llmTitle ? item.text : undefined}
-                            >
-                              {item.llmTitle || item.text}
+                            <TodoQueueItemText title={item.llmTitle || undefined}>
+                              {item.text}
                             </TodoQueueItemText>
                             <TodoQueuePeerMeta>
                               <TodoQueuePeerPill data-peer-status={item.status}>
@@ -13742,7 +13838,11 @@ const TodoQueuePanel = memo(function TodoQueuePanel({
                       </TodoQueueItemCard>
                     );
                   })}
-                  <TodoQueueComposer data-todo-composer="true" onSubmit={handleSubmit}>
+                  <TodoQueueComposer
+                    data-snip-drop-composer="true"
+                    data-todo-composer="true"
+                    onSubmit={handleSubmit}
+                  >
                     <TodoQueueTextArea
                       aria-label="New todo"
                       maxLength={TODO_QUEUE_MAX_TEXT_LENGTH}
@@ -14419,15 +14519,20 @@ function TerminalView({
     () => normalizeWorkspaceTodoPeerActivityItems(workspaceTodos, terminalWorkspace?.id, workspaceTodoDeviceMap),
     [terminalWorkspace?.id, workspaceTodoDeviceMap, workspaceTodos],
   );
-  // Cloud-generated todo titles (cheap LLM, created once a todo is sent to a
-  // coding agent) keyed by todo id; synced back through the todo mirror.
+  // Cloud-generated todo titles (cheap LLM, created once a todo is queued or
+  // beyond) keyed by todo id; synced back through the todo mirror. Each entry
+  // remembers the text it was generated for, so an edited todo drops its
+  // stale title instantly (the server clears + regenerates on its side).
   const workspaceTodoLlmTitles = useMemo(() => {
     const titles = new Map();
     workspaceTodoItemsForWorkspace(workspaceTodos, terminalWorkspace?.id || "").forEach((item) => {
       const todoId = String(item?.todoId || item?.todo_id || item?.id || "").trim();
       const title = String(item?.llmTitle || item?.llm_title || "").trim();
       if (todoId && title) {
-        titles.set(todoId, title);
+        titles.set(todoId, {
+          text: String(item?.todoText || item?.todo_text || item?.text || ""),
+          title,
+        });
       }
     });
     return titles;
@@ -14532,12 +14637,36 @@ function TerminalView({
     const send = () => {
       todoQueueCloudSyncTimerRef.current = 0;
       todoQueueCloudSyncSignatureRef.current = signature;
-      // Mirror the queue snapshot into the Rust ledger so the background
-      // dispatcher can submit queued todos when no webview is alive.
+      // Write-through to the authoritative Rust store: removals become
+      // terminal tombstones there, and the store rejects any item a tombstone
+      // already covers — prune those locally so ghosts can't linger.
       void invoke("todo_dispatch_queue_sync", {
         items: payload.todos,
         reason: payload.reason,
+        removedIds: payload.removedTodoIds,
         workspaceId,
+      }).then((result) => {
+        const rejectedIds = Array.isArray(result?.rejectedIds)
+          ? result.rejectedIds.map((value) => String(value || "").trim()).filter(Boolean)
+          : [];
+        if (!rejectedIds.length) {
+          return;
+        }
+        recordTodoQueueDeletedReceipts(
+          getTodoQueueDeletedReceiptStorageKey(workspaceId),
+          rejectedIds,
+        );
+        const rejectedSet = new Set(rejectedIds);
+        setTodoQueueItems((currentItems) => {
+          const nextItems = currentItems.filter((item) => (
+            !rejectedSet.has(String(item?.id || "").trim())
+          ));
+          if (nextItems.length === currentItems.length) {
+            return currentItems;
+          }
+          writeTodoQueueItems(todoQueueStorageKeyRef.current, nextItems);
+          return nextItems;
+        });
       }).catch(() => {});
       void invoke("cloud_mcp_sync_workspace_todos", {
         reason: payload.reason,
@@ -19003,7 +19132,31 @@ function TerminalView({
       return null;
     }
     const element = document.elementFromPoint(clientX, clientY);
-    return element?.closest?.("[data-snip-drop-todo-id], [data-terminal-surface-slot='true']") || null;
+    return element?.closest?.(
+      "[data-snip-drop-todo-id], [data-terminal-surface-slot='true'], [data-snip-drop-composer='true']",
+    ) || null;
+  }, []);
+  // One green pulse on the target confirming the drop landed.
+  const flashDropTarget = useCallback((element) => {
+    if (!element) {
+      return;
+    }
+    element.removeAttribute("data-drop-flash");
+    // Force a reflow so back-to-back drops restart the animation.
+    void element.offsetWidth;
+    element.setAttribute("data-drop-flash", "true");
+    window.setTimeout(() => {
+      element.removeAttribute("data-drop-flash");
+    }, 950);
+  }, []);
+  const buildDroppedImageFromDataUrl = useCallback((dataUrl, name) => {
+    const mimeEnd = dataUrl.indexOf(";");
+    return {
+      name,
+      size: 0,
+      src: dataUrl,
+      type: dataUrl.startsWith("data:") && mimeEnd > 5 ? dataUrl.slice(5, mimeEnd) : "image/png",
+    };
   }, []);
 
   useEffect(() => {
@@ -19076,13 +19229,7 @@ function TerminalView({
         if (!dataUrl || disposed) {
           return;
         }
-        const mimeEnd = dataUrl.indexOf(";");
-        const droppedImage = {
-          name: snipName,
-          size: 0,
-          src: dataUrl,
-          type: dataUrl.startsWith("data:") && mimeEnd > 5 ? dataUrl.slice(5, mimeEnd) : "image/png",
-        };
+        const droppedImage = buildDroppedImageFromDataUrl(dataUrl, snipName);
         updateTodoQueueItems((currentItems) => currentItems.map((item) => {
           if (item.id !== todoId) {
             return item;
@@ -19090,6 +19237,30 @@ function TerminalView({
           const nextImages = [...getTodoQueueItemImages(item), droppedImage];
           return { ...item, image: nextImages[0], images: nextImages };
         }), { reason: "snip_preview_dropped" });
+        flashDropTarget(target);
+        invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
+        return;
+      }
+
+      // The draft composer: dropping a snip creates a brand-new (uncreated)
+      // todo carrying the image, ready to edit before queueing.
+      if (target.getAttribute("data-snip-drop-composer") === "true") {
+        let dataUrl = "";
+        try {
+          dataUrl = String(await invoke("snipping_read_asset_data_url", { path }) || "");
+        } catch {
+          return;
+        }
+        if (!dataUrl || disposed) {
+          return;
+        }
+        window.dispatchEvent(new CustomEvent(TODO_COMPOSER_MEDIA_DROP_EVENT, {
+          detail: {
+            workspaceId: terminalWorkspace?.id || "",
+            images: [buildDroppedImageFromDataUrl(dataUrl, snipName)],
+          },
+        }));
+        flashDropTarget(target);
         invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
         return;
       }
@@ -19106,6 +19277,7 @@ function TerminalView({
           "snip_preview_drop",
         );
         if (accepted) {
+          flashDropTarget(target);
           invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
         }
       }
@@ -19124,6 +19296,8 @@ function TerminalView({
       unlisten();
     };
   }, [
+    buildDroppedImageFromDataUrl,
+    flashDropTarget,
     queueWorkspaceFileForTerminalIndex,
     resolveSnipDropElement,
     setSnipDropHighlightElement,
@@ -22334,6 +22508,13 @@ function TerminalView({
     }
     clearTodoQueueItemPending(itemId, "removed", item ? getTodoQueuePendingFieldsFromItem(item, source) : { source });
     recordTodoQueueDeletedReceipts(todoQueueDeletedReceiptStorageKey, [itemId]);
+    // Rust tombstone first: terminal, restart-proof, and gates every replica
+    // (journal adoption, remote intake, snapshot writes) from resurrecting it.
+    void invoke("todo_store_delete", {
+      workspaceId: String(item?.workspaceId || terminalWorkspace?.id || "").trim(),
+      todoIds: [itemId],
+      reason: "todo_queue_item_removed",
+    }).catch(() => {});
     updateTodoQueueItems((currentItems) => (
       currentItems.filter((item) => item.id !== itemId)
     ), {
@@ -22345,6 +22526,7 @@ function TerminalView({
   }, [
     clearTodoQueueItemPending,
     recordVoicePlanTaskStatus,
+    terminalWorkspace?.id,
     todoQueueDeletedReceiptStorageKey,
     updateTodoQueueItems,
   ]);
@@ -22491,7 +22673,47 @@ function TerminalView({
           }
         });
         if (!matchedPrompt) {
-          respond(detail, false, "This todo is not running in a terminal on this device.");
+          // Nothing is actually running for this row in this session: the
+          // "running" claim is stale (dead session, another replica). Ask the
+          // Rust store to cancel with a guaranteed outcome — it flips the
+          // store row or pushes a cancelled correction for mirror-only rows —
+          // so the history view converges instead of erroring forever.
+          const cancelWorkspaceId = String(detail.workspaceId || terminalWorkspace?.id || "").trim();
+          void invoke("todo_store_cancel", {
+            workspaceId: cancelWorkspaceId,
+            todoId: String(detail.todoId || detail.itemId || "").trim() || null,
+            commandId: String(detail.commandId || "").trim() || null,
+            dispatchId: String(detail.dispatchId || "").trim() || null,
+            reason: "todo_history_cancel",
+          }).then(() => {
+            respond(detail, true);
+            const staleIds = new Set(
+              [detail.itemId, detail.todoId, detail.commandId, detail.dispatchId]
+                .map((value) => String(value || "").trim())
+                .filter(Boolean),
+            );
+            if (!staleIds.size) {
+              return;
+            }
+            updateTodoQueueItems((currentItems) => {
+              let changed = false;
+              const nextItems = currentItems.map((item) => {
+                const itemId = String(item?.id || "").trim();
+                if (!staleIds.has(itemId) && !staleIds.has(String(item?.remoteCommand?.commandId || "").trim())) {
+                  return item;
+                }
+                changed = true;
+                return getTodoQueueItemWithCloudStatus(item, "cancelled", { reason: "todo_history_cancel" });
+              });
+              return changed ? nextItems : currentItems;
+            }, {
+              force: true,
+              immediate: true,
+              reason: "todo_history_cancel_correction",
+            });
+          }).catch((error) => {
+            respond(detail, false, getErrorMessage(error, "Unable to cancel this todo."));
+          });
           return;
         }
         const cancelItemId = String(matchedPrompt.itemId || "").trim();
@@ -22538,6 +22760,13 @@ function TerminalView({
           getTodoQueueDeletedReceiptStorageKey(terminalWorkspace?.id || ""),
           tombstoneIds,
         );
+        // Rust tombstones are terminal: they survive restarts, gate journal
+        // re-adoption, and push the removal durably through the outbox.
+        void invoke("todo_store_delete", {
+          workspaceId: String(detail.workspaceId || terminalWorkspace?.id || "").trim(),
+          todoIds: tombstoneIds,
+          reason: "todo_history_delete",
+        }).catch(() => {});
         syncTodoQueueItemsToCloud(todoQueueItemsRef.current, {
           force: true,
           immediate: true,
@@ -22568,10 +22797,31 @@ function TerminalView({
         respond(detail, true);
         return;
       }
+      const findLiveInFlightPrompt = () => {
+        let matchedPrompt = null;
+        let matchedTerminalIndex = null;
+        todoQueueTerminalInFlightPromptsRef.current.forEach((prompt, terminalIndex) => {
+          if (matchedPrompt) {
+            return;
+          }
+          if (String(prompt?.itemId || "").trim() === itemId) {
+            matchedPrompt = prompt;
+            matchedTerminalIndex = terminalIndex;
+          }
+        });
+        return { matchedPrompt, matchedTerminalIndex };
+      };
+
       if (action === "unqueue") {
         if (pendingItem && getTodoQueuePendingPhase(pendingItem) !== "queued") {
-          respond(detail, false, "This todo is already being sent to a terminal; cancel it instead.");
-          return;
+          // Only a genuinely live in-flight prompt justifies refusing. A
+          // persisted "sending" claim with no matching prompt is exactly the
+          // stuck state users can't escape — clear it and unqueue anyway.
+          const { matchedPrompt } = findLiveInFlightPrompt();
+          if (matchedPrompt) {
+            respond(detail, false, "This todo is already being sent to a terminal; cancel it instead.");
+            return;
+          }
         }
         clearTodoQueueItemPending(itemId, "unqueued", { reason: "todo_history_unqueue" });
         updateTodoQueueItems((currentItems) => currentItems.map((candidate) => (
@@ -22587,9 +22837,15 @@ function TerminalView({
         return;
       }
       if (action === "delete") {
-        if (pendingItem) {
-          respond(detail, false, "Unqueue this todo before deleting it.");
-          return;
+        // Delete is terminal and always wins: interrupt a live turn if one is
+        // actually running, clear any pending claim, tombstone, remove.
+        const { matchedPrompt, matchedTerminalIndex } = findLiveInFlightPrompt();
+        if (matchedPrompt) {
+          void interruptVoicePlanTaskTerminal({
+            inFlightPrompt: matchedPrompt,
+            reason: "todo_history_delete",
+            terminalIndex: matchedTerminalIndex,
+          }).catch(() => {});
         }
         removeTodoQueueItem(itemId);
         respond(detail, true);
@@ -22612,6 +22868,186 @@ function TerminalView({
     terminalWorkspace?.id,
     updateTodoQueueItems,
   ]);
+
+  // The Rust todo store is authoritative: when it changes outside this
+  // webview (orphan sweep, headless levers, remote deletes, store cancels),
+  // re-pull the snapshot and reconcile — drop tombstoned items, adopt items
+  // this session doesn't know, and apply settled-status flips.
+  useEffect(() => {
+    const storeWorkspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!storeWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let unlistenChanged = null;
+
+    const reconcileFromStore = () => {
+      invoke("todo_store_snapshot", { workspaceId: storeWorkspaceId }).then((snapshot) => {
+        if (cancelled || !snapshot) {
+          return;
+        }
+        const tombstonedIds = new Set(
+          (Array.isArray(snapshot.tombstonedIds) ? snapshot.tombstonedIds : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        );
+        const storeItems = (Array.isArray(snapshot.items) ? snapshot.items : [])
+          .map((item) => normalizeTodoQueueItems([item])[0])
+          .filter(Boolean);
+        const storeById = new Map(storeItems.map((item) => [String(item.id || "").trim(), item]));
+        const settledStatuses = new Set(["completed", "failed", "interrupted", "cancelled", "timed_out"]);
+        if (tombstonedIds.size) {
+          recordTodoQueueDeletedReceipts(
+            getTodoQueueDeletedReceiptStorageKey(storeWorkspaceId),
+            [...tombstonedIds],
+          );
+        }
+        updateTodoQueueItems((currentItems) => {
+          let changed = false;
+          const seenIds = new Set();
+          const nextItems = [];
+          currentItems.forEach((item) => {
+            const itemId = String(item?.id || "").trim();
+            seenIds.add(itemId);
+            if (tombstonedIds.has(itemId)
+              || tombstonedIds.has(String(item?.remoteCommand?.commandId || "").trim())) {
+              changed = true;
+              return;
+            }
+            const storeItem = storeById.get(itemId);
+            if (storeItem) {
+              const storeStatus = normalizeTodoQueueLifecycleStatus(
+                storeItem.todoStatus || storeItem.todo_status,
+              );
+              const localStatus = normalizeTodoQueueLifecycleStatus(
+                item.todoStatus || item.todo_status,
+              );
+              // Adopt settled flips from the store (sweep/cancel corrections);
+              // live lifecycle (queued/sending/running) stays webview-owned.
+              if (settledStatuses.has(storeStatus) && storeStatus !== localStatus) {
+                changed = true;
+                nextItems.push(getTodoQueueItemWithCloudStatus(item, storeStatus, {
+                  reason: String(storeItem.todoStatusReason || storeItem.statusReason || "todo_store_reconcile"),
+                }));
+                return;
+              }
+            }
+            nextItems.push(item);
+          });
+          storeItems.forEach((storeItem) => {
+            const itemId = String(storeItem.id || "").trim();
+            if (!itemId || seenIds.has(itemId)) {
+              return;
+            }
+            changed = true;
+            nextItems.push(storeItem);
+          });
+          return changed ? nextItems : currentItems;
+        }, {
+          force: true,
+          immediate: true,
+          reason: "todo_store_reconcile",
+        });
+      }).catch(() => {});
+    };
+
+    listen(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (String(payload.workspaceId || "").trim() !== storeWorkspaceId) {
+        return;
+      }
+      // Skip echoes of this webview's own queue syncs.
+      if (String(payload.origin || "").trim() === "webview") {
+        return;
+      }
+      reconcileFromStore();
+    }).then((nextUnlisten) => {
+      if (cancelled) {
+        nextUnlisten();
+        return;
+      }
+      unlistenChanged = nextUnlisten;
+    }).catch(() => {});
+
+    // Mount-time pass: prune tombstoned localStorage survivors and adopt
+    // store rows written while no webview was alive.
+    reconcileFromStore();
+
+    return () => {
+      cancelled = true;
+      if (unlistenChanged) {
+        unlistenChanged();
+      }
+    };
+  }, [terminalWorkspace?.id, updateTodoQueueItems]);
+
+  // Rust store cancels that target a live terminal turn ask this webview (the
+  // actuator) to interrupt the pane; the store row is already cancelled.
+  useEffect(() => {
+    const actuateWorkspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!actuateWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let unlistenCancel = null;
+    listen(TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT, (event) => {
+      if (cancelled) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (String(payload.workspaceId || "").trim() !== actuateWorkspaceId) {
+        return;
+      }
+      const refs = new Set(
+        [payload.itemId, ...(Array.isArray(payload.refs) ? payload.refs : [])]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean),
+      );
+      const paneId = String(payload.paneId || "").trim();
+      let matchedPrompt = null;
+      let matchedTerminalIndex = null;
+      todoQueueTerminalInFlightPromptsRef.current.forEach((prompt, terminalIndex) => {
+        if (matchedPrompt) {
+          return;
+        }
+        const promptItemId = String(prompt?.itemId || "").trim();
+        const promptPaneId = String(prompt?.paneId || "").trim();
+        if ((promptItemId && refs.has(promptItemId)) || (paneId && promptPaneId === paneId)) {
+          matchedPrompt = prompt;
+          matchedTerminalIndex = terminalIndex;
+        }
+      });
+      if (!matchedPrompt) {
+        return;
+      }
+      const cancelItemId = String(matchedPrompt.itemId || "").trim();
+      void interruptVoicePlanTaskTerminal({
+        inFlightPrompt: matchedPrompt,
+        reason: "todo_store_cancel",
+        terminalIndex: matchedTerminalIndex,
+      }).finally(() => {
+        if (cancelItemId) {
+          clearTodoQueueItemPending(cancelItemId, "cancelled", { reason: "todo_store_cancel" });
+        }
+        setTodoQueueDispatchRevision((revision) => revision + 1);
+      });
+    }).then((nextUnlisten) => {
+      if (cancelled) {
+        nextUnlisten();
+        return;
+      }
+      unlistenCancel = nextUnlisten;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenCancel) {
+        unlistenCancel();
+      }
+    };
+  }, [clearTodoQueueItemPending, interruptVoicePlanTaskTerminal, terminalWorkspace?.id]);
 
   useEffect(() => {
     // Late-bound reconcile used by the receipts listener (which mounts before
@@ -22944,6 +23380,165 @@ function TerminalView({
       queueTodoQueueItem(pendingId);
     }
   }, [queueTodoQueueItem, todoQueueItems]);
+
+  // OS file drags (Finder, etc.): the Tauri webview intercepts native file
+  // drags, so DOM drop events never carry files. Route the webview's
+  // drag-drop stream through the same targets as snip previews — todo cards,
+  // terminal slots, and the draft composer — with the same hover highlight
+  // and accept flash.
+  const readDroppedImagePaths = useCallback(async (paths) => {
+    const images = [];
+    for (const path of paths.slice(0, 4)) {
+      try {
+        const dataUrl = String(await invoke("todo_read_image_data_url", { path }) || "");
+        if (dataUrl) {
+          const name = path.split(/[\\/]/).filter(Boolean).pop() || "image";
+          images.push(buildDroppedImageFromDataUrl(dataUrl, name));
+        }
+      } catch {
+        // Unreadable/oversized images are skipped; other drops still land.
+      }
+    }
+    return images;
+  }, [buildDroppedImageFromDataUrl]);
+
+  const routeDroppedFilePaths = useCallback(async (paths, target) => {
+    const imagePaths = paths.filter((path) => TODO_DROP_IMAGE_PATH_PATTERN.test(path));
+    const otherPaths = paths.filter((path) => !TODO_DROP_IMAGE_PATH_PATTERN.test(path));
+
+    const terminalIndex = Number.parseInt(target.getAttribute("data-terminal-index") || "", 10);
+    if (Number.isInteger(terminalIndex)) {
+      let accepted = false;
+      paths.forEach((path) => {
+        const name = path.split(/[\\/]/).filter(Boolean).pop() || "file";
+        const ok = queueWorkspaceFileForTerminalIndex(
+          { name, path, workspaceId: terminalWorkspace?.id || "" },
+          terminalIndex,
+          "os_file_drop",
+        );
+        accepted = accepted || Boolean(ok);
+      });
+      if (accepted) {
+        flashDropTarget(target);
+      }
+      return;
+    }
+
+    const todoId = String(target.getAttribute("data-snip-drop-todo-id") || "").trim();
+    if (todoId) {
+      if (!todoQueueItemsRef.current.some((item) => item.id === todoId)) {
+        return;
+      }
+      const images = await readDroppedImagePaths(imagePaths);
+      const pathLines = otherPaths.join("\n");
+      if (!images.length && !pathLines) {
+        return;
+      }
+      updateTodoQueueItems((currentItems) => currentItems.map((item) => {
+        if (item.id !== todoId) {
+          return item;
+        }
+        const nextImages = images.length
+          ? [...getTodoQueueItemImages(item), ...images]
+          : getTodoQueueItemImages(item);
+        const currentText = String(item.text || "");
+        const nextText = pathLines
+          ? normalizeTodoQueueText(currentText ? `${currentText}\n${pathLines}` : pathLines)
+          : item.text;
+        return {
+          ...item,
+          ...(nextImages.length ? { image: nextImages[0], images: nextImages } : {}),
+          text: nextText,
+        };
+      }), { reason: "os_file_dropped" });
+      flashDropTarget(target);
+      return;
+    }
+
+    if (target.getAttribute("data-snip-drop-composer") === "true") {
+      const images = await readDroppedImagePaths(imagePaths);
+      if (images.length) {
+        window.dispatchEvent(new CustomEvent(TODO_COMPOSER_MEDIA_DROP_EVENT, {
+          detail: { workspaceId: terminalWorkspace?.id || "", images },
+        }));
+      }
+      if (otherPaths.length) {
+        addWorkspaceToolTodo(otherPaths.join("\n"));
+      }
+      if (images.length || otherPaths.length) {
+        flashDropTarget(target);
+      }
+    }
+  }, [
+    addWorkspaceToolTodo,
+    flashDropTarget,
+    queueWorkspaceFileForTerminalIndex,
+    readDroppedImagePaths,
+    terminalWorkspace?.id,
+    updateTodoQueueItems,
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    const toClientPoint = (position) => {
+      const scale = window.devicePixelRatio || 1;
+      return {
+        x: Number(position?.x || 0) / scale,
+        y: Number(position?.y || 0) / scale,
+      };
+    };
+
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (payload.type === "over") {
+        if (!isWorkspaceRuntimeVisibleRef.current) {
+          return;
+        }
+        const point = toClientPoint(payload.position);
+        setSnipDropHighlightElement(resolveSnipDropElement(point.x, point.y));
+        return;
+      }
+      if (payload.type === "leave" || payload.type === "cancel" || payload.type === "cancelled") {
+        setSnipDropHighlightElement(null);
+        return;
+      }
+      if (payload.type !== "drop") {
+        return;
+      }
+      setSnipDropHighlightElement(null);
+      if (!isWorkspaceRuntimeVisibleRef.current) {
+        return;
+      }
+      const paths = (Array.isArray(payload.paths) ? payload.paths : [])
+        .map((path) => String(path || "").trim())
+        .filter(Boolean);
+      if (!paths.length) {
+        return;
+      }
+      const point = toClientPoint(payload.position);
+      const target = resolveSnipDropElement(point.x, point.y);
+      if (!target) {
+        return;
+      }
+      void routeDroppedFilePaths(paths, target);
+    }).then((nextUnlisten) => {
+      if (disposed) {
+        nextUnlisten();
+        return;
+      }
+      unlisten = nextUnlisten;
+    }).catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+      setSnipDropHighlightElement(null);
+    };
+  }, [resolveSnipDropElement, routeDroppedFilePaths, setSnipDropHighlightElement]);
 
   const queueAllTodoQueueItems = useCallback(() => {
     const pendingItems = todoQueuePendingItemsRef.current || {};

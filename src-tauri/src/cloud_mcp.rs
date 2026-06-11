@@ -1652,10 +1652,11 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
 fn cloud_mcp_outbox_release_backoff_now() -> Result<usize, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
     // Reconnect releases only rows that failed because the websocket was
-    // unavailable (the offline backlog). Rows that failed WITH a server reply
-    // (application errors, request timeouts) keep their capped backoff —
-    // re-firing those on every reconnect turned one poison row into a
-    // permanent retry storm.
+    // unavailable (the offline backlog) or because auth was not restored yet
+    // (a ready websocket proves the bearer works now). Rows that failed WITH
+    // a server reply (application errors, request timeouts) keep their capped
+    // backoff — re-firing those on every reconnect turned one poison row into
+    // a permanent retry storm.
     let released = conn
         .execute(
             &format!(
@@ -1670,6 +1671,8 @@ fn cloud_mcp_outbox_release_backoff_now() -> Result<usize, String> {
                         OR last_error LIKE '%sender closed%'
                         OR last_error LIKE '%websocket unavailable%'
                         OR last_error LIKE '%did not send a ready frame%'
+                        OR last_error LIKE '%auth token is unavailable%'
+                        OR last_error LIKE '%waiting for sign-in%'
                    )"
             ),
             [],
@@ -2001,12 +2004,37 @@ async fn cloud_mcp_enqueue_background_sync(
     state.background_sync.notify.notify_one();
 }
 
+/// Cheap auth-material probe for the outbox drain: when there is no static
+/// JWT, no cached Appwrite JWT, and no desktop session token, every dispatch
+/// is guaranteed to fail with "auth token unavailable" — there is nothing to
+/// exchange for a bearer. Draining in that state burns row attempts into
+/// multi-minute backoffs that outlive the eventual sign-in.
+async fn cloud_mcp_auth_material_present(state: &CloudMcpState) -> bool {
+    if cloud_mcp_static_appwrite_jwt().is_some() {
+        return true;
+    }
+    let auth = state.auth.lock().await;
+    auth.appwrite_jwt.is_some() || auth.desktop_session_token.is_some()
+}
+
+const CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS: u64 = 3_000;
+
 async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
     loop {
         state.background_sync.notify.notified().await;
         sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS)).await;
 
         loop {
+            if !cloud_mcp_auth_material_present(&state).await {
+                // Hold the backlog instead of failing every row; re-check
+                // shortly (sign-in also notifies through the ready path).
+                let notify = state.background_sync.notify.clone();
+                tauri::async_runtime::spawn(async move {
+                    sleep(Duration::from_millis(CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS)).await;
+                    notify.notify_one();
+                });
+                break;
+            }
             let mut drained_any = false;
             match cloud_mcp_outbox_claim_due_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT) {
                 Ok(rows) => {
@@ -12708,7 +12736,11 @@ async fn cloud_mcp_set_desktop_session_token(
 
 #[tauri::command]
 async fn cloud_mcp_get_status(state: State<'_, CloudMcpState>) -> Result<CloudMcpStatus, String> {
-    let _ = cloud_mcp_refresh_live_runtime_status_if_connected(state.inner()).await;
+    // Status polls must never hold the caller hostage on a websocket round
+    // trip (the connect overlay polls every 650ms): return the cached
+    // snapshot immediately and refresh the live runtime block in the
+    // background, rate limited and single-flight.
+    cloud_mcp_spawn_live_runtime_status_refresh(state.inner());
     Ok(cloud_mcp_status_snapshot(state.inner()).await)
 }
 
@@ -12739,6 +12771,31 @@ async fn cloud_mcp_get_cached_workspace_todos(
     Ok(scoped.or(fallback).unwrap_or_else(|| json!({})))
 }
 
+static CLOUD_MCP_LIVE_RUNTIME_REFRESH_INFLIGHT: AtomicBool = AtomicBool::new(false);
+static CLOUD_MCP_LIVE_RUNTIME_REFRESH_LAST_MS: AtomicU64 = AtomicU64::new(0);
+const CLOUD_MCP_LIVE_RUNTIME_REFRESH_MIN_INTERVAL_MS: u64 = 3_000;
+const CLOUD_MCP_LIVE_RUNTIME_REFRESH_TIMEOUT_MS: u64 = 5_000;
+
+/// Refreshes the cached live runtime block in the background, at most once
+/// per `CLOUD_MCP_LIVE_RUNTIME_REFRESH_MIN_INTERVAL_MS` and never more than
+/// one request in flight, no matter how fast the UI polls `cloud_mcp_get_status`.
+fn cloud_mcp_spawn_live_runtime_status_refresh(state: &CloudMcpState) {
+    let now = cloud_mcp_now_ms();
+    let last = CLOUD_MCP_LIVE_RUNTIME_REFRESH_LAST_MS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < CLOUD_MCP_LIVE_RUNTIME_REFRESH_MIN_INTERVAL_MS {
+        return;
+    }
+    if CLOUD_MCP_LIVE_RUNTIME_REFRESH_INFLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = cloud_mcp_refresh_live_runtime_status_if_connected(&state).await;
+        CLOUD_MCP_LIVE_RUNTIME_REFRESH_LAST_MS.store(cloud_mcp_now_ms(), Ordering::Release);
+        CLOUD_MCP_LIVE_RUNTIME_REFRESH_INFLIGHT.store(false, Ordering::Release);
+    });
+}
+
 async fn cloud_mcp_refresh_live_runtime_status_if_connected(
     state: &CloudMcpState,
 ) -> Result<(), String> {
@@ -12746,11 +12803,17 @@ async fn cloud_mcp_refresh_live_runtime_status_if_connected(
     if !snapshot.global_ws_connected {
         return Ok(());
     }
-    let response = cloud_mcp_ws_request_with_timeout(
+    // Passive probe: a single attempt with a generous budget that bypasses
+    // the strike accounting entirely. live_runtime_status hits SQLite on the
+    // server and shares the socket with heavier traffic, so a slow response
+    // is normal — it must never tear down a healthy connection. (The old
+    // 900ms two-strike version of this call was the reconnect-storm root
+    // cause that flapped the sync pill between Connecting and Syncing.)
+    let response = cloud_mcp_ws_request_once_with_timeout(
         state,
         "live_runtime_status",
         &json!({}),
-        Duration::from_millis(900),
+        Duration::from_millis(CLOUD_MCP_LIVE_RUNTIME_REFRESH_TIMEOUT_MS),
     )
     .await?;
     let data = cloud_mcp_response_data(&response);
@@ -19070,6 +19133,126 @@ fn cloud_mcp_open_todo_mirror_conn() -> Result<rusqlite::Connection, String> {
     cloud_mcp_todo_mirror_init_conn(&conn)
         .map_err(|error| format!("Unable to initialize todo mirror SQLite cache: {error}"))?;
     Ok(conn)
+}
+
+/// Builds a minimal correction-item payload from the newest mirror row for a
+/// todo id: enough fields for the server upsert (id + body) without claiming
+/// anything else. Used by todo_store_cancel to converge stale mirror rows that
+/// no device store tracks anymore.
+pub(crate) fn cloud_mcp_todo_mirror_correction_item(
+    workspace_id: &str,
+    todo_id: &str,
+) -> Option<Value> {
+    let todo_id = todo_id.trim();
+    if todo_id.is_empty() {
+        return None;
+    }
+    let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    let row_json: String = conn
+        .query_row(
+            "SELECT row_json FROM workspace_todo_mirror_rows
+             WHERE workspace_id = ?1 AND (todo_id = ?2 OR command_id = ?2 OR dispatch_id = ?2)
+             ORDER BY mirror_updated_at_ms DESC LIMIT 1",
+            rusqlite::params![workspace_id, todo_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let row = serde_json::from_str::<Value>(&row_json).ok()?;
+    let resolved_id = row
+        .get("todo_id")
+        .or_else(|| row.get("todoId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(todo_id);
+    let text = row
+        .get("todo_text")
+        .or_else(|| row.get("todoText"))
+        .or_else(|| row.get("todo_body_preview"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(json!({
+        "id": resolved_id,
+        "todoId": resolved_id,
+        "kind": "todo",
+        "text": text,
+        "workspaceId": workspace_id,
+    }))
+}
+
+/// Device-local mirror rows stuck in running/sending older than the cutoff —
+/// the zombie class nothing will ever settle. Returns (workspace_id, minimal
+/// item) pairs ready for a status-correction push.
+pub(crate) fn cloud_mcp_todo_mirror_stale_active_items(older_than_ms: u64) -> Vec<(String, Value)> {
+    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
+        return Vec::new();
+    };
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = device_profile
+        .get("device_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if device_id.is_empty() {
+        return Vec::new();
+    }
+    let cutoff_ms = cloud_mcp_now_ms().saturating_sub(older_than_ms) as i64;
+    let Ok(mut statement) = conn.prepare(
+        "SELECT workspace_id, row_json FROM workspace_todo_mirror_rows
+         WHERE row_kind = 'todo' AND status IN ('running', 'sending')
+           AND mirror_updated_at_ms > 0 AND mirror_updated_at_ms < ?1
+         LIMIT 200",
+    ) else {
+        return Vec::new();
+    };
+    let rows = statement
+        .query_map(rusqlite::params![cutoff_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for (workspace_id, row_json) in rows {
+        let Ok(row) = serde_json::from_str::<Value>(&row_json) else {
+            continue;
+        };
+        let row_device = row
+            .get("device_id")
+            .or_else(|| row.get("deviceId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        // Only correct rows this device authored; other devices own theirs.
+        if row_device != device_id {
+            continue;
+        }
+        let todo_id = row
+            .get("todo_id")
+            .or_else(|| row.get("todoId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        if todo_id.is_empty() {
+            continue;
+        }
+        let text = row
+            .get("todo_text")
+            .or_else(|| row.get("todoText"))
+            .or_else(|| row.get("todo_body_preview"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        items.push((
+            workspace_id,
+            json!({
+                "id": todo_id,
+                "todoId": todo_id,
+                "kind": "todo",
+                "text": text,
+            }),
+        ));
+    }
+    items
 }
 
 fn cloud_mcp_todo_mirror_text_values(input: &Value, keys: &[&str]) -> HashSet<String> {

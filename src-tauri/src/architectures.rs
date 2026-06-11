@@ -2554,8 +2554,20 @@ pub(crate) fn architecture_central_repo_root_for(repo: &Path) -> Result<PathBuf,
 
 /// Resolve the requested repo path plus the centralized storage base for it.
 /// Paths already inside the central architectures data root (global root,
-/// per-repo central folders) are used as-is.
+/// per-repo central folders) are used as-is — and they must be detected
+/// BEFORE the workspace-root validation runs: the central store lives under
+/// the app data directory (e.g. ~/Library/Application Support), which that
+/// validation rejects as "an application settings, cache, or package manager
+/// folder" even though it is our own managed storage.
 fn architecture_resolved_and_storage(repo_path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let trimmed = repo_path.trim();
+    if !trimmed.is_empty() {
+        let raw = PathBuf::from(trimmed);
+        let candidate = raw.canonicalize().unwrap_or(raw);
+        if architecture_path_is_central(&candidate) {
+            return Ok((candidate.clone(), candidate));
+        }
+    }
     let resolved = resolve_workspace_root_directory(Some(repo_path))?;
     if architecture_path_is_central(&resolved) {
         return Ok((resolved.clone(), resolved));

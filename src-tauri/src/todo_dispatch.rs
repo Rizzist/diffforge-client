@@ -484,21 +484,23 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     // queue sync rewrites the store — both paths converge on one item.
     {
         let queue_path = todo_dispatch_data_path("queues", &workspace_id);
-        let already_queued = queue_path
-            .as_deref()
-            .map(|path| {
-                todo_dispatch_queue_read(path)
-                    .get("items")
-                    .and_then(Value::as_array)
-                    .is_some_and(|items| {
-                        items.iter().any(|item| {
-                            item.get("id").and_then(Value::as_str).map(str::trim)
-                                == Some(command_id.as_str())
-                                || todo_dispatch_queue_item_command_id(item) == command_id
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        let already_queued = tombstoned.contains(command_id.as_str())
+            || queue_path
+                .as_deref()
+                .map(|path| {
+                    todo_dispatch_queue_read(path)
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item.get("id").and_then(Value::as_str).map(str::trim)
+                                    == Some(command_id.as_str())
+                                    || todo_dispatch_queue_item_command_id(item) == command_id
+                            })
                         })
-                    })
-            })
-            .unwrap_or(false);
+                })
+                .unwrap_or(false);
         if !already_queued && !text.trim().is_empty() {
             let now_iso = chrono_like_now_iso();
             let item = json!({
@@ -837,6 +839,727 @@ fn todo_dispatch_journal_append(workspace_id: &str, entry: Value) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Authoritative todo store layer.
+//
+// The queue store file is the device's single todo truth. Tombstones are
+// terminal and live beside it: once a todo id is tombstoned nothing — journal
+// adoption, remote intake, webview snapshots, cloud echoes — may bring it
+// back. Every store mutation emits TODO_STORE_CHANGED_EVENT so the webview
+// (a renderer, not an owner) re-pulls the snapshot; mutations that must reach
+// the account ride the durable outbox via the cloud snapshot push.
+// ---------------------------------------------------------------------------
+
+pub(crate) const TODO_STORE_CHANGED_EVENT: &str = "todo-store-changed";
+pub(crate) const TODO_STORE_CANCEL_REQUESTED_EVENT: &str = "todo-store-cancel-requested";
+const TODO_STORE_TOMBSTONE_MAX: usize = 2000;
+const TODO_STORE_ORPHAN_AFTER_MS: u64 = 15 * 60 * 1000;
+const TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
+const TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS: u64 = 90;
+const TODO_STORE_ACTIVE_RUN_STATUSES: [&str; 2] = ["running", "sending"];
+
+fn todo_store_tombstones_read(workspace_id: &str) -> serde_json::Map<String, Value> {
+    let Some(path) = todo_dispatch_data_path("tombstones", workspace_id) else {
+        return serde_json::Map::new();
+    };
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn todo_store_tombstones_write(workspace_id: &str, tombstones: &serde_json::Map<String, Value>) {
+    let Some(path) = todo_dispatch_data_path("tombstones", workspace_id) else {
+        return;
+    };
+    if let Ok(bytes) = serde_json::to_vec(&Value::Object(tombstones.clone())) {
+        let _ = fs::write(path, bytes);
+    }
+}
+
+pub(crate) fn todo_store_tombstone_ids(workspace_id: &str) -> HashSet<String> {
+    todo_store_tombstones_read(workspace_id)
+        .keys()
+        .map(|key| key.to_string())
+        .collect()
+}
+
+/// Records terminal tombstones for the given todo ids. Returns the ids that
+/// were newly tombstoned (already-tombstoned ids are skipped so callers can
+/// avoid duplicate downstream pushes).
+pub(crate) fn todo_store_add_tombstones(
+    workspace_id: &str,
+    todo_ids: &[String],
+    reason: &str,
+    origin: &str,
+) -> Vec<String> {
+    let cleaned = todo_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+    let mut tombstones = todo_store_tombstones_read(workspace_id);
+    let now_ms = todo_dispatch_now_ms();
+    let mut added = Vec::new();
+    for todo_id in cleaned {
+        if tombstones.contains_key(&todo_id) {
+            continue;
+        }
+        tombstones.insert(
+            todo_id.clone(),
+            json!({
+                "deletedAtMs": now_ms,
+                "deletedAt": chrono_like_now_iso(),
+                "reason": reason,
+                "origin": origin,
+            }),
+        );
+        added.push(todo_id);
+    }
+    if added.is_empty() {
+        return added;
+    }
+    if tombstones.len() > TODO_STORE_TOMBSTONE_MAX {
+        let mut entries = tombstones
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value.get("deletedAtMs").and_then(Value::as_u64).unwrap_or(0),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, deleted_at)| *deleted_at);
+        let overflow = tombstones.len() - TODO_STORE_TOMBSTONE_MAX;
+        for (key, _) in entries.into_iter().take(overflow) {
+            tombstones.remove(&key);
+        }
+    }
+    todo_store_tombstones_write(workspace_id, &tombstones);
+    added
+}
+
+pub(crate) fn todo_store_emit_changed(
+    app: &AppHandle,
+    workspace_id: &str,
+    reason: &str,
+    origin: &str,
+) {
+    let _ = app.emit(
+        TODO_STORE_CHANGED_EVENT,
+        json!({
+            "workspaceId": workspace_id,
+            "reason": reason,
+            "origin": origin,
+            "updatedAtMs": todo_dispatch_now_ms(),
+        }),
+    );
+}
+
+fn todo_store_item_matches_id(item: &Value, todo_id: &str) -> bool {
+    if todo_id.is_empty() {
+        return false;
+    }
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    item_id == todo_id || todo_dispatch_queue_item_command_id(item) == todo_id
+}
+
+fn todo_store_item_is_tombstoned(item: &Value, tombstoned: &HashSet<String>) -> bool {
+    tombstoned.iter().any(|id| todo_store_item_matches_id(item, id))
+}
+
+/// Splits incoming items into the kept set and the ids rejected because a
+/// tombstone exists for them. This is the resurrection gate every write path
+/// goes through.
+fn todo_store_filter_tombstoned(
+    items: Vec<Value>,
+    tombstoned: &HashSet<String>,
+) -> (Vec<Value>, Vec<String>) {
+    if tombstoned.is_empty() {
+        return (items, Vec::new());
+    }
+    let mut kept = Vec::with_capacity(items.len());
+    let mut rejected = Vec::new();
+    for item in items {
+        if todo_store_item_is_tombstoned(&item, tombstoned) {
+            if let Some(id) = item.get("id").and_then(Value::as_str).map(str::trim) {
+                rejected.push(id.to_string());
+            }
+            continue;
+        }
+        kept.push(item);
+    }
+    (kept, rejected)
+}
+
+fn todo_store_item_status(item: &Value) -> String {
+    todo_dispatch_text(item, &["todoStatus", "todo_status", "status"]).to_ascii_lowercase()
+}
+
+fn todo_store_item_pane_id(item: &Value) -> String {
+    todo_dispatch_text(
+        item,
+        &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"],
+    )
+}
+
+fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
+    let now_iso = chrono_like_now_iso();
+    if let Some(object) = item.as_object_mut() {
+        object.insert("todoStatus".to_string(), json!(status));
+        object.insert("status".to_string(), json!(status));
+        object.insert("todoStatusReason".to_string(), json!(reason));
+        object.insert("statusReason".to_string(), json!(reason));
+        object.insert("todoStatusUpdatedAt".to_string(), json!(now_iso.clone()));
+        object.insert("updatedAt".to_string(), json!(now_iso));
+        object.insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
+    }
+}
+
+/// Durable removal push: tombstoned ids reach the account through the outbox
+/// without re-sending the (possibly stale) full queue file.
+fn todo_store_push_removals(
+    app: &AppHandle,
+    workspace_id: &str,
+    removed_todo_ids: Vec<String>,
+    reason: &str,
+) {
+    if removed_todo_ids.is_empty() {
+        return;
+    }
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let payload = json!({
+            "todos": [],
+            "removed_todo_ids": removed_todo_ids.clone(),
+            "removedTodoIds": removed_todo_ids,
+        });
+        let _ = cloud_mcp_sync_workspace_todos_internal(
+            &state,
+            String::new(),
+            workspace_id,
+            None,
+            payload,
+            Some(reason),
+        )
+        .await;
+    });
+}
+
+/// Status-correction push: upserts only the given rows (used to heal stale
+/// "running" mirror rows nothing will ever settle).
+fn todo_store_push_corrections(
+    app: &AppHandle,
+    workspace_id: &str,
+    items: Vec<Value>,
+    reason: &str,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let workspace_id = workspace_id.to_string();
+    let reason = reason.to_string();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<CloudMcpState>().inner().clone();
+        let _ = cloud_mcp_sync_workspace_todos_internal(
+            &state,
+            String::new(),
+            workspace_id,
+            None,
+            json!({ "todos": items }),
+            Some(reason),
+        )
+        .await;
+    });
+}
+
+/// Tombstone + queue-store removal + journal + durable cloud removal in one
+/// place. Every delete path (history view, webview list, remote lever) funnels
+/// here so a deleted todo can never come back from any replica.
+pub(crate) fn todo_store_delete_internal(
+    app: &AppHandle,
+    workspace_id: &str,
+    todo_ids: &[String],
+    reason: &str,
+    origin: &str,
+) -> Vec<String> {
+    let tombstoned = todo_store_add_tombstones(workspace_id, todo_ids, reason, origin);
+    let all_ids = todo_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if all_ids.is_empty() {
+        return tombstoned;
+    }
+    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let items = todo_dispatch_queue_read(&path)
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let before = items.len();
+        let next_items = items
+            .into_iter()
+            .filter(|item| !all_ids.iter().any(|id| todo_store_item_matches_id(item, id)))
+            .collect::<Vec<_>>();
+        if next_items.len() != before {
+            todo_dispatch_queue_write(workspace_id, &next_items);
+        }
+    }
+    for todo_id in &all_ids {
+        todo_dispatch_journal_append(
+            workspace_id,
+            json!({
+                "kind": "remote_todo_deleted",
+                "itemId": todo_id,
+                "at": chrono_like_now_iso(),
+                "reason": reason,
+                "origin": origin,
+            }),
+        );
+    }
+    todo_store_push_removals(app, workspace_id, all_ids, reason);
+    todo_store_emit_changed(app, workspace_id, reason, "store");
+    tombstoned
+}
+
+#[tauri::command]
+async fn todo_store_snapshot(workspace_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_id = workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err("workspace_id is required.".to_string());
+        }
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        let snapshot = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| todo_dispatch_queue_read(&path))
+            .unwrap_or_else(|| json!({}));
+        let items = snapshot
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (items, _) = todo_store_filter_tombstoned(items, &tombstoned);
+        Ok(json!({
+            "workspaceId": workspace_id,
+            "items": items,
+            "tombstonedIds": tombstoned.into_iter().collect::<Vec<_>>(),
+            "updatedAtMs": snapshot.get("updatedAtMs").and_then(Value::as_u64).unwrap_or(0),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store snapshot worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn todo_store_delete(
+    app: AppHandle,
+    workspace_id: String,
+    todo_ids: Vec<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_store_delete".to_string());
+    let tombstoned = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let workspace_id = workspace_id.clone();
+        move || todo_store_delete_internal(&app, &workspace_id, &todo_ids, &reason, "user_delete")
+    })
+    .await
+    .map_err(|error| format!("Todo store delete worker failed: {error}"))?;
+    Ok(json!({ "workspaceId": workspace_id, "tombstonedIds": tombstoned }))
+}
+
+/// Cancel with a guaranteed outcome. If the todo's pane is mid-turn and a
+/// webview is alive, the webview actuator is asked to interrupt the terminal;
+/// in every case the store row (or, for rows that only exist in the cloud
+/// mirror, a pushed correction) ends up `cancelled` so the UI can never show
+/// a running todo that nothing can stop.
+#[tauri::command]
+async fn todo_store_cancel(
+    app: AppHandle,
+    workspace_id: String,
+    todo_id: Option<String>,
+    command_id: Option<String>,
+    dispatch_id: Option<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_history_cancel".to_string());
+    let refs = [todo_id, command_id, dispatch_id]
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        return Err("A todo id, command id, or dispatch id is required.".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut matched_item: Option<Value> = None;
+        if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
+            let mut items = todo_dispatch_queue_read(&path)
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in items.iter_mut() {
+                if refs.iter().any(|reference| todo_store_item_matches_id(item, reference)) {
+                    todo_store_set_item_status(item, "cancelled", &reason);
+                    matched_item = Some(item.clone());
+                    break;
+                }
+            }
+            if matched_item.is_some() {
+                todo_dispatch_queue_write(&workspace_id, &items);
+            }
+        }
+
+        let mut actuated = false;
+        let mut corrected = false;
+        if let Some(item) = matched_item.as_ref() {
+            let pane_id = todo_store_item_pane_id(item);
+            // inputReady == false means the pane is mid-turn: ask the webview
+            // actuator to interrupt the terminal itself.
+            if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+                let _ = app.emit(
+                    TODO_STORE_CANCEL_REQUESTED_EVENT,
+                    json!({
+                        "workspaceId": workspace_id,
+                        "itemId": item.get("id").cloned().unwrap_or(Value::Null),
+                        "paneId": pane_id,
+                        "refs": refs,
+                        "reason": reason,
+                    }),
+                );
+                actuated = true;
+            }
+            todo_store_push_corrections(
+                &app,
+                &workspace_id,
+                vec![item.clone()],
+                "todo_store_cancel",
+            );
+        } else {
+            // Not in the device store: the row the user is looking at lives in
+            // the cloud mirror (stale "running" from a dead session or another
+            // replica). Push a cancelled correction built from the mirror row
+            // so every view converges instead of erroring.
+            for reference in &refs {
+                if let Some(mut item) =
+                    cloud_mcp_todo_mirror_correction_item(&workspace_id, reference)
+                {
+                    todo_store_set_item_status(&mut item, "cancelled", &reason);
+                    todo_store_push_corrections(
+                        &app,
+                        &workspace_id,
+                        vec![item],
+                        "todo_store_cancel_correction",
+                    );
+                    corrected = true;
+                    break;
+                }
+            }
+            if !corrected {
+                // No replica knows this row beyond its id: push a minimal
+                // cancelled correction so even an id-only zombie converges.
+                let reference = refs[0].clone();
+                let mut item = json!({
+                    "id": reference,
+                    "todoId": reference,
+                    "kind": "todo",
+                    "workspaceId": workspace_id,
+                });
+                todo_store_set_item_status(&mut item, "cancelled", &reason);
+                todo_store_push_corrections(
+                    &app,
+                    &workspace_id,
+                    vec![item],
+                    "todo_store_cancel_correction",
+                );
+                corrected = true;
+            }
+        }
+        todo_store_emit_changed(&app, &workspace_id, "todo_store_cancel", "store");
+        Ok(json!({
+            "ok": true,
+            "workspaceId": workspace_id,
+            "status": "cancelled",
+            "actuated": actuated,
+            "corrected": corrected,
+            "matchedInStore": matched_item.is_some(),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store cancel worker failed: {error}"))?
+}
+
+const TODO_DROP_IMAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads an OS-dropped image file into a data URL so it can attach to a todo
+/// (draft or existing). Restricted to image extensions with a size cap — this
+/// is a UI attachment path, not a general file reader.
+#[tauri::command]
+async fn todo_read_image_data_url(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = PathBuf::from(path.trim());
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !matches!(
+            extension.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "avif" | "heic"
+        ) {
+            return Err(format!("Not an image file: .{extension}"));
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("Unable to read dropped file: {error}"))?;
+        if !metadata.is_file() {
+            return Err("Dropped path is not a file.".to_string());
+        }
+        if metadata.len() > TODO_DROP_IMAGE_MAX_BYTES {
+            return Err("Dropped image is too large to attach (16 MB cap).".to_string());
+        }
+        let bytes =
+            fs::read(&path).map_err(|error| format!("Unable to read dropped image: {error}"))?;
+        let mime = cloud_mcp_asset_mime_for_path(&path);
+        let mime = if mime.trim().is_empty() {
+            "image/png".to_string()
+        } else {
+            mime
+        };
+        Ok(format!(
+            "data:{mime};base64,{}",
+            general_purpose::STANDARD.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(|error| format!("Todo image read worker failed: {error}"))?
+}
+
+/// Status correction with the same guaranteed-outcome shape as cancel but no
+/// terminal actuation: flips the store row when the device tracks it, else
+/// pushes a correction built from the mirror row (or the bare id). This is
+/// what lets history-view Unqueue work on rows no webview owns.
+#[tauri::command]
+async fn todo_store_set_status(
+    app: AppHandle,
+    workspace_id: String,
+    todo_id: Option<String>,
+    command_id: Option<String>,
+    dispatch_id: Option<String>,
+    status: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    let status = status.trim().to_ascii_lowercase();
+    if !matches!(
+        status.as_str(),
+        "listed" | "queued" | "cancelled" | "interrupted" | "completed" | "failed"
+    ) {
+        return Err(format!("Unsupported todo status: {status}"));
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_store_set_status".to_string());
+    let refs = [todo_id, command_id, dispatch_id]
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if refs.is_empty() {
+        return Err("A todo id, command id, or dispatch id is required.".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut matched_item: Option<Value> = None;
+        if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
+            let mut items = todo_dispatch_queue_read(&path)
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for item in items.iter_mut() {
+                if refs.iter().any(|reference| todo_store_item_matches_id(item, reference)) {
+                    todo_store_set_item_status(item, &status, &reason);
+                    matched_item = Some(item.clone());
+                    break;
+                }
+            }
+            if matched_item.is_some() {
+                todo_dispatch_queue_write(&workspace_id, &items);
+            }
+        }
+
+        let correction = match matched_item.clone() {
+            Some(item) => item,
+            None => {
+                let mut item = refs
+                    .iter()
+                    .find_map(|reference| {
+                        cloud_mcp_todo_mirror_correction_item(&workspace_id, reference)
+                    })
+                    .unwrap_or_else(|| {
+                        json!({
+                            "id": refs[0],
+                            "todoId": refs[0],
+                            "kind": "todo",
+                            "workspaceId": workspace_id,
+                        })
+                    });
+                todo_store_set_item_status(&mut item, &status, &reason);
+                item
+            }
+        };
+        todo_store_push_corrections(&app, &workspace_id, vec![correction], &reason);
+        todo_store_emit_changed(&app, &workspace_id, &reason, "store");
+        Ok(json!({
+            "ok": true,
+            "workspaceId": workspace_id,
+            "status": status,
+            "matchedInStore": matched_item.is_some(),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store set-status worker failed: {error}"))?
+}
+
+/// Standing orphan sweep: running/sending rows that nothing is actually
+/// driving flip to `interrupted` instead of haunting every view forever.
+/// Queue-store items are only swept while no webview owns the queue (a live
+/// webview manages its own items); stale device-local mirror rows are healed
+/// regardless, because nothing else will ever settle them.
+async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
+    let webview_alive = todo_dispatch_webview_dispatcher_active();
+    let now_ms = todo_dispatch_now_ms();
+
+    if !webview_alive {
+        for path in todo_dispatch_data_workspace_files("queues") {
+            let snapshot = todo_dispatch_queue_read(&path);
+            let workspace_id = snapshot
+                .get("workspaceId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if workspace_id.is_empty() {
+                continue;
+            }
+            let file_age_ms = now_ms
+                .saturating_sub(snapshot.get("updatedAtMs").and_then(Value::as_u64).unwrap_or(0));
+            if file_age_ms < TODO_STORE_ORPHAN_AFTER_MS {
+                continue;
+            }
+            let mut items = snapshot
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut flipped = Vec::new();
+            for item in items.iter_mut() {
+                let status = todo_store_item_status(item);
+                if !TODO_STORE_ACTIVE_RUN_STATUSES.contains(&status.as_str()) {
+                    continue;
+                }
+                let pane_id = todo_store_item_pane_id(item);
+                // A pane mid-turn (inputReady == false) is legitimately busy;
+                // everything else (idle pane, dead pane, no pane) is orphaned.
+                if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+                    continue;
+                }
+                todo_store_set_item_status(item, "interrupted", "todo_store_orphan_sweep");
+                flipped.push(item.clone());
+            }
+            if flipped.is_empty() {
+                continue;
+            }
+            todo_dispatch_queue_write(&workspace_id, &items);
+            todo_store_push_corrections(app, &workspace_id, flipped, "todo_store_orphan_sweep");
+            todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
+        }
+    }
+
+    // Device-local mirror rows stuck running/sending that the queue store no
+    // longer tracks: no settlement will ever arrive, so push corrections.
+    let stale = cloud_mcp_todo_mirror_stale_active_items(TODO_STORE_ORPHAN_AFTER_MS);
+    let mut by_workspace: HashMap<String, Vec<Value>> = HashMap::new();
+    for (workspace_id, mut item) in stale {
+        if workspace_id.is_empty() {
+            continue;
+        }
+        let tracked = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| {
+                todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|candidate| {
+                            let id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .unwrap_or_default();
+                            todo_store_item_matches_id(candidate, id)
+                        })
+                    })
+            })
+            .unwrap_or(false);
+        if tracked {
+            // The queue-store pass above (or the live webview) owns this row.
+            continue;
+        }
+        todo_store_set_item_status(&mut item, "interrupted", "todo_store_orphan_sweep");
+        by_workspace.entry(workspace_id).or_default().push(item);
+    }
+    for (workspace_id, items) in by_workspace {
+        todo_store_push_corrections(app, &workspace_id, items, "todo_store_orphan_sweep");
+        todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
+    }
+}
+
+pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS)).await;
+        loop {
+            todo_store_orphan_sweep_tick(&app).await;
+            sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS)).await;
+        }
+    });
+}
+
 fn todo_dispatch_queue_item_command_id(item: &Value) -> String {
     item.get("remoteCommand")
         .and_then(|remote| remote.get("commandId").or_else(|| remote.get("command_id")))
@@ -942,6 +1665,76 @@ fn chrono_like_now_iso() -> String {
         secs_of_day % 60,
         millis,
     )
+}
+
+#[cfg(test)]
+mod todo_store_tests {
+    use super::*;
+
+    #[test]
+    fn tombstone_filter_rejects_by_item_id_and_command_id() {
+        let tombstoned: HashSet<String> =
+            ["dead-id".to_string(), "dead-command".to_string()].into();
+        let items = vec![
+            json!({ "id": "alive", "text": "keep me" }),
+            json!({ "id": "dead-id", "text": "ghost by id" }),
+            json!({
+                "id": "other",
+                "remoteCommand": { "commandId": "dead-command" },
+                "text": "ghost by command id",
+            }),
+        ];
+        let (kept, rejected) = todo_store_filter_tombstoned(items, &tombstoned);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["id"], "alive");
+        assert_eq!(rejected, vec!["dead-id".to_string(), "other".to_string()]);
+    }
+
+    #[test]
+    fn tombstone_filter_passes_everything_when_no_tombstones() {
+        let items = vec![json!({ "id": "a" }), json!({ "id": "b" })];
+        let (kept, rejected) = todo_store_filter_tombstoned(items, &HashSet::new());
+        assert_eq!(kept.len(), 2);
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn item_matcher_covers_id_and_command_id_and_rejects_empty() {
+        let item = json!({
+            "id": "item-1",
+            "remoteCommand": { "commandId": "command-1" },
+        });
+        assert!(todo_store_item_matches_id(&item, "item-1"));
+        assert!(todo_store_item_matches_id(&item, "command-1"));
+        assert!(!todo_store_item_matches_id(&item, "unrelated"));
+        assert!(!todo_store_item_matches_id(&item, ""));
+    }
+
+    #[test]
+    fn status_setter_stamps_both_field_families_and_timestamps() {
+        let mut item = json!({
+            "id": "item-1",
+            "todoStatus": "running",
+            "status": "running",
+        });
+        todo_store_set_item_status(&mut item, "cancelled", "todo_history_cancel");
+        assert_eq!(item["todoStatus"], "cancelled");
+        assert_eq!(item["status"], "cancelled");
+        assert_eq!(item["todoStatusReason"], "todo_history_cancel");
+        assert_eq!(item["statusReason"], "todo_history_cancel");
+        assert!(item["updatedAtMs"].as_u64().unwrap() > 0);
+        assert!(item["updatedAt"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn store_item_status_and_pane_read_both_field_families() {
+        let item = json!({
+            "todo_status": "Running",
+            "target_terminal_id": "pane-9",
+        });
+        assert_eq!(todo_store_item_status(&item), "running");
+        assert_eq!(todo_store_item_pane_id(&item), "pane-9");
+    }
 }
 
 #[cfg(test)]
@@ -1176,54 +1969,16 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
     if workspace_id.is_empty() || todo_id.is_empty() {
         return;
     }
-    let Some(path) = todo_dispatch_data_path("queues", &workspace_id) else {
-        return;
-    };
-    let snapshot = todo_dispatch_queue_read(&path);
-    let items = snapshot
-        .get("items")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let before = items.len();
-    let next_items = items
-        .into_iter()
-        .filter(|item| {
-            let item_id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default();
-            item_id != todo_id && todo_dispatch_queue_item_command_id(item) != todo_id
-        })
-        .collect::<Vec<_>>();
-    let removed = next_items.len() != before;
-    if removed {
-        todo_dispatch_queue_write(&workspace_id, &next_items);
-    }
-    todo_dispatch_journal_append(
+    // One funnel for every delete: tombstone, queue-store removal, journal,
+    // and a durable removal-only cloud push (safe next to a live webview —
+    // removals are idempotent and don't carry a possibly-stale item set).
+    todo_store_delete_internal(
+        app,
         &workspace_id,
-        json!({
-            "kind": "remote_todo_deleted",
-            "itemId": todo_id,
-            "commandId": todo_dispatch_text(event, &["command_id", "commandId"]),
-            "at": chrono_like_now_iso(),
-            "removedFromQueueStore": removed,
-        }),
+        &[todo_id],
+        "remote_todo_delete",
+        "remote_command",
     );
-    // Cloud convergence only when no webview dispatcher is alive: a mounted
-    // TerminalView handles the same lever itself and pushes a fresher queue;
-    // pushing the (possibly debounce-stale) file copy alongside it could
-    // overwrite the webview's snapshot. Unmounted-workspace deletions converge
-    // on the next mount via the journal entry above.
-    if !todo_dispatch_webview_dispatcher_active() {
-        todo_dispatch_push_queue_snapshot(
-            app,
-            &workspace_id,
-            vec![todo_id],
-            "remote_todo_delete_headless",
-        );
-    }
 }
 
 #[tauri::command]
@@ -1268,15 +2023,30 @@ pub(crate) fn todo_dispatch_flush_deferred_remote_commands(app: &AppHandle) {
 
 #[tauri::command]
 async fn todo_dispatch_queue_sync(
+    app: AppHandle,
     workspace_id: String,
     items: Value,
     reason: Option<String>,
+    removed_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let workspace_id = workspace_id.trim().to_string();
         if workspace_id.is_empty() {
             return Err("workspace_id is required.".to_string());
         }
+        let reason = reason.unwrap_or_default();
+        // Webview removals become terminal tombstones first, so the incoming
+        // snapshot (and every later writer) can never resurrect them.
+        let removed_ids = removed_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        if !removed_ids.is_empty() {
+            todo_store_add_tombstones(&workspace_id, &removed_ids, &reason, "webview_sync");
+        }
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
         let items = items
             .as_array()
             .cloned()
@@ -1284,11 +2054,16 @@ async fn todo_dispatch_queue_sync(
             .into_iter()
             .filter(|item| item.is_object())
             .collect::<Vec<_>>();
+        let (items, rejected_ids) = todo_store_filter_tombstoned(items, &tombstoned);
         todo_dispatch_queue_write(&workspace_id, &items);
+        // Origin "webview": the webview's own changed-listener skips these to
+        // avoid sync feedback loops; other windows still refresh.
+        todo_store_emit_changed(&app, &workspace_id, &reason, "webview");
         Ok(json!({
             "workspaceId": workspace_id,
             "itemCount": items.len(),
-            "reason": reason.unwrap_or_default(),
+            "rejectedIds": rejected_ids,
+            "reason": reason,
         }))
     })
     .await
@@ -1310,6 +2085,24 @@ async fn todo_dispatch_backend_submissions_drain(workspace_id: String) -> Result
         if !entries.is_empty() {
             let _ = fs::write(&path, b"[]");
         }
+        // Tombstones are terminal: a creation entry for a later-deleted todo
+        // must never be re-adopted by the restored webview (this was the ghost
+        // "delete it and it comes back listed" path).
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                if entry.get("kind").and_then(Value::as_str) != Some("remote_todo_created") {
+                    return true;
+                }
+                let item_id = entry
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                !tombstoned.contains(item_id)
+            })
+            .collect::<Vec<_>>();
         Ok(json!({ "entries": entries, "workspaceId": workspace_id }))
     })
     .await

@@ -2663,6 +2663,10 @@ const CLOUD_WORKSPACE_CONNECT_ATTEMPTS = 8;
 const ARCHITECTURE_GRAPH_LIST_ERROR_RETRY_MS = 30_000;
 const CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS = 2200;
 const CLOUD_WORKSPACE_STATUS_POLL_MS = 650;
+// A short websocket reopen (route refresh, transient drop) must not flash
+// the title-bar pill from Live/Syncing to Connecting; only a disconnect that
+// persists past this window demotes the pill.
+const CLOUD_SYNC_DISCONNECT_GRACE_MS = 4000;
 const CLOUD_WORKSPACE_STAGE_ORDER = Object.freeze({
   idle: 0,
   desktop_session: 1,
@@ -7812,6 +7816,31 @@ export default function App() {
       prefetchTimers.clear();
     };
   }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
+
+  // The startup catalog fetch often runs before workspaces/settings hydrate,
+  // which builds (and caches) a catalog with zero workspace groups — git repo
+  // entries never appear. Rebuild whenever the effective workspace list (ids
+  // + root directories) actually changes.
+  const architectureHubWorkspaceSignature = useMemo(() => (
+    (Array.isArray(workspaces) ? workspaces : [])
+      .map((workspace) => `${graphText(workspace?.id)}::${cleanWorkspaceRootDirectory(
+        getWorkspaceRootDirectory(workspaceSettings, workspace?.id) || defaultWorkingDirectory,
+      )}`)
+      .filter((entry) => !entry.startsWith("::"))
+      .sort()
+      .join("|")
+  ), [defaultWorkingDirectory, workspaceSettings, workspaces]);
+  const architectureHubWorkspaceSignatureRef = useRef("");
+  useEffect(() => {
+    if (authState !== "authenticated" || !architectureHubWorkspaceSignature) {
+      return;
+    }
+    if (architectureHubWorkspaceSignatureRef.current === architectureHubWorkspaceSignature) {
+      return;
+    }
+    architectureHubWorkspaceSignatureRef.current = architectureHubWorkspaceSignature;
+    void refreshArchitectureHubCatalog({ refresh: true });
+  }, [architectureHubWorkspaceSignature, authState, refreshArchitectureHubCatalog]);
 
   const applyWorkspaceGraphSnapshot = useCallback((repoPath, workspaceId, snapshot) => {
     if (!snapshot || typeof snapshot !== "object") return;
@@ -13262,14 +13291,53 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
     let unlistenSyncStatus = null;
+    let lastApplied = null;
+    let demoteTimer = 0;
+    let pendingDemotion = null;
+
+    const applySyncStatus = (normalized) => {
+      lastApplied = normalized;
+      setCloudSyncStatus(normalized);
+    };
+
+    const handleSyncStatus = (normalized) => {
+      if (cancelled || !normalized) {
+        return;
+      }
+      if (normalized.connection === "connected") {
+        if (demoteTimer) {
+          window.clearTimeout(demoteTimer);
+          demoteTimer = 0;
+        }
+        pendingDemotion = null;
+        applySyncStatus(normalized);
+        return;
+      }
+      if (lastApplied?.connection === "connected") {
+        // Demotion grace: hold the connected pill through quick reconnects;
+        // if the disconnect persists, the latest demoted status applies.
+        pendingDemotion = normalized;
+        if (!demoteTimer) {
+          demoteTimer = window.setTimeout(() => {
+            demoteTimer = 0;
+            if (!cancelled && pendingDemotion) {
+              applySyncStatus(pendingDemotion);
+              pendingDemotion = null;
+            }
+          }, CLOUD_SYNC_DISCONNECT_GRACE_MS);
+        }
+        return;
+      }
+      applySyncStatus(normalized);
+    };
 
     invoke("cloud_mcp_get_status").then((status) => {
       if (cancelled) {
         return;
       }
       const normalized = cloudSyncStatusFromRuntimeStatus(status);
-      if (normalized) {
-        setCloudSyncStatus((current) => (current ? current : normalized));
+      if (normalized && !lastApplied) {
+        applySyncStatus(normalized);
       }
     }).catch(() => {});
 
@@ -13281,7 +13349,7 @@ export default function App() {
       if (!normalized) {
         return;
       }
-      setCloudSyncStatus(normalized);
+      handleSyncStatus(normalized);
       if (normalized.connection === "connected") {
         void revalidateOfflineSessionQuietly();
       }
@@ -13295,6 +13363,9 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      if (demoteTimer) {
+        window.clearTimeout(demoteTimer);
+      }
       if (unlistenSyncStatus) {
         unlistenSyncStatus();
       }
