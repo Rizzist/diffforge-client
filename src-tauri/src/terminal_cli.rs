@@ -1550,6 +1550,11 @@ fn extend_terminal_activity_env_vars(
         env_vars.retain(|(existing_key, _)| existing_key != &key);
         env_vars.push((key, value));
     }
+    // Account profile binding: stamps the pane with the active agent account
+    // and injects CLAUDE_CONFIG_DIR / CODEX_HOME for non-default profiles.
+    // Every agent spawn and relaunch path funnels through here, so switching
+    // accounts applies to the next spawn without an app restart.
+    agent_accounts_apply_spawn_env(env_vars, pane_id, provider_id);
 }
 
 fn refresh_codex_activity_hook_profile_for_terminal(

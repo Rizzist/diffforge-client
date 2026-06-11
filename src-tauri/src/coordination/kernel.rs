@@ -25195,6 +25195,12 @@ fn codex_prepare_private_home(home: &Path) -> Result<(), String> {
 }
 
 fn codex_user_home_for_auth_bridge() -> Option<PathBuf> {
+    // The active agent-account profile wins: managed per-slot homes re-link
+    // auth.json from it, so coordinated Codex panes adopt the account the
+    // user selected (the bridge replaces stale links when the source moves).
+    if let Some(profile_home) = crate::agent_accounts_active_codex_home() {
+        return Some(profile_home);
+    }
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))

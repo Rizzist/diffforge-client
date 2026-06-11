@@ -56,6 +56,385 @@ const PROVIDER_ACCENTS = {
   claude: "#fb923c",
 };
 
+const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
+
+const AgentAccountsSection = styled.section`
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.35);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.2);
+    background: rgba(241, 245, 249, 0.7);
+  }
+`;
+
+const AgentAccountsHeader = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+
+  strong {
+    color: rgba(226, 232, 240, 0.92);
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  span {
+    color: rgba(148, 163, 184, 0.75);
+    font-size: 11px;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: rgba(30, 41, 59, 0.9);
+  }
+`;
+
+const AgentAccountsRow = styled.div`
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+`;
+
+const AgentAccountsKindLabel = styled.span`
+  min-width: 56px;
+  color: rgba(148, 163, 184, 0.85);
+  font-size: 11.5px;
+  font-weight: 750;
+`;
+
+const AgentAccountPill = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  color: rgba(203, 213, 225, 0.9);
+  background: rgba(30, 41, 59, 0.55);
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+
+  &[data-active="true"] {
+    border-color: rgba(74, 222, 128, 0.55);
+    color: rgba(187, 247, 208, 0.96);
+    background: rgba(34, 197, 94, 0.14);
+    cursor: default;
+  }
+
+  &:hover:not([data-active="true"]) {
+    border-color: rgba(125, 176, 255, 0.5);
+  }
+
+  em {
+    color: rgba(148, 163, 184, 0.75);
+    font-size: 10.5px;
+    font-style: normal;
+    font-weight: 600;
+  }
+
+  i {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(74, 222, 128, 0.9);
+    font-style: normal;
+  }
+
+  i[data-auth="false"] {
+    background: rgba(251, 146, 60, 0.95);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(30, 41, 59, 0.85);
+    background: rgba(255, 255, 255, 0.85);
+  }
+`;
+
+const AgentAccountRemove = styled.button`
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(148, 163, 184, 0.7);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+
+  &:hover {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.85);
+  }
+`;
+
+const AgentAccountAddButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border: 1px dashed rgba(148, 163, 184, 0.4);
+  border-radius: 999px;
+  color: rgba(148, 163, 184, 0.9);
+  background: transparent;
+  font-size: 11.5px;
+  font-weight: 700;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.6);
+    color: rgba(200, 222, 255, 0.95);
+  }
+`;
+
+const AgentAccountAddForm = styled.form`
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  input {
+    width: 150px;
+    padding: 4px 9px;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 999px;
+    color: inherit;
+    background: rgba(2, 6, 14, 0.5);
+    font-size: 11.5px;
+    outline: none;
+
+    html[data-forge-theme="light"] & {
+      background: #ffffff;
+    }
+  }
+
+  button {
+    padding: 4px 10px;
+    border: 1px solid rgba(74, 222, 128, 0.45);
+    border-radius: 999px;
+    color: rgba(187, 247, 208, 0.95);
+    background: rgba(34, 197, 94, 0.12);
+    font-size: 11.5px;
+    font-weight: 750;
+    cursor: pointer;
+  }
+`;
+
+const AgentAccountLoginHint = styled.div`
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border: 1px solid rgba(251, 146, 60, 0.35);
+  border-radius: 10px;
+  background: rgba(251, 146, 60, 0.08);
+  color: rgba(254, 215, 170, 0.95);
+  font-size: 11.5px;
+
+  code {
+    overflow-wrap: anywhere;
+    padding: 4px 8px;
+    border-radius: 7px;
+    color: rgba(226, 232, 240, 0.95);
+    background: rgba(2, 6, 14, 0.6);
+    font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(154, 52, 18, 0.95);
+  }
+`;
+
+/* Agent account profiles: per-CLI account switching managed beside the usage
+   data that motivates the switch. Switching only affects NEW terminal spawns;
+   running panes show a restart chip instead (never forced). */
+function AgentAccountsManager() {
+  const [accounts, setAccounts] = useState(null);
+  const [addingKind, setAddingKind] = useState("");
+  const [addLabel, setAddLabel] = useState("");
+  const [loginHint, setLoginHint] = useState(null);
+  const [actionError, setActionError] = useState("");
+
+  const refresh = useCallback(() => {
+    invoke("agent_accounts_state").then((state) => {
+      setAccounts(state?.agents || null);
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten = null;
+    refresh();
+    listen(AGENT_ACCOUNTS_CHANGED_EVENT, () => {
+      if (!cancelled) {
+        refresh();
+      }
+    }).then((next) => {
+      if (cancelled) {
+        next();
+        return;
+      }
+      unlisten = next;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [refresh]);
+
+  const setActive = useCallback((kind, profileId) => {
+    setActionError("");
+    invoke("agent_accounts_set_active", { agentKind: kind, profileId })
+      .then(refresh)
+      .catch((error) => setActionError(String(error?.message || error || "Unable to switch account.")));
+  }, [refresh]);
+
+  const removeProfile = useCallback((kind, profileId) => {
+    setActionError("");
+    invoke("agent_accounts_remove", { agentKind: kind, profileId })
+      .then(refresh)
+      .catch((error) => setActionError(String(error?.message || error || "Unable to remove account.")));
+  }, [refresh]);
+
+  const submitAdd = useCallback((event) => {
+    event.preventDefault();
+    const kind = addingKind;
+    const label = addLabel.trim();
+    if (!kind || !label) {
+      return;
+    }
+    setActionError("");
+    invoke("agent_accounts_add", { agentKind: kind, label }).then((result) => {
+      setAddingKind("");
+      setAddLabel("");
+      setLoginHint({
+        command: String(result?.loginCommand || ""),
+        kind,
+        label,
+      });
+      refresh();
+    }).catch((error) => setActionError(String(error?.message || error || "Unable to add account.")));
+  }, [addLabel, addingKind, refresh]);
+
+  const copyLoginCommand = useCallback(() => {
+    if (loginHint?.command && navigator?.clipboard?.writeText) {
+      void navigator.clipboard.writeText(loginHint.command);
+    }
+  }, [loginHint]);
+
+  if (!accounts) {
+    return null;
+  }
+
+  return (
+    <AgentAccountsSection aria-label="Agent account profiles">
+      <AgentAccountsHeader>
+        <strong>Agent accounts</strong>
+        <span>Switching applies to new terminals; running ones show a restart chip.</span>
+      </AgentAccountsHeader>
+      {["claude", "codex"].map((kind) => {
+        const entry = accounts[kind];
+        if (!entry) {
+          return null;
+        }
+        const profiles = Array.isArray(entry.profiles) ? entry.profiles : [];
+        return (
+          <AgentAccountsRow key={kind}>
+            <AgentAccountsKindLabel>
+              {kind === "claude" ? "Claude" : "Codex"}
+            </AgentAccountsKindLabel>
+            {profiles.map((profile) => (
+              <AgentAccountPill
+                data-active={profile.isActive ? "true" : "false"}
+                key={profile.id}
+                onClick={() => {
+                  if (!profile.isActive) {
+                    setActive(kind, profile.id);
+                  }
+                }}
+                title={profile.isActive
+                  ? `Active: new ${kind} terminals use this account`
+                  : `Use this account for new ${kind} terminals`}
+                type="button"
+              >
+                <i aria-hidden="true" data-auth={profile.identity?.authReady ? "true" : "false"} />
+                {profile.label}
+                {profile.identity?.email ? <em>{profile.identity.email}</em> : null}
+                {!profile.identity?.authReady && !profile.isDefault ? <em>needs login</em> : null}
+                {!profile.isDefault && (
+                  <AgentAccountRemove
+                    aria-label={`Remove ${profile.label}`}
+                    as="span"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      removeProfile(kind, profile.id);
+                    }}
+                    role="button"
+                    title="Remove this profile (its login stays on disk)"
+                  >
+                    ×
+                  </AgentAccountRemove>
+                )}
+              </AgentAccountPill>
+            ))}
+            {addingKind === kind ? (
+              <AgentAccountAddForm onSubmit={submitAdd}>
+                <input
+                  aria-label="New account label"
+                  autoFocus
+                  maxLength={40}
+                  onChange={(event) => setAddLabel(event.target.value)}
+                  placeholder="Label (e.g. Work)"
+                  value={addLabel}
+                />
+                <button type="submit">Create</button>
+              </AgentAccountAddForm>
+            ) : (
+              <AgentAccountAddButton
+                onClick={() => {
+                  setAddingKind(kind);
+                  setAddLabel("");
+                }}
+                type="button"
+              >
+                + Add account
+              </AgentAccountAddButton>
+            )}
+          </AgentAccountsRow>
+        );
+      })}
+      {loginHint ? (
+        <AgentAccountLoginHint role="status">
+          <span>
+            {`Sign in once to finish adding “${loginHint.label}”: run this in any terminal `}
+            {"(use a private browser window if you're already signed into another account), "}
+            {"then this card updates automatically."}
+          </span>
+          <code onClick={copyLoginCommand} title="Click to copy">{loginHint.command}</code>
+        </AgentAccountLoginHint>
+      ) : null}
+      {actionError ? <TokenomicsError>{actionError}</TokenomicsError> : null}
+    </AgentAccountsSection>
+  );
+}
+
 function createTokenomicsStoreState() {
   return {
     summary: null,
@@ -1652,6 +2031,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
             ))}
           </AccountTabs>
         ) : null}
+
+        <AgentAccountsManager />
 
         {error ? <TokenomicsError>{error}</TokenomicsError> : null}
 

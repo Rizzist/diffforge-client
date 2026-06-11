@@ -7543,6 +7543,60 @@ async fn cloud_mcp_send_device_heartbeat_async(
     Ok(())
 }
 
+/// Coarse latency hint for region-aware balancer placement, derived from the
+/// system timezone (the /etc/localtime symlink on macOS/Linux). Values match
+/// the balancer's location categories: "us-east", "us-west", "eu", "asia".
+/// None on platforms where the zone cannot be read; the balancer then uses
+/// its default region.
+fn cloud_mcp_region_hint() -> Option<&'static str> {
+    static REGION_HINT: OnceLock<Option<&'static str>> = OnceLock::new();
+    *REGION_HINT.get_or_init(|| {
+        let zone = fs::read_link("/etc/localtime")
+            .ok()
+            .map(|target| target.to_string_lossy().to_string())?;
+        let zone = zone
+            .split("zoneinfo/")
+            .nth(1)
+            .map(str::to_string)
+            .unwrap_or(zone);
+        let zone_lower = zone.to_ascii_lowercase();
+        if zone_lower.starts_with("europe/") || zone_lower.starts_with("africa/") {
+            return Some("eu");
+        }
+        if zone_lower.starts_with("asia/")
+            || zone_lower.starts_with("australia/")
+            || zone_lower.starts_with("pacific/")
+            || zone_lower.starts_with("indian/")
+        {
+            return Some("asia");
+        }
+        if zone_lower.starts_with("america/")
+            || zone_lower.starts_with("us/")
+            || zone_lower.starts_with("canada/")
+            || zone_lower.starts_with("mexico/")
+        {
+            let western = [
+                "los_angeles",
+                "vancouver",
+                "tijuana",
+                "phoenix",
+                "denver",
+                "edmonton",
+                "boise",
+                "whitehorse",
+                "anchorage",
+                "pacific",
+                "mountain",
+            ];
+            if western.iter().any(|needle| zone_lower.contains(needle)) {
+                return Some("us-west");
+            }
+            return Some("us-east");
+        }
+        None
+    })
+}
+
 async fn cloud_mcp_fetch_direct_route_async(
     base_url: &str,
     endpoint_path: &str,
@@ -7554,6 +7608,7 @@ async fn cloud_mcp_fetch_direct_route_async(
     device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
         "billingScopeType": billing_scope_type,
@@ -7562,6 +7617,7 @@ async fn cloud_mcp_fetch_direct_route_async(
         "planName": plan_name,
         "deviceLimit": device_limit,
         "deviceId": device_id,
+        "regionHint": region_hint,
     });
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -7584,6 +7640,12 @@ async fn cloud_mcp_fetch_direct_route_async(
                 if let Ok(value) = reqwest::header::HeaderValue::from_str(device_id) {
                     headers.insert("x-diffforge-device-id", value);
                 }
+            }
+            if let Some(region_hint) = region_hint {
+                headers.insert(
+                    "x-diffforge-region-hint",
+                    reqwest::header::HeaderValue::from_static(region_hint),
+                );
             }
             if billing_scope_type == "team" {
                 if let Some(team_id) = team_id {

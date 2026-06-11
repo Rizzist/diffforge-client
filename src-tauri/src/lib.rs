@@ -2174,6 +2174,7 @@ include!("terminals.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
+include!("agent_accounts.rs");
 include!("background_mode.rs");
 include!("audio.rs");
 include!("handsfree_audio.rs");
@@ -4463,6 +4464,11 @@ pub fn run() {
             todo_store_cancel,
             todo_store_set_status,
             todo_read_image_data_url,
+            agent_accounts_state,
+            agent_accounts_add,
+            agent_accounts_set_active,
+            agent_accounts_remove,
+            agent_accounts_pane_profiles,
             app_enter_background,
             app_exit_background,
             app_background_mode_state,

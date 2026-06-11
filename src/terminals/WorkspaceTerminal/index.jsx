@@ -1403,6 +1403,88 @@ function defaultTerminalSessionModeForRole(roleId, _isPrewarm = false) {
   return TERMINAL_SESSION_MODE_GENERAL;
 }
 
+const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
+
+/* Self-contained stale-account chip: each pane is stamped (Rust-side) with
+   the agent account profile it spawned under. When the active profile for
+   its agent kind changes, the pane keeps working on its old account — this
+   chip just says so, and that a restart adopts the new one. Never forced. */
+function TerminalAccountStaleChip({ paneId, agentKind }) {
+  const [stale, setStale] = useState(null);
+
+  useEffect(() => {
+    const kind = String(agentKind || "").toLowerCase().includes("claude")
+      ? "claude"
+      : String(agentKind || "").toLowerCase().includes("codex") ? "codex" : "";
+    const safePaneId = String(paneId || "").trim();
+    if (!kind || !safePaneId) {
+      setStale(null);
+      return undefined;
+    }
+    let cancelled = false;
+    let unlisten = null;
+    const check = () => {
+      invoke("agent_accounts_pane_profiles").then((state) => {
+        if (cancelled) {
+          return;
+        }
+        const stamp = state?.panes?.[safePaneId];
+        const active = state?.active?.[kind];
+        if (!stamp || !active?.profileId) {
+          setStale(null);
+          return;
+        }
+        if (String(stamp.profileId || "") !== String(active.profileId)) {
+          setStale({ label: String(active.profileLabel || "new account") });
+        } else {
+          setStale(null);
+        }
+      }).catch(() => {});
+    };
+    check();
+    listen(AGENT_ACCOUNTS_CHANGED_EVENT, check).then((next) => {
+      if (cancelled) {
+        next();
+        return;
+      }
+      unlisten = next;
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, [agentKind, paneId]);
+
+  if (!stale) {
+    return null;
+  }
+
+  return (
+    <span
+      style={{
+        alignItems: "center",
+        background: "rgba(251, 146, 60, 0.14)",
+        border: "1px solid rgba(251, 146, 60, 0.45)",
+        borderRadius: 999,
+        color: "rgba(254, 215, 170, 0.95)",
+        display: "inline-flex",
+        flex: "0 0 auto",
+        fontSize: 10,
+        fontWeight: 750,
+        gap: 4,
+        lineHeight: 1,
+        padding: "3px 8px",
+        whiteSpace: "nowrap",
+      }}
+      title={`Account switched to “${stale.label}”. This terminal still uses the account it started with — close and relaunch it to use the new one.`}
+    >
+      {`↻ ${stale.label}`}
+    </span>
+  );
+}
+
 function getTerminalStartupDefaultModel(agentKind) {
   return TERMINAL_STARTUP_DEFAULT_MODELS[String(agentKind || "").trim().toLowerCase()] || "";
 }
@@ -13620,6 +13702,7 @@ function WorkspaceTerminal({
           <TerminalStateDebugBadge title={`Terminal state: ${terminalStateDebugLabel}`}>
             {terminalStateDebugLabel}
           </TerminalStateDebugBadge>
+          <TerminalAccountStaleChip agentKind={terminalAgentKind} paneId={paneId} />
         </TerminalRailIdentity>
         <TerminalRailControls data-rail-row="primary">
           <TerminalCloseButton

@@ -577,7 +577,10 @@ fn tokenomics_scan_usage_for(
             source.agent_kind,
             TOKENOMICS_GENERIC_SCANNER_VERSION,
         )?;
-        let provider_account = tokenomics_provider_account(source.provider, source.agent_kind);
+        let provider_account = source
+            .account
+            .clone()
+            .unwrap_or_else(|| tokenomics_provider_account(source.provider, source.agent_kind));
         let mut source_files = 0usize;
         let mut source_inserted = 0usize;
         for root in source.roots {
@@ -654,6 +657,9 @@ struct TokenomicsSource {
     provider: &'static str,
     agent_kind: &'static str,
     roots: Vec<PathBuf>,
+    /// Per-source account override: agent-account profiles attribute their
+    /// transcripts to their own account key instead of the default identity.
+    account: Option<TokenomicsProviderAccount>,
 }
 
 fn tokenomics_sources() -> Vec<TokenomicsSource> {
@@ -664,6 +670,7 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
             provider: "anthropic",
             agent_kind: "claude",
             roots: vec![home.join(".claude").join("projects")],
+            account: None,
         });
         sources.push(TokenomicsSource {
             provider: "opencode",
@@ -673,6 +680,22 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
                 home.join(".config").join("opencode"),
                 home.join(".opencode"),
             ],
+            account: None,
+        });
+    }
+    // Additional Claude account profiles: each isolated CLAUDE_CONFIG_DIR
+    // keeps its own transcript tree, so without these roots every non-default
+    // account's usage would be invisible to tokenomics.
+    for (profile_id, profile_label, profile_dir) in agent_accounts_claude_profiles_for_tokenomics()
+    {
+        sources.push(TokenomicsSource {
+            provider: "anthropic",
+            agent_kind: "claude",
+            roots: vec![profile_dir.join("projects")],
+            account: Some(TokenomicsProviderAccount {
+                key: format!("anthropic:claude:profile:{profile_id}"),
+                label: format!("Claude · {profile_label}"),
+            }),
         });
     }
     sources
