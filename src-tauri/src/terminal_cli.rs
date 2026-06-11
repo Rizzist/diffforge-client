@@ -5074,6 +5074,104 @@ fn uninstall_agent_with_npm(provider: AgentProvider) -> AgentInstallResult {
     }
 }
 
+fn npm_global_node_modules_root() -> Option<PathBuf> {
+    let capture = run_command_capture(
+        npm_binary(),
+        &["root", "-g"],
+        None,
+        Duration::from_secs(AGENT_STATUS_TIMEOUT_SECS),
+        None,
+    )
+    .ok()?;
+    if capture.exit_code != Some(0) {
+        return None;
+    }
+    let line = first_output_line(&command_output_text(&capture.stdout, &capture.stderr));
+    if line.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(line))
+}
+
+/// An earlier interrupted install can wedge npm: it fails with ENOTEMPTY
+/// renaming the package dir onto a stale hidden temp dir it left behind
+/// (e.g. `@anthropic-ai/.claude-code-XXXX`). Removing that reported temp dir
+/// unblocks the retry. Only paths inside node_modules whose final component
+/// is hidden are eligible.
+fn cleanup_npm_wedged_temp_dir(output: &str) -> bool {
+    for line in output.lines() {
+        let Some(path_text) = line.trim().strip_prefix("npm error dest ") else {
+            continue;
+        };
+        let path = PathBuf::from(path_text.trim());
+        let in_node_modules = path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules");
+        let hidden_temp = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false);
+        if in_node_modules && hidden_temp && path.exists() {
+            return fs::remove_dir_all(&path).is_ok();
+        }
+    }
+    false
+}
+
+/// Confirms the installed agent binary actually starts. A killed or failed
+/// npm extraction can leave the wrapper's placeholder stub in place, which
+/// only prints "native binary not installed" when a terminal launches it.
+fn verify_agent_binary_runs(definition: AgentDefinition) -> Result<(), String> {
+    let Some(binary) = npm_global_executable_path(definition) else {
+        return Err(format!(
+            "{} binary was not found in the npm global prefix after install.",
+            definition.label
+        ));
+    };
+    let binary_text = binary.to_string_lossy().to_string();
+    let capture = run_command_capture(
+        &binary_text,
+        &["--version"],
+        None,
+        Duration::from_secs(30),
+        None,
+    )
+    .map_err(|error| format!("{} did not start after install: {error}", definition.label))?;
+    if capture.exit_code == Some(0) {
+        return Ok(());
+    }
+    let detail = first_output_line(&command_output_text(&capture.stdout, &capture.stderr));
+    Err(if detail.is_empty() {
+        format!("{} exited with an error after install.", definition.label)
+    } else {
+        detail
+    })
+}
+
+/// Re-runs the npm package's own postinstall (install.cjs) to place the
+/// platform-native binary, the same repair the package suggests when its
+/// stub runs.
+fn repair_agent_npm_postinstall(definition: AgentDefinition) -> bool {
+    let Some(root) = npm_global_node_modules_root() else {
+        return false;
+    };
+    let installer = root.join(definition.install_package).join("install.cjs");
+    if !installer.is_file() {
+        return false;
+    }
+    let installer_text = installer.to_string_lossy().to_string();
+    run_command_capture(
+        "node",
+        &[&installer_text],
+        None,
+        Duration::from_secs(120),
+        None,
+    )
+    .map(|capture| capture.exit_code == Some(0))
+    .unwrap_or(false)
+}
+
 fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInstallResult {
     let definition = agent_definition(provider);
 
@@ -5093,32 +5191,60 @@ fn run_agent_npm_install(provider: AgentProvider, is_update: bool) -> AgentInsta
         };
     }
 
-    let install = run_command_capture(
-        npm_binary(),
-        &["install", "-g", definition.install_package],
-        None,
-        Duration::from_secs(AGENT_INSTALL_TIMEOUT_SECS),
-        None,
-    );
+    let run_npm_install = || {
+        run_command_capture(
+            npm_binary(),
+            &["install", "-g", definition.install_package],
+            None,
+            Duration::from_secs(AGENT_INSTALL_TIMEOUT_SECS),
+            None,
+        )
+    };
+    let mut install = run_npm_install();
+    if let Ok(capture) = &install {
+        if capture.exit_code != Some(0) {
+            let output = command_output_text(&capture.stdout, &capture.stderr);
+            if output.contains("ENOTEMPTY") && cleanup_npm_wedged_temp_dir(&output) {
+                install = run_npm_install();
+            }
+        }
+    }
 
     match install {
-        Ok(capture) if capture.exit_code == Some(0) => AgentInstallResult {
-            provider: definition.id,
-            label: definition.label,
-            installed: true,
-            updated: is_update,
-            permission_denied: false,
-            command: definition.install_command,
-            native_install_url: definition.native_install_url,
-            message: if is_update {
-                format!("{} npm package is up to date.", definition.label)
-            } else {
-                format!(
-                    "{} installed with npm. Recheck status, then connect your account.",
-                    definition.label
-                )
-            },
-        },
+        Ok(capture) if capture.exit_code == Some(0) => {
+            // npm exiting 0 is not enough: verify the binary really starts,
+            // and try the package's own postinstall repair once before
+            // reporting a corrupt install.
+            if let Err(verify_error) = verify_agent_binary_runs(definition) {
+                let repaired = repair_agent_npm_postinstall(definition)
+                    && verify_agent_binary_runs(definition).is_ok();
+                if !repaired {
+                    return failed_agent_install_result(
+                        definition,
+                        &verify_error,
+                        "The npm package installed but its binary does not run (likely an interrupted download). Try again on a stable connection.",
+                        if is_update { "update" } else { "install" },
+                    );
+                }
+            }
+            AgentInstallResult {
+                provider: definition.id,
+                label: definition.label,
+                installed: true,
+                updated: is_update,
+                permission_denied: false,
+                command: definition.install_command,
+                native_install_url: definition.native_install_url,
+                message: if is_update {
+                    format!("{} npm package is up to date.", definition.label)
+                } else {
+                    format!(
+                        "{} installed with npm. Recheck status, then connect your account.",
+                        definition.label
+                    )
+                },
+            }
+        }
         Ok(capture) => failed_agent_install_result(
             definition,
             &command_output_text(&capture.stdout, &capture.stderr),

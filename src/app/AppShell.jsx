@@ -140,7 +140,7 @@ import {
 } from "../threads/workspaceThreads";
 import {
   AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
-  AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT,
+  AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
   readDeepgramApiKey,
@@ -13633,7 +13633,7 @@ export default function App() {
     }
 
     const selectedAudioProvider = readAudioTranscriptionProvider();
-    const canUseCloudRecorder = selectedAudioProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
+    const canUseCloudRecorder = selectedAudioProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
       || (
         selectedAudioProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
         && Boolean(readDeepgramApiKey().trim())
@@ -23627,6 +23627,7 @@ export default function App() {
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}
                             isWorkspaceRuntimeVisible={runtimeVisible}
+                            isWorkspaceSurfaceVisible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeVisible}
                             isWorkspaceRuntimeDeactivating={runtimeIsDeactivating}
                             manageWorkspaceAgents={manageWorkspaceAgents}
                             onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}

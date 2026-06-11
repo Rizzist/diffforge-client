@@ -8572,6 +8572,35 @@ function todoQueueTerminalDirectLifecycleEventType(value) {
   return String(value || "").trim().toLowerCase().replace(/_/g, "-");
 }
 
+const TODO_QUEUE_TERMINAL_DIRECT_TEXT_DEDUPE_MS = 45000;
+
+// Cross-path dedupe for terminal-direct todos: the Rust capture (input gate
+// or UserPromptSubmit hook) and the webview lifecycle materializer can both
+// observe the same typed prompt; whichever lands first wins.
+function todoQueueItemsHaveRecentDirectPrompt(items, paneId, text, nowMs = Date.now()) {
+  const normalizedText = String(text || "").trim().replace(/\s+/g, " ");
+  const normalizedPane = String(paneId || "").trim();
+  if (!normalizedText) {
+    return false;
+  }
+  return (Array.isArray(items) ? items : []).some((item) => {
+    const itemText = String(getTodoQueueItemTerminalText(item) || item?.text || "")
+      .trim()
+      .replace(/\s+/g, " ");
+    if (itemText !== normalizedText) {
+      return false;
+    }
+    const itemPane = String(item?.targetTerminalId || item?.target_terminal_id || "").trim();
+    if (normalizedPane && itemPane && itemPane !== normalizedPane) {
+      return false;
+    }
+    const at = Date.parse(
+      item?.todoStatusUpdatedAt || item?.updatedAt || item?.createdAt || "",
+    ) || 0;
+    return at > 0 && nowMs - at <= TODO_QUEUE_TERMINAL_DIRECT_TEXT_DEDUPE_MS;
+  });
+}
+
 function todoQueueTerminalDirectSourceIsEligible(value) {
   const source = String(value || "").trim().toLowerCase();
   return source === "tui-manual-input"
@@ -14155,6 +14184,10 @@ function TerminalView({
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
+  // True only while this workspace's terminals tab is the visible app view;
+  // isWorkspaceRuntimeVisible stays true on other tabs so terminals keep
+  // running, which is too broad for "is the user looking at the terminals".
+  isWorkspaceSurfaceVisible = true,
   isWorkspaceRuntimeDeactivating = false,
   manageWorkspaceAgents,
   onOpenWorkspaceSettings,
@@ -15099,14 +15132,14 @@ function TerminalView({
   ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
-  const activeTerminalPaneIdRef = useRef(activePaneId);
-  useEffect(() => {
-    activeTerminalPaneIdRef.current = activePaneId;
-  }, [activePaneId]);
   const isWorkspaceRuntimeVisibleRef = useRef(Boolean(isWorkspaceRuntimeVisible));
   useEffect(() => {
     isWorkspaceRuntimeVisibleRef.current = Boolean(isWorkspaceRuntimeVisible);
   }, [isWorkspaceRuntimeVisible]);
+  const isWorkspaceSurfaceVisibleRef = useRef(Boolean(isWorkspaceSurfaceVisible));
+  useEffect(() => {
+    isWorkspaceSurfaceVisibleRef.current = Boolean(isWorkspaceSurfaceVisible);
+  }, [isWorkspaceSurfaceVisible]);
   const [todoCompletionFlashes, setTodoCompletionFlashes] = useState({});
   const todoCompletionFlashTimersRef = useRef(new Map());
   const triggerTodoCompletionFlash = useCallback((paneId) => {
@@ -16510,10 +16543,13 @@ function TerminalView({
       const completedPaneId = String(
         pendingItem?.paneId || inFlightPrompt?.paneId || getTerminalPaneId(safeTerminalIndex) || "",
       ).trim();
+      // "Watching" means this workspace's terminals tab is the visible app
+      // surface (not just that the workspace is selected — another tab like
+      // Files or Tools must still ring the SFX). Any finishing terminal on
+      // the visible terminals tab flashes its border instead of ringing.
       const watchingCompletedTerminal = Boolean(
-        isWorkspaceRuntimeVisibleRef.current
+        isWorkspaceSurfaceVisibleRef.current
           && completedPaneId
-          && completedPaneId === activeTerminalPaneIdRef.current
           && typeof document !== "undefined"
           && document.hasFocus(),
       );
@@ -19645,7 +19681,7 @@ function TerminalView({
         const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
         return String(item?.id || "").trim() === itemId
           || String(queueState.promptId || queueState.promptEventId || "").trim() === promptId;
-      });
+      }) || todoQueueItemsHaveRecentDirectPrompt(currentItems, paneId, text);
       return alreadyPresent ? currentItems : currentItems.concat([queueItem]);
     }, {
       force: true,
@@ -22709,6 +22745,13 @@ function TerminalView({
       updateTodoQueueItems((currentItems) => {
         const itemId = String(normalized.id || "").trim();
         if (!itemId || currentItems.some((current) => String(current?.id || "").trim() === itemId)) {
+          return currentItems;
+        }
+        if (todoQueueItemsHaveRecentDirectPrompt(
+          currentItems,
+          normalized.targetTerminalId,
+          getTodoQueueItemTerminalText(normalized) || normalized.text,
+        )) {
           return currentItems;
         }
         return [...currentItems, normalized];

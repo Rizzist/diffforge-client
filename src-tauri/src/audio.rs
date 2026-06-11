@@ -3715,45 +3715,11 @@ async fn run_cloud_voice_agent_stream(
         }
     };
 
+    // Direct-only policy: the balancer never proxies websocket traffic; a
+    // failed direct connect surfaces the error and the caller retries with a
+    // freshly resolved route.
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
-        Err(error) if opened_target.route_token.is_some() => {
-            let direct_error = error.to_string();
-            let fallback = cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), CLOUD_VOICE_AGENT_WS_PATH);
-            let fallback_request = match cloud_voice_agent_ws_request(
-                &fallback,
-                auth_bearer.as_deref(),
-                &workspace_id,
-                &repo_id,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    let message =
-                        format!("Unable to prepare cloud voice agent balancer fallback: {error}");
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Err(message.clone()));
-                    }
-                    let _ = finished_tx.send(Err(message));
-                    return;
-                }
-            };
-            match connect_async(fallback_request).await {
-                Ok(stream) => {
-                    opened_target = fallback;
-                    stream
-                }
-                Err(fallback_error) => {
-                    let message = format!(
-                        "Unable to open cloud voice agent WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
-                    );
-                    if let Some(ready_tx) = ready_tx.take() {
-                        let _ = ready_tx.send(Err(message.clone()));
-                    }
-                    let _ = finished_tx.send(Err(message));
-                    return;
-                }
-            }
-        }
         Err(error) => {
             let message = format!("Unable to open cloud voice agent WebSocket: {error}");
             if let Some(ready_tx) = ready_tx.take() {
@@ -4264,39 +4230,11 @@ async fn run_cloud_voice_agent_text_message(
         }
     };
 
+    // Direct-only policy: the balancer never proxies websocket traffic; a
+    // failed direct connect surfaces the error and the caller retries with a
+    // freshly resolved route.
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
-        Err(error) if opened_target.route_token.is_some() => {
-            let direct_error = error.to_string();
-            let fallback = cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), CLOUD_VOICE_AGENT_WS_PATH);
-            let fallback_request = match cloud_voice_agent_ws_request(
-                &fallback,
-                auth_bearer.as_deref(),
-                &workspace_id,
-                &repo_id,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    let message =
-                        format!("Unable to prepare cloud voice agent chat balancer fallback: {error}");
-                    let _ = ready_tx.send(Err(message));
-                    return;
-                }
-            };
-            match connect_async(fallback_request).await {
-                Ok(stream) => {
-                    opened_target = fallback;
-                    stream
-                }
-                Err(fallback_error) => {
-                    let message = format!(
-                        "Unable to open cloud voice agent chat WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
-                    );
-                    let _ = ready_tx.send(Err(message));
-                    return;
-                }
-            }
-        }
         Err(error) => {
             let message = format!("Unable to open cloud voice agent chat WebSocket: {error}");
             let _ = ready_tx.send(Err(message));
@@ -4509,12 +4447,29 @@ async fn start_cloud_voice_agent_stream(
             return Err(error);
         }
     };
-    let ws_target = cloud_mcp_resolve_ws_target(
+    let ws_target = match cloud_mcp_resolve_ws_target(
         cloud_mcp_state.inner(),
         &cloud_mcp_base_url(),
         CLOUD_VOICE_AGENT_WS_PATH,
     )
-    .await;
+    .await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            let message = format!("Cloud voice route unavailable: {error}");
+            spawn_cloud_voice_agent_desktop_log(
+                cloud_mcp_state.inner(),
+                "voice_media_route_resolved",
+                "error",
+                &message,
+                &voice_session_id,
+                &workspace_id,
+                &repo_id,
+                json!({}),
+            );
+            return Err(message);
+        }
+    };
     spawn_cloud_voice_agent_desktop_log(
         cloud_mcp_state.inner(),
         "voice_media_route_resolved",
@@ -4837,12 +4792,29 @@ async fn send_cloud_voice_agent_text_message(
             return Err(error);
         }
     };
-    let ws_target = cloud_mcp_resolve_ws_target(
+    let ws_target = match cloud_mcp_resolve_ws_target(
         cloud_mcp_state.inner(),
         &cloud_mcp_base_url(),
         CLOUD_VOICE_AGENT_WS_PATH,
     )
-    .await;
+    .await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            let message = format!("Cloud voice route unavailable: {error}");
+            spawn_cloud_voice_agent_desktop_log(
+                cloud_mcp_state.inner(),
+                "text_message_voice_media_route_resolved",
+                "error",
+                &message,
+                &voice_session_id,
+                &workspace_id,
+                &repo_id,
+                json!({}),
+            );
+            return Err(message);
+        }
+    };
     spawn_cloud_voice_agent_desktop_log(
         cloud_mcp_state.inner(),
         "text_message_voice_media_route_resolved",
@@ -5331,38 +5303,11 @@ async fn run_forge_dictation_stream(
         }
     };
 
+    // Direct-only policy: the balancer never proxies websocket traffic; a
+    // failed direct connect surfaces the error and the caller retries with a
+    // freshly resolved route.
     let (ws_stream, _) = match connect_async(request).await {
         Ok(stream) => stream,
-        Err(error) if ws_target.route_token.is_some() => {
-            let direct_error = error.to_string();
-            let fallback =
-                cloud_mcp_fallback_ws_target(&cloud_mcp_base_url(), CLOUD_DICTATION_WS_PATH);
-            let fallback_request =
-                match cloud_voice_agent_ws_request(&fallback, auth_bearer.as_deref(), "", "") {
-                    Ok(request) => request,
-                    Err(error) => {
-                        fail(
-                            &mut ready_tx,
-                            finished_tx,
-                            format!("Unable to prepare cloud dictation balancer fallback: {error}"),
-                        );
-                        return;
-                    }
-                };
-            match connect_async(fallback_request).await {
-                Ok(stream) => stream,
-                Err(fallback_error) => {
-                    fail(
-                        &mut ready_tx,
-                        finished_tx,
-                        format!(
-                            "Unable to open cloud dictation WebSocket via direct route ({direct_error}); fallback via balancer also failed: {fallback_error}"
-                        ),
-                    );
-                    return;
-                }
-            }
-        }
         Err(error) => {
             fail(
                 &mut ready_tx,
@@ -5594,7 +5539,8 @@ async fn start_forge_dictation_transcription(
         &cloud_mcp_base_url(),
         CLOUD_DICTATION_WS_PATH,
     )
-    .await;
+    .await
+    .map_err(|error| format!("Cloud dictation route unavailable: {error}"))?;
 
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;

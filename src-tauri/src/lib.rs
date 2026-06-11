@@ -57,7 +57,13 @@ const DESKTOP_SIGNIN_DIAGNOSTIC_TIMEOUT_SECS: u64 = 3;
 const DESKTOP_SIGNIN_DIAGNOSTIC_MAX_TEXT: usize = 600;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
-const AGENT_INSTALL_TIMEOUT_SECS: u64 = 240;
+// Coding-agent npm packages ship multi-hundred-MB native binaries (Claude
+// Code's darwin-arm64 binary alone is ~220MB). run_command_capture KILLS the
+// child on timeout, and killing npm mid-extraction leaves a truncated binary
+// with a missing package.json — the agent then launches as a broken stub
+// ("native binary not installed"). Keep this generous; a slow network is not
+// an error.
+const AGENT_INSTALL_TIMEOUT_SECS: u64 = 900;
 const AGENT_RUN_TIMEOUT_SECS: u64 = 120;
 const AGENT_THREAD_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 const AGENT_LOGOUT_TIMEOUT_SECS: u64 = 30;

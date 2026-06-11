@@ -281,6 +281,7 @@ import {
   AudioActionRow,
   AudioWidgetShell,
   AudioWidgetCancelButton,
+  AudioWidgetErrorPopover,
   AudioWidgetLockBadge,
   AudioBarShell,
   AudioBarSurface,
@@ -448,6 +449,10 @@ const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
 const AUDIO_WIDGET_BAR_SIZE = { width: 332, height: 52 };
 const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 28;
 const AUDIO_WIDGET_PILL_SIZE = { width: 240, height: 96 };
+// Extra window height for the small error card shown above the bubble; the
+// window shifts up by the same amount so the pill stays put on screen.
+const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
+const AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS = 6500;
 const AUDIO_WIDGET_PILL_BOTTOM_MARGIN = 4;
 const AUDIO_BAR_METER_BARS = 18;
 const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
@@ -523,7 +528,8 @@ function isWindowsPlatform() {
 
 const isFocusedAudioWidgetState = (state) => state === "arming"
   || state === "recording"
-  || state === "transcribing";
+  || state === "transcribing"
+  || state === "error";
 const isBusyAudioWidgetState = (state) => state === "arming"
   || state === "recording"
   || state === "transcribing"
@@ -1904,17 +1910,6 @@ export default function AudioWorkspaceView({
                   <span>Nova-3 + LLM cleanup</span>
                 </span>
               </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={isForgeAgentMode}
-                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT)}
-                type="button"
-              >
-                <ButtonHubIcon aria-hidden="true" />
-                <span>
-                  <strong>Forge Voice</strong>
-                  <span>LLM + streamed speech</span>
-                </span>
-              </AudioModeButton>
             </AudioModeGrid>
             {(isForgeMode || isForgeAgentMode) && (
               <>
@@ -2076,32 +2071,40 @@ export default function AudioWorkspaceView({
           </AudioRecorderPanel>
         </AudioGeneralToolbar>
 
-        {isCloudMode && (
-          <AudioDevicePanel aria-label="Deepgram cloud settings">
+        {(isCloudMode || isForgeMode) && (
+          <AudioDevicePanel aria-label="Cloud transcription settings">
             <AudioDeviceHeader>
               <div>
                 <SettingsLabel>Cloud transcription</SettingsLabel>
-                <SettingsHint>Deepgram Nova-3 streams push-to-talk audio over a live WebSocket.</SettingsHint>
+                <SettingsHint>
+                  {isForgeMode
+                    ? "Diff Forge Cloud streams Nova-3 over a live WebSocket; the language applies to the realtime transcript."
+                    : "Deepgram Nova-3 streams push-to-talk audio over a live WebSocket."}
+                </SettingsHint>
               </div>
-              <AudioStatePill data-installed={deepgramReady}>
-                {deepgramReady ? "Key saved" : "Key required"}
-              </AudioStatePill>
+              {isCloudMode && (
+                <AudioStatePill data-installed={deepgramReady}>
+                  {deepgramReady ? "Key saved" : "Key required"}
+                </AudioStatePill>
+              )}
             </AudioDeviceHeader>
             <AudioCloudGrid>
-              <AudioCloudField>
-                API key
-                <AudioCloudInput
-                  autoComplete="off"
-                  onChange={updateDeepgramApiKey}
-                  placeholder="Deepgram API key"
-                  type="password"
-                  value={deepgramApiKey}
-                />
-              </AudioCloudField>
+              {isCloudMode && (
+                <AudioCloudField>
+                  API key
+                  <AudioCloudInput
+                    autoComplete="off"
+                    onChange={updateDeepgramApiKey}
+                    placeholder="Deepgram API key"
+                    type="password"
+                    value={deepgramApiKey}
+                  />
+                </AudioCloudField>
+              )}
               <AudioCloudField>
                 Language
                 <AudioDeviceSelect
-                  aria-label="Deepgram language"
+                  aria-label="Transcription language"
                   onChange={updateDeepgramLanguage}
                   value={deepgramLanguage}
                 >
@@ -2713,6 +2716,10 @@ export function AudioWidgetWindow() {
   const [audioWidgetTheme, setAudioWidgetTheme] = useState(readAudioWidgetTheme);
   const [widgetStyle, setWidgetStyle] = useState(readAudioWidgetStyle);
   const [recordingLocked, setRecordingLocked] = useState(false);
+  // True the instant the user finishes speaking (released hold, second tap,
+  // finish button): the widget shows the loading phase immediately, even
+  // while the pipeline is still arming or draining the final audio.
+  const [finishPending, setFinishPending] = useState(false);
   const [cancelNotice, setCancelNotice] = useState(null);
   const [cancelNoticePaused, setCancelNoticePaused] = useState(false);
   const audioBufferRef = useRef(null);
@@ -2940,6 +2947,7 @@ export function AudioWidgetWindow() {
     const recordingRunId = recordingRunRef.current + 1;
     recordingRunRef.current = recordingRunId;
     setError("");
+    setFinishPending(false);
     setMessage("Arming buffer");
     setRealtimeTranscript("");
     setWidgetAudioStats(EMPTY_AUDIO_INPUT_STATS);
@@ -3244,6 +3252,14 @@ export function AudioWidgetWindow() {
     });
   }, [barVisible, runWidgetWindowAction, usesBottomAnchoredStyle, widgetStyle]);
 
+  // Bubble-style errors get a small card above the widget: the window grows
+  // upward by the card height while the error shows, and the pill stays at
+  // its original spot on screen. (The resize effect itself is declared after
+  // the frame-mode effect below so its size wins within the same commit.)
+  const errorFrameActive = widgetState === "error"
+    && Boolean(error)
+    && !usesBottomAnchoredStyle;
+
   useEffect(() => {
     if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetStyle === AUDIO_WIDGET_STYLE_PILL) {
       return undefined;
@@ -3336,6 +3352,36 @@ export function AudioWidgetWindow() {
     };
   }, [runWidgetWindowAction, setWidgetFrameMode, widgetStyle, widgetTargetMode]);
 
+  useEffect(() => {
+    if (!errorFrameActive) {
+      return undefined;
+    }
+    let savedPosition = null;
+    runWidgetWindowAction(async (windowHandle) => {
+      const scale = await windowHandle.scaleFactor().catch(() => 1);
+      savedPosition = await windowHandle.outerPosition();
+      await windowHandle.setSize(new LogicalSize(
+        AUDIO_WIDGET_FOCUS_SIZE.width,
+        AUDIO_WIDGET_FOCUS_SIZE.height + AUDIO_WIDGET_ERROR_POPOVER_HEIGHT,
+      ));
+      await windowHandle.setPosition(new PhysicalPosition(
+        savedPosition.x,
+        savedPosition.y - Math.round(AUDIO_WIDGET_ERROR_POPOVER_HEIGHT * (scale || 1)),
+      ));
+    });
+    return () => {
+      runWidgetWindowAction(async (windowHandle) => {
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_FOCUS_SIZE.width,
+          AUDIO_WIDGET_FOCUS_SIZE.height,
+        ));
+        if (savedPosition) {
+          await windowHandle.setPosition(savedPosition);
+        }
+      });
+    };
+  }, [errorFrameActive, runWidgetWindowAction]);
+
   const dragWidget = useCallback((event) => {
     if (event.button !== 0) {
       return;
@@ -3379,8 +3425,10 @@ export function AudioWidgetWindow() {
     pushToTalkDownRef.current = false;
 
     if (widgetStateRef.current === "recording") {
+      setFinishPending(true);
       stopRecordingRef.current?.();
     } else if (widgetStateRef.current === "arming") {
+      setFinishPending(true);
       stopAfterStartRef.current = true;
     }
   }, []);
@@ -3391,6 +3439,7 @@ export function AudioWidgetWindow() {
     if (currentState === "recording") {
       pushToTalkDownRef.current = false;
       stopAfterStartRef.current = false;
+      setFinishPending(true);
       stopRecordingRef.current?.();
       return;
     }
@@ -3398,6 +3447,7 @@ export function AudioWidgetWindow() {
     if (currentState === "arming") {
       pushToTalkDownRef.current = false;
       stopAfterStartRef.current = true;
+      setFinishPending(true);
       return;
     }
 
@@ -3445,9 +3495,11 @@ export function AudioWidgetWindow() {
       pushToTalkDownRef.current = false;
       if (widgetStateRef.current === "recording") {
         stopAfterStartRef.current = false;
+        setFinishPending(true);
         stopRecordingRef.current?.();
       } else if (widgetStateRef.current === "arming") {
         stopAfterStartRef.current = true;
+        setFinishPending(true);
       }
       return;
     }
@@ -3936,9 +3988,11 @@ export function AudioWidgetWindow() {
 
     if (widgetStateRef.current === "recording") {
       stopAfterStartRef.current = false;
+      setFinishPending(true);
       stopRecordingRef.current?.();
     } else if (widgetStateRef.current === "arming") {
       stopAfterStartRef.current = true;
+      setFinishPending(true);
     }
   }, []);
 
@@ -3949,6 +4003,32 @@ export function AudioWidgetWindow() {
       .catch((error) => {
       });
   }, []);
+
+  // The finish-pending loading phase only spans the live pipeline states;
+  // once the run settles (ready, error, reset) the flag clears itself.
+  useEffect(() => {
+    if (
+      widgetState !== "arming"
+      && widgetState !== "recording"
+      && widgetState !== "transcribing"
+    ) {
+      setFinishPending(false);
+    }
+  }, [widgetState]);
+
+  // Errors (cloud dictation failures included) show in the small card above
+  // the widget, then the widget returns to its resting state on its own.
+  useEffect(() => {
+    if (widgetState !== "error") {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      if (widgetStateRef.current === "error") {
+        resetWidgetToStartState();
+      }
+    }, AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS);
+    return () => window.clearTimeout(timer);
+  }, [resetWidgetToStartState, widgetState]);
 
   useEffect(() => {
     stopRecordingRef.current = stopRecording;
@@ -4479,8 +4559,11 @@ export function AudioWidgetWindow() {
   const compactLabel = error
     || message
     || (installed ? "Audio recorder ready" : "Audio recorder setup needed");
-  const isRecordingFocus = widgetState === "recording";
-  const isProcessingFocus = widgetState === "transcribing";
+  // finishPending flips the visual to the loading phase the moment the user
+  // finishes speaking, even while the run is still arming or draining audio.
+  const isProcessingFocus = widgetState === "transcribing"
+    || (finishPending && (widgetState === "arming" || widgetState === "recording"));
+  const isRecordingFocus = widgetState === "recording" && !isProcessingFocus;
   const widgetHasSignal = isProcessingFocus || (isRecordingFocus && widgetLevel >= 6);
   const isOpeningFocus = widgetFrameMode === "opening";
   const isClosingFocus = widgetFrameMode === "closing";
@@ -4602,11 +4685,17 @@ export function AudioWidgetWindow() {
   return (
     <>
       <GlobalStyle />
+      {errorFrameActive && (
+        <AudioWidgetErrorPopover data-theme={audioWidgetTheme} role="alert" title={error}>
+          {error}
+        </AudioWidgetErrorPopover>
+      )}
       <AudioWidgetShell
         aria-label={widgetLabel}
         data-tauri-drag-region
         data-closing={isClosingFocus ? "true" : undefined}
         data-concealed={widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN && !widgetActive ? "true" : undefined}
+        data-error-frame={errorFrameActive ? "true" : undefined}
         data-focus={isFocusedWidget ? "true" : undefined}
         data-handoff={isCompactHandoff ? "true" : undefined}
         data-opening={isOpeningFocus ? "true" : undefined}

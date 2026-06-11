@@ -485,6 +485,13 @@ function hasKnownLimitPercent(limit = {}) {
   ) != null;
 }
 
+function isProviderResetEstimate(limit = {}) {
+  if (!(limit?.client_estimated || limit?.clientEstimated)) return false;
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  const resetLabel = String(limit.reset_label || limit.resetLabel || "");
+  return resetAfterSeconds === 0 && /provider window reset/i.test(resetLabel);
+}
+
 function clientProjectedLimit(limit = {}) {
   const resetDate = limitResetDate(limit);
   if (!resetDate || !hasKnownLimitPercent(limit)) return limit;
@@ -501,10 +508,10 @@ function clientProjectedLimit(limit = {}) {
     used: 0,
     allowance: 100,
     remaining: 100,
-    used_percent: 0,
-    usedPercent: 0,
-    limit_used_percent: 0,
-    limitUsedPercent: 0,
+    used_percent: 100,
+    usedPercent: 100,
+    limit_used_percent: 100,
+    limitUsedPercent: 100,
     remaining_percent: 100,
     remainingPercent: 100,
     reset_after_seconds: 0,
@@ -539,19 +546,26 @@ function mergeLimits(limits, windowKind) {
       ratePoints: [],
     };
   }
+  const resetEstimated = rows.length > 0 && rows.every(isProviderResetEstimate);
   const used = rows.reduce((sum, row) => sum + numeric(row?.used), 0);
   const allowanceValues = rows.map((row) => numeric(row?.allowance)).filter((value) => value > 0);
   const allowance = allowanceValues.length ? allowanceValues.reduce((sum, value) => sum + value, 0) : null;
-  const usedPercent = allowance ? Math.max(0, Math.min(100, Math.round((used / allowance) * 100))) : null;
-  const remainingPercent = usedPercent == null ? null : Math.max(0, 100 - usedPercent);
-  const paceDelta = Math.round(rows.reduce((sum, row) => sum + numeric(row?.pace_delta_percent, row?.paceDeltaPercent), 0) / rows.length);
+  const usedPercent = resetEstimated
+    ? 100
+    : allowance
+      ? Math.max(0, Math.min(100, Math.round((used / allowance) * 100)))
+      : null;
+  const remainingPercent = resetEstimated ? 100 : (usedPercent == null ? null : Math.max(0, 100 - usedPercent));
+  const paceDelta = resetEstimated
+    ? 0
+    : Math.round(rows.reduce((sum, row) => sum + numeric(row?.pace_delta_percent, row?.paceDeltaPercent), 0) / rows.length);
   const plans = [...new Set(rows.map((row) => row?.plan_name || row?.planName).filter(Boolean))];
   const confidences = [...new Set(rows.map((row) => row?.confidence).filter(Boolean))];
   const ratePoints = rows.flatMap((row) => Array.isArray(row?.rate_points || row?.ratePoints) ? (row.rate_points || row.ratePoints) : []);
   const limitSource = rows.find((row) => row?.limit_source || row?.limitSource)?.limit_source || rows.find((row) => row?.limitSource)?.limitSource || "";
   const providerKeys = [...new Set(rows.map(providerKey).filter(Boolean))];
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
-  const paceStatus = limitPaceStatus(rows);
+  const paceStatus = resetEstimated ? "on_pace" : limitPaceStatus(rows);
   const overPace = paceStatus === "over_pace" || paceDelta > 0;
   return {
     windowKind,
@@ -566,7 +580,7 @@ function mergeLimits(limits, windowKind) {
     paceDelta,
     paceStatus,
     overPace,
-    statusLabel: limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
+    statusLabel: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
     resetLabel: limitResetLabel(rows, windowKind, claudeUnavailable),
     ratePoints,
     limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),

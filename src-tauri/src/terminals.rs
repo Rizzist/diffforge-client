@@ -8228,25 +8228,32 @@ fn emit_terminal_prompt_submitted(
     );
     // Prompts typed directly into a coding-agent terminal (no queue todo
     // attached) are captured Rust-side as running todos, so terminal-first
-    // work shows up in todo history even with the window closed.
-    if todo_id.is_none()
+    // work shows up in todo history even with the window closed. The shared
+    // per-pane registry guarantees one capture per prompt across observers
+    // (input gate at write time + UserPromptSubmit hook), and queue/resume
+    // prompts mark the registry so their hook echo never double-counts.
+    let direct_capture_candidate = todo_id.is_none()
         && todo_dispatch_id.is_none()
         && todo_command_id.is_none()
-        && !todo_resume_requested
-    {
-        todo_dispatch_capture_direct_prompt_todo(
-            app,
-            &metadata.workspace_id,
-            &metadata.workspace_name,
-            &metadata.pane_id,
-            metadata.terminal_index.map(u64::from).unwrap_or(0),
-            thread_id_override
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(metadata.thread_id.as_str()),
-            &metadata.agent_kind,
-            prompt,
-        );
+        && !todo_resume_requested;
+    if direct_capture_candidate {
+        if terminal_direct_prompt_should_capture(&metadata.pane_id, prompt) {
+            todo_dispatch_capture_direct_prompt_todo(
+                app,
+                &metadata.workspace_id,
+                &metadata.workspace_name,
+                &metadata.pane_id,
+                metadata.terminal_index.map(u64::from).unwrap_or(0),
+                thread_id_override
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(metadata.thread_id.as_str()),
+                &metadata.agent_kind,
+                prompt,
+            );
+        }
+    } else {
+        terminal_direct_prompt_mark_seen(&metadata.pane_id, prompt);
     }
     let _ = app.emit(
         TERMINAL_PROMPT_SUBMITTED_EVENT,
@@ -9126,6 +9133,113 @@ fn terminal_native_plan_update_from_claude_todos_file(session_id: &str) -> Optio
     Some(json!({ "tool": "todowrite", "steps": steps }))
 }
 
+const TERMINAL_DIRECT_PROMPT_DEDUPE_WINDOW_MS: u64 = 30_000;
+const TERMINAL_DIRECT_PROMPT_DEDUPE_MAX_PER_PANE: usize = 12;
+
+static TERMINAL_RECENT_SUBMITTED_PROMPTS: OnceLock<StdMutex<HashMap<String, Vec<(u64, String)>>>> =
+    OnceLock::new();
+
+fn terminal_direct_prompt_dedupe_key(prompt: &str) -> String {
+    prompt
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(400)
+        .collect()
+}
+
+/// One shared per-pane registry keeps every direct-capture source honest: a
+/// prompt only becomes a terminal-direct todo once, no matter how many
+/// observers see it (input-gate emulation at write time, the provider's
+/// UserPromptSubmit hook moments later, or a queue dispatch that already owns
+/// a todo).
+fn terminal_direct_prompt_registry_apply(pane_id: &str, prompt: &str, record: bool) -> bool {
+    let key = terminal_direct_prompt_dedupe_key(prompt);
+    if key.is_empty() {
+        return true;
+    }
+    let registry =
+        TERMINAL_RECENT_SUBMITTED_PROMPTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut map) = registry.lock() else {
+        return false;
+    };
+    let now = current_time_ms();
+    let entries = map.entry(pane_id.to_string()).or_default();
+    entries.retain(|(at, _)| now.saturating_sub(*at) <= TERMINAL_DIRECT_PROMPT_DEDUPE_WINDOW_MS);
+    let seen = entries.iter().any(|(_, existing)| existing == &key);
+    if !seen && record {
+        if entries.len() >= TERMINAL_DIRECT_PROMPT_DEDUPE_MAX_PER_PANE {
+            entries.remove(0);
+        }
+        entries.push((now, key));
+    }
+    seen
+}
+
+fn terminal_direct_prompt_recently_seen(pane_id: &str, prompt: &str) -> bool {
+    terminal_direct_prompt_registry_apply(pane_id, prompt, false)
+}
+
+fn terminal_direct_prompt_mark_seen(pane_id: &str, prompt: &str) {
+    let _ = terminal_direct_prompt_registry_apply(pane_id, prompt, true);
+}
+
+/// Returns true exactly once per (pane, prompt) inside the dedupe window.
+fn terminal_direct_prompt_should_capture(pane_id: &str, prompt: &str) -> bool {
+    !terminal_direct_prompt_registry_apply(pane_id, prompt, true)
+}
+
+/// Hook-driven prompt registration: the provider's own UserPromptSubmit hook
+/// reports every submitted prompt verbatim — typed, pasted, or recalled from
+/// the TUI history — so prompts entered directly in the CLI register todos
+/// even when the write-time input-gate emulation missed them. Prompts the
+/// app dispatched (queue/composer/resume) were already marked seen at write
+/// time, so this never double-counts.
+fn terminal_hook_prompt_submitted_observe(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    payload: &TerminalActivityHookPayload,
+) {
+    if terminal_activity_hook_name_key(&payload.hook_event_name) != "userpromptsubmit" {
+        return;
+    }
+    let Some(prompt) = payload
+        .user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if is_terminal_control_prompt(prompt) {
+        return;
+    }
+    if terminal_direct_prompt_recently_seen(&payload.pane_id, prompt) {
+        return;
+    }
+
+    emit_terminal_prompt_submitted(
+        app,
+        instance,
+        prompt,
+        None,
+        None,
+        Some("cli-activity-hook"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        Some(prompt),
+        true,
+        "cli_hook_user_prompt_submit",
+        Some(payload.thread_id.as_str()).filter(|value| !value.trim().is_empty()),
+    );
+}
+
 /// Native plan capture: when a provider's own plan/todo tool fires (Claude
 /// TodoWrite/ExitPlanMode, Codex update_plan, OpenCode todowrite), the hook
 /// record carries a normalized planUpdate. Forward it into the coordination
@@ -9413,6 +9527,7 @@ fn spawn_terminal_activity_hook_watcher(
                                 .await;
                             });
                             todo_dispatch_observe_activity_hook(&app, &payload);
+                            terminal_hook_prompt_submitted_observe(&app, &instance, &payload);
                             terminal_native_plan_capture_observe(&instance, &event, &payload);
                             let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
                             if let Some(payload) = architecture_payload {
@@ -12960,6 +13075,31 @@ mod terminal_tests {
             terminal_activity_hook_lifecycle_kind("StopFailure"),
             Some(("provider-turn-error", "error", "error", "failed", true))
         );
+    }
+
+    #[test]
+    fn direct_prompt_registry_captures_once_per_pane_and_prompt() {
+        let pane = format!("test-pane-{}", current_time_ms());
+
+        // First observer wins; the echo (hook after gate, or gate after hook)
+        // is suppressed.
+        assert!(terminal_direct_prompt_should_capture(&pane, "fix the login bug"));
+        assert!(!terminal_direct_prompt_should_capture(&pane, "fix the login bug"));
+        assert!(terminal_direct_prompt_recently_seen(&pane, "  fix   the login bug "));
+
+        // A different prompt on the same pane still captures.
+        assert!(terminal_direct_prompt_should_capture(&pane, "now run the tests"));
+
+        // Queue-dispatched prompts mark the registry up front so the
+        // UserPromptSubmit hook echo never creates a duplicate todo.
+        let queue_pane = format!("{pane}-queue");
+        terminal_direct_prompt_mark_seen(&queue_pane, "queued todo prompt");
+        assert!(terminal_direct_prompt_recently_seen(&queue_pane, "queued todo prompt"));
+        assert!(!terminal_direct_prompt_should_capture(&queue_pane, "queued todo prompt"));
+
+        // Other panes are independent.
+        let other_pane = format!("{pane}-other");
+        assert!(!terminal_direct_prompt_recently_seen(&other_pane, "fix the login bug"));
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("Interrupt"),
             Some((

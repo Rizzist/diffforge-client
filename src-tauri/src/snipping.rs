@@ -1858,8 +1858,8 @@ fn snipping_open_annotation_editor_for_paths(
         WebviewUrl::App(format!("index.html#/snipping-editor/{encoded_paths}").into()),
     )
     .title(if path_values.len() > 1 { "Annotate Assets" } else { "Annotate Snip" })
-    .inner_size(820.0, 600.0)
-    .min_inner_size(360.0, 260.0)
+    .inner_size(840.0, 620.0)
+    .min_inner_size(380.0, 280.0)
     .resizable(true)
     .decorations(false)
     // Normal z-order: clicking the main Diff Forge window brings it in front
@@ -1870,7 +1870,10 @@ fn snipping_open_annotation_editor_for_paths(
     .transparent(true)
     .background_color(Color(0, 0, 0, 0))
     .visible(false)
-    .shadow(true)
+    // The native shadow is computed from the window frame, which paints a
+    // square halo behind the rounded CSS chrome; the webview draws its own
+    // shadow inside a transparent gutter instead.
+    .shadow(false)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
     snipping_center_floating_window(app, &window);
@@ -2054,7 +2057,9 @@ fn snipping_save_edited_untracked_asset_for(
 
     // The original's preview window keeps its label but now shows the edited
     // copy; keep the label -> path map in sync so a later drop consumes the
-    // annotated image, not the stale original.
+    // annotated image, not the stale original. Saving NEVER spawns a new
+    // preview window: if no preview is showing (dismissed, or opened through
+    // the editor directly), the save is just a save.
     if !source_is_edited_copy {
         let preview_label = format!(
             "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
@@ -2064,27 +2069,6 @@ fn snipping_save_edited_untracked_asset_for(
             if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
                 paths.insert(preview_label, target_path.clone());
             }
-        }
-    }
-
-    if !source_is_edited_copy {
-        // No preview is showing the original (already dismissed): give the
-        // fresh edited copy its own preview window instead.
-        let original_label = format!(
-            "{SNIPPING_FLOAT_WINDOW_PREFIX}-{}",
-            snipping_window_token(&source)
-        );
-        if app.get_webview_window(&original_label).is_none() {
-            let app_for_preview = app.clone();
-            let preview_path = target_path.clone();
-            let _ = app.run_on_main_thread(move || {
-                let _ = snipping_open_snip_preview_window_for(
-                    &app_for_preview,
-                    &preview_path,
-                    None,
-                    false,
-                );
-            });
         }
     }
 

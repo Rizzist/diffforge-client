@@ -979,84 +979,55 @@ export function SnippingAnnotationEditorWindow() {
     getCurrentWindow().close().catch(() => {});
   }, []);
 
+  const savedState = status === "Saved" ? "saved" : status === "Saving…" ? "saving" : "idle";
+
   return (
     <>
       <SnipFloatingGlobalStyle />
-      <EditorWindowRoot>
-        <EditorTitleBar data-tauri-drag-region>
-          <div data-tauri-drag-region>
-            <strong data-tauri-drag-region>{multiImage ? "Annotate Selection" : "Annotate"}</strong>
-            <span data-tauri-drag-region>{multiImage ? `${name} · ${activeIndex + 1}/${localPaths.length}` : name}</span>
-          </div>
-          <EditorStatus data-tauri-drag-region>{status}</EditorStatus>
-          <FloatingButton aria-label="Close editor" onClick={closeEditor} title="Close" type="button">
-            <Close aria-hidden="true" />
-          </FloatingButton>
-        </EditorTitleBar>
+      <EditorViewport>
+        <EditorWindowRoot>
+          <EditorTitleBar data-tauri-drag-region>
+            <EditorTitleMeta data-tauri-drag-region>
+              <strong data-tauri-drag-region>{name}</strong>
+              {multiImage && (
+                <span data-tauri-drag-region>{activeIndex + 1} / {localPaths.length}</span>
+              )}
+            </EditorTitleMeta>
+            <EditorStatus data-state={savedState} data-tauri-drag-region>
+              <i aria-hidden="true" />
+              {savedState === "saved" ? "Saved" : savedState === "saving" ? "Saving" : status}
+            </EditorStatus>
+            <FloatingButton aria-label="Close editor" onClick={closeEditor} title="Close" type="button">
+              <Close aria-hidden="true" />
+            </FloatingButton>
+          </EditorTitleBar>
 
-        {multiImage && (
-          <EditorBatchStrip aria-label="Selected images">
-            {localPaths.map((path, index) => {
-              const itemName = assetName({ localPath: path });
-              const itemPreviewUrl = assetPreviewUrl({ localPath: path });
-              const annotationCount = (annotationsByPath[path] || []).length;
-              const active = path === activePath;
-              return (
-                <EditorThumbButton
-                  aria-label={`Edit ${itemName}`}
-                  data-active={active ? "true" : "false"}
-                  key={path}
-                  onClick={() => setActivePath(path)}
-                  title={itemName}
-                  type="button"
-                >
-                  {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
-                  <strong>{index + 1}</strong>
-                  {annotationCount > 0 && <small>{annotationCount}</small>}
-                </EditorThumbButton>
-              );
-            })}
-          </EditorBatchStrip>
-        )}
+          {multiImage && (
+            <EditorBatchStrip aria-label="Selected images">
+              {localPaths.map((path, index) => {
+                const itemName = assetName({ localPath: path });
+                const itemPreviewUrl = assetPreviewUrl({ localPath: path });
+                const annotationCount = (annotationsByPath[path] || []).length;
+                const active = path === activePath;
+                return (
+                  <EditorThumbButton
+                    aria-label={`Edit ${itemName}`}
+                    data-active={active ? "true" : "false"}
+                    key={path}
+                    onClick={() => setActivePath(path)}
+                    title={itemName}
+                    type="button"
+                  >
+                    {itemPreviewUrl ? <img alt="" draggable={false} src={itemPreviewUrl} /> : <span>{index + 1}</span>}
+                    <strong>{index + 1}</strong>
+                    {annotationCount > 0 && <small>{annotationCount}</small>}
+                  </EditorThumbButton>
+                );
+              })}
+            </EditorBatchStrip>
+          )}
 
-        <EditorBody>
-          <EditorToolRail aria-label="Annotation tools">
-            <EditorToolGroup>
-              {TOOL_OPTIONS.map(({ id, label, Icon }) => (
-                <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
-                  <Icon aria-hidden="true" />
-                </EditorToolButton>
-              ))}
-            </EditorToolGroup>
-            <EditorRailDivider aria-hidden="true" />
-            <EditorToolGroup>
-              {COLOR_OPTIONS.map((option) => (
-                <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
-              ))}
-            </EditorToolGroup>
-            <EditorRailDivider aria-hidden="true" />
-            <StrokeControl title={`Stroke ${strokeWidth}`}>
-              <input
-                aria-label="Stroke width"
-                max="14"
-                min="2"
-                onChange={(event) => setStrokeWidth(Number(event.target.value) || 5)}
-                type="range"
-                value={strokeWidth}
-              />
-            </StrokeControl>
-            <EditorRailDivider aria-hidden="true" />
-            <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
-              <Undo aria-hidden="true" />
-            </EditorToolButton>
-            <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
-              <Delete aria-hidden="true" />
-            </EditorToolButton>
-            <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
-              <ContentCopy aria-hidden="true" />
-            </EditorToolButton>
-          </EditorToolRail>
-          <EditorCanvasStage>
+          <EditorStage>
             <canvas
               aria-label="Snip annotation canvas"
               onMouseDown={beginDraw}
@@ -1065,46 +1036,88 @@ export function SnippingAnnotationEditorWindow() {
               onMouseUp={finishDraw}
               ref={canvasRef}
             />
-          </EditorCanvasStage>
-        </EditorBody>
-        <EditorTodoComposer onSubmit={queueTodo}>
-          <EditorTargetSelect
-            aria-label="Target workspace"
-            onChange={(event) => setTargetWorkspaceId(event.target.value)}
-            value={targetWorkspaceId}
-          >
-            {!dispatchTargets.length && <option value="">No workspaces</option>}
-            {dispatchTargets.map((target) => (
-              <option key={target.workspaceId} value={target.workspaceId}>
-                {target.workspaceName || target.workspaceId}
-              </option>
-            ))}
-          </EditorTargetSelect>
-          <EditorTargetSelect
-            aria-label="Target terminal"
-            disabled={!(targetWorkspace?.threads || []).length}
-            onChange={(event) => setTargetThreadId(event.target.value)}
-            value={targetThreadId}
-          >
-            <option value="">Any terminal</option>
-            {(targetWorkspace?.threads || []).map((thread) => (
-              <option key={thread.threadId} value={thread.threadId}>
-                {thread.label}
-              </option>
-            ))}
-          </EditorTargetSelect>
-          <input
-            aria-label="Todo for coding agent"
-            onChange={(event) => setTodoDraft(event.target.value)}
-            placeholder="Circle an area, describe the fix, send it to a coding agent..."
-            value={todoDraft}
-          />
-          <EditorTodoSendButton disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
-            <Send aria-hidden="true" />
-            <span>Queue todo</span>
-          </EditorTodoSendButton>
-        </EditorTodoComposer>
-      </EditorWindowRoot>
+            <EditorFloatingRail aria-label="Annotation tools">
+              <EditorToolGroup>
+                {TOOL_OPTIONS.map(({ id, label, Icon }) => (
+                  <EditorToolButton aria-label={label} data-active={tool === id} key={id} onClick={() => setTool(id)} title={label} type="button">
+                    <Icon aria-hidden="true" />
+                  </EditorToolButton>
+                ))}
+              </EditorToolGroup>
+              <EditorRailDivider aria-hidden="true" />
+              <EditorToolGroup data-compact="true">
+                {COLOR_OPTIONS.map((option) => (
+                  <ColorButton aria-label={`Use ${option}`} data-active={color === option} key={option} onClick={() => setColor(option)} style={{ "--snip-color": option }} title={option} type="button" />
+                ))}
+              </EditorToolGroup>
+              <EditorRailDivider aria-hidden="true" />
+              <EditorToolGroup data-compact="true">
+                {[3, 5, 9].map((size) => (
+                  <SizeDotButton
+                    aria-label={`Stroke size ${size}`}
+                    data-active={strokeWidth === size ? "true" : "false"}
+                    key={size}
+                    onClick={() => setStrokeWidth(size)}
+                    title={`Stroke ${size}`}
+                    type="button"
+                  >
+                    <i aria-hidden="true" style={{ width: size + 3, height: size + 3 }} />
+                  </SizeDotButton>
+                ))}
+              </EditorToolGroup>
+              <EditorRailDivider aria-hidden="true" />
+              <EditorToolGroup>
+                <EditorToolButton aria-label="Undo" disabled={!annotations.length} onClick={undo} title="Undo" type="button">
+                  <Undo aria-hidden="true" />
+                </EditorToolButton>
+                <EditorToolButton aria-label="Clear annotations" disabled={!annotations.length} onClick={() => { updateActiveAnnotations([]); setStatus("Cleared"); }} title="Clear" type="button">
+                  <Delete aria-hidden="true" />
+                </EditorToolButton>
+                <EditorToolButton aria-label="Copy annotated image" onClick={copyCanvas} title="Copy image" type="button">
+                  <ContentCopy aria-hidden="true" />
+                </EditorToolButton>
+              </EditorToolGroup>
+            </EditorFloatingRail>
+          </EditorStage>
+
+          <EditorComposer onSubmit={queueTodo}>
+            <EditorTargetSelect
+              aria-label="Target workspace"
+              onChange={(event) => setTargetWorkspaceId(event.target.value)}
+              value={targetWorkspaceId}
+            >
+              {!dispatchTargets.length && <option value="">No workspaces</option>}
+              {dispatchTargets.map((target) => (
+                <option key={target.workspaceId} value={target.workspaceId}>
+                  {target.workspaceName || target.workspaceId}
+                </option>
+              ))}
+            </EditorTargetSelect>
+            <EditorTargetSelect
+              aria-label="Target terminal"
+              disabled={!(targetWorkspace?.threads || []).length}
+              onChange={(event) => setTargetThreadId(event.target.value)}
+              value={targetThreadId}
+            >
+              <option value="">Any terminal</option>
+              {(targetWorkspace?.threads || []).map((thread) => (
+                <option key={thread.threadId} value={thread.threadId}>
+                  {thread.label}
+                </option>
+              ))}
+            </EditorTargetSelect>
+            <input
+              aria-label="Todo for coding agent"
+              onChange={(event) => setTodoDraft(event.target.value)}
+              placeholder="Circle an area, describe the fix, send it to an agent…"
+              value={todoDraft}
+            />
+            <EditorSendButton aria-label="Queue todo with this image" disabled={!todoDraft.trim()} title="Queue todo with this image" type="submit">
+              <Send aria-hidden="true" />
+            </EditorSendButton>
+          </EditorComposer>
+        </EditorWindowRoot>
+      </EditorViewport>
     </>
   );
 }
@@ -1243,17 +1256,29 @@ const FloatingButton = styled.button`
   }
 `;
 
+// Transparent gutter so the rounded chrome and its CSS shadow render fully
+// inside the (shadowless, transparent) native window.
+const EditorViewport = styled.div`
+  width: 100vw;
+  height: 100vh;
+  padding: 12px;
+  background: transparent;
+`;
+
 const EditorWindowRoot = styled.main`
   display: flex;
   flex-direction: column;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  background: rgba(9, 11, 16, 0.97);
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 18px;
+  background: rgba(8, 10, 15, 0.97);
   color: #f8fafc;
-  clip-path: inset(0 round 14px);
+  clip-path: inset(0 round 18px);
+  box-shadow:
+    0 28px 80px rgba(0, 0, 0, 0.55),
+    0 4px 18px rgba(0, 0, 0, 0.4);
   font-family:
     Inter,
     ui-sans-serif,
@@ -1269,21 +1294,20 @@ const EditorTitleBar = styled.header`
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
-  min-height: 42px;
-  padding: 8px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-  background: rgba(13, 16, 23, 0.85);
+  min-height: 40px;
+  padding: 7px 10px 7px 14px;
   cursor: grab;
 
   &:active {
     cursor: grabbing;
   }
+`;
 
-  > div {
-    display: grid;
-    min-width: 0;
-    gap: 2px;
-  }
+const EditorTitleMeta = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
 
   strong,
   span {
@@ -1294,21 +1318,47 @@ const EditorTitleBar = styled.header`
   }
 
   strong {
-    font-size: 13px;
-    font-weight: 850;
+    font-size: 12.5px;
+    font-weight: 800;
+    letter-spacing: 0.01em;
   }
 
   span {
-    color: rgba(248, 250, 252, 0.58);
+    flex: none;
+    color: rgba(248, 250, 252, 0.5);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: 750;
   }
 `;
 
+// Auto-save indicator: a quiet dot + word, never a button.
 const EditorStatus = styled.span`
-  color: rgba(248, 250, 252, 0.62);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(248, 250, 252, 0.55);
   font-size: 11px;
   font-weight: 750;
+  white-space: nowrap;
+
+  i {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.7);
+  }
+
+  &[data-state="saved"] {
+    color: rgba(187, 247, 208, 0.85);
+  }
+
+  &[data-state="saved"] i {
+    background: #4ade80;
+  }
+
+  &[data-state="saving"] i {
+    background: #60a5fa;
+  }
 `;
 
 // Thin, horizontally scrollable strip of the other selected images.
@@ -1319,9 +1369,7 @@ const EditorBatchStrip = styled.div`
   gap: 6px;
   min-width: 0;
   overflow-x: auto;
-  padding: 5px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.92);
+  padding: 4px 12px 8px;
   scrollbar-width: thin;
 `;
 
@@ -1390,111 +1438,20 @@ const EditorThumbButton = styled.button`
   }
 `;
 
-const EditorBody = styled.div`
-  display: flex;
-  flex: 1;
-  min-height: 0;
-  min-width: 0;
-`;
-
-// Slim vertical tool rail hugging the left edge; the canvas owns the rest.
-const EditorToolRail = styled.nav`
-  display: flex;
-  flex: none;
-  flex-direction: column;
-  align-items: center;
-  gap: 8px;
-  width: 46px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  padding: 10px 0;
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(9, 12, 18, 0.92);
-  scrollbar-width: thin;
-`;
-
-const EditorRailDivider = styled.span`
-  width: 22px;
-  height: 1px;
-  flex: none;
-  background: rgba(255, 255, 255, 0.1);
-`;
-
-const EditorToolGroup = styled.div`
-  display: flex;
-  flex: none;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-`;
-
-const EditorToolButton = styled.button`
-  display: inline-grid;
-  width: 32px;
-  height: 32px;
-  place-items: center;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 9px;
-  color: #f8fafc;
-  background: rgba(255, 255, 255, 0.055);
-  cursor: pointer;
-
-  svg {
-    width: 18px;
-    height: 18px;
-  }
-
-  &[data-active="true"],
-  &:hover:not(:disabled) {
-    border-color: rgba(147, 197, 253, 0.44);
-    background: rgba(59, 130, 246, 0.22);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.42;
-  }
-`;
-
-const ColorButton = styled.button`
-  width: 24px;
-  height: 24px;
-  border: 2px solid rgba(255, 255, 255, 0.2);
-  border-radius: 999px;
-  background: var(--snip-color);
-  cursor: pointer;
-
-  &[data-active="true"] {
-    border-color: #f8fafc;
-    box-shadow: 0 0 0 2px rgba(147, 197, 253, 0.42);
-  }
-`;
-
-const StrokeControl = styled.label`
-  display: flex;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-
-  input {
-    width: 20px;
-    height: 72px;
-    -webkit-appearance: slider-vertical;
-    writing-mode: vertical-lr;
-    direction: rtl;
-  }
-`;
-
-const EditorCanvasStage = styled.section`
+// The canvas owns the whole stage; the tools float over it as a glass pill
+// hugging the artwork's left edge — annotation controls live "around the
+// thing", not in app chrome.
+const EditorStage = styled.section`
+  position: relative;
   display: grid;
   flex: 1;
   min-width: 0;
   min-height: 0;
   place-items: center;
-  overflow: auto;
-  padding: 8px;
+  overflow: hidden;
+  padding: 14px 14px 14px 68px;
   background:
-    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.12), transparent 40%),
+    radial-gradient(circle at 50% 0%, rgba(59, 130, 246, 0.1), transparent 42%),
     #05070b;
 
   canvas {
@@ -1504,74 +1461,211 @@ const EditorCanvasStage = styled.section`
     border-radius: 10px;
     box-shadow:
       0 24px 70px rgba(0, 0, 0, 0.5),
-      0 0 0 1px rgba(255, 255, 255, 0.08);
+      0 0 0 1px rgba(230, 236, 245, 0.08);
     cursor: crosshair;
   }
 `;
 
-const EditorTargetSelect = styled.select`
-  max-width: 160px;
-  padding: 8px 9px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  color: #f8fafc;
-  background: rgba(15, 20, 28, 0.9);
-  font-size: 11.5px;
-  font-weight: 650;
+const EditorFloatingRail = styled.nav`
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 7px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  background: rgba(10, 13, 19, 0.86);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+  transform: translateY(-50%);
+  scrollbar-width: none;
 
-  &:disabled {
-    opacity: 0.5;
+  &::-webkit-scrollbar {
+    display: none;
   }
 `;
 
-const EditorTodoComposer = styled.form`
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
+const EditorRailDivider = styled.span`
+  width: 18px;
+  height: 1px;
+  flex: none;
+  background: rgba(230, 236, 245, 0.12);
+`;
+
+const EditorToolGroup = styled.div`
+  display: flex;
+  flex: none;
+  flex-direction: column;
   align-items: center;
+  gap: 5px;
+
+  &[data-compact="true"] {
+    gap: 6px;
+  }
+`;
+
+const EditorToolButton = styled.button`
+  display: inline-grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.78);
+  background: transparent;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  &:hover:not(:disabled) {
+    color: #ffffff;
+    background: rgba(230, 236, 245, 0.1);
+  }
+
+  &[data-active="true"] {
+    color: #ffffff;
+    background: rgba(59, 130, 246, 0.42);
+    box-shadow: 0 0 0 1px rgba(147, 197, 253, 0.38);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.35;
+  }
+`;
+
+const ColorButton = styled.button`
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 1px solid rgba(230, 236, 245, 0.25);
+  border-radius: 999px;
+  background: var(--snip-color);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+
+  &:hover {
+    transform: scale(1.15);
+  }
+
+  &[data-active="true"] {
+    box-shadow:
+      0 0 0 2px rgba(8, 10, 15, 0.95),
+      0 0 0 4px var(--snip-color);
+    transform: scale(1.05);
+  }
+`;
+
+const SizeDotButton = styled.button`
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+
+  i {
+    display: block;
+    border-radius: 999px;
+    background: rgba(248, 250, 252, 0.55);
+    transition: background 120ms ease;
+  }
+
+  &:hover i {
+    background: rgba(248, 250, 252, 0.85);
+  }
+
+  &[data-active="true"] {
+    background: rgba(59, 130, 246, 0.32);
+  }
+
+  &[data-active="true"] i {
+    background: #ffffff;
+  }
+`;
+
+const EditorTargetSelect = styled.select`
+  height: 32px;
+  max-width: 150px;
+  padding: 0 9px;
+  border: 1px solid rgba(230, 236, 245, 0.12);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.85);
+  background: rgba(230, 236, 245, 0.06);
+  font-size: 11px;
+  font-weight: 750;
+  outline: none;
+  cursor: pointer;
+
+  &:hover:not(:disabled),
+  &:focus {
+    border-color: rgba(147, 197, 253, 0.4);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.45;
+  }
+`;
+
+const EditorComposer = styled.form`
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
   padding: 10px 12px 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  background:
-    linear-gradient(180deg, rgba(9, 12, 18, 0.86), rgba(7, 10, 16, 0.98)),
-    #070a10;
+  background: transparent;
 
   input {
+    flex: 1;
     min-width: 0;
-    height: 40px;
-    padding: 0 15px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    height: 36px;
+    padding: 0 14px;
+    border: 1px solid rgba(230, 236, 245, 0.12);
     border-radius: 999px;
     color: #f8fafc;
-    background: rgba(255, 255, 255, 0.055);
+    background: rgba(230, 236, 245, 0.06);
     font: inherit;
     font-size: 12px;
-    font-weight: 750;
+    font-weight: 700;
     outline: none;
   }
 
   input::placeholder {
-    color: rgba(248, 250, 252, 0.42);
+    color: rgba(248, 250, 252, 0.4);
   }
 
   input:focus {
-    border-color: rgba(147, 197, 253, 0.48);
-    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.14);
+    border-color: rgba(147, 197, 253, 0.45);
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
   }
 `;
 
-const EditorTodoSendButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  height: 40px;
-  padding: 0 14px;
+const EditorSendButton = styled.button`
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  flex: none;
+  place-items: center;
   border: 1px solid rgba(147, 197, 253, 0.34);
   border-radius: 999px;
   color: #e0f2fe;
-  background: rgba(37, 99, 235, 0.28);
+  background: rgba(37, 99, 235, 0.32);
   cursor: pointer;
-  font-size: 12px;
-  font-weight: 850;
+  transition: background 120ms ease;
 
   svg {
     width: 16px;
@@ -1580,11 +1674,11 @@ const EditorTodoSendButton = styled.button`
 
   &:hover:not(:disabled) {
     border-color: rgba(147, 197, 253, 0.56);
-    background: rgba(37, 99, 235, 0.42);
+    background: rgba(37, 99, 235, 0.5);
   }
 
   &:disabled {
     cursor: default;
-    opacity: 0.46;
+    opacity: 0.4;
   }
 `;

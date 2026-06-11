@@ -6528,6 +6528,10 @@ export const AudioStatusGrid = styled(VaultStatusGrid)`
 export const AudioGeneralToolbar = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* Panels take only the height their content needs; without this the grid
+     stretches both panels to the tallest one and the options jump around
+     when switching providers. */
+  align-items: start;
   gap: 10px;
   min-width: 0;
 
@@ -6538,6 +6542,7 @@ export const AudioGeneralToolbar = styled.div`
 
 export const AudioProviderPanel = styled.section`
   display: grid;
+  align-content: start;
   min-width: 0;
   gap: 10px;
   padding: 12px;
@@ -7896,6 +7901,18 @@ export const AudioWidgetShell = styled.main`
     pointer-events: none;
   }
 
+  /* Error frame: the window grew upward to fit the error card, so the pill
+     pins to the bottom 64px and keeps its shape. */
+  &[data-error-frame="true"] {
+    position: fixed;
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: auto;
+    height: 64px;
+  }
+
   &::before,
   &::after {
     content: "";
@@ -7998,6 +8015,39 @@ export const AudioWidgetShell = styled.main`
   &[data-handoff="true"]::before,
   &[data-handoff="true"]::after {
     transition: none;
+  }
+`;
+
+// Small error card shown above the bubble widget while a dictation run
+// fails (cloud stream errors included); the widget window grows upward to
+// make room and the card auto-dismisses with the error state.
+export const AudioWidgetErrorPopover = styled.div`
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  max-height: 54px;
+  overflow: hidden;
+  margin: 2px 2px 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(239, 107, 107, 0.42);
+  border-radius: 12px;
+  color: #ffd9d9;
+  background: rgba(46, 14, 18, 0.96);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  pointer-events: none;
+  word-break: break-word;
+
+  &[data-theme="light"] {
+    border-color: rgba(217, 72, 72, 0.45);
+    color: #8c1d1d;
+    background: rgba(255, 236, 236, 0.97);
   }
 `;
 

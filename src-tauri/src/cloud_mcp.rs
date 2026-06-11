@@ -2472,6 +2472,23 @@ fn cloud_mcp_jwt_is_fresh(expires_ms: Option<u64>, now_ms: u64) -> bool {
     })
 }
 
+/// The server just rejected our bearer (401): the cached JWT is dead no
+/// matter what its bookkeeping says, so drop it and force a re-mint on the
+/// next attempt instead of replaying the rejected token until its TTL lapses.
+fn cloud_mcp_invalidate_cached_appwrite_jwt() {
+    if let Ok(mut cache) = cloud_mcp_process_auth_cache().lock() {
+        cache.appwrite_jwt = None;
+        cache.appwrite_jwt_expires_ms = None;
+    }
+}
+
+async fn cloud_mcp_invalidate_appwrite_jwt(state: &CloudMcpState) {
+    cloud_mcp_invalidate_cached_appwrite_jwt();
+    let mut auth = state.auth.lock().await;
+    auth.appwrite_jwt = None;
+    auth.appwrite_jwt_expires_ms = None;
+}
+
 fn cloud_mcp_bearer_header(token: &str, label: &str) -> Result<HeaderValue, String> {
     let token = cloud_mcp_clean_bearer_token(token)
         .ok_or_else(|| format!("{label} is invalid for an Authorization header."))?;
@@ -3499,7 +3516,36 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
             runtime.base_url.clone()
         };
         cloud_mcp_set_global_ws_phase(&state, "resolving_route", "resolving_route").await;
-        let target = cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await;
+        // Direct-only policy: the balancer is a route directory, never a
+        // websocket proxy. If no direct route resolves, stay in retrying and
+        // resolve again on the next loop pass instead of proxying traffic.
+        let target = match cloud_mcp_resolve_ws_target(&state, &base_url, "/v1/app/ws").await {
+            Ok(target) => target,
+            Err(error) => {
+                if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
+                    state.global_ws_started.store(false, Ordering::SeqCst);
+                    return;
+                }
+                if error.contains("401") {
+                    cloud_mcp_invalidate_appwrite_jwt(&state).await;
+                }
+                {
+                    let mut runtime = state.inner.lock().await;
+                    runtime.connected = false;
+                    runtime.status = "websocket_retrying".to_string();
+                    runtime.last_error = format!("Cloud MCP direct route unavailable: {error}");
+                    runtime.global_ws_connected = false;
+                    runtime.global_ws_status = "retrying".to_string();
+                    runtime.global_ws_last_error = clean_terminal_telemetry_text(&error);
+                }
+                cloud_mcp_note_sync_connection(false, "websocket_retrying");
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(2)) => {}
+                    _ = state.global_ws_reconnect.notified() => {}
+                }
+                continue;
+            }
+        };
         if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
             state.global_ws_started.store(false, Ordering::SeqCst);
             return;
@@ -3522,6 +3568,12 @@ async fn cloud_mcp_global_ws_loop(state: CloudMcpState) {
                 if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
                     state.global_ws_started.store(false, Ordering::SeqCst);
                     return;
+                }
+                // A 401 means the server rejected our bearer regardless of
+                // its local freshness bookkeeping; re-mint before the next
+                // attempt instead of looping the same rejected token.
+                if error.contains("401") {
+                    cloud_mcp_invalidate_appwrite_jwt(&state).await;
                 }
                 {
                     let mut runtime = state.inner.lock().await;
@@ -3573,7 +3625,7 @@ fn cloud_mcp_log_voice_shared_ws(
 
 async fn cloud_mcp_open_global_ws(
     state: &CloudMcpState,
-    base_url: &str,
+    _base_url: &str,
     target: &CloudMcpWsTarget,
 ) -> Result<(), String> {
     cloud_mcp_record_signin_diagnostic(
@@ -3675,68 +3727,13 @@ async fn cloud_mcp_open_global_ws(
     };
 
     cloud_mcp_set_global_ws_phase(state, "opening_websocket", "opening_websocket").await;
-    let mut opened_target = target.clone();
+    let opened_target = target.clone();
     let request = build_request(&opened_target)?;
+    // Direct-only policy: a failed direct connect returns to the reconnect
+    // loop (which re-resolves a fresh route) instead of proxying through the
+    // balancer.
     let (stream, response) = match connect_async(request).await {
         Ok(result) => result,
-        Err(error)
-            if opened_target.route_token.is_some()
-                || opened_target.transport == "local_docker_cloud" =>
-        {
-            let direct_message = format!("Unable to open Cloud MCP app websocket: {error}");
-            cloud_mcp_record_connection_diagnostic(
-                state,
-                "rust.cloud_mcp.websocket.open",
-                "warn",
-                "Selected Cloud MCP app websocket failed; retrying through balancer.",
-                json!({
-                    "ws_url": opened_target.ws_url,
-                    "transport": opened_target.transport,
-                    "clientIdentity": "appwrite_account",
-                    "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
-                    "hasDirectRouteHeader": opened_target.route_token.is_some(),
-                    "directError": clean_terminal_telemetry_text(&direct_message),
-                }),
-            )
-            .await;
-            let fallback = cloud_mcp_fallback_ws_target(base_url, "/v1/app/ws");
-            let fallback_request = build_request(&fallback)?;
-            match connect_async(fallback_request).await {
-                Ok(result) => {
-                    opened_target = fallback;
-                    result
-                }
-                Err(fallback_error) => {
-                    let message = format!(
-                        "{direct_message}; fallback via balancer also failed: {fallback_error}"
-                    );
-                    cloud_mcp_record_signin_diagnostic(
-                        state,
-                        "websocket.open",
-                        "error",
-                        &message,
-                        json!({"ws_url": opened_target.ws_url, "transport": opened_target.transport}),
-                    )
-                    .await;
-                    cloud_mcp_record_connection_diagnostic(
-                        state,
-                        "rust.cloud_mcp.websocket.open",
-                        "error",
-                        &message,
-                        json!({
-                            "ws_url": opened_target.ws_url,
-                            "transport": opened_target.transport,
-                            "clientIdentity": "appwrite_account",
-                            "sourceClientId": CLOUD_MCP_RUST_CLIENT_ID,
-                            "hasDirectRouteHeader": true,
-                            "fallbackTransport": "balancer_proxy",
-                        }),
-                    )
-                    .await;
-                    return Err(message);
-                }
-            }
-        }
         Err(error) => {
             let message = format!("Unable to open Cloud MCP app websocket: {error}");
             cloud_mcp_record_signin_diagnostic(
@@ -3852,6 +3849,35 @@ async fn cloud_mcp_open_global_ws(
                     break Err(format!(
                         "Cloud MCP app websocket keepalive ping failed (write failed): {error}"
                     ));
+                }
+                // Application-level keepalive too: balancer/node websocket
+                // proxies may not forward protocol Ping/Pong frames, which
+                // would make a healthy idle connection look silent and trip
+                // the watchdog every 90s (an endless Connecting loop). The
+                // server answers kind=ping with a kind=pong Text frame, which
+                // every proxy forwards and which refreshes last_inbound_at.
+                let message_auth = {
+                    let runtime = state.inner.lock().await;
+                    runtime
+                        .global_ws_connection_id
+                        .clone()
+                        .zip(runtime.global_ws_message_token.clone())
+                };
+                if let Some((connection_id, message_token)) = message_auth {
+                    let envelope = json!({
+                        "kind": "ping",
+                        "id": format!("keepalive-{}", cloud_mcp_now_ms()),
+                        "contract": "diffforge.app_ws.v1",
+                        "auth": {
+                            "connection_id": connection_id,
+                            "message_token": message_token,
+                        },
+                    });
+                    if let Err(error) = write.send(Message::Text(envelope.to_string().into())).await {
+                        break Err(format!(
+                            "Cloud MCP app websocket keepalive ping failed (write failed): {error}"
+                        ));
+                    }
                 }
             }
             incoming = read.next() => {
@@ -6919,7 +6945,7 @@ async fn cloud_mcp_resolve_ws_target(
     state: &CloudMcpState,
     base_url: &str,
     endpoint_path: &str,
-) -> CloudMcpWsTarget {
+) -> Result<CloudMcpWsTarget, String> {
     if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
         if cloud_mcp_ws_target_reachable_async(&target.ws_url).await {
             cloud_mcp_record_signin_diagnostic(
@@ -6930,19 +6956,18 @@ async fn cloud_mcp_resolve_ws_target(
                 json!({"transport": target.transport, "ws_url": target.ws_url}),
             )
             .await;
-            return target;
+            return Ok(target);
         }
         cloud_mcp_record_signin_diagnostic(
             state,
             "route.resolve",
             "warn",
-            "Cloud MCP local Docker websocket route is not listening; falling back to balancer",
+            "Cloud MCP local Docker websocket route is not listening; resolving direct route",
             json!({"transport": target.transport, "ws_url": target.ws_url}),
         )
         .await;
     }
 
-    let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
     cloud_mcp_set_global_ws_phase(state, "authenticating", "authenticating").await;
     let bearer = match cloud_mcp_authorization_bearer(state).await {
         Ok(token) => token,
@@ -6954,21 +6979,25 @@ async fn cloud_mcp_resolve_ws_target(
                     json!({"source": "route.resolve"}),
                 )
                 .await;
-                return fallback;
+                return Err(error);
             }
+            let message = format!("Unable to prepare Cloud MCP route auth: {error}");
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
                 "error",
-                &format!("Unable to prepare Cloud MCP route auth: {error}"),
-                json!({"transport": "balancer_fallback"}),
+                &message,
+                json!({"transport": "direct_route_unavailable"}),
             )
             .await;
-            return fallback;
+            return Err(message);
         }
     };
     let Some(bearer) = bearer else {
-        return fallback;
+        return Err(
+            "Cloud MCP auth token is unavailable; waiting for sign-in before resolving a route."
+                .to_string(),
+        );
     };
 
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
@@ -7009,19 +7038,31 @@ async fn cloud_mcp_resolve_ws_target(
                 json!({"transport": target.transport, "ws_url": target.ws_url}),
             )
             .await;
-            target
+            Ok(target)
         }
-        Ok(None) => fallback,
-        Err(error) => {
+        Ok(None) => {
+            let message = "Balancer did not offer a direct route (direct routing disabled or backend unsupported).".to_string();
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "route.resolve",
                 "error",
-                &format!("Cloud MCP direct route unavailable: {error}"),
-                json!({"transport": "balancer_fallback"}),
+                &message,
+                json!({"transport": "direct_route_unavailable"}),
             )
             .await;
-            fallback
+            Err(message)
+        }
+        Err(error) => {
+            let message = format!("Cloud MCP direct route unavailable: {error}");
+            cloud_mcp_record_signin_diagnostic(
+                state,
+                "route.resolve",
+                "error",
+                &message,
+                json!({"transport": "direct_route_unavailable"}),
+            )
+            .await;
+            Err(message)
         }
     }
 }
@@ -7067,11 +7108,15 @@ async fn cloud_mcp_asset_http_target_async(
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
     let base_url = cloud_mcp_base_url();
-    let target = cloud_mcp_resolve_ws_target(state, &base_url, endpoint_path).await;
-    cloud_mcp_http_url_from_ws_url(&target.ws_url)
+    let target = cloud_mcp_resolve_ws_target(state, &base_url, endpoint_path)
+        .await
+        .ok();
+    target
+        .as_ref()
+        .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
         .map(|url| CloudMcpAssetHttpTarget {
             url,
-            route_token: target.route_token,
+            route_token: target.as_ref().and_then(|target| target.route_token.clone()),
         })
         .unwrap_or_else(|| CloudMcpAssetHttpTarget {
             url: fallback_url.to_string(),
@@ -7084,11 +7129,13 @@ fn cloud_mcp_asset_http_target_blocking(
     fallback_url: &str,
 ) -> CloudMcpAssetHttpTarget {
     let base_url = cloud_mcp_base_url();
-    let target = cloud_mcp_proxy_resolve_blocking_target(&base_url, endpoint_path);
-    cloud_mcp_http_url_from_ws_url(&target.ws_url)
+    let target = cloud_mcp_proxy_resolve_blocking_target(&base_url, endpoint_path).ok();
+    target
+        .as_ref()
+        .and_then(|target| cloud_mcp_http_url_from_ws_url(&target.ws_url))
         .map(|url| CloudMcpAssetHttpTarget {
             url,
-            route_token: target.route_token,
+            route_token: target.as_ref().and_then(|target| target.route_token.clone()),
         })
         .unwrap_or_else(|| CloudMcpAssetHttpTarget {
             url: fallback_url.to_string(),
@@ -7412,20 +7459,6 @@ fn cloud_mcp_direct_target_from_route(
             .unwrap_or("direct_cloud_container")
             .to_string(),
     })
-}
-
-fn cloud_mcp_fallback_ws_target(base_url: &str, endpoint_path: &str) -> CloudMcpWsTarget {
-    let ws_url = if endpoint_path == "/v1/app/ws" {
-        cloud_mcp_app_ws_url(base_url)
-    } else {
-        cloud_mcp_proxy_websocket_url(base_url, endpoint_path)
-            .unwrap_or_else(|_| cloud_mcp_app_ws_url(base_url))
-    };
-    CloudMcpWsTarget {
-        ws_url,
-        route_token: None,
-        transport: "balancer_proxy".to_string(),
-    }
 }
 
 async fn cloud_mcp_replay_runtime_snapshots(
@@ -27940,7 +27973,7 @@ fn cloud_mcp_proxy_post_json_endpoint(
         .unwrap_or_else(|| "desktop-primary".to_string());
     let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
     let (plan_name, device_limit) = cloud_mcp_process_account_plan();
-    let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws");
+    let target = cloud_mcp_proxy_resolve_blocking_target(base_url, "/v1/app/ws")?;
     let build_request = |target: &CloudMcpWsTarget| -> Result<
         tokio_tungstenite::tungstenite::http::Request<()>,
         String,
@@ -28009,12 +28042,18 @@ fn cloud_mcp_proxy_post_json_endpoint(
                     .map_err(|error| format!("Invalid Cloud MCP repo id header: {error}"))?,
             );
         }
-        if let Some(token) = cloud_mcp_process_authorization_bearer() {
-            request.headers_mut().insert(
-                "authorization",
-                cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
-            );
-        }
+        // Never connect unauthenticated: a missing bearer guarantees a
+        // balancer 401 ("Appwrite bearer token missing") and wastes a
+        // connection attempt. Failing fast keeps the outbox retry/backoff
+        // honest and the error legible.
+        let token = cloud_mcp_process_authorization_bearer().ok_or_else(|| {
+            "Cloud MCP auth token is unavailable; waiting for sign-in or auth refresh."
+                .to_string()
+        })?;
+        request.headers_mut().insert(
+            "authorization",
+            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
+        );
         if let Some(route_token) = target.route_token.as_deref() {
             request.headers_mut().insert(
                 "x-diffforge-direct-route-token",
@@ -28026,18 +28065,17 @@ fn cloud_mcp_proxy_post_json_endpoint(
     };
 
     let request = build_request(&target)?;
+    // Direct-only policy: failures surface to the outbox retry/backoff, which
+    // re-resolves a fresh direct route on the next attempt.
     let (mut websocket, _) = match tokio_tungstenite::tungstenite::connect(request) {
         Ok(result) => result,
-        Err(error) if target.route_token.is_some() || target.transport == "local_docker_cloud" => {
-            let fallback = cloud_mcp_fallback_ws_target(base_url, "/v1/app/ws");
-            let fallback_request = build_request(&fallback)?;
-            tokio_tungstenite::tungstenite::connect(fallback_request).map_err(|fallback_error| {
-                format!(
-                    "Unable to open Cloud MCP websocket via direct route ({error}); fallback via balancer also failed: {fallback_error}"
-                )
-            })?
+        Err(error) => {
+            let message = format!("Unable to open Cloud MCP websocket: {error}");
+            if message.contains("401") {
+                cloud_mcp_invalidate_cached_appwrite_jwt();
+            }
+            return Err(message);
         }
-        Err(error) => return Err(format!("Unable to open Cloud MCP websocket: {error}")),
     };
     let ready_text = cloud_mcp_proxy_read_blocking_ws_text(&mut websocket)?;
     let ready = serde_json::from_str::<Value>(&ready_text)
@@ -28124,20 +28162,23 @@ fn cloud_mcp_proxy_websocket_url(base_url: &str, endpoint_path: &str) -> Result<
 fn cloud_mcp_proxy_resolve_blocking_target(
     base_url: &str,
     endpoint_path: &str,
-) -> CloudMcpWsTarget {
-    let fallback = cloud_mcp_fallback_ws_target(base_url, endpoint_path);
+) -> Result<CloudMcpWsTarget, String> {
     if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
         if cloud_mcp_ws_target_reachable_blocking(&target.ws_url) {
-            return target;
+            return Ok(target);
         }
     }
     let Some(bearer) = cloud_mcp_process_authorization_bearer() else {
-        return fallback;
+        return Err(
+            "Cloud MCP auth token is unavailable; waiting for sign-in before resolving a route."
+                .to_string(),
+        );
     };
     let (billing_scope_type, team_id) = cloud_mcp_process_account_scope();
     let (plan_name, device_limit) = cloud_mcp_process_account_plan();
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]);
+    // Direct-only policy: the balancer never proxies websocket traffic.
     match cloud_mcp_fetch_direct_route_blocking(
         base_url,
         endpoint_path,
@@ -28148,8 +28189,12 @@ fn cloud_mcp_proxy_resolve_blocking_target(
         device_limit,
         device_id.as_deref(),
     ) {
-        Ok(Some(target)) => target,
-        _ => fallback,
+        Ok(Some(target)) => Ok(target),
+        Ok(None) => Err(
+            "Balancer did not offer a direct route (direct routing disabled or backend unsupported)."
+                .to_string(),
+        ),
+        Err(error) => Err(format!("Cloud MCP direct route unavailable: {error}")),
     }
 }
 

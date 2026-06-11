@@ -248,12 +248,30 @@ export function writeAudioWidgetTheme(theme) {
   }
 }
 
+// The dictation provider setting has exactly three values: local Whisper,
+// Deepgram cloud (your key), and Diff Forge AI (Nova-3 + LLM cleanup). The
+// voice-agent pathway is not a dictation provider — it lives behind the
+// Orchestrator voice button. Legacy stored "forge-agent" values migrate to
+// "forge"; the constant stays only so history rows keep their labels.
+function normalizeAudioTranscriptionProviderSetting(value) {
+  if (value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
+    return AUDIO_TRANSCRIPTION_PROVIDER_FORGE;
+  }
+  if (
+    value === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+    || value === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+  ) {
+    return value;
+  }
+  return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
+}
+
 export function readAudioTranscriptionProvider() {
   if (!canUseStorage()) {
     return AUDIO_TRANSCRIPTION_PROVIDER_LOCAL;
   }
 
-  return normalizeAudioTranscriptionProvider(
+  return normalizeAudioTranscriptionProviderSetting(
     window.localStorage.getItem(AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY),
   );
 }
@@ -262,7 +280,7 @@ export function writeAudioTranscriptionProvider(provider) {
   if (canUseStorage()) {
     window.localStorage.setItem(
       AUDIO_TRANSCRIPTION_PROVIDER_STORAGE_KEY,
-      normalizeAudioTranscriptionProvider(provider),
+      normalizeAudioTranscriptionProviderSetting(provider),
     );
   }
 }
