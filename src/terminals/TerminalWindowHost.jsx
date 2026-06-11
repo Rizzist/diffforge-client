@@ -476,6 +476,16 @@ export default function TerminalWindowHost() {
     <HostShell>
       <TerminalRestartPill data-tauri-drag-region data-terminal-control="true">
         <TerminalRailIdentity data-tauri-drag-region>
+          {/* Drag handle lives at the far left of the rail, away from the
+              destructive close button on the right. */}
+          <TerminalRestartButton
+            aria-label="Move window"
+            onPointerDown={startWindowDrag}
+            title="Move window"
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </TerminalRestartButton>
           <TerminalAgentDot
             aria-hidden="true"
             data-agent={meta.agentKind || undefined}
@@ -490,14 +500,6 @@ export default function TerminalWindowHost() {
           </TerminalStateDebugBadge>
         </TerminalRailIdentity>
         <TerminalRailControls data-rail-row="primary">
-          <TerminalRestartButton
-            aria-label="Move window"
-            onPointerDown={startWindowDrag}
-            title="Move window"
-            type="button"
-          >
-            <ButtonDragIcon aria-hidden="true" />
-          </TerminalRestartButton>
           <TerminalCloseButton
             aria-label="Close terminal"
             onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL)}

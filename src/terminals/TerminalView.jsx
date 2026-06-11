@@ -22688,6 +22688,51 @@ function TerminalView({
   }, [terminalWorkspace?.id, updateTodoQueueItems]);
 
   useEffect(() => {
+    // Prompts typed directly into a coding-agent terminal are captured
+    // Rust-side as running todos; adopt them into the visible queue live so
+    // todo history reflects terminal-first work immediately.
+    const captureWorkspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!captureWorkspaceId) {
+      return undefined;
+    }
+    let cancelled = false;
+    let unlistenCapture = null;
+    listen("todo-dispatch-direct-todo-captured", (event) => {
+      if (cancelled) return;
+      const payload = event?.payload || {};
+      const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (eventWorkspaceId !== captureWorkspaceId) return;
+      const item = payload.item && typeof payload.item === "object" ? payload.item : null;
+      if (!item) return;
+      const normalized = normalizeTodoQueueItems([item])[0];
+      if (!normalized) return;
+      updateTodoQueueItems((currentItems) => {
+        const itemId = String(normalized.id || "").trim();
+        if (!itemId || currentItems.some((current) => String(current?.id || "").trim() === itemId)) {
+          return currentItems;
+        }
+        return [...currentItems, normalized];
+      }, {
+        force: true,
+        immediate: true,
+        reason: "terminal_direct_capture",
+      });
+    })
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlistenCapture = unlisten;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (unlistenCapture) unlistenCapture();
+    };
+  }, [terminalWorkspace?.id, updateTodoQueueItems]);
+
+  useEffect(() => {
     // Account-level cloud cleanup re-pushes the local queue as the
     // authoritative copy: drop the dedupe signature and sync immediately.
     const handleCloudResync = () => {

@@ -865,6 +865,7 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
         return;
     };
     let mut changed = false;
+    let mut completed_item_id = String::new();
     let now_iso = chrono_like_now_iso();
     let next_items = items
         .into_iter()
@@ -874,6 +875,11 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
             }
             changed = true;
             if status == "completed" {
+                completed_item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(command_id)
+                    .to_string();
                 return None;
             }
             if let Some(object) = item.as_object_mut() {
@@ -887,6 +893,20 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
         .collect::<Vec<_>>();
     if changed {
         todo_dispatch_queue_write(workspace_id, &next_items);
+    }
+    // Completed items leave the queue; journal the removal so a webview that
+    // mounts later does not resurrect them from an earlier creation entry.
+    if !completed_item_id.is_empty() {
+        todo_dispatch_journal_append(
+            workspace_id,
+            json!({
+                "kind": "remote_todo_deleted",
+                "itemId": completed_item_id,
+                "commandId": command_id,
+                "at": now_iso,
+                "reason": "todo_queue_backend_settled",
+            }),
+        );
     }
 }
 
@@ -910,6 +930,112 @@ pub(crate) fn todo_dispatch_workspace_has_busy_terminals(workspace_id: &str) -> 
                 .and_then(Value::as_u64)
                 .is_some_and(|at| now.saturating_sub(at) < TODO_DISPATCH_TERMINAL_RUNTIME_TTL_MS)
     })
+}
+
+const TODO_DISPATCH_DIRECT_CAPTURE_EVENT: &str = "todo-dispatch-direct-todo-captured";
+
+/// Captures a prompt the user typed directly into a coding-agent terminal as
+/// a running todo: it lands in the Rust queue store (history truth), the
+/// receipts ledger (hook settlement completes it when the turn ends), the
+/// journal (a later webview mount adopts it), a live webview event (an open
+/// queue panel adopts it immediately and syncs it to cloud), and the cloud
+/// snapshot directly when no webview is alive.
+pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
+    app: &AppHandle,
+    workspace_id: &str,
+    workspace_name: &str,
+    pane_id: &str,
+    terminal_index: u64,
+    thread_id: &str,
+    agent_kind: &str,
+    prompt: &str,
+) {
+    let workspace_id = workspace_id.trim();
+    let prompt = prompt.trim();
+    if workspace_id.is_empty() || prompt.is_empty() {
+        return;
+    }
+    // Only managed coding agents: shell terminals would turn every command
+    // line into a phantom todo.
+    if !matches!(
+        agent_kind.trim().to_ascii_lowercase().as_str(),
+        "codex" | "claude" | "opencode"
+    ) {
+        return;
+    }
+    let now_iso = chrono_like_now_iso();
+    let item_id = format!(
+        "direct-{}-{}",
+        todo_dispatch_now_ms(),
+        uuid::Uuid::new_v4()
+    );
+    let item = json!({
+        "id": item_id,
+        "kind": "todo",
+        "text": prompt,
+        "todoStatus": "running",
+        "status": "running",
+        // Backend-submit reason routes the item through the existing Rust
+        // ledger settlement machinery (crash sweep exclusion, drain reconcile).
+        "todoStatusReason": "todo_queue_backend_submit",
+        "source": "terminal_direct",
+        "createdAt": now_iso,
+        "updatedAt": now_iso,
+        "workspaceId": workspace_id,
+        "targetTerminalId": pane_id,
+        "targetTerminalIndex": terminal_index,
+        "targetThreadId": thread_id,
+        "targetAgentId": agent_kind,
+    });
+    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let mut items = todo_dispatch_queue_read(&path)
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        items.push(item.clone());
+        todo_dispatch_queue_write(workspace_id, &items);
+    }
+    todo_dispatch_journal_append(
+        workspace_id,
+        json!({
+            "kind": "remote_todo_created",
+            "itemId": item_id,
+            "commandId": item_id,
+            "item": item,
+            "at": now_iso,
+        }),
+    );
+    let receipt = json!({
+        "commandId": item_id,
+        "itemId": item_id,
+        "paneId": pane_id,
+        "status": "submitted",
+        "text": prompt.chars().take(180).collect::<String>(),
+        "workspaceId": workspace_id,
+        "workspaceName": workspace_name,
+    });
+    let _ = todo_dispatch_record_receipt_internal(
+        Some(app),
+        workspace_id,
+        receipt,
+        "terminal_direct_submit",
+    );
+    let _ = app.emit(
+        TODO_DISPATCH_DIRECT_CAPTURE_EVENT,
+        json!({
+            "workspaceId": workspace_id,
+            "item": item,
+        }),
+    );
+    if !todo_dispatch_webview_dispatcher_active() {
+        todo_dispatch_push_queue_snapshot(
+            app,
+            workspace_id,
+            Vec::new(),
+            "terminal_direct_submit",
+        );
+    }
 }
 
 /// Last hook-reported input-ready state for one pane (None when the pane has

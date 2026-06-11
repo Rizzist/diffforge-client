@@ -147,6 +147,7 @@ const WHISPER_LOCAL_AUDIO_LOG_MAX_TEXT: usize = 512;
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
+const DEEP_LINK_NEW_URL_EVENT: &str = "deep-link://new-url";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
@@ -3756,6 +3757,27 @@ fn restore_main_window(app: &AppHandle) -> bool {
     false
 }
 
+fn deep_link_urls_from_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter_map(|arg| {
+            let url = arg.trim();
+            if url.starts_with("diffforge://") {
+                Some(url.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn emit_deep_link_urls(app: &AppHandle, urls: Vec<String>) {
+    if urls.is_empty() {
+        return;
+    }
+
+    let _ = app.emit(DEEP_LINK_NEW_URL_EVENT, urls);
+}
+
 #[cfg(target_os = "macos")]
 fn focus_restored_main_window(app: &AppHandle) {
     let _ = app.show();
@@ -4010,15 +4032,19 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let deep_link_urls = deep_link_urls_from_args(&argv);
+
             if app_is_in_background_mode() {
                 app_exit_background_internal(app);
-                return;
+            } else {
+                #[cfg(target_os = "macos")]
+                restore_main_window_after_reopen(app.clone(), false);
+                #[cfg(not(target_os = "macos"))]
+                restore_main_window(app);
             }
-            #[cfg(target_os = "macos")]
-            restore_main_window_after_reopen(app.clone(), false);
-            #[cfg(not(target_os = "macos"))]
-            restore_main_window(app);
+
+            emit_deep_link_urls(app, deep_link_urls);
         }));
     }
 

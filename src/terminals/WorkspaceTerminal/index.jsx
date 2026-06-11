@@ -13588,6 +13588,18 @@ function WorkspaceTerminal({
     >
       <TerminalRestartPill data-terminal-control="true">
         <TerminalRailIdentity>
+          {/* Drag handle lives at the far left of the rail, away from the
+              destructive close button on the right. */}
+          <TerminalRestartButton
+            aria-label="Drag terminal"
+            data-terminal-drag-handle="true"
+            disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
+            onPointerDown={beginTerminalDrag}
+            title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </TerminalRestartButton>
           <TerminalAgentDot
             aria-hidden="true"
             data-agent={terminalAgentKind}
@@ -13602,16 +13614,6 @@ function WorkspaceTerminal({
           </TerminalStateDebugBadge>
         </TerminalRailIdentity>
         <TerminalRailControls data-rail-row="primary">
-          <TerminalRestartButton
-            aria-label="Drag terminal"
-            data-terminal-drag-handle="true"
-            disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
-            onPointerDown={beginTerminalDrag}
-            title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
-            type="button"
-          >
-            <ButtonDragIcon aria-hidden="true" />
-          </TerminalRestartButton>
           <TerminalCloseButton
             aria-label={threadsViewActive ? "Exit threads view" : "Close terminal"}
             disabled={terminalClosed || terminalClosing}

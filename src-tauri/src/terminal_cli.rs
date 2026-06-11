@@ -1218,18 +1218,7 @@ fn claude_write_authority_guard_settings(
                     ]
                 }
             ],
-            "Error": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": activity_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }
-            ],
-            "Interrupt": [
+            "StopFailure": [
                 {
                     "hooks": [
                         {
@@ -2524,6 +2513,32 @@ fn diff_forge_activity_hook_record(
 #[cfg(test)]
 mod terminal_cli_tests {
     use super::*;
+
+    #[test]
+    fn claude_guard_settings_use_valid_claude_hook_events() {
+        let coordination = TerminalCoordinationSession {
+            repo_path: "/repo".to_string(),
+            db_path: "/repo/.coordination/db".to_string(),
+            mcp_command: "diff-forge".to_string(),
+            agent_id: "claude".to_string(),
+            agent_kind: "claude".to_string(),
+            session_id: "session-1".to_string(),
+            terminal_launch_epoch: None,
+            env_vars: Vec::new(),
+        };
+
+        let settings = claude_write_authority_guard_settings(&coordination, "/repo", false);
+
+        // Claude Code rejects unknown hook events with a startup settings
+        // warning; "Error"/"Interrupt" are Codex hook names.
+        assert!(settings.contains("\"StopFailure\""));
+        assert!(!settings.contains("\"Error\""));
+        assert!(!settings.contains("\"Interrupt\""));
+        assert!(settings.contains("\"UserPromptSubmit\""));
+        assert!(settings.contains("\"Stop\""));
+        assert!(settings.contains("\"PostToolUse\""));
+        assert!(settings.contains("\"SubagentStop\""));
+    }
 
     #[test]
     fn native_plan_update_extracts_provider_plan_tools() {

@@ -156,6 +156,23 @@ function clearPendingStorage() {
   removeStorageValue(PENDING_STATE_KEY);
 }
 
+function persistSessionStorage(session) {
+  if (!session?.token || !session?.user) {
+    throw new Error("Desktop session is missing.");
+  }
+
+  writeStorageValue(SESSION_TOKEN_KEY, session.token);
+  writeStorageValue(SESSION_USER_KEY, JSON.stringify(session.user));
+  const activeScope = readStoredScope(session.user);
+  writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
+
+  return {
+    activeScope,
+    token: session.token,
+    user: session.user,
+  };
+}
+
 function subscribe(listener) {
   listeners.add(listener);
 
@@ -273,24 +290,21 @@ export const authStore = {
     });
   },
   saveAuthenticatedSession(session, message) {
-    if (!session?.token || !session?.user) {
-      throw new Error("Desktop session is missing.");
-    }
+    const persisted = persistSessionStorage(session);
 
-    writeStorageValue(SESSION_TOKEN_KEY, session.token);
-    writeStorageValue(SESSION_USER_KEY, JSON.stringify(session.user));
-    const activeScope = readStoredScope(session.user);
-    writeStorageValue(SESSION_SCOPE_KEY, JSON.stringify(activeScope));
     emitAuthChange({
       status: "authenticated",
       stage: "authenticated",
       message: message ?? snapshot.message,
       error: "",
-      user: session.user,
-      token: session.token,
-      activeScope,
+      user: persisted.user,
+      token: persisted.token,
+      activeScope: persisted.activeScope,
       pendingState: readPendingState(),
     });
+  },
+  persistAuthenticatedSession(session) {
+    return persistSessionStorage(session);
   },
   setActiveScope(scope) {
     const user = readStoredUser();

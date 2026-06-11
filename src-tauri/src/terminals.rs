@@ -8226,6 +8226,28 @@ fn emit_terminal_prompt_submitted(
             "workspace_id": metadata.workspace_id.clone(),
         }),
     );
+    // Prompts typed directly into a coding-agent terminal (no queue todo
+    // attached) are captured Rust-side as running todos, so terminal-first
+    // work shows up in todo history even with the window closed.
+    if todo_id.is_none()
+        && todo_dispatch_id.is_none()
+        && todo_command_id.is_none()
+        && !todo_resume_requested
+    {
+        todo_dispatch_capture_direct_prompt_todo(
+            app,
+            &metadata.workspace_id,
+            &metadata.workspace_name,
+            &metadata.pane_id,
+            metadata.terminal_index.map(u64::from).unwrap_or(0),
+            thread_id_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(metadata.thread_id.as_str()),
+            &metadata.agent_kind,
+            prompt,
+        );
+    }
     let _ = app.emit(
         TERMINAL_PROMPT_SUBMITTED_EVENT,
         TerminalPromptSubmittedPayload {
@@ -8575,7 +8597,7 @@ fn terminal_activity_hook_lifecycle_kind(
             "completed",
             true,
         )),
-        "error" | "turnerror" | "assistantturnerror" => {
+        "error" | "turnerror" | "assistantturnerror" | "stopfailure" => {
             Some(("provider-turn-error", "error", "error", "failed", true))
         }
         "interrupt"
@@ -12933,6 +12955,10 @@ mod terminal_tests {
                 "completed",
                 true
             ))
+        );
+        assert_eq!(
+            terminal_activity_hook_lifecycle_kind("StopFailure"),
+            Some(("provider-turn-error", "error", "error", "failed", true))
         );
         assert_eq!(
             terminal_activity_hook_lifecycle_kind("Interrupt"),

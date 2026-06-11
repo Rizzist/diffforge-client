@@ -570,7 +570,7 @@ const PRICING_URL = "https://diffforge.ai/pricing";
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
 const AUTH_STARTUP_TIMEOUT_MS = 30000;
-const DEEP_LINK_STARTUP_TIMEOUT_MS = 1000;
+const DEEP_LINK_STARTUP_TIMEOUT_MS = 3000;
 const SESSION_RESTORE_TIMEOUT_MS = 5000;
 const SESSION_RESTORE_TIMEOUT_MESSAGE = "Secure session check timed out after 5 seconds.";
 const AUTH_EXCHANGE_TIMEOUT_MS = 10000;
@@ -6345,6 +6345,8 @@ export default function App() {
   );
   const authStartupFinishedRef = useRef(false);
   const authFlowIdRef = useRef(0);
+  const authCallbackInFlightStateRef = useRef("");
+  const authCallbackCompletedStateRef = useRef("");
   // True while the app is running on a saved session that could not be
   // re-validated because the API was unreachable (offline grace). Cleared by
   // the quiet re-validation that runs when the cloud connection returns.
@@ -8724,7 +8726,7 @@ export default function App() {
     );
   }, [setSignedOut]);
 
-  const setAuthenticated = useCallback((sessionUser) => {
+  const setAuthenticated = useCallback((sessionUser, options = {}) => {
     const isPaid = isPaidUser(sessionUser);
 
     authStore.setAuthenticated(
@@ -8741,10 +8743,12 @@ export default function App() {
     } else {
       setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
     }
-    void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
-      ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
-      onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
-    });
+    if (options.syncCloud !== false) {
+      void syncCloudMcpDesktopSessionToken(authStore.getToken(), {
+        ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
+        onProgress: isPaid ? updateCloudWorkspaceProgress : undefined,
+      });
+    }
     terminalPresenceSyncKeyRef.current = "";
     workspaceMcpSyncKeyRef.current = "";
     workspaceCatalogSyncKeyRef.current = "";
@@ -8781,7 +8785,7 @@ export default function App() {
     setStartupAgentGateState(isPaid ? "checking" : "idle");
     setStartupAgentUpdateMessage("");
     setWorkspaceError("");
-  }, [updateCloudWorkspaceProgress]);
+  }, [billingStatus, updateCloudWorkspaceProgress]);
 
   const showView = useCallback((nextView, options = {}) => {
     if (nextView === activeView && nextView === visibleView) {
@@ -9848,9 +9852,62 @@ export default function App() {
     }
   }, []);
 
+  const connectCloudWorkspaceForAuthenticatedSession = useCallback(async ({
+    accountScope,
+    flowId,
+    sessionUser,
+    step,
+    successMessage,
+    token,
+  }) => {
+    if (!isPaidUser(sessionUser)) {
+      return null;
+    }
+
+    await recordCloudSigninDiagnostic(token, {
+      flowId,
+      step,
+      status: "start",
+      message: "starting Cloud MCP connection before desktop auth is accepted",
+      details: {},
+    });
+
+    try {
+      const status = await syncCloudMcpDesktopSessionToken(token, {
+        accountScope,
+        connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
+        connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
+        flowId,
+        ...cloudMcpBillingEntitlementPayload(billingStatus, sessionUser),
+        onProgress: updateCloudWorkspaceProgress,
+        requireConnected: true,
+      });
+
+      await recordCloudSigninDiagnostic(token, {
+        flowId,
+        step,
+        status: "ok",
+        message: successMessage,
+        details: status || {},
+      });
+
+      return status;
+    } catch (cloudError) {
+      await recordCloudSigninDiagnostic(token, {
+        flowId,
+        step,
+        status: "error",
+        message: getErrorMessage(cloudError, "Cloud workspace connection failed."),
+        details: { requireConnected: true },
+      });
+      throw cloudError;
+    }
+  }, [billingStatus, updateCloudWorkspaceProgress]);
+
   const validateStoredSession = useCallback(async () => {
     const token = authStore.getToken();
     const validationFlowId = authFlowIdRef.current;
+    let cloudWorkspaceRestoreFailed = false;
 
     if (!isSafeAuthValue(token)) {
       setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
@@ -9880,41 +9937,26 @@ export default function App() {
         return;
       }
 
-      setAuthenticated(session.user);
-      void (async () => {
-        await recordCloudSigninDiagnostic(token, {
+      const sessionNeedsCloudWorkspace = isPaidUser(session.user);
+
+      if (sessionNeedsCloudWorkspace) {
+        authStore.setChecking("Checking saved desktop session. Connecting your cloud workspace...");
+        cloudWorkspaceRestoreFailed = true;
+        await connectCloudWorkspaceForAuthenticatedSession({
           flowId: `restore-${validationFlowId}`,
+          sessionUser: session.user,
           step: "desktop_restore.cloud_workspace",
-          status: "start",
-          message: "starting Cloud MCP connection from saved desktop session",
-          details: {},
+          successMessage: "Cloud MCP connection completed from saved desktop session",
+          token,
         });
-        try {
-          await syncCloudMcpDesktopSessionToken(token, {
-            connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
-            connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
-            flowId: `restore-${validationFlowId}`,
-            ...cloudMcpBillingEntitlementPayload(billingStatus, session.user),
-            onProgress: updateCloudWorkspaceProgress,
-            requireConnected: true,
-          });
-          await recordCloudSigninDiagnostic(token, {
-            flowId: `restore-${validationFlowId}`,
-            step: "desktop_restore.cloud_workspace",
-            status: "ok",
-            message: "Cloud MCP connection completed from saved desktop session",
-            details: {},
-          });
-        } catch (cloudError) {
-          await recordCloudSigninDiagnostic(token, {
-            flowId: `restore-${validationFlowId}`,
-            step: "desktop_restore.cloud_workspace",
-            status: "error",
-            message: getErrorMessage(cloudError, "Cloud workspace connection is retrying."),
-            details: {},
-          });
+        cloudWorkspaceRestoreFailed = false;
+
+        if (validationFlowId !== authFlowIdRef.current) {
+          return;
         }
-      })();
+      }
+
+      setAuthenticated(session.user, { syncCloud: !sessionNeedsCloudWorkspace });
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -9922,6 +9964,7 @@ export default function App() {
 
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
+      const didCloudWorkspaceFail = cloudWorkspaceRestoreFailed;
       const isNetworkRestoreError = didTimeout
         || /unable to validate desktop session/i.test(restoreError)
         || /unable to read diff forge ai api response/i.test(restoreError)
@@ -9929,10 +9972,9 @@ export default function App() {
         || /unable to prepare backend request/i.test(restoreError);
       const storedUser = authStore.getSnapshot().user;
 
-      if (isNetworkRestoreError && storedUser) {
-        // Offline grace: the API was unreachable, not the session invalid.
-        // Enter the app on the saved session; the title-bar sync pill shows
-        // Connecting and the session re-validates quietly after reconnect.
+      if (isNetworkRestoreError && storedUser && !isPaidUser(storedUser)) {
+        // Free accounts do not open a cloud workspace, so a saved pricing-screen
+        // session can survive a temporary API outage without entering sync limbo.
         offlineSessionGraceRef.current = true;
         await recordCloudSigninDiagnostic(token, {
           flowId: `restore-${validationFlowId}`,
@@ -9945,15 +9987,19 @@ export default function App() {
         return;
       }
 
-      const signedOutMessage = didTimeout
-        ? "Secure session check timed out. Sign in with the web app."
-        : "Your desktop session expired. Sign in again with the web app.";
+      const signedOutMessage = didCloudWorkspaceFail
+        ? "Cloud workspace did not finish connecting. Sign in again to retry."
+        : (
+          didTimeout || isNetworkRestoreError
+            ? "Secure session could not be verified. Sign in again with the web app."
+            : "Your desktop session expired. Sign in again with the web app."
+        );
       await recordCloudSigninDiagnostic(token, {
         flowId: `restore-${validationFlowId}`,
         step: "desktop_session.restore",
         status: "error",
         message: restoreError,
-        details: { didTimeout },
+        details: { didCloudWorkspaceFail, didTimeout },
       });
 
       setSignedOut(signedOutMessage, restoreError, {
@@ -9961,7 +10007,7 @@ export default function App() {
         clearSession: true,
       });
     }
-  }, [setAuthenticated, setSignedOut, updateCloudWorkspaceProgress]);
+  }, [connectCloudWorkspaceForAuthenticatedSession, setAuthenticated, setSignedOut]);
 
   const revalidateOfflineSessionQuietly = useCallback(async () => {
     if (!offlineSessionGraceRef.current) {
@@ -10001,11 +10047,21 @@ export default function App() {
       return false;
     }
 
-    authFlowIdRef.current += 1;
-    const loginFlowId = authFlowIdRef.current;
     const pendingState = authStore.getPendingState();
 
+    if (
+      callback.state === authCallbackInFlightStateRef.current
+      || callback.state === authCallbackCompletedStateRef.current
+    ) {
+      return true;
+    }
+
     if (!pendingState || callback.state !== pendingState) {
+      if (!pendingState && authStore.getSnapshot().status === "authenticated") {
+        return true;
+      }
+
+      authFlowIdRef.current += 1;
       setSignedOut(
         DEFAULT_AUTH_MESSAGE,
         "Desktop login state did not match. Start again from this app.",
@@ -10014,8 +10070,12 @@ export default function App() {
       return true;
     }
 
+    authFlowIdRef.current += 1;
+    const loginFlowId = authFlowIdRef.current;
+    authCallbackInFlightStateRef.current = callback.state;
     authStore.setExchanging("Browser callback matched. Creating your desktop session...");
     let diagnosticToken = "";
+    let failureStep = "desktop_session.exchange";
 
     try {
       const session = await withTimeout(
@@ -10043,49 +10103,34 @@ export default function App() {
         return true;
       }
 
-      authStore.saveAuthenticatedSession(session);
-      authStore.clearPending();
-      setAuthenticated(session.user);
-      void (async () => {
-        await recordCloudSigninDiagnostic(diagnosticToken, {
+      const sessionNeedsCloudWorkspace = isPaidUser(session.user);
+
+      if (sessionNeedsCloudWorkspace) {
+        authStore.setExchanging("Browser callback matched. Connecting your cloud workspace...");
+        failureStep = "desktop_signin.cloud_workspace";
+        await connectCloudWorkspaceForAuthenticatedSession({
+          accountScope: {
+            id: "personal",
+            type: "personal",
+            label: "Personal",
+            teamId: null,
+          },
           flowId: callback.state,
+          sessionUser: session.user,
           step: "desktop_signin.cloud_workspace",
-          status: "start",
-          message: "starting Cloud MCP connection after deeplink",
-          details: {},
+          successMessage: "Cloud MCP connection completed after deeplink",
+          token: session.token,
         });
-        try {
-          await syncCloudMcpDesktopSessionToken(session.token, {
-            accountScope: {
-              id: "personal",
-              type: "personal",
-              label: "Personal",
-              teamId: null,
-            },
-            connectAttempts: CLOUD_WORKSPACE_CONNECT_ATTEMPTS,
-            connectRetryDelayMs: CLOUD_WORKSPACE_CONNECT_RETRY_DELAY_MS,
-            flowId: callback.state,
-            ...cloudMcpBillingEntitlementPayload(billingStatus, session.user),
-            onProgress: updateCloudWorkspaceProgress,
-            requireConnected: true,
-          });
-          await recordCloudSigninDiagnostic(diagnosticToken, {
-            flowId: callback.state,
-            step: "desktop_signin.cloud_workspace",
-            status: "ok",
-            message: "Cloud MCP connection completed after deeplink",
-            details: {},
-          });
-        } catch (cloudError) {
-          await recordCloudSigninDiagnostic(diagnosticToken, {
-            flowId: callback.state,
-            step: "desktop_signin.cloud_workspace",
-            status: "error",
-            message: getErrorMessage(cloudError, "Cloud workspace connection is retrying."),
-            details: {},
-          });
+
+        if (loginFlowId !== authFlowIdRef.current) {
+          return true;
         }
-      })();
+      }
+
+      authStore.persistAuthenticatedSession(session);
+      authStore.clearPending();
+      setAuthenticated(session.user, { syncCloud: !sessionNeedsCloudWorkspace });
+      authCallbackCompletedStateRef.current = callback.state;
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
         return true;
@@ -10093,7 +10138,7 @@ export default function App() {
 
       await recordCloudSigninDiagnostic(diagnosticToken, {
         flowId: callback?.state,
-        step: "desktop_signin.cloud_workspace",
+        step: failureStep,
         status: "error",
         message: getErrorMessage(error, "Desktop login expired. Try again."),
         details: {},
@@ -10103,13 +10148,19 @@ export default function App() {
         getErrorMessage(error, "Desktop login expired. Try again."),
         { clearPending: true },
       );
+    } finally {
+      if (authCallbackInFlightStateRef.current === callback.state) {
+        authCallbackInFlightStateRef.current = "";
+      }
     }
 
     return true;
-  }, [setAuthenticated, setSignedOut, updateCloudWorkspaceProgress]);
+  }, [connectCloudWorkspaceForAuthenticatedSession, setAuthenticated, setSignedOut]);
 
   const startWebLogin = useCallback(async () => {
     authFlowIdRef.current += 1;
+    authCallbackInFlightStateRef.current = "";
+    authCallbackCompletedStateRef.current = "";
     const state = createAuthState();
     authStore.setWaiting(state, "Opening secure web sign-in in your browser...");
 

@@ -1385,6 +1385,50 @@ fn snipping_capture_area_image(
         .map_err(|error| format!("Unable to capture selected area: {error}"))
 }
 
+/// Mid-session capture that must NOT end the snip: tries the
+/// capture-below-overlay path first (works through macOS 14), and where
+/// CGWindowListCreateImage is gone (macOS 15+ returns nil) it hides the
+/// overlay only for the duration of the capture and puts it straight back —
+/// keeping the session, the Escape grab, and the overlay window alive. This
+/// is what Space-change re-freezes use; routing them through the final-capture
+/// fallback used to tear the whole session down the moment the user swiped
+/// to a full-screen app.
+fn snipping_capture_monitor_image_keeping_session(
+    app: &AppHandle,
+    monitor: &XcapMonitor,
+    width: u32,
+    height: u32,
+) -> Result<xcap::image::RgbaImage, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(window_number) = snipping_macos_area_overlay_window_number(app) {
+            if let Ok(image) = snipping_macos_capture_region_below_window(
+                monitor,
+                0,
+                0,
+                width,
+                height,
+                window_number,
+            ) {
+                return Ok(image);
+            }
+        }
+    }
+
+    let overlay = app.get_webview_window(SNIPPING_AREA_OVERLAY_WINDOW_LABEL);
+    if let Some(overlay) = overlay.as_ref() {
+        let _ = overlay.hide();
+    }
+    thread::sleep(Duration::from_millis(60));
+    let captured = monitor
+        .capture_region(0, 0, width, height)
+        .map_err(|error| format!("Unable to capture screen for snip re-freeze: {error}"));
+    if let Some(overlay) = overlay.as_ref() {
+        let _ = overlay.show();
+    }
+    captured
+}
+
 fn snipping_capture_toast_path(value: &Value) -> Option<String> {
     value
         .get("path")
@@ -2326,7 +2370,9 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
         };
         let width = monitor.width().unwrap_or(area_monitor.capture_width).max(1);
         let height = monitor.height().unwrap_or(area_monitor.capture_height).max(1);
-        let Ok(image) = snipping_capture_area_image(&app, &monitor, 0, 0, width, height) else {
+        let Ok(image) =
+            snipping_capture_monitor_image_keeping_session(&app, &monitor, width, height)
+        else {
             return;
         };
         let image = Arc::new(image);
