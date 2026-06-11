@@ -3623,6 +3623,66 @@ fn cloud_mcp_log_voice_shared_ws(
     );
 }
 
+/// Direct node-gateway routes authorize the websocket via the route token; the
+/// gateway's `forward_auth` step also scans the `Authorization` header for a
+/// route token and rejects the handshake with 403 when it finds the Appwrite
+/// JWT there instead. Direct targets therefore carry the route token in both
+/// accepted header names and move the Appwrite JWT to its dedicated header,
+/// keeping `Authorization` off the request entirely. Targets without a route
+/// token (local Docker cloud) keep the plain bearer.
+fn cloud_mcp_apply_ws_auth_headers(
+    request: &mut tokio_tungstenite::tungstenite::http::Request<()>,
+    auth_bearer: Option<&str>,
+    route_token: Option<&str>,
+) -> Result<(), String> {
+    if let Some(route_token) = route_token {
+        let route_header = HeaderValue::from_str(route_token)
+            .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?;
+        request
+            .headers_mut()
+            .insert("x-diffforge-direct-route-token", route_header.clone());
+        request
+            .headers_mut()
+            .insert("x-diffforge-route-token", route_header);
+        let token = auth_bearer.ok_or_else(|| {
+            "Cloud MCP auth token is unavailable; waiting for sign-in or auth refresh."
+                .to_string()
+        })?;
+        request.headers_mut().insert(
+            "x-diffforge-appwrite-jwt",
+            HeaderValue::from_str(token)
+                .map_err(|error| format!("Invalid Cloud MCP auth token header: {error}"))?,
+        );
+    } else if let Some(token) = auth_bearer {
+        request.headers_mut().insert(
+            "authorization",
+            cloud_mcp_bearer_header(token, "Cloud MCP auth token")?,
+        );
+    }
+    Ok(())
+}
+
+/// Websocket handshake rejections carry the reason in the HTTP response body
+/// (the node gateway answers 403 with a JSON error such as "route token
+/// signature is invalid"); folding it into the error text keeps a failed open
+/// self-diagnosing instead of a bare status line.
+fn cloud_mcp_ws_handshake_error_text(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
+        let status = response.status();
+        let body = response
+            .body()
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(300).collect::<String>());
+        return match body {
+            Some(body) => format!("HTTP error: {status} ({body})"),
+            None => format!("HTTP error: {status}"),
+        };
+    }
+    error.to_string()
+}
+
 async fn cloud_mcp_open_global_ws(
     state: &CloudMcpState,
     _base_url: &str,
@@ -3710,19 +3770,11 @@ async fn cloud_mcp_open_global_ws(
                 );
             }
         }
-        if let Some(token) = auth_bearer.as_deref() {
-            request.headers_mut().insert(
-                "authorization",
-                cloud_mcp_bearer_header(token, "Cloud MCP auth token")?,
-            );
-        }
-        if let Some(route_token) = target.route_token.as_deref() {
-            request.headers_mut().insert(
-                "x-diffforge-direct-route-token",
-                HeaderValue::from_str(route_token)
-                    .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
-            );
-        }
+        cloud_mcp_apply_ws_auth_headers(
+            &mut request,
+            auth_bearer.as_deref(),
+            target.route_token.as_deref(),
+        )?;
         Ok(request)
     };
 
@@ -3735,7 +3787,10 @@ async fn cloud_mcp_open_global_ws(
     let (stream, response) = match connect_async(request).await {
         Ok(result) => result,
         Err(error) => {
-            let message = format!("Unable to open Cloud MCP app websocket: {error}");
+            let message = format!(
+                "Unable to open Cloud MCP app websocket: {}",
+                cloud_mcp_ws_handshake_error_text(&error)
+            );
             cloud_mcp_record_signin_diagnostic(
                 state,
                 "websocket.open",
@@ -28043,24 +28098,17 @@ fn cloud_mcp_proxy_post_json_endpoint(
             );
         }
         // Never connect unauthenticated: a missing bearer guarantees a
-        // balancer 401 ("Appwrite bearer token missing") and wastes a
-        // connection attempt. Failing fast keeps the outbox retry/backoff
-        // honest and the error legible.
+        // server 401 and wastes a connection attempt. Failing fast keeps the
+        // outbox retry/backoff honest and the error legible.
         let token = cloud_mcp_process_authorization_bearer().ok_or_else(|| {
             "Cloud MCP auth token is unavailable; waiting for sign-in or auth refresh."
                 .to_string()
         })?;
-        request.headers_mut().insert(
-            "authorization",
-            cloud_mcp_bearer_header(&token, "Cloud MCP auth token")?,
-        );
-        if let Some(route_token) = target.route_token.as_deref() {
-            request.headers_mut().insert(
-                "x-diffforge-direct-route-token",
-                HeaderValue::from_str(route_token)
-                    .map_err(|error| format!("Invalid Cloud MCP route token header: {error}"))?,
-            );
-        }
+        cloud_mcp_apply_ws_auth_headers(
+            &mut request,
+            Some(&token),
+            target.route_token.as_deref(),
+        )?;
         Ok(request)
     };
 
@@ -28070,7 +28118,10 @@ fn cloud_mcp_proxy_post_json_endpoint(
     let (mut websocket, _) = match tokio_tungstenite::tungstenite::connect(request) {
         Ok(result) => result,
         Err(error) => {
-            let message = format!("Unable to open Cloud MCP websocket: {error}");
+            let message = format!(
+                "Unable to open Cloud MCP websocket: {}",
+                cloud_mcp_ws_handshake_error_text(&error)
+            );
             if message.contains("401") {
                 cloud_mcp_invalidate_cached_appwrite_jwt();
             }

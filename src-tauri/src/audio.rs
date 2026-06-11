@@ -10,6 +10,18 @@ const CLOUD_DICTATION_CONTRACT: &str = "diffforge.voice_dictation.v1";
 const CLOUD_DICTATION_WS_PATH: &str = "/v1/voice/dictation/ws";
 const CLOUD_DICTATION_START_TIMEOUT_SECS: u64 = 20;
 const CLOUD_DICTATION_RESULT_TIMEOUT_SECS: u64 = 45;
+// Warm dictation pool: while Diff Forge Cloud dictation is the selected
+// provider, a pre-authenticated websocket stays parked on the cloud ready
+// frame so press-to-talk skips auth, route resolution, and the TLS/WS
+// handshake entirely. The parked socket is kept alive with JSON pings (the
+// cloud resets its start deadline on every ping) and is replaced as soon as
+// it is claimed or dies, so dictation is always ready to go instantly.
+const CLOUD_DICTATION_WARM_PING_SECS: u64 = 8;
+const CLOUD_DICTATION_WARM_CONNECT_TIMEOUT_SECS: u64 = 10;
+const CLOUD_DICTATION_WARM_READY_TIMEOUT_SECS: u64 = 10;
+const CLOUD_DICTATION_WARM_CLAIM_TIMEOUT_MS: u64 = 800;
+const CLOUD_DICTATION_WARM_RETRY_MIN_MS: u64 = 1_000;
+const CLOUD_DICTATION_WARM_RETRY_MAX_MS: u64 = 30_000;
 
 fn whisper_local_audio_log_path() -> PathBuf {
     diagnostic_log_path(WHISPER_LOCAL_AUDIO_LOG_FILE)
@@ -3260,19 +3272,11 @@ fn cloud_voice_agent_ws_request(
             cloud_voice_agent_header(repo_id, "repo id")?,
         );
     }
-    if let Some(token) = auth_bearer {
-        request.headers_mut().insert(
-            "authorization",
-            cloud_mcp_bearer_header(token, "Cloud voice agent auth token")?,
-        );
-    }
-    if let Some(route_token) = ws_target.route_token.as_deref() {
-        request.headers_mut().insert(
-            "x-diffforge-direct-route-token",
-            HeaderValue::from_str(route_token)
-                .map_err(|error| format!("Invalid Cloud voice agent route token header: {error}"))?,
-        );
-    }
+    cloud_mcp_apply_ws_auth_headers(
+        &mut request,
+        auth_bearer,
+        ws_target.route_token.as_deref(),
+    )?;
     Ok(request)
 }
 
@@ -5274,11 +5278,41 @@ fn forge_dictation_result_from_payload(
     })
 }
 
+/// How the dictation stream task reaches Diff Forge Cloud: a warm parked
+/// socket claimed from the prewarm pool (instant), or a cold connect with a
+/// freshly resolved route (fallback).
+enum ForgeDictationConnection {
+    Warm(ForgeDictationWsStream),
+    Cold {
+        ws_target: CloudMcpWsTarget,
+        auth_bearer: Option<String>,
+    },
+}
+
+async fn resolve_forge_dictation_cloud_route(
+    cloud_mcp_state: &CloudMcpState,
+) -> Result<(CloudMcpWsTarget, Option<String>), String> {
+    cloud_mcp_wait_for_app_ws_auth(cloud_mcp_state)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            format!("Diff Forge Cloud dictation needs the signed-in Diff Forge AI connection. {error}")
+        })?;
+    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state).await?;
+    let ws_target = cloud_mcp_resolve_ws_target(
+        cloud_mcp_state,
+        &cloud_mcp_base_url(),
+        CLOUD_DICTATION_WS_PATH,
+    )
+    .await
+    .map_err(|error| format!("Cloud dictation route unavailable: {error}"))?;
+    Ok((ws_target, auth_bearer))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_forge_dictation_stream(
     app: AppHandle,
-    ws_target: CloudMcpWsTarget,
-    auth_bearer: Option<String>,
+    connection: ForgeDictationConnection,
     start_request: Value,
     mut audio_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut control_rx: mpsc::UnboundedReceiver<ForgeDictationControl>,
@@ -5295,26 +5329,35 @@ async fn run_forge_dictation_stream(
         let _ = finished_tx.send(Err(message));
     };
 
-    let request = match cloud_voice_agent_ws_request(&ws_target, auth_bearer.as_deref(), "", "") {
-        Ok(request) => request,
-        Err(error) => {
-            fail(&mut ready_tx, finished_tx, error);
-            return;
-        }
-    };
+    let ws_stream = match connection {
+        ForgeDictationConnection::Warm(stream) => stream,
+        ForgeDictationConnection::Cold {
+            ws_target,
+            auth_bearer,
+        } => {
+            let request =
+                match cloud_voice_agent_ws_request(&ws_target, auth_bearer.as_deref(), "", "") {
+                    Ok(request) => request,
+                    Err(error) => {
+                        fail(&mut ready_tx, finished_tx, error);
+                        return;
+                    }
+                };
 
-    // Direct-only policy: the balancer never proxies websocket traffic; a
-    // failed direct connect surfaces the error and the caller retries with a
-    // freshly resolved route.
-    let (ws_stream, _) = match connect_async(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            fail(
-                &mut ready_tx,
-                finished_tx,
-                format!("Unable to open cloud dictation WebSocket: {error}"),
-            );
-            return;
+            // Direct-only policy: the balancer never proxies websocket
+            // traffic; a failed direct connect surfaces the error and the
+            // caller retries with a freshly resolved route.
+            match connect_async(request).await {
+                Ok((stream, _)) => stream,
+                Err(error) => {
+                    fail(
+                        &mut ready_tx,
+                        finished_tx,
+                        format!("Unable to open cloud dictation WebSocket: {error}"),
+                    );
+                    return;
+                }
+            }
         }
     };
 
@@ -5331,70 +5374,27 @@ async fn run_forge_dictation_stream(
         return;
     }
 
-    // Wait for the server to accept the start frame. "voice_dictation_started"
-    // only arrives after the cloud reserved Diff Forge credits, so this is the
-    // client-visible credits gate too.
-    let start_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS));
-    tokio::pin!(start_deadline);
-    loop {
-        tokio::select! {
-            maybe_message = read.next() => {
-                match maybe_message {
-                    Some(Ok(Message::Ping(payload))) => {
-                        if write.send(Message::Pong(payload)).await.is_err() {
-                            fail(&mut ready_tx, finished_tx, "Cloud dictation closed before it started.".to_string());
-                            return;
-                        }
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        let Ok(payload) = serde_json::from_str::<Value>(text.as_str()) else {
-                            continue;
-                        };
-                        match payload.get("kind").and_then(Value::as_str).unwrap_or_default() {
-                            "voice_dictation_started" => {
-                                if let Some(ready_tx) = ready_tx.take() {
-                                    let _ = ready_tx.send(Ok(()));
-                                }
-                            }
-                            "voice_dictation_error" => {
-                                let message = payload
-                                    .pointer("/error/message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("Cloud dictation could not start.")
-                                    .to_string();
-                                fail(&mut ready_tx, finished_tx, message);
-                                return;
-                            }
-                            _ => {}
-                        }
-                        if ready_tx.is_none() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        fail(&mut ready_tx, finished_tx, "Cloud dictation closed before the audio stream started.".to_string());
-                        return;
-                    }
-                    Some(Err(error)) => {
-                        fail(&mut ready_tx, finished_tx, format!("Cloud dictation stream failed before it started: {error}"));
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            _ = &mut start_deadline => {
-                fail(&mut ready_tx, finished_tx, "Cloud dictation timed out while starting the audio stream.".to_string());
-                return;
-            }
-        }
+    // The start frame is on the wire, so report ready immediately instead of
+    // blocking on the cloud credits gate and the Deepgram handshake. Audio is
+    // forwarded right away and queues on the server socket until the stream
+    // goes live, so no speech is lost; a start failure (for example missing
+    // credits) surfaces as a "voice_dictation_error" through `finished_tx`.
+    if let Some(ready_tx) = ready_tx.take() {
+        let _ = ready_tx.send(Ok(()));
     }
 
     let mut audio_open = true;
     let mut control_open = true;
     let mut finish_sent = false;
     let mut cancel_requested = false;
+    let mut started = false;
+    let start_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_START_TIMEOUT_SECS));
+    tokio::pin!(start_deadline);
     let result: Result<ForgeDictationResult, String> = loop {
         tokio::select! {
+            _ = &mut start_deadline, if !started => {
+                break Err("Cloud dictation timed out while starting the audio stream.".to_string());
+            }
             maybe_control = control_rx.recv(), if control_open => {
                 let (control_kind, cancel) = match maybe_control {
                     Some(ForgeDictationControl::Cancel) => ("cancel", true),
@@ -5440,7 +5440,11 @@ async fn run_forge_dictation_stream(
                             continue;
                         };
                         match payload.get("kind").and_then(Value::as_str).unwrap_or_default() {
+                            "voice_dictation_started" => {
+                                started = true;
+                            }
                             "voice_dictation_transcript" => {
+                                started = true;
                                 let transcript = payload
                                     .get("text")
                                     .and_then(Value::as_str)
@@ -5498,6 +5502,242 @@ async fn run_forge_dictation_stream(
     let _ = finished_tx.send(result);
 }
 
+/// Opens a fresh dictation websocket and waits for the cloud ready frame so a
+/// claimed warm socket is known-good before press-to-talk relies on it.
+async fn open_forge_dictation_warm_socket(
+    cloud_mcp_state: &CloudMcpState,
+) -> Result<ForgeDictationWsStream, String> {
+    let (ws_target, auth_bearer) = resolve_forge_dictation_cloud_route(cloud_mcp_state).await?;
+    let request = cloud_voice_agent_ws_request(&ws_target, auth_bearer.as_deref(), "", "")?;
+    let (mut stream, _) = timeout(
+        Duration::from_secs(CLOUD_DICTATION_WARM_CONNECT_TIMEOUT_SECS),
+        connect_async(request),
+    )
+    .await
+    .map_err(|_| "Warm cloud dictation connect timed out.".to_string())?
+    .map_err(|error| format!("Unable to open the warm cloud dictation WebSocket: {error}"))?;
+
+    let ready_deadline = sleep(Duration::from_secs(CLOUD_DICTATION_WARM_READY_TIMEOUT_SECS));
+    tokio::pin!(ready_deadline);
+    loop {
+        tokio::select! {
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let kind = serde_json::from_str::<Value>(text.as_str())
+                            .ok()
+                            .and_then(|payload| {
+                                payload
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        if kind == "voice_dictation_ready" {
+                            return Ok(stream);
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        if stream.send(Message::Pong(payload)).await.is_err() {
+                            return Err("Warm cloud dictation socket closed during setup.".to_string());
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err("Warm cloud dictation socket closed during setup.".to_string());
+                    }
+                    Some(Err(error)) => {
+                        return Err(format!("Warm cloud dictation socket failed during setup: {error}"));
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut ready_deadline => {
+                return Err("Warm cloud dictation socket timed out waiting for ready.".to_string());
+            }
+        }
+    }
+}
+
+enum ForgeDictationParkOutcome {
+    Claimed(oneshot::Sender<Option<ForgeDictationWsStream>>),
+    Released,
+    Dead,
+}
+
+/// Parks a ready dictation socket in the warm slot and keeps it alive with
+/// JSON pings until it is claimed by press-to-talk, released by a prewarm
+/// disable/generation bump, or dies and needs a replacement.
+async fn park_forge_dictation_warm_socket(
+    audio_state: &AudioState,
+    generation: u64,
+    mut stream: ForgeDictationWsStream,
+) {
+    let (claim_tx, mut claim_rx) =
+        oneshot::channel::<oneshot::Sender<Option<ForgeDictationWsStream>>>();
+    {
+        let mut slot_guard = audio_state.forge_dictation_warm.lock().await;
+        if !audio_state.forge_dictation_warm_desired.load(Ordering::SeqCst)
+            || audio_state.forge_dictation_warm_generation.load(Ordering::SeqCst) != generation
+        {
+            drop(slot_guard);
+            let _ = stream.close(None).await;
+            return;
+        }
+        *slot_guard = Some(ForgeDictationWarmSlot { claim_tx });
+    }
+    log_audio_diagnostic_event("audio.forge_dictation.warm.parked", json!({}));
+
+    let mut ping_interval =
+        tokio::time::interval(Duration::from_secs(CLOUD_DICTATION_WARM_PING_SECS));
+    ping_interval.tick().await;
+    let outcome = loop {
+        tokio::select! {
+            claim = &mut claim_rx => {
+                match claim {
+                    Ok(reply_tx) => break ForgeDictationParkOutcome::Claimed(reply_tx),
+                    Err(_) => break ForgeDictationParkOutcome::Released,
+                }
+            }
+            _ = ping_interval.tick() => {
+                let ping = json!({
+                    "kind": "ping",
+                    "contract": CLOUD_DICTATION_CONTRACT,
+                });
+                if stream.send(Message::Text(ping.to_string().into())).await.is_err() {
+                    break ForgeDictationParkOutcome::Dead;
+                }
+            }
+            incoming = stream.next() => {
+                match incoming {
+                    Some(Ok(Message::Ping(payload))) => {
+                        if stream.send(Message::Pong(payload)).await.is_err() {
+                            break ForgeDictationParkOutcome::Dead;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        break ForgeDictationParkOutcome::Dead;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    match outcome {
+        ForgeDictationParkOutcome::Claimed(reply_tx) => {
+            log_audio_diagnostic_event("audio.forge_dictation.warm.claimed", json!({}));
+            let _ = reply_tx.send(Some(stream));
+        }
+        ForgeDictationParkOutcome::Released => {
+            let _ = stream.close(None).await;
+        }
+        ForgeDictationParkOutcome::Dead => {
+            log_audio_diagnostic_event("audio.forge_dictation.warm.died", json!({}));
+            // Only this keeper installs slots for its generation, so taking
+            // the slot here cannot remove another keeper's socket.
+            audio_state.forge_dictation_warm.lock().await.take();
+            let _ = stream.close(None).await;
+        }
+    }
+}
+
+/// Background keeper: while warm dictation stays desired for this generation,
+/// keep one ready socket parked at all times, replacing it immediately after
+/// it is claimed or dies (with backoff while the cloud is unreachable).
+fn spawn_forge_dictation_warm_loop(app: AppHandle, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        let audio_state = app.state::<AudioState>().inner().clone();
+        let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
+        let mut retry_delay_ms = CLOUD_DICTATION_WARM_RETRY_MIN_MS;
+        loop {
+            if !audio_state.forge_dictation_warm_desired.load(Ordering::SeqCst)
+                || audio_state.forge_dictation_warm_generation.load(Ordering::SeqCst) != generation
+            {
+                return;
+            }
+            match open_forge_dictation_warm_socket(&cloud_mcp_state).await {
+                Ok(stream) => {
+                    retry_delay_ms = CLOUD_DICTATION_WARM_RETRY_MIN_MS;
+                    park_forge_dictation_warm_socket(&audio_state, generation, stream).await;
+                }
+                Err(error) => {
+                    log_audio_diagnostic_event(
+                        "audio.forge_dictation.warm.connect_error",
+                        json!({ "error": error }),
+                    );
+                    sleep(Duration::from_millis(retry_delay_ms)).await;
+                    retry_delay_ms = (retry_delay_ms * 2).min(CLOUD_DICTATION_WARM_RETRY_MAX_MS);
+                }
+            }
+        }
+    });
+}
+
+/// Claims the parked warm socket, if one is ready right now.
+async fn claim_forge_dictation_warm_stream(
+    audio_state: &AudioState,
+) -> Option<ForgeDictationWsStream> {
+    let slot = audio_state.forge_dictation_warm.lock().await.take()?;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if slot.claim_tx.send(reply_tx).is_err() {
+        return None;
+    }
+    match timeout(
+        Duration::from_millis(CLOUD_DICTATION_WARM_CLAIM_TIMEOUT_MS),
+        reply_rx,
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        _ => None,
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct ForgeDictationPrewarmRequest {
+    enabled: Option<bool>,
+}
+
+#[tauri::command]
+async fn prewarm_forge_dictation_transcription(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    request: Option<ForgeDictationPrewarmRequest>,
+) -> Result<bool, String> {
+    let enabled = request.and_then(|request| request.enabled).unwrap_or(true);
+    log_audio_diagnostic_event(
+        "audio.forge_dictation.prewarm.command",
+        json!({ "enabled": enabled }),
+    );
+
+    if !enabled {
+        audio_state
+            .forge_dictation_warm_desired
+            .store(false, Ordering::SeqCst);
+        audio_state
+            .forge_dictation_warm_generation
+            .fetch_add(1, Ordering::SeqCst);
+        audio_state.forge_dictation_warm.lock().await.take();
+        return Ok(false);
+    }
+
+    if audio_state
+        .forge_dictation_warm_desired
+        .swap(true, Ordering::SeqCst)
+    {
+        // A keeper loop is already maintaining the warm connection.
+        return Ok(true);
+    }
+
+    let generation = audio_state
+        .forge_dictation_warm_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    spawn_forge_dictation_warm_loop(app, generation);
+    Ok(true)
+}
+
 #[tauri::command]
 async fn start_forge_dictation_transcription(
     app: AppHandle,
@@ -5527,23 +5767,30 @@ async fn start_forge_dictation_transcription(
         return Err("Cloud voice agent stream is already active.".to_string());
     }
 
-    cloud_mcp_wait_for_app_ws_auth(cloud_mcp_state.inner())
-        .await
-        .map(|_| ())
-        .map_err(|error| {
-            format!("Diff Forge Cloud dictation needs the signed-in Diff Forge AI connection. {error}")
-        })?;
-    let auth_bearer = cloud_mcp_authorization_bearer(cloud_mcp_state.inner()).await?;
-    let ws_target = cloud_mcp_resolve_ws_target(
-        cloud_mcp_state.inner(),
-        &cloud_mcp_base_url(),
-        CLOUD_DICTATION_WS_PATH,
-    )
-    .await
-    .map_err(|error| format!("Cloud dictation route unavailable: {error}"))?;
-
+    // Attach the microphone before any network work: captured audio buffers
+    // in the unbounded channel from this moment, so even a cold connect loses
+    // none of the user's speech.
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let status = audio_state.input_worker.attach_realtime_stream(audio_tx)?;
+
+    // Prefer the parked warm websocket (already authenticated and ready on
+    // the cloud side); fall back to a cold connect when none is available.
+    let warm_stream = claim_forge_dictation_warm_stream(&audio_state).await;
+    let used_warm_socket = warm_stream.is_some();
+    let connection = match warm_stream {
+        Some(stream) => ForgeDictationConnection::Warm(stream),
+        None => match resolve_forge_dictation_cloud_route(cloud_mcp_state.inner()).await {
+            Ok((ws_target, auth_bearer)) => ForgeDictationConnection::Cold {
+                ws_target,
+                auth_bearer,
+            },
+            Err(error) => {
+                let _ = audio_state.input_worker.detach_realtime_stream();
+                return Err(error);
+            }
+        },
+    };
+
     let (control_tx, control_rx) = mpsc::unbounded_channel::<ForgeDictationControl>();
     let (ready_tx, ready_rx) = oneshot::channel();
     let (finished_tx, finished_rx) = oneshot::channel();
@@ -5559,8 +5806,7 @@ async fn start_forge_dictation_transcription(
 
     tauri::async_runtime::spawn(run_forge_dictation_stream(
         app,
-        ws_target,
-        auth_bearer,
+        connection,
         start_request,
         audio_rx,
         control_rx,
@@ -5595,6 +5841,7 @@ async fn start_forge_dictation_transcription(
             "language": language.clone(),
             "sample_rate": status.sample_rate,
             "llm_cleanup": llm_cleanup,
+            "warm_socket": used_warm_socket,
         }),
     );
 

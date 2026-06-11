@@ -20,7 +20,6 @@ import {
   AUDIO_WIDGET_STYLE_BAR,
   AUDIO_WIDGET_STYLE_BUBBLE,
   AUDIO_WIDGET_STYLE_HIDDEN,
-  AUDIO_WIDGET_STYLE_PILL,
   AUDIO_WIDGET_THEME_DARK,
   AUDIO_WIDGET_THEME_LIGHT,
   AUDIO_WIDGET_THEME_STORAGE_KEY,
@@ -285,15 +284,16 @@ import {
   AudioWidgetLockBadge,
   AudioBarShell,
   AudioBarSurface,
-  AudioBarLogoButton,
+  AudioBarCancelButton,
   AudioBarMeter,
   AudioBarStatusText,
-  AudioBarFinishButton,
   AudioBarUndoButton,
   AudioBarNoticeProgress,
-  AudioPillShell,
-  AudioPillTooltip,
-  AudioPillMicButton,
+  AudioBarIdleShell,
+  AudioBarIdleReveal,
+  AudioBarIdleLine,
+  AudioBarRecordButton,
+  AudioBarShortcutHint,
   AudioWidgetFocusStage,
   AudioWidgetLogo,
   AudioWidgetMeter,
@@ -441,19 +441,26 @@ const AUDIO_HYBRID_TAP_MAX_MS = 280;
 const AUDIO_HYBRID_DOUBLE_TAP_MS = 360;
 const AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS = 600;
 const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
+// Forge cloud dictation streams audio continuously through the native
+// worker, so only a short tail is needed to flush in-flight chunks before
+// the finish frame; this keeps release-to-transcript latency low.
+const FORGE_RELEASE_POST_BUFFER_MS = 350;
 const AUDIO_WIDGET_PREROLL_READY_MS = 500;
 const AUDIO_INPUT_METER_BARS = 32;
 const AUDIO_WIDGET_METER_BARS = 26;
 const AUDIO_WIDGET_COMPACT_SIZE = { width: 64, height: 64 };
 const AUDIO_WIDGET_FOCUS_SIZE = { width: 292, height: 64 };
-const AUDIO_WIDGET_BAR_SIZE = { width: 332, height: 52 };
-const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 28;
-const AUDIO_WIDGET_PILL_SIZE = { width: 240, height: 96 };
+// Recording: a slim Wispr-style line bottom-center (X to cancel + waveform).
+const AUDIO_WIDGET_BAR_SIZE = { width: 264, height: 40 };
+const AUDIO_WIDGET_BAR_BOTTOM_MARGIN = 10;
+// Idle: a thin line hugging the bottom; the window stays this small dock
+// zone so hovering it can reveal the round record button + shortcut hint.
+const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 200, height: 96 };
+const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 // Extra window height for the small error card shown above the bubble; the
 // window shifts up by the same amount so the pill stays put on screen.
 const AUDIO_WIDGET_ERROR_POPOVER_HEIGHT = 62;
 const AUDIO_WIDGET_ERROR_AUTO_DISMISS_MS = 6500;
-const AUDIO_WIDGET_PILL_BOTTOM_MARGIN = 4;
 const AUDIO_BAR_METER_BARS = 18;
 const AUDIO_WIDGET_CLOSE_ANIMATION_MS = 240;
 const EMPTY_AUDIO_INPUT_STATS = { bufferMs: 0, peak: 0, rms: 0 };
@@ -504,14 +511,9 @@ const AUDIO_WIDGET_STYLE_OPTIONS = [
     label: "Hidden",
   },
   {
-    detail: "Centered bar while speaking",
+    detail: "Thin line; hover to record",
     id: AUDIO_WIDGET_STYLE_BAR,
     label: "Bottom bar",
-  },
-  {
-    detail: "Closed pill, hover to dictate",
-    id: AUDIO_WIDGET_STYLE_PILL,
-    label: "Pill",
   },
 ];
 const AUDIO_HISTORY_ROW_HEIGHT = 124;
@@ -1533,6 +1535,15 @@ export default function AudioWorkspaceView({
     }
   }, [isForgeAgentMode, isForgeMode, refreshForgeBilling]);
 
+  useEffect(() => {
+    // Keep a pre-authenticated cloud dictation websocket parked whenever
+    // Diff Forge Cloud dictation is the selected provider so press-to-talk
+    // starts instantly instead of paying the connect handshake.
+    invoke("prewarm_forge_dictation_transcription", {
+      request: { enabled: isForgeMode },
+    }).catch(() => {});
+  }, [isForgeMode]);
+
   const toggleForgeLlmCleanup = useCallback(() => {
     setForgeLlmCleanup((currentValue) => {
       const nextValue = !currentValue;
@@ -2024,12 +2035,10 @@ export default function AudioWorkspaceView({
               </AudioModeGrid>
               <SettingsHint>
                 {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
-                  ? "A small centered bar shows at the bottom while you speak: hover the logo to cancel, hit the check to finish and paste."
-                  : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_PILL
-                    ? "A tiny closed pill sits bottom-center (above the Dock). Hover it for the dictate mic; speaking turns it into the bottom bar."
-                    : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
-                      ? "The bubble stays invisible until you start speaking."
-                      : "The bubble stays visible and draggable at all times."}
+                  ? "A thin line sits at the bottom of the screen. Hover it for the record button (the orange hint is the shortcut); while recording it becomes a slim bar with an X to cancel."
+                  : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
+                    ? "The bubble stays invisible until you start speaking."
+                    : "The bubble stays visible and draggable at all times."}
               </SettingsHint>
             </AudioCloudField>
           </AudioRecorderPanel>
@@ -2763,6 +2772,14 @@ export function AudioWidgetWindow() {
     applyAudioWidgetThemePreference(audioWidgetTheme);
   }, [audioWidgetTheme]);
 
+  useEffect(() => {
+    // Keep the warm cloud dictation websocket parked while Diff Forge Cloud
+    // dictation is selected so push-to-talk in the widget starts instantly.
+    invoke("prewarm_forge_dictation_transcription", {
+      request: { enabled: transcriptionProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE },
+    }).catch(() => {});
+  }, [transcriptionProvider]);
+
   const setWidgetFrameMode = useCallback((nextMode) => {
     widgetFrameModeRef.current = nextMode;
     setWidgetFrameModeState(nextMode);
@@ -3185,26 +3202,22 @@ export function AudioWidgetWindow() {
     || widgetState === "recording"
     || widgetState === "transcribing"
     || widgetState === "error";
-  const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR
-    || widgetStyle === AUDIO_WIDGET_STYLE_PILL;
+  const usesBottomAnchoredStyle = widgetStyle === AUDIO_WIDGET_STYLE_BAR;
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || Boolean(cancelNotice));
 
-  // Hidden and bar styles keep the window "visible" to the OS (global
-  // shortcuts require it) but make it inert and invisible while idle.
+  // The hidden style keeps the window "visible" to the OS (global shortcuts
+  // require it) but inert and invisible while idle. The bar style is always
+  // interactive: its idle line must respond to hover.
   useEffect(() => {
-    const ignoreCursor = widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN
-      ? !widgetActive
-      : widgetStyle === AUDIO_WIDGET_STYLE_BAR
-        ? !barVisible
-        : false;
+    const ignoreCursor = widgetStyle === AUDIO_WIDGET_STYLE_HIDDEN && !widgetActive;
     runWidgetWindowAction((windowHandle) => windowHandle.setIgnoreCursorEvents(ignoreCursor));
-  }, [barVisible, runWidgetWindowAction, widgetActive, widgetStyle]);
+  }, [runWidgetWindowAction, widgetActive, widgetStyle]);
 
-  // Bottom-anchored styles (bar and pill) dock the window bottom-center of
-  // the active monitor; the user's bubble placement is restored on exit. The
-  // monitor work area keeps the pill above the macOS Dock / Windows taskbar,
-  // and in fullscreen (no dock) the same math sits closer to the bottom edge.
+  // The bar style docks the window bottom-center of the active monitor; the
+  // user's bubble placement is restored on exit. The monitor work area keeps
+  // the line above the macOS Dock / Windows taskbar on whichever screen it is
+  // on, and in fullscreen (no dock/taskbar) the same math hugs the bare edge.
   useEffect(() => {
     if (!usesBottomAnchoredStyle) {
       const saved = barSavedPlacementRef.current;
@@ -3220,14 +3233,10 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    // The bar style has nothing to place while idle (the window is inert and
-    // invisible); the pill style is always anchored.
-    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR && !barVisible) {
-      return;
-    }
-
-    const target = barVisible ? AUDIO_WIDGET_BAR_SIZE : AUDIO_WIDGET_PILL_SIZE;
-    const margin = barVisible ? AUDIO_WIDGET_BAR_BOTTOM_MARGIN : AUDIO_WIDGET_PILL_BOTTOM_MARGIN;
+    const target = barVisible ? AUDIO_WIDGET_BAR_SIZE : AUDIO_WIDGET_BAR_IDLE_SIZE;
+    const margin = barVisible
+      ? AUDIO_WIDGET_BAR_BOTTOM_MARGIN
+      : AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN;
 
     runWidgetWindowAction(async (windowHandle) => {
       if (!barSavedPlacementRef.current) {
@@ -3261,7 +3270,7 @@ export function AudioWidgetWindow() {
     && !usesBottomAnchoredStyle;
 
   useEffect(() => {
-    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetStyle === AUDIO_WIDGET_STYLE_PILL) {
+    if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
       return undefined;
     }
     const wantsFocus = widgetTargetMode === "focus";
@@ -3387,10 +3396,7 @@ export function AudioWidgetWindow() {
       return;
     }
 
-    if (
-      widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR
-      || widgetStyleRef.current === AUDIO_WIDGET_STYLE_PILL
-    ) {
+    if (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
       return;
     }
 
@@ -3704,7 +3710,7 @@ export function AudioWidgetWindow() {
       : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
         ? await (async () => {
           setMessage("Capturing final audio");
-          await waitForAudioPostBuffer(DEEPGRAM_RELEASE_POST_BUFFER_MS);
+          await waitForAudioPostBuffer(FORGE_RELEASE_POST_BUFFER_MS);
           if (recordingRunRef.current !== recordingRunId) {
             throw new Error("Diff Forge Cloud dictation canceled.");
           }
@@ -3879,12 +3885,7 @@ export function AudioWidgetWindow() {
     const salvageable = currentState === "transcribing"
       || (currentState === "recording" && Boolean(audioBuffer));
 
-    if (
-      salvage
-      && salvageable
-      && (widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR
-        || widgetStyleRef.current === AUDIO_WIDGET_STYLE_PILL)
-    ) {
+    if (salvage && salvageable && widgetStyleRef.current === AUDIO_WIDGET_STYLE_BAR) {
       showCancelNotice();
     }
 
@@ -4585,28 +4586,26 @@ export function AudioWidgetWindow() {
   const widgetLabel = isFocusedWidget && !isClosingFocus ? expandedLabel : compactLabel;
   const showWidgetCancelButton = (isRecordingFocus || isProcessingFocus) && !isClosingFocus;
 
-  if (widgetStyle === AUDIO_WIDGET_STYLE_BAR || widgetStyle === AUDIO_WIDGET_STYLE_PILL) {
-    if (widgetStyle === AUDIO_WIDGET_STYLE_PILL && !barVisible) {
+  if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
+    if (!barVisible) {
       const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
       return (
         <>
           <GlobalStyle />
-          <AudioPillShell aria-label="Dictation pill" data-theme={audioWidgetTheme}>
-            <AudioPillTooltip role="tooltip">
-              {`Dictate (${dictateShortcutLabel})`}
-            </AudioPillTooltip>
-            <AudioPillMicButton
-              aria-label={`Dictate (${dictateShortcutLabel})`}
-              onClick={toggleTalk}
-              type="button"
-            >
-              <svg fill="none" stroke="currentColor" strokeWidth="1.8" viewBox="0 0 24 24">
-                <rect height="11" rx="3" strokeLinejoin="round" width="6" x="9" y="2.5" />
-                <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0" strokeLinecap="round" />
-                <path d="M12 18v3.5M8.5 21.5h7" strokeLinecap="round" />
-              </svg>
-            </AudioPillMicButton>
-          </AudioPillShell>
+          <AudioBarIdleShell aria-label="Dictation bar" data-theme={audioWidgetTheme}>
+            <AudioBarIdleReveal>
+              <AudioBarRecordButton
+                aria-label={`Start dictation (${dictateShortcutLabel})`}
+                onClick={toggleTalk}
+                title={`Start dictation (${dictateShortcutLabel})`}
+                type="button"
+              />
+              <AudioBarShortcutHint aria-hidden="true">
+                {dictateShortcutLabel}
+              </AudioBarShortcutHint>
+            </AudioBarIdleReveal>
+            <AudioBarIdleLine aria-hidden="true" />
+          </AudioBarIdleShell>
         </>
       );
     }
@@ -4641,15 +4640,25 @@ export function AudioWidgetWindow() {
               />
             </AudioBarSurface>
           ) : (
-            <AudioBarSurface role="status">
-              <AudioBarLogoButton
+            <AudioBarSurface
+              onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
+              role="status"
+              style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
+              title={isRecordingFocus || widgetState === "arming"
+                ? "Click to finish and paste, or press the shortcut again. X cancels."
+                : undefined}
+            >
+              <AudioBarCancelButton
                 aria-label="Cancel dictation"
-                onClick={() => cancelRecording()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  cancelRecording();
+                }}
                 title="Cancel: stop without pasting. The transcript is still saved to History."
                 type="button"
               >
-                <img alt="" src="/logo.webp" />
-              </AudioBarLogoButton>
+                ×
+              </AudioBarCancelButton>
               {widgetState === "error" ? (
                 <AudioBarStatusText title={error || message}>
                   {error || message || "Audio error"}
@@ -4664,17 +4673,6 @@ export function AudioWidgetWindow() {
                   ))}
                 </AudioBarMeter>
               )}
-              <AudioBarFinishButton
-                aria-label="Finish and paste"
-                disabled={!isRecordingFocus && widgetState !== "arming"}
-                onClick={finishFromBar}
-                title="Finish and paste: stop recording, transcribe, and insert into the focused app."
-                type="button"
-              >
-                <svg fill="none" stroke="currentColor" strokeWidth="3" viewBox="0 0 24 24">
-                  <path d="M4 12.5 10 18 20 6.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </AudioBarFinishButton>
             </AudioBarSurface>
           )}
         </AudioBarShell>

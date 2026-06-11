@@ -1098,31 +1098,36 @@ const TerminalSurfaceSlot = styled.div`
 const SNIP_PREVIEW_DROP_EVENT = "forge-snip-preview-drop";
 const SNIP_PREVIEW_DRAG_OVER_EVENT = "forge-snip-preview-drag-over";
 
-const TODO_COMPLETION_FLASH_MS = 1600;
+const TODO_COMPLETION_FLASH_MS = 2000;
 
 const todoCompletionFlashPulse = keyframes`
   0% { opacity: 0; }
-  10% { opacity: 1; }
-  55% { opacity: 0.82; }
+  8% { opacity: 1; }
+  42% { opacity: 0.66; }
+  62% { opacity: 1; }
   100% { opacity: 0; }
 `;
 
 const TerminalTodoCompletionFlash = styled.div`
   position: absolute;
   inset: 0;
-  z-index: 80;
+  z-index: 200;
   pointer-events: none;
   border-radius: inherit;
+  border: 2px solid rgba(74, 222, 128, 0.95);
   box-shadow:
-    inset 0 0 0 2px rgba(74, 222, 128, 0.9),
-    inset 0 0 26px rgba(74, 222, 128, 0.24);
+    0 0 14px 3px rgba(74, 222, 128, 0.55),
+    0 0 34px 8px rgba(74, 222, 128, 0.3),
+    inset 0 0 18px rgba(74, 222, 128, 0.22);
   opacity: 0;
-  animation: ${todoCompletionFlashPulse} 1.6s ease-out forwards;
+  animation: ${todoCompletionFlashPulse} 2s ease-in-out forwards;
 
   html[data-forge-theme="light"] & {
+    border-color: rgba(22, 163, 74, 0.9);
     box-shadow:
-      inset 0 0 0 2px rgba(22, 163, 74, 0.85),
-      inset 0 0 22px rgba(22, 163, 74, 0.18);
+      0 0 14px 3px rgba(22, 163, 74, 0.42),
+      0 0 30px 8px rgba(22, 163, 74, 0.22),
+      inset 0 0 16px rgba(22, 163, 74, 0.16);
   }
 `;
 
@@ -16543,35 +16548,25 @@ function TerminalView({
       const completedPaneId = String(
         pendingItem?.paneId || inFlightPrompt?.paneId || getTerminalPaneId(safeTerminalIndex) || "",
       ).trim();
-      // "Watching" means this workspace's terminals tab is the visible app
-      // surface (not just that the workspace is selected — another tab like
-      // Files or Tools must still ring the SFX). Any finishing terminal on
-      // the visible terminals tab flashes its border instead of ringing.
-      const watchingCompletedTerminal = Boolean(
-        isWorkspaceSurfaceVisibleRef.current
-          && completedPaneId
-          && typeof document !== "undefined"
-          && document.hasFocus(),
-      );
-      if (watchingCompletedTerminal) {
-        triggerTodoCompletionFlash(completedPaneId);
-      } else {
-        // AppShell turns this into a workspace notification + cue, which
-        // plays the SFX and lights the workspace rail indicator.
-        window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
-          detail: {
-            agentId: pendingItem?.targetAgentId || pendingItem?.targetRole || inFlightPrompt?.agentId || "",
-            itemId,
-            paneId: completedPaneId,
-            queueDrained: todoQueueDrained,
-            terminalIndex: safeTerminalIndex,
-            threadId: inFlightPrompt?.threadId || "",
-            todoText: completedItem?.text ? String(completedItem.text).slice(0, 200) : "",
-            todoTitle: completedItem?.title || "",
-            workspaceId: pendingItem?.workspaceId || terminalWorkspace?.id || "",
-          },
-        }));
-      }
+      // A finishing terminal always glows AND always rings: the cue cooldown
+      // in the notification reducer dedupes the SFX if the activity-hook
+      // listener already rang for this turn close.
+      triggerTodoCompletionFlash(completedPaneId);
+      // AppShell turns this into a workspace notification + cue, which
+      // plays the SFX and lights the workspace rail indicator.
+      window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
+        detail: {
+          agentId: pendingItem?.targetAgentId || pendingItem?.targetRole || inFlightPrompt?.agentId || "",
+          itemId,
+          paneId: completedPaneId,
+          queueDrained: todoQueueDrained,
+          terminalIndex: safeTerminalIndex,
+          threadId: inFlightPrompt?.threadId || "",
+          todoText: completedItem?.text ? String(completedItem.text).slice(0, 200) : "",
+          todoTitle: completedItem?.title || "",
+          workspaceId: pendingItem?.workspaceId || terminalWorkspace?.id || "",
+        },
+      }));
       setTodoQueueDispatchRevision((revision) => revision + 1);
       return;
     }
@@ -17719,7 +17714,7 @@ function TerminalView({
     let unlistenActivityHook = null;
 
     const handleActivityHookEvent = (hookEvent) => {
-      if (cancelled || !todoQueueTerminalInFlightPromptsRef.current.size) {
+      if (cancelled) {
         return;
       }
 
@@ -17749,6 +17744,32 @@ function TerminalView({
       }
       if (terminalIndex == null || !logicalTerminalIndexes.includes(terminalIndex)) {
         return;
+      }
+
+      // Every completed turn glows the finishing terminal and rings the SFX,
+      // even with no todo-queue prompt in flight (e.g. prompts typed directly
+      // into the CLI). When an in-flight prompt exists its settle path owns
+      // the notification event so the unread list gets the todo text; the
+      // cue cooldown in the reducer keeps the SFX from ringing twice.
+      if (eventType === "provider-turn-completed") {
+        triggerTodoCompletionFlash(payloadPaneId || getTerminalPaneId(terminalIndex));
+        if (!todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex)) {
+          window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {
+            detail: {
+              agentId: normalizeTodoTerminalAgentId(
+                payload.agentId || payload.agentKind || payload.agent_kind || "",
+              ),
+              itemId: "",
+              paneId: payloadPaneId || getTerminalPaneId(terminalIndex),
+              queueDrained: false,
+              terminalIndex,
+              threadId: payload.threadId || "",
+              todoText: String(payload.userMessage || payload.message || "").slice(0, 200),
+              todoTitle: "",
+              workspaceId: eventWorkspaceId || terminalWorkspace?.id || "",
+            },
+          }));
+        }
       }
 
       const inFlightPrompt = todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex);
@@ -17958,6 +17979,7 @@ function TerminalView({
     logicalTerminalIndexes,
     settleTodoQueueInFlightPrompt,
     terminalWorkspace?.id,
+    triggerTodoCompletionFlash,
   ]);
 
 	  useEffect(() => {

@@ -31,7 +31,6 @@ const AUDIO_WIDGET_STYLE_STORAGE_KEY = "diffforge.audio.widgetStyle";
 export const AUDIO_WIDGET_STYLE_BUBBLE = "bubble";
 export const AUDIO_WIDGET_STYLE_HIDDEN = "hidden";
 export const AUDIO_WIDGET_STYLE_BAR = "bar";
-export const AUDIO_WIDGET_STYLE_PILL = "pill";
 export const AUDIO_DEEPGRAM_DEFAULT_LANGUAGE = "en";
 const AUDIO_INPUT_STATS_EVENT = "forge-audio-input-stats";
 export const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
@@ -79,12 +78,14 @@ export function normalizeAudioWidgetTheme(value) {
 }
 
 export function normalizeAudioWidgetStyle(value) {
-  if (
-    value === AUDIO_WIDGET_STYLE_HIDDEN
-    || value === AUDIO_WIDGET_STYLE_BAR
-    || value === AUDIO_WIDGET_STYLE_PILL
-  ) {
+  if (value === AUDIO_WIDGET_STYLE_HIDDEN || value === AUDIO_WIDGET_STYLE_BAR) {
     return value;
+  }
+
+  // The retired "pill" style merged into the bottom bar (idle line + hover
+  // record button); saved preferences migrate instead of falling to bubble.
+  if (value === "pill") {
+    return AUDIO_WIDGET_STYLE_BAR;
   }
 
   return AUDIO_WIDGET_STYLE_BUBBLE;

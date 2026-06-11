@@ -431,6 +431,7 @@ struct TerminalState {
         Arc<StdMutex<HashMap<String, Vec<TerminalOutputTransportSubscriber>>>>,
     parked_prompts: Arc<RwLock<HashMap<String, TerminalParkedPrompt>>>,
     active_audio_input_target: Arc<StdMutex<Option<TerminalAudioInputTarget>>>,
+    audio_route_gate: Arc<StdMutex<TerminalAudioRouteGate>>,
     lifecycle_lock: Arc<Mutex<()>>,
     pty_pool: Arc<PtyPool>,
     cleanup_tracker: Arc<TerminalCleanupTracker>,
@@ -739,6 +740,26 @@ struct TerminalAudioInputTarget {
     instance_id: Option<u64>,
 }
 
+/// Webview-reported gate for routing dictation into the selected terminal.
+/// The main window keeps this current from tab visibility and DOM focus:
+/// the terminal route is only allowed while the Terminals tab is visible and
+/// no non-terminal editable element holds focus, so speech follows what the
+/// user is actually looking at instead of the sticky pane selection.
+#[derive(Clone)]
+struct TerminalAudioRouteGate {
+    allow_terminal: bool,
+}
+
+impl Default for TerminalAudioRouteGate {
+    fn default() -> Self {
+        // Allow by default so dictation keeps working if a webview build
+        // that does not report the gate is running.
+        Self {
+            allow_terminal: true,
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalAudioInputRefocusPayload {
@@ -753,6 +774,9 @@ struct AudioState {
     cloud_voice_agent_stream: Arc<Mutex<Option<CloudVoiceAgentSession>>>,
     deepgram_stream: Arc<Mutex<Option<DeepgramRealtimeSession>>>,
     forge_dictation_stream: Arc<Mutex<Option<ForgeDictationSession>>>,
+    forge_dictation_warm: Arc<Mutex<Option<ForgeDictationWarmSlot>>>,
+    forge_dictation_warm_desired: Arc<AtomicBool>,
+    forge_dictation_warm_generation: Arc<AtomicU64>,
     input_worker: NativeAudioWorker,
     realtime_stream_lock: Arc<Mutex<()>>,
     shortcut_manager: AudioShortcutManager,
@@ -782,6 +806,17 @@ struct ForgeDictationSession {
 enum ForgeDictationControl {
     Finish,
     Cancel,
+}
+
+type ForgeDictationWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// A parked, pre-authenticated cloud dictation websocket kept alive with
+/// keepalive pings so press-to-talk skips the connect handshake. Claiming
+/// sends a reply channel to the warm keeper task, which hands the live
+/// stream back (or `None` if the parked socket died).
+struct ForgeDictationWarmSlot {
+    claim_tx: oneshot::Sender<oneshot::Sender<Option<ForgeDictationWsStream>>>,
 }
 
 #[derive(Clone)]
@@ -4063,6 +4098,7 @@ pub fn run() {
             terminal_output_transport_subscribers: Arc::new(StdMutex::new(HashMap::new())),
             parked_prompts: Arc::new(RwLock::new(HashMap::new())),
             active_audio_input_target: Arc::new(StdMutex::new(None)),
+            audio_route_gate: Arc::new(StdMutex::new(TerminalAudioRouteGate::default())),
             lifecycle_lock: Arc::new(Mutex::new(())),
             pty_pool: Arc::clone(&pty_pool),
             cleanup_tracker: Arc::new(TerminalCleanupTracker::new()),
@@ -4080,6 +4116,9 @@ pub fn run() {
             cloud_voice_agent_stream: Arc::new(Mutex::new(None)),
             deepgram_stream: Arc::new(Mutex::new(None)),
             forge_dictation_stream: Arc::new(Mutex::new(None)),
+            forge_dictation_warm: Arc::new(Mutex::new(None)),
+            forge_dictation_warm_desired: Arc::new(AtomicBool::new(false)),
+            forge_dictation_warm_generation: Arc::new(AtomicU64::new(0)),
             input_worker: NativeAudioWorker::new(),
             realtime_stream_lock: Arc::new(Mutex::new(())),
             shortcut_manager: AudioShortcutManager::new(),
@@ -4252,6 +4291,7 @@ pub fn run() {
             voice_orchestrator_diagnostic_log,
             read_orchestrator_voice_history,
             write_orchestrator_voice_history,
+            prewarm_forge_dictation_transcription,
             start_forge_dictation_transcription,
             stop_forge_dictation_transcription,
             audio_shortcuts_status,
@@ -4402,6 +4442,7 @@ pub fn run() {
             terminal_start_agent,
             terminal_start_agent_many,
             set_terminal_audio_input_target,
+            set_terminal_audio_route_gate,
             terminal_write_to_audio_input_target,
             terminal_write,
             terminal_input_transport_endpoint,

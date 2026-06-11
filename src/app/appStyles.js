@@ -8175,47 +8175,6 @@ export const AudioBarSurface = styled.div`
   }
 `;
 
-export const AudioBarLogoButton = styled.button`
-  position: relative;
-  display: inline-flex;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  cursor: pointer;
-
-  img {
-    display: block;
-    width: 100%;
-    height: 100%;
-    border-radius: inherit;
-  }
-
-  &::after {
-    content: "\\00d7";
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: inherit;
-    color: #fff;
-    background: rgba(214, 69, 69, 0.94);
-    font-size: 15px;
-    font-weight: 800;
-    line-height: 1;
-    opacity: 0;
-    transition: opacity 120ms ease;
-  }
-
-  &:hover::after {
-    opacity: 1;
-  }
-`;
-
 export const AudioBarMeter = styled.div`
   display: flex;
   flex: 1;
@@ -8256,36 +8215,6 @@ export const AudioBarStatusText = styled.span`
 
   ${AudioBarShell}[data-theme="light"] & {
     color: rgba(29, 29, 31, 0.85);
-  }
-`;
-
-export const AudioBarFinishButton = styled.button`
-  display: inline-flex;
-  width: 26px;
-  height: 26px;
-  flex: none;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid rgba(75, 212, 170, 0.42);
-  border-radius: 999px;
-  color: var(--forge-green, #4bd4aa);
-  background: rgba(75, 212, 170, 0.12);
-  cursor: pointer;
-  transition: background 130ms ease, color 130ms ease;
-
-  svg {
-    width: 13px;
-    height: 13px;
-  }
-
-  &:hover:not(:disabled) {
-    color: #06120d;
-    background: var(--forge-green, #4bd4aa);
-  }
-
-  &:disabled {
-    opacity: 0.38;
-    cursor: default;
   }
 `;
 
@@ -8332,103 +8261,156 @@ export const AudioBarNoticeProgress = styled.span`
   }
 `;
 
-export const AudioPillShell = styled.div`
+/* Idle bottom-bar (Wispr-style): a thin line hugs the bottom of the screen
+   (the window is anchored to the monitor work area, so it sits just above
+   the macOS Dock / Windows taskbar, or near the bare edge when there is
+   none). Hovering the dock zone reveals one round record button with its
+   shortcut hinted in orange at the button's top right. */
+export const AudioBarIdleShell = styled.div`
   position: fixed;
   inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: flex-end;
-  gap: 9px;
-  padding-bottom: 5px;
+  padding-bottom: 6px;
 `;
 
-export const AudioPillTooltip = styled.span`
-  display: inline-flex;
+export const AudioBarIdleReveal = styled.div`
+  position: relative;
+  display: flex;
   align-items: center;
-  padding: 4px 10px;
-  border: 1px solid rgba(230, 236, 245, 0.14);
-  border-radius: 999px;
-  color: rgba(230, 236, 245, 0.92);
-  background: linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.97));
-  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
-  font-size: 11px;
-  font-weight: 740;
-  white-space: nowrap;
+  justify-content: center;
+  margin-bottom: 9px;
   opacity: 0;
-  transform: translateY(6px);
+  transform: translateY(8px) scale(0.9);
   pointer-events: none;
   transition: opacity 150ms ease, transform 180ms cubic-bezier(0.3, 0, 0.2, 1);
 
-  ${AudioPillShell}:hover & {
+  ${AudioBarIdleShell}:hover & {
     opacity: 1;
-    transform: translateY(0);
-  }
-
-  ${AudioPillShell}[data-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.1);
-    color: rgba(29, 29, 31, 0.9);
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
-    box-shadow: 0 8px 20px rgba(29, 29, 31, 0.16);
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
   }
 `;
 
-// Idle: a tiny closed pill hugging the bottom of the screen. Hover morphs
-// the same element into a round microphone button (Wispr-style).
-export const AudioPillMicButton = styled.button`
+export const AudioBarRecordButton = styled.button`
   display: inline-flex;
-  width: 44px;
-  height: 7px;
+  width: 42px;
+  height: 42px;
   flex: none;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid rgba(230, 236, 245, 0.22);
-  border-radius: 999px;
-  color: #7db0ff;
-  background: rgba(230, 236, 245, 0.3);
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(230, 236, 245, 0.18);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 30% 18%, rgba(125, 176, 255, 0.14), transparent 55%),
+    linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.98));
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
   cursor: pointer;
-  transition:
-    width 180ms cubic-bezier(0.3, 0, 0.2, 1),
-    height 180ms cubic-bezier(0.3, 0, 0.2, 1),
-    background 160ms ease,
-    border-color 160ms ease;
+  transition: transform 130ms ease, border-color 130ms ease;
 
-  svg {
+  &::after {
+    content: "";
     width: 15px;
     height: 15px;
-    opacity: 0;
-    transition: opacity 120ms ease 60ms;
-  }
-
-  ${AudioPillShell}:hover & {
-    width: 34px;
-    height: 34px;
-    border-color: rgba(230, 236, 245, 0.18);
-    background:
-      radial-gradient(circle at 30% 18%, rgba(125, 176, 255, 0.2), transparent 55%),
-      linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.98));
-
-    svg {
-      opacity: 1;
-    }
+    border-radius: 50%;
+    background: #f25555;
+    transition: transform 130ms ease;
   }
 
   &:hover {
-    color: #fff;
+    transform: scale(1.06);
+    border-color: rgba(242, 85, 85, 0.55);
   }
 
-  ${AudioPillShell}[data-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.16);
-    color: var(--forge-blue, #0066cc);
-    background: rgba(29, 29, 31, 0.3);
+  &:hover::after {
+    transform: scale(1.12);
   }
 
-  ${AudioPillShell}[data-theme="light"]:hover & {
+  ${AudioBarIdleShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.14);
     background:
-      radial-gradient(circle at 30% 18%, rgba(0, 102, 204, 0.1), transparent 55%),
+      radial-gradient(circle at 30% 18%, rgba(0, 102, 204, 0.08), transparent 55%),
       linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(247, 247, 250, 0.98));
+    box-shadow: 0 10px 22px rgba(29, 29, 31, 0.2);
+  }
+`;
+
+export const AudioBarShortcutHint = styled.span`
+  position: absolute;
+  left: calc(100% + 7px);
+  top: -5px;
+  color: var(--forge-orange, #ff9f43);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.45);
+
+  ${AudioBarIdleShell}[data-theme="light"] & {
+    text-shadow: none;
+  }
+`;
+
+export const AudioBarIdleLine = styled.span`
+  width: 64px;
+  height: 5px;
+  flex: none;
+  border: 1px solid rgba(230, 236, 245, 0.2);
+  border-radius: 999px;
+  background: rgba(230, 236, 245, 0.34);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  transition: background 150ms ease, width 160ms cubic-bezier(0.3, 0, 0.2, 1);
+
+  ${AudioBarIdleShell}:hover & {
+    width: 78px;
+    background: rgba(230, 236, 245, 0.55);
+  }
+
+  ${AudioBarIdleShell}[data-theme="light"] & {
+    border-color: rgba(0, 0, 0, 0.16);
+    background: rgba(29, 29, 31, 0.32);
+    box-shadow: 0 2px 8px rgba(29, 29, 31, 0.18);
+  }
+
+  ${AudioBarIdleShell}[data-theme="light"]:hover & {
+    background: rgba(29, 29, 31, 0.5);
+  }
+`;
+
+export const AudioBarCancelButton = styled.button`
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: rgba(230, 236, 245, 0.78);
+  background: rgba(230, 236, 245, 0.12);
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+
+  &:hover {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.94);
+  }
+
+  ${AudioBarShell}[data-theme="light"] & {
+    color: rgba(29, 29, 31, 0.7);
+    background: rgba(29, 29, 31, 0.08);
+  }
+
+  ${AudioBarShell}[data-theme="light"] &:hover {
+    color: #fff;
+    background: rgba(214, 69, 69, 0.94);
   }
 `;
 
@@ -12869,7 +12851,12 @@ export const WindowSyncPill = styled.button`
   }
 `;
 
-export const WindowSyncPillSpinner = styled.span`
+/* One element for every pill state: the spin animation is never added,
+   removed, or re-mounted on state changes, so it can never visibly reset.
+   The dot variant is a uniform circle, so its (still running) rotation is
+   invisible. will-change keeps the rotation on its own compositor layer so
+   a busy webview main thread cannot freeze it mid-spin. */
+export const WindowSyncPillIndicator = styled.span`
   width: 10px;
   height: 10px;
   flex: 0 0 auto;
@@ -12877,14 +12864,14 @@ export const WindowSyncPillSpinner = styled.span`
   border-top-color: transparent;
   border-radius: 50%;
   animation: ${workspaceCloseSpin} 0.8s linear infinite;
-`;
+  will-change: transform;
 
-export const WindowSyncPillDot = styled.span`
-  width: 6px;
-  height: 6px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: currentColor;
+  &[data-variant="dot"] {
+    width: 6px;
+    height: 6px;
+    border: none;
+    background: currentColor;
+  }
 `;
 
 export const TitleMinimizeIcon = styled(Remove)`

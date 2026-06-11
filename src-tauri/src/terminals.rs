@@ -238,6 +238,40 @@ fn clear_terminal_audio_input_target_if_matches(
     Ok(())
 }
 
+fn terminal_audio_route_gate(state: &TerminalState) -> Result<TerminalAudioRouteGate, String> {
+    state
+        .audio_route_gate
+        .lock()
+        .map(|gate| gate.clone())
+        .map_err(|_| "Unable to read the terminal audio route gate.".to_string())
+}
+
+fn set_terminal_audio_route_gate_for(
+    state: &TerminalState,
+    allow_terminal: bool,
+) -> Result<(), String> {
+    let mut gate = state
+        .audio_route_gate
+        .lock()
+        .map_err(|_| "Unable to update the terminal audio route gate.".to_string())?;
+
+    if gate.allow_terminal != allow_terminal {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.audio_input_target.route_gate",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "allow_terminal": allow_terminal,
+            },
+        }));
+    }
+    gate.allow_terminal = allow_terminal;
+
+    Ok(())
+}
+
 fn clear_terminal_audio_input_target(state: &TerminalState) -> Result<(), String> {
     let mut active_target = state
         .active_audio_input_target
@@ -428,6 +462,26 @@ async fn write_to_active_terminal_audio_input_target(
     let Some(target) = active_terminal_audio_input_target(state)? else {
         return Ok(false);
     };
+
+    // The webview gates the terminal route by what the user is actually
+    // looking at: another tab in front of the Terminals view, or focus in a
+    // non-terminal editable (for example the todo list), routes dictation to
+    // that input instead. The pane selection is kept so the terminal becomes
+    // the target again once it is back in view.
+    if !terminal_audio_route_gate(state)?.allow_terminal {
+        write_thread_bridge_diagnostic_log_entry(json!({
+            "ts_ms": current_time_ms(),
+            "phase": "backend.audio_input_target.write_skip",
+            "source": "backend",
+            "app_pid": std::process::id(),
+            "thread": terminal_diagnostic_thread_label(),
+            "fields": {
+                "pane_id": clean_terminal_diagnostic_log_text(&target.pane_id),
+                "reason": "route_gate_blocked",
+            },
+        }));
+        return Ok(false);
+    }
 
     if !app_has_focused_audio_input_window(app) {
         clear_terminal_audio_input_target_if_matches(state, &target.pane_id, target.instance_id)?;
@@ -5361,6 +5415,14 @@ fn set_terminal_audio_input_target(
     active: bool,
 ) -> Result<(), String> {
     set_terminal_audio_input_target_for(&state, pane_id, instance_id, active)
+}
+
+#[tauri::command]
+fn set_terminal_audio_route_gate(
+    state: State<'_, TerminalState>,
+    allow_terminal: bool,
+) -> Result<(), String> {
+    set_terminal_audio_route_gate_for(&state, allow_terminal)
 }
 
 #[tauri::command]

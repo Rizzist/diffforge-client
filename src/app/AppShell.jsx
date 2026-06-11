@@ -484,8 +484,7 @@ import {
   TitleMinimizeIcon,
   WindowBackgroundPill,
   WindowSyncPill,
-  WindowSyncPillDot,
-  WindowSyncPillSpinner,
+  WindowSyncPillIndicator,
   TitleMaximizeIcon,
   TitleRestoreIcon,
   TitleCloseIcon,
@@ -8110,6 +8109,70 @@ export default function App() {
   }, [visibleView]);
 
   useEffect(() => {
+    // Report whether dictation may route into the selected terminal pane.
+    // Pane selection is sticky (grey outline), so the backend needs to know
+    // what the user is actually looking at: the terminal route is only
+    // allowed while the Terminals view is visible and focus is not held by a
+    // non-terminal editable element (todo list, composers, and similar).
+    // When blocked, transcripts fall through to the focused input instead.
+    let lastReported = null;
+    let flushTimer = 0;
+
+    const elementAcceptsDictation = (element) => {
+      if (!element || element === document.body || element === document.documentElement) {
+        return false;
+      }
+      if (element.closest?.("[data-pane-id]")) {
+        // Focus inside a terminal surface keeps the terminal route.
+        return false;
+      }
+      if (element.isContentEditable) {
+        return true;
+      }
+      const tag = (element.tagName || "").toLowerCase();
+      if (tag === "textarea") {
+        return true;
+      }
+      if (tag === "input") {
+        const type = (element.getAttribute("type") || "text").toLowerCase();
+        return ![
+          "button", "checkbox", "color", "file", "image",
+          "radio", "range", "reset", "submit",
+        ].includes(type);
+      }
+      return false;
+    };
+
+    const reportGate = () => {
+      const terminalsVisible = visibleViewRef.current === DEFAULT_WORKSPACE_VIEW;
+      const allowTerminal = terminalsVisible
+        && !elementAcceptsDictation(document.activeElement);
+      if (lastReported === allowTerminal) {
+        return;
+      }
+      lastReported = allowTerminal;
+      invoke("set_terminal_audio_route_gate", { allowTerminal }).catch(() => {
+        lastReported = null;
+      });
+    };
+
+    const scheduleReport = () => {
+      window.clearTimeout(flushTimer);
+      // Let focus settle: focusout fires before the next element's focusin.
+      flushTimer = window.setTimeout(reportGate, 0);
+    };
+
+    reportGate();
+    window.addEventListener("focusin", scheduleReport, true);
+    window.addEventListener("focusout", scheduleReport, true);
+    return () => {
+      window.clearTimeout(flushTimer);
+      window.removeEventListener("focusin", scheduleReport, true);
+      window.removeEventListener("focusout", scheduleReport, true);
+    };
+  }, [visibleView]);
+
+  useEffect(() => {
     mainWindowFocusedRef.current = mainWindowFocused;
   }, [mainWindowFocused]);
 
@@ -9913,7 +9976,6 @@ export default function App() {
   const validateStoredSession = useCallback(async () => {
     const token = authStore.getToken();
     const validationFlowId = authFlowIdRef.current;
-    let cloudWorkspaceRestoreFailed = false;
 
     if (!isSafeAuthValue(token)) {
       setSignedOut(DEFAULT_AUTH_MESSAGE, "", { clearPending: true });
@@ -9952,25 +10014,38 @@ export default function App() {
       }
 
       const sessionNeedsCloudWorkspace = isPaidUser(session.user);
+      let cloudConnectCompleted = false;
 
       if (sessionNeedsCloudWorkspace) {
         authStore.setChecking("Checking saved desktop session. Connecting your cloud workspace...");
-        cloudWorkspaceRestoreFailed = true;
-        await connectCloudWorkspaceForAuthenticatedSession({
-          flowId: `restore-${validationFlowId}`,
-          sessionUser: session.user,
-          step: "desktop_restore.cloud_workspace",
-          successMessage: "Cloud MCP connection completed from saved desktop session",
-          token,
-        });
-        cloudWorkspaceRestoreFailed = false;
+        try {
+          await connectCloudWorkspaceForAuthenticatedSession({
+            flowId: `restore-${validationFlowId}`,
+            sessionUser: session.user,
+            step: "desktop_restore.cloud_workspace",
+            successMessage: "Cloud MCP connection completed from saved desktop session",
+            token,
+          });
+          cloudConnectCompleted = true;
+        } catch (cloudError) {
+          // The saved session already validated; a sync transport that cannot
+          // connect right now must not demote a valid session back to the
+          // sign-in screen. Enter the app and let the background websocket
+          // loop keep retrying (the sync pill shows Connecting).
+          updateCloudWorkspaceProgress({
+            detail: getErrorMessage(cloudError, "Cloud sync is still connecting in the background."),
+            stage: "cloud_instance",
+            status: "active",
+            title: "Cloud sync connecting in background",
+          });
+        }
 
         if (validationFlowId !== authFlowIdRef.current) {
           return;
         }
       }
 
-      setAuthenticated(session.user, { syncCloud: !sessionNeedsCloudWorkspace });
+      setAuthenticated(session.user, { syncCloud: !cloudConnectCompleted });
     } catch (error) {
       if (validationFlowId !== authFlowIdRef.current) {
         return;
@@ -9978,7 +10053,6 @@ export default function App() {
 
       const restoreError = getErrorMessage(error, "Unable to restore your desktop session.");
       const didTimeout = restoreError === SESSION_RESTORE_TIMEOUT_MESSAGE;
-      const didCloudWorkspaceFail = cloudWorkspaceRestoreFailed;
       const isNetworkRestoreError = didTimeout
         || /unable to validate desktop session/i.test(restoreError)
         || /unable to read diff forge ai api response/i.test(restoreError)
@@ -10001,19 +10075,15 @@ export default function App() {
         return;
       }
 
-      const signedOutMessage = didCloudWorkspaceFail
-        ? "Cloud workspace did not finish connecting. Sign in again to retry."
-        : (
-          didTimeout || isNetworkRestoreError
-            ? "Secure session could not be verified. Sign in again with the web app."
-            : "Your desktop session expired. Sign in again with the web app."
-        );
+      const signedOutMessage = didTimeout || isNetworkRestoreError
+        ? "Secure session could not be verified. Sign in again with the web app."
+        : "Your desktop session expired. Sign in again with the web app.";
       await recordCloudSigninDiagnostic(token, {
         flowId: `restore-${validationFlowId}`,
         step: "desktop_session.restore",
         status: "error",
         message: restoreError,
-        details: { didCloudWorkspaceFail, didTimeout },
+        details: { didTimeout },
       });
 
       setSignedOut(signedOutMessage, restoreError, {
@@ -10021,7 +10091,12 @@ export default function App() {
         clearSession: true,
       });
     }
-  }, [connectCloudWorkspaceForAuthenticatedSession, setAuthenticated, setSignedOut]);
+  }, [
+    connectCloudWorkspaceForAuthenticatedSession,
+    setAuthenticated,
+    setSignedOut,
+    updateCloudWorkspaceProgress,
+  ]);
 
   const revalidateOfflineSessionQuietly = useCallback(async () => {
     if (!offlineSessionGraceRef.current) {
@@ -10118,23 +10193,39 @@ export default function App() {
       }
 
       const sessionNeedsCloudWorkspace = isPaidUser(session.user);
+      let cloudConnectCompleted = false;
 
       if (sessionNeedsCloudWorkspace) {
         authStore.setExchanging("Browser callback matched. Connecting your cloud workspace...");
         failureStep = "desktop_signin.cloud_workspace";
-        await connectCloudWorkspaceForAuthenticatedSession({
-          accountScope: {
-            id: "personal",
-            type: "personal",
-            label: "Personal",
-            teamId: null,
-          },
-          flowId: callback.state,
-          sessionUser: session.user,
-          step: "desktop_signin.cloud_workspace",
-          successMessage: "Cloud MCP connection completed after deeplink",
-          token: session.token,
-        });
+        try {
+          await connectCloudWorkspaceForAuthenticatedSession({
+            accountScope: {
+              id: "personal",
+              type: "personal",
+              label: "Personal",
+              teamId: null,
+            },
+            flowId: callback.state,
+            sessionUser: session.user,
+            step: "desktop_signin.cloud_workspace",
+            successMessage: "Cloud MCP connection completed after deeplink",
+            token: session.token,
+          });
+          cloudConnectCompleted = true;
+        } catch (cloudError) {
+          // Auth must never be hostage to the sync transport: the deeplink
+          // exchange already proved the session, so a websocket that cannot
+          // connect right now enters the app anyway and keeps retrying in the
+          // background (the sync pill shows Connecting). Signing out here used
+          // to wipe the valid session over a transport outage.
+          updateCloudWorkspaceProgress({
+            detail: getErrorMessage(cloudError, "Cloud sync is still connecting in the background."),
+            stage: "cloud_instance",
+            status: "active",
+            title: "Cloud sync connecting in background",
+          });
+        }
 
         if (loginFlowId !== authFlowIdRef.current) {
           return true;
@@ -10143,7 +10234,7 @@ export default function App() {
 
       authStore.persistAuthenticatedSession(session);
       authStore.clearPending();
-      setAuthenticated(session.user, { syncCloud: !sessionNeedsCloudWorkspace });
+      setAuthenticated(session.user, { syncCloud: !cloudConnectCompleted });
       authCallbackCompletedStateRef.current = callback.state;
     } catch (error) {
       if (loginFlowId !== authFlowIdRef.current) {
@@ -10169,7 +10260,12 @@ export default function App() {
     }
 
     return true;
-  }, [connectCloudWorkspaceForAuthenticatedSession, setAuthenticated, setSignedOut]);
+  }, [
+    connectCloudWorkspaceForAuthenticatedSession,
+    setAuthenticated,
+    setSignedOut,
+    updateCloudWorkspaceProgress,
+  ]);
 
   const startWebLogin = useCallback(async () => {
     authFlowIdRef.current += 1;
@@ -23071,11 +23167,10 @@ export default function App() {
                 title={cloudSyncPillTitle}
                 type="button"
               >
-                {["syncing", "connecting"].includes(cloudSyncPillState) ? (
-                  <WindowSyncPillSpinner aria-hidden="true" />
-                ) : (
-                  <WindowSyncPillDot aria-hidden="true" />
-                )}
+                <WindowSyncPillIndicator
+                  aria-hidden="true"
+                  data-variant={["syncing", "connecting"].includes(cloudSyncPillState) ? "spinner" : "dot"}
+                />
                 <span>{cloudSyncPillLabel}</span>
               </WindowSyncPill>
             ) : null}

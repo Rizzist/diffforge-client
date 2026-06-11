@@ -10886,6 +10886,14 @@ function WorkspaceTerminal({
               const workspaceId = workspace?.id || "";
               const syncKey = getCurrentThreadComposerSyncKey(terminalInstanceId);
               const submittedWaiterReady = createTerminalPromptSubmittedWaiter({
+                // Manually typed prompts carry synthetic terminal-direct todo
+                // refs, so the Rust write observer marks them seen and the
+                // UserPromptSubmit hook never re-emits a prompt-submitted
+                // event. The observed input gate is the only confirmation
+                // that can arrive for hook-managed agents here; without it
+                // this waiter times out and the typed prompt never reaches
+                // todo history.
+                allowObservedInputGateForHookManaged: true,
                 agentId: terminalAgentKind,
                 expectedPrompt: promptTextAtSubmit,
                 instanceId: terminalInstanceId,

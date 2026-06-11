@@ -911,7 +911,60 @@ fn todo_dispatch_queue_mark_settled(workspace_id: &str, command_id: &str, status
 }
 
 fn chrono_like_now_iso() -> String {
-    crate::coordination::kernel::now_rfc3339()
+    // kernel::now_rfc3339 returns "<epoch_secs>.<millis>Z", which Date.parse
+    // rejects; captured todos flow into the webview/cloud where createdAt
+    // must be real ISO-8601.
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = duration.as_secs() as i64;
+    let millis = duration.subsec_millis();
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year,
+        month,
+        day,
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60,
+        millis,
+    )
+}
+
+#[cfg(test)]
+mod todo_dispatch_time_tests {
+    #[test]
+    fn chrono_like_now_iso_is_parseable_iso8601() {
+        let value = super::chrono_like_now_iso();
+        let bytes = value.as_bytes();
+        assert_eq!(bytes.len(), 24, "unexpected length: {value}");
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b'T');
+        assert_eq!(bytes[13], b':');
+        assert_eq!(bytes[16], b':');
+        assert_eq!(bytes[19], b'.');
+        assert_eq!(bytes[23], b'Z');
+        let year: i32 = value[0..4].parse().unwrap();
+        assert!(year >= 2026);
+        let month: u32 = value[5..7].parse().unwrap();
+        assert!((1..=12).contains(&month));
+        let day: u32 = value[8..10].parse().unwrap();
+        assert!((1..=31).contains(&day));
+    }
 }
 
 /// Best-effort headless idle assessment from the activity-hook runtime
